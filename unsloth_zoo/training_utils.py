@@ -20,8 +20,9 @@ import math
 from transformers import set_seed as transformers_set_seed
 from transformers import get_scheduler as transformers_get_scheduler
 from transformers import Trainer
+from transformers.trainer import OPTIMIZER_NAME, SCHEDULER_NAME, TRAINER_STATE_NAME
 from transformers.trainer_utils import seed_worker as trainer_utils_seed_worker
-from transformers.trainer_utils import get_last_checkpoint
+from transformers.trainer_utils import get_last_checkpoint, PREFIX_CHECKPOINT_DIR
 from transformers.trainer_callback import TrainerState
 from tqdm import tqdm as ProgressBar
 from packaging.version import Version
@@ -117,13 +118,22 @@ def unset_training(model):
 pass
 
 
+def save_checkpoint(trainer, optimizer, lr_scheduler, args, checkpoint_dir:str, step:int):
+    output_dir = os.path.join(checkpoint_dir, f"{PREFIX_CHECKPOINT_DIR}-{step}")
+    trainer.save_model(output_dir, _internal_call = False)
+    if args.should_save:
+        trainer.state.stateful_callbacks["TrainerControl"] = trainer.control.state()
+        trainer.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+        torch.save(optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+        torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+
+
 from dataclasses import dataclass
 @dataclass
 class Trainer_Stats:
     metrics: dict
 pass
 
-TRAINER_STATE_NAME = "trainer_state.json"
 
 def unsloth_train(trainer, resume_from_checkpoint):
     """
@@ -155,7 +165,8 @@ def unsloth_train(trainer, resume_from_checkpoint):
     if resume_from_checkpoint is not None and os.path.isfile(
         os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)):
         trainer.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
-        trainer.compare_trainer_and_checkpoint_args()
+        # This line currently does not work as trainer.state does not seem to be updated with the values from the training arguments.
+        #trainer.compare_trainer_and_checkpoint_args(training_args, trainer.state)
         trainer._load_callback_state()
 
     model = trainer.model
@@ -325,16 +336,16 @@ def unsloth_train(trainer, resume_from_checkpoint):
             step += 1
             if step == max_steps: break
 
-            if save_strategy is not "epoch":
+            if save_strategy !="epoch":
                 # Should save checkpoints to output directory
-                if step % save_steps == 0 and save_steps >= 1:
-                    trainer._tune_save_checkpoint(checkpoint_dir=output_dir)
+                if step % save_steps == 0 and save_steps >= 1 and step != 0:
+                    save_checkpoint(trainer, optimizer, lr_scheduler, training_args, checkpoint_dir=output_dir, step = step)
                 elif step == int(max_steps * save_steps) and save_steps > 0:
-                    trainer._tune_save_checkpoint(checkpoint_dir=output_dir)
+                    save_checkpoint(trainer, optimizer, lr_scheduler, training_args, checkpoint_dir=output_dir, step = step)
         pass
 
-        if save_strategy is "epoch":
-            trainer._tune_save_checkpoint(checkpoint_dir=output_dir)
+        if save_strategy == "epoch":
+            save_checkpoint(trainer, optimizer, lr_scheduler, training_args, checkpoint_dir=output_dir, step = step)
 
     pass
     progress_bar.close()
