@@ -177,19 +177,9 @@ def train_on_responses_only(
     pass
 
     # Get most common tokens since tokenizers can tokenize stuff differently!
-    Q_must, Q_left, Q_right = _find_common_token_ids(instruction_part, tokenizer)
-    A_must, A_left, A_right = _find_common_token_ids(response_part,    tokenizer)
-
-    # Store some temporary stuff
-    A_first = A_must[0]
-    len_A_must = len(A_must)
-    A_left_reversed = A_left[::-1]
-    A_right_forward = A_right
-
-    Q_first = Q_must[0]
-    len_Q_must = len(Q_must)
-    Q_left_reversed = Q_left[::-1]
-    Q_right_forward = Q_right
+    # Get the actual tokens
+    Q_tokens = tokenizer(instruction_part, add_special_tokens=False).input_ids
+    A_tokens = tokenizer(response_part, add_special_tokens=False).input_ids
 
     def _train_on_responses_only(examples):
         input_ids_ = examples["input_ids"]
@@ -198,72 +188,29 @@ def train_on_responses_only(
         for input_ids in input_ids_:
             n = len(input_ids)
             labels = [-100] * n
-            n_minus_1 = n - 1
             j = 0
+            
             while j < n:
-                # Find <assistant>
-                if (input_ids[j] == A_first) and \
-                    (input_ids[j : (k := j + len_A_must)] == A_must):
-
-                    # Now backtrack to get previous optional tokens
-                    for optional_left in A_left_reversed:
-                        if j < 1: break
-                        if optional_left == input_ids[j-1]: j -= 1
-                        else: break
-                    pass
-                    # And forwards look as well
-                    for optional_right in A_right_forward:
-                        if k >= n_minus_1: break
-                        if optional_right == input_ids[k+1]: k += 1
-                        else: break
-                    pass
-                    # assistant_j = j
-                    assistant_k = k
-
-                    j = assistant_k
-                    # Given <assistant>, now find next user
-                    while j < n:
-                        # Find <user>
-                        # Also accept last final item if assistant is the last turn
-                        if (j == n_minus_1) or \
-                            ((input_ids[j] == Q_first) and \
-                             (input_ids[j : (k := j + len_Q_must)] == Q_must)):
-
-                            # Now backtrack to get previous optional tokens
-                            for optional_left in Q_left_reversed:
-                                if j < 1: break
-                                if optional_left == input_ids[j-1]: j -= 1
-                                else: break
-                            pass
-                            # And forwards look as well
-                            for optional_right in Q_right_forward:
-                                if k >= n_minus_1: break
-                                if optional_right == input_ids[k+1]: k += 1
-                                else: break
-                            pass
-                            user_j = j
-                            # Account for last item
-                            if user_j != n_minus_1:
-                                # user_k = k
-                                # j = user_k
-                                j = k
-                            else:
-                                user_j = n
-                                k = n
-                            pass
-                            # Now copy input_ids to labels
-                            labels[assistant_k : user_j] = input_ids[assistant_k : user_j]
-                            # print(assistant_j, assistant_k, user_j, user_k)
+                # Look for response start marker
+                if j + len(A_tokens) <= n and input_ids[j:j + len(A_tokens)] == A_tokens:
+                    response_start = j + len(A_tokens)
+                    
+                    # Find next instruction marker or end of sequence
+                    next_inst = n
+                    for k in range(response_start, n - len(Q_tokens) + 1):
+                        if input_ids[k:k + len(Q_tokens)] == Q_tokens:
+                            next_inst = k
                             break
-                        pass
-                        j += 1
-                    pass
-                pass
-                j += 1
-            pass
+                    
+                    # Copy response tokens to labels
+                    labels[response_start:next_inst] = input_ids[response_start:next_inst]
+                    j = next_inst
+                else:
+                    j += 1
+            
             all_labels.append(labels)
-        pass
-        return { "labels" : all_labels }
+        
+        return {"labels": all_labels}
     pass
 
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
