@@ -241,7 +241,7 @@ pass
 class UnslothVisionDataCollator:
     __slots__ = "padding_token_ids", "dtype", "ignore_index", "processor", "formatting_func"
 
-    def __init__(self, model, processor, formatting_func=None, ignore_index = -100):
+    def __init__(self, model, processor, formatting_func = None, ignore_index = -100):
         self.padding_token_ids = get_padding_tokens_ids(processor)
         self.dtype = _get_dtype(
             model.config.torch_dtype \
