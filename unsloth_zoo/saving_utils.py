@@ -194,7 +194,7 @@ def assert_same_keys(model, new_state_dict):
         where_bias   = x.rfind(".bias")
         if where_weight != -1: x = x[:where_weight + len(".weight")]
         elif where_bias != -1: x = x[:where_bias   + len(".bias")  ]
-        else: raise RuntimeError("Unsloth: Items must either have .weight or .bias!")
+        else: pass
 
         # Remove LoRA and base_layer
         j = max(x.rfind(".lora_"), x.rfind(".base_layer"))
@@ -262,7 +262,13 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
         else:
             new_keys = expand_module_keys(name, module, set())
             for key in new_keys:
-                if not key.endswith((".weight", ".bias")): remove_keys.add(key)
+                if not key.endswith((".weight", ".bias")):
+                    # Check if quantized item exactly which has ".weight"
+                    if ".weight." in key:
+                        remove_keys.add(key)
+                    else:
+                        # Keep gate_tanh, embedding etc
+                        pass
             remove_keys.add(name)
         pass
     pass
@@ -304,7 +310,7 @@ pass
 
 
 @torch.inference_mode
-def _merge_and_overwrite_lora(save_directory, filename, lora_weights,):
+def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype,):
     # Code licensed under LGPL
     # Merges LoRA and overwrites the safetensors file it was merged to
     filename = os.path.join(save_directory, filename)
@@ -317,7 +323,7 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights,):
             if lora_stats is not None:
                 count += 1
                 W = _merge_lora(W, lora_stats, key)
-                W = W.to("cpu", dtype = old_dtype, non_blocking = True)
+                W = W.to(device = 'cpu', dtype = output_dtype, non_blocking = True)
             pass
             tensors[key] = W
         pass
@@ -360,6 +366,7 @@ pass
 
 
 def prepare_saving(
+    model,
     save_directory,
     push_to_hub = False,
     max_shard_size = "5GB",
@@ -491,6 +498,7 @@ def merge_and_overwrite_lora(
     push_to_hub          = False,
     private              = False,
     token                = None,
+    output_dtype         = None,
     low_disk_space_usage = False,
     use_temp_file        = False,
 ):
@@ -524,6 +532,7 @@ def merge_and_overwrite_lora(
         temp_file, save_directory, new_use_temp_file,
         low_disk_space_usage, max_shard_size_in_bytes,
     ) = prepare_saving(
+        model = model,
         save_directory = save_directory,
         push_to_hub = push_to_hub,
         max_shard_size = "5GB",
@@ -556,7 +565,7 @@ def merge_and_overwrite_lora(
         save_directory = save_directory,
         state_dict = {},
     )
-    upload_items()
+    if push_to_hub: upload_items()
 
     if not low_disk_space_usage:
         # Download all safetensors in 1 go!
@@ -579,6 +588,7 @@ def merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
             lora_weights = lora_weights,
+            output_dtype = output_dtype,
         )
         if low_disk_space_usage and push_to_hub:
             upload_items(filename)
@@ -731,6 +741,7 @@ def merge_and_dequantize_lora(
         temp_file, save_directory, use_temp_file,
         low_disk_space_usage, max_shard_size_in_bytes,
     ) = prepare_saving(
+        model = model,
         save_directory = save_directory,
         push_to_hub = push_to_hub,
         max_shard_size = max_shard_size,
