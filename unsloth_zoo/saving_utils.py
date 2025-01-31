@@ -561,14 +561,22 @@ def merge_and_overwrite_lora(
     )
     if push_to_hub: upload_items()
 
+    safe_tensor_index_files = ["model.safetensors.index.json"] if len(safetensors_list) > 1 else []
     if not low_disk_space_usage:
         # Download all safetensors in 1 go!
+        print(f"Downloading safetensors for {model_name}...")
         snapshot_download(
-            repo_id = model_name,
-            local_dir = save_directory,
-            allow_patterns  = safetensors_list,
+            repo_id=model_name,
+            local_dir=save_directory,
+            allow_patterns=safe_tensor_index_files + safetensors_list,
         )
-    pass
+    elif safe_tensor_index_files:
+        print(f"Downloading safetensors index for {model_name}...")
+        snapshot_download(
+            repo_id=model_name,
+            local_dir=save_directory,
+            allow_patterns=["model.safetensors.index.json"],
+        )
     for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
         if low_disk_space_usage:
             hf_hub_download(
@@ -669,7 +677,7 @@ def incremental_save_pretrained(
         new_for_loop = for_loop[:first_newline] + \
             for_loop[first_newline:] + \
             " "*spaces + \
-            re.sub(r"[ ]{8,}", "", 
+            re.sub(r"[ ]{8,}", "",
                    _PUSHING_CODE.format(
                        repo_id = repo_id,
                        revision = revision,
