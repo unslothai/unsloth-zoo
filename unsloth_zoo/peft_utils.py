@@ -216,8 +216,7 @@ def requires_grad_for_gradient_checkpointing(model):
     # Find 1st ever item which requires grad
     param = None
     for name, param in model.named_parameters():
-        if param.requires_grad: 
-            break
+        if param.requires_grad: break
     if param is None: return
 
     name = re.sub("\.([\d]{1,})\.", r"[\1].", name)
