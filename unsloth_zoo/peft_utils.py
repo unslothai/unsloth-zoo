@@ -1,5 +1,5 @@
 # Unsloth Zoo - Utilities for Unsloth
-# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as published by
@@ -188,7 +188,15 @@ def requires_grad_for_gradient_checkpointing(model):
 
     # Add post forward hook
     def requires_grad_post_hook(module, input, output):
-        output.requires_grad_(True)
+        type_output = type(output)
+        if type_output is torch.Tensor:
+            output.requires_grad_(True)
+        else:
+            try:
+                # Output in huggingface generally a dataclass with loss, try to add to that
+                output.loss.requires_grad_(True)
+            except Exception as _:
+                raise RuntimeError("Unsloth: Failed to make output require gradients!")
     pass
 
     def requires_grad_pre_hook(module, input):
@@ -198,6 +206,8 @@ def requires_grad_for_gradient_checkpointing(model):
         elif type_input is tuple or type_input is list:
             if len(input) == 0:
                 raise RuntimeError("Unsloth: Failed to make input require gradients!")
+                # print(f"  WARNING: Empty list input to {module.__class__.__name__}!") # 
+                # return
             input[0].requires_grad_(True)
         else:
             raise RuntimeError("Unsloth: Failed to make input require gradients!")
@@ -291,7 +301,7 @@ def requires_grad_for_gradient_checkpointing(model):
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
-# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as published by

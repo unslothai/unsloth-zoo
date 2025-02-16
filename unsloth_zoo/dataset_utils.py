@@ -1,5 +1,5 @@
 # Unsloth Zoo - Utilities for Unsloth
-# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as published by
@@ -301,11 +301,15 @@ def train_on_responses_only(
             trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True)
         pass
     pass
+
+    # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
+    from .training_utils import fix_zero_training_loss
+    fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
     return trainer
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
-# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as published by

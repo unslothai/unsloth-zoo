@@ -1,5 +1,5 @@
 # Unsloth Zoo - Utilities for Unsloth
-# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as published by
@@ -18,6 +18,7 @@ __all__ = [
     "UNSLOTH_COMPILE_LOCATION",
     "get_transformers_model_type",
     "unsloth_compile_transformers",
+    "create_new_function",
 ]
 
 import inspect
@@ -422,7 +423,7 @@ loss = loss_fct(shift_logits, shift_labels)
 """
 
 cross_entropy_replacement_1 = """
-if not self.training and labels is None:
+if labels is None:
     logits = self.lm_head(hidden_states)
 elif NOT_RETURN_LOGITS and labels is not None:
     n_items = loss_kwargs.get("num_items_in_batch", None) or loss_kwargs.get("n_items", None)
@@ -444,7 +445,7 @@ if labels is not None:$loss = self.loss_function(logits=logits, labels=labels, v
 """
 
 cross_entropy_replacement_2 = """
-if not self.training and labels is None:
+if labels is None:
     logits = self.lm_head(hidden_states)
 elif NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
     n_items = loss_kwargs.get("num_items_in_batch", None) or loss_kwargs.get("n_items", None)
@@ -467,7 +468,7 @@ if labels is not None:$loss = self.loss_function(logits, labels, self.vocab_size
 """
 
 cross_entropy_replacement_3 = """
-if not self.training and labels is None:
+if labels is None:
     logits = self.lm_head(hidden_states)
 elif NOT_RETURN_LOGITS and self.training and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
     n_items = loss_kwargs.get("num_items_in_batch", None) or loss_kwargs.get("n_items", None)
@@ -1537,7 +1538,7 @@ def unsloth_compile_transformers(
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
-# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as published by
