@@ -56,6 +56,8 @@ except:
     from huggingface_hub.utils._token import get_token
 pass
 from transformers.modeling_utils import PushToHubMixin
+import json
+from pathlib import Path
 import tempfile
 
 
@@ -483,6 +485,21 @@ def prepare_saving(
 pass
 
 
+def _remove_quantization_config(config_path: Path):
+    assert config_path.exists(), "Given config does not exist"
+    with open(config_path, "r") as f:
+        config = json.load(f)
+    if "quantization_config" in config:
+        # Remove the quantization_config field
+        del config["quantization_config"]
+    else:
+        # No-op
+        return
+    # Overwrite the config file
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=4)
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -559,6 +576,10 @@ def merge_and_overwrite_lora(
         save_directory = save_directory,
         state_dict = {},
     )
+    # Remove the quantization_config in the config.json file if it exists,
+    # as we are exporting the model in 16-bit format.
+    _remove_quantization_config(config_path=Path(save_directory) / "config.json")
+
     if push_to_hub: upload_items()
 
     safe_tensor_index_files = ["model.safetensors.index.json"] if len(safetensors_list) > 1 else []
