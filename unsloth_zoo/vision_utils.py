@@ -161,7 +161,6 @@ def fetch_image(
             max_pixels=max_pixels,
         )
     image = image.resize((resized_width, resized_height))
-    print(image.width)
     return image
 pass
 
