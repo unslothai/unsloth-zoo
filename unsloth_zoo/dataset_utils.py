@@ -188,8 +188,10 @@ def train_on_responses_only(
     # "vision_tower": Llava/Pixtral (Mistral AI) models
     # "vision_model": Llama models
     IS_VISION_MODEL = False
-    for vision_layer_name in ["visual", "vision_tower", "vision_model"]:
-        if hasattr(trainer.model.base_model.model, vision_layer_name):
+    # This approach should support all kind of models irrespecitve 
+    # of depth of vision layer in the parent module.
+    for module_name, _ in trainer.model.named_modules():
+        if any(name in module_name for name in ["visual", "vision_tower", "vision_model"]):
             IS_VISION_MODEL = True
             break
     
