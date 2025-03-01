@@ -179,8 +179,8 @@ def train_on_responses_only(
     """
     Trains only on responses and not on the instruction by masking out
     the labels with -100 for the instruction part for Language models
-    and by removing the "text" key from message if "role" is "user" for
-    Vision models.
+    and by removing content entries from messages with "role": "user" 
+    and "type": "text" for Vision models.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     
