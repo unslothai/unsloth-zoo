@@ -182,6 +182,7 @@ def train_on_responses_only(
     """
     # All Unsloth Zoo code licensed under LGPLv3
     tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
+    has_tokenized = not trainer.args.dataset_kwargs["skip_prepare_dataset"]
     
     if  not hasattr(tokenizer, "_unsloth_input_part") or \
         not hasattr(tokenizer, "_unsloth_output_part"):
@@ -218,6 +219,8 @@ def train_on_responses_only(
         all_labels = []
 
         for input_ids in input_ids_:
+            if not has_tokenized:
+                input_ids = input_ids.tolist()
             n = len(input_ids)
             labels = [-100] * n
             n_minus_1 = n - 1
@@ -285,26 +288,39 @@ def train_on_responses_only(
             pass
             all_labels.append(labels)
         pass
+        if not has_tokenized:
+            import torch
+            all_labels = torch.tensor(all_labels)
         return { "labels" : all_labels }
     pass
 
-    if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
-        trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True)
-    pass
-    
-    if hasattr(trainer, "eval_dataset")  and trainer.eval_dataset  is not None:
-        # Eval datasets could be a dict!
-        if type(trainer.eval_dataset) is dict:
-            for key, value in trainer.eval_dataset.items():
-                trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True)
-        else:
-            trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True)
+    if has_tokenized:
+        if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
+            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True)
         pass
-    pass
+        
+        if hasattr(trainer, "eval_dataset")  and trainer.eval_dataset  is not None:
+            # Eval datasets could be a dict!
+            if type(trainer.eval_dataset) is dict:
+                for key, value in trainer.eval_dataset.items():
+                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True)
+            else:
+                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True)
+            pass
+        pass
 
-    # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
-    from .training_utils import fix_zero_training_loss
-    fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
+        # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
+        from .training_utils import fix_zero_training_loss
+        fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
+    else:
+        class data_collator:
+            old_collator = trainer.data_collator
+            def __call__(self, examples):
+                batch = self.old_collator(examples)
+                batch["labels"] = _train_on_responses_only(batch)
+                return batch
+        trainer.data_collator = data_collator()
+
     return trainer
 pass
 
