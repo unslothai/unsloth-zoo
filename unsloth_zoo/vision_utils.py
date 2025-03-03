@@ -255,41 +255,53 @@ class UnslothVisionDataCollator:
         self.processor = processor
         self.formatting_func = formatting_func
         return
-    pass
 
     def __call__(self, examples):
-        # [TODO] Support non image inputs as well
-        # The issue is batch = self.processor( forces tensors to be returned and not None.
-        texts  = []
+        # Support mixed text & image examples
+        texts = []
         images = []
-        
+
         if self.formatting_func is not None:
             examples = [self.formatting_func(example) for example in examples]
-        
-        for example in examples:    
+
+        # Determine whether any example has image data.
+        has_any_image = any(
+            "images" in example and example["images"] is not None and len(example["images"]) > 0
+            for example in examples
+        )
+
+        # If at least one example contains images, use a dummy image for text-only examples.
+        dummy_image = None
+        if has_any_image:
+            from PIL import Image
+            dummy_image = Image.new("RGB", (1, 1))
+
+        for example in examples:
             messages = example["messages"]
             message = self.processor.apply_chat_template(
                 messages,
                 tokenize = False,
                 add_generation_prompt = False,
             )
-            # Dataset with 2 columns messages / images
-            if "images" in example:
+            texts.append(message)
+            
+            # Use the image provided or set to a dummy if we are in a mixed batch.
+            if "images" in example and example["images"] and example["images"][0] is not None:
                 image = example["images"][0]
             else:
-                image, video = process_vision_info(messages)
-            texts .append(message)
+                image = dummy_image if has_any_image else None
             images.append(image)
-        pass
 
-        # Tokenize the texts and process the images
+        # If the batch is entirely text-only then set images to None.
+        if not has_any_image:
+            images = None
+
+        # Tokenize texts and process images (if any)
         batch = self.processor(
-            text    = texts,
-            images  = images,
-            padding = True,
-            # [TODO] Truncating to max_seq_length does NOT work for VLMs
-            # truncation = True,
-            return_tensors = "pt",
+            text=texts,
+            images=images,
+            padding=True,
+            return_tensors="pt",
         )
         batch.pop("token_type_ids", None)
         
