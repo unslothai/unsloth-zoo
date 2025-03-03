@@ -317,7 +317,7 @@ def train_on_responses_only(
             old_collator = trainer.data_collator
             def __call__(self, examples):
                 batch = self.old_collator(examples)
-                batch["labels"] = _train_on_responses_only(batch)
+                batch["labels"] = _train_on_responses_only(batch)["labels"]
                 return batch
         trainer.data_collator = data_collator()
 
