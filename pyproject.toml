@@ -41,6 +41,7 @@ dependencies = [
     "hf_transfer",
     "cut_cross_entropy",
     "pillow",
+    "appdirs ~= 1.4.4"
 ]
 
 [tool.setuptools.dynamic]
