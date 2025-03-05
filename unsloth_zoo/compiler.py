@@ -33,7 +33,7 @@ import types
 import time
 import logging
 import sys
-import appdirs
+import tempfile
 from .utils import Version, is_main_process
 import triton
 from .peft_utils import get_lora_layer_modules
@@ -64,7 +64,7 @@ global COMBINED_UNSLOTH_NAME
 global UNSLOTH_COMPILE_LOCATION
 global UNSLOTH_CREATED_FUNCTIONS
 COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
-UNSLOTH_COMPILE_LOCATION = appdirs.user_data_dir("unsloth_compiled_cache")
+UNSLOTH_COMPILE_LOCATION = os.path.join(tempfile.gettempdir(), "unsloth_compiled_cache")
 UNSLOTH_CREATED_FUNCTIONS = []
 
 
