@@ -33,6 +33,7 @@ import types
 import time
 import logging
 import sys
+import appdirs
 from .utils import Version, is_main_process
 import triton
 from .peft_utils import get_lora_layer_modules
@@ -63,7 +64,7 @@ global COMBINED_UNSLOTH_NAME
 global UNSLOTH_COMPILE_LOCATION
 global UNSLOTH_CREATED_FUNCTIONS
 COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
-UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
+UNSLOTH_COMPILE_LOCATION = appdirs.user_data_dir("unsloth_compiled_cache")
 UNSLOTH_CREATED_FUNCTIONS = []
 
 
@@ -234,9 +235,6 @@ def create_new_function(
     new_source = imports + "\n\n" + new_source
     new_source = prepend + new_source + append
 
-    # Fix super() Not necessary anymore!
-    # new_source = new_source.replace("super()", "super(type(self), self)")
-
     # Check location
     if is_main_process():
         if not os.path.exists(UNSLOTH_COMPILE_LOCATION):
@@ -259,32 +257,44 @@ def create_new_function(
         if overwrite or not os.path.isfile(function_location):
             while not os.path.isfile(function_location): continue
     pass
-
-    # Try loading new module
+    
+    
+    # First try adding to sys.path and using import_module
     new_module = None
-    while True:
+    old_path = None
+    
+    try:
+        # Add directory to sys.path temporarily if it's not already there
+        if UNSLOTH_COMPILE_LOCATION not in sys.path:
+            old_path = list(sys.path)
+            sys.path.insert(0, UNSLOTH_COMPILE_LOCATION)
+        
+        # Try standard import
+        new_module = importlib.import_module(name)
+    except Exception as e:
+        print(f"Standard import failed for {name}: {e}")
+        
+        # Fallback to direct module loading
         try:
-            new_module = importlib.import_module(UNSLOTH_COMPILE_LOCATION + "." + name)
-            break
-        except:
-            # Instead use sys modules for dynamic loading
             module_name = f"unsloth_cache_{name}"
             file_location = os.path.join(UNSLOTH_COMPILE_LOCATION, name) + ".py"
             spec = importlib.util.spec_from_file_location(module_name, file_location)
             new_module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = new_module
             spec.loader.exec_module(new_module)
-
-            time.sleep(0.01)
-        pass
-    pass
+        except Exception as e:
+            print(f"Direct module loading failed for {name}: {e}")
+    finally:
+        # Restore original sys.path if we modified it
+        if old_path is not None:
+            sys.path = old_path
+    
     if new_module is None:
-        raise ImportError(f'Unsloth: Cannot import {UNSLOTH_COMPILE_LOCATION + "." + name}')
+        raise ImportError(f'Unsloth: Cannot import {name} from {UNSLOTH_COMPILE_LOCATION}')
 
     # Must save to global state or else temp file closes
     UNSLOTH_CREATED_FUNCTIONS.append(location)
     return new_module
-pass
 
 
 def create_standalone_class(
