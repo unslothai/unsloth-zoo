@@ -115,7 +115,8 @@ pass
 
 
 def fetch_image(
-    ele: Dict[str, Union[str, Dict[str, str], Image.Image, int]], size_factor: int = IMAGE_FACTOR
+    ele: dict[Union[Tuple[str, str], Image.Image]],
+    size_factor: int = IMAGE_FACTOR,
 ) -> Image.Image:
     if "image" in ele:
         image = ele["image"]
@@ -123,6 +124,7 @@ def fetch_image(
         image = ele["image_url"]
         if isinstance(image, dict) and "url" in image:
             image = image["url"]
+    pass
     image_obj = None
     if isinstance(image, Image.Image):
         image_obj = image
