@@ -114,7 +114,7 @@ def smart_resize(
 pass
 
 
-def fetch_image(ele: dict[Union[Tuple[str, str], Image.Image]], size_factor: int = IMAGE_FACTOR) -> Image.Image:
+def fetch_image(ele: dict[Union[Tuple[str, str], Image.Image]], size_factor: int = IMAGE_FACTOR,max_image_size: Union[Tuple[int, int], None] = None) -> Image.Image:
     if "image" in ele:
         image = ele["image"]
     else:
@@ -155,7 +155,9 @@ def fetch_image(ele: dict[Union[Tuple[str, str], Image.Image]], size_factor: int
             max_pixels=max_pixels,
         )
     image = image.resize((resized_width, resized_height))
-
+    if max_image_size is not None:                           # <-- New: Force resize if max_image_size is provided
+        image = image.resize(max_image_size)
+    #print(f"✅ Resized Image Size: {image.size}")
     return image
 pass
 
@@ -181,6 +183,7 @@ pass
 
 def process_vision_info(
     conversations: Union[list[dict], list[list[dict]]],
+    max_image_size: Union[Tuple[int, int], None] = None
 ) -> tuple[Union[list[Image.Image], None], Union[list[Union[torch.Tensor, list[Image.Image]]], None]]:
     vision_infos = extract_vision_info(conversations)
     ## Read images or videos
@@ -188,7 +191,7 @@ def process_vision_info(
     video_inputs = []
     for vision_info in vision_infos:
         if "image" in vision_info or "image_url" in vision_info:
-            image_inputs.append(fetch_image(vision_info))
+            image_inputs.append(fetch_image(vision_info, max_image_size=max_image_size))  # <-- Pass parameter
         elif "video" in vision_info:
             video_inputs.append(fetch_video(vision_info))
         else:
@@ -242,9 +245,9 @@ pass
 
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
-    __slots__ = "padding_token_ids", "dtype", "ignore_index", "processor", "formatting_func"
+    __slots__ = "padding_token_ids", "dtype", "ignore_index", "processor", "formatting_func","max_image_size"
 
-    def __init__(self, model, processor, formatting_func = None, ignore_index = -100):
+    def __init__(self, model, processor, formatting_func = None, ignore_index = -100, max_image_size: Union[Tuple[int, int], None] = None):
         self.padding_token_ids = get_padding_tokens_ids(processor)
         self.dtype = _get_dtype(
             model.config.torch_dtype \
@@ -253,7 +256,10 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+
         self.formatting_func = formatting_func
+        self.max_image_size = max_image_size if max_image_size is not None else getattr(model.config, "max_image_size", None)
+
         return
     pass
 
@@ -277,8 +283,8 @@ class UnslothVisionDataCollator:
             if "images" in example:
                 image = example["images"][0]
             else:
-                image, video = process_vision_info(messages)
-            texts .append(message)
+                image, video = process_vision_info(messages, max_image_size=self.max_image_size)  # <-- Modified here
+            texts.append(message)
             images.append(image)
         pass
 
