@@ -32,10 +32,30 @@ import subprocess
 import types
 import time
 import logging
+import tempfile
 import sys
-from .utils import Version
+from .utils import (
+    Version,
+    is_main_process,
+    is_distributed,
+    distributed_function,
+)
 import triton
 from .peft_utils import get_lora_layer_modules
+from importlib.metadata import version as importlib_version
+from packaging.version import Version
+import functools
+from .compiler_replacements import compiler_replacements
+
+# Compiled cache location
+global COMBINED_UNSLOTH_NAME
+COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
+
+global UNSLOTH_COMPILE_LOCATION
+UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
+
+global UNSLOTH_COMPILE_USE_TEMP
+UNSLOTH_COMPILE_USE_TEMP = False
 
 # Disable some compilations if old versions are seen
 OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
@@ -43,29 +63,17 @@ major, minor = torch.cuda.get_device_capability()
 OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
 OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
 
-
 # Ignore logging messages
 class HideLoggingMessage(logging.Filter):
     def __init__(self, text): self.text = text
     def filter(self, x): return not (self.text in x.getMessage())
 pass
 
-
-from .compiler_replacements import compiler_replacements
-
 DISABLED_KEYWORDS = [
     "select_best_resolution", # Llava NeXT errors out
     "original_aspect_ratio > current_aspect_ratio",  # Llava NeXT errors out
     "causal_mask[start:end, start:end] = 0", # Pixtral Dynamic slicing on data-dependent value is not supported
 ]
-
-global COMBINED_UNSLOTH_NAME
-global UNSLOTH_COMPILE_LOCATION
-global UNSLOTH_CREATED_FUNCTIONS
-COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
-UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
-UNSLOTH_CREATED_FUNCTIONS = []
-
 
 _license_header = """
 # Unsloth Zoo - Utilities for Unsloth
@@ -102,8 +110,8 @@ _patch_functions = [
     "Conv1d", "Conv2d", "Conv3d",
     "ConvTranspose1d", "ConvTranspose2d", "ConvTranspose3d",
     "BatchNorm1d", "BatchNorm2d", "BatchNorm3d",
-    "GroupNorm", "RMSNorm",
-    # "CrossEntropyLoss", "LayerNorm",
+    "GroupNorm", "RMSNorm", "LayerNorm",
+    # "CrossEntropyLoss",
 ]
 
 
@@ -198,6 +206,38 @@ def replace_with_grouped_query_attention(module, source):
     return source
 pass
 
+def _get_compile_folder(use_tempfile = False):
+    global UNSLOTH_COMPILE_LOCATION
+    global UNSLOTH_COMPILE_USE_TEMP
+    if UNSLOTH_COMPILE_USE_TEMP or use_tempfile:
+        UNSLOTH_COMPILE_USE_TEMP = True
+        location = os.path.join(tempfile.gettempdir(), UNSLOTH_COMPILE_LOCATION)
+        if not os.path.exists(location):
+            print(
+                f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
+            )
+            os.makedirs(location, exist_ok = True)
+    else:
+        location = UNSLOTH_COMPILE_LOCATION
+        if os.path.exists(location): return location, UNSLOTH_COMPILE_USE_TEMP
+        try:
+            # Try creating the directory
+            os.makedirs(location, exist_ok = True)
+        except:
+            # Instead use a temporary location!
+            UNSLOTH_COMPILE_USE_TEMP = True
+            location = os.path.join(tempfile.gettempdir(), location)
+            os.makedirs(location, exist_ok = True)
+            print(
+                f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
+            )
+    return location, UNSLOTH_COMPILE_USE_TEMP
+pass
+
+def get_compile_folder(use_tempfile = False):
+    location, UNSLOTH_COMPILE_USE_TEMP = distributed_function(2, _get_compile_folder, use_tempfile)
+    return location, UNSLOTH_COMPILE_USE_TEMP
+pass
 
 def create_new_function(
     name,
@@ -210,8 +250,9 @@ def create_new_function(
     add_torch_compile = False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
-    global UNSLOTH_CREATED_FUNCTIONS
-    global UNSLOTH_COMPILE_LOCATION
+    old_new_source = new_source
+    do_logging = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+
     if new_source[0] == " ":
         spaces = new_source.find("def")
         new_source = new_source.split("\n")
@@ -234,47 +275,126 @@ def create_new_function(
     new_source = imports + "\n\n" + new_source
     new_source = prepend + new_source + append
 
-    # Fix super() Not necessary anymore!
-    # new_source = new_source.replace("super()", "super(type(self), self)")
+    # Check versioning
+    try: unsloth_zoo_version = importlib_version("unsloth_zoo")
+    except: unsloth_zoo_version = "0"
+    try: unsloth_version = importlib_version("unsloth")
+    except: unsloth_version = "0"
+    try: transformers_version = importlib_version("transformers")
+    except: transformers_version = "0"
+    try: trl_version = importlib_version("trl")
+    except: trl_version = "0"
 
-    # Check location
-    if not os.path.exists(UNSLOTH_COMPILE_LOCATION):
-        os.makedirs(UNSLOTH_COMPILE_LOCATION)
+    versioning = '"""\n' + \
+        f'{unsloth_zoo_version}\n'\
+        f'{unsloth_version}\n'\
+        f'{transformers_version}\n'\
+        f'{trl_version}\n__UNSLOTH_VERSIONING__\n' + '"""\n'
+
+    write_new_source = versioning + new_source
 
     # Write function
-    location = os.path.join(UNSLOTH_COMPILE_LOCATION, f"{name}.py")
-    function_location = location
-    if overwrite or not os.path.isfile(function_location):
+    global UNSLOTH_COMPILE_USE_TEMP
+    file_source = None
+    compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = False)
+    function_location = os.path.join(compile_folder, f"{name}.py")
+
+    # Check if file was already created!
+    if not overwrite and os.path.isfile(function_location):
+
+        # Check if exactly equivalent
+        with open(function_location, "r") as f: file_source = f.read()
+
+        if file_source != write_new_source:
+            overwrite = True
+        elif not overwrite:
+            if "__UNSLOTH_VERSIONING__" not in file_source:
+                overwrite = True
+            else:
+                versions = file_source[:file_source.find('__UNSLOTH_VERSIONING__')]
+                if versioning[:versioning.find('__UNSLOTH_VERSIONING__')] != versions:
+                    overwrite = True
+    pass
+
+    # Check location
+    def write_file(function_location, write_new_source):
         with open(function_location, "wb", buffering = 0) as file:
-            file.write(new_source.encode("utf-8"))
+            file.write(write_new_source.encode("utf-8"))
             file.flush()
             os.fsync(file.fileno())
-        pass
+        return None
     pass
 
-    # Try loading new module
-    new_module = None
-    for trial in range(3):
+    if overwrite or not os.path.isfile(function_location):
         try:
-            new_module = importlib.import_module(UNSLOTH_COMPILE_LOCATION + "." + name)
-        except:
-            # Instead use sys modules for dynamic loading
-            module_name = f"unsloth_cache_{name}"
-            file_location = os.path.join(UNSLOTH_COMPILE_LOCATION, name) + ".py"
-            spec = importlib.util.spec_from_file_location(module_name, file_location)
-            new_module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = new_module
-            spec.loader.exec_module(new_module)
-
-            time.sleep(0.2 + trial)
-            continue
+            distributed_function(1, write_file, function_location, write_new_source)
+        except Exception as error:
+            if UNSLOTH_COMPILE_USE_TEMP:
+                raise RuntimeError(error)
+            else:
+                # Failed so instead use a temporary directory
+                compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = True)
+                function_location = os.path.join(compile_folder, f"{name}.py")
+                distributed_function(1, write_file, function_location, write_new_source)
+            pass
         pass
     pass
-    if new_module is None:
-        raise ImportError(f'Unsloth: Cannot import {UNSLOTH_COMPILE_LOCATION + "." + name}')
 
-    # Must save to global state or else temp file closes
-    UNSLOTH_CREATED_FUNCTIONS.append(location)
+    # Now import modules! Use a tempfile if it fails on the first try!
+    old_path = None
+    new_module = None
+
+    def import_module(compile_folder, name):
+        # Add directory to sys.path temporarily if it's not already there
+        if compile_folder not in sys.path:
+            old_path = list(sys.path)
+            # Fail if name already exists!
+            if name in old_path:
+                raise OSError(f"Unsloth: File {name} already exists")
+            sys.path.insert(0, compile_folder)
+        # Try standard import
+        new_module = importlib.import_module(name)
+        return new_module, old_path
+    pass
+
+    try:
+        new_module, old_path = import_module(compile_folder, name)
+    except Exception as e:
+        new_module = None
+        # Try using temp directory instead!
+        if not UNSLOTH_COMPILE_USE_TEMP:
+            compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = True)
+            function_location = os.path.join(compile_folder, f"{name}.py")
+            distributed_function(1, write_file, function_location, write_new_source)
+            if is_main_process():
+                print(f"Standard import failed for {name}: {e}. Using tempfile instead!")
+            try:
+                new_module, old_path = import_module(compile_folder, name)
+            except Exception as e:
+                new_module = None
+                if is_main_process():
+                    print(f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!")
+        pass
+        # Fallback to direct module loading
+        if new_module is None:
+            try:
+                module_name = f"unsloth_cache_{name}"
+                file_location = os.path.join(compile_folder, name) + ".py"
+                spec = importlib.util.spec_from_file_location(module_name, file_location)
+                new_module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = new_module
+                spec.loader.exec_module(new_module)
+            except Exception as e:
+                raise RuntimeError(f"Direct module loading failed for {name}: {e}")
+        pass
+    finally:
+        # Restore original sys.path if we modified it
+        if old_path is not None:
+            sys.path = old_path
+
+    if new_module is None:
+        raise ImportError(f'Unsloth: Cannot import {name} from {UNSLOTH_COMPILE_LOCATION}')
+
     return new_module
 pass
 
@@ -382,10 +502,11 @@ pass
 # os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
 LOGITS_ERROR_STRING = \\
     "Unsloth: Logits are empty from 2024.11 onwards. To get raw logits again, please "\\
-    'set the environment variable `UNSLOTH_RETURN_LOGITS` to `"1" BEFORE starting to train ie before `trainer.train()`. For example:\\n\\n'\\
-    "import os\\n"\\
+    'set the environment variable `UNSLOTH_RETURN_LOGITS` to `"1" BEFORE starting to train ie before `trainer.train()`. For example:\\n'\\
+    "```\\nimport os\\n"\\
     "os.environ['UNSLOTH_RETURN_LOGITS'] = '1'\\n"\\
-    "... trainer.train() ..."
+    "trainer.train()\\n```\\n"\\
+    "No need to restart your console - just add `os.environ['UNSLOTH_RETURN_LOGITS'] = '1'` before trainer.train() and re-run the cell!"
 
 def raise_logits_error(*args, **kwargs): raise NotImplementedError(LOGITS_ERROR_STRING)
 def return_none(*args, **kwargs): return None
@@ -1255,44 +1376,32 @@ def unsloth_compile_transformers(
         else:
             inner_training_loop = Trainer._original_training_loop
     except:
-        raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
+        raise RuntimeError('Unsloth: Unsuccessfully patched inner_training_loop')
     pass
 
     import transformers.trainer
     items_in_trainer = dir(transformers.trainer)
     good_items = []
     for item in items_in_trainer:
-        # TODO: Support Deepspeed
-        if item.startswith(("deepspeed", "xm", "met", "smp")): continue
         if item in inner_training_loop: good_items.append(item)
     pass
     exec("from transformers.trainer import (" + ", ".join(x for x in good_items) + ")", globals())
 
-    start = re.search('logger\.info\([\"\'].+?Running training', inner_training_loop).span(0)[0]
+    start = re.search(r'logger\.info\([\"\'].+?Running training', inner_training_loop).span(0)[0]
     end = inner_training_loop.find("\n\n", start)
     original_debug = inner_training_loop[start:end]
-    spaces = re.search('\n([\s\t]{1,})', original_debug).group(0)[1:]
-    front_spaces = re.match('([\s\t]{1,})', inner_training_loop).group(0)
+    spaces = re.search(r'\n([\s\t]{1,})', original_debug).group(0)[1:]
+    front_spaces = re.match(r'([\s\t]{1,})', inner_training_loop).group(0)
 
     debug_info = """debug_info = \\
-        f"==((====))==  Unsloth - 2x faster free finetuning | Num GPUs = {args.world_size}\\n"\\
-        f"   {chr(92)}{chr(92)}   /|    Num examples = {num_examples:,} | Num Epochs = {num_train_epochs:,}\\n"\\
-        f"O^O/ {chr(92)}_/ {chr(92)}    Batch size per device = {self._train_batch_size:,} | Gradient Accumulation steps = {args.gradient_accumulation_steps}\\n"\\
-        f"{chr(92)}        /    Total batch size = {total_train_batch_size:,} | Total steps = {max_steps:,}\\n"\\
-        f' "-____-"     Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}\\n'\\
+        f"==((====))==  Unsloth - 2x faster free finetuning | Num GPUs used = {len(set(p.device for p in model.parameters()))}\\n"\\
+        f"   {chr(92)}{chr(92)}   /|    Num examples = {num_examples:,} | Num Epochs = {num_train_epochs:,} | Total steps = {max_steps:,}\\n"\\
+        f"O^O/ {chr(92)}_/ {chr(92)}    Batch size per device = {self._train_batch_size:,} | Gradient accumulation steps = {args.gradient_accumulation_steps}\\n"\\
+        f"{chr(92)}        /    Data Parallel GPUs = {args.world_size} | Total batch size ({self._train_batch_size} x {args.gradient_accumulation_steps} x {args.world_size}) = {total_train_batch_size:,}\\n"\\
+        f' "-____-"     Trainable parameters = {get_model_param_count(model, trainable_only=True):,}/{get_model_param_count(model):,} ({get_model_param_count(model, trainable_only=True)/get_model_param_count(model)*100:.2f}% trained)'
         f"🦥 Unsloth needs about 1-3 minutes to load everything - please wait!"
         logger.warning(debug_info)
-        import subprocess, re, gc, numpy as np
-        a = np.array([0,])
-        try:
-            a = subprocess.check_output('nvidia-smi --query-gpu=memory.used --format=csv', shell = True)
-            a = re.findall(rb'([\\d]{1,})[\\s]{1,}M', a)
-            a = np.array([int(x.decode('utf-8'))/1024 for x in a])
-        except:
-            if not torch.cuda.is_available():
-                raise RuntimeError('Unsloth: We do not support AMD / Intel machines yet - it is a work in progress!')
-        if ((a - PRE_CHECK) >= 1).sum() > 1:
-            raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
+        import gc
         for _ in range(3):
             gc.collect()
             torch.cuda.empty_cache()"""
@@ -1304,7 +1413,7 @@ def unsloth_compile_transformers(
     debug_info = """n_total_devices = total_train_batch_size // \\
             args.gradient_accumulation_steps // self._train_batch_size
         if n_total_devices > 1:
-            logger.warning_once('Unsloth currently does not support multi GPU setups - but we are working on it!')
+            logger.warning_once('Unsloth is running with multi GPUs - the effective batch size is multiplied by ' + str(n_total_devices))
         debug_info ="""
     debug_info = debug_info.split('\n')
     debug_info = "\n".join([debug_info[0]] + [spaces + x[8:] for x in debug_info[1:]])
@@ -1317,46 +1426,11 @@ def unsloth_compile_transformers(
         "raise RuntimeError('Unsloth: TPUs are not yet supported!')"
     )
     inner_training_loop = inner_training_loop.replace(
-        "self.accelerator.free_memory()",
-        "self.accelerator.free_memory()\n" + \
-        front_spaces + "if self.is_deepspeed_enabled:"\
-        "raise RuntimeError('Unsloth: Deepspeed is not yet supported!')\n", 1,
-    )
-
-    check_batches = """train_dataloader = self.get_train_dataloader()
-        ga  = args.gradient_accumulation_steps
-        bsz = self._train_batch_size
-        total_batches = bsz * ga * args.world_size
-        n_total_devices = total_batches // ga // bsz
-        if n_total_devices > 1:
-            logger.warning_once('Unsloth currently does not support multi GPU setups - but we are working on it!')
-            divisor = n_total_devices / 1
-            bsz = self._train_batch_size = max(int(bsz / divisor), 1)
-            if total_batches // ga // bsz > 1:
-                divisor = n_total_devices / 1
-                ga = args.gradient_accumulation_steps = max(int(ga / divisor), 1)"""
-    check_batches = check_batches.split('\n')
-    check_batches = "\n".join([check_batches[0]] + [front_spaces + x[8:] for x in check_batches[1:]])
-    inner_training_loop = inner_training_loop.replace(
-        "train_dataloader = self.get_train_dataloader()",
-        check_batches, 1,
-    )
-    inner_training_loop = inner_training_loop.replace(
         "_inner_training_loop",
         "_fast_inner_training_loop", 1,
     )
-    exec(inner_training_loop, globals())
-
-    Trainer._inner_training_loop = _fast_inner_training_loop
     inner_training_loop = inner_training_loop.replace(
         "is_torch_tpu_available()",
-        "False",
-    )
-    if "n_total_devices >" not in inner_training_loop:
-        raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
-    pass
-    inner_training_loop = inner_training_loop.replace(
-        "is_sagemaker_mp_enabled()",
         "False",
     )
     exec(inner_training_loop, globals())
@@ -1446,31 +1520,20 @@ def unsloth_compile_transformers(
 
     all_code = "\n\n".join(final_all_standalone_classes)
 
-    if import_from_cache:
-        try:
-            combined_module = importlib.import_module(f"{UNSLOTH_COMPILE_LOCATION}.{COMBINED_UNSLOTH_NAME}_{model_type}")
-            import_from_cache = True
-        except:
-            import_from_cache = False
-    else:
-        import_from_cache = False
-    pass
-    if not import_from_cache:
-        try:
-            combined_module = create_new_function(
-                f"{COMBINED_UNSLOTH_NAME}_{model_type}",
-                all_code,
-                model_location,
-                functions,
-                prepend = \
-                    _disabled_sdpa_code + \
-                    f"\ntorch_compile_options = {torch_compile_options}\n" + \
-                    _cross_entropy_code + "\n"
-            )
-        except Exception as exception:
-            raise RuntimeError(exception)
-            combined_module = None
-    pass
+    try:
+        combined_module = create_new_function(
+            f"{COMBINED_UNSLOTH_NAME}_{model_type}",
+            all_code,
+            model_location,
+            functions,
+            prepend = \
+                _disabled_sdpa_code + \
+                f"\ntorch_compile_options = {torch_compile_options}\n" + \
+                _cross_entropy_code + "\n"
+        )
+    except Exception as exception:
+        raise RuntimeError(exception)
+        combined_module = None
 
     if compile_torch_modules and not disable:
 
