@@ -182,7 +182,10 @@ def train_on_responses_only(
     """
     # All Unsloth Zoo code licensed under LGPLv3
     tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
+    # if input haven't been tokenized by the trainer
     has_tokenized = not trainer.args.dataset_kwargs["skip_prepare_dataset"]
+    # for vlms, get the text tokenizer
+    tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
     
     if  not hasattr(tokenizer, "_unsloth_input_part") or \
         not hasattr(tokenizer, "_unsloth_output_part"):
