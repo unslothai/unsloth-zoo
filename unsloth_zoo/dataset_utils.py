@@ -175,10 +175,12 @@ def train_on_responses_only(
     trainer,
     instruction_part = None,
     response_part    = None,
+    is_vlm           = False,
+    image_token_id   = None
 ):
     """
     Trains only on responses and not on the instruction by masking out
-    the labels with -100 for the instruction part.
+    the labels with -100 for the instruction part. Supports VLMs when is_vlm=True by preserving image tokens specified by image_token_id in the response part.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
@@ -263,19 +265,17 @@ def train_on_responses_only(
                                 if optional_right == input_ids[k+1]: k += 1
                                 else: break
                             pass
-                            user_j = j
-                            # Account for last item
-                            if user_j != n_minus_1:
-                                # user_k = k
-                                # j = user_k
-                                j = k
+                            user_j = j if j != n_minus_1 else n
+                            k = n if user_j == n else k
+                            
+                            if is_vlm and image_token_id is not None:
+                                for idx in range(assistant_k, user_j):
+                                    if input_ids[idx] == image_token_id:
+                                        labels[idx] = input_ids[idx]
+                                    else:
+                                        labels[idx] = input_ids[idx] if idx >= assistant_k else -100
                             else:
-                                user_j = n
-                                k = n
-                            pass
-                            # Now copy input_ids to labels
-                            labels[assistant_k : user_j] = input_ids[assistant_k : user_j]
-                            # print(assistant_j, assistant_k, user_j, user_k)
+                                labels[assistant_k:user_j] = input_ids[assistant_k:user_j]
                             break
                         pass
                         j += 1
