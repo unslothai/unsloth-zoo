@@ -240,7 +240,7 @@ def train_on_responses_only(
                         else: break
                     pass
                     # assistant_j = j
-                    assistant_k = k
+                    assistant_k = k + 1
 
                     j = assistant_k
                     # Given <assistant>, now find next user
