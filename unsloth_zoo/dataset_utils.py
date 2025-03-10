@@ -331,8 +331,12 @@ def train_on_responses_only(
                 batch = self.collator(examples)
                 batch["labels"] = self.modifier_fn(batch)["labels"]
                 return batch
-        if hasattr(trainer, "data_collator") and not hasattr(trainer.data_collator, "collator"):
-            trainer.data_collator = UnslothResponseOnlyCollator(trainer.data_collator, _train_on_responses_only)
+        if hasattr(trainer, "data_collator"):
+            # If `UnslothResponseOnlyCollator` is found, extract internal collator to avoid double wrapping
+            if hasattr(trainer.data_collator, "collator"):
+                trainer.data_collator = UnslothResponseOnlyCollator(trainer.data_collator.collator, _train_on_responses_only)
+            else:
+                trainer.data_collator = UnslothResponseOnlyCollator(trainer.data_collator, _train_on_responses_only)
         else:
             pass
     # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
