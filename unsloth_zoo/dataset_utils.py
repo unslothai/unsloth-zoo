@@ -331,7 +331,7 @@ def train_on_responses_only(
                 batch = self.collator(examples)
                 batch["labels"] = self.modifier_fn(batch)["labels"]
                 return batch
-        if hasattr(trainer, "data_collator") and hasattr(trainer.data_collator, "collator"):
+        if hasattr(trainer, "data_collator") and not hasattr(trainer.data_collator, "collator"):
             trainer.data_collator = UnslothResponseOnlyCollator(trainer.data_collator, _train_on_responses_only)
         else:
             pass
