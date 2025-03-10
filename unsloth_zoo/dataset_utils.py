@@ -301,16 +301,6 @@ def train_on_responses_only(
     from multiprocessing import cpu_count
     num_proc = cpu_count()
 
-    # Edit data collator if not DataCollatorForSeq2Seq or UnslothVisionDataCollator, then apply _train_on_responses_only
-    from transformers import DataCollatorForSeq2Seq
-    from unsloth_zoo.vision_utils import UnslothVisionDataCollator
-    if hasattr(trainer, "data_collator"):
-        if not isinstance(trainer.data_collator, DataCollatorForSeq2Seq) and not hasattr(trainer.data_collator, "tokenizer"):
-            trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer)
-        elif not isinstance(trainer.data_collator, UnslothVisionDataCollator) and hasattr(trainer.data_collator, "tokenizer"):
-            trainer.data_collator = UnslothVisionDataCollator(model = trainer.model, tokenizer = tokenizer)
-        else:
-            pass
 
     if has_tokenized:
         if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
@@ -326,8 +316,14 @@ def train_on_responses_only(
                 trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
             pass
         pass
+
+        # Edit data collator as well if not DataCollatorForSeq2Seq
+        from transformers import DataCollatorForSeq2Seq
+        if hasattr(trainer, "data_collator") and \
+            not isinstance(trainer.data_collator, DataCollatorForSeq2Seq):
+            trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer)
     else:
-        class CustomDataCollator:
+        class UnslothResponseOnlyCollator:
             def __init__(self, collator, modifier_fn):
                 self.collator = collator
                 self.modifier_fn = modifier_fn
@@ -335,8 +331,8 @@ def train_on_responses_only(
                 batch = self.collator(examples)
                 batch["labels"] = self.modifier_fn(batch)["labels"]
                 return batch
-        if hasattr(trainer, "data_collator") and not isinstance(trainer.data_collator, CustomDataCollator):
-            trainer.data_collator = CustomDataCollator(trainer.data_collator, _train_on_responses_only)
+        if hasattr(trainer, "data_collator") and not isinstance(trainer.data_collator, UnslothResponseOnlyCollator):
+            trainer.data_collator = UnslothResponseOnlyCollator(trainer.data_collator, _train_on_responses_only)
         else:
             pass
     # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
