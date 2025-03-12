@@ -182,6 +182,8 @@ def train_on_responses_only(
     """
     # All Unsloth Zoo code licensed under LGPLv3
     tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
+    # if input haven't been tokenized by the trainer
+    has_tokenized = not trainer.args.dataset_kwargs["skip_prepare_dataset"]
 
     if  not hasattr(tokenizer, "_unsloth_input_part") or \
         not hasattr(tokenizer, "_unsloth_output_part"):
@@ -198,9 +200,12 @@ def train_on_responses_only(
         response_part    = tokenizer._unsloth_output_part
     pass
 
+    # for vlms, get the text tokenizer
+    text_tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
+
     # Get most common tokens since tokenizers can tokenize stuff differently!
-    Q_must, Q_left, Q_right = _find_common_token_ids(instruction_part, tokenizer)
-    A_must, A_left, A_right = _find_common_token_ids(response_part,    tokenizer)
+    Q_must, Q_left, Q_right = _find_common_token_ids(instruction_part, text_tokenizer)
+    A_must, A_left, A_right = _find_common_token_ids(response_part,    text_tokenizer)
 
     # Store some temporary stuff
     A_first = A_must[0]
@@ -218,6 +223,8 @@ def train_on_responses_only(
         all_labels = []
 
         for input_ids in input_ids_:
+            if not has_tokenized:
+                input_ids = input_ids.tolist()
             n = len(input_ids)
             labels = [-100] * n
             n_minus_1 = n - 1
@@ -285,35 +292,57 @@ def train_on_responses_only(
             pass
             all_labels.append(labels)
         pass
+        if not has_tokenized:
+            import torch
+            all_labels = torch.tensor(all_labels)
         return { "labels" : all_labels }
     pass
 
     from multiprocessing import cpu_count
     num_proc = cpu_count()
 
-    if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
-        trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
-    pass
-    
-    if hasattr(trainer, "eval_dataset")  and trainer.eval_dataset  is not None:
-        # Eval datasets could be a dict!
-        if type(trainer.eval_dataset) is dict:
-            for key, value in trainer.eval_dataset.items():
-                trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = num_proc)
-        else:
-            trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+
+    if has_tokenized:
+        if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
+            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
         pass
-    pass
+        
+        if hasattr(trainer, "eval_dataset")  and trainer.eval_dataset  is not None:
+            # Eval datasets could be a dict!
+            if type(trainer.eval_dataset) is dict:
+                for key, value in trainer.eval_dataset.items():
+                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+            else:
+                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+            pass
+        pass
 
-    # Edit data collator as well if not DataCollatorForSeq2Seq
-    from transformers import DataCollatorForSeq2Seq
-    if hasattr(trainer, "data_collator") and \
-        not isinstance(trainer.data_collator, DataCollatorForSeq2Seq):
-        trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer)
-
+        # Edit data collator as well if not DataCollatorForSeq2Seq
+        from transformers import DataCollatorForSeq2Seq
+        if hasattr(trainer, "data_collator") and \
+            not isinstance(trainer.data_collator, DataCollatorForSeq2Seq):
+            trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer)
+    else:
+        class UnslothResponseOnlyCollator:
+            def __init__(self, collator, modifier_fn):
+                self.collator = collator
+                self.modifier_fn = modifier_fn
+            def __call__(self, examples):
+                batch = self.collator(examples)
+                batch["labels"] = self.modifier_fn(batch)["labels"]
+                return batch
+        if hasattr(trainer, "data_collator"):
+            # If `UnslothResponseOnlyCollator` is found, extract internal collator to avoid double wrapping
+            if hasattr(trainer.data_collator, "collator"):
+                trainer.data_collator = UnslothResponseOnlyCollator(trainer.data_collator.collator, _train_on_responses_only)
+            else:
+                trainer.data_collator = UnslothResponseOnlyCollator(trainer.data_collator, _train_on_responses_only)
+        else:
+            pass
     # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
     from .training_utils import fix_zero_training_loss
     fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
+
     return trainer
 pass
 
