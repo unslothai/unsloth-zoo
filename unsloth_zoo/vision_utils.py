@@ -287,7 +287,7 @@ class UnslothVisionDataCollator:
             else:
                 image, video = process_vision_info(messages)
             texts .append(message)
-            images.append(image)
+            if image: images.append(image)
         pass
 
         # Tokenize the texts and process the images
