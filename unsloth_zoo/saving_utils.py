@@ -927,8 +927,16 @@ def get_original_model_id(local_path: str):
             
         # Check for _name_or_path that's not a local path
         # When we load using AutoConfig, the _name_or_path changed into the local path instead
-        if "_name_or_path" in config and not os.path.exists(config["_name_or_path"]):
+        if "_name_or_path" in config:
             return config["_name_or_path"]
+        
+    config_path = os.path.join(local_path, "adapter_config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config = json.load(f)
+            
+        if "base_model_name_or_path" in config:
+            return config["base_model_name_or_path"]
     
     return None
 
