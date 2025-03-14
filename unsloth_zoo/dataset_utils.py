@@ -192,42 +192,55 @@ def train_on_responses_only(
     """
     Trains only on responses and not on the instruction by masking out
     the labels with -100 for the instruction part.
+    Now supports a list of instruction patterns.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     if tokenizer is None and trainer is not None:
         tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
-    # Get non vision tokenizer
+    # Get non-vision tokenizer
     if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
         tokenizer = tokenizer.tokenizer
-    if  not hasattr(tokenizer, "_unsloth_input_part") or \
-        not hasattr(tokenizer, "_unsloth_output_part"):
-        
+    if not hasattr(tokenizer, "_unsloth_input_part") or \
+       not hasattr(tokenizer, "_unsloth_output_part"):
         if instruction_part is None or response_part is None:
             raise ValueError("Unsloth: instruction_part and response_part must be given!")
         pass
     elif (instruction_part is not None or response_part is not None) and \
-        (hasattr(tokenizer, "_unsloth_input_part") or hasattr(tokenizer, "_unsloth_output_part")):
-
+         (hasattr(tokenizer, "_unsloth_input_part") or hasattr(tokenizer, "_unsloth_output_part")):
         raise ValueError("Unsloth: Your tokenizer already has instruction and response parts set - do not give custom ones!")
     else:
         instruction_part = tokenizer._unsloth_input_part
         response_part    = tokenizer._unsloth_output_part
     pass
 
-    # Get most common tokens since tokenizers can tokenize stuff differently!
-    Q_must, Q_left, Q_right = _find_common_token_ids(instruction_part, tokenizer, force_match)
-    A_must, A_left, A_right = _find_common_token_ids(response_part,    tokenizer, force_match)
+    # Process instruction_part: support both a single string and a list of strings.
+    if isinstance(instruction_part, str):
+        instruction_list = [instruction_part]
+    elif isinstance(instruction_part, list):
+        instruction_list = instruction_part
+    else:
+        raise ValueError("Unsloth: instruction_part must be a string or list of strings.")
+    
+    # Compute token patterns for each instruction segment
+    Q_patterns = []
+    for instr in instruction_list:
+        q_must, q_left, q_right = _find_common_token_ids(instr, tokenizer, force_match)
+        q_first = q_must[0] if q_must else None
+        len_q_must = len(q_must)
+        q_left_reversed = q_left[::-1]
+        q_right_forward = q_right
+        Q_patterns.append((q_must, q_left_reversed, q_right_forward, q_first, len_q_must))
+    pass
 
-    # Store some temporary stuff
+    # Get token pattern for the response part
+    A_must, A_left, A_right = _find_common_token_ids(response_part, tokenizer, force_match)
+
+    # Store some temporary variables for the response pattern
     A_first = A_must[0]
     len_A_must = len(A_must)
     A_left_reversed = A_left[::-1]
     A_right_forward = A_right
 
-    Q_first = Q_must[0]
-    len_Q_must = len(Q_must)
-    Q_left_reversed = Q_left[::-1]
-    Q_right_forward = Q_right
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
 
@@ -237,11 +250,11 @@ def train_on_responses_only(
         if type(input_ids_) is torch_Tensor:
             use_tensors = True
             input_ids_ = input_ids_.tolist()
-        if "labels" in examples:
+        if "labels" in examples and not isinstance(examples["labels"], list):
             labels_ = examples["labels"].tolist()
             assert(len(labels_) == len(input_ids_))
         else:
-            labels_ = [None]*len(input_ids_)
+            labels_ = [None] * len(input_ids_)
 
         all_labels = []
         for input_ids, old_labels in zip(input_ids_, labels_):
@@ -255,75 +268,82 @@ def train_on_responses_only(
             n_minus_1 = n - 1
             j = 0
             while j < n:
-                # Find <assistant>
+                # Find <assistant> pattern in the input_ids
                 if (input_ids[j] == A_first) and \
-                    (input_ids[j : (k := j + len_A_must)] == A_must):
+                   (input_ids[j : (k := j + len_A_must)] == A_must):
 
-                    # Now backtrack to get previous optional tokens
+                    # Backtrack optional left tokens for assistant
                     for optional_left in A_left_reversed:
-                        if j < 1: break
-                        if optional_left == input_ids[j-1]: j -= 1
-                        else: break
-                    pass
-                    # And forwards look as well
+                        if j < 1:
+                            break
+                        if optional_left == input_ids[j-1]:
+                            j -= 1
+                        else:
+                            break
+
+                    # Forward optional right tokens for assistant
                     for optional_right in A_right_forward:
-                        if k >= n_minus_1: break
-                        if optional_right == input_ids[k+1]: k += 1
-                        else: break
-                    pass
-                    # assistant_j = j
+                        if k >= n_minus_1:
+                            break
+                        if optional_right == input_ids[k+1]:
+                            k += 1
+                        else:
+                            break
+
                     assistant_k = k
-
                     j = assistant_k
-                    # Given <assistant>, now find next user
+
+                    # Now find the next user (instruction) pattern or end of sequence
                     while j < n:
-                        # Find <user>
-                        # Also accept last final item if assistant is the last turn
-                        if (j == n_minus_1) or \
-                            ((input_ids[j] == Q_first) and \
-                             (input_ids[j : (k := j + len_Q_must)] == Q_must)):
-
-                            # Now backtrack to get previous optional tokens
-                            for optional_left in Q_left_reversed:
-                                if j < 1: break
-                                if optional_left == input_ids[j-1]: j -= 1
-                                else: break
-                            pass
-                            # And forwards look as well
-                            for optional_right in Q_right_forward:
-                                if k >= n_minus_1: break
-                                if optional_right == input_ids[k+1]: k += 1
-                                else: break
-                            pass
-                            user_j = j
-                            # Account for last item
-                            if user_j != n_minus_1:
-                                # user_k = k
-                                # j = user_k
-                                j = k
-                            else:
-                                user_j = n
-                                k = n
-                            pass
-
+                        if j == n_minus_1:
+                            user_j = n
+                            k = n
                             if not use_old_labels:
-                                # Now copy input_ids to labels
-                                labels[assistant_k : user_j] = input_ids [assistant_k : user_j]
-                                # print(assistant_j, assistant_k, user_j, user_k)
+                                labels[assistant_k : user_j] = input_ids[assistant_k : user_j]
                             else:
-                                # Copy over from old labels!
                                 labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
                             break
-                        pass
+                        else:
+                            matched = False
+                            for (q_must, q_left_reversed, q_right_forward, q_first, len_q_must) in Q_patterns:
+                                if q_first is not None and (input_ids[j] == q_first) and \
+                                   (input_ids[j : (qk := j + len_q_must)] == q_must):
+
+                                    # Backtrack optional left tokens for user pattern
+                                    for optional_left in q_left_reversed:
+                                        if j < 1:
+                                            break
+                                        if optional_left == input_ids[j-1]:
+                                            j -= 1
+                                        else:
+                                            break
+
+                                    # Forward optional right tokens for user pattern
+                                    for optional_right in q_right_forward:
+                                        if qk >= n_minus_1:
+                                            break
+                                        if optional_right == input_ids[qk+1]:
+                                            qk += 1
+                                        else:
+                                            break
+
+                                    user_j = j
+                                    k = qk
+                                    if not use_old_labels:
+                                        labels[assistant_k : user_j] = input_ids[assistant_k : user_j]
+                                    else:
+                                        labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
+                                    j = k
+                                    matched = True
+                                    break
+                            if matched:
+                                break
                         j += 1
-                    pass
-                pass
                 j += 1
-            pass
             all_labels.append(labels)
-        pass
-        return { "labels" : torch.tensor(all_labels, dtype = torch.int64) if use_tensors else all_labels }
+        return { "labels" : torch.tensor(all_labels, dtype=torch.int64) if use_tensors else all_labels }
     pass
+
     if return_function:
         return _train_on_responses_only
 
@@ -333,31 +353,30 @@ def train_on_responses_only(
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-        trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+        trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched=True, num_proc=num_proc)
     pass
     
-    if hasattr(trainer, "eval_dataset")  and trainer.eval_dataset  is not None:
+    if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
         # Eval datasets could be a dict!
-        if type(trainer.eval_dataset) is dict:
+        if isinstance(trainer.eval_dataset, dict):
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-                trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+                trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched=True, num_proc=num_proc)
         else:
             if not hasattr(trainer.eval_dataset, "map"):
                 raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-            trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+            trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched=True, num_proc=num_proc)
         pass
     pass
 
     # Edit data collator as well if not DataCollatorForSeq2Seq
     from transformers import DataCollatorForSeq2Seq
     if hasattr(trainer, "data_collator") and \
-        not isinstance(trainer.data_collator, DataCollatorForSeq2Seq):
-        trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer)
+       not isinstance(trainer.data_collator, DataCollatorForSeq2Seq):
+        trainer.data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer)
 
-    # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
-    from .training_utils import fix_zero_training_loss
+    from unsloth_zoo.training_utils import fix_zero_training_loss
     fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
     return trainer
 pass
