@@ -376,7 +376,7 @@ def train_on_responses_only(
        not isinstance(trainer.data_collator, DataCollatorForSeq2Seq):
         trainer.data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer)
 
-    from unsloth_zoo.training_utils import fix_zero_training_loss
+    from .training_utils import fix_zero_training_loss
     fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
     return trainer
 pass
