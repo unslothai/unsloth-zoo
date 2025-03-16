@@ -549,19 +549,17 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     new_model = create_empty_causal_lm(config, dtype)
     quantization_config = getattr(config, "quantization_config", {})
     kwargs = dict()
+    compute_dtype = dtype  # Do not use config file's dtype!
+
     if quantization_config != {} or bnb_config:
         # Get quantization_config flags
         if quantization_config:
-            compute_dtype = _get_dtype(quantization_config["bnb_4bit_compute_dtype"])
-            compute_dtype = dtype  # Do not use config file's dtype!
             kwargs["compress_statistics"] = quantization_config["bnb_4bit_use_double_quant"]
             kwargs["quant_type"] = quantization_config["bnb_4bit_quant_type"]
             kwargs["quant_storage"] = _get_dtype(quantization_config["bnb_4bit_quant_storage"])
 
         # Get bnb_config flags
         elif bnb_config:
-            compute_dtype = _get_dtype(bnb_config.bnb_4bit_compute_dtype)
-            compute_dtype = dtype  # Do not use config file's dtype!
             kwargs["compress_statistics"] = bnb_config.bnb_4bit_use_double_quant
             kwargs["quant_type"] = bnb_config.bnb_4bit_quant_type
             kwargs["quant_storage"] = _get_dtype(bnb_config.bnb_4bit_quant_storage)
