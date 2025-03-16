@@ -542,7 +542,7 @@ pass
 
 
 @torch.inference_mode
-def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config=None):
+def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
     config.update({"torch_dtype" : dtype}) # Do not use config file's dtype!
@@ -551,15 +551,15 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     kwargs = dict()
     compute_dtype = dtype  # Do not use config file's dtype!
 
-    if quantization_config != {} or bnb_config:
+    if quantization_config != {} or bnb_config is not None:
         # Get quantization_config flags
-        if quantization_config:
+        if quantization_config != {}:
             kwargs["compress_statistics"] = quantization_config["bnb_4bit_use_double_quant"]
             kwargs["quant_type"] = quantization_config["bnb_4bit_quant_type"]
             kwargs["quant_storage"] = _get_dtype(quantization_config["bnb_4bit_quant_storage"])
 
         # Get bnb_config flags
-        elif bnb_config:
+        elif bnb_config is not None:
             kwargs["compress_statistics"] = bnb_config.bnb_4bit_use_double_quant
             kwargs["quant_type"] = bnb_config.bnb_4bit_quant_type
             kwargs["quant_storage"] = _get_dtype(bnb_config.bnb_4bit_quant_storage)
