@@ -27,6 +27,7 @@ import importlib
 import importlib.util
 import numpy as np
 import os
+from pathlib import Path
 import torch
 import subprocess
 import types
@@ -53,7 +54,7 @@ global COMBINED_UNSLOTH_NAME
 COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
 
 global UNSLOTH_COMPILE_LOCATION
-UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
+UNSLOTH_COMPILE_LOCATION = os.path.join(Path.home(), "unsloth_compiled_cache")
 
 global UNSLOTH_COMPILE_USE_TEMP
 UNSLOTH_COMPILE_USE_TEMP = False
