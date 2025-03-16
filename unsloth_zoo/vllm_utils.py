@@ -556,7 +556,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16)
         kwargs["compress_statistics"] = quantization_config["bnb_4bit_use_double_quant"]
         kwargs["quant_type"] = quantization_config["bnb_4bit_quant_type"]
         kwargs["quant_storage"] = _get_dtype(quantization_config["bnb_4bit_quant_storage"])
-    pass
+    else:
+        compute_dtype = dtype
 
     from bitsandbytes.nn.modules import Linear4bit, Params4bit
     from torch.nn.modules import Linear
