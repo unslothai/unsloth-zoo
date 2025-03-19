@@ -208,7 +208,8 @@ def requires_grad_for_gradient_checkpointing(model):
                 raise RuntimeError("Unsloth: Failed to make input require gradients!")
                 # print(f"  WARNING: Empty list input to {module.__class__.__name__}!") # 
                 # return
-            input[0].requires_grad_(True)
+            if torch.is_floating_point(input[0]):
+                input[0].requires_grad_(True)
         else:
             raise RuntimeError("Unsloth: Failed to make input require gradients!")
     pass
@@ -247,6 +248,10 @@ def requires_grad_for_gradient_checkpointing(model):
             if f"in self.{module_list}:" in forward:
                 final_where = j
                 break
+            elif re.search(r"for [^\s]{3,} in self\." + module_list, forward) is not None:
+                # Might have failed finding self.layers: like self.layers[...]:
+                final_where = j
+                break
             pass
         pass
     pass
@@ -263,10 +268,19 @@ def requires_grad_for_gradient_checkpointing(model):
         module.register_forward_hook(requires_grad_post_hook)
         return
     pass
-    
+
     module_name = "model." + ".".join(name_components[:final_where])
-    print(f"Unsloth: Making `{module_name}` require gradients")
     module = eval(module_name)
+
+    if hasattr(module, "config") and module.config.__class__.__name__ == "CLIPVisionConfig":
+        # CLIP - backtrack to get_input_embeddings since requires_grad fails!
+        old_module = model
+        for module_name, module in model.named_modules():
+            if not hasattr(module, "get_input_embeddings"): break
+            old_module = module
+        module = old_module
+    pass
+    print(f"Unsloth: Making `{module_name}` require gradients")
 
     still_need_patching = True
     # Check if input_embeddings exists

@@ -22,6 +22,7 @@ import torch
 import inspect
 import os
 import numpy as np
+from typing import Union, Callable, Optional, List, Dict
 
 RL_REPLACEMENTS = dict()
 
@@ -77,9 +78,9 @@ def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages)
     n_mask_per_reward = mask.sum(1)
 
     # See https://github.com/huggingface/trl/pull/2881
-    # loss_per_reward = (loss_i * mask).sum(1) / n_mask_per_reward
-    # loss = loss_per_reward.mean()
-    loss = (loss_i * mask).sum() / mask.sum()
+    loss_per_reward = (loss_i * mask).sum(1) / n_mask_per_reward
+    loss = loss_per_reward.mean()
+    # loss = (loss_i * mask).sum() / mask.sum()
     
     # Get metrics as well which are folded
     with torch.inference_mode():
@@ -89,11 +90,15 @@ def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages)
     pass
     return loss, completion_length, mean_kl
 pass
-# grpo_compute_loss = torch.compile(_grpo_compute_loss,
-#     dynamic = True, fullgraph = True, options = torch_compile_options,
-# )
-RL_REPLACEMENTS["grpo_compute_loss"] = grpo_compute_loss
-
+RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
+RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
+    f"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
+    f"{inspect.getsource(grpo_compute_loss)}"
+RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
+    RL_REPLACEMENTS["grpo_compute_loss_slow"].replace(
+        "def grpo_compute_loss",
+        "def grpo_compute_loss_slow",
+)
 
 # Unsloth's memory efficient GRPO implementation
 class UnslothEfficientGRPO(torch.autograd.Function):
@@ -137,7 +142,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             fullgraph = True,
             options = torch_compile_options,
         )
-        
+
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
         new_hidden_states  = torch.chunk(_new_hidden_states, chunks = n_chunks, dim = 0)
         old_hidden_states  = torch.chunk(_old_hidden_states, chunks = n_chunks, dim = 0)
@@ -234,6 +239,9 @@ def grpo_accumulated_loss(
     pass
 pass
 RL_REPLACEMENTS["grpo_accumulated_loss"] = grpo_accumulated_loss
+
+from .dataset_utils import sft_prepare_dataset
+RL_REPLACEMENTS["sft_prepare_dataset"] = sft_prepare_dataset
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
