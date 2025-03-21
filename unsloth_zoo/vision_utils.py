@@ -31,6 +31,7 @@
 __all__ = [
     "process_vision_info",
     "UnslothVisionDataCollator",
+    "UnslothOptionalImageSampler",
 ]
 
 global IMAGE_TOKENS
@@ -55,12 +56,13 @@ IMAGE_TOKENS = [
 ]
 
 import torch
+from torch.utils.data import Sampler, Dataset
 from PIL import Image
 import base64
 from io import BytesIO
 import math
 import requests
-from typing import Union, Tuple
+from typing import Union, Tuple, List, Optional
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
 MAX_PIXELS = 16384 * 28 * 28
@@ -256,6 +258,40 @@ import PIL.Image
 LANCZOS = PIL.Image.Resampling.LANCZOS
 from .dataset_utils import train_on_responses_only as _train_on_responses_only
 
+def get_message_and_validate(example):
+    if "messages" in example:
+        messages = example["messages"]
+    elif "conversations" in example:
+        messages = example["conversations"]
+    else:
+        messages = example
+
+    # Check if data format is correct for VLMs!
+    if len(messages) != 0:
+        message = messages[0]
+        assert(type(message) is dict)
+        if "role" not in message and "content" not in message:
+            raise TypeError(
+                "Unsloth: Failed to use vision data collator!\n"\
+                "Maybe use `standardize_data_formats` first!"
+            )
+        content = message["content"]
+        if type(content) is str:
+            message["content"] = [{"type" : "text", "text" : content}]
+        elif type(content) is list or type(content) is tuple:
+            part = content[0]
+            assert("type" in part)
+        else:
+            raise TypeError(
+                "Unsloth: Failed to use vision data collator!\n"\
+                "Your messages must be a like:\n"\
+                "[{'role':'user', 'content':[{'type':'text', 'text':'Hello!'}]}]"
+            )
+        pass
+    pass
+    return messages
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = \
@@ -348,36 +384,7 @@ class UnslothVisionDataCollator:
             examples = [self.formatting_func(example) for example in examples]
 
         for example in examples:
-            if "messages" in example:
-                messages = example["messages"]
-            elif "conversations" in example:
-                messages = example["conversations"]
-            else:
-                messages = example
-
-            # Check if data format is correct for VLMs!
-            if len(messages) != 0:
-                message = messages[0]
-                assert(type(message) is dict)
-                if "role" not in message and "content" not in message:
-                    raise TypeError(
-                        "Unsloth: Failed to use vision data collator!\n"\
-                        "Maybe use `standardize_data_formats` first!"
-                    )
-                content = message["content"]
-                if type(content) is str:
-                    message["content"] = [{"type" : "text", "text" : content}]
-                elif type(content) is list or type(content) is tuple:
-                    part = content[0]
-                    assert("type" in part)
-                else:
-                    raise TypeError(
-                        "Unsloth: Failed to use vision data collator!\n"\
-                        "Your messages must be a like:\n"\
-                        "[{'role':'user', 'content':[{'type':'text', 'text':'Hello!'}]}]"
-                    )
-                pass
-            pass
+            messages = get_message_and_validate(example)
             message = self.processor.apply_chat_template(
                 messages,
                 tokenize = False,
@@ -388,51 +395,74 @@ class UnslothVisionDataCollator:
             if "images" in example:
                 image = [example["images"][0]]
             else:
-                image, video = process_vision_info(messages)
-                if image is None: image = []
+                try:
+                    image, video = process_vision_info(messages)
+                except:
+                    image, video = None, None
             pass
             # Resize images
             image_size = self.image_size
 
-            if image_size is not None:
-                for i, img in enumerate(image):
-                    if type(image_size) is tuple:
-                        image[i] = img.resize(image_size, LANCZOS)
-                    elif img.size[0] > image_size:
-                        if hasattr(img, "resize"):
-                            wpercent = image_size / img.size[0]
-                            hsize = int(img.size[1] * wpercent)
-                            image[i] = img.resize((image_size, hsize), LANCZOS)
+            if image is not None:
+                if image_size is not None:
+                    for i, img in enumerate(image):
+                        if type(image_size) is tuple:
+                            image[i] = img.resize(image_size, LANCZOS)
+                        elif img.size[0] > image_size:
+                            if hasattr(img, "resize"):
+                                wpercent = image_size / img.size[0]
+                                hsize = int(img.size[1] * wpercent)
+                                image[i] = img.resize((image_size, hsize), LANCZOS)
+                pass
             pass
             images.append(image)
         pass
 
+        images_none = all(image is None for image in images)
         # Tokenize the texts and process the images
-        batch = self.processor(
-            text    = texts,
-            images  = images,
-            padding = True,
-            truncation = self.truncation,
-            max_length = self.max_seq_length,
-            return_tensors = "pt",
-            add_special_tokens = False, # Stop double BOS
-        )
-        # Cannot remove due to bidirectional attention fro Gemma 3!
-        # batch.pop("token_type_ids", None)
+        if images_none:
+            batch = self.processor(
+                text    = texts,
+                padding = True,
+                truncation = self.truncation,
+                max_length = self.max_seq_length,
+                return_tensors = "pt",
+                add_special_tokens = False, # Stop double BOS
+            )
+        else:
+            try:
+                batch = self.processor(
+                    text    = texts,
+                    images  = images,
+                    padding = True,
+                    # truncation set to True and max_length set seems to cause feature token mismatch errors
+                    # truncation = self.truncation,
+                    max_length = self.max_seq_length,
+                    return_tensors = "pt",
+                    add_special_tokens = False, # Stop double BOS
+                )
+                # Cannot remove due to bidirectional attention fro Gemma 3!
+                # batch.pop("token_type_ids", None)
+            except Exception as e:
+                print("Unsloth: Some images are None, but not all! Use set group_mixed_image_text to `True`")
+                raise e
+
 
         # Pixtral accepts multiple images, so we have to cast it individually
-        pixel_values = batch["pixel_values"]
-        if type(pixel_values) is list:
-            for j, pixel_value_j in enumerate(pixel_values):
-                if type(pixel_value_j) is list:
-                    for k, pixel_value_k in enumerate(pixel_value_j):
-                        pixel_value_j[k] = pixel_value_k.to(self.dtype)
-                else:
-                    pixel_values[j] = pixel_value_j.to(self.dtype)
+        if not images_none:
+            pixel_values = batch["pixel_values"]
+            if type(pixel_values) is list:
+                for j, pixel_value_j in enumerate(pixel_values):
+                    if type(pixel_value_j) is list:
+                        for k, pixel_value_k in enumerate(pixel_value_j):
+                            pixel_value_j[k] = pixel_value_k.to(self.dtype)
+                    else:
+                        pixel_values[j] = pixel_value_j.to(self.dtype)
+                pass
+                batch["pixel_values"] = pixel_values
+            else:
+                batch["pixel_values"] = batch["pixel_values"].to(self.dtype)
             pass
-            batch["pixel_values"] = pixel_values
-        else:
-            batch["pixel_values"] = batch["pixel_values"].to(self.dtype)
         pass
 
         # Mask image tokens and pad tokens
@@ -445,3 +475,109 @@ class UnslothVisionDataCollator:
         return batch
     pass
 pass
+
+
+class UnslothOptionalImageSampler(Sampler[List[int]]):
+    """
+    A custom batch sampler that:
+      - Splits the dataset into two groups (image vs. no-image),
+      - Chunks each group into 'homogeneous' batches,
+      - Iterates over these batches in a random order *without replacement*,
+        where the probability of picking a batch from either group is
+        proportional to the *remaining number of examples* in that group.
+
+    By default we drop the last batch for images and no images.
+
+    Args:
+        dataset (Dataset): The dataset to sample from.
+        batch_size (int): The number of examples in each batch.
+        seed (int): Random seed for reproducibility.
+    """
+    def __init__(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        seed: Optional[int] = None,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        if seed is None:
+            self.generator = None
+        else:
+            self.generator = torch.Generator()
+            self.generator.manual_seed(seed)
+
+        # Split dataset indices into two groups
+        self.image_indices = []
+        self.no_image_indices = []
+        for idx in range(len(dataset)):
+            if self._has_image(dataset[idx]):
+                self.image_indices.append(idx)
+            else:
+                self.no_image_indices.append(idx)
+
+        # Precompute total examples in these batches (for ratio-based picking)
+        self.image_examples_left = self._get_index_realized_len(self.image_indices)
+        self.no_image_examples_left = self._get_index_realized_len(self.no_image_indices)
+
+    def _get_index_realized_len(self, indices):
+        return (len(indices) // self.batch_size) * self.batch_size
+
+    def _get_index_num_batches(self, indices):
+        return len(indices) // self.batch_size
+
+    def _has_image(self, example) -> bool:
+        """
+        Determine if an example is in the 'image' group or 'no_image' group.
+        Replace with your real logic.
+        """
+        try:
+            messages = get_message_and_validate(example)
+            if "images" in example:
+                return True
+            else:
+                image_info, video_info = process_vision_info(messages)
+                return image_info is not None or video_info is not None
+        except:
+            return False
+
+    def __len__(self) -> int:
+        """Number of total samples while dropping the last batch for images and no images."""
+        return self._get_index_realized_len(self.image_indices) + self._get_index_realized_len(self.no_image_indices)
+
+    def __iter__(self):
+        """
+        Yield one homogeneous batch (list of indices) at a time, chosen with
+        probability proportional to how many examples remain in each group.
+        """
+        if self.generator is None:
+            seed = int(torch.empty((), dtype=torch.int64).random_().item())
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+        else:
+            generator = self.generator
+
+
+        num_image_batches = self._get_index_num_batches(self.image_indices)
+        num_no_image_batches = self._get_index_num_batches(self.no_image_indices)
+
+        initial_picker_indices = [0]*num_no_image_batches + [1]*num_image_batches
+        initial_picker = torch.randperm(len(initial_picker_indices), generator=generator)
+        initial_picker_indices = [initial_picker_indices[i] for i in initial_picker]
+        image_order = torch.randperm(self._get_index_realized_len(self.image_indices), generator=generator)
+        no_image_order = torch.randperm(self._get_index_realized_len(self.no_image_indices), generator=generator)
+
+        image_idx = 0
+        no_image_idx = 0
+
+        for i in initial_picker_indices:
+            if i == 0:
+                for _ in range(self.batch_size):
+                    i_idx = self.no_image_indices[no_image_order[no_image_idx]]
+                    yield i_idx
+                    no_image_idx += 1
+            else:
+                for _ in range(self.batch_size):
+                    i_idx = self.image_indices[image_order[image_idx]]
+                    yield i_idx
+                    image_idx += 1
