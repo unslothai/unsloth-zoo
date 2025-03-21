@@ -61,8 +61,10 @@ except:
 pass
 from transformers.modeling_utils import PushToHubMixin
 import json
+import os
 from pathlib import Path
 import tempfile
+from peft import PeftModelForCausalLM
 
 
 def create_huggingface_repo(
@@ -324,6 +326,10 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
     filename = os.path.join(save_directory, filename)
     tensors = OrderedDict()
     count = 0
+    import psutil
+    import tempfile
+    import pickle
+    limit = 700 * 1024 * 1024 # 700MB
     with safe_open(filename, framework = "pt", device = "cpu") as file:
         for key in file.keys():
             W = file.get_tensor(key)
@@ -331,7 +337,12 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
             if lora_stats is not None:
                 count += 1
                 W = _merge_lora(W, lora_stats, key)
-                W = W.to(device = "cpu", dtype = output_dtype, non_blocking = True)
+                if psutil.virtual_memory().available <= limit:
+                    filename = tempfile.NamedTemporaryFile(suffix = ".pt")
+                    torch.save(W.to(output_dtype), filename, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL)
+                    W = torch.load(filename, map_location = "cpu", mmap = True, weights_only = False)
+                else:
+                    W = W.to(device = "cpu", dtype = output_dtype, non_blocking = True)
             pass
             tensors[key] = W
         pass
@@ -497,11 +508,11 @@ def _remove_quantization_config(config_path: Path):
         # Remove the quantization_config field
         del config["quantization_config"]
     else:
-        # No-op
         return
     # Overwrite the config file
     with open(config_path, "w") as f:
         json.dump(config, f, indent = 4)
+    pass
 pass
 
 
@@ -517,10 +528,12 @@ def merge_and_overwrite_lora(
     output_dtype         = None,
     low_disk_space_usage = False,
     use_temp_file        = False,
+    cleanup_temp_file    = True,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Directly downloads 16bit original weights and merges LoRA
-    inner_model = model.base_model.model if hasattr(model, "base_model") else model
+    inner_model = model.base_model.model if isinstance(model, PeftModelForCausalLM) else model
+    inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
 
     try:
         model_name = get_model_name(model.config._name_or_path, load_in_4bit = False)
@@ -528,7 +541,13 @@ def merge_and_overwrite_lora(
         model_name = model.config._name_or_path
 
     # Find repository's max shard size and total size of everything
-    file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+    try:
+        file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+    except:
+        original_model_id = get_original_model_id(model_name)
+        model_name = original_model_id
+        file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+
     safetensors_list = []
     max_size_in_bytes = 0
     total_size_in_bytes = 0
@@ -618,6 +637,7 @@ def merge_and_overwrite_lora(
             lora_weights = lora_weights,
             output_dtype = output_dtype,
         )
+        torch.cuda.empty_cache()
         if low_disk_space_usage and push_to_hub:
             upload_items(filename)
             os.remove(os.path.join(save_directory, filename)) # Remove to conserve disk space
@@ -636,6 +656,7 @@ def merge_and_overwrite_lora(
         try: temp_file.cleanup()
         except: pass
     pass
+    return save_directory
 pass
 
 
@@ -763,7 +784,8 @@ def merge_and_dequantize_lora(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantizes model to 16bit weights and merges LoRA
-    inner_model = model.base_model.model if hasattr(model, "base_model") else model
+    inner_model = model.base_model.model if isinstance(model, PeftModelForCausalLM) else model
+    inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
 
     (
         username, repo_id, hf_api, token,
@@ -893,6 +915,30 @@ def merge_and_dequantize_lora(
         except: pass
     pass
 pass
+
+def get_original_model_id(local_path: str):
+    import json
+    import os
+    
+    config_path = os.path.join(local_path, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config = json.load(f)
+            
+        # Check for _name_or_path that's not a local path
+        # When we load using AutoConfig, the _name_or_path changed into the local path instead
+        if "_name_or_path" in config:
+            return config["_name_or_path"]
+        
+    config_path = os.path.join(local_path, "adapter_config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config = json.load(f)
+            
+        if "base_model_name_or_path" in config:
+            return config["base_model_name_or_path"]
+    
+    return None
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
