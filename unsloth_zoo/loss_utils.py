@@ -223,8 +223,10 @@ pass
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
-def _unsloth_get_batch_samples(self, epoch_iterator, num_batches):
+def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, *args):
     # All Unsloth Zoo code licensed under LGPLv3
+    if args:
+        print(f"WARNING: _unsloth_get_batch_samples() has unexpected arguments: {args}")
     batch_samples = []
     num_items_in_batch = None
 
