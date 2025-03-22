@@ -1000,7 +1000,7 @@ def apply_fused_lm_head(forward):
 
         cross_entropy_replacement = cross_entropy_replacement\
             .replace(
-                "$KWARGS$", 
+                "$KWARGS$",
                 "locals().get('loss_kwargs', {}) or locals().get('kwargs', {})"
             )
 
@@ -1179,7 +1179,7 @@ def patch_gradient_checkpointing(module, source):
         .replace("LAYER", layer).replace("MODULELIST_ITEM", modulelist_item)\
         .replace("ARGS", args).replace("$", spaces)
     forward = forward.replace(forward[span[0] : span[1]], replacer)
-    
+
     # Also fix init
     spaces = init.find("def")
     init = init + "\n" + (spaces + 4) * " " + "self.gradient_checkpointing = False\n\n"
@@ -1381,10 +1381,10 @@ def patch_gradient_accumulation(modeling_file, module):
 
     functions = dir(modeling_file)
     module = eval(f"modeling_file.{module}")
-    try: 
+    try:
         forward = module.forward
         source = inspect.getsource(forward)
-    except: 
+    except:
         return None
     has_kwargs = tuple(inspect.signature(forward).parameters.values())[-1].kind == inspect._VAR_KEYWORD
     if has_kwargs: return None
@@ -1792,7 +1792,7 @@ def unsloth_compile_transformers(
             # Disable if torch < 2.5 or V100s 7.0 (Tesla T4 7.5 works) or old Triton < 3
             if OLD_CUDA_ARCH_VERSION or OLD_TORCH_VERSION or OLD_TRITON_VERSION:
                 continue
-            
+
             module_class = eval(f"modeling_file.{module}")
             if hasattr(module_class, "forward") and issubclass(module_class, GenerationMixin):
                 try:
@@ -1863,6 +1863,16 @@ def unsloth_compile_transformers(
     except:
         raise RuntimeError('Unsloth: Unsuccessfully patched inner_training_loop')
     pass
+    try:
+        if Trainer._get_train_sampler.__name__ != "_unsloth_get_train_sampler":
+            _get_train_sampler_code = inspect.getsource(Trainer._get_train_sampler)
+            Trainer._original_get_train_sampler = _get_train_sampler_code
+        else:
+            _get_train_sampler_code = Trainer._original_get_train_sampler
+        pass
+    except:
+        raise RuntimeError('Unsloth: Unsuccessfully patched _get_train_sampler')
+    pass
 
     import transformers.trainer
     items_in_trainer = dir(transformers.trainer)
@@ -1920,6 +1930,35 @@ def unsloth_compile_transformers(
     )
     exec(inner_training_loop, globals())
     Trainer._inner_training_loop = _fast_inner_training_loop
+
+    start_sampler = re.search(r'def _get_train_sampler\(self\) -> Optional\[torch.utils.data.Sampler\]:', _get_train_sampler_code).span(0)[0]
+    end_sampler = len(_get_train_sampler_code)
+
+    original_sampler_def = _get_train_sampler_code[start_sampler:end_sampler]
+
+    spaces_match_sampler = re.search(r'\n([\s\t]+)', original_sampler_def)
+    if spaces_match_sampler:
+        spaces = spaces_match_sampler.group(0)[1:]
+    else:
+        spaces = "    "
+    pass
+    _get_train_sampler_code_insert = """def _get_train_sampler(self):
+    from unsloth_zoo.vision_utils import UnslothOptionalImageSampler
+    if self.args.group_mixed_image_text:
+        return UnslothOptionalImageSampler(self.train_dataset, self._train_batch_size, seed=self.args.data_seed or self.args.seed)
+
+"""
+    sampler_lines = _get_train_sampler_code_insert.split('\n')
+    sampler_lines = [spaces + x for x in sampler_lines]
+    sampler_lines = [sampler_lines[0]] + [spaces + l[8:] for l in sampler_lines[1:]]
+    _get_train_sampler_code = "\n".join(sampler_lines)
+
+    _get_train_sampler_code = _get_train_sampler_code.replace('def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:\n)', _get_train_sampler_code)
+    _get_train_sampler_code = '\n'.join([l[8:] if l.startswith(' ' * 8) else l for l in _get_train_sampler_code.split('\n')])
+
+    exec(_get_train_sampler_code, globals())
+    Trainer._get_train_sampler = _get_train_sampler
+    Trainer._get_train_sampler.__name__ = "_unsloth_get_train_sampler"
 
     # All other functions
     if compile_function_calls:
