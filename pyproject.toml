@@ -43,6 +43,7 @@ dependencies = [
     "cut_cross_entropy",
     "pillow",
     "regex",
+    "unsloth",
 ]
 
 [tool.setuptools.dynamic]
@@ -58,3 +59,8 @@ exclude = ["images*"]
 homepage = "http://www.unsloth.ai"
 documentation = "https://github.com/unslothai/unsloth"
 repository = "https://github.com/unslothai/unsloth"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.5",
+]
