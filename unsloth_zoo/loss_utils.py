@@ -233,37 +233,44 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches):
     model_name = m.__class__.__name__
     global ALLOWED_NUM_ITEMS_IN_BATCH
     if model_name not in ALLOWED_NUM_ITEMS_IN_BATCH:
-
         has_kwargs = False
         is_vlm = False
-        while True:
-            # Stop when we encounter the name as ForConditionalGeneration or ForCausalLM
-            if not hasattr(m, "forward"): break
-            if not hasattr(m.forward, "__qualname__"): break
-            forward = m.forward
 
-            # Check double wrapped - for full finetuning
-            if hasattr(forward, "__wrapped__"):
-                __wrapped__ = forward.__wrapped__
-                if hasattr(__wrapped__, "__wrapped__"):
-                    __wrapped__ = __wrapped__.__wrapped__
-                    if hasattr(__wrapped__, "__qualname__"):
-                        forward = __wrapped__
-            pass
-            name = forward.__qualname__
-            if "ForConditionalGeneration" in name or "VisionText2Text" in name:
-                is_vlm = True
-            if is_vlm or "CausalLM" in name or "_fast_forward" in name:
-                signature = inspect.signature(forward).parameters.values()
-                has_kwargs = tuple(signature)[-1].kind == inspect._VAR_KEYWORD
-                break
-            if not hasattr(m, "model"): break
-            m = m.model
-        pass
+        # Special handling for Qwen2 models which don't have nested .model
+        if model_name.startswith("Qwen2"):
+            forward = m.forward
+            if hasattr(forward, "__qualname__"):
+                name = forward.__qualname__
+                if "CausalLM" in name or "_fast_forward" in name:
+                    signature = inspect.signature(forward).parameters.values()
+                    has_kwargs = tuple(signature)[-1].kind == inspect._VAR_KEYWORD
+        else:
+            # Regular model traversal for nested architectures
+            while True:
+                if not hasattr(m, "forward"): break
+                if not hasattr(m.forward, "__qualname__"): break
+                forward = m.forward
+
+                # Check double wrapped - for full finetuning
+                if hasattr(forward, "__wrapped__"):
+                    __wrapped__ = forward.__wrapped__
+                    if hasattr(__wrapped__, "__wrapped__"):
+                        __wrapped__ = __wrapped__.__wrapped__
+                        if hasattr(__wrapped__, "__qualname__"):
+                            forward = __wrapped__
+                name = forward.__qualname__
+                if "ForConditionalGeneration" in name or "VisionText2Text" in name:
+                    is_vlm = True
+                if is_vlm or "CausalLM" in name or "_fast_forward" in name:
+                    signature = inspect.signature(forward).parameters.values()
+                    has_kwargs = tuple(signature)[-1].kind == inspect._VAR_KEYWORD
+                    break
+                if not hasattr(m, "model"): break
+                m = m.model
+
         ALLOWED_NUM_ITEMS_IN_BATCH[model_name] = (has_kwargs, is_vlm)
     else:
         has_kwargs, is_vlm = ALLOWED_NUM_ITEMS_IN_BATCH[model_name]
-    pass
 
     # Iterate to find all batches
     for _ in range(num_batches):
