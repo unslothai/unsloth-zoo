@@ -370,6 +370,7 @@ def standardize_data_formats(
     aliases_for_system    = ["system",],
     aliases_for_user      = ["user", "human", "input",],
     aliases_for_assistant = ["gpt", "assistant", "output",],
+    num_proc              = None,
 ):
     """
     Standardizes ShareGPT and other formats to user/assistant Hugging Face format.
@@ -456,14 +457,20 @@ def standardize_data_formats(
     pass
 
     from multiprocessing import cpu_count
-    num_proc = cpu_count()
+    if num_proc is None or not isinstance(num_proc, int):
+        num_proc = cpu_count()
 
-    return dataset.map(
-        _standardize_dataset,
-        batched = True,
-        desc = "Unsloth: Standardizing formats",
-        num_proc = num_proc,
-    )
+    try:
+        return dataset.map(
+            _standardize_dataset,
+            batched=True,
+            desc="Unsloth: Standardizing formats",
+            num_proc=num_proc,
+        )
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Unsloth: Process crashed: {str(e)}\nTry reducing num_proc (currently {num_proc}) to a lower value."
+        ) from e
 pass
 
 
