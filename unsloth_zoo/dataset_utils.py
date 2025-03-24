@@ -531,14 +531,14 @@ def sft_prepare_dataset(
     if do_tokenize:
         # Check double BOS tokens
         if do_formatting_func:
-            test_text = formatting_func(dataset[0])
+            test_text = formatting_func(next(iter(dataset))
             if not isinstance(test_text, list):
                 raise ValueError(
                     "Unsloth: The `formatting_func` should return a list of processed strings."
                 )
             test_text = test_text[0]
         else:
-            test_text = dataset[0][dataset_text_field]
+            test_text = next(iter(dataset)[dataset_text_field]
 
         # Get chat template
         chat_template = getattr(processing_class, 'chat_template', '')
