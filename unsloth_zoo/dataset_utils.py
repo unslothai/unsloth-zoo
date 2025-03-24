@@ -570,7 +570,7 @@ def sft_prepare_dataset(
             )
         pass
 
-        if not isinstanceof(dataset, IterableDataset):
+        if not isinstance(dataset, IterableDataset):
             map_kwargs["num_proc"] = getattr(args, "dataset_num_proc", 2)
             
         if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
