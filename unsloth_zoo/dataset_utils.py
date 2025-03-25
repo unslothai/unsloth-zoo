@@ -334,7 +334,10 @@ def train_on_responses_only(
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-        trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+        if instanceof(trainer.train_dataset, IterableDataset):
+            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batch_size = trainer.dataset._ex_iterable.batch_size, batched = True)
+        else:
+            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
     pass
     
     if hasattr(trainer, "eval_dataset")  and trainer.eval_dataset  is not None:
@@ -343,11 +346,17 @@ def train_on_responses_only(
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-                trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+                if instanceof(trainer.eval_dataset, IterableDataset):
+                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = trainer.dataset._ex_iterable.batch_size, batched = True)
+                else:
+                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = num_proc)
         else:
             if not hasattr(trainer.eval_dataset, "map"):
                 raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-            trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+            if instanceof(trainer.eval_dataset, IterableDataset):
+                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batch_size = trainer.dataset._ex_iterable.batch_size, batched = True)
+            else:
+                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
         pass
     pass
 
