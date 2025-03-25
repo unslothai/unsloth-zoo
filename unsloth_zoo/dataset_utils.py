@@ -572,6 +572,8 @@ def sft_prepare_dataset(
 
         if not isinstance(dataset, IterableDataset):
             map_kwargs["num_proc"] = getattr(args, "dataset_num_proc", 2)
+        else:
+            map_kwargs["batch_size"] = dataset.ex_iterable.batch_size
             
         if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
         dataset = dataset.map(_tokenize, batched = True, **map_kwargs)
