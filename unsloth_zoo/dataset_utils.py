@@ -334,7 +334,7 @@ def train_on_responses_only(
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-        if instanceof(trainer.train_dataset, IterableDataset):
+        if isinstance(trainer.train_dataset, IterableDataset):
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batch_size = trainer.dataset._ex_iterable.batch_size, batched = True)
         else:
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
