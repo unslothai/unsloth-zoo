@@ -320,17 +320,17 @@ pass
 
 
 @torch.inference_mode
-def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype,):
-    # All Unsloth Zoo code licensed under LGPLv3
-    # Merges LoRA and overwrites the safetensors file it was merged to
-    filename = os.path.join(save_directory, filename)
+def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype, local_file_path=None):
+    # Merges LoRA weights and overwrites the safetensors file
+    # If local_file_path is provided, use it directly instead of save_directory/filename
+    file_to_process = local_file_path if local_file_path else os.path.join(save_directory, filename)
     tensors = OrderedDict()
     count = 0
     import psutil
     import tempfile
     import pickle
-    limit = 700 * 1024 * 1024 # 700MB
-    with safe_open(filename, framework = "pt", device = "cpu") as file:
+    limit = 700 * 1024 * 1024  # 700MB memory limit
+    with safe_open(file_to_process, framework="pt", device="cpu") as file:
         for key in file.keys():
             W = file.get_tensor(key)
             lora_stats = lora_weights.get(key[:-len(".weight")], None)
@@ -338,17 +338,18 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                 count += 1
                 W = _merge_lora(W, lora_stats, key)
                 if psutil.virtual_memory().available <= limit:
-                    filename = tempfile.NamedTemporaryFile(suffix = ".pt")
-                    torch.save(W.to(output_dtype), filename, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL)
-                    W = torch.load(filename, map_location = "cpu", mmap = True, weights_only = False)
+                    temp_file = tempfile.NamedTemporaryFile(suffix=".pt")
+                    torch.save(W.to(output_dtype), temp_file.name, pickle_module=pickle,
+                               pickle_protocol=pickle.HIGHEST_PROTOCOL)
+                    W = torch.load(temp_file.name, map_location="cpu", mmap=True, weights_only=False)
                 else:
-                    W = W.to(device = "cpu", dtype = output_dtype, non_blocking = True)
-            pass
+                    W = W.to(device="cpu", dtype=output_dtype, non_blocking=True)
             tensors[key] = W
-        pass
-    pass
-    save_file(tensors, filename, metadata = {"format": "pt"})
+    # Save the merged weights back to the target file (only if not using local_file_path directly)
+    save_file(tensors, os.path.join(save_directory, filename), metadata={"format": "pt"})
     return count
+
+
 pass
 
 
@@ -540,13 +541,28 @@ def merge_and_overwrite_lora(
     except:
         model_name = model.config._name_or_path
 
+    # Check if model_name is a local directory
+    is_local_dir = os.path.isdir(model_name)
+
     # Find repository's max shard size and total size of everything
-    try:
-        file_list = HfFileSystem(token = token).ls(model_name, detail = True)
-    except:
-        original_model_id = get_original_model_id(model_name)
-        model_name = original_model_id
-        file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+    # List .safetensors files
+    if is_local_dir:
+        file_list = [
+            {
+                "name": os.path.join(model_name, fname),
+                "size": os.path.getsize(os.path.join(model_name, fname)),
+                "type": "file"
+            }
+            for fname in os.listdir(model_name)
+            if os.path.isfile(os.path.join(model_name, fname)) and fname.endswith(".safetensors")
+        ]
+    else:
+        try:
+            file_list = HfFileSystem(token=token).ls(model_name, detail=True)
+        except:
+            original_model_id = get_original_model_id(model_name)
+            model_name = original_model_id
+            file_list = HfFileSystem(token=token).ls(model_name, detail=True)
 
     safetensors_list = []
     max_size_in_bytes = 0
@@ -606,44 +622,57 @@ def merge_and_overwrite_lora(
 
     if push_to_hub: upload_items()
 
-    safe_tensor_index_files = ["model.safetensors.index.json"] if len(safetensors_list) > 1 else []
-    if not low_disk_space_usage:
-        # Download all safetensors in 1 go!
-        print(f"Downloading safetensors for {model_name}...")
-        snapshot_download(
-            repo_id = model_name,
-            local_dir = save_directory,
-            allow_patterns = safe_tensor_index_files + safetensors_list,
-        )
-    elif safe_tensor_index_files:
-        print(f"Downloading safetensors index for {model_name}...")
-        snapshot_download(
-            repo_id = model_name,
-            local_dir = save_directory,
-            allow_patterns = ["model.safetensors.index.json"],
-        )
-    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
-        if low_disk_space_usage:
-            hf_hub_download(
-                repo_id = model_name,
-                filename = filename,
-                repo_type = "model",
-                local_dir = save_directory,
+    # Merge weights based on whether model_name is local
+    if is_local_dir:
+        for filename in ProgressBar(safetensors_list, desc="Unsloth: Merging weights into 16bit"):
+            local_file_path = os.path.join(model_name, filename)
+            n_saved_modules += _merge_and_overwrite_lora(
+                save_directory=save_directory,
+                filename=filename,
+                lora_weights=lora_weights,
+                output_dtype=output_dtype,
+                local_file_path=local_file_path  # Use local file directly
             )
+            torch.cuda.empty_cache()
+    else:
+        safe_tensor_index_files = ["model.safetensors.index.json"] if len(safetensors_list) > 1 else []
+        if not low_disk_space_usage:
+            # Download all safetensors in 1 go!
+            print(f"Downloading safetensors for {model_name}...")
+            snapshot_download(
+                repo_id=model_name,
+                local_dir=save_directory,
+                allow_patterns=safe_tensor_index_files + safetensors_list,
+            )
+        elif safe_tensor_index_files:
+            print(f"Downloading safetensors index for {model_name}...")
+            snapshot_download(
+                repo_id=model_name,
+                local_dir=save_directory,
+                allow_patterns=["model.safetensors.index.json"],
+            )
+        for filename in ProgressBar(safetensors_list, desc="Unsloth: Merging weights into 16bit"):
+            if low_disk_space_usage:
+                hf_hub_download(
+                    repo_id=model_name,
+                    filename=filename,
+                    repo_type="model",
+                    local_dir=save_directory,
+                )
+            pass
+            n_saved_modules += _merge_and_overwrite_lora(
+                save_directory=save_directory,
+                filename=filename,
+                lora_weights=lora_weights,
+                output_dtype=output_dtype,
+            )
+            torch.cuda.empty_cache()
+            if low_disk_space_usage and push_to_hub:
+                upload_items(filename)
+                os.remove(os.path.join(save_directory, filename))  # Remove to conserve disk space
+            pass
         pass
-        n_saved_modules += _merge_and_overwrite_lora(
-            save_directory = save_directory,
-            filename = filename,
-            lora_weights = lora_weights,
-            output_dtype = output_dtype,
-        )
-        torch.cuda.empty_cache()
-        if low_disk_space_usage and push_to_hub:
-            upload_items(filename)
-            os.remove(os.path.join(save_directory, filename)) # Remove to conserve disk space
-        pass
-    pass
-    if not low_disk_space_usage and push_to_hub: upload_items()
+        if not low_disk_space_usage and push_to_hub: upload_items()
 
     # Check for errors
     if len(lora_weights) != n_saved_modules:
