@@ -405,10 +405,10 @@ def standardize_data_formats(
     if "conversations" not in column_names:
         return dataset
 
-    convos = dataset[:10]["conversations"]
+    examples = itertools.islice(dataset, 10)
     uniques = collections.defaultdict(list)
-    for convo in convos:
-        for message in convo:
+    for example in examples:
+        for message in example["conversations"]:
             for key, value in message.items():
                 if type(value) is not str:
                     raise RuntimeError("Unsloth: Cannot standardize non text datasets!")
@@ -464,15 +464,23 @@ def standardize_data_formats(
         return { "conversations" : all_convos, }
     pass
 
-    from multiprocessing import cpu_count
-    num_proc = cpu_count()
+    if isinstance(dataset, IterableDataset):
+        return dataset.map(
+            _standardize_dataset,
+            batched = True,
+            batch_size = dataset._ex_iterable.batch_size,
+            desc = "Unsloth: Standardizing formats"
+        )
+    else:
+        from multiprocessing import cpu_count
+        num_proc = cpu_count()
 
-    return dataset.map(
-        _standardize_dataset,
-        batched = True,
-        desc = "Unsloth: Standardizing formats",
-        num_proc = num_proc,
-    )
+        return dataset.map(
+            _standardize_dataset,
+            batched = True,
+            desc = "Unsloth: Standardizing formats",
+            num_proc = num_proc,
+        )
 pass
 
 
