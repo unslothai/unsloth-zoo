@@ -231,11 +231,13 @@ def patch_model_and_tokenizer(
     if do_forced_float32:
         correct_dtype = torch.float16
         for name, module in model.named_modules():
-            if "down_proj" in name or "up_proj" in name or "gate_proj" in name:
+            if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
                 exec(f"module.to(torch.float16)")
-            if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name:
+            if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
                 exec(f"module.to(torch.float16)")
             if "lm_head" in name or "embed_tokens" in name:
+                exec(f"module.to(torch.float16)")
+            if "patch_embedding" in name:
                 exec(f"module.to(torch.float16)")
             if "norm" in name:
                 exec(f"module.to(torch.float32)")
