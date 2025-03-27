@@ -20,6 +20,7 @@ import numpy as np
 import itertools
 import datasets
 import re
+import os
 
 __all__ = [
     "mean_of_trained_tokens",
@@ -416,7 +417,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         counter = np.fromiter(itertools.chain.from_iterable(input_ids), dtype = np.int32)
         np.add.at(final_counts, counter, 1)
     pass
-    train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
+    train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens", num_proc = os.cpu_count())
 
     # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
