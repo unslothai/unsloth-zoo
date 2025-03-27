@@ -223,10 +223,8 @@ pass
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
-def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, *args):
+def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
-    if args:
-        print(f"WARNING: _unsloth_get_batch_samples() has unexpected arguments: {args}")
     batch_samples = []
     num_items_in_batch = None
 
@@ -289,12 +287,11 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, *args):
                     [((x["labels"][..., 1:] != -100) & (x["attention_mask"][..., 1:] != 0))\
                     .sum() for x in batch_samples]
                 )
-            if self.args.average_tokens_across_devices:
-                num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum().item()
-            if torch.is_tensor(num_items_in_batch):
-                num_items_in_batch = num_items_in_batch.item()
-            pass
 
+            if self.args.average_tokens_across_devices:
+                num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
+            if device is not None and torch.is_tensor(num_items_in_batch):
+                num_items_in_batch = num_items_in_batch.to(device)
         except Exception as exception:
             raise RuntimeError(exception)
     pass
