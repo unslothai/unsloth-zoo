@@ -22,6 +22,8 @@ if find_spec("unsloth") is None:
 pass
 del find_spec
 
+from unsloth import DEVICE_TYPE
+
 import os
 if not ("UNSLOTH_IS_PRESENT" in os.environ):
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
