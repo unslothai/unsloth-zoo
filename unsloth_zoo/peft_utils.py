@@ -26,7 +26,7 @@ __all__ = [
 import inspect
 import os
 import re
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
 
 import torch
