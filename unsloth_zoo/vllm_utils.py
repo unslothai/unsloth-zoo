@@ -59,7 +59,7 @@ pass
 
 def _return_nothing(*args, **kwargs): return None
 def _return_self(self, *args, **kwargs): return self
-
+def _return_self_tokenizer(self, *args, **kwargs): return self.tokenizer
 
 if importlib.util.find_spec("vllm") is not None:
 
@@ -188,9 +188,19 @@ if importlib.util.find_spec("vllm") is not None:
         vllm.transformers_utils.tokenizer.get_lora_tokenizer = _return_nothing
         vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing
         
-        import vllm.transformers_utils.tokenizer_group.tokenizer_group
-        vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer = _return_nothing
-        vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer_async = _return_nothing
+        try:
+            import vllm.transformers_utils.tokenizer_group.tokenizer_group
+            vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer = _return_nothing
+            vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer_async = _return_nothing
+        except:
+            pass
+        try:
+            # New vLLM is now a class!
+            import vllm.transformers_utils.tokenizer_group
+            vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer = _return_self_tokenizer
+            vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer_async = _return_self_tokenizer
+        except:
+            pass
     pass
 
     from .vllm_lora_request import LoRARequest as PatchedLoRARequest
@@ -822,6 +832,7 @@ def load_vllm(
     conservativeness       : float = 1.0, # For low VRAM devices, scale batches, num_seqs
     max_logprobs           : int  = 0,
     use_bitsandbytes       : bool = True,
+    return_args            : bool = False, # Just return args
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
@@ -1015,6 +1026,9 @@ def load_vllm(
             print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
         pass
     pass
+
+    # Quick exit
+    if return_args: return engine_args
 
     # Keep trying until success (2 times)
     trials = 0
