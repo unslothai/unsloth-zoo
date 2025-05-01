@@ -214,10 +214,14 @@ def grpo_accumulated_loss(
 
     with torch.amp.autocast(device_type = "cuda", dtype = mixed_dtype):
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
-            old_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
+            old_model_output = trainer.model(input_ids = input_ids, output_hidden_states = True, logits_to_keep = logits_to_keep + 1)
         pass
 
-        new_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
+        new_model_output = trainer.model(input_ids = input_ids, output_hidden_states = True, logits_to_keep = logits_to_keep + 1)
+
+        sequence_length = old_model_output.logits.shape[1]
+        old_hidden_states = old_model_output.hidden_states[-1][:,:sequence_length,:]
+        new_hidden_states = new_model_output.hidden_states[-1][:,:sequence_length,:]
         
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
             new_hidden_states, old_hidden_states, lm_head,
