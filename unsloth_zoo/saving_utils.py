@@ -209,7 +209,7 @@ pass
 
 def assert_same_keys(model, new_state_dict):
     # All Unsloth Zoo code licensed under LGPLv3
-    inner_model = model.base_model.model if hasattr(model, "base_model") else model
+    inner_model = getattr(getattr(model, "base_model", model), "model", model)
     original_keys = inner_model.state_dict().keys()
     all_original_keys = set()
     for x in original_keys:
@@ -246,7 +246,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     remove_keys = set()
     keep_keys   = set()
 
-    inner_model = model.base_model.model if hasattr(model, "base_model") else model
+    inner_model = getattr(getattr(model, "base_model", model), "model", model)
     for name, module in inner_model.named_modules():
         if name == "": continue
 
