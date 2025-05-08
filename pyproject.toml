@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Utils for Unsloth"
 readme = "README.md"
 requires-python = ">=3.9,<3.13"
-license = {file = "LICENSE"}
+license = "LGPL-3.0-or-later"
 keywords = ["ai", "llm",]
 authors = [
     {email = "info@unsloth.ai"},
@@ -24,9 +24,10 @@ classifiers = [
 dependencies = [
     "torch",
     "triton ; platform_system == 'Linux'",
-    "packaging",
+    "triton_windows ; platform_system == 'Windows'",
+    "packaging>=24.1",
     "tyro",
-    "transformers>=4.46.1,!=4.47.0",
+    "transformers>=4.51.3,!=4.47.0",
     "datasets>=2.16.0",
     "sentencepiece>=0.2.0",
     "tqdm",
@@ -37,10 +38,12 @@ dependencies = [
     "trl>=0.7.9,!=0.9.0,!=0.9.1,!=0.9.2,!=0.9.3,!=0.15.0,<=0.15.2",
     "peft>=0.7.1,!=0.11.0",
     "protobuf",
-    "huggingface_hub",
+    "huggingface_hub >= 0.30.0",
     "hf_transfer",
     "cut_cross_entropy",
     "pillow",
+    "regex",
+    "msgspec",
 ]
 
 [tool.setuptools.dynamic]

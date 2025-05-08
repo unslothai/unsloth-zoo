@@ -26,6 +26,8 @@ __all__ = [
     "save_lora",
     "load_lora",
     "generate_batches",
+    "convert_lora_modules",
+    "return_lora_modules",
 ]
 
 from typing import Optional, List, Tuple, Dict, Any
@@ -42,6 +44,7 @@ import json
 import psutil
 import functools
 import contextlib
+import inspect
 from functools import partial
 from .utils import _get_dtype
 from .patching_utils import patch_model_and_tokenizer
@@ -56,7 +59,7 @@ pass
 
 def _return_nothing(*args, **kwargs): return None
 def _return_self(self, *args, **kwargs): return self
-
+def _return_self_tokenizer(self, *args, **kwargs): return self.tokenizer
 
 if importlib.util.find_spec("vllm") is not None:
 
@@ -77,58 +80,106 @@ if importlib.util.find_spec("vllm") is not None:
         return vllm_check or unsloth_check
     pass
 
-    # Fix force using torch.bfloat16 all the time and make it dynamic
-    def _apply_4bit_weight(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # only load the bitsandbytes module when needed
-        from bitsandbytes import matmul_4bit
+    import vllm.model_executor.layers.quantization.bitsandbytes
 
-        original_type = x.dtype
-        original_shape = x.shape
-        reshape_after_matmul = False
-        if x.ndim > 2:
-            x = x.reshape(-1, x.size(-1))
-            reshape_after_matmul = True
+    if not hasattr(
+        vllm.model_executor.layers.quantization.bitsandbytes,
+        "apply_bnb_4bit"
+    ):
+        # Fix force using torch.bfloat16 all the time and make it dynamic
+        def _apply_4bit_weight(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            bias: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            # only load the bitsandbytes module when needed
+            from bitsandbytes import matmul_4bit
 
-        qweight = layer.weight
-        quant_states = qweight.bnb_quant_state
-        offsets = qweight.bnb_shard_offsets
-        inference_dtype = quant_states[0].dtype
-        bf_x = x.to(inference_dtype) # Originally used bfloat16
+            original_type = x.dtype
+            original_shape = x.shape
+            reshape_after_matmul = False
+            if x.ndim > 2:
+                x = x.reshape(-1, x.size(-1))
+                reshape_after_matmul = True
 
-        out_dim_0 = x.shape[0]
-        out_dim_1 = sum(
-            [quant_state[1].shape[0] for quant_state in quant_states.items()])
-        out = torch.empty(out_dim_0,
-                            out_dim_1,
-                            dtype=inference_dtype,
-                            device=x.device)
+            qweight = layer.weight
+            quant_states = qweight.bnb_quant_state
+            offsets = qweight.bnb_shard_offsets
+            inference_dtype = quant_states[0].dtype
+            bf_x = x.to(inference_dtype) # Originally used bfloat16
 
-        current_index = 0
-        for i in range(len(quant_states)):
-            output_size = quant_states[i].shape[0]
-            # It is more efficient to use out kwarg like
-            # matmul_4bit(..., out = ...).  Infeasible now due to the bug
-            # https://github.com/TimDettmers/bitsandbytes/issues/1235.
-            # Need to change  after the bug is fixed.
-            out[:, current_index:current_index + output_size] = matmul_4bit(
-                bf_x, qweight[offsets[i]:offsets[i + 1]].t(), quant_states[i])
+            out_dim_0 = x.shape[0]
+            out_dim_1 = sum(
+                [quant_state[1].shape[0] for quant_state in quant_states.items()])
+            out = torch.empty(out_dim_0,
+                              out_dim_1,
+                              dtype=inference_dtype,
+                              device=x.device)
 
-            current_index += output_size
+            current_index = 0
+            for i in range(len(quant_states)):
+                output_size = quant_states[i].shape[0]
+                # It is more efficient to use out kwarg like
+                # matmul_4bit(..., out = ...).  Infeasible now due to the bug
+                # https://github.com/TimDettmers/bitsandbytes/issues/1235.
+                # Need to change  after the bug is fixed.
+                out[:, current_index:current_index + output_size] = matmul_4bit(
+                    bf_x, qweight[offsets[i]:offsets[i + 1]].t(), quant_states[i])
 
-        out = out.to(original_type)
+                current_index += output_size
 
-        if reshape_after_matmul:
-            out = out.view(*original_shape[:-1], out.size(-1))
+            out = out.to(original_type)
 
-        if bias is not None:
-            out += bias
+            if reshape_after_matmul:
+                out = out.view(*original_shape[:-1], out.size(-1))
 
-        return out
+            if bias is not None:
+                out += bias
+
+            return out
+        pass
+    else:
+        # Newer vLLM versions have _apply_bnb_4bit
+        apply_bnb_4bit = vllm.model_executor.layers.quantization.bitsandbytes.apply_bnb_4bit
+        def _apply_4bit_weight(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            bias: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            # only load the bitsandbytes module when needed
+            original_type = x.dtype
+            original_shape = x.shape
+            reshape_after_matmul = False
+            if x.ndim > 2:
+                x = x.reshape(-1, x.size(-1))
+                reshape_after_matmul = True
+
+            qweight = layer.weight
+            quant_states = qweight.bnb_quant_state
+            offsets = qweight.bnb_shard_offsets
+            inference_dtype = quant_states[0].dtype
+            bf_x = x.to(inference_dtype) # Originally used bfloat16
+
+            out_dim_0 = x.shape[0]
+            out_dim_1 = sum(
+                [quant_state[1].shape[0] for quant_state in quant_states.items()])
+            out = torch.empty(out_dim_0,
+                              out_dim_1,
+                              dtype=inference_dtype,
+                              device=x.device)
+            apply_bnb_4bit(bf_x, qweight, offsets, out)
+            out = out.to(original_type)
+
+            if reshape_after_matmul:
+                out = out.view(*original_shape[:-1], out.size(-1))
+
+            if bias is not None:
+                out += bias
+
+            return out
+        pass
     pass
 
     def patch_vllm_bitsandbytes():
@@ -146,28 +197,27 @@ if importlib.util.find_spec("vllm") is not None:
         del vllm_config_logger
     pass
 
+    class BitsAndBytesConfig(
+        vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
+    ):
+        # All Unsloth Zoo code licensed under LGPLv3
+        def __init__(self, *args, **kwargs):
+            dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype", kwargs["bnb_4bit_compute_dtype"])
+            kwargs["bnb_4bit_compute_dtype"] = dtype
+            print(f"Unsloth: vLLM Bitsandbytes config using kwargs = {kwargs}")
+            super().__init__(*args, **kwargs)
+        pass
+    pass
+
     def patch_vllm_compute_dtype(dtype = torch.float16):
         # All Unsloth Zoo code licensed under LGPLv3
         # vLLM defaults to using the model config file's compute_dtype
         # We shall fix it dynamically!
-        import vllm.model_executor.layers.quantization.bitsandbytes
         old_config = vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
 
         dtype = str(dtype)
         if dtype.startswith("torch."): dtype = dtype[len("torch."):]
         os.environ["UNSLOTH_bnb_4bit_compute_dtype"] = dtype
-
-        class BitsAndBytesConfig(
-            vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
-        ):
-            # All Unsloth Zoo code licensed under LGPLv3
-            def __init__(self, *args, **kwargs):
-                dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype", kwargs["bnb_4bit_compute_dtype"])
-                kwargs["bnb_4bit_compute_dtype"] = dtype
-                print(f"Unsloth: vLLM Bitsandbytes config using kwargs = {kwargs}")
-                super().__init__(*args, **kwargs)
-            pass
-        pass
 
         vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig = BitsAndBytesConfig
         return old_config
@@ -185,9 +235,19 @@ if importlib.util.find_spec("vllm") is not None:
         vllm.transformers_utils.tokenizer.get_lora_tokenizer = _return_nothing
         vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing
         
-        import vllm.transformers_utils.tokenizer_group.tokenizer_group
-        vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer = _return_nothing
-        vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer_async = _return_nothing
+        try:
+            import vllm.transformers_utils.tokenizer_group.tokenizer_group
+            vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer = _return_nothing
+            vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer_async = _return_nothing
+        except:
+            pass
+        try:
+            # New vLLM is now a class!
+            import vllm.transformers_utils.tokenizer_group
+            vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer = _return_self_tokenizer
+            vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer_async = _return_self_tokenizer
+        except:
+            pass
     pass
 
     from .vllm_lora_request import LoRARequest as PatchedLoRARequest
@@ -334,8 +394,8 @@ pass
 
 
 def patch_vllm():
-    patch_bitsandbytes_quant_state()
-    patch_vllm_bitsandbytes()
+    # patch_bitsandbytes_quant_state()
+    # patch_vllm_bitsandbytes()
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
     global LORA_REQUEST_ID
@@ -383,7 +443,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
     try:
-        llm_engine = getattr(llm, "llm_engine", llm)
+        llm_engine = getattr(llm, "llm_engine", getattr(llm, "engine", llm))
         vllm_internals = llm_engine.model_executor.driver_worker.model_runner.model
     except:
         raise RuntimeError("Unsloth: Failed to access llm.llm_engine.model_executor.driver_worker.model_runner.model")
@@ -541,22 +601,29 @@ pass
 
 
 @torch.inference_mode
-def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16):
+def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
     config.update({"torch_dtype" : dtype}) # Do not use config file's dtype!
     new_model = create_empty_causal_lm(config, dtype)
     quantization_config = getattr(config, "quantization_config", {})
     kwargs = dict()
-    if quantization_config != {}:
-        # Get quantization_config flags
-        compute_dtype = _get_dtype(quantization_config["bnb_4bit_compute_dtype"])
-        compute_dtype = dtype # Do not use config file's dtype!
-        kwargs["compress_statistics"] = quantization_config["bnb_4bit_use_double_quant"]
-        kwargs["quant_type"] = quantization_config["bnb_4bit_quant_type"]
-        kwargs["quant_storage"] = _get_dtype(quantization_config["bnb_4bit_quant_storage"])
-    pass
+    compute_dtype = dtype  # Do not use config file's dtype!
 
+    if quantization_config != {} or bnb_config is not None:
+        # Get quantization_config flags
+        if quantization_config != {}:
+            kwargs["compress_statistics"] = quantization_config["bnb_4bit_use_double_quant"]
+            kwargs["quant_type"] = quantization_config["bnb_4bit_quant_type"]
+            kwargs["quant_storage"] = _get_dtype(quantization_config["bnb_4bit_quant_storage"])
+
+        # Get bnb_config flags
+        elif bnb_config is not None:
+            kwargs["compress_statistics"] = bnb_config.bnb_4bit_use_double_quant
+            kwargs["quant_type"] = bnb_config.bnb_4bit_quant_type
+            kwargs["quant_storage"] = _get_dtype(bnb_config.bnb_4bit_quant_storage)
+
+    pass
     from bitsandbytes.nn.modules import Linear4bit, Params4bit
     from torch.nn.modules import Linear
 
@@ -805,16 +872,19 @@ def load_vllm(
     max_loras              : int  = 1,
     use_async              : bool = False,
     use_engine             : bool = False,
-    disable_log_stats      : bool = True,
+    disable_log_stats      : bool = False,
     enforce_eager          : bool = False, # Good for debugging
     enable_prefix_caching  : bool = True,
     compilation_config     : int  = 3, # -O3 for maximum performance
     conservativeness       : float = 1.0, # For low VRAM devices, scale batches, num_seqs
     max_logprobs           : int  = 0,
+    use_bitsandbytes       : bool = True,
+    return_args            : bool = False, # Just return args
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
     assert(config is not None)
+    assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
     major_version, minor_version = torch.cuda.get_device_capability()
@@ -866,7 +936,8 @@ def load_vllm(
 
     free_memory, total_memory = torch.cuda.mem_get_info()
     total_memory_gb = round(total_memory / 1024 / 1024 / 1024, 2)
-    use_bitsandbytes = model_name.lower().endswith("-bnb-4bit")
+    use_bitsandbytes = use_bitsandbytes or \
+        model_name.lower().endswith("-bnb-4bit")
 
     # Fix up vLLM compute_dtype for bitsandbytes
     BitsAndBytesConfig = patch_vllm_compute_dtype(dtype)
@@ -889,7 +960,24 @@ def load_vllm(
         # os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
     pass
 
-    from vllm import LLM, LLMEngine, AsyncLLMEngine, EngineArgs
+    # Prefix Caching fails for V100, Titan X CUDA Compute Capability 7.0
+    # See https://github.com/huggingface/trl/issues/2798
+    major_version, minor_version = torch.cuda.get_device_capability()
+    if (major_version < 7) or (major_version == 7 and minor_version < 5):
+        print("Unsloth: Your GPU does not support prefix caching - will disable!")
+        enable_prefix_caching = False
+    pass
+
+    # Use VLLM_USE_V1 for vllm >= 0.7.4 and CUDA >= 8.0
+    # [FAILS] for bitsandbytes - https://github.com/unslothai/unsloth/issues/2102
+    # if importlib.util.find_spec("vllm") and (major_version >= 8):
+    #     from importlib.metadata import version as importlib_version
+    #     from packaging.version import Version
+    #     if Version(importlib_version("vllm")) > Version("0.7.3"):
+    #         os.environ["VLLM_USE_V1"] = "1"
+    # pass
+
+    from vllm import LLM, LLMEngine, AsyncLLMEngine, EngineArgs, AsyncEngineArgs
 
     # Default vLLM max_num_seqs is 256
     approx_max_num_seqs = 256
@@ -949,14 +1037,6 @@ def load_vllm(
     # Get device as well
     device = "cuda:0"
 
-    # Prefix Caching fails for V100, Titan X CUDA Compute Capability 7.0
-    # See https://github.com/huggingface/trl/issues/2798
-    major_version, minor_version = torch.cuda.get_device_capability()
-    if (major_version < 7) or (major_version == 7 and minor_version < 5):
-        print("Unsloth: Your GPU does not support prefix caching - will disable!")
-        enable_prefix_caching = False
-    pass
-
     engine_args = dict(
         model                  = model_name,
         gpu_memory_utilization = actual_gpu_memory_utilization,
@@ -985,13 +1065,24 @@ def load_vllm(
         swap_space             = swap_space, # Low memory devices like Colab (13GB) default 4GB
         device                 = device,
     )
+    good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
+    old_keys = engine_args.keys()
+    for key in old_keys:
+        if key not in good_keys:
+            del engine_args[key]
+            print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
+        pass
+    pass
+
+    # Quick exit
+    if return_args: return engine_args
 
     # Keep trying until success (2 times)
     trials = 0
     while True:
         try:
             if use_async:
-                llm = AsyncLLMEngine.from_engine_args(EngineArgs(**engine_args))
+                llm = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**engine_args))
             elif use_engine:
                 llm = LLMEngine.from_engine_args(EngineArgs(**engine_args))
             else:
@@ -1012,6 +1103,7 @@ def load_vllm(
             if "gpu_memory_utilization" in error or "memory" in error:
                 approx_max_num_seqs = int(approx_max_num_seqs * 0.75)
                 engine_args["max_num_seqs"] = approx_max_num_seqs
+                engine_args["gpu_memory_utilization"] *= 0.85
                 print(
                     f"Unsloth: Retrying vLLM to process {approx_max_num_seqs} sequences and {max_num_batched_tokens} tokens in tandem.\n"\
                     f"Error:\n{error}"
@@ -1173,11 +1265,66 @@ def load_lora_directly(model):
         vllm_lora_B.copy_(model_lora_B, non_blocking = True)
         if s is not None: vllm_lora_B *= s
     pass
+    # Must block!
+    torch.cuda.synchronize()
+pass
+
+
+from peft import PeftType
+
+@torch.inference_mode
+def convert_lora_modules(
+    model,
+    dtype = None,
+):
+    dtype = _get_dtype(model.config.torch_dtype if dtype is None else dtype)
+
+    if (hasattr(model, "peft_config") and "default" in model.peft_config) \
+        and (model.peft_config["default"].peft_type == PeftType.LORA):
+
+        state_dict = model.state_dict().items()
+        state_dict = {
+            k : v.detach().clone() for k, v in state_dict \
+            if (v.dtype != dtype) and \
+               (".lora_A.default" in k or ".lora_B.default" in k)
+        }
+        if len(state_dict) == 0: return {}
+
+        for name, module in model.named_modules():
+            if name + ".default.weight" in state_dict:
+                exec(f"module.to({dtype})")
+        pass
+        return state_dict
+    return {}
 pass
 
 
 @torch.inference_mode
-def load_lora(model, save_directory, load_tensors = True):
+def return_lora_modules(
+    model,
+    state_dict = {},
+    dtype = torch.float32,
+):
+    if state_dict == {} or state_dict is None: return
+    dtype = _get_dtype(model.config.torch_dtype if dtype is None else dtype)
+
+    if (hasattr(model, "peft_config") and "default" in model.peft_config) \
+        and (model.peft_config["default"].peft_type == PeftType.LORA):
+
+        for name, module in model.named_modules():
+            old_name = name + ".default.weight"
+            old_weight = state_dict.get(old_name, None)
+            if old_weight is not None:
+                exec(f"module.to({dtype})")
+                # module.default.weight.copy_(old_weight)
+        pass
+        return
+    return
+pass
+
+
+@torch.inference_mode
+def load_lora(model, save_directory, load_tensors = False):
     # vllm_lora_already_loaded(model)
     # Check internally if model has hot loaded LoRAs
     # if load_tensors and hasattr(model, "saved_vllm_lora_request"):# vllm_lora_already_loaded(model):
@@ -1198,7 +1345,7 @@ def load_lora(model, save_directory, load_tensors = True):
         if load_tensors:
             # We need to save and load the config file once!
             model.peft_config["default"].save_pretrained(save_directory)
-        else:
+        elif not os.path.exists(save_directory):
             raise OSError(f"Unsloth: LoRA filepath = {save_directory} does not exist!")
     pass
 
@@ -1207,7 +1354,8 @@ def load_lora(model, save_directory, load_tensors = True):
         # We extract it directly from the model's state_dict
         peft_config = get_peft_config(save_directory)
         state_dict = model.state_dict()
-        state_dict = {k.replace(".default", ""):v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
+        items = state_dict.items()
+        state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
 
         # vllm_lora_already_loaded(model)
         lora_request = LoRARequest(str(LORA_REQUEST_ID), LORA_REQUEST_ID, lora_tensors = state_dict, lora_config = peft_config)
@@ -1259,16 +1407,16 @@ def generate_batches(llm, inputs, n_batches = None, lora_request = None, *args, 
 
     batches = create_batches(inputs, n_batches)
     kwargs["lora_request"] = lora_request
-    outputs = []
+    output_list = []
     for batch in batches:
         outputs = llm.generate(batch, *args, **kwargs)
-        outputs += list(outputs)
+        output_list += list(outputs)
     pass
-    return outputs
+    return output_list
 pass
 
 
-def delete_vllm(llm):
+def delete_vllm(llm = None):
     # From https://github.com/vllm-project/vllm/issues/1908
     import ray
     from vllm.distributed.parallel_state import (
@@ -1278,13 +1426,16 @@ def delete_vllm(llm):
     # Delete the llm object and free the memory
     destroy_model_parallel()
     destroy_distributed_environment()
-    del llm.llm_engine.model_executor
-    del llm
+    if llm is not None:
+        del llm.llm_engine.model_executor
+        del llm
+        llm = None
     with contextlib.suppress(AssertionError):
         torch.distributed.destroy_process_group()
     gc.collect()
     torch.cuda.empty_cache()
     ray.shutdown()
+    return llm
 pass
 
 

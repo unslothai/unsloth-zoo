@@ -41,6 +41,7 @@ from .utils import (
     distributed_function,
 )
 import triton
+import regex
 from .peft_utils import get_lora_layer_modules
 from importlib.metadata import version as importlib_version
 from packaging.version import Version
@@ -62,6 +63,14 @@ OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
 major, minor = torch.cuda.get_device_capability()
 OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
 OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
+
+# Check if Unsloth Studio is allowed
+import importlib.util
+if importlib.util.find_spec("unsloth_studio") is None:
+    UNSLOTH_STUDIO_ENABLED = False
+else:
+    UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
+pass
 
 # Ignore logging messages
 class HideLoggingMessage(logging.Filter):
@@ -90,12 +99,27 @@ _license_header = """
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>."""
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import os
+import importlib.util
+if importlib.util.find_spec("unsloth_studio") is None:
+    UNSLOTH_STUDIO_ENABLED = False
+else:
+    UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
+pass
+from typing import List, Dict, Tuple, Optional, Any, Callable
+import math
+"""
 
 _disabled_sdpa_code = f"""{_license_header}
 
+import os
 import torch
 from unsloth_zoo.loss_utils import fused_linear_cross_entropy
+
+if UNSLOTH_STUDIO_ENABLED:
+    from unsloth_zoo.loss_utils import fast_linear_cross_entropy
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
 @torch.compiler.disable(recursive = False)
@@ -139,6 +163,9 @@ def get_transformers_model_type(
     config = str(config.to_dict())
     model_types = re.findall(r"'model_type': '([^\s\']{1,})'", config)
     model_types = [x.replace("-", "_").lower() for x in model_types]
+    # Add splitted modules for eg gemma3_text -> gemma3
+    model_types += [x.split("_")[0] for x in model_types]
+    model_types = list(dict().fromkeys(model_types))
 
     from transformers import models
     models = dir(models)
@@ -266,7 +293,10 @@ def create_new_function(
     pass
 
     # Import items to make the function executable
-    items = [x for x in functions if ((x in new_source) and (x != name) and not (f"def {x}" in new_source))]
+    items = [x for x in functions if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))]
+    # Patch for SiglipEncoder and others
+    if "SiglipEncoder" in new_source: items += ["SiglipEncoder"]
+
     imports = "from torch import Tensor\n"
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
@@ -474,6 +504,9 @@ def create_standalone_class(
 
     # Combine all into file
     source = source + full_class
+
+    # Fix Gemma 3 ignore_index being not set!
+    source = source.replace("self.config.ignore_index", "-100")
     return source
 pass
 
@@ -482,7 +515,7 @@ _cross_entropy_code = """
 from torch.nn import CrossEntropyLoss
 
 @torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
-def uncompiled_cross_entropy_loss(self, hidden_states, labels,):
+def normal_cross_entropy_loss(self, hidden_states, labels):
     logits = self.lm_head(hidden_states)
     logits = logits.float()
     # Shift so that tokens < n predict n
@@ -531,78 +564,350 @@ pass
 
 # Replace Cross Entropy cells with fused linear lm heads
 cross_entropy_find_1 = """
-logits = self.lm_head(hidden_states%
+logits = self.lm_head(hidden_states$INDEXING$
+$LOGITSCALINGMULTIPLY$
+$LOGITSCALINGDIVISION$
+$LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$logits = logits.float()
-shift_logits = logits[..., :-1, :].contiguous()
-shift_labels = labels[..., 1:].contiguous()
-loss_fct = CrossEntropyLoss()
-shift_logits = shift_logits.view(-1, self.config.vocab_size)
+if labels is not None:$SPACES$
+$UPCASTING$
+$LOGITSUPCAST$
+$LABELSDEVICE$
+shift_logits = logits[..., :-1, :]$CONTIGUOUS$
+shift_labels = labels[..., 1:]$CONTIGUOUS$
+loss_fct = $CROSSENTROPYLOSS$
+shift_logits = shift_logits.view(-1, $VOCABSIZE$)
 shift_labels = shift_labels.view(-1)
 shift_labels = shift_labels.to(shift_logits.device)
 loss = loss_fct(shift_logits, shift_labels)
 """
 
 cross_entropy_replacement_1 = """
+NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
+
+all_locals = locals()
+n_items = None
+for __kwargs in all_locals.values():
+    if type(__kwargs) is dict:
+        n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+        break
+requires_grad_ = self.lm_head.weight.requires_grad
 if labels is None:
-    logits = self.lm_head(hidden_states)
-elif NOT_RETURN_LOGITS and labels is not None:
-    n_items = loss_kwargs.get("num_items_in_batch", None) or loss_kwargs.get("n_items", None)
+    logits = self.lm_head(hidden_states\\1)
+elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
+    loss = fast_linear_cross_entropy(
+        hidden_states        = hidden_states\\1,
+        lm_head              = self.lm_head,
+        labels               = labels,
+        num_items_in_batch   = n_items,
+        logit_softcapping    = None if (\\4) == () else (\\4),
+        logit_scale_multiply = None if (\\2) == () else (\\2),
+        logit_scale_divide   = None if (\\3) == () else (\\3),
+    )
+elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
-        hidden_states      = hidden_states,
+        hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
-        labels             = labels,
+        labels             = labels.to(self.lm_head.weight.device),
         num_items_in_batch = n_items,
-        logit_softcapping  = getattr(self.config, "final_logit_softcapping", 0),
+        logit_softcapping  = None if (\\4) == () else (\\4),
     )
 else:
-    loss, logits = uncompiled_cross_entropy_loss(self, hidden_states, labels,)
+    logits = self.lm_head(hidden_states\\1)
+    def _compiled_loss_function(
+        output_logits : torch.Tensor,
+        output_labels : torch.Tensor,
+        logit_scale_multiply : float = 0,
+        logit_scale_divide : float = 0,
+        logit_softcapping : float = 0,
+        vocab_size : int = 0,
+        n_items : int = 0,
+    ):
+        device = output_logits.device
+        if logit_scale_multiply != 0:
+            output_logits = output_logits * logit_scale_multiply
+        if logit_scale_divide != 0:
+            output_logits = output_logits / logit_scale_divide
+        if logit_softcapping != 0:
+            output_logits = output_logits / logit_softcapping
+            output_logits = torch.tanh(output_logits)
+            output_logits = output_logits * logit_softcapping
+
+        shift_logits = output_logits
+        shift_labels = torch.empty_like(output_labels, device = device)
+        shift_labels[..., :-1] = output_labels[..., 1:]
+        shift_labels[..., -1] = -100
+        # shift_logits = output_logits[..., :-1, :].float().contiguous()
+        # shift_labels = output_labels[..., 1:].contiguous()
+
+        shift_logits = shift_logits.view(-1, vocab_size)
+        shift_labels = shift_labels.view(-1)
+
+        n_chunks = int(math.ceil((vocab_size / 262144) * 8))
+        if requires_grad_: n_chunks += 2
+        __shift_logits = torch.chunk(shift_logits, n_chunks, dim = 0)
+        __shift_labels = torch.chunk(shift_labels, n_chunks, dim = 0)
+        loss = 0.0
+        for (_shift_logits, _shift_labels) in zip(__shift_logits, __shift_labels):
+            loss += torch.nn.functional.cross_entropy(
+                input  = _shift_logits.float().contiguous(),
+                target = _shift_labels.contiguous(),
+                reduction = 'sum',
+            )
+        pass
+        if n_items != 0:
+            loss = loss / n_items
+        else:
+            loss = loss / (shift_labels != -100).sum()
+        return loss
+    pass
+    _compiled_loss_function = torch.compile(
+        _compiled_loss_function,
+        fullgraph = False,
+        dynamic = True,
+        options = torch_compile_options,
+    )
+    torch._dynamo.mark_dynamic(logits, 1)
+    torch._dynamo.mark_dynamic(labels, 1)
+    loss = _compiled_loss_function(
+        output_logits        = logits,
+        output_labels        = labels,
+        logit_scale_multiply = (\\2) if (\\2) != () else 0,
+        logit_scale_divide   = (\\3) if (\\3) != () else 0,
+        logit_softcapping    = (\\4) if (\\4) != () else 0,
+        vocab_size           = (\\6),
+        n_items              = n_items if n_items is not None else 0,
+    )
+    # if (\\2) != ():
+    #     logits = logits * (\\2)
+    # if (\\3) != ():
+    #     logits = logits / (\\3)
+    # if (\\4) != ():
+    #     logits = logits / (\\4)
+    #     logits = torch.tanh(logits)
+    #     logits = logits * (\\4)
+    # shift_logits = logits[..., :-1, :].float().contiguous()
+    # shift_labels = labels[..., 1:].contiguous()
+    # reduction = 'mean' if n_items is None else 'sum'
+    # loss_fct = torch.nn.CrossEntropyLoss(reduction = reduction)
+    # shift_logits = shift_logits.view(-1, \\6)
+    # shift_labels = shift_labels.view(-1)
+    # shift_labels = shift_labels.to(shift_logits.device)
+    # loss = loss_fct(shift_logits, shift_labels)
+    # if n_items is not None: loss = loss / n_items
 """
 
 cross_entropy_find_2 = """
-logits = self.lm_head(hidden_states%
+logits = self.lm_head(hidden_states$INDEXING$
+$LOGITSCALINGMULTIPLY$
+$LOGITSCALINGDIVISION$
+$LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **loss_kwargs)
+if labels is not None:$SPACES$loss = self.loss_function($LOGITS$, $LABELS$, $VOCABSIZE$, $KWARGS$)
 """
 
 cross_entropy_replacement_2 = """
+NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
+n_items = (\\9).get("num_items_in_batch", None) or (\\9).get("n_items", None)
+requires_grad_ = self.lm_head.weight.requires_grad
+
 if labels is None:
-    logits = self.lm_head(hidden_states)
-elif NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
-    n_items = loss_kwargs.get("num_items_in_batch", None) or loss_kwargs.get("n_items", None)
+    logits = self.lm_head(hidden_states\\1)
+elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and not requires_grad_:
+    loss = fast_linear_cross_entropy(
+        hidden_states        = hidden_states\\1,
+        lm_head              = self.lm_head,
+        labels               = labels,
+        num_items_in_batch   = n_items,
+        logit_softcapping    = None if (\\4) == () else (\\4),
+        logit_scale_multiply = None if (\\2) == () else (\\2),
+        logit_scale_divide   = None if (\\3) == () else (\\3),
+    )
+elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
-        hidden_states      = hidden_states,
+        hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
-        labels             = labels,
+        labels             = labels.to(self.lm_head.weight.device),
         num_items_in_batch = n_items,
-        logit_softcapping  = getattr(self.config, "final_logit_softcapping", 0),
+        logit_softcapping  = None if (\\4) == () else (\\4),
+    )
+elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+    logits = self.lm_head(hidden_states\\1)
+    def _compiled_loss_function(
+        output_logits : torch.Tensor,
+        output_labels : torch.Tensor,
+        logit_scale_multiply : float = 0,
+        logit_scale_divide : float = 0,
+        logit_softcapping : float = 0,
+        vocab_size : int = 0,
+        n_items : int = 0,
+    ):
+        device = output_logits.device
+        if logit_scale_multiply != 0:
+            output_logits = output_logits * logit_scale_multiply
+        if logit_scale_divide != 0:
+            output_logits = output_logits / logit_scale_divide
+        if logit_softcapping != 0:
+            output_logits = output_logits / logit_softcapping
+            output_logits = torch.tanh(output_logits)
+            output_logits = output_logits * logit_softcapping
+
+        shift_logits = output_logits
+        shift_labels = torch.empty_like(output_labels, device = device)
+        shift_labels[..., :-1] = output_labels[..., 1:]
+        shift_labels[..., -1] = -100
+        # shift_logits = output_logits[..., :-1, :].float().contiguous()
+        # shift_labels = output_labels[..., 1:].contiguous()
+
+        shift_logits = shift_logits.view(-1, vocab_size)
+        shift_labels = shift_labels.view(-1)
+
+        n_chunks = int(math.ceil((vocab_size / 262144) * 8))
+        if requires_grad_: n_chunks += 2
+        __shift_logits = torch.chunk(shift_logits, n_chunks, dim = 0)
+        __shift_labels = torch.chunk(shift_labels, n_chunks, dim = 0)
+        loss = 0.0
+        for (_shift_logits, _shift_labels) in zip(__shift_logits, __shift_labels):
+            loss += torch.nn.functional.cross_entropy(
+                input  = _shift_logits.float().contiguous(),
+                target = _shift_labels.contiguous(),
+                reduction = 'sum',
+            )
+        pass
+        if n_items != 0:
+            loss = loss / n_items
+        else:
+            loss = loss / (shift_labels != -100).sum()
+        return loss
+    pass
+    _compiled_loss_function = torch.compile(
+        _compiled_loss_function,
+        fullgraph = False,
+        dynamic = True,
+        options = torch_compile_options,
+    )
+    torch._dynamo.mark_dynamic(logits, 1)
+    torch._dynamo.mark_dynamic(labels, 1)
+    loss = _compiled_loss_function(
+        output_logits        = logits,
+        output_labels        = labels,
+        logit_scale_multiply = (\\2) if (\\2) != () else 0,
+        logit_scale_divide   = (\\3) if (\\3) != () else 0,
+        logit_softcapping    = (\\4) if (\\4) is not None or (\\4) != () else 0,
+        vocab_size           = (\\8),
+        n_items              = n_items if n_items is not None else 0,
     )
 else:
-    logits = self.lm_head(hidden_states)
-    loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **loss_kwargs)
+    logits = self.lm_head(hidden_states\\1)
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) is not None or (\\4) != ():
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
+    loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), \\8, **\\9)
 """
 
 cross_entropy_find_3 = """
-logits = self.lm_head(hidden_states%
+$OUTPUTLOGITS$
+$LOGITSCALINGMULTIPLY$
+$LOGITSCALINGDIVISION$
+$LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
+if labels is not None:$SPACES$
+$UPCASTING$
+$LOGITSUPCAST$
+$LABELSDEVICE$
+$LOGITSHIFTING$
+$VLMATTENTIONMASK$
+loss_fct = $CROSSENTROPYLOSS$
+shift_logits = shift_logits.view(-1, $VOCABSIZE$)
+shift_labels = shift_labels.view(-1)###
+$LOGITSDEVICE$###
+loss = loss_fct(shift_logits, shift_labels)
 """
 
 cross_entropy_replacement_3 = """
-if labels is None:
-    logits = self.lm_head(hidden_states)
-elif NOT_RETURN_LOGITS and self.training and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
-    n_items = loss_kwargs.get("num_items_in_batch", None) or loss_kwargs.get("n_items", None)
-    loss = fused_linear_cross_entropy(
-        hidden_states      = hidden_states,
-        lm_weight          = self.lm_head.weight,
-        labels             = labels,
-        num_items_in_batch = n_items,
-        logit_softcapping  = getattr(self.config, "final_logit_softcapping", 0),
+NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
+
+all_locals = locals()
+n_items = None
+for __kwargs in all_locals.values():
+    if type(__kwargs) is dict:
+        n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+        break
+
+if labels is not None:
+    def _compiled_loss_function(
+        output_logits : torch.Tensor,
+        output_labels : torch.Tensor,
+        mask : torch.Tensor = None,
+        logit_scale_multiply : float = 0,
+        logit_scale_divide : float = 0,
+        logit_softcapping : float = 0,
+        vocab_size : int = 0,
+        n_items : int = 0,
+    ):
+        device = output_logits.device
+        if logit_scale_multiply != 0:
+            output_logits = output_logits * logit_scale_multiply
+        if logit_scale_divide != 0:
+            output_logits = output_logits / logit_scale_divide
+        if logit_softcapping != 0:
+            output_logits = output_logits / logit_softcapping
+            output_logits = torch.tanh(output_logits)
+            output_logits = output_logits * logit_softcapping
+
+        shift_logits = output_logits
+        shift_labels = torch.empty_like(output_labels, device = device)
+        shift_labels[..., :-1] = output_labels[..., 1:]
+        if mask is not None:
+            mask = mask.to(device = device)
+            shift_labels[..., :-1][mask[..., 1:] == 0] = -100
+        pass
+        shift_labels[..., -1] = -100
+
+        shift_logits = shift_logits.view(-1, vocab_size)
+        shift_labels = shift_labels.view(-1)
+
+        __shift_logits = torch.chunk(shift_logits, 4, dim = 0)
+        __shift_labels = torch.chunk(shift_labels, 4, dim = 0)
+        loss = 0.0
+        for (_shift_logits, _shift_labels) in zip(__shift_logits, __shift_labels):
+            loss += torch.nn.functional.cross_entropy(
+                input  = _shift_logits.float().contiguous(),
+                target = _shift_labels.contiguous(),
+                reduction = 'sum',
+            )
+        pass
+        if n_items != 0:
+            loss = loss / n_items
+        else:
+            loss = loss / (shift_labels != -100).sum()
+        return loss
+    pass
+    _compiled_loss_function = torch.compile(
+        _compiled_loss_function,
+        fullgraph = False,
+        dynamic = True,
+        options = torch_compile_options,
     )
-else:
-    logits = self.lm_head(hidden_states)
-    loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
+    torch._dynamo.mark_dynamic(logits, 1)
+    torch._dynamo.mark_dynamic(labels, 1)
+    if attention_mask is not None:
+        torch._dynamo.mark_dynamic(attention_mask, 1)
+    loss = _compiled_loss_function(
+        output_logits        = logits,
+        output_labels        = labels,
+        mask                 = \\5,
+        logit_scale_multiply = (\\1) if (\\1) != () else 0,
+        logit_scale_divide   = (\\2) if (\\2) != () else 0,
+        logit_softcapping    = (\\3) if (\\3) is not None or (\\3) != () else 0,
+        vocab_size           = (\\6),
+        n_items              = n_items if n_items is not None else 0,
+    )
 """
 
 ce_finders = [
@@ -614,10 +919,6 @@ ce_finders = [
 
 def apply_fused_lm_head(forward):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Logit returning?
-    RETURN_LOGITS = os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
-    NOT_RETURN_LOGITS = not RETURN_LOGITS
-
     for cross_entropy_find, cross_entropy_replacement in ce_finders:
         cross_entropy_find = cross_entropy_find.strip()\
             .replace("*", "\*").replace("^", "\^")\
@@ -626,53 +927,179 @@ def apply_fused_lm_head(forward):
             .replace(".", "\.").replace(",", "\,")\
             .replace("(", "\(").replace(")", "\)")\
             .replace("[", "\[").replace("]", "\]")\
-            .replace("\n", r"[\s\n]{1,}(?:\#[^\n]{1,}[\n][\s\n]{1,})?")
+            .replace(
+                "\n",
+                r"(?:[\s\n]{0,}(?:\#[^\n]{1,}[\n][\s\n]{1,})?){0,}"
+            )
 
-        # Find indentation
+        # Replace $ with anything and % with num_logits_to_keep or .float()
         cross_entropy_find = cross_entropy_find\
-            .replace("$", r"[\n]([\s]{1,})(?:\#[^\n]{1,}[\n][\s\n]{1,})?")\
-            .replace("%", 
-                     r"(?:\[\:\,[\s]{0,}\-num_logits_to_keep\:\,[\s]{0,}\:\])?\)"\
-                     r"(?:\.float\(\))?[\n][\s]{0,}")
+            .replace("$INDEXING$",     r"([^\n^\)]{0,})\)(?:\.float\(\))?[\n][\s]{0,}")\
+            .replace("$UPCASTING$",    r"(?:\.float\(\))?")\
+            .replace("$SPACES$",       r"[\n]([\s]{1,})(?:\#[^\n]{1,}[\n][\s\n]{1,})?")\
+            .replace("$LOGITS$",       r"(logits=logits|logits)")\
+            .replace("$LABELS$",       r"(labels=labels|labels)")\
+            .replace("$VOCABSIZE$",
+                     r"((?:vocab_size\=)?"\
+                     r"self\.config\.vocab_size|"\
+                     r"self\.vocab_size|"\
+                     r"self\.config\.vocab_size|"\
+                     r"self\.config\.text_config\.vocab_size"\
+                     ")")\
+            .replace("$KWARGS$",       r"\*\*(loss_kwargs|kwargs)")\
+            .replace("$LOGITSUPCAST$", r"(?:logits = logits\.float\(\))?")\
+            .replace("$LABELSDEVICE$", r"(?:labels = labels\.to\([^\)]{1,}\))?")\
+            .replace("$LOGITSCALINGMULTIPLY$",
+                     r"(?:[\n\s]{0,}logits = logits \* (self\.[^ \n]{1,})[^\n]{0,})?###")\
+            .replace("$LOGITSCALINGDIVISION$",
+                     r"(?:[\n\s]{0,}logits = logits \/ (self\.[^ \n]{1,})[^\n]{0,})?###")\
+            .replace("$LOGITSOFTCAPPING$",
+                     r"(?:[\n\s]{0,}(?:if self\.[^\n\s]{1,} is not None:\n)?"\
+                     r"[\s\n]{0,}logits = logits \/ (self\.[^ \n]{1,})\n"\
+                     r"[\s\n]{0,}logits = torch\.tanh\(logits\)\n"\
+                     r"[\s\n]{0,}logits = logits \* self\.[^ \n]{1,}\n)?")\
+            .replace("$CROSSENTROPYLOSS$",
+                     r"(?:CrossEntropyLoss\(\)|"\
+                     r"nn\.CrossEntropyLoss\(\)|"\
+                     r"torch\.nn\.CrossEntropyLoss\(\)"\
+                     r")")\
+            .replace(r"$VLMATTENTIONMASK$",
+                     r"(?:"\
+                     r"(?:"\
+                     r"shift_logits = logits\[\.\.\.\, :-1, :\]$CONTIGUOUS$"\
+                     r"shift_labels = labels\[\.\.\.\, 1:\]$CONTIGUOUS$"\
+                     r")?"
+                     r"if ([a-zA-Z\_]{1,}_mask) is not None:###"\
+                     r"shift_attention_mask = @@@###"\
+                     r"shift_logits = @@@###"\
+                     r"shift_labels = @@@###"\
+                     r"else:###"\
+                     r"shift_logits = [^\n]{1,}###"\
+                     r"shift_labels = [^\n]{1,}###"\
+                     r")?")\
+            .replace(r"$LOGITSHIFTING$",
+                     r"(?:"\
+                     r"shift_logits = logits\[\.\.\.\, :-1, :\]$CONTIGUOUS$###"\
+                     r"shift_labels = labels\[\.\.\.\, 1:\]$CONTIGUOUS$###"\
+                     r")?")\
+            .replace(r"$LOGITSDEVICE$",
+                     r"(?:"\
+                     r"\.to\([^\)]{1,}\)|shift_labels = shift_labels\.to\([^\)]{1,}\)"
+                     r")")\
+            .replace(r"$OUTPUTLOGITS$",
+                     r"(?:"\
+                     r"logits = outputs\.logits|"\
+                     r"logits = self\.lm_head\(hidden_states\)"\
+                     r")")\
+            .replace(r"shift_", r"(?:shift_|flat_)")\
+            .replace("$CONTIGUOUS$",   r"(?:\.contiguous\(\))?")\
+            .replace(r"shift\_", r"(?:shift\_|flat\_)")\
+            .replace(r"###", r"(?:[\s\n]{0,}(?:\#[^\n]{1,}[\n][\s\n]{1,})?){0,}")\
+            .replace(r"@@@", r"[^\[]{1,}\[[^\]]{1,}\][^\n]{0,}\n")\
+            .replace(r"$EMPTY$", r"()")
 
-        spaces = re.findall(cross_entropy_find, forward, flags = re.DOTALL | re.MULTILINE)
-        if len(spaces) == 0: continue
-        spaces = spaces[0]
+        cross_entropy_replacement = cross_entropy_replacement\
+            .replace(
+                "$KWARGS$",
+                "locals().get('loss_kwargs', {}) or locals().get('kwargs', {})"
+            )
 
+        # Fix Idefics and Idefics3
+        forward = forward.replace(
+            "loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))",
+
+            "shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)\n"\
+            "shift_labels = shift_labels.view(-1)\n"\
+            "shift_labels = shift_labels.to(shift_logits.device)\n"\
+            "loss = loss_fct(shift_logits, shift_labels)"
+        )
+
+        # Find matches
+        if "loss\_function" in cross_entropy_find and "loss_function" not in forward:
+            continue
+        elif "loss\_function" not in cross_entropy_find and "loss_function" in forward:
+            continue
+        elif "CrossEntropyLoss" not in cross_entropy_find and "CrossEntropyLoss" in forward:
+            continue
+        elif "CrossEntropyLoss" in cross_entropy_find and "CrossEntropyLoss" not in forward:
+            continue
+        try:
+            finder = regex.findall(
+                cross_entropy_find,
+                forward,
+                flags = regex.DOTALL | regex.MULTILINE,
+                timeout = 1
+            )
+        except:
+            continue
+        if len(finder) == 0: continue
+
+        spaces = finder[0][4]
+        if spaces.count(" ") != len(spaces):
+            spaces = finder[0][3]
         replacement = cross_entropy_replacement.strip().split("\n")
         replacement = "\n".join((len(spaces)-4)*" " + x for x in replacement)
         replacement = \
             "logits = EMPTY_LOGITS\n" + \
             (len(spaces)-4)*" " + "loss = None\n" + \
             replacement + "\n"
-
-        forward = re.sub(
-            cross_entropy_find,
-            replacement,
+        try:
+            forward = regex.sub(
+                cross_entropy_find,
+                replacement,
+                forward,
+                flags = regex.DOTALL | regex.MULTILINE,
+            )
+        except:
+            continue
+        # Return logits back
+        if "logits = outputs\.logits" in cross_entropy_find:
+            forward = forward.replace(
+                "logits = EMPTY_LOGITS",
+                "logits = outputs.logits",
+            )
+        # Fix vocab_size = (vocab_size=
+        forward = regex.sub(
+            r"vocab_size[ ]{0,}=[ ]{0,}\(vocab_size[ ]{0,}=",
+            "vocab_size = (",
             forward,
-            flags = re.DOTALL | re.MULTILINE,
         )
-
-        # Also consider logits
-        forward = forward.replace("NOT_RETURN_LOGITS", str(NOT_RETURN_LOGITS))
+        return forward
     pass
     return forward
 pass
 
 
-def check_nvidia():
-    # Unsloth doesn't work yet on AMD devices - we're working on it!
-    output = np.array([0,])
-    try:
-        output = subprocess.check_output("nvidia-smi --query-gpu=memory.used --format=csv", shell = True)
-        output = re.findall(rb'([\d]{1,})[\s]{1,}M', output)
-        output = np.array([int(x.decode('utf-8'))/1024 for x in output])
-    except:
-        if not torch.cuda.is_available():
-            raise RuntimeError("Unsloth: We do not support AMD / Intel machines yet - it is a work in progress!")    
-    return output
+def test_apply_fused_lm_head():
+    forwards = []
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
+    forwards.append(Qwen2VLForConditionalGeneration)
+    from transformers.models.granite.modeling_granite import GraniteForCausalLM
+    forwards.append(GraniteForCausalLM)
+    from transformers.models.gemma2.modeling_gemma2 import Gemma2ForCausalLM
+    forwards.append(Gemma2ForCausalLM)
+    from transformers.models.cohere.modeling_cohere import CohereForCausalLM
+    forwards.append(CohereForCausalLM)
+    from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
+    forwards.append(GemmaForCausalLM)
+    from transformers.models.llama.modeling_llama import LlamaForCausalLM
+    forwards.append(LlamaForCausalLM)
+    from transformers.models.mistral.modeling_mistral import MistralForCausalLM
+    forwards.append(MistralForCausalLM)
+    from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
+    forwards.append(PaliGemmaForConditionalGeneration)
+    from transformers.models.idefics.modeling_idefics import IdeficsForVisionText2Text
+    forwards.append(IdeficsForVisionText2Text)
+    from transformers.models.idefics3.modeling_idefics3 import Idefics3ForConditionalGeneration
+    forwards.append(Idefics3ForConditionalGeneration)
+    forwards = [(f.__name__, inspect.getsource(f.forward),) for f in forwards]
+    for name, forward in forwards:
+        print("=" * 30)
+        print(name)
+        print(apply_fused_lm_head(forward))
+        print("=" * 30)
+    pass
 pass
-PRE_CHECK = check_nvidia()
 
 
 # Patch remaining functions
@@ -752,7 +1179,7 @@ def patch_gradient_checkpointing(module, source):
         .replace("LAYER", layer).replace("MODULELIST_ITEM", modulelist_item)\
         .replace("ARGS", args).replace("$", spaces)
     forward = forward.replace(forward[span[0] : span[1]], replacer)
-    
+
     # Also fix init
     spaces = init.find("def")
     init = init + "\n" + (spaces + 4) * " " + "self.gradient_checkpointing = False\n\n"
@@ -782,6 +1209,34 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
         output = torch_add(
         output,
         bias,
+        alpha = scaling,
+    )
+    return output
+pass
+
+"""
+
+COMPILED_LORA_FORWARD_forced_float32 = """
+torch_addmm = torch.addmm
+torch_add   = torch.add
+# @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
+def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
+    xA = dropout(x.to(torch.float16)) @ lora_A.weight.to(torch.float16).t()
+    # output = result + scaling * xA @ lora_B.weight.t()
+    shape = result.shape
+    output = torch_addmm(
+        result.view(-1, shape[-1]),
+        xA.view(-1, xA.shape[-1]),
+        lora_B.weight.to(torch.float16).t(),
+        alpha = scaling,
+        beta = 1,
+    ).view(shape)
+
+    bias = lora_B.bias
+    if bias is not None:
+        output = torch_add(
+        output,
+        bias.to(torch.float16),
         alpha = scaling,
     )
     return output
@@ -830,16 +1285,22 @@ def patch_lora_forwards(torch_compile_options):
         )
 
         # Check failed upcasting
-        if "torch.is_autocast_enabled()" not in source:
-            source = source.replace(
-                "x = x.to(lora_A.weight.dtype)",
-                "if not torch.is_autocast_enabled(): "\
-                "result, x = "\
-                    "result.to(lora_A.weight.dtype), "\
-                    "x.to(lora_A.weight.dtype)"
-            )
+        replacements = [
+            "x = x.to(lora_A.weight.dtype)",
+            "x = self._cast_input_dtype(x, lora_A.weight.dtype)",
+        ]
+        if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+            if "torch.is_autocast_enabled()" not in source:
+                new = "if not torch.is_autocast_enabled(): "\
+                    "result, x = "\
+                        "result.to(lora_A.weight.dtype), "\
+                        "x.to(lora_A.weight.dtype)"
+                for replace in replacements:
+                    source = source.replace(replace, new)
+        else:
+            for replace in replacements:
+                source = source.replace(replace, "")
         pass
-
         source = source.replace(
             "self._check_forward_args(x, *args, **kwargs)",
             "",
@@ -847,9 +1308,14 @@ def patch_lora_forwards(torch_compile_options):
 
         if hash(source) != old_hash:
             success += 1
+            compiled_lora_forward = \
+                COMPILED_LORA_FORWARD \
+                if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0" \
+                else COMPILED_LORA_FORWARD_forced_float32
+
             forward = create_new_function(
                 f"{child}_peft_forward",
-                COMPILED_LORA_FORWARD + source,
+                compiled_lora_forward + source,
                 parent,
                 dir(eval(parent)),
                 prepend = \
@@ -915,10 +1381,10 @@ def patch_gradient_accumulation(modeling_file, module):
 
     functions = dir(modeling_file)
     module = eval(f"modeling_file.{module}")
-    try: 
+    try:
         forward = module.forward
         source = inspect.getsource(forward)
-    except: 
+    except:
         return None
     has_kwargs = tuple(inspect.signature(forward).parameters.values())[-1].kind == inspect._VAR_KEYWORD
     if has_kwargs: return None
@@ -983,10 +1449,14 @@ def unsloth_compile_transformers(
     import_from_cache      : bool = False,
     disable                : bool = False,
     return_logits          : bool = False,
+    supports_sdpa          : list = None,
 ):
+    # import transformers logging module and instantiate model_type logging instance.
+    from transformers import logging as transformers_logging
+    model_logger = transformers_logging.get_logger(f"modeling_{model_type}")
+
     # All Unsloth Zoo code licensed under LGPLv3
     disable = disable or (os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1")
-
     if fast_residual_stream:
         raise NotImplementedError("Unsloth: Fast residual stream optimization makes things slower!")
     pass
@@ -996,8 +1466,8 @@ def unsloth_compile_transformers(
     modeling_file = eval(model_location)
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"): return
 
-    # Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
-    exec("modeling_file.logger.addFilter(HideLoggingMessage('Setting `use_cache=False`'))", globals(), locals())
+    # Use transformers model_type logger to supress message: Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
+    exec("model_logger.addFilter(HideLoggingMessage('Setting `use_cache=False`'))", globals(), locals())
 
     # torch_compile_options
     UNSLOTH_COMPILE_DEBUG         = os.environ.get("UNSLOTH_COMPILE_DEBUG",         "0") == "1"
@@ -1024,12 +1494,12 @@ def unsloth_compile_transformers(
     if "UNSLOTH_FULLGRAPH" not in os.environ:
         os.environ["UNSLOTH_FULLGRAPH"] = UNSLOTH_FULLGRAPH
     else:
-        UNSLOTH_FULLGRAPH = os.environ["UNSLOTH_FULLGRAPH"] == "1"
+        UNSLOTH_FULLGRAPH = os.environ["UNSLOTH_FULLGRAPH"]
     pass
     UNSLOTH_FULLGRAPH = UNSLOTH_FULLGRAPH == "1"
 
     # Patch PEFT lora forwards
-    if fast_lora_forwards:
+    if (not disable) and fast_lora_forwards:
         print("Unsloth: Patching LoRA to make it faster")
         patch_lora_forwards(torch_compile_options)
     pass
@@ -1082,6 +1552,17 @@ def unsloth_compile_transformers(
     )
     torch_modules = [x for x in torch_modules if x not in removal]
 
+    # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
+    if supports_sdpa is not None:
+        assert(type(supports_sdpa) is list and len(supports_sdpa) == 1)
+        if len(scaled_dot_product_attention_modules) != 0:
+            if supports_sdpa[0] != False: supports_sdpa[0] = True
+        elif "_supports_sdpa = True" in full_source:
+            if supports_sdpa[0] != False: supports_sdpa[0] = True
+        else:
+            supports_sdpa[0] = False
+    pass
+
     # Get functions which are called
     called_functions = []
     for function in functions:
@@ -1100,6 +1581,14 @@ def unsloth_compile_transformers(
         try: source = inspect.getsource(source.__init__)
         except: continue
         fullgraph = not ("nn.Linear" in source or "nn.ModuleList" in source)
+
+        # Eg SiglipVisionEmbeddings and CLIPVisionEmbeddings
+        if str(module).endswith("VisionEmbeddings"):
+            # sometimes we attach a post forward call to make sure requires grad is set
+            # this breaks full graph mode and fails so instead we relax the full graph check
+            # We attach via post forward call, since the forward call only passes keyword
+            # arguments in transformers and pre_forward hook doesn't pass kwargs.
+            fullgraph = False
 
         # Check if other modules is used as well
         for another_module in torch_modules:
@@ -1196,7 +1685,13 @@ def unsloth_compile_transformers(
 
         if "attn_weights" in source or "self.self_attn" in source or "_ATTENTION_CLASSES" in init:
 
-            print(f"Unsloth: Will not compile {module}.")
+            print(f"Unsloth: Will not compile {module} since it looks like it calls attention modules!")
+            bad_torch_modules.add(module)
+        pass
+
+        if "self.encoder" in source or "BaseModelOutput" in source:
+
+            print(f"Unsloth: Will not compile {module} since it looks like a vision encoder!")
             bad_torch_modules.add(module)
         pass
 
@@ -1290,9 +1785,23 @@ def unsloth_compile_transformers(
     pass
 
     # Remove causal masks
+    do_not_remove = False
     for module in remove_causal_masks:
+        if module.endswith(("ForConditionalGeneration")):
+            do_not_remove = True
+            print(f"Unsloth: Will not remove causal mask for {model_location} since it's a VLM!")
+            break
+    pass
+    for module in remove_causal_masks:
+        if do_not_remove: continue
+
         source = eval(f"{model_location}.{module}")
         if not hasattr(source, "_update_causal_mask"): continue
+
+        # Don't remove for VLMs!
+        if module.endswith(("ForConditionalGeneration")):
+            print(f"Unsloth: Will not remove causal mask for {module} since it's a VLM!")
+            continue
 
         exec(f"{model_location}.{module}._update_causal_mask = no_update_causal_mask", globals())
         print(f"Unsloth: Removed causal mask for {module} to reduce memory usage.")
@@ -1307,7 +1816,7 @@ def unsloth_compile_transformers(
             # Disable if torch < 2.5 or V100s 7.0 (Tesla T4 7.5 works) or old Triton < 3
             if OLD_CUDA_ARCH_VERSION or OLD_TORCH_VERSION or OLD_TRITON_VERSION:
                 continue
-            
+
             module_class = eval(f"modeling_file.{module}")
             if hasattr(module_class, "forward") and issubclass(module_class, GenerationMixin):
                 try:
@@ -1532,7 +2041,8 @@ def unsloth_compile_transformers(
                 _cross_entropy_code + "\n"
         )
     except Exception as exception:
-        raise RuntimeError(exception)
+        if not disable:
+            raise RuntimeError(exception)
         combined_module = None
 
     if compile_torch_modules and not disable:
