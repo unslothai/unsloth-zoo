@@ -803,7 +803,7 @@ else:
         logits = logits * (\\2)
     if (\\3) != ():
         logits = logits / (\\3)
-    if (\\4) is not None:
+    if (\\4) is not None or (\\4) != ():
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
