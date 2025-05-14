@@ -36,6 +36,8 @@ SKIP_QUANTIZATION_MODULES = [
     "multi_modal_projector", # Llama 3.2 Vision, Pixtral, Llava
     "merger",                # Qwen2 VL
     "modality_projection",   # Idefics, SmolVLM
+    "router",                # MoE Router
+    "gate",                  # MoE Router
 ]
 
 def get_peft_regex(
@@ -272,7 +274,7 @@ def requires_grad_for_gradient_checkpointing(model):
     module_name = "model." + ".".join(name_components[:final_where])
     module = eval(module_name)
 
-    if hasattr(module, "config") and module.config.__class__.__name__ == "CLIPVisionConfig":
+    if hasattr(module, "config") and (module.config.__class__.__name__ in ("CLIPVisionConfig", "SiglipVisionConfig",)):
         # CLIP - backtrack to get_input_embeddings since requires_grad fails!
         old_module = model
         for module_name, module in model.named_modules():

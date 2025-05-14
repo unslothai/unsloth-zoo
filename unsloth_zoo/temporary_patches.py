@@ -19,6 +19,9 @@ from typing import Union, List, Any, Tuple, Dict, Callable, Optional
 import inspect
 import torch
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 UNSLOTH_COMPILE_DEBUG         = os.environ.get("UNSLOTH_COMPILE_DEBUG",         "0") == "1"
 UNSLOTH_COMPILE_MAXIMUM       = os.environ.get("UNSLOTH_COMPILE_MAXIMUM",       "0") == "1"
@@ -100,17 +103,25 @@ def patch_Gemma3Processor():
             # Replace image tokens by the full expanded sequence
             batch_num_crops = to_py_obj(image_inputs.pop("num_crops"))
             text_with_crops = text
-            for batch_idx, (prompt, images, num_crops) in enumerate(zip(text, batched_images, batch_num_crops)):
+            for batch_idx, (prompt, images_for_item, num_crops_for_item) in enumerate(zip(text, batched_images, batch_num_crops)):
                 image_indexes = [m.start() for m in re.finditer(self.boi_token, prompt)]
 
-                if len(images) != len(image_indexes):
+                if len(images_for_item) != len(image_indexes):
                     raise ValueError(
-                        f"Prompt contained {len(image_indexes)} image tokens but received {len(images)} images."
+                        f"Prompt contained {len(image_indexes)} image tokens but received {len(images_for_item)} images."
                     )
+                
+                iterable_num_crops = num_crops_for_item
+                
+                if isinstance(num_crops_for_item, int):
+                        if len(image_indexes) > 0:
+                            iterable_num_crops = [num_crops_for_item] + [0] * (len(image_indexes) - 1)
+                        else:
+                            iterable_num_crops = []
 
                 # Insert additional image tokens for Pan-and-Scan crops
-                for num, idx in reversed(list(zip(num_crops, image_indexes))):
-                    if num:
+                for num, idx in reversed(list(zip(iterable_num_crops, image_indexes))):
+                    if isinstance(num, int) and num > 0:
                         formatted_image_text = (
                             f"Here is the original image {self.boi_token} and here are some crops to help you see better "
                             + " ".join([self.boi_token] * num)
@@ -153,7 +164,6 @@ def patch_Gemma3Processor():
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
-
 def patch_Gemma3ForConditionalGeneration():
     try:
         import transformers.models.gemma3.modeling_gemma3
@@ -168,8 +178,8 @@ def patch_Gemma3ForConditionalGeneration():
     )
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
-        pixel_values: torch.FloatTensor = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None,
@@ -180,7 +190,6 @@ def patch_Gemma3ForConditionalGeneration():
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **lm_kwargs,
     ) -> Union[Tuple, Gemma3CausalLMOutputWithPast]:
@@ -191,7 +200,6 @@ def patch_Gemma3ForConditionalGeneration():
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         is_training = token_type_ids is not None and labels is not None
 
@@ -212,8 +220,6 @@ def patch_Gemma3ForConditionalGeneration():
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0) + 1  # Gemma3 positions are 1-indexed
 
         # Merge text and images
         if pixel_values is not None:
@@ -261,7 +267,6 @@ def patch_Gemma3ForConditionalGeneration():
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
             cache_position=cache_position,
             logits_to_keep=logits_to_keep,
             **lm_kwargs,
@@ -292,9 +297,6 @@ def patch_Gemma3ForConditionalGeneration():
             flat_labels = shift_labels.view(-1).to(shift_logits.device)
             loss = loss_fct(flat_logits, flat_labels)
         loss = outputs.loss
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
 
         return Gemma3CausalLMOutputWithPast(
             loss=loss,
@@ -571,3 +573,408 @@ def patch_Gemma3Attention():
     return
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention)
+
+def patch_SmolVLMForConditionalGeneration_forward():
+    try:
+        import transformers.models.smolvlm.modeling_smolvlm
+    except:
+        return
+
+    from typing import List, Optional, Tuple, Union
+
+    from transformers.models.smolvlm.modeling_smolvlm import (
+        CrossEntropyLoss,
+        SmolVLMCausalLMOutputWithPast,
+        SmolVLMForConditionalGeneration,
+    )
+
+    # Check if the fix is already present (either from Transformers library or previous Unsloth patch)
+    # We look for the specific device handling code that fixes torch.compile indentation errors,
+    # rather than an Unsloth marker, to handle cases where the fix comes from upstream
+    current_forward_source = inspect.getsource(
+        transformers.models.smolvlm.modeling_smolvlm.SmolVLMForConditionalGeneration.forward
+    )
+    if "shift_labels.view(-1).to(shift_logits.device)" in current_forward_source:
+        return  # Already patched
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        pixel_attention_mask: Optional[torch.BoolTensor] = None,
+        image_hidden_states: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+    ) -> Union[Tuple, SmolVLMCausalLMOutputWithPast]:
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_attention_mask=pixel_attention_mask,
+            image_hidden_states=image_hidden_states,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            # Upcast to float if we need to compute the loss to avoid potential precision issues
+            logits = logits.float()
+            labels = labels.to(logits.device)
+            # Shift so that tokens < n predict n
+            if attention_mask is not None:
+                # we use the input attention mask to shift the logits and labels, because it is 2D.
+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft
+                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(
+                    logits.device
+                )
+                shift_logits = logits[..., :-1, :][
+                    shift_attention_mask != 0
+                ].contiguous()
+                shift_labels = labels[..., 1:][shift_attention_mask != 0].contiguous()
+            else:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1).to(
+                    shift_logits.device
+                ),  # The fix is here - explicit device conversion
+            )
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return SmolVLMCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=outputs.image_hidden_states,
+        )
+
+    # Check if we can patch the model by comparing signatures
+    old_keys = inspect.signature(
+        transformers.models.smolvlm.modeling_smolvlm.SmolVLMForConditionalGeneration.forward
+    ).parameters
+    new_keys = inspect.signature(forward).parameters
+
+    if old_keys != new_keys:
+        pass
+        # print(
+        #     "Unsloth: Failed to patch SmolVLMForConditionalGeneration forward function."
+        # )
+    else:
+        transformers.models.smolvlm.modeling_smolvlm.SmolVLMForConditionalGeneration.forward = (
+            forward
+        )
+        pass
+        # print(
+        #     "Unsloth: Successfully patched SmolVLMForConditionalGeneration for better torch.compile compatibility."
+        # )
+
+    return
+
+
+# Add the patch to the TEMPORARY_PATCHES list
+TEMPORARY_PATCHES.append(patch_SmolVLMForConditionalGeneration_forward)
+
+
+def patch_CsmBackboneModelEmbeddings_forward():
+    try:
+        import transformers.models.csm.modeling_csm
+    except:
+        return
+
+
+    def forward(self, input_ids):
+        input_embeds = self.embed_audio_tokens(input_ids + self.audio_tokens_offsets)
+        # fix for dtype cast
+        dtype = input_embeds.dtype
+        input_embeds = input_embeds.sum(dim=2).to(dtype)
+        return input_embeds
+
+    old_keys = inspect.signature(
+        transformers.models.csm.modeling_csm.CsmBackboneModelEmbeddings.forward
+    ).parameters
+    new_keys = inspect.signature(forward).parameters
+
+    if old_keys != new_keys:
+        print("Unsloth: Failed to patch CsmBackboneModelEmbeddings forward.")
+    else:
+        transformers.models.csm.modeling_csm.CsmBackboneModelEmbeddings.forward = forward
+
+    
+TEMPORARY_PATCHES.append(patch_CsmBackboneModelEmbeddings_forward)
+
+def patch_CsmDepthDecoderForCausalLM_forward():
+    try:
+        import transformers.models.csm.modeling_csm
+    except:
+        return
+
+    from transformers.modeling_outputs import CausalLMOutputWithPast 
+    from transformers.models.csm.modeling_csm import Cache, Unpack, KwargsForCausalLM
+    from transformers.loss.loss_utils import ForCausalLMLoss
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        backbone_last_hidden_state: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[KwargsForCausalLM],
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            backbone_last_hidden_state=backbone_last_hidden_state,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        if isinstance(logits_to_keep, int):
+            if logits_to_keep == 0:
+                # skip idx 0 logits since it's for the concatenated backbone last hidden state
+                slice_indices = slice(1, None)
+            else:
+                slice_indices = slice(-logits_to_keep, None)
+        else:
+            slice_indices = logits_to_keep
+
+        logits = self.codebooks_head(
+            hidden_states[:, slice_indices, :], cache_position[slice_indices] if cache_position is not None else None
+        )
+        logits = logits.contiguous()
+
+        loss = None
+        if labels is not None:
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = ForCausalLMLoss
+            loss = loss_fct(
+                logits=logits, labels=None, vocab_size=self.config.vocab_size, shift_labels=shift_labels, **kwargs
+            )
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    old_keys = inspect.signature(
+        transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM.forward
+    ).parameters
+    new_keys = inspect.signature(forward).parameters
+
+    if old_keys != new_keys:
+        print("Unsloth: Failed to patch CsmDepthDecoderForCausalLM forward.")
+    else:
+        transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM.forward = forward
+
+
+TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
+
+
+def patch_CsmForConditionalGeneration_forward():
+    try:
+        import transformers.models.csm.modeling_csm
+    except:
+        return
+
+    from transformers.models.csm.modeling_csm import Cache, Unpack, KwargsForCausalLM, CsmOutputWithPast
+    from transformers.loss.loss_utils import ForCausalLMLoss
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        input_values: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        input_values_cutoffs: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[KwargsForCausalLM],
+    ) -> Union[Tuple, CsmOutputWithPast]:
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        if input_ids is not None and input_ids.ndim == 2:
+            merged_inputs = self._merge_input_ids_with_input_values(
+                input_ids, input_values, input_values_cutoffs, labels
+            )
+            inputs_embeds = merged_inputs["inputs_embeds"]
+            labels = merged_inputs["labels"]
+            input_ids = None
+
+        backbone_outputs = self.backbone_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        backbone_hidden_states = backbone_outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        backbone_logits = self.lm_head(backbone_hidden_states[:, slice_indices, :])
+
+        loss = None
+        backbone_loss = None
+        depth_decoder_loss = None
+        depth_decoder_outputs = None
+        if labels is not None:
+            # select first codebook as labels for the backbone model
+            backbone_labels = labels[:, :, 0]
+            backbone_loss = self.loss_function(
+                logits=backbone_logits, labels=backbone_labels, vocab_size=self.config.vocab_size, **kwargs
+            )
+
+            # for the depth decoder, we need to select the frames to train on
+            # those are frames where the label is not uniformly `ignore_index` along the codebook dimension
+            train_mask = ~(labels[:, :, 1:] == -100).all(dim=-1)
+            depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
+            # add place holder in position 0 that will be replaced by the backbone_last_hidden_state
+            depth_decoder_input_ids = torch.nn.functional.pad(depth_decoder_input_ids, (1, 0), value=0)
+
+            train_idxs = train_mask.nonzero(as_tuple=True)
+            backbone_last_hidden_states = backbone_hidden_states[train_idxs[0], train_idxs[1] - 1, :]
+            depth_decoder_labels = labels[train_mask]
+
+            # Fix: explicitly pass kwargs to depth decoder to get access to num_items_in_batch
+            depth_decoder_kwargs = kwargs.copy()
+            # backbone loss num_items is based on the 0th codebooks index
+            # while depth loss num_items is based on the the remaining 31 codebooks
+            # therefore num_items_in_batch should be multiplied by 31
+            if 'num_items_in_batch' in depth_decoder_kwargs:
+                depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
+
+            # make sure return_dict is set to True
+            depth_decoder_kwargs.pop('return_dict', None)
+
+            depth_decoder_outputs = self.depth_decoder(
+                input_ids=depth_decoder_input_ids,
+                backbone_last_hidden_state=backbone_last_hidden_states,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                labels=depth_decoder_labels,
+                # Fix: explicitly pass kwargs to depth decoder to get access to num_items_in_batch
+                **depth_decoder_kwargs,
+            )
+
+            depth_decoder_loss = depth_decoder_outputs.loss
+            loss = backbone_loss + depth_decoder_loss
+
+        return CsmOutputWithPast(
+            loss=loss,
+            backbone_loss=backbone_loss,
+            depth_decoder_loss=depth_decoder_loss,
+            logits=backbone_logits,
+            past_key_values=backbone_outputs.past_key_values,
+            hidden_states=backbone_outputs.hidden_states,
+            attentions=backbone_outputs.attentions,
+            depth_decoder_logits=depth_decoder_outputs.logits if depth_decoder_outputs is not None else None,
+            depth_decoder_past_key_values=depth_decoder_outputs.past_key_values
+            if depth_decoder_outputs is not None
+            else None,
+            depth_decoder_hidden_states=depth_decoder_outputs.hidden_states
+            if depth_decoder_outputs is not None
+            else None,
+            depth_decoder_attentions=depth_decoder_outputs.attentions if depth_decoder_outputs is not None else None,
+        )
+
+
+    old_keys = inspect.signature(
+        transformers.models.csm.modeling_csm.CsmForConditionalGeneration.forward
+    ).parameters
+    new_keys = inspect.signature(forward).parameters
+
+    if old_keys != new_keys:
+        print("Unsloth: Failed to patch CsmForConditionalGeneration forward.")
+    else:
+        transformers.models.csm.modeling_csm.CsmForConditionalGeneration.forward = forward
+
+TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)

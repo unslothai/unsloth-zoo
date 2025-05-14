@@ -154,6 +154,7 @@ def post_patch_loss_function(model):
 pass
 
 
+torch_cuda_device = torch.cuda.device
 def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,
@@ -167,16 +168,17 @@ def fused_linear_cross_entropy(
     # All Unsloth Zoo code licensed under LGPLv3
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
-    loss = linear_cross_entropy(
-        hidden_states.to(lm_weight.dtype),
-        lm_weight,
-        targets      = labels,
-        ignore_index = ignore_index,
-        softcap      = logit_softcapping,
-        reduction    = reduction,
-        shift        = True,
-        filter_eps   = accuracy_threshold,
-    )
+    with torch_cuda_device(lm_weight.device):
+        loss = linear_cross_entropy(
+            hidden_states.to(lm_weight.dtype),
+            lm_weight,
+            targets      = labels,
+            ignore_index = ignore_index,
+            softcap      = logit_softcapping,
+            reduction    = reduction,
+            shift        = True,
+            filter_eps   = accuracy_threshold,
+        )
     if num_items_in_batch is not None: loss = loss / num_items_in_batch
     return loss
 pass
@@ -223,7 +225,7 @@ pass
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
-def _unsloth_get_batch_samples(self, epoch_iterator, num_batches):
+def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
     num_items_in_batch = None
@@ -294,12 +296,11 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches):
                     [((x["labels"][..., 1:] != -100) & (x["attention_mask"][..., 1:] != 0))\
                     .sum() for x in batch_samples]
                 )
-            if self.args.average_tokens_across_devices:
-                num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum().item()
-            if torch.is_tensor(num_items_in_batch):
-                num_items_in_batch = num_items_in_batch.item()
-            pass
 
+            if self.args.average_tokens_across_devices:
+                num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
+            if device is not None and torch.is_tensor(num_items_in_batch):
+                num_items_in_batch = num_items_in_batch.to(device)
         except Exception as exception:
             raise RuntimeError(exception)
     pass
