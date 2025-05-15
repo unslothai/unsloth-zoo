@@ -18,6 +18,7 @@ import re
 from typing import Union, List, Any, Tuple, Dict, Callable, Optional
 import inspect
 import torch
+import torch.nn
 import os
 import logging
 
@@ -272,6 +273,7 @@ def patch_Gemma3ForConditionalGeneration():
             **lm_kwargs,
         )
         labels = None
+        # We NEVER ENTER if labels is not None: since we already accounted for it
 
 
         logits = outputs.logits
@@ -307,13 +309,109 @@ def patch_Gemma3ForConditionalGeneration():
             image_hidden_states=image_features if pixel_values is not None else None,
         )
     pass
+
+    old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration.forward).parameters
+    new_keys = inspect.signature(forward).parameters
+    if old_keys != new_keys:
+        pass
+    else:
+        transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration.forward = forward
+        return
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        pixel_values: torch.FloatTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **lm_kwargs,
+    ) -> Union[Tuple, Gemma3CausalLMOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        if labels is not None and attention_mask is not None:
+            attention_mask = attention_mask.to(device = labels.device)
+            labels[attention_mask == 0] = -100
+        pass
+        outputs = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            token_type_ids=token_type_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            labels=labels,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            **lm_kwargs,
+        )
+        labels = None
+        # We NEVER ENTER if labels is not None: since we already accounted for it
+
+        hidden_states = outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            # Upcast to float if we need to compute the loss to avoid potential precision issues
+            logits = logits.float()
+            shift_logits = logits[..., :-1, :]
+            shift_labels = labels[..., 1:]
+            if attention_mask is not None:
+                # we use the input attention mask to shift the logits and labels, because it is 2D.
+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft
+                shift_attention_mask = attention_mask[:, -shift_logits.shape[1] :].to(logits.device)
+                shift_logits = shift_logits[shift_attention_mask.to(logits.device) != 0].contiguous()
+                shift_labels = shift_labels[shift_attention_mask.to(shift_labels.device) != 0].contiguous()
+            else:
+                shift_logits = shift_logits.contiguous()
+                shift_labels = shift_labels.contiguous()
+            # Flatten the tokens
+            loss_fct = nn.CrossEntropyLoss()
+
+            flat_logits = shift_logits.view(-1, self.config.text_config.vocab_size)
+            flat_labels = shift_labels.view(-1).to(shift_logits.device)
+            loss = loss_fct(flat_logits, flat_labels)
+        loss = outputs.loss
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return Gemma3CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=outputs.image_hidden_states,
+        )
+    pass
+
     old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration.forward).parameters
     new_keys = inspect.signature(forward).parameters
     if old_keys != new_keys:
         print("Unsloth: Failed to patch Gemma3ForConditionalGeneration.")
     else:
         transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration.forward = forward
-    return
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration)
 
@@ -395,12 +493,21 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
 
         return causal_mask
     pass
-    old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration._update_causal_mask).parameters
-    new_keys = inspect.signature(_update_causal_mask).parameters
-    if old_keys != new_keys:
-        print("Unsloth: Failed to patch Gemma3ForConditionalGeneration.")
+
+    if hasattr(transformers.models.gemma3.modeling_gemma3, "Gemma3Model"):
+        old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3Model._update_causal_mask).parameters
+        new_keys = inspect.signature(_update_causal_mask).parameters
+        if old_keys != new_keys:
+            print("Unsloth: Failed to patch Gemma3Model.")
+        else:
+            transformers.models.gemma3.modeling_gemma3.Gemma3Model._update_causal_mask = _update_causal_mask
     else:
-        transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration._update_causal_mask = _update_causal_mask
+        old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration._update_causal_mask).parameters
+        new_keys = inspect.signature(_update_causal_mask).parameters
+        if old_keys != new_keys:
+            print("Unsloth: Failed to patch Gemma3ForConditionalGeneration._update_causal_mask.")
+        else:
+            transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration._update_causal_mask = _update_causal_mask
     return
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
@@ -583,7 +690,6 @@ def patch_SmolVLMForConditionalGeneration_forward():
     from typing import List, Optional, Tuple, Union
 
     from transformers.models.smolvlm.modeling_smolvlm import (
-        CrossEntropyLoss,
         SmolVLMCausalLMOutputWithPast,
         SmolVLMForConditionalGeneration,
     )
@@ -675,7 +781,7 @@ def patch_SmolVLMForConditionalGeneration_forward():
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1).to(
@@ -721,3 +827,260 @@ def patch_SmolVLMForConditionalGeneration_forward():
 
 # Add the patch to the TEMPORARY_PATCHES list
 TEMPORARY_PATCHES.append(patch_SmolVLMForConditionalGeneration_forward)
+
+
+def patch_CsmBackboneModelEmbeddings_forward():
+    try:
+        import transformers.models.csm.modeling_csm
+    except:
+        return
+
+
+    def forward(self, input_ids):
+        input_embeds = self.embed_audio_tokens(input_ids + self.audio_tokens_offsets)
+        # fix for dtype cast
+        dtype = input_embeds.dtype
+        input_embeds = input_embeds.sum(dim=2).to(dtype)
+        return input_embeds
+
+    old_keys = inspect.signature(
+        transformers.models.csm.modeling_csm.CsmBackboneModelEmbeddings.forward
+    ).parameters
+    new_keys = inspect.signature(forward).parameters
+
+    if old_keys != new_keys:
+        print("Unsloth: Failed to patch CsmBackboneModelEmbeddings forward.")
+    else:
+        transformers.models.csm.modeling_csm.CsmBackboneModelEmbeddings.forward = forward
+
+    
+TEMPORARY_PATCHES.append(patch_CsmBackboneModelEmbeddings_forward)
+
+def patch_CsmDepthDecoderForCausalLM_forward():
+    try:
+        import transformers.models.csm.modeling_csm
+    except:
+        return
+
+    from transformers.modeling_outputs import CausalLMOutputWithPast 
+    from transformers.models.csm.modeling_csm import Cache, Unpack, KwargsForCausalLM
+    from transformers.loss.loss_utils import ForCausalLMLoss
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        backbone_last_hidden_state: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[KwargsForCausalLM],
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            backbone_last_hidden_state=backbone_last_hidden_state,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        if isinstance(logits_to_keep, int):
+            if logits_to_keep == 0:
+                # skip idx 0 logits since it's for the concatenated backbone last hidden state
+                slice_indices = slice(1, None)
+            else:
+                slice_indices = slice(-logits_to_keep, None)
+        else:
+            slice_indices = logits_to_keep
+
+        logits = self.codebooks_head(
+            hidden_states[:, slice_indices, :], cache_position[slice_indices] if cache_position is not None else None
+        )
+        logits = logits.contiguous()
+
+        loss = None
+        if labels is not None:
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = ForCausalLMLoss
+            loss = loss_fct(
+                logits=logits, labels=None, vocab_size=self.config.vocab_size, shift_labels=shift_labels, **kwargs
+            )
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    old_keys = inspect.signature(
+        transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM.forward
+    ).parameters
+    new_keys = inspect.signature(forward).parameters
+
+    if old_keys != new_keys:
+        print("Unsloth: Failed to patch CsmDepthDecoderForCausalLM forward.")
+    else:
+        transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM.forward = forward
+
+
+TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
+
+
+def patch_CsmForConditionalGeneration_forward():
+    try:
+        import transformers.models.csm.modeling_csm
+    except:
+        return
+
+    from transformers.models.csm.modeling_csm import Cache, Unpack, KwargsForCausalLM, CsmOutputWithPast
+    from transformers.loss.loss_utils import ForCausalLMLoss
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        input_values: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        input_values_cutoffs: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[KwargsForCausalLM],
+    ) -> Union[Tuple, CsmOutputWithPast]:
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        if input_ids is not None and input_ids.ndim == 2:
+            merged_inputs = self._merge_input_ids_with_input_values(
+                input_ids, input_values, input_values_cutoffs, labels
+            )
+            inputs_embeds = merged_inputs["inputs_embeds"]
+            labels = merged_inputs["labels"]
+            input_ids = None
+
+        backbone_outputs = self.backbone_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        backbone_hidden_states = backbone_outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        backbone_logits = self.lm_head(backbone_hidden_states[:, slice_indices, :])
+
+        loss = None
+        backbone_loss = None
+        depth_decoder_loss = None
+        depth_decoder_outputs = None
+        if labels is not None:
+            # select first codebook as labels for the backbone model
+            backbone_labels = labels[:, :, 0]
+            backbone_loss = self.loss_function(
+                logits=backbone_logits, labels=backbone_labels, vocab_size=self.config.vocab_size, **kwargs
+            )
+
+            # for the depth decoder, we need to select the frames to train on
+            # those are frames where the label is not uniformly `ignore_index` along the codebook dimension
+            train_mask = ~(labels[:, :, 1:] == -100).all(dim=-1)
+            depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
+            # add place holder in position 0 that will be replaced by the backbone_last_hidden_state
+            depth_decoder_input_ids = torch.nn.functional.pad(depth_decoder_input_ids, (1, 0), value=0)
+
+            train_idxs = train_mask.nonzero(as_tuple=True)
+            backbone_last_hidden_states = backbone_hidden_states[train_idxs[0], train_idxs[1] - 1, :]
+            depth_decoder_labels = labels[train_mask]
+
+            # Fix: explicitly pass kwargs to depth decoder to get access to num_items_in_batch
+            depth_decoder_kwargs = kwargs.copy()
+            # backbone loss num_items is based on the 0th codebooks index
+            # while depth loss num_items is based on the the remaining 31 codebooks
+            # therefore num_items_in_batch should be multiplied by 31
+            if 'num_items_in_batch' in depth_decoder_kwargs:
+                depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
+
+            # make sure return_dict is set to True
+            depth_decoder_kwargs.pop('return_dict', None)
+
+            depth_decoder_outputs = self.depth_decoder(
+                input_ids=depth_decoder_input_ids,
+                backbone_last_hidden_state=backbone_last_hidden_states,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                labels=depth_decoder_labels,
+                # Fix: explicitly pass kwargs to depth decoder to get access to num_items_in_batch
+                **depth_decoder_kwargs,
+            )
+
+            depth_decoder_loss = depth_decoder_outputs.loss
+            loss = backbone_loss + depth_decoder_loss
+
+        return CsmOutputWithPast(
+            loss=loss,
+            backbone_loss=backbone_loss,
+            depth_decoder_loss=depth_decoder_loss,
+            logits=backbone_logits,
+            past_key_values=backbone_outputs.past_key_values,
+            hidden_states=backbone_outputs.hidden_states,
+            attentions=backbone_outputs.attentions,
+            depth_decoder_logits=depth_decoder_outputs.logits if depth_decoder_outputs is not None else None,
+            depth_decoder_past_key_values=depth_decoder_outputs.past_key_values
+            if depth_decoder_outputs is not None
+            else None,
+            depth_decoder_hidden_states=depth_decoder_outputs.hidden_states
+            if depth_decoder_outputs is not None
+            else None,
+            depth_decoder_attentions=depth_decoder_outputs.attentions if depth_decoder_outputs is not None else None,
+        )
+
+
+    old_keys = inspect.signature(
+        transformers.models.csm.modeling_csm.CsmForConditionalGeneration.forward
+    ).parameters
+    new_keys = inspect.signature(forward).parameters
+
+    if old_keys != new_keys:
+        print("Unsloth: Failed to patch CsmForConditionalGeneration forward.")
+    else:
+        transformers.models.csm.modeling_csm.CsmForConditionalGeneration.forward = forward
+
+TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
