@@ -62,7 +62,10 @@ def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages)
     new = new_x - torch.logsumexp(new_logits, dim = -1)
 
     # Reverse KL
-    kl_i = torch.exp(old - new) - (old - new) - 1.0
+    if beta != 0.0:
+        kl_i = torch.exp(old - new) - (old - new) - 1.0
+    else:
+        kl_i = 0.0 # set it to 0 to not effect the downstream computation
     # Full correct reverse KL divergence?? Missing term maybe?
     # kl_i = torch.exp(new) * kl_i
 
