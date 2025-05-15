@@ -294,6 +294,8 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                 num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
             if device is not None and torch.is_tensor(num_items_in_batch):
                 num_items_in_batch = num_items_in_batch.to(device)
+            num_items_in_batch = num_items_in_batch.item() if isinstance(num_items_in_batch, torch.Tensor) else num_items_in_batch
+            num_items_in_batch = int(num_items_in_batch) if num_items_in_batch is not None else None
         except Exception as exception:
             raise RuntimeError(exception)
     pass
