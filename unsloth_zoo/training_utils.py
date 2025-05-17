@@ -403,6 +403,7 @@ def unsloth_train(trainer):
                 n_items = torch.stack([
                     torch.count_nonzero(x["labels"][..., 1:] != -100) for x in batches
                 ]).sum()
+                n_items = int(n_items.item())
 
                 # Gradient accumulation
                 for batch in batches:
