@@ -49,8 +49,22 @@ RL_REPLACEMENTS["selective_log_softmax"] = selective_log_softmax
 
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
-def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages):
-    # All Unsloth Zoo code licensed under LGPLv3
+def grpo_compute_loss(
+    old_logits,
+    new_logits,
+    input_ids,
+    mask,
+    beta,
+    advantages,
+    **kwargs
+):
+    # Set defaults for optional arguments
+    loss_type = kwargs.get("loss_type", "grpo")
+    epsilon_low = kwargs.get("epsilon_low", 0.2)
+    epsilon_high = kwargs.get("epsilon_high", 0.2)
+    max_completion_length = kwargs.get("max_completion_length", 8192)
+    delta = kwargs.get("delta", None)
+
     old_logits = old_logits.to(torch.float32)
     new_logits = new_logits.to(torch.float32)
     input_ids  = input_ids.unsqueeze(-1)
@@ -62,6 +76,7 @@ def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages)
     new = new_x - torch.logsumexp(new_logits, dim = -1)
 
     # Reverse KL
+    # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
     if beta != 0.0:
         kl_i = torch.exp(old - new) - (old - new) - 1.0
     else:
@@ -72,17 +87,37 @@ def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages)
     # Below is forward KL (normal KL)
     # kl_i = torch.exp(old) * (old - new)
 
+    coef_1 = torch.exp(new - old)
+    coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
+
+    if delta is not None:
+        loss_1 = torch.clamp(coef_1, max=delta) * advantages.unsqueeze(1)
+    else:
+        loss_1 = coef_1 * advantages.unsqueeze(1)
+
+    
     # Must detach - otherwise gradients are not propagated correctly!
     # exp(x - x) == 1
-    loss_i = torch.exp(new - new.detach()) * advantages.unsqueeze(1)
-    loss_i = -(loss_i - beta * kl_i)
+    # loss_i = torch.exp(new - new.detach()) * advantages.unsqueeze(1)
+
+    loss_2 = coef_2 * advantages.unsqueeze(1)
+    loss_i = -torch.min(loss_1, loss_2)
+    if beta != 0.0:
+        loss_i = loss_i + beta * kl_i
 
     mask = mask.to(torch.float32)
     n_mask_per_reward = mask.sum(1)
 
-    # See https://github.com/huggingface/trl/pull/2881
-    loss_per_reward = (loss_i * mask).sum(1) / n_mask_per_reward
-    loss = loss_per_reward.mean()
+    # https://github.com/huggingface/trl/blob/main/trl/trainer/grpo_trainer.py#L1363-L1370
+    if loss_type == "grpo":
+        loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
+    elif loss_type == "bnpo":
+        loss = (loss_i * mask).sum() / mask.sum().clamp(min=1.0)
+    elif loss_type == "dr_grpo":
+        loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}")
+
     # loss = (loss_i * mask).sum() / mask.sum()
     
     # Get metrics as well which are folded
@@ -107,14 +142,17 @@ RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
 class UnslothEfficientGRPO(torch.autograd.Function):
     # All Unsloth Zoo code licensed under LGPLv3
     @staticmethod
-    def forward(ctx, _new_hidden_states, _old_hidden_states, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1):
+    def forward(ctx, _new_hidden_states, _old_hidden_states, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None):
+        if extra_kwargs is None:
+            extra_kwargs = {}
+        print(f'Extra kwargs: {extra_kwargs}, beta = {beta}')
         def compute_loss(new_hidden_states, old_hidden_states, input_ids, mask, advantages, scaling):
             new_logits = torch.matmul(new_hidden_states, lm_head.t())
             new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             old_logits = torch.matmul(old_hidden_states, lm_head.t())
             old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             loss, completion_length, mean_kl = grpo_compute_loss(
-                old_logits, new_logits, input_ids, mask, beta, advantages,
+                old_logits, new_logits, input_ids, mask, beta, advantages, **extra_kwargs
             )
             # Scale loss if needed for mixed precision training
             scaled_loss = loss * scaling
@@ -188,7 +226,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, dcompletion_length, dmean_kl):
         (grad_input,) = ctx.saved_tensors
-        return (grad_input, None, None, None, None, None, None, None, None,)
+        return (grad_input, None, None, None, None, None, None, None, None, None)
     pass
 pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
@@ -201,6 +239,7 @@ def grpo_accumulated_loss(
     completion_mask,
     advantages,
     n_chunks = -1,
+    **kwargs,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     bsz, qlen = input_ids.shape
@@ -226,7 +265,7 @@ def grpo_accumulated_loss(
             new_hidden_states, old_hidden_states, lm_head,
             completion_input_ids, completion_mask, advantages, trainer.beta,
             trainer.accelerator.scaler,
-            n_chunks, 
+            n_chunks, kwargs # pass kwargs as a dict
         )
         return loss, completion_length, mean_kl
 
