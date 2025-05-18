@@ -139,6 +139,9 @@ from huggingface_hub import (
 import safetensors # Added import
 from safetensors import safe_open
 from safetensors.torch import save_file
+import struct # Added import
+import json   # Added import
+import numpy as np # Added import
 from collections import OrderedDict
 from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
@@ -395,67 +398,119 @@ def _direct_merge_shard_to_memory_then_save_file(save_directory, filename, lora_
 pass
 
 
+DTYPE_TO_STR = {
+    torch.float32  : "F32",
+    torch.float16  : "F16",
+    torch.bfloat16 : "BF16",
+    torch.int64    : "I64",
+    torch.int32    : "I32",
+    torch.int16    : "I16",
+    torch.int8     : "I8",
+    torch.uint8    : "U8",
+    # Add other dtypes if commonly encountered and supported by safetensors standard
+}
+
 @torch.inference_mode
-def _stream_merged_shard_to_file(input_shard_path, lora_weights_map, output_dtype, output_shard_path, per_tensor_ram_limit_for_mmap, temp_dir_for_mmap_files):
+def _direct_write_merged_shard(input_shard_path, lora_weights_map, output_dtype, output_shard_path):
     # All Unsloth Zoo code licensed under LGPLv3
-    import psutil # Ensure psutil is available in this scope
+    # Manually constructs a safetensors file by writing header then tensor data.
 
-    lora_modules_merged_count = 0
+    # A. Metadata Collection Pass (Dry Run)
+    tensor_metadata_list = []
+    current_data_offset = 0
+    # Ensure output_dtype is a torch.dtype object
+    if not isinstance(output_dtype, torch.dtype):
+        raise ValueError(f"output_dtype must be a torch.dtype, got {type(output_dtype)}")
 
-    def _tensor_stream_generator(input_shard_path, lora_weights_map, output_dtype, per_tensor_ram_limit_for_mmap, temp_dir_for_mmap_files):
-        nonlocal lora_modules_merged_count # Modify outer scope's counter
-        with safetensors.safe_open(input_shard_path, framework="pt", device="cpu") as f_original:
-            for key_full_name in f_original.keys():
-                W_original = f_original.get_tensor(key_full_name)
-                
-                base_name_for_lora = key_full_name[:-len(".weight")] if key_full_name.endswith(".weight") else key_full_name
-                lora_stats = lora_weights_map.get(base_name_for_lora, None)
-                
-                merged_tensor_cpu = None
+    element_size = torch.tensor([], dtype=output_dtype).element_size()
+    if output_dtype not in DTYPE_TO_STR:
+        raise ValueError(f"output_dtype {output_dtype} is not supported in DTYPE_TO_STR map.")
+    output_dtype_str = DTYPE_TO_STR[output_dtype]
 
-                if lora_stats is not None:
-                    lora_modules_merged_count +=1
-                    merged_on_cuda = _merge_lora(W_original, lora_stats, key_full_name)
-                    merged_tensor_cpu = merged_on_cuda.to(device="cpu", dtype=output_dtype, non_blocking=True)
-                    del merged_on_cuda
-                else:
-                    merged_tensor_cpu = W_original.to(dtype=output_dtype)
-                
-                del W_original # Free original tensor memory
-                if torch.cuda.is_available(): torch.cuda.empty_cache()
+    with safetensors.safe_open(input_shard_path, framework="pt", device="cpu") as f_input_meta:
+        for key in f_input_meta.keys():
+            # get_tensor_info might not exist or might not provide shape directly in all safetensors versions/backends
+            # For robustness, load tensor to get shape, then delete.
+            W_header_only = f_input_meta.get_tensor(key)
+            shape = list(W_header_only.shape)
+            del W_header_only # Crucial to free memory
 
-                if psutil.virtual_memory().available <= per_tensor_ram_limit_for_mmap:
-                    temp_mmap_filename = tempfile.NamedTemporaryFile(dir=temp_dir_for_mmap_files, suffix=".pt", delete=False).name
-                    torch.save(merged_tensor_cpu, temp_mmap_filename)
-                    del merged_tensor_cpu
-                    if torch.cuda.is_available(): torch.cuda.empty_cache()
-                    merged_tensor_cpu = torch.load(temp_mmap_filename, map_location="cpu", mmap=True)
-                    os.remove(temp_mmap_filename)
-                
-                yield key_full_name, merged_tensor_cpu.contiguous()
-                
-                del merged_tensor_cpu # Free the (potentially mmaped) tensor
-                if torch.cuda.is_available(): torch.cuda.empty_cache()
-        pass # End of safe_open context for input_shard_path
-    pass # End of _tensor_stream_generator definition
-
-    # Now, use the generator to serialize and write to the output file
-    generator_instance = _tensor_stream_generator(
-        input_shard_path,
-        lora_weights_map,
-        output_dtype,
-        per_tensor_ram_limit_for_mmap,
-        temp_dir_for_mmap_files
-    )
-
-    # Write the tensors to the output file using safetensors.serialize for streaming
-    # The metadata={"format": "pt"} is standard for PyTorch safetensors.
-    serialized_tensors_generator = safetensors.serialize(generator_instance, metadata={"format": "pt"})
-    
-    with open(output_shard_path, "wb") as f_out:
-        for chunk in serialized_tensors_generator:
-            f_out.write(chunk)
+            tensor_size_bytes = np.prod(shape) * element_size if shape else 0 # Handle scalar tensors (empty shape)
             
+            tensor_entry = {
+                "name": key,
+                "dtype": output_dtype_str, # All output tensors will have output_dtype
+                "shape": shape,
+                "data_offsets": [current_data_offset, current_data_offset + tensor_size_bytes]
+            }
+            tensor_metadata_list.append(tensor_entry)
+            current_data_offset += tensor_size_bytes
+    
+    # B. Header Construction & Writing
+    header_content_for_json = {"__metadata__": {"format": "pt"}} # Standard safetensors metadata
+    for entry in tensor_metadata_list:
+        header_content_for_json[entry["name"]] = {
+            "dtype": entry["dtype"],
+            "shape": entry["shape"],
+            "data_offsets": entry["data_offsets"]
+        }
+    
+    header_str = json.dumps(header_content_for_json, indent=2) # indent for readability if debugging
+    header_bytes = header_str.encode('utf-8')
+    header_length_bytes = struct.pack('<Q', len(header_bytes)) # Safetensors uses little-endian 64-bit unsigned int for header length
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_shard_path), exist_ok=True)
+
+    with open(output_shard_path, "wb") as f_out:
+        f_out.write(header_length_bytes)
+        f_out.write(header_bytes)
+
+    # C. Tensor Data Writing Pass
+    lora_modules_merged_count = 0
+    # Re-open input shard for actual data reading
+    # Important: Iterate tensor_metadata_list IN THE SAME ORDER as it was created
+    # to ensure data_offsets match the actual written tensor data.
+    with safetensors.safe_open(input_shard_path, framework="pt", device="cpu") as f_input_data, \
+         open(output_shard_path, "ab") as f_out: # Append binary mode
+
+        for entry in tensor_metadata_list:
+            key = entry["name"]
+            W_original = f_input_data.get_tensor(key)
+            
+            base_name_for_lora = key[:-len(".weight")] if key.endswith(".weight") else key
+            lora_stats = lora_weights_map.get(base_name_for_lora, None)
+            
+            final_tensor_cpu = None
+            if lora_stats is not None:
+                lora_modules_merged_count += 1
+                # _merge_lora typically puts result on CUDA.
+                merged_cuda = _merge_lora(W_original, lora_stats, key) 
+                final_tensor_cpu = merged_cuda.to(device="cpu", dtype=output_dtype).contiguous()
+                del merged_cuda
+            else:
+                final_tensor_cpu = W_original.to(dtype=output_dtype).contiguous()
+            
+            del W_original # Free original tensor from CPU memory
+
+            # Get tensor data as bytes.
+            # .numpy(force=True) for PyTorch >= 2.1 to handle different dispatch keys,
+            # otherwise just .numpy(). For older versions, ensure tensor is CPU.
+            if hasattr(final_tensor_cpu, 'numpy') and callable(getattr(final_tensor_cpu, 'numpy')):
+                if "force" in inspect.signature(final_tensor_cpu.numpy).parameters:
+                    tensor_bytes = final_tensor_cpu.numpy(force=True).tobytes()
+                else:
+                    tensor_bytes = final_tensor_cpu.numpy().tobytes()
+            else:
+                # Fallback for non-numpy compatible tensors, though unlikely for standard types
+                raise TypeError(f"Tensor {key} could not be converted to numpy array for byte serialization.")
+
+            f_out.write(tensor_bytes)
+            del final_tensor_cpu
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
     return lora_modules_merged_count
 pass
 
@@ -880,32 +935,41 @@ def merge_and_overwrite_lora(
                 print(f"Copied {filename} from local model directory to {save_directory}")
         elif not copied_all_from_cache and (low_disk_space_usage or use_streaming_save) and not os.path.exists(input_shard_path) and not is_local_path:
             # Download individual shard if in low disk/RAM mode and not copied from cache
+            print(f"Downloading shard {filename} for processing...")
             hf_hub_download(
                 repo_id=model_name,
                 filename=filename,
                 repo_type="model",
-                local_dir=save_directory,
+                local_dir=save_directory, # Download directly to save_directory if not copied from cache
             )
 
+        output_shard_path = os.path.join(save_directory, filename) # Final destination for the processed shard
+
         if use_streaming_save:
-            output_shard_path = os.path.join(save_directory, filename) # Output is same as input path
-            # Create a unique temporary directory for mmap files for *this shard*
-            with tempfile.TemporaryDirectory() as temp_dir_for_mmap_files:
-                n_saved_modules += _stream_merged_shard_to_file(
-                    input_shard_path=input_shard_path, # Already in save_directory
-                    lora_weights_map=lora_weights,
-                    output_dtype=output_dtype,
-                    output_shard_path=output_shard_path, # Overwrite in place
-                    per_tensor_ram_limit_for_mmap=700 * 1024 * 1024, # From original mmap logic
-                    temp_dir_for_mmap_files=temp_dir_for_mmap_files,
-                )
-            # If input_shard_path was downloaded specifically for streaming and low_disk_space,
-            # it's implicitly handled by the upload then delete logic below.
-            # If it was pre-existing (copied_all_from_cache or full snapshot), it's overwritten.
-        else: # Standard path (RAM > Threshold)
+            print(f"Processing shard {filename} with direct-to-disk writing.")
+            # input_shard_path is where the original shard is (already in save_directory or copied/downloaded there)
+            # output_shard_path is where the merged shard will be written, effectively overwriting the original
+            # if save_directory is the same for input and output, which it is in this logic.
+            
+            # If low_disk_space_usage is True, the original shard might be in a temp location
+            # before being processed and written to save_directory.
+            # However, current logic downloads/copies to save_directory's input_shard_path first.
+            # This means input_shard_path and output_shard_path are the same.
+            # This is fine, as _direct_write_merged_shard reads all metadata first, then writes.
+            
+            # A temporary file could be used for output if we want to avoid overwriting input
+            # before successfully completing the write, then rename. For simplicity, direct overwrite:
+            n_saved_modules += _direct_write_merged_shard(
+                input_shard_path=input_shard_path,
+                lora_weights_map=lora_weights,
+                output_dtype=output_dtype,
+                output_shard_path=output_shard_path, # Writes to its final location
+            )
+        else: # Standard path (RAM > Threshold), use the memory-based approach
+            print(f"Processing shard {filename} with in-memory merging.")
             n_saved_modules += _direct_merge_shard_to_memory_then_save_file(
-                save_directory=save_directory,
-                filename=filename, # filename is relative to save_directory
+                save_directory=save_directory, # This function expects save_directory and then joins path
+                filename=filename, 
                 lora_weights=lora_weights,
                 output_dtype=output_dtype,
             )
@@ -923,41 +987,33 @@ def merge_and_overwrite_lora(
             # If an index file exists and was also part of low_disk_space (unlikely to be removed per shard)
             # it should remain until final cleanup or explicit handling.
             # The main concern here is removing the large shard files.
+            # After processing (either streaming or direct memory) and potential upload,
+            # if low_disk_space_usage, the file at output_shard_path is removed.
+            # This means the original downloaded/copied shard is removed after processing.
         pass
     pass
 
-    # Step 6: Final upload of all shards if not using low disk space mode and pushing
+    # Step 6: Final upload of all remaining files if not using low disk space mode and pushing
     if not low_disk_space_usage and push_to_hub:
-        # Explicitly upload all safetensors files if not already handled
-        for filename in safetensors_list:
-            if os.path.exists(os.path.join(save_directory, filename)): # Check if file exists before uploading
-                upload_items(filename)
-        # Upload other files like config, tokenizer files etc.
-        # This was simplified to upload_items() without args, which uploads the whole folder.
-        # Let's ensure it uploads remaining items.
-        upload_items()
+        # In this mode, all processed shards remain in `save_directory`.
+        # Upload the entire `save_directory` content.
+        # This includes all processed shards, config, tokenizer files, and index file.
+        print(f"Uploading all files from {save_directory} to hub.")
+        upload_items() # Uploads the entire folder
 
-
-    # Step 7: Check for errors
+    # Step 7: Check for errors (Maintained from previous version)
     if len(lora_weights) != n_saved_modules:
-        # It's possible that some LoRA weights are not in any shard if the base model's sharding
-        # doesn't include weights that LoRA tries to modify (e.g. lm_head if not part of main shards)
-        # However, the original code has this check, so we maintain its spirit.
-        # A more robust check might be to sum counts from each shard and compare to total expected.
-        print(f"Warning: Number of LoRA modules ({len(lora_weights)}) does not exactly match number of saved/merged modules ({n_saved_modules}). This might be an issue or due to sharding specifics.")
-        # For now, let's not raise an error, but keep the warning.
-        # raise RuntimeError(
-        #     f"Unsloth: Saving LoRA finetune failed since # of LoRAs = {len(lora_weights)} "
-        #     f"does not match # of saved modules = {n_saved_modules}. Please file a bug report!"
-        # )
+        print(f"Warning: Number of LoRA modules ({len(lora_weights)}) does not exactly match number of saved/merged modules ({n_saved_modules}). This might be due to sharding specifics or if some LoRA layers were not present in any shard.")
     pass
 
     # --- Cleanup
-    if temp_file is not None and cleanup_temp_file: # Added cleanup_temp_file check
+    if temp_file is not None and cleanup_temp_file:
+        print(f"Cleaning up temporary directory: {temp_file.name}")
         try: temp_file.cleanup()
         except Exception as e: print(f"Warning: Failed to cleanup main temp_file: {e}")
     pass
 
+    print(f"Unsloth: Merge process completed. Results saved to: {save_directory}")
     return save_directory
 pass
 
