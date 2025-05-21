@@ -14,24 +14,20 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.5.8"
-
-from importlib.util import find_spec
-if find_spec("unsloth") is None:
-    raise ImportError("Please install Unsloth via `pip install unsloth`!")
-pass
-del find_spec
-
 import os
-if not ("UNSLOTH_IS_PRESENT" in os.environ):
-    raise ImportError("Please install Unsloth via `pip install unsloth`!")
-pass
 
-try:
-    print("🦥 Unsloth: Will patch your computer to enable 2x faster free finetuning.")
-except:
-    print("Unsloth: Will patch your computer to enable 2x faster free finetuning.")
-pass
-# Log Unsloth-Zoo Utilities
-os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
-del os
+UNSLOTH_COMPILE_DEBUG         = os.environ.get("UNSLOTH_COMPILE_DEBUG",         "0") == "1"
+UNSLOTH_COMPILE_MAXIMUM       = os.environ.get("UNSLOTH_COMPILE_MAXIMUM",       "0") == "1"
+UNSLOTH_COMPILE_IGNORE_ERRORS = os.environ.get("UNSLOTH_COMPILE_IGNORE_ERRORS", "0") == "1"
+torch_compile_options = {
+    "epilogue_fusion"   : True,
+    "max_autotune"      : UNSLOTH_COMPILE_MAXIMUM,
+    "shape_padding"     : True,
+    "trace.enabled"     : UNSLOTH_COMPILE_DEBUG,
+    "triton.cudagraphs" : False,
+}
+
+global TEMPORARY_PATCHES
+TEMPORARY_PATCHES = []
+
+__all__ = ["TEMPORARY_PATCHES", "torch_compile_options"]

@@ -14,24 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.5.8"
 
-from importlib.util import find_spec
-if find_spec("unsloth") is None:
-    raise ImportError("Please install Unsloth via `pip install unsloth`!")
-pass
-del find_spec
-
-import os
-if not ("UNSLOTH_IS_PRESENT" in os.environ):
-    raise ImportError("Please install Unsloth via `pip install unsloth`!")
-pass
-
-try:
-    print("🦥 Unsloth: Will patch your computer to enable 2x faster free finetuning.")
-except:
-    print("Unsloth: Will patch your computer to enable 2x faster free finetuning.")
-pass
-# Log Unsloth-Zoo Utilities
-os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
-del os
+from .common import *
+from .gemma import *
+from .misc import *
