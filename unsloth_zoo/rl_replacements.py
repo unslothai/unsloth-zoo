@@ -214,7 +214,7 @@ def grpo_accumulated_loss(
     logits_to_keep,
     completion_mask,
     advantages,
-    old_hidden_states,
+    old_logprobs,
     n_chunks = -1,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -239,7 +239,7 @@ def grpo_accumulated_loss(
         new_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
         
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
-            new_hidden_states, old_hidden_states ,ref_hidden_states, lm_head,
+            new_hidden_states, old_logprobs ,ref_hidden_states, lm_head,
             completion_input_ids, completion_mask, advantages, trainer.beta,
             trainer.accelerator.scaler,
             n_chunks, 
