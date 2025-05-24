@@ -75,7 +75,7 @@ def grpo_compute_loss(ref_logits, new_logits, old_logprobs, input_ids, mask, bet
     # Must detach - otherwise gradients are not propagated correctly!
     # exp(x - x) == 1
     if old_logprobs is not None: 
-        loss_i = torch.exp(new - old_logprobs) * advantages.unsqueeze(1)
+        loss_i = torch.exp(new - old_logprobs.detach()) * advantages.unsqueeze(1)
     else: 
         loss_i = torch.exp(new - new.detach()) * advantages.unsqueeze(1)
 
