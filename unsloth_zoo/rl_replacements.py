@@ -67,14 +67,17 @@ def grpo_compute_loss(
     delta = kwargs.get("delta", None)
 
     # All Unsloth Zoo code licensed under LGPLv3
-    ref_logits = ref_logits.to(torch.float32)
     new_logits = new_logits.to(torch.float32)
     input_ids  = input_ids.unsqueeze(-1)
 
     # x_i - logsumexp(x_i)
-    ref_x = torch.gather(ref_logits, dim = -1, index = input_ids).squeeze(-1)
+    if beta != 0.0:
+        assert ref_logits is not None, "ref_logits should not be None when beta != 0.0"
+        ref_logits = ref_logits.to(torch.float32)
+        ref_x = torch.gather(ref_logits, dim = -1, index = input_ids).squeeze(-1)
+        ref = ref_x - torch.logsumexp(ref_logits, dim = -1)
+    
     new_x = torch.gather(new_logits, dim = -1, index = input_ids).squeeze(-1)
-    ref = ref_x - torch.logsumexp(ref_logits, dim = -1)
     new = new_x - torch.logsumexp(new_logits, dim = -1)
 
     # Reverse KL
