@@ -171,11 +171,13 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 if old_hidden_states is not None:
                     old_logits = torch.matmul(old_hidden_states, lm_head.t())
                     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
+                else: 
+                    old_logits = None
             # if old_hidden_states is not None: 
             #     old_logits = torch.matmul(old_hidden_states, lm_head.t()) #last logit already excluded
             #     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
             # else:
-            #     old_logits = None
+            #     old_logits = Noneunsloth_zoo/rl_replacements.py
             loss, completion_length, mean_kl = grpo_compute_loss(
                 ref_logits, new_logits,old_logits, input_ids, mask, beta, advantages, **extra_kwargs
             )
