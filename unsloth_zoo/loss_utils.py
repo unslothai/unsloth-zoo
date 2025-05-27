@@ -25,6 +25,7 @@ if DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
 
 import inspect
+from typing import Union
 
 global HAS_CUT_CROSS_ENTROPY
 global UNSLOTH_STUDIO_ENABLED
@@ -169,12 +170,15 @@ def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,
     labels             : torch.Tensor,
-    num_items_in_batch : int = None,
+    num_items_in_batch : Union[int, torch.Tensor] = None,
     ignore_index       : int = -100,
     reduction          : str = "mean",
     logit_softcapping  : float = 0,
     accuracy_threshold : str = "auto",
 ):
+    if isinstance(num_items_in_batch, torch.Tensor):
+        num_items_in_batch = num_items_in_batch.detach().cpu().item()  # `torch.Tensor` -> `int`.
+
     # All Unsloth Zoo code licensed under LGPLv3
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
