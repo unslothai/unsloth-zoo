@@ -156,7 +156,6 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
 def patch_Gemma3ForConditionalGeneration():
-    print("Patching patch_Gemma3ForConditionalGeneration")
     try:
         import transformers.models.gemma3.modeling_gemma3
     except:
