@@ -176,10 +176,12 @@ def fused_linear_cross_entropy(
     accuracy_threshold : str = "auto",
 ):
     # All Unsloth Zoo code licensed under LGPLv3
-    reduction = "sum" if num_items_in_batch is not None else "mean"
-    if logit_softcapping == 0: logit_softcapping = None
     if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
         num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+
+    reduction = "sum" if num_items_in_batch is not None else "mean"
+    if logit_softcapping == 0: logit_softcapping = None
+
     with torch_cuda_device(lm_weight.device):
         loss = linear_cross_entropy(
             hidden_states.to(lm_weight.dtype),
@@ -209,6 +211,9 @@ def fast_linear_cross_entropy(
     attention_mask       : torch.Tensor = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
+    if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
+        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
     if logit_scale_multiply != 0:
@@ -217,8 +222,6 @@ def fast_linear_cross_entropy(
         logit_scale = 1.0 / logit_scale_divide
     else:
         logit_scale = None
-    if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
-        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
 
     loss = unsloth_efficient_ce_loss(
         hidden_states = hidden_states,
