@@ -99,9 +99,9 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
             graph_breaks = True,
             recompiles = True,
             recompiles_verbose = True,
-            compiled_autograd_verbose = True,
-            aot_joint_graph = True,
-            aot_graphs = True,
+            compiled_autograd_verbose = False, # Produces too much code
+            aot_joint_graph = False, # Produces too much code
+            aot_graphs = False,  # Produces too much code
         )
         torch._dynamo.config.verbose = True
     else:
