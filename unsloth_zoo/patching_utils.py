@@ -28,25 +28,32 @@ __all__ = [
 ]
 
 from .compiler import UNSLOTH_COMPILE_LOCATION
-from .utils import _get_dtype
+from .utils import _get_dtype, Version
 
 # Also disable compiling on bitsandbytes
 def patch_compiling_bitsandbytes():
     # All Unsloth Zoo code licensed under LGPLv3
     os.environ["UNSLOTH_PATCHED"] = "1"
 
-    # Disable dynamo on Linear4bit, Linear8bit and other future modules
-    for x in ["bitsandbytes.nn.modules", "peft.tuners.lora.bnb",]:
-        exec(f"import {x}", globals(), locals())
-        layers = dir(eval(x))
-        for fx in layers:
-            try: layer = eval(f"{x}.{fx}")
-            except: continue
-            if not hasattr(layer, "forward"): continue
-            if hasattr(eval(f"{x}.{fx}.forward"), "__wrapped__"): continue
-            exec(f"{x}.{fx}.forward = torch._disable_dynamo({x}.{fx}.forward)", globals(), locals())
+    import bitsandbytes
+    if Version(bitsandbytes.__version__) >= Version("0.46.0"):
+        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+            print("Unsloth: Bitsandbytes >= 0.46.0 supports torch.compile - enabling.")
+    else:
+        # Disable dynamo on Linear4bit, Linear8bit and other future modules
+        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+            print("Unsloth: Bitsandbytes < 0.46.0 does not support torch.compile - disabling.")
+        for x in ["bitsandbytes.nn.modules", "peft.tuners.lora.bnb",]:
+            exec(f"import {x}", globals(), locals())
+            layers = dir(eval(x))
+            for fx in layers:
+                try: layer = eval(f"{x}.{fx}")
+                except: continue
+                if not hasattr(layer, "forward"): continue
+                if hasattr(eval(f"{x}.{fx}.forward"), "__wrapped__"): continue
+                exec(f"{x}.{fx}.forward = torch._disable_dynamo({x}.{fx}.forward)", globals(), locals())
+            pass
         pass
-    pass
 
     # import bitsandbytes.autograd._functions
     # bitsandbytes.autograd._functions.matmul_4bit = torch._disable_dynamo(

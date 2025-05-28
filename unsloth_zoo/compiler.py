@@ -1070,7 +1070,7 @@ def apply_fused_lm_head(forward):
         except:
             continue
         # Return logits back
-        if "logits = outputs\.logits" in cross_entropy_find:
+        if "logits = outputs.logits" in cross_entropy_find:
             forward = forward.replace(
                 "logits = EMPTY_LOGITS",
                 "logits = outputs.logits",
