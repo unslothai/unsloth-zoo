@@ -19,7 +19,11 @@ from packaging.version import Version
 import os
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
-major, minor = torch.cuda.get_device_capability()
+from . import DEVICE_TYPE
+
+if DEVICE_TYPE == "cuda":
+    major, minor = torch.cuda.get_device_capability()
+
 import inspect
 
 global HAS_CUT_CROSS_ENTROPY
@@ -36,16 +40,22 @@ if UNSLOTH_STUDIO_ENABLED:
     )
 pass
 
-if (Version(torch.__version__) >= Version("2.4.0")) and \
-    (not ((major <= 7) and (minor < 5))) and \
-    (not (Version(triton_version) < Version("3.0.0"))):
-    try:
-        from cut_cross_entropy import linear_cross_entropy
-        HAS_CUT_CROSS_ENTROPY = True
-    except:
+if DEVICE_TYPE == "cuda":
+    if (Version(torch.__version__) >= Version("2.4.0")) and \
+        (not ((major <= 7) and (minor < 5))) and \
+        (not (Version(triton_version) < Version("3.0.0"))):
+        try:
+            from cut_cross_entropy import linear_cross_entropy
+            HAS_CUT_CROSS_ENTROPY = True
+        except:
+            HAS_CUT_CROSS_ENTROPY = False
+    else:
         HAS_CUT_CROSS_ENTROPY = False
-else:
+    pass
+elif DEVICE_TYPE == "xpu":
     HAS_CUT_CROSS_ENTROPY = False
+else:
+    pass
 pass
 
 __all__ = [
@@ -166,8 +176,12 @@ def fused_linear_cross_entropy(
     accuracy_threshold : str = "auto",
 ):
     # All Unsloth Zoo code licensed under LGPLv3
+    if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
+        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
+
     with torch_cuda_device(lm_weight.device):
         loss = linear_cross_entropy(
             hidden_states.to(lm_weight.dtype),
@@ -197,6 +211,9 @@ def fast_linear_cross_entropy(
     attention_mask       : torch.Tensor = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
+    if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
+        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
     if logit_scale_multiply != 0:
@@ -232,6 +249,9 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
     # Check if model allows **kwargs
     m = self.model
+    if hasattr(m, "get_base_model"):
+        # Removes PeftModelForCausalLM and gets internal model
+        m = m.get_base_model()
     model_name = m.__class__.__name__
     global ALLOWED_NUM_ITEMS_IN_BATCH
     if model_name not in ALLOWED_NUM_ITEMS_IN_BATCH:

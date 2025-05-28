@@ -47,6 +47,7 @@ from importlib.metadata import version as importlib_version
 from packaging.version import Version
 import functools
 from .compiler_replacements import compiler_replacements
+from . import DEVICE_TYPE
 
 # Compiled cache location
 global COMBINED_UNSLOTH_NAME
@@ -60,8 +61,17 @@ UNSLOTH_COMPILE_USE_TEMP = False
 
 # Disable some compilations if old versions are seen
 OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
-major, minor = torch.cuda.get_device_capability()
-OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+
+# device capability
+major = None
+minor = None
+if DEVICE_TYPE == "cuda":
+    major, minor = torch.cuda.get_device_capability()
+    OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+elif DEVICE_TYPE == "xpu":
+    OLD_CUDA_ARCH_VERSION = False
+pass
+
 OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
 
 # Check if Unsloth Studio is allowed
@@ -506,7 +516,8 @@ def create_standalone_class(
     source = source + full_class
 
     # Remove @auto_docstring
-    source = source.replace("@auto_docstring", "")
+    source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{1,}\))?", "", source)
+    # source = source.replace("@auto_docstring", "")
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
@@ -1059,7 +1070,7 @@ def apply_fused_lm_head(forward):
         except:
             continue
         # Return logits back
-        if "logits = outputs\.logits" in cross_entropy_find:
+        if "logits = outputs.logits" in cross_entropy_find:
             forward = forward.replace(
                 "logits = EMPTY_LOGITS",
                 "logits = outputs.logits",
