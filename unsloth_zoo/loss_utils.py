@@ -276,6 +276,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     else:
         has_kwargs, is_vlm = ALLOWED_NUM_ITEMS_IN_BATCH[model_name]
     pass
+    print(has_kwargs, is_vlm)
 
     # Iterate to find all batches
     for _ in range(num_batches):
