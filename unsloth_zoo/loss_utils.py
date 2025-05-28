@@ -249,8 +249,10 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
     # Check if model allows **kwargs
     m = self.model
+    if hasattr(m, "get_base_model"):
+        # Removes PeftModelForCausalLM and gets internal model
+        m = m.get_base_model()
     model_name = m.__class__.__name__
-    print(model_name)
     global ALLOWED_NUM_ITEMS_IN_BATCH
     if model_name not in ALLOWED_NUM_ITEMS_IN_BATCH:
 
@@ -271,12 +273,10 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                         forward = __wrapped__
             pass
             name = forward.__qualname__
-            print(name)
             if "ForConditionalGeneration" in name or "VisionText2Text" in name:
                 is_vlm = True
             if is_vlm or "CausalLM" in name or "_fast_forward" in name:
                 signature = inspect.signature(forward).parameters.values()
-                print(signature)
                 has_kwargs = tuple(signature)[-1].kind == inspect._VAR_KEYWORD
                 break
             if not hasattr(m, "model"): break
@@ -286,7 +286,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     else:
         has_kwargs, is_vlm = ALLOWED_NUM_ITEMS_IN_BATCH[model_name]
     pass
-    print(has_kwargs, is_vlm)
 
     # Iterate to find all batches
     for _ in range(num_batches):
