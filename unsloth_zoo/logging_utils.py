@@ -36,6 +36,7 @@ REMOVED_METRICS = [
     'clip_ratio/high_mean',
     'clip_ratio/high_max',
     'clip_ratio/region_mean',
+    'frac_reward_zero_std',
 ]
 REMOVED_METRICS = frozenset(REMOVED_METRICS)
 
