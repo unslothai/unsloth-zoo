@@ -453,8 +453,6 @@ def prepare_saving(
         pass
     pass
 
-    with open("prepare_saving_model","w") as file:
-        file.write(str(model))
 
     if output_dtype is None: output_dtype = _get_dtype(model.config.torch_dtype)
     assert(output_dtype in (torch.float32, torch.float16, torch.float64, torch.bfloat16))
@@ -467,9 +465,6 @@ def prepare_saving(
         merge_into_original = merge_into_original,
         return_state_dict = True,
     )
-    lora_weights_list = list(lora_weights.keys())
-    with open("lora_weights", "w") as file:
-        file.write(str(lora_weights_list))
     # Total save size in bytes
     save_size = sum(get_torch_storage_size_new(x, element_size) for x in state_dict.values())
 
@@ -512,7 +507,7 @@ def prepare_saving(
         pass
 
         # Too small - try using the temporary file system (sometimes large like Kaggle)
-        try_temp_file = tempfile.TemporaryDirectory(ignore_cleanup_errors = True)
+        temp_file = tempfile.TemporaryDirectory(ignore_cleanup_errors = True)
         try_save_directory = temp_file.name
 
         total, used, free = shutil.disk_usage(save_directory)
@@ -827,7 +822,6 @@ def merge_and_overwrite_lora(
             output_dtype = output_dtype,
             model_class_name = find_lora_base_model(model).__class__.__name__,
         )
-        print(f"current aggregate value of n_saved_modules is now {n_saved_modules}")
         torch.cuda.empty_cache()
         if low_disk_space_usage and push_to_hub:
             upload_items(filename)
@@ -856,6 +850,13 @@ def merge_and_overwrite_lora(
     if temp_file is not None:
         try: temp_file.cleanup()
         except: pass
+    pass
+
+    if push_to_hub and os.path.exists(save_directory):
+        try:
+            shutil.rmtree(save_directory)
+        except Exception as e:
+            print(f"Warning: Failed to remove temporary directory {save_directory}: {e}")
     pass
 
     return save_directory
@@ -1325,7 +1326,6 @@ def _convert_lora_keys_to_safetensor_format(
     forward_mapping = _get_checkpoint_conversion_mapping(model_class_name)
 
     if not forward_mapping:
-        print("🔍 DEBUG: No conversion mapping defined by model class. No LoRA key conversion will be applied.")
         return defaultdict(lora_weights.default_factory, lora_weights)
 
     # Create reverse mapping
