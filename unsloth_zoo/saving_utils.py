@@ -820,7 +820,6 @@ def merge_and_overwrite_lora(
                 local_dir = save_directory,
             )
         pass
-        print(f"calling _merge_and_overwrite_lora for filename {filename}")
         n_saved_modules += _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
@@ -881,7 +880,6 @@ def _try_copy_all_from_cache(
         return False
 
     hf_cache_dir_str = str(hf_cache_dir)
-    print(f"Checking cache directory for required files...") # Verbose
     cached_paths_map = {}
 
     all_found = True
@@ -890,11 +888,11 @@ def _try_copy_all_from_cache(
             cached_path_str = hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True)
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
-            print(f"Cache check failed: {filename} not found in local cache.") # Verbose
+            #print(f"Cache check failed: {filename} not found in local cache.") # Verbose
             all_found = False
             break
         except Exception as check_err:
-            print(f"Cache check failed: Error checking for {filename}: {check_err}.")
+            #print(f"Cache check failed: Error checking for {filename}: {check_err}.")
             all_found = False
             break
 
@@ -1322,11 +1320,9 @@ def _convert_lora_keys_to_safetensor_format(
     model_class_name="PretrainedModel" # The actual model instance (e.g. Qwen2VLForConditionalGeneration)
 ):
     import re
-    print(f"model_class_name is {model_class_name}")
 
     # Get the forward mapping from the model class itself
     forward_mapping = _get_checkpoint_conversion_mapping(model_class_name)
-    print(f"forward mapping found: {forward_mapping}")
 
     if not forward_mapping:
         print("🔍 DEBUG: No conversion mapping defined by model class. No LoRA key conversion will be applied.")
