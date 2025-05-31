@@ -259,8 +259,8 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
     remove_keys = set()
     keep_keys   = set()
-
-    inner_model = model.base_model.model if hasattr(model, "base_model") else model
+    # Use the new function to find the right model level
+    inner_model = find_lora_base_model(model)
     for name, module in inner_model.named_modules():
         if name == "": continue
 
@@ -344,10 +344,10 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     if return_state_dict: assert_same_keys(model, state_dict)
     return lora_weights, state_dict
 pass
-
+#
 
 @torch.inference_mode
-def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype):
+def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype, model_class_name):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
     filename = os.path.join(save_directory, filename)
@@ -358,26 +358,37 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
     import pickle
     limit = 700 * 1024 * 1024 # 700MB
     with safe_open(filename, framework = "pt", device = "cpu") as file:
-        for key in file.keys():
+        safetensor_keys = list(file.keys())
+
+        # Convert LoRA keys to match safetensor format
+        converted_lora_weights = _convert_lora_keys_to_safetensor_format(
+            lora_weights, safetensor_keys, model_class_name=model_class_name)
+
+        for key in safetensor_keys:
             W = file.get_tensor(key)
-            lora_stats = lora_weights.get(key[:-len(".weight")], None)
-            if lora_stats is not None:
+            # Remove .weight suffix to match LoRA key format
+            lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
+            lora_stats = converted_lora_weights.get(lora_key, None)
+
+            if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                 count += 1
                 W = _merge_lora(W, lora_stats, key)
                 if psutil.virtual_memory().available <= limit:
-                    filename = tempfile.NamedTemporaryFile(suffix = ".pt")
-                    torch.save(W.to(output_dtype), filename, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL)
-                    W = torch.load(filename, map_location = "cpu", mmap = True, weights_only = False)
+                    temp_file = tempfile.NamedTemporaryFile(suffix = ".pt")
+                    torch.save(W.to(output_dtype), temp_file, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL)
+                    W = torch.load(temp_file, map_location = "cpu", mmap = True, weights_only = False)
                 else:
                     W = W.to(device = "cpu", dtype = output_dtype, non_blocking = True)
-            pass
+            else:
+                if lora_key in converted_lora_weights:
+                    lora_stats_info = converted_lora_weights[lora_key]
             tensors[key] = W
         pass
     pass
+
     save_file(tensors, filename, metadata = {"format": "pt"})
     return count
 pass
-
 
 from huggingface_hub import (
     split_state_dict_into_shards_factory,
@@ -442,6 +453,9 @@ def prepare_saving(
         pass
     pass
 
+    with open("prepare_saving_model","w") as file:
+        file.write(str(model))
+
     if output_dtype is None: output_dtype = _get_dtype(model.config.torch_dtype)
     assert(output_dtype in (torch.float32, torch.float16, torch.float64, torch.bfloat16))
     assert(type(torch.bfloat16) is torch.dtype)
@@ -453,6 +467,9 @@ def prepare_saving(
         merge_into_original = merge_into_original,
         return_state_dict = True,
     )
+    lora_weights_list = list(lora_weights.keys())
+    with open("lora_weights", "w") as file:
+        file.write(str(lora_weights_list))
     # Total save size in bytes
     save_size = sum(get_torch_storage_size_new(x, element_size) for x in state_dict.values())
 
@@ -803,12 +820,15 @@ def merge_and_overwrite_lora(
                 local_dir = save_directory,
             )
         pass
+        print(f"calling _merge_and_overwrite_lora for filename {filename}")
         n_saved_modules += _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
             lora_weights = lora_weights,
             output_dtype = output_dtype,
+            model_class_name = find_lora_base_model(model).__class__.__name__,
         )
+        print(f"current aggregate value of n_saved_modules is now {n_saved_modules}")
         torch.cuda.empty_cache()
         if low_disk_space_usage and push_to_hub:
             upload_items(filename)
@@ -1244,6 +1264,128 @@ def get_original_model_id(local_path: str):
             return config["base_model_name_or_path"]
 
     return None
+
+def _get_checkpoint_conversion_mapping(model_class_name):
+    """Get the checkpoint conversion mapping for a specific model class"""
+    try:
+        # Dynamically import the model class
+        module = __import__('transformers', fromlist=[model_class_name])
+        model_class = getattr(module, model_class_name)
+        return getattr(model_class, '_checkpoint_conversion_mapping', {})  # Returns {} if attribute doesn't exist
+    except (ImportError, AttributeError):
+        return {}
+pass
+
+from collections import defaultdict
+
+
+def detect_keys_format(keys_to_check, forward_mapping):
+    if not forward_mapping:
+        return "new"
+
+    count_matches_old_pattern = 0
+    count_matches_new_pattern = 0
+
+    # Compile regex patterns for efficiency if called multiple times with same mapping (though here it's per call)
+    old_regex_compiled = [re.compile(p) for p in forward_mapping.keys()]
+    # For new patterns (values of forward_mapping), treat them as literal prefixes to match
+    new_regex_compiled = [re.compile(r"^" + re.escape(val)) for val in forward_mapping.values()]
+
+    for key in keys_to_check:
+        if not isinstance(key, str): continue
+
+        # A key is "new" if it starts with one of the new_prefix_strings (values of forward_mapping)
+        # A key is "old" if it matches one of the old_pattern_regex (keys of forward_mapping)
+        #   AND it does NOT start with one of the new_prefix_strings (to avoid double counting if patterns overlap badly)
+
+        matched_new = any(r.match(key) for r in new_regex_compiled)
+        matched_old = any(r.match(key) for r in old_regex_compiled)
+
+        if matched_new:
+            count_matches_new_pattern += 1
+        elif matched_old: # Only count as old if not already counted as new
+            count_matches_old_pattern += 1
+
+    # Decision logic
+    if count_matches_new_pattern > 0 and count_matches_old_pattern == 0: return "new"
+    if count_matches_old_pattern > 0 and count_matches_new_pattern == 0: return "old"
+
+    # If mixed,
+    if count_matches_new_pattern > count_matches_old_pattern: return "new"
+    if count_matches_old_pattern > count_matches_new_pattern: return "old"
+
+    return "new" # Default, assuming most models/keys will be in the "new" (current HF) format.
+
+def _convert_lora_keys_to_safetensor_format(
+    lora_weights,        # Global dict of LoraStats objects
+    safetensor_keys,     # List of keys from the CURRENT shard
+    model_class_name="PretrainedModel" # The actual model instance (e.g. Qwen2VLForConditionalGeneration)
+):
+    import re
+    print(f"model_class_name is {model_class_name}")
+
+    # Get the forward mapping from the model class itself
+    forward_mapping = _get_checkpoint_conversion_mapping(model_class_name)
+    print(f"forward mapping found: {forward_mapping}")
+
+    if not forward_mapping:
+        print("🔍 DEBUG: No conversion mapping defined by model class. No LoRA key conversion will be applied.")
+        return defaultdict(lora_weights.default_factory, lora_weights)
+
+    # Create reverse mapping
+    reverse_mapping = {}
+    for pattern, replacement in forward_mapping.items():
+        reverse_mapping[replacement] = pattern
+    # Determine formats
+    lora_key_format_assumed = "new"
+    shard_key_format = detect_keys_format(safetensor_keys, forward_mapping)
+
+    converted_lora_weights_output = defaultdict(lora_weights.default_factory)
+    conversion_applied_count = 0
+
+    for lora_key_module_name, lora_stats in lora_weights.items():
+        if not isinstance(lora_key_module_name, str):
+            converted_lora_weights_output[lora_key_module_name] = lora_stats
+            continue
+
+        converted_key_for_lookup = lora_key_module_name
+        applied_conversion_for_this_key = False
+
+        if lora_key_format_assumed == "new" and shard_key_format == "old":
+            # LoRA keys are new format, shard is old style -> convert LoRA key to old style
+            # Use reverse mapping
+            for pattern, replacement in reverse_mapping.items():
+                replacement = re.sub(r"\^?([^(?]+).*", r"\1", replacement.lstrip("^"))
+                temp_key, n_replace = re.subn(pattern, replacement, converted_key_for_lookup)
+                if n_replace > 0:
+                    converted_key_for_lookup = temp_key
+                    applied_conversion_for_this_key = True
+                    break
+
+        elif lora_key_format_assumed == "old" and shard_key_format == "new":
+            # LoRA keys are old format, shard is new format -> convert LoRA key to new style
+            for pattern, replacement in forward_mapping.items():
+                temp_key, n_replace = re.subn(pattern, replacement, converted_key_for_lookup)
+                if n_replace > 0:
+                    converted_key_for_lookup = temp_key
+                    applied_conversion_for_this_key = True
+                    break
+
+        if applied_conversion_for_this_key:
+            conversion_applied_count += 1
+
+        converted_lora_weights_output[converted_key_for_lookup] = lora_stats
+    return converted_lora_weights_output
+pass
+
+def find_lora_base_model(model_to_inspect):
+    current = model_to_inspect
+    if hasattr(current, "base_model"):
+        current = current.base_model
+    if hasattr(current, "model"):
+        current = current.model
+    return current
+pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
