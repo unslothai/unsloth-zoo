@@ -637,7 +637,7 @@ else:
         logit_scale_divide : float = 0,
         logit_softcapping : float = 0,
         vocab_size : int = 0,
-        n_items : int = 0,
+        n_items : int | torch.Tensor = 0,
     ):
         device = output_logits.device
         if logit_scale_multiply != 0:
@@ -672,6 +672,8 @@ else:
             )
         pass
         if n_items != 0:
+            if torch.is_tensor(n_items):
+                n_items = n_items.to(loss.device)
             loss = loss / n_items
         else:
             loss = loss / (shift_labels != -100).sum()
@@ -762,7 +764,7 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_scale_divide : float = 0,
         logit_softcapping : float = 0,
         vocab_size : int = 0,
-        n_items : int = 0,
+        n_items : int | torch.Tensor = 0,
     ):
         device = output_logits.device
         if logit_scale_multiply != 0:
@@ -797,6 +799,8 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
             )
         pass
         if n_items != 0:
+            if torch.is_tensor(n_items):
+                n_items = n_items.to(loss.device)
             loss = loss / n_items
         else:
             loss = loss / (shift_labels != -100).sum()
@@ -870,7 +874,7 @@ if labels is not None:
         logit_scale_divide : float = 0,
         logit_softcapping : float = 0,
         vocab_size : int = 0,
-        n_items : int = 0,
+        n_items : int | torch.Tensor = 0,
     ):
         device = output_logits.device
         if logit_scale_multiply != 0:
@@ -905,6 +909,8 @@ if labels is not None:
             )
         pass
         if n_items != 0:
+            if torch.is_tensor(n_items):
+                n_items = n_items.to(loss.device)
             loss = loss / n_items
         else:
             loss = loss / (shift_labels != -100).sum()
