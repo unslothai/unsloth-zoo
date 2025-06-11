@@ -93,13 +93,16 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
                 ignore_index = ignore_index,
                 reduction    = reduction,
             )
-            if reduction == "sum": loss = loss / num_items_in_batch
+            if reduction == "sum": 
+                if torch.is_tensor(num_items_in_batch):
+                    num_items_in_batch = num_items_in_batch.to(loss.device)
+                loss = loss / num_items_in_batch
         return loss
     pass
     
     # Causal LM loss
     def UnslothForCausalLMLoss(
-        logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
+        logits, labels, vocab_size, num_items_in_batch= None, ignore_index = -100, **kwargs
     ):
         if labels is None: return None
         shift_logits = logits
@@ -169,7 +172,7 @@ def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,
     labels             : torch.Tensor,
-    num_items_in_batch : int = None,
+    num_items_in_batch : int | torch.Tensor = None,
     ignore_index       : int = -100,
     reduction          : str = "mean",
     logit_softcapping  : float = 0,
@@ -193,7 +196,10 @@ def fused_linear_cross_entropy(
             shift        = True,
             filter_eps   = accuracy_threshold,
         )
-    if num_items_in_batch is not None: loss = loss / num_items_in_batch
+        if num_items_in_batch is not None: 
+            if torch.is_tensor(num_items_in_batch):
+                num_items_in_batch = num_items_in_batch.to(loss.device)
+            loss = loss / num_items_in_batch
     return loss
 pass
 
@@ -202,7 +208,7 @@ def fast_linear_cross_entropy(
     hidden_states        : torch.Tensor,
     lm_head              : torch.nn.Linear,
     labels               : torch.Tensor,
-    num_items_in_batch   : int = None,
+    num_items_in_batch   : int | torch.Tensor = None,
     ignore_index         : int = -100,
     reduction            : str = "mean",
     logit_softcapping    : float = 0,
@@ -235,7 +241,10 @@ def fast_linear_cross_entropy(
         chunk_size = 512,
         attention_mask = attention_mask,
     )
-    if num_items_in_batch is not None: loss = loss / num_items_in_batch
+    if num_items_in_batch is not None: 
+        if torch.is_tensor(num_items_in_batch):
+            num_items_in_batch = num_items_in_batch.to(loss.device)
+        loss = loss / num_items_in_batch
     return loss
 pass
 
@@ -312,8 +321,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
             if self.args.average_tokens_across_devices:
                 num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
-            if device is not None and torch.is_tensor(num_items_in_batch):
-                num_items_in_batch = num_items_in_batch.to(device)
         except Exception as exception:
             raise RuntimeError(exception)
     pass
