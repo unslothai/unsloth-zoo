@@ -574,7 +574,7 @@ def merge_and_overwrite_lora(
     inner_model = model.base_model.model if isinstance(model, PeftModel) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
     if not isinstance(model, PeftModel):
-        warnings.warn("Model is not a PeftModel (no Lora adapters detected). Skipping Merge.")
+        warnings.warn("Model is not a PeftModel (no Lora adapters detected). Skipping Merge. Please use save_pretrained() or push_to_hub() instead!")
         return None
     try:
         model_name = get_model_name(model.config._name_or_path, load_in_4bit = False)
