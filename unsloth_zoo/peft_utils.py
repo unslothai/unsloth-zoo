@@ -197,7 +197,7 @@ def requires_grad_for_gradient_checkpointing(model):
             try: # For dataclass from HF, try on loss or logits 
                 if hasattr(output, "loss") and output.loss is not None:
                     output.loss.requires_grad_(True)
-                elif hasattr(output, "logits") and output.logits is not None: #with RL like GRPO there are no loss as you don't provide labels
+                elif hasattr(output, "logits") and output.logits is not None: #with RL like GRPO there are no loss as you don't provide labels 
                     output.logits.requires_grad_(True)
                 else:
                     raise ValueError("Neither loss nor logits are available for grad post hook.")
