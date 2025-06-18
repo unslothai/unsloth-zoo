@@ -47,6 +47,7 @@ from importlib.metadata import version as importlib_version
 from packaging.version import Version
 import functools
 from .compiler_replacements import compiler_replacements
+from . import DEVICE_TYPE
 
 # Compiled cache location
 global COMBINED_UNSLOTH_NAME
@@ -60,8 +61,17 @@ UNSLOTH_COMPILE_USE_TEMP = False
 
 # Disable some compilations if old versions are seen
 OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
-major, minor = torch.cuda.get_device_capability()
-OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+
+# device capability
+major = None
+minor = None
+if DEVICE_TYPE == "cuda":
+    major, minor = torch.cuda.get_device_capability()
+    OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+elif DEVICE_TYPE == "xpu":
+    OLD_CUDA_ARCH_VERSION = False
+pass
+
 OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
 
 # Check if Unsloth Studio is allowed
@@ -333,7 +343,8 @@ def create_new_function(
     if not overwrite and os.path.isfile(function_location):
 
         # Check if exactly equivalent
-        with open(function_location, "r") as f: file_source = f.read()
+        with open(function_location, "r", encoding="utf-8") as f:
+            file_source = f.read()
 
         if file_source != write_new_source:
             overwrite = True
@@ -493,7 +504,7 @@ def create_standalone_class(
 
     source = f"{compile}\n{source}\n"
 
-    left = re.match("[\s\n]{4,}", leftover).span()[1]
+    left = re.match(r"[\s\n]{4,}", leftover).span()[1]
     new_forward = definition + leftover[:left] + \
         f"return {module}_forward({parameters})\n"
     full_class = full_class.replace(old_source, new_forward)
@@ -504,6 +515,10 @@ def create_standalone_class(
 
     # Combine all into file
     source = source + full_class
+
+    # Remove @auto_docstring
+    source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{1,}\))?", "", source)
+    # source = source.replace("@auto_docstring", "")
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
@@ -592,6 +607,8 @@ for __kwargs in all_locals.values():
         n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
         break
 requires_grad_ = self.lm_head.weight.requires_grad
+requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
+
 if labels is None:
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
@@ -703,13 +720,19 @@ $LOGITSCALINGMULTIPLY$
 $LOGITSCALINGDIVISION$
 $LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$SPACES$loss = self.loss_function($LOGITS$, $LABELS$, $VOCABSIZE$, $KWARGS$)
+if labels is not None:$SPACES$loss = self.loss_function($LOGITS$, $LABELS$, $VOCABSIZE$$KWARGS$)
 """
 
 cross_entropy_replacement_2 = """
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
-n_items = (\\9).get("num_items_in_batch", None) or (\\9).get("n_items", None)
+all_locals = locals()
+n_items = None
+for __kwargs in all_locals.values():
+    if type(__kwargs) is dict:
+        n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+        break
 requires_grad_ = self.lm_head.weight.requires_grad
+requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
 if labels is None:
     logits = self.lm_head(hidden_states\\1)
@@ -793,7 +816,7 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         output_labels        = labels,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
-        logit_softcapping    = (\\4) if (\\4) != () else 0,
+        logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
         vocab_size           = (\\8),
         n_items              = n_items if n_items is not None else 0,
     )
@@ -803,7 +826,7 @@ else:
         logits = logits * (\\2)
     if (\\3) != ():
         logits = logits / (\\3)
-    if (\\4) != ():
+    if (\\4) not in (None, (),):
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
@@ -904,7 +927,7 @@ if labels is not None:
         mask                 = \\5,
         logit_scale_multiply = (\\1) if (\\1) != () else 0,
         logit_scale_divide   = (\\2) if (\\2) != () else 0,
-        logit_softcapping    = (\\3) if (\\3) != () else 0,
+        logit_softcapping    = (\\3) if (\\3) not in (None, (),) else 0,
         vocab_size           = (\\6),
         n_items              = n_items if n_items is not None else 0,
     )
@@ -919,14 +942,15 @@ ce_finders = [
 
 def apply_fused_lm_head(forward):
     # All Unsloth Zoo code licensed under LGPLv3
+    import regex
     for cross_entropy_find, cross_entropy_replacement in ce_finders:
         cross_entropy_find = cross_entropy_find.strip()\
-            .replace("*", "\*").replace("^", "\^")\
-            .replace("-", "\-").replace("_", "\_")\
-            .replace(":", "\:").replace("+", "\+")\
-            .replace(".", "\.").replace(",", "\,")\
-            .replace("(", "\(").replace(")", "\)")\
-            .replace("[", "\[").replace("]", "\]")\
+            .replace("*", r"\*").replace("^", r"\^")\
+            .replace("-", r"\-").replace("_", r"\_")\
+            .replace(":", r"\:").replace("+", r"\+")\
+            .replace(".", r"\.").replace(",", r"\,")\
+            .replace("(", r"\(").replace(")", r"\)")\
+            .replace("[", r"\[").replace("]", r"\]")\
             .replace(
                 "\n",
                 r"(?:[\s\n]{0,}(?:\#[^\n]{1,}[\n][\s\n]{1,})?){0,}"
@@ -946,7 +970,7 @@ def apply_fused_lm_head(forward):
                      r"self\.config\.vocab_size|"\
                      r"self\.config\.text_config\.vocab_size"\
                      ")")\
-            .replace("$KWARGS$",       r"\*\*(loss_kwargs|kwargs)")\
+            .replace("$KWARGS$",       r"(?:, \*\*(loss_kwargs|kwargs))?")\
             .replace("$LOGITSUPCAST$", r"(?:logits = logits\.float\(\))?")\
             .replace("$LABELSDEVICE$", r"(?:labels = labels\.to\([^\)]{1,}\))?")\
             .replace("$LOGITSCALINGMULTIPLY$",
@@ -1013,11 +1037,10 @@ def apply_fused_lm_head(forward):
             "shift_labels = shift_labels.to(shift_logits.device)\n"\
             "loss = loss_fct(shift_logits, shift_labels)"
         )
-
         # Find matches
-        if "loss\_function" in cross_entropy_find and "loss_function" not in forward:
+        if r"loss\_function" in cross_entropy_find and "loss_function" not in forward:
             continue
-        elif "loss\_function" not in cross_entropy_find and "loss_function" in forward:
+        elif r"loss\_function" not in cross_entropy_find and "loss_function" in forward:
             continue
         elif "CrossEntropyLoss" not in cross_entropy_find and "CrossEntropyLoss" in forward:
             continue
@@ -1053,7 +1076,7 @@ def apply_fused_lm_head(forward):
         except:
             continue
         # Return logits back
-        if "logits = outputs\.logits" in cross_entropy_find:
+        if "logits = outputs.logits" in cross_entropy_find:
             forward = forward.replace(
                 "logits = EMPTY_LOGITS",
                 "logits = outputs.logits",
@@ -1064,6 +1087,11 @@ def apply_fused_lm_head(forward):
             "vocab_size = (",
             forward,
         )
+        # Fix , **
+        forward = forward.replace(", **)", ")")
+        forward = forward.replace(",**)", ")")
+        forward = forward.replace(",** )", ")")
+
         return forward
     pass
     return forward
@@ -1071,6 +1099,7 @@ pass
 
 
 def test_apply_fused_lm_head():
+    import inspect
     forwards = []
     from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
     forwards.append(Qwen2VLForConditionalGeneration)
@@ -1467,18 +1496,45 @@ def unsloth_compile_transformers(
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"): return
 
     # Use transformers model_type logger to supress message: Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
-    exec("model_logger.addFilter(HideLoggingMessage('Setting `use_cache=False`'))", globals(), locals())
+    exec("model_logger.addFilter(HideLoggingMessage('`use_cache`'))", globals(), locals())
+
+    # Instead of Inductor Compilation:
+    try:
+        import torch._inductor.async_compile
+        from torch.hub import tqdm
+        def replaced_tqdm(*args, **kwargs):
+            kwargs["desc"] = "Unsloth: Compiling kernels"
+            return tqdm(*args, **kwargs)
+        torch._inductor.async_compile.tqdm = replaced_tqdm
+    except:
+        print("Unsloth: Failed editing tqdm to replace Inductor Compilation:")
+    pass
 
     # torch_compile_options
     UNSLOTH_COMPILE_DEBUG         = os.environ.get("UNSLOTH_COMPILE_DEBUG",         "0") == "1"
     UNSLOTH_COMPILE_MAXIMUM       = os.environ.get("UNSLOTH_COMPILE_MAXIMUM",       "0") == "1"
     UNSLOTH_COMPILE_IGNORE_ERRORS = os.environ.get("UNSLOTH_COMPILE_IGNORE_ERRORS", "0") == "1"
+    UNSLOTH_ENABLE_LOGGING        = os.environ.get("UNSLOTH_ENABLE_LOGGING",        "0") == "1"
     torch_compile_options = {
-        "epilogue_fusion"   : epilogue_fusion,
-        "max_autotune"      : max_autotune,
-        "shape_padding"     : shape_padding,
-        "trace.enabled"     : UNSLOTH_COMPILE_DEBUG or debug,
-        "triton.cudagraphs" : cudagraphs,
+        "epilogue_fusion"           : epilogue_fusion,
+        "max_autotune"              : max_autotune,
+        "shape_padding"             : shape_padding,
+        "trace.enabled"             : UNSLOTH_COMPILE_DEBUG or debug,
+        "triton.cudagraphs"         : cudagraphs,
+        "debug"                     : UNSLOTH_COMPILE_DEBUG or debug,
+        "dce"                       : True,
+        "memory_planning"           : True,
+        "coordinate_descent_tuning" : UNSLOTH_COMPILE_MAXIMUM,
+        "trace.graph_diagram"       : UNSLOTH_COMPILE_DEBUG or debug,
+        "compile_threads"           : 24,
+        "combo_kernels"             : False, # Causes incompatible gradient sizes on 2.6
+        "group_fusion"              : True,
+        "disable_progress"          : not UNSLOTH_ENABLE_LOGGING,
+        "verbose_progress"          : UNSLOTH_ENABLE_LOGGING,
+        "triton.multi_kernel"       : False, # Sometimes fails
+        "triton.use_block_ptr"      : False,
+        "triton.enable_persistent_tma_matmul" : True,
+        "triton.autotune_at_compile_time"     : True,
     }
 
     # Return logits
@@ -1702,6 +1758,18 @@ def unsloth_compile_transformers(
             bad_torch_modules.add(module)
         pass
 
+        # Remove decoder layers
+        if "for layer in self." in source:
+            print(f"Unsloth: Failed compiling function {module} since it looks like a decoder!")
+            bad_torch_modules.add(module)
+        pass
+
+        # Remove padding
+        if "nn.functional.pad" in source or "padding" in source:
+            print(f"Unsloth: Failed compiling function {module} since there is padding done.")
+            bad_torch_modules.add(module)
+        pass
+
         # Check for residual streams optimizations
         if fast_residual_stream and "residual" in source:
             new_source = patch_residual_stream(source)
@@ -1787,7 +1855,7 @@ def unsloth_compile_transformers(
     # Remove causal masks
     do_not_remove = False
     for module in remove_causal_masks:
-        if module.endswith(("ForConditionalGeneration")):
+        if module.endswith(("ForConditionalGeneration", "Gemma3Model")):
             do_not_remove = True
             print(f"Unsloth: Will not remove causal mask for {model_location} since it's a VLM!")
             break

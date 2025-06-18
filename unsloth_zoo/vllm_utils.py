@@ -80,58 +80,106 @@ if importlib.util.find_spec("vllm") is not None:
         return vllm_check or unsloth_check
     pass
 
-    # Fix force using torch.bfloat16 all the time and make it dynamic
-    def _apply_4bit_weight(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # only load the bitsandbytes module when needed
-        from bitsandbytes import matmul_4bit
+    import vllm.model_executor.layers.quantization.bitsandbytes
 
-        original_type = x.dtype
-        original_shape = x.shape
-        reshape_after_matmul = False
-        if x.ndim > 2:
-            x = x.reshape(-1, x.size(-1))
-            reshape_after_matmul = True
+    if not hasattr(
+        vllm.model_executor.layers.quantization.bitsandbytes,
+        "apply_bnb_4bit"
+    ):
+        # Fix force using torch.bfloat16 all the time and make it dynamic
+        def _apply_4bit_weight(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            bias: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            # only load the bitsandbytes module when needed
+            from bitsandbytes import matmul_4bit
 
-        qweight = layer.weight
-        quant_states = qweight.bnb_quant_state
-        offsets = qweight.bnb_shard_offsets
-        inference_dtype = quant_states[0].dtype
-        bf_x = x.to(inference_dtype) # Originally used bfloat16
+            original_type = x.dtype
+            original_shape = x.shape
+            reshape_after_matmul = False
+            if x.ndim > 2:
+                x = x.reshape(-1, x.size(-1))
+                reshape_after_matmul = True
 
-        out_dim_0 = x.shape[0]
-        out_dim_1 = sum(
-            [quant_state[1].shape[0] for quant_state in quant_states.items()])
-        out = torch.empty(out_dim_0,
-                            out_dim_1,
-                            dtype=inference_dtype,
-                            device=x.device)
+            qweight = layer.weight
+            quant_states = qweight.bnb_quant_state
+            offsets = qweight.bnb_shard_offsets
+            inference_dtype = quant_states[0].dtype
+            bf_x = x.to(inference_dtype) # Originally used bfloat16
 
-        current_index = 0
-        for i in range(len(quant_states)):
-            output_size = quant_states[i].shape[0]
-            # It is more efficient to use out kwarg like
-            # matmul_4bit(..., out = ...).  Infeasible now due to the bug
-            # https://github.com/TimDettmers/bitsandbytes/issues/1235.
-            # Need to change  after the bug is fixed.
-            out[:, current_index:current_index + output_size] = matmul_4bit(
-                bf_x, qweight[offsets[i]:offsets[i + 1]].t(), quant_states[i])
+            out_dim_0 = x.shape[0]
+            out_dim_1 = sum(
+                [quant_state[1].shape[0] for quant_state in quant_states.items()])
+            out = torch.empty(out_dim_0,
+                              out_dim_1,
+                              dtype=inference_dtype,
+                              device=x.device)
 
-            current_index += output_size
+            current_index = 0
+            for i in range(len(quant_states)):
+                output_size = quant_states[i].shape[0]
+                # It is more efficient to use out kwarg like
+                # matmul_4bit(..., out = ...).  Infeasible now due to the bug
+                # https://github.com/TimDettmers/bitsandbytes/issues/1235.
+                # Need to change  after the bug is fixed.
+                out[:, current_index:current_index + output_size] = matmul_4bit(
+                    bf_x, qweight[offsets[i]:offsets[i + 1]].t(), quant_states[i])
 
-        out = out.to(original_type)
+                current_index += output_size
 
-        if reshape_after_matmul:
-            out = out.view(*original_shape[:-1], out.size(-1))
+            out = out.to(original_type)
 
-        if bias is not None:
-            out += bias
+            if reshape_after_matmul:
+                out = out.view(*original_shape[:-1], out.size(-1))
 
-        return out
+            if bias is not None:
+                out += bias
+
+            return out
+        pass
+    else:
+        # Newer vLLM versions have _apply_bnb_4bit
+        apply_bnb_4bit = vllm.model_executor.layers.quantization.bitsandbytes.apply_bnb_4bit
+        def _apply_4bit_weight(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            bias: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            # only load the bitsandbytes module when needed
+            original_type = x.dtype
+            original_shape = x.shape
+            reshape_after_matmul = False
+            if x.ndim > 2:
+                x = x.reshape(-1, x.size(-1))
+                reshape_after_matmul = True
+
+            qweight = layer.weight
+            quant_states = qweight.bnb_quant_state
+            offsets = qweight.bnb_shard_offsets
+            inference_dtype = quant_states[0].dtype
+            bf_x = x.to(inference_dtype) # Originally used bfloat16
+
+            out_dim_0 = x.shape[0]
+            out_dim_1 = sum(
+                [quant_state[1].shape[0] for quant_state in quant_states.items()])
+            out = torch.empty(out_dim_0,
+                              out_dim_1,
+                              dtype=inference_dtype,
+                              device=x.device)
+            apply_bnb_4bit(bf_x, qweight, offsets, out)
+            out = out.to(original_type)
+
+            if reshape_after_matmul:
+                out = out.view(*original_shape[:-1], out.size(-1))
+
+            if bias is not None:
+                out += bias
+
+            return out
+        pass
     pass
 
     def patch_vllm_bitsandbytes():
@@ -149,28 +197,27 @@ if importlib.util.find_spec("vllm") is not None:
         del vllm_config_logger
     pass
 
+    class BitsAndBytesConfig(
+        vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
+    ):
+        # All Unsloth Zoo code licensed under LGPLv3
+        def __init__(self, *args, **kwargs):
+            dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype", kwargs["bnb_4bit_compute_dtype"])
+            kwargs["bnb_4bit_compute_dtype"] = dtype
+            print(f"Unsloth: vLLM Bitsandbytes config using kwargs = {kwargs}")
+            super().__init__(*args, **kwargs)
+        pass
+    pass
+
     def patch_vllm_compute_dtype(dtype = torch.float16):
         # All Unsloth Zoo code licensed under LGPLv3
         # vLLM defaults to using the model config file's compute_dtype
         # We shall fix it dynamically!
-        import vllm.model_executor.layers.quantization.bitsandbytes
         old_config = vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
 
         dtype = str(dtype)
         if dtype.startswith("torch."): dtype = dtype[len("torch."):]
         os.environ["UNSLOTH_bnb_4bit_compute_dtype"] = dtype
-
-        class BitsAndBytesConfig(
-            vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
-        ):
-            # All Unsloth Zoo code licensed under LGPLv3
-            def __init__(self, *args, **kwargs):
-                dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype", kwargs["bnb_4bit_compute_dtype"])
-                kwargs["bnb_4bit_compute_dtype"] = dtype
-                print(f"Unsloth: vLLM Bitsandbytes config using kwargs = {kwargs}")
-                super().__init__(*args, **kwargs)
-            pass
-        pass
 
         vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig = BitsAndBytesConfig
         return old_config
@@ -216,6 +263,23 @@ if importlib.util.find_spec("vllm") is not None:
         vllm.lora.worker_manager.WorkerLoRAManager = PatchedWorkerLoRAManager
         vllm.lora.worker_manager.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
     pass
+
+    def set_inductor_config(config, runtime_shape):
+        if isinstance(runtime_shape, int):
+            # for a specific batchsize, tuning triton kernel parameters
+            # can be beneficial
+            config["max_autotune"] = False # Very slow so disable
+            config["coordinate_descent_tuning"] = True
+    pass
+
+    def patch_vllm_set_inductor_config():
+        try:
+            import vllm.compilation.compiler_interface
+            vllm.compilation.compiler_interface.set_inductor_config = set_inductor_config
+        except:
+            pass
+        return
+    pass
 else:
     def patch_vllm_bitsandbytes():
         return
@@ -234,6 +298,10 @@ else:
     pass
 
     def patch_vllm_lora_load_tensors():
+        return
+    pass
+
+    def patch_vllm_set_inductor_config():
         return
     pass
 pass
@@ -346,13 +414,20 @@ else:
 pass
 
 
-def patch_vllm():
+def patch_vllm(debug = True):
+    # Temporary patch to disable multiprocessing for vLLM
+    # Allows accessing model_executor
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    if debug:
+        os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
+    # os.environ["VLLM_TRACE_FUNCTION"] = "1"
+    patch_vllm_set_inductor_config()
     patch_bitsandbytes_quant_state()
     patch_vllm_bitsandbytes()
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
     global LORA_REQUEST_ID
-    LORA_REQUEST_ID = 0
+    LORA_REQUEST_ID = 1
 pass
 
 
@@ -395,12 +470,28 @@ pass
 def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
+    # vllm_state_dict = {}
     try:
         llm_engine = getattr(llm, "llm_engine", getattr(llm, "engine", llm))
         vllm_internals = llm_engine.model_executor.driver_worker.model_runner.model
+
+        # for name, p in vllm_internals.named_parameters():
+        #     vllm_state_dict[name] = p
     except:
-        raise RuntimeError("Unsloth: Failed to access llm.llm_engine.model_executor.driver_worker.model_runner.model")
+        # Using a new VLLM version must use collective_rpc
+        try:
+            vllm_state_dict = {}
+            gpu_ids = llm.collective_rpc("report_device_id", args = tuple())
+            weights = llm.collective_rpc("get_weight_ipc_handles", args = tuple())[0]
+            weights = weights[gpu_ids[0]]
+            for weight_name, (to_cuda_fx, cuda_data,) in weights.items():
+                vllm_state_dict[weight_name] = to_cuda_fx(*cuda_data)
+            pass
+            raise NotImplementedError("Unsloth: Currently vLLM RPC is not yet fully enabled!")
+        except Exception as e:
+            raise RuntimeError(f"Unsloth: Cannot get internal vLLM states with error = {str(e)}")
     pass
+
     assert(config is not None)
     vocab_size = config.vocab_size
 
@@ -453,6 +544,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     quant_state_dict["model.embed_tokens.weight"] = state_dict["model.embed_tokens.weight"]
 
     # All layers
+    skipped_layernorms = []
     for kk in range(len(vllm_internals.model.layers)):
         proj = vllm_internals.model.layers[kk].self_attn.qkv_proj
         get_state_dict(f"model.layers.{kk}.self_attn.q_proj", 0, state_dict, proj)
@@ -469,15 +561,24 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
         proj = vllm_internals.model.layers[kk].mlp.down_proj
         get_state_dict(f"model.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
 
-        state_dict[f"model.layers.{kk}.input_layernorm.weight"] = \
-            vllm_internals.model.layers[kk].input_layernorm.state_dict()["weight"]
-        quant_state_dict[f"model.layers.{kk}.input_layernorm.weight"] = \
-            state_dict[f"model.layers.{kk}.input_layernorm.weight"]
-
-        state_dict[f"model.layers.{kk}.post_attention_layernorm.weight"] = \
-            vllm_internals.model.layers[kk].post_attention_layernorm.state_dict()["weight"]
-        quant_state_dict[f"model.layers.{kk}.post_attention_layernorm.weight"] = \
-            state_dict[f"model.layers.{kk}.post_attention_layernorm.weight"]
+        for layernorm_name in [
+            f"model.layers.{kk}.input_layernorm",
+            f"model.layers.{kk}.post_attention_layernorm",
+            f"model.layers.{kk}.pre_feedforward_layernorm", # Gemma3
+            f"model.layers.{kk}.post_feedforward_layernorm", # Gemma3
+            f"model.layers.{kk}.self_attn.q_norm", # Qwen3, Gemma3
+            f"model.layers.{kk}.self_attn.k_norm", # Qwen3, Gemma3
+        ]:
+            vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].")
+            vllm_name = f"vllm_internals.{vllm_name}"
+            try:
+                layernorm = eval(vllm_name).state_dict()["weight"]
+                layernorm_name = layernorm_name + ".weight"
+                state_dict[layernorm_name] = layernorm
+                quant_state_dict[layernorm_name] = state_dict[layernorm_name]
+            except Exception as e:
+                skipped_layernorms.append(layernorm_name.split(".")[-1])
+        pass
     pass
 
     # Norm
@@ -495,6 +596,9 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
         state_dict["lm_head.weight"] = lm_head
         quant_state_dict["lm_head.weight"] = state_dict["lm_head.weight"]
     pass
+
+    if len(skipped_layernorms) != 0:
+        print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
 
     if not return_state_dict: state_dict = None
     return state_dict, quant_state_dict
@@ -590,10 +694,18 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         "model.layers.{kk}.mlp.down_proj",
         "model.layers.{kk}.input_layernorm",
         "model.layers.{kk}.post_attention_layernorm",
+        "model.layers.{kk}.pre_feedforward_layernorm", # Gemma3
+        "model.layers.{kk}.post_feedforward_layernorm", # Gemma3
+        "model.layers.{kk}.self_attn.q_norm", # Qwen3, Gemma3
+        "model.layers.{kk}.self_attn.k_norm", # Qwen3, Gemma3
     ]
     layernorm_names = [
         "input_layernorm",
         "post_attention_layernorm",
+        "pre_feedforward_layernorm",
+        "post_feedforward_layernorm",
+        "q_norm",
+        "k_norm",
     ]
     # Override .to("cuda") to disable it otherwise we'll get
     # ValueError: Blockwise quantization only supports 16/32-bit floats, but got torch.uint8
@@ -602,9 +714,14 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         except: return self
     pass
 
+    skipped_layernorms = []
     for kk in range(config.num_hidden_layers):
         for layer_name in layer_names:
             layer_name = layer_name.format(kk = kk)
+            if f"{layer_name}.weight" not in quant_state_dict:
+                skipped_layernorms.append(layer_name.split(".")[-1])
+                continue
+            pass
             weight = quant_state_dict[f"{layer_name}.weight"]
 
             if f"{layer_name}.bias" in quant_state_dict:
@@ -711,6 +828,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     for _ in range(3):
         gc.collect()
         torch.cuda.empty_cache()
+
+    if len(skipped_layernorms) != 0:
+        print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
     return new_model
 pass
 
@@ -825,13 +945,14 @@ def load_vllm(
     max_loras              : int  = 1,
     use_async              : bool = False,
     use_engine             : bool = False,
-    disable_log_stats      : bool = True,
+    disable_log_stats      : bool = False,
     enforce_eager          : bool = False, # Good for debugging
     enable_prefix_caching  : bool = True,
     compilation_config     : int  = 3, # -O3 for maximum performance
     conservativeness       : float = 1.0, # For low VRAM devices, scale batches, num_seqs
     max_logprobs           : int  = 0,
     use_bitsandbytes       : bool = True,
+    return_args            : bool = False, # Just return args
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
@@ -972,11 +1093,11 @@ def load_vllm(
     RAM_GB = memory.available / 1024 / 1024 / 1024
     swap_space = 4
     if   RAM_GB <= 4:  swap_space = 0
-    elif RAM_GB <= 8:  swap_space = 1
-    elif RAM_GB <= 12: swap_space = 2
-    elif RAM_GB <= 16: swap_space = 3
-    elif RAM_GB <= 24: swap_space = 4
-    elif RAM_GB <= 48: swap_space = 5
+    elif RAM_GB <= 8:  swap_space = 0
+    elif RAM_GB <= 12: swap_space = 0
+    elif RAM_GB <= 16: swap_space = 0
+    elif RAM_GB <= 24: swap_space = 2
+    elif RAM_GB <= 48: swap_space = 4
     else: swap_space = 6
 
     print(
@@ -988,6 +1109,37 @@ def load_vllm(
 
     # Get device as well
     device = "cuda:0"
+
+    if compilation_config == 3:
+        try:
+            from vllm.config import CompilationConfig, CompilationLevel
+            compilation_config = CompilationConfig(
+                level = 3,
+                backend = "inductor",
+                # cache_dir = "unsloth_compiled_vllm_cache", # Pytorch fails to load from cache
+                # compile_sizes = [1, 2, 4, 8, 16],
+                # cudagraph_capture_sizes = [1, 2, 4, 8, 16],
+                # max_capture_size = 16,
+                cudagraph_num_of_warmups = 1,
+                full_cuda_graph = False,
+                use_cudagraph = True,
+                use_inductor = True,
+                inductor_compile_config = {
+                    "debug" : False,
+                    "dce" : True,
+                    "coordinate_descent_tuning" : True,
+                    "trace.enabled" : False,
+                    "trace.graph_diagram" : False,
+                    "triton.cudagraphs" : True,
+                    "compile_threads" : 48,
+                    "max_autotune" : False, # Way too slow
+                    "disable_progress" : False,
+                    "verbose_progress" : True,
+                }
+            )
+        except:
+            pass
+    pass
 
     engine_args = dict(
         model                  = model_name,
@@ -1011,11 +1163,14 @@ def load_vllm(
         disable_log_stats      = disable_log_stats,
         enable_prefix_caching  = enable_prefix_caching,
         # enable_chunked_prefill = True, # LoRA fails with chunked prefill as at Feb 2025
-        max_seq_len_to_capture = min(8192, max_seq_length + 256), # Default is 8192 for CUDAGraphs
+        # max_seq_len_to_capture fails for V1
+        # max_seq_len_to_capture = min(8192, max_seq_length + 256), # Default is 8192 for CUDAGraphs
         compilation_config     = compilation_config, # 0, 1, 2, 3
         enforce_eager          = enforce_eager,
         swap_space             = swap_space, # Low memory devices like Colab (13GB) default 4GB
         device                 = device,
+        # New vLLM versions need to pass this in!
+        # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
     )
     good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
     old_keys = engine_args.keys()
@@ -1025,6 +1180,9 @@ def load_vllm(
             print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
         pass
     pass
+
+    # Quick exit
+    if return_args: return engine_args
 
     # Keep trying until success (2 times)
     trials = 0
@@ -1287,10 +1445,10 @@ def load_lora(model, save_directory, load_tensors = False):
 
     # All Unsloth Zoo code licensed under LGPLv3
     global LORA_REQUEST_ID
-    if LORA_REQUEST_ID is None: LORA_REQUEST_ID = 0
+    if LORA_REQUEST_ID is None: LORA_REQUEST_ID = 1
 
     # Check if path exists
-    if not os.path.exists(save_directory) or LORA_REQUEST_ID == 0:
+    if not os.path.exists(save_directory) or LORA_REQUEST_ID == 1:
         if load_tensors:
             # We need to save and load the config file once!
             model.peft_config["default"].save_pretrained(save_directory)
@@ -1365,9 +1523,8 @@ def generate_batches(llm, inputs, n_batches = None, lora_request = None, *args, 
 pass
 
 
-def delete_vllm(llm):
+def delete_vllm(llm = None):
     # From https://github.com/vllm-project/vllm/issues/1908
-    import ray
     from vllm.distributed.parallel_state import (
         destroy_model_parallel,
         destroy_distributed_environment,
@@ -1375,13 +1532,20 @@ def delete_vllm(llm):
     # Delete the llm object and free the memory
     destroy_model_parallel()
     destroy_distributed_environment()
-    del llm.llm_engine.model_executor
-    del llm
+    if llm is not None:
+        del llm.llm_engine.model_executor
+        del llm
+        llm = None
     with contextlib.suppress(AssertionError):
         torch.distributed.destroy_process_group()
     gc.collect()
     torch.cuda.empty_cache()
-    ray.shutdown()
+    try:
+        import ray
+        ray.shutdown()
+    except:
+        pass
+    return llm
 pass
 
 
