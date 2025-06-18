@@ -479,7 +479,6 @@ def patch_vllm_enable_sleep_mode():
         gc.collect()
         torch.cuda.empty_cache()
 
-
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
         """
         Wake up the allocator from sleep mode.
@@ -490,16 +489,13 @@ def patch_vllm_enable_sleep_mode():
             back to GPU memory. If None, all memory allocation will be loaded
             back to GPU memory.
         """
+        delete_memory()
         for ptr, data in self.pointer_to_data.items():
             if data.tag == "weights": 
                 # In unsloth's case we have weights managed by unsloth. So we neither offload/delete them nor onload/create them here.
                 continue
             if tags is None or data.tag in tags:
                 handle = data.handle
-                free, total = torch.cuda.mem_get_info()
-                logger.info("free memory before create and map is %s", free)
-                logger.info("total memory before create and map is %s", total)
-                logger.info("handle takes %s", handle[1])
                 create_and_map(handle)
                 if data.cpu_backup_tensor is not None:
                     cpu_backup_tensor = data.cpu_backup_tensor
@@ -510,6 +506,10 @@ def patch_vllm_enable_sleep_mode():
                         libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
                         data.cpu_backup_tensor = None
 
+    def delete_memory():
+        torch.cuda.empty_cache()
+        gc.collect()
+    pass
 
     def print_memory_summary(self):
         """
@@ -1075,7 +1075,7 @@ def load_vllm(
     conservativeness       : float = 1.0, # For low VRAM devices, scale batches, num_seqs
     max_logprobs           : int  = 0,
     use_bitsandbytes       : bool = True,
-    enable_sleep_mode      : bool = True,
+    unsloth_vllm_standby   : bool = False,
     return_args            : bool = False, # Just return args
 ):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1295,9 +1295,9 @@ def load_vllm(
         device                 = device,
         # New vLLM versions need to pass this in!
         # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
-        enable_sleep_mode      = enable_sleep_mode,
+        enable_sleep_mode      = unsloth_vllm_standby,
     )
-    if enable_sleep_mode and "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
+    if unsloth_vllm_standby and "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
         del os.environ['PYTORCH_CUDA_ALLOC_CONF'] # Disable expandable segments cuz https://github.com/pytorch/pytorch/issues/147851
     good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
     old_keys = engine_args.keys()
@@ -1809,7 +1809,7 @@ def _test_get_vllm_state_dict(
     counts = 100,
     conservativeness = 1.0,
     float8_kv_cache = False,
-    enable_sleep_mode = True,
+    unsloth_vllm_standby = False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if model is allowed to be used in vLLM
@@ -1864,7 +1864,7 @@ def _test_get_vllm_state_dict(
         disable_log_stats      = False,
         float8_kv_cache        = float8_kv_cache,
         conservativeness       = conservativeness,
-        enable_sleep_mode      = enable_sleep_mode,
+        enable_sleep_mode      = unsloth_vllm_standby,
     )
 
     state_dict, quant_state_dict = get_vllm_state_dict(
@@ -1992,7 +1992,7 @@ def test_get_vllm_state_dict():
                 counts = counts,
                 conservativeness = conservativeness,
                 float8_kv_cache = float8_kv_cache,
-                enable_sleep_mode = enable_sleep_mode,
+                unsloth_vllm_standby = unsloth_vllm_standby,
             )
         except Exception as error:
             error = str(error)
