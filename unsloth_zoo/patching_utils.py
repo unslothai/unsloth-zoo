@@ -284,6 +284,11 @@ def patch_model_and_tokenizer(
     for name, module in model.named_modules():
         if isinstance(module, (Bnb_Linear4bit, Peft_Linear4bit)):
             weight = module.weight
+            # Check if quant_state exists for vision models like unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit, unsloth/granite-vision-3.2-2b
+            if not hasattr(weight, 'quant_state'):
+                print(f"Skipping {name}: no quant_state found")
+                continue
+
             quant_state = weight.quant_state
 
             if type(quant_state) is list:
@@ -565,7 +570,7 @@ if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") a
 
         # will raise error if patch fails
         compile(new_source, '<temp_patched>', 'exec')
-        if '_mark_parent' not in new_source or '_unmark_parent' not in new_source:
+        if '_mark_parent' not in new_source and '_unmark_parent' not in new_source:
             do_logging = os.environ.get('UNSLOTH_ENABLE_LOGGING', '0') == '1'
             if do_logging:
                 print(f"Unsloth: Could not wrap replace_with_bnb_linear but may not be an issue")
@@ -587,11 +592,26 @@ if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") a
             1,
         )
 
-    # Need more than 1 replacement since recursion is done
     source = source.replace(
         "_replace_with_bnb_linear",
         "_unsloth_replace_with_bnb_linear",
     )
+
+    score_code = """if name == 'score':
+    modules_to_not_convert.append("score")"""
+
+    pattern = r"(^\s*)(current_key_name\.append\(name\))"
+
+    def add_score_code(match):
+        indentation = match.group(1)  # Captured indentation
+        line_content = match.group(2) # The line 'current_key_name.append(name)'
+        
+        indented_breakpoint_code = "\n".join([f"{indentation}{line}" for line in score_code.splitlines()])
+        
+        return f"{indentation}{line_content}\n{indented_breakpoint_code}"
+
+    source = re.sub(pattern, add_score_code, source, flags=re.MULTILINE)
+
     exec(source, globals())
     transformers.integrations.bitsandbytes._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
 pass
