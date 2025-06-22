@@ -75,12 +75,7 @@ def grpo_compute_loss(
     input_ids  = input_ids.unsqueeze(-1)
 
     # x_i - logsumexp(x_i)
-
-    print("new_logits", new_logits.shape)
     with torch.no_grad():
-        print("input_ids", input_ids.shape)
-        print("ref_logits", ref_logits.shape)
-        if old_logits is not None: print("old_logits", old_logits.shape)
         if beta != 0.0:
             assert ref_logits is not None, "ref_logits should not be None when beta != 0.0"
             ref_logits = ref_logits.to(torch.float32)
@@ -232,11 +227,11 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             return chunk_grad_input
         pass
 
-        # accumulate_chunk = torch.compile(
-        #     accumulate_chunk,
-        #     fullgraph = True,
-        #     options = torch_compile_options,
-        # )
+        accumulate_chunk = torch.compile(
+            accumulate_chunk,
+            fullgraph = True,
+            options = torch_compile_options,
+        )
 
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
         new_hidden_states  = torch.chunk(_new_hidden_states, chunks = n_chunks, dim = 0)
