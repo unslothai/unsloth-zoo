@@ -332,7 +332,8 @@ def grpo_accumulated_loss(
             advantages,
             trainer.beta,
             trainer.accelerator.scaler,
-            n_chunks, kwargs # pass kwargs as a dict
+            n_chunks,
+            kwargs # pass kwargs as a dict
         )
 
         return loss, completion_length, mean_kl
