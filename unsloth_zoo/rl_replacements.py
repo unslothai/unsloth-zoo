@@ -76,6 +76,7 @@ def grpo_compute_loss(
 
     # x_i - logsumexp(x_i)
 
+    print("new_logits", new_logits.shape)
     with torch.no_grad():
         print("input_ids", input_ids.shape)
         print("ref_logits", ref_logits.shape)
