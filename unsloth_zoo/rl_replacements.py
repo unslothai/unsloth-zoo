@@ -73,6 +73,9 @@ def grpo_compute_loss(
     # x_i - logsumexp(x_i)
 
     with torch.no_grad():
+        print("input_ids", input_ids.shape)
+        print("ref_logits", ref_logits.shape)
+        print("old_logits", old_logits.shape)
         if beta != 0.0:
             assert ref_logits is not None, "ref_logits should not be None when beta != 0.0"
             ref_logits = ref_logits.to(torch.float32)
