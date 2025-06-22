@@ -90,6 +90,9 @@ def grpo_compute_loss(
             ref = ref_x - torch.logsumexp(ref_logits, dim = -1)
         if old_logits is not None:
             old_logits = old_logits.to(torch.float32)
+            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
+            if temperature != 1.0:
+                old_logits = old_logits / temperature
             old_x = torch.gather(old_logits, dim = -1, index = input_ids).squeeze(-1)
             old = old_x - torch.logsumexp(old_logits, dim = -1)
 
