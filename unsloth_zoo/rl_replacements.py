@@ -60,11 +60,12 @@ def grpo_compute_loss(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Set defaults for optional arguments
-    loss_type = kwargs.get("loss_type", "bnpo")
+    loss_type = kwargs.get("loss_type", "grpo")
     epsilon_low = kwargs.get("epsilon_low", 0.2)
     epsilon_high = kwargs.get("epsilon_high", 0.2)
     max_completion_length = kwargs.get("max_completion_length", 8192)
     delta = kwargs.get("delta", None)
+    temperature = kwargs.get("temperature", 1.0)
 
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
