@@ -198,7 +198,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             zip(grad_inputs_chunks, new_logps_chunks, old_logps_chunks, ref_logps_chunks, mask, advantages):
 
             mark_dynamic(new_logps_j)
-            mark_dynamic(old_logps_j)
+            if old_logps_j is not None:
+                mark_dynamic(old_logps_j)
             mark_dynamic(ref_logps_j)
             mark_dynamic(mask_j)
 
