@@ -38,6 +38,7 @@ SKIP_QUANTIZATION_MODULES = [
     "modality_projection",   # Idefics, SmolVLM
     "router",                # MoE Router
     "gate",                  # MoE Router
+    'mamba',
 ]
 
 def get_peft_regex(
