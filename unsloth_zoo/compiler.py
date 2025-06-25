@@ -1421,6 +1421,13 @@ def patch_gradient_accumulation(modeling_file, module):
     return source
 pass
 
+# if module ends with any of these, disable compile
+DISABLE_COMPILE_MODULES = [
+    "ParallelExperts",
+    "GraniteMoeHybridMoE",
+    "GraniteMoeHybridMambaLayer",
+]
+
 
 def unsloth_compile_transformers(
     model_type             : str = "llama",
@@ -1701,6 +1708,8 @@ def unsloth_compile_transformers(
     # Remove modules which have attention mechanisms
     # since torch.compile will compile too many kernels
     bad_torch_modules = set()
+    # actively disable certain modules
+    disable_modules = set()
     for module, fullgraph in torch_modules.items():
         source = eval(f"{model_location}.{module}")
         if not hasattr(source, "forward"): continue
@@ -1740,6 +1749,13 @@ def unsloth_compile_transformers(
             bad_torch_modules.add(module)
         pass
 
+        # if more modules need to be disabled consider adding to a global list
+        if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+            print(f"Unsloth: Disabling compile for {module} since it's marked for disabling.")
+            bad_torch_modules.add(module)
+            disable_modules.add(module)
+        pass
+
         # Check for residual streams optimizations
         if fast_residual_stream and "residual" in source:
             new_source = patch_residual_stream(source)
@@ -1762,6 +1778,23 @@ def unsloth_compile_transformers(
     pass
     # Add back to functions since failed compiling
     functions += list(bad_torch_modules)
+
+    if len(disable_modules) > 0:
+        for module in disable_modules:
+            try:
+                new_module = create_standalone_class(
+                    module,
+                    model_location,
+                    functions,
+                    fullgraph = False,
+                    disable = True,
+                )
+                all_standalone_classes[module] = new_module
+            except:
+                print(f"Unsloth: Failed to disable {module}.")
+                continue
+        pass
+    pass
 
     # Now patch modules ie LlamaRMSNorm
     if compile_custom_modules:
