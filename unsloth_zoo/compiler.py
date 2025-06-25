@@ -575,6 +575,60 @@ for j, function in enumerate(functions):
         except: continue
 pass
 
+
+def _compiled_loss_function(
+    output_logits : torch.Tensor,
+    output_labels : torch.Tensor,
+    logit_scale_multiply : float = 0,
+    logit_scale_divide : float = 0,
+    logit_softcapping : float = 0,
+    vocab_size : int = 0,
+    n_items : int = 0,
+):
+    device = output_logits.device
+    if logit_scale_multiply != 0:
+        output_logits = output_logits * logit_scale_multiply
+    if logit_scale_divide != 0:
+        output_logits = output_logits / logit_scale_divide
+    if logit_softcapping != 0:
+        output_logits = output_logits / logit_softcapping
+        output_logits = torch.tanh(output_logits)
+        output_logits = output_logits * logit_softcapping
+
+    shift_logits = output_logits
+    shift_labels = torch.empty_like(output_labels, device = device)
+    shift_labels[..., :-1] = output_labels[..., 1:]
+    shift_labels[..., -1] = -100
+    # shift_logits = output_logits[..., :-1, :].float().contiguous()
+    # shift_labels = output_labels[..., 1:].contiguous()
+
+    shift_logits = shift_logits.view(-1, vocab_size)
+    shift_labels = shift_labels.view(-1)
+
+    n_chunks = int(math.ceil((vocab_size / 262144) * 8))
+    if requires_grad_: n_chunks += 2
+    __shift_logits = torch.chunk(shift_logits, n_chunks, dim = 0)
+    __shift_labels = torch.chunk(shift_labels, n_chunks, dim = 0)
+    loss = 0.0
+    for (_shift_logits, _shift_labels) in zip(__shift_logits, __shift_labels):
+        loss += torch.nn.functional.cross_entropy(
+            input  = _shift_logits.float().contiguous(),
+            target = _shift_labels.contiguous(),
+            reduction = 'sum',
+        )
+    pass
+    if n_items != 0:
+        loss = loss / n_items
+    else:
+        loss = loss / (shift_labels != -100).sum()
+    return loss
+pass
+_compiled_loss_function = torch.compile(
+    _compiled_loss_function,
+    fullgraph = False,
+    dynamic = True,
+    options = torch_compile_options,
+)
 """
 
 # Replace Cross Entropy cells with fused linear lm heads
@@ -631,59 +685,6 @@ elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.
     )
 else:
     logits = self.lm_head(hidden_states\\1)
-    def _compiled_loss_function(
-        output_logits : torch.Tensor,
-        output_labels : torch.Tensor,
-        logit_scale_multiply : float = 0,
-        logit_scale_divide : float = 0,
-        logit_softcapping : float = 0,
-        vocab_size : int = 0,
-        n_items : int = 0,
-    ):
-        device = output_logits.device
-        if logit_scale_multiply != 0:
-            output_logits = output_logits * logit_scale_multiply
-        if logit_scale_divide != 0:
-            output_logits = output_logits / logit_scale_divide
-        if logit_softcapping != 0:
-            output_logits = output_logits / logit_softcapping
-            output_logits = torch.tanh(output_logits)
-            output_logits = output_logits * logit_softcapping
-
-        shift_logits = output_logits
-        shift_labels = torch.empty_like(output_labels, device = device)
-        shift_labels[..., :-1] = output_labels[..., 1:]
-        shift_labels[..., -1] = -100
-        # shift_logits = output_logits[..., :-1, :].float().contiguous()
-        # shift_labels = output_labels[..., 1:].contiguous()
-
-        shift_logits = shift_logits.view(-1, vocab_size)
-        shift_labels = shift_labels.view(-1)
-
-        n_chunks = int(math.ceil((vocab_size / 262144) * 8))
-        if requires_grad_: n_chunks += 2
-        __shift_logits = torch.chunk(shift_logits, n_chunks, dim = 0)
-        __shift_labels = torch.chunk(shift_labels, n_chunks, dim = 0)
-        loss = 0.0
-        for (_shift_logits, _shift_labels) in zip(__shift_logits, __shift_labels):
-            loss += torch.nn.functional.cross_entropy(
-                input  = _shift_logits.float().contiguous(),
-                target = _shift_labels.contiguous(),
-                reduction = 'sum',
-            )
-        pass
-        if n_items != 0:
-            loss = loss / n_items
-        else:
-            loss = loss / (shift_labels != -100).sum()
-        return loss
-    pass
-    _compiled_loss_function = torch.compile(
-        _compiled_loss_function,
-        fullgraph = False,
-        dynamic = True,
-        options = torch_compile_options,
-    )
     torch._dynamo.mark_dynamic(logits, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     loss = _compiled_loss_function(
@@ -725,12 +726,7 @@ if labels is not None:$SPACES$loss = self.loss_function($LOGITS$, $LABELS$, $VOC
 
 cross_entropy_replacement_2 = """
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
-all_locals = locals()
-n_items = None
-for __kwargs in all_locals.values():
-    if type(__kwargs) is dict:
-        n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
-        break
+n_items = (\\9).get("num_items_in_batch", None) or (\\9).get("n_items", None)
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -863,60 +859,6 @@ for __kwargs in all_locals.values():
         break
 
 if labels is not None:
-    def _compiled_loss_function(
-        output_logits : torch.Tensor,
-        output_labels : torch.Tensor,
-        mask : torch.Tensor = None,
-        logit_scale_multiply : float = 0,
-        logit_scale_divide : float = 0,
-        logit_softcapping : float = 0,
-        vocab_size : int = 0,
-        n_items : int = 0,
-    ):
-        device = output_logits.device
-        if logit_scale_multiply != 0:
-            output_logits = output_logits * logit_scale_multiply
-        if logit_scale_divide != 0:
-            output_logits = output_logits / logit_scale_divide
-        if logit_softcapping != 0:
-            output_logits = output_logits / logit_softcapping
-            output_logits = torch.tanh(output_logits)
-            output_logits = output_logits * logit_softcapping
-
-        shift_logits = output_logits
-        shift_labels = torch.empty_like(output_labels, device = device)
-        shift_labels[..., :-1] = output_labels[..., 1:]
-        if mask is not None:
-            mask = mask.to(device = device)
-            shift_labels[..., :-1][mask[..., 1:] == 0] = -100
-        pass
-        shift_labels[..., -1] = -100
-
-        shift_logits = shift_logits.view(-1, vocab_size)
-        shift_labels = shift_labels.view(-1)
-
-        __shift_logits = torch.chunk(shift_logits, 4, dim = 0)
-        __shift_labels = torch.chunk(shift_labels, 4, dim = 0)
-        loss = 0.0
-        for (_shift_logits, _shift_labels) in zip(__shift_logits, __shift_labels):
-            loss += torch.nn.functional.cross_entropy(
-                input  = _shift_logits.float().contiguous(),
-                target = _shift_labels.contiguous(),
-                reduction = 'sum',
-            )
-        pass
-        if n_items != 0:
-            loss = loss / n_items
-        else:
-            loss = loss / (shift_labels != -100).sum()
-        return loss
-    pass
-    _compiled_loss_function = torch.compile(
-        _compiled_loss_function,
-        fullgraph = False,
-        dynamic = True,
-        options = torch_compile_options,
-    )
     torch._dynamo.mark_dynamic(logits, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
@@ -942,7 +884,6 @@ ce_finders = [
 
 def apply_fused_lm_head(forward):
     # All Unsloth Zoo code licensed under LGPLv3
-    import regex
     for cross_entropy_find, cross_entropy_replacement in ce_finders:
         cross_entropy_find = cross_entropy_find.strip()\
             .replace("*", r"\*").replace("^", r"\^")\
@@ -1013,8 +954,11 @@ def apply_fused_lm_head(forward):
             .replace(r"$OUTPUTLOGITS$",
                      r"(?:"\
                      r"logits = outputs\.logits|"\
-                     r"logits = self\.lm_head\(hidden_states\)"\
+                     r"logits = self\.lm_head\(hidden_states\)|"\
+                     r"logits = self\.lm_head\(hidden_states$INDEXING$"
                      r")")\
+            .replace("$INDEXING$",
+                     r"([^\n^\)]{0,})\)(?:\.float\(\))?[\n][\s]{0,}")\
             .replace(r"shift_", r"(?:shift_|flat_)")\
             .replace("$CONTIGUOUS$",   r"(?:\.contiguous\(\))?")\
             .replace(r"shift\_", r"(?:shift\_|flat\_)")\
@@ -1022,6 +966,7 @@ def apply_fused_lm_head(forward):
             .replace(r"@@@", r"[^\[]{1,}\[[^\]]{1,}\][^\n]{0,}\n")\
             .replace(r"$EMPTY$", r"()")
 
+        # print(cross_entropy_find)
         cross_entropy_replacement = cross_entropy_replacement\
             .replace(
                 "$KWARGS$",
@@ -1037,6 +982,7 @@ def apply_fused_lm_head(forward):
             "shift_labels = shift_labels.to(shift_logits.device)\n"\
             "loss = loss_fct(shift_logits, shift_labels)"
         )
+
         # Find matches
         if r"loss\_function" in cross_entropy_find and "loss_function" not in forward:
             continue
@@ -1045,6 +991,7 @@ def apply_fused_lm_head(forward):
         elif "CrossEntropyLoss" not in cross_entropy_find and "CrossEntropyLoss" in forward:
             continue
         elif "CrossEntropyLoss" in cross_entropy_find and "CrossEntropyLoss" not in forward:
+            print(forward)
             continue
         try:
             finder = regex.findall(
@@ -1053,7 +1000,9 @@ def apply_fused_lm_head(forward):
                 flags = regex.DOTALL | regex.MULTILINE,
                 timeout = 1
             )
-        except:
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                print(f"Unsloth failed patching fast linear cross entropy with error: {str(e)}")
             continue
         if len(finder) == 0: continue
 
@@ -1091,7 +1040,6 @@ def apply_fused_lm_head(forward):
         forward = forward.replace(", **)", ")")
         forward = forward.replace(",**)", ")")
         forward = forward.replace(",** )", ")")
-
         return forward
     pass
     return forward
@@ -1121,12 +1069,34 @@ def test_apply_fused_lm_head():
     forwards.append(IdeficsForVisionText2Text)
     from transformers.models.idefics3.modeling_idefics3 import Idefics3ForConditionalGeneration
     forwards.append(Idefics3ForConditionalGeneration)
+    from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
+    forwards.append(Mistral3ForConditionalGeneration)
+    from transformers.models.mllama.modeling_mllama import MllamaForConditionalGeneration
+    forwards.append(MllamaForConditionalGeneration)
+    from transformers.models.mllama.modeling_mllama import MllamaForCausalLM
+    forwards.append(MllamaForCausalLM)
+    from transformers.models.llama4.modeling_llama4 import Llama4ForCausalLM
+    forwards.append(Llama4ForCausalLM)
+    from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
+    forwards.append(Llama4ForConditionalGeneration)
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+    forwards.append(Qwen3ForCausalLM)
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+    forwards.append(Qwen2_5_VLForConditionalGeneration)
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+    forwards.append(Gemma3ForConditionalGeneration)
     forwards = [(f.__name__, inspect.getsource(f.forward),) for f in forwards]
     for name, forward in forwards:
-        print("=" * 30)
-        print(name)
-        print(apply_fused_lm_head(forward))
-        print("=" * 30)
+        # print("=" * 30)
+        # print(name)
+        forward = apply_fused_lm_head(forward)
+        if "NOT_RETURN_LOGITS" not in forward:
+            print(f"Failed patching fast CE forward for {name}")
+        if "loss = outputs.loss" in forward:
+            print(f"Failed patching fast CE forward for {name} since `loss = outputs.loss` exists")
+        # return apply_fused_lm_head(forward)
+        # print(apply_fused_lm_head(forward))
+        # print("=" * 30)
     pass
 pass
 
@@ -1456,6 +1426,13 @@ def patch_gradient_accumulation(modeling_file, module):
     return source
 pass
 
+# if module ends with any of these, disable compile
+DISABLE_COMPILE_MODULES = [
+    "ParallelExperts",
+    "GraniteMoeHybridMoE",
+    "GraniteMoeHybridMambaLayer",
+]
+
 
 def unsloth_compile_transformers(
     model_type             : str = "llama",
@@ -1736,6 +1713,8 @@ def unsloth_compile_transformers(
     # Remove modules which have attention mechanisms
     # since torch.compile will compile too many kernels
     bad_torch_modules = set()
+    # actively disable certain modules
+    disable_modules = set()
     for module, fullgraph in torch_modules.items():
         source = eval(f"{model_location}.{module}")
         if not hasattr(source, "forward"): continue
@@ -1775,6 +1754,13 @@ def unsloth_compile_transformers(
             bad_torch_modules.add(module)
         pass
 
+        # if more modules need to be disabled consider adding to a global list
+        if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+            print(f"Unsloth: Disabling compile for {module} since it's marked for disabling.")
+            bad_torch_modules.add(module)
+            disable_modules.add(module)
+        pass
+
         # Check for residual streams optimizations
         if fast_residual_stream and "residual" in source:
             new_source = patch_residual_stream(source)
@@ -1797,6 +1783,23 @@ def unsloth_compile_transformers(
     pass
     # Add back to functions since failed compiling
     functions += list(bad_torch_modules)
+
+    if len(disable_modules) > 0:
+        for module in disable_modules:
+            try:
+                new_module = create_standalone_class(
+                    module,
+                    model_location,
+                    functions,
+                    fullgraph = False,
+                    disable = True,
+                )
+                all_standalone_classes[module] = new_module
+            except:
+                print(f"Unsloth: Failed to disable {module}.")
+                continue
+        pass
+    pass
 
     # Now patch modules ie LlamaRMSNorm
     if compile_custom_modules:

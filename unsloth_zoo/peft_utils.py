@@ -38,6 +38,7 @@ SKIP_QUANTIZATION_MODULES = [
     "modality_projection",   # Idefics, SmolVLM
     "router",                # MoE Router
     "gate",                  # MoE Router
+    'mamba',
 ]
 
 def get_peft_regex(
@@ -46,11 +47,11 @@ def get_peft_regex(
     finetune_language_layers   : bool = True,
     finetune_attention_modules : bool = True,
     finetune_mlp_modules       : bool = True,
-    target_modules             : list[str] = None,
-    vision_tags                : list[str] = ["vision", "image", "visual", "patch",],
-    language_tags              : list[str] = ["language", "text",],
-    attention_tags             : list[str] = ["self_attn", "attention", "attn",],
-    mlp_tags                   : list[str] = ["mlp", "feed_forward", "ffn", "dense",],
+    target_modules             : List[str] = None,
+    vision_tags                : List[str] = ["vision", "image", "visual", "patch",],
+    language_tags              : List[str] = ["language", "text",],
+    attention_tags             : List[str] = ["self_attn", "attention", "attn",],
+    mlp_tags                   : List[str] = ["mlp", "feed_forward", "ffn", "dense",],
 ) -> str:
     """
     Create a regex pattern to apply LoRA to only select layers of a model.

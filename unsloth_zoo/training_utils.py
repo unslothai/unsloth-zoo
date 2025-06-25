@@ -164,6 +164,17 @@ def prepare_model_for_training(
                 # Maybe model.model
                 exec(f"model.{name}.to({str(dtype)})")
         pass
+
+        if ('norm.' in name or '_layernorm' in name) and os.environ.get("UNSLOTH_UPCAST_LAYERNORM", "0") == "1":
+            try:
+                name = name.replace("base_model", "model", 1)
+                name = re.sub(r'\.(\d+)\.', r'[\1].', name)
+                name = name.replace(".weight", "", 1)
+                # Try original name
+                exec(f"{name}.to({str(torch.float32)})")
+            except:
+                # Maybe model.model
+                exec(f"model.{name}.to({str(torch.float32)})")
     pass
 
     # Gradient checkpointing

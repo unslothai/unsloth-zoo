@@ -478,7 +478,7 @@ def patch_vllm_enable_sleep_mode():
         gc.collect()
         torch.cuda.empty_cache()
 
-    def wake_up(self, tags: Optional[list[str]] = None) -> None:
+    def wake_up(self, tags: Optional[List[str]] = None) -> None:
         """
         Wake up the allocator from sleep mode.
         All data that is previously offloaded will be loaded back to GPU 
