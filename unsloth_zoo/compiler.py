@@ -575,6 +575,60 @@ for j, function in enumerate(functions):
         except: continue
 pass
 
+
+def _compiled_loss_function(
+    output_logits : torch.Tensor,
+    output_labels : torch.Tensor,
+    logit_scale_multiply : float = 0,
+    logit_scale_divide : float = 0,
+    logit_softcapping : float = 0,
+    vocab_size : int = 0,
+    n_items : int = 0,
+):
+    device = output_logits.device
+    if logit_scale_multiply != 0:
+        output_logits = output_logits * logit_scale_multiply
+    if logit_scale_divide != 0:
+        output_logits = output_logits / logit_scale_divide
+    if logit_softcapping != 0:
+        output_logits = output_logits / logit_softcapping
+        output_logits = torch.tanh(output_logits)
+        output_logits = output_logits * logit_softcapping
+
+    shift_logits = output_logits
+    shift_labels = torch.empty_like(output_labels, device = device)
+    shift_labels[..., :-1] = output_labels[..., 1:]
+    shift_labels[..., -1] = -100
+    # shift_logits = output_logits[..., :-1, :].float().contiguous()
+    # shift_labels = output_labels[..., 1:].contiguous()
+
+    shift_logits = shift_logits.view(-1, vocab_size)
+    shift_labels = shift_labels.view(-1)
+
+    n_chunks = int(math.ceil((vocab_size / 262144) * 8))
+    if requires_grad_: n_chunks += 2
+    __shift_logits = torch.chunk(shift_logits, n_chunks, dim = 0)
+    __shift_labels = torch.chunk(shift_labels, n_chunks, dim = 0)
+    loss = 0.0
+    for (_shift_logits, _shift_labels) in zip(__shift_logits, __shift_labels):
+        loss += torch.nn.functional.cross_entropy(
+            input  = _shift_logits.float().contiguous(),
+            target = _shift_labels.contiguous(),
+            reduction = 'sum',
+        )
+    pass
+    if n_items != 0:
+        loss = loss / n_items
+    else:
+        loss = loss / (shift_labels != -100).sum()
+    return loss
+pass
+_compiled_loss_function = torch.compile(
+    _compiled_loss_function,
+    fullgraph = False,
+    dynamic = True,
+    options = torch_compile_options,
+)
 """
 
 # Replace Cross Entropy cells with fused linear lm heads
@@ -631,59 +685,6 @@ elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.
     )
 else:
     logits = self.lm_head(hidden_states\\1)
-    def _compiled_loss_function(
-        output_logits : torch.Tensor,
-        output_labels : torch.Tensor,
-        logit_scale_multiply : float = 0,
-        logit_scale_divide : float = 0,
-        logit_softcapping : float = 0,
-        vocab_size : int = 0,
-        n_items : int = 0,
-    ):
-        device = output_logits.device
-        if logit_scale_multiply != 0:
-            output_logits = output_logits * logit_scale_multiply
-        if logit_scale_divide != 0:
-            output_logits = output_logits / logit_scale_divide
-        if logit_softcapping != 0:
-            output_logits = output_logits / logit_softcapping
-            output_logits = torch.tanh(output_logits)
-            output_logits = output_logits * logit_softcapping
-
-        shift_logits = output_logits
-        shift_labels = torch.empty_like(output_labels, device = device)
-        shift_labels[..., :-1] = output_labels[..., 1:]
-        shift_labels[..., -1] = -100
-        # shift_logits = output_logits[..., :-1, :].float().contiguous()
-        # shift_labels = output_labels[..., 1:].contiguous()
-
-        shift_logits = shift_logits.view(-1, vocab_size)
-        shift_labels = shift_labels.view(-1)
-
-        n_chunks = int(math.ceil((vocab_size / 262144) * 8))
-        if requires_grad_: n_chunks += 2
-        __shift_logits = torch.chunk(shift_logits, n_chunks, dim = 0)
-        __shift_labels = torch.chunk(shift_labels, n_chunks, dim = 0)
-        loss = 0.0
-        for (_shift_logits, _shift_labels) in zip(__shift_logits, __shift_labels):
-            loss += torch.nn.functional.cross_entropy(
-                input  = _shift_logits.float().contiguous(),
-                target = _shift_labels.contiguous(),
-                reduction = 'sum',
-            )
-        pass
-        if n_items != 0:
-            loss = loss / n_items
-        else:
-            loss = loss / (shift_labels != -100).sum()
-        return loss
-    pass
-    _compiled_loss_function = torch.compile(
-        _compiled_loss_function,
-        fullgraph = False,
-        dynamic = True,
-        options = torch_compile_options,
-    )
     torch._dynamo.mark_dynamic(logits, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     loss = _compiled_loss_function(
@@ -858,60 +859,6 @@ for __kwargs in all_locals.values():
         break
 
 if labels is not None:
-    def _compiled_loss_function(
-        output_logits : torch.Tensor,
-        output_labels : torch.Tensor,
-        mask : torch.Tensor = None,
-        logit_scale_multiply : float = 0,
-        logit_scale_divide : float = 0,
-        logit_softcapping : float = 0,
-        vocab_size : int = 0,
-        n_items : int = 0,
-    ):
-        device = output_logits.device
-        if logit_scale_multiply != 0:
-            output_logits = output_logits * logit_scale_multiply
-        if logit_scale_divide != 0:
-            output_logits = output_logits / logit_scale_divide
-        if logit_softcapping != 0:
-            output_logits = output_logits / logit_softcapping
-            output_logits = torch.tanh(output_logits)
-            output_logits = output_logits * logit_softcapping
-
-        shift_logits = output_logits
-        shift_labels = torch.empty_like(output_labels, device = device)
-        shift_labels[..., :-1] = output_labels[..., 1:]
-        if mask is not None:
-            mask = mask.to(device = device)
-            shift_labels[..., :-1][mask[..., 1:] == 0] = -100
-        pass
-        shift_labels[..., -1] = -100
-
-        shift_logits = shift_logits.view(-1, vocab_size)
-        shift_labels = shift_labels.view(-1)
-
-        __shift_logits = torch.chunk(shift_logits, 4, dim = 0)
-        __shift_labels = torch.chunk(shift_labels, 4, dim = 0)
-        loss = 0.0
-        for (_shift_logits, _shift_labels) in zip(__shift_logits, __shift_labels):
-            loss += torch.nn.functional.cross_entropy(
-                input  = _shift_logits.float().contiguous(),
-                target = _shift_labels.contiguous(),
-                reduction = 'sum',
-            )
-        pass
-        if n_items != 0:
-            loss = loss / n_items
-        else:
-            loss = loss / (shift_labels != -100).sum()
-        return loss
-    pass
-    _compiled_loss_function = torch.compile(
-        _compiled_loss_function,
-        fullgraph = False,
-        dynamic = True,
-        options = torch_compile_options,
-    )
     torch._dynamo.mark_dynamic(logits, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
