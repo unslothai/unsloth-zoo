@@ -1277,6 +1277,7 @@ def patch_lora_forwards(torch_compile_options):
     # All Unsloth Zoo code licensed under LGPLv3
     Linear_LoRA_Layers = get_lora_layer_modules()
     success = 0
+    could_not_replace_modules = []
     for function, parent, child in Linear_LoRA_Layers:
         if not hasattr(function, "forward"): continue
         if function.forward.__name__ == "unsloth_forward": continue
@@ -1351,11 +1352,15 @@ def patch_lora_forwards(torch_compile_options):
                     f"\ntorch_compile_options = {torch_compile_options}\n"
             ).unsloth_forward
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
-        pass
+        else:
+            could_not_replace_modules.append(parent)
     pass
-
     if success <= 5:
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
+    
+    if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+        print("Unsloth: Not an error, but could not optimize some PEFT modules.")
+        print(could_not_replace_modules)
     return
 pass
 
