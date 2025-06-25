@@ -153,7 +153,7 @@ def patch_Gemma3Processor():
         transformers.models.gemma3.processing_gemma3.Gemma3Processor.__call__ = __call__
     return
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3Processor)
+# TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
 def patch_Gemma3ForConditionalGeneration_forward_router():
     try:
