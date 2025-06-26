@@ -315,7 +315,7 @@ def grpo_accumulated_loss(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     bsz, qlen = input_ids.shape
-    
+
     # Find closest multiple
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
@@ -331,7 +331,6 @@ def grpo_accumulated_loss(
     lm_head = trainer.model.get_output_embeddings().weight
 
     with torch.amp.autocast(device_type = "cuda", dtype = trainer._autocast_dtype):
-        # breakpoint()
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
             ref_hidden_states = trainer.model(
                 input_ids = input_ids,
@@ -344,7 +343,10 @@ def grpo_accumulated_loss(
             attention_mask = attention_mask,
             logits_to_keep = logits_to_keep + 1,
         ).logits
-        
+
+        print(ref_hidden_states.shape, getattr(ref_hidden_states, "__is_hidden_state", False))
+        print(new_hidden_states.shape, getattr(new_hidden_states, "__is_hidden_state", False))
+
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
             new_hidden_states,
             old_hidden_states,
