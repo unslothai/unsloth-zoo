@@ -637,6 +637,7 @@ loss = loss_fct(shift_logits, shift_labels)
 
 cross_entropy_replacement_1 = """
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
+RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
 n_items = None
 all_locals = locals()
@@ -659,7 +660,10 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
-if labels is None:
+if RETURN_HIDDEN_STATES:
+    logits = hidden_states\\1
+    logits.__is_hidden_state = True
+elif labels is None:
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
     loss = fast_linear_cross_entropy(
@@ -722,6 +726,7 @@ if labels is not None:$SPACES$loss = self.loss_function($NEWLINES$$LOGITS$, $LAB
 
 cross_entropy_replacement_2 = """
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
+RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
 n_items = None
 if (\\9) != () and type(\\9) is dict:
@@ -747,7 +752,10 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
-if labels is None:
+if RETURN_HIDDEN_STATES:
+    logits = hidden_states\\1
+    logits.__is_hidden_state = True
+elif labels is None:
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and not requires_grad_:
     loss = fast_linear_cross_entropy(
@@ -814,6 +822,7 @@ loss = loss_fct(shift_logits, shift_labels)
 
 cross_entropy_replacement_3 = """
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
+RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
 all_locals = locals()
 n_items = None
@@ -833,7 +842,10 @@ if n_items is None:
             break
 pass
 
-if labels is not None:
+if RETURN_HIDDEN_STATES:
+    logits = hidden_states\\1
+    logits.__is_hidden_state = True
+elif labels is not None:
     logits = self.lm_head(hidden_states\\1)
     torch._dynamo.mark_dynamic(logits, 1)
     torch._dynamo.mark_dynamic(labels, 1)
