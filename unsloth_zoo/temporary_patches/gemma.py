@@ -496,15 +496,15 @@ def patch_Gemma3ForConditionalGeneration_forward_llm():
             attentions=outputs.attentions,
             image_hidden_states=None,  # No images in text-only mode
         )
-     pass
+    pass
 
-     old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration.forward).parameters
-     new_keys = inspect.signature(forward_llm).parameters
-     if old_keys != new_keys:
-         if UNSLOTH_ENABLE_LOGGING:
-             print("Unsloth: Failed patching Gemma3ForConditionalGeneration language forward")
-     else:
-         transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration.forward_llm = forward_llm
+    old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration.forward).parameters
+    new_keys = inspect.signature(forward_llm).parameters
+    if old_keys != new_keys:
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Failed patching Gemma3ForConditionalGeneration language forward")
+    else:
+        transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration.forward_llm = forward_llm
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_forward_llm)
 
@@ -652,6 +652,7 @@ def patch_Gemma3ForCausalLM():
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+    pass
 
     old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForCausalLM.forward).parameters
     new_keys = inspect.signature(forward).parameters
@@ -756,6 +757,7 @@ def patch_Gemma3ForCausalLMGRPO():
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+    pass
 
     # Apply the patch
     old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForCausalLM.forward).parameters
@@ -767,6 +769,7 @@ def patch_Gemma3ForCausalLMGRPO():
     return
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3ForCausalLMGRPO)
+
 
 def patch_Gemma3ForConditionalGeneration_causal_mask():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
@@ -1050,7 +1053,6 @@ def patch_Gemma3Attention():
             attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
 
         output_attentions = kwargs.get("output_attentions", False)
-
 
         attn_output_fp32 = scaled_dot_product_attention(
             query_states_fp32,
