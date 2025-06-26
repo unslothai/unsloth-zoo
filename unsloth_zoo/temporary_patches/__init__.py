@@ -18,3 +18,4 @@
 from .common import *
 from .gemma import *
 from .misc import *
+from .gemma3n import *
