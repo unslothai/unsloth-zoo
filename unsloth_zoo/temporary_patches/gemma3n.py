@@ -129,4 +129,4 @@ def patch_Gemma3nForConditionalGeneration_forward():
         transformers.models.gemma3n.modeling_gemma3n.Gemma3nForConditionalGeneration.forward = forward
     return
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3nForConditionalGeneration)
+TEMPORARY_PATCHES.append(patch_Gemma3nForConditionalGeneration_forward)
