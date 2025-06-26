@@ -137,6 +137,28 @@ def disable_compile_scaled_dot_product_attention(*args, **kwargs):
     return scaled_dot_product_attention(*args, **kwargs)
 pass
 
+
+from transformers.modeling_flash_attention_utils import is_flash_attn_available
+
+if is_flash_attn_available():
+    try:
+        from transformers.modeling_flash_attention_utils import flash_attn_supports_top_left_mask
+    except:
+        flash_attn_supports_top_left_mask = None
+    try:
+        from transformers.modeling_flash_attention_utils import _flash_attention_forward
+    except:
+        _flash_attention_forward = None
+    try:
+        from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+    except:
+        FlashAttentionKwargs = None
+else:
+    flash_attn_supports_top_left_mask = None
+    _flash_attention_forward = None
+    FlashAttentionKwargs = None
+pass
+
 """
 
 # Patch Layernorm, Conv
