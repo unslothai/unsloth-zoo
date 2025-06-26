@@ -660,10 +660,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
-if RETURN_HIDDEN_STATES:
-    logits = hidden_states\\1
-    logits.__is_hidden_state = True
-elif labels is None:
+if labels is None:
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
     loss = fast_linear_cross_entropy(
@@ -752,10 +749,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
-if RETURN_HIDDEN_STATES:
-    logits = hidden_states\\1
-    logits.__is_hidden_state = True
-elif labels is None:
+if labels is None:
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and not requires_grad_:
     loss = fast_linear_cross_entropy(
@@ -842,10 +836,7 @@ if n_items is None:
             break
 pass
 
-if RETURN_HIDDEN_STATES:
-    logits = hidden_states\\1
-    logits.__is_hidden_state = True
-elif labels is not None:
+if labels is not None:
     logits = self.lm_head(hidden_states\\1)
     torch._dynamo.mark_dynamic(logits, 1)
     torch._dynamo.mark_dynamic(labels, 1)
