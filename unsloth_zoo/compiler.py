@@ -900,7 +900,7 @@ ce_finders = [
 ]
 
 
-def apply_fused_lm_head(forward):
+def apply_fused_lm_head(forward, module = None):
     # All Unsloth Zoo code licensed under LGPLv3
     for cross_entropy_find, cross_entropy_replacement in ce_finders:
         cross_entropy_find = cross_entropy_find.strip()\
@@ -1003,13 +1003,20 @@ def apply_fused_lm_head(forward):
 
         # Find matches
         if r"loss\_function" in cross_entropy_find and "loss_function" not in forward:
+            if UNSLOTH_ENABLE_LOGGING:
+                print(f"(1) Unsloth skipping patching fast linear cross entropy for {module}")
             continue
         elif r"loss\_function" not in cross_entropy_find and "loss_function" in forward:
+            if UNSLOTH_ENABLE_LOGGING:
+                print(f"(2) Unsloth skipping patching fast linear cross entropy for {module}")
             continue
         elif "CrossEntropyLoss" not in cross_entropy_find and "CrossEntropyLoss" in forward:
+            if UNSLOTH_ENABLE_LOGGING:
+                print(f"(3) Unsloth skipping patching fast linear cross entropy for {module}")
             continue
         elif "CrossEntropyLoss" in cross_entropy_find and "CrossEntropyLoss" not in forward:
-            print(forward)
+            if UNSLOTH_ENABLE_LOGGING:
+                print(f"(4) Unsloth skipping patching fast linear cross entropy for {module}")
             continue
         try:
             finder = regex.findall(
@@ -1107,13 +1114,13 @@ def test_apply_fused_lm_head():
     for name, forward in forwards:
         # print("=" * 30)
         # print(name)
-        forward = apply_fused_lm_head(forward)
+        forward = apply_fused_lm_head(forward, name)
         if "NOT_RETURN_LOGITS" not in forward:
             print(f"Failed patching fast CE forward for {name}")
         if "loss = outputs.loss" in forward:
             print(f"Failed patching fast CE forward for {name} since `loss = outputs.loss` exists")
-        # return apply_fused_lm_head(forward)
-        # print(apply_fused_lm_head(forward))
+        # return apply_fused_lm_head(forward, name)
+        # print(apply_fused_lm_head(forward, name))
         # print("=" * 30)
     pass
 pass
@@ -1917,7 +1924,7 @@ def unsloth_compile_transformers(
                     source = inspect.getsource(module_class.forward)
                 except:
                     continue
-                new_source = apply_fused_lm_head(source)
+                new_source = apply_fused_lm_head(source, module)
                 if new_source != source:
                     new_module = create_standalone_class(
                         module,
