@@ -694,6 +694,7 @@ else:
         logit_softcapping    = (\\4) if (\\4) != () else 0,
         vocab_size           = (\\6),
         n_items              = n_items if n_items is not None else 0,
+        requires_grad_       = requires_grad_,
     )
     # if (\\2) != ():
     #     logits = logits * (\\2)
@@ -785,6 +786,7 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
         vocab_size           = (\\8),
         n_items              = n_items if n_items is not None else 0,
+        requires_grad_       = requires_grad_,
     )
 else:
     logits = self.lm_head(hidden_states\\1)
@@ -840,9 +842,14 @@ if n_items is None:
             break
 pass
 
+requires_grad_ = self.lm_head.weight.requires_grad
+requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
+
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
-elif labels is not None:
+elif labels is None:
+    logits = self.lm_head(hidden_states\\1)
+else:
     logits = self.lm_head(hidden_states\\1)
     torch._dynamo.mark_dynamic(logits, 1)
     torch._dynamo.mark_dynamic(labels, 1)
@@ -851,12 +858,13 @@ elif labels is not None:
     loss = compiled_ce_loss_function(
         output_logits        = logits,
         output_labels        = labels,
-        mask                 = \\6,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
         vocab_size           = (\\7),
         n_items              = n_items if n_items is not None else 0,
+        mask                 = \\6,
+        requires_grad_       = requires_grad_,
     )
 """
 

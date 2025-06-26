@@ -329,6 +329,8 @@ def compiled_ce_loss_function(
     logit_softcapping : float = 0,
     vocab_size : int = 0,
     n_items : int = 0,
+    mask : torch.Tensor = None,
+    requires_grad_ : bool = False,
 ):
     device = output_logits.device
     if logit_scale_multiply != 0:
@@ -343,6 +345,10 @@ def compiled_ce_loss_function(
     shift_logits = output_logits
     shift_labels = torch.empty_like(output_labels, device = device)
     shift_labels[..., :-1] = output_labels[..., 1:]
+    if mask is not None:
+        mask = mask.to(device = device)
+        shift_labels[..., :-1][mask[..., 1:] == 0] = -100
+    pass
     shift_labels[..., -1] = -100
     # shift_logits = output_logits[..., :-1, :].float().contiguous()
     # shift_labels = output_labels[..., 1:].contiguous()
@@ -350,7 +356,7 @@ def compiled_ce_loss_function(
     shift_logits = shift_logits.view(-1, vocab_size)
     shift_labels = shift_labels.view(-1)
 
-    n_chunks = int(math.ceil((vocab_size / 262144) * 8))
+    n_chunks = int(torch.ceil((torch.tensor(vocab_size) / 262144) * 8))
     if requires_grad_: n_chunks += 2
     __shift_logits = torch.chunk(shift_logits, n_chunks, dim = 0)
     __shift_labels = torch.chunk(shift_labels, n_chunks, dim = 0)
