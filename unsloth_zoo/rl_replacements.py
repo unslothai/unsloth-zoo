@@ -347,20 +347,20 @@ def grpo_accumulated_loss(
         print(ref_hidden_states.shape, getattr(ref_hidden_states, "__is_hidden_state", False))
         print(new_hidden_states.shape, getattr(new_hidden_states, "__is_hidden_state", False))
 
-        loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
-            new_hidden_states,
-            old_hidden_states,
-            ref_hidden_states,
-            lm_head,
-            completion_input_ids,
-            completion_mask,
-            advantages,
-            trainer.beta,
-            trainer.accelerator.scaler,
-            n_chunks,
-            kwargs # pass kwargs as a dict
-        )
-        return loss, completion_length, mean_kl
+        # loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
+        #     new_hidden_states,
+        #     old_hidden_states,
+        #     ref_hidden_states,
+        #     lm_head,
+        #     completion_input_ids,
+        #     completion_mask,
+        #     advantages,
+        #     trainer.beta,
+        #     trainer.accelerator.scaler,
+        #     n_chunks,
+        #     kwargs # pass kwargs as a dict
+        # )
+        # return loss, completion_length, mean_kl
 
         # Old non efficient code path
         new_logits = torch.matmul(new_hidden_states, lm_head.t())
