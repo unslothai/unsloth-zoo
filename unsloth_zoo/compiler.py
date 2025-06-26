@@ -842,6 +842,9 @@ if n_items is None:
             break
 pass
 
+requires_grad_ = self.lm_head.weight.requires_grad
+requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
+
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
