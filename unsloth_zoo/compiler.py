@@ -717,7 +717,7 @@ $LOGITSCALINGMULTIPLY$
 $LOGITSCALINGDIVISION$
 $LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$SPACES$loss = self.loss_function($LOGITS$, $LABELS$, $VOCABSIZE$$KWARGS$)
+if labels is not None:$SPACES$loss = self.loss_function($NEWLINES$$LOGITS$, $LABELS$, $VOCABSIZE$$KWARGS$$NEWLINES$)
 """
 
 cross_entropy_replacement_2 = """
@@ -834,6 +834,7 @@ if n_items is None:
 pass
 
 if labels is not None:
+    logits = self.lm_head(hidden_states\\1)
     torch._dynamo.mark_dynamic(logits, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
@@ -841,11 +842,11 @@ if labels is not None:
     loss = compiled_ce_loss_function(
         output_logits        = logits,
         output_labels        = labels,
-        mask                 = \\5,
-        logit_scale_multiply = (\\1) if (\\1) != () else 0,
-        logit_scale_divide   = (\\2) if (\\2) != () else 0,
-        logit_softcapping    = (\\3) if (\\3) not in (None, (),) else 0,
-        vocab_size           = (\\6),
+        mask                 = \\6,
+        logit_scale_multiply = (\\2) if (\\2) != () else 0,
+        logit_scale_divide   = (\\3) if (\\3) != () else 0,
+        logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
+        vocab_size           = (\\7),
         n_items              = n_items if n_items is not None else 0,
     )
 """
@@ -860,7 +861,7 @@ ce_finders = [
 def apply_fused_lm_head(forward, module = None):
     # All Unsloth Zoo code licensed under LGPLv3
     UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
-    for cross_entropy_find, cross_entropy_replacement in ce_finders:
+    for jj, (cross_entropy_find, cross_entropy_replacement) in enumerate(ce_finders):
         cross_entropy_find = cross_entropy_find.strip()\
             .replace("*", r"\*").replace("^", r"\^")\
             .replace("-", r"\-").replace("_", r"\_")\
@@ -881,7 +882,8 @@ def apply_fused_lm_head(forward, module = None):
             .replace("$LOGITS$",       r"(logits=logits|logits)")\
             .replace("$LABELS$",       r"(labels=labels|labels)")\
             .replace("$VOCABSIZE$",
-                     r"((?:vocab_size\=)?"\
+                     r"(?:vocab_size\=)?"\
+                     r"("\
                      r"self\.config\.vocab_size|"\
                      r"self\.vocab_size|"\
                      r"self\.config\.vocab_size|"\
@@ -940,7 +942,8 @@ def apply_fused_lm_head(forward, module = None):
             .replace(r"shift\_", r"(?:shift\_|flat\_)")\
             .replace(r"###", r"(?:[\s\n]{0,}(?:\#[^\n]{1,}[\n][\s\n]{1,})?){0,}")\
             .replace(r"@@@", r"[^\[]{1,}\[[^\]]{1,}\][^\n]{0,}\n")\
-            .replace(r"$EMPTY$", r"()")
+            .replace(r"$EMPTY$", r"()")\
+            .replace(r"$NEWLINES$", r"[\s\n]{0,}")
 
         # print(cross_entropy_find)
         cross_entropy_replacement = cross_entropy_replacement\
@@ -988,6 +991,10 @@ def apply_fused_lm_head(forward, module = None):
                 print(f"Unsloth failed patching fast linear cross entropy with error: {str(e)}")
             continue
         if len(finder) == 0: continue
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"[{jj+1}/3 pattern] Successfully patched fast linear cross entropy for {module}")
+        pass
+        # print(forward)
 
         spaces = finder[0][4]
         if spaces.count(" ") != len(spaces):
@@ -1023,6 +1030,7 @@ def apply_fused_lm_head(forward, module = None):
         forward = forward.replace(", **)", ")")
         forward = forward.replace(",**)", ")")
         forward = forward.replace(",** )", ")")
+        # print(forward)
         return forward
     pass
     return forward
