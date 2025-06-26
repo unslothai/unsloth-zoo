@@ -355,7 +355,7 @@ def compiled_ce_loss_function(
     shift_logits = shift_logits.view(-1, vocab_size)
     shift_labels = shift_labels.view(-1)
 
-    n_chunks = int(math.ceil((vocab_size / 262144) * 8))
+    n_chunks = int(torch.ceil((torch.tensor(vocab_size) / 262144) * 8))
     if requires_grad_: n_chunks += 2
     __shift_logits = torch.chunk(shift_logits, n_chunks, dim = 0)
     __shift_labels = torch.chunk(shift_labels, n_chunks, dim = 0)
