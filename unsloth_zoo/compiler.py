@@ -681,12 +681,24 @@ loss = loss_fct(shift_logits, shift_labels)
 cross_entropy_replacement_1 = """
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
 
-all_locals = locals()
 n_items = None
-for __kwargs in all_locals.values():
+all_locals = locals()
+if 'loss_kwargs' in all_locals:
+    __kwargs = loss_kwargs
     if type(__kwargs) is dict:
         n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
-        break
+if n_items is None and 'kwargs' in all_locals:
+    __kwargs = kwargs
+    if type(__kwargs) is dict:
+        n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+if n_items is None:
+    all_locals = all_locals.values()
+    for __kwargs in all_locals:
+        if type(__kwargs) is dict:
+            n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+            break
+pass
+
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -753,7 +765,28 @@ if labels is not None:$SPACES$loss = self.loss_function($LOGITS$, $LABELS$, $VOC
 
 cross_entropy_replacement_2 = """
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
-n_items = (\\9).get("num_items_in_batch", None) or (\\9).get("n_items", None)
+
+n_items = None
+if (\\9) != () and type(\\9) is dict:
+    n_items = (\\9).get("num_items_in_batch", None) or (\\9).get("n_items", None)
+if n_items is None:
+    all_locals = locals()
+    if 'loss_kwargs' in all_locals:
+        __kwargs = loss_kwargs
+        if type(__kwargs) is dict:
+            n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+    if n_items is None and 'kwargs' in all_locals:
+        __kwargs = kwargs
+        if type(__kwargs) is dict:
+            n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+    if n_items is None:
+        all_locals = all_locals.values()
+        for __kwargs in all_locals:
+            if type(__kwargs) is dict:
+                n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+                break
+pass
+
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -827,10 +860,21 @@ NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
 
 all_locals = locals()
 n_items = None
-for __kwargs in all_locals.values():
+if 'loss_kwargs' in all_locals:
+    __kwargs = loss_kwargs
     if type(__kwargs) is dict:
         n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
-        break
+if n_items is None and 'kwargs' in all_locals:
+    __kwargs = kwargs
+    if type(__kwargs) is dict:
+        n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+if n_items is None:
+    all_locals = all_locals.values()
+    for __kwargs in all_locals:
+        if type(__kwargs) is dict:
+            n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+            break
+pass
 
 if labels is not None:
     torch._dynamo.mark_dynamic(logits, 1)
@@ -1014,6 +1058,12 @@ def apply_fused_lm_head(forward):
         forward = forward.replace(", **)", ")")
         forward = forward.replace(",**)", ")")
         forward = forward.replace(",** )", ")")
+
+        # Fix empty n_items
+        if 'n_items = ().get("num_items_in_batch", None) or ().get("n_items", None)' in forward:
+            forward = forward.replace(
+                'n_items = ().get("num_items_in_batch", None) or ().get("n_items", None)',
+                'if "loss_kwargs" in locals()')
         return forward
     pass
     return forward
