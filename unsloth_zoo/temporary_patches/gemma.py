@@ -157,39 +157,38 @@ TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
 def patch_Gemma3ForConditionalGeneration_forward_router():
     try:
-            import transformers.models.gemma3.modeling_gemma3
+        import transformers.models.gemma3.modeling_gemma3
     except:
-            return
+        return
     from transformers.models.gemma3.modeling_gemma3 import (
             Gemma3CausalLMOutputWithPast,
             Cache,
         )
 
     def forward_router(
-         self,
-         input_ids: torch.LongTensor = None,
-         pixel_values: torch.FloatTensor = None,
-         attention_mask: Optional[torch.Tensor] = None,
-         position_ids: Optional[torch.LongTensor] = None,
-         past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None,
-         token_type_ids: Optional[torch.LongTensor] = None,
-         cache_position: Optional[torch.LongTensor] = None,
-         inputs_embeds: Optional[torch.FloatTensor] = None,
-         labels: Optional[torch.LongTensor] = None,
-         use_cache: Optional[bool] = None,
-         output_attentions: Optional[bool] = None,
-         output_hidden_states: Optional[bool] = None,
-         return_dict: Optional[bool] = None,
-         logits_to_keep: Union[int, torch.Tensor] = 0,
-         **lm_kwargs,
-                       ) -> Union[Tuple, Gemma3CausalLMOutputWithPast]:
+        self,
+        input_ids: torch.LongTensor = None,
+        pixel_values: torch.FloatTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **lm_kwargs,
+    ) -> Union[Tuple, Gemma3CausalLMOutputWithPast]:
         # Routing logic
         is_text_only = (
             pixel_values is None and
             token_type_ids is None and
             (input_ids is not None or inputs_embeds is not None)
         )
-
         if is_text_only:
             return self.forward_llm(
                 input_ids,
@@ -206,7 +205,8 @@ def patch_Gemma3ForConditionalGeneration_forward_router():
                 output_hidden_states,
                 return_dict,
                 logits_to_keep,
-                **lm_kwargs)
+                **lm_kwargs,
+            )
         else:
             return self.forward_multimodal(
                 input_ids,
@@ -223,7 +223,9 @@ def patch_Gemma3ForConditionalGeneration_forward_router():
                 output_hidden_states,
                 return_dict,
                 logits_to_keep,
-                **lm_kwargs)
+                **lm_kwargs,
+            )
+    pass
 
     old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration.forward).parameters
     new_keys = inspect.signature(forward_router).parameters
@@ -355,7 +357,6 @@ def patch_Gemma3ForConditionalGeneration_forward_multimodal():
           # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
           slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 
-
           # Check if we're on a float16 machine with forced float32
           if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
               # Compute in float32 to avoid overflow, then convert back
@@ -415,33 +416,33 @@ TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_forward_multimodal
 
 
 def patch_Gemma3ForConditionalGeneration_forward_llm():
-     try:
+    try:
         import transformers.models.gemma3.modeling_gemma3
-     except:
+    except:
         return
-     from transformers.models.gemma3.modeling_gemma3 import (
+    from transformers.models.gemma3.modeling_gemma3 import (
         Gemma3CausalLMOutputWithPast,
         Cache,
     )
 
-     def forward_llm(
-         self,
-         input_ids: torch.LongTensor = None,
-         pixel_values: torch.FloatTensor = None,
-         attention_mask: Optional[torch.Tensor] = None,
-         position_ids: Optional[torch.LongTensor] = None,
-         past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None,
-         token_type_ids: Optional[torch.LongTensor] = None,
-         cache_position: Optional[torch.LongTensor] = None,
-         inputs_embeds: Optional[torch.FloatTensor] = None,
-         labels: Optional[torch.LongTensor] = None,
-         use_cache: Optional[bool] = None,
-         output_attentions: Optional[bool] = None,
-         output_hidden_states: Optional[bool] = None,
-         return_dict: Optional[bool] = None,
-         logits_to_keep: Union[int, torch.Tensor] = 0,
-         **lm_kwargs,
-     ) -> Union[Tuple, Gemma3CausalLMOutputWithPast]:
+    def forward_llm(
+        self,
+        input_ids: torch.LongTensor = None,
+        pixel_values: torch.FloatTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **lm_kwargs,
+    ) -> Union[Tuple, Gemma3CausalLMOutputWithPast]:
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -519,7 +520,7 @@ def patch_Gemma3ForCausalLM_forward_router():
     )
 
     def forward_router(
-         self,
+        self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -533,46 +534,28 @@ def patch_Gemma3ForCausalLM_forward_router():
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **loss_kwargs,
     ) -> CausalLMOutputWithPast:
-
         # Routing logic
         is_grpo_training = (
             os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1" and
             self.training and
             labels is None
         )
-
-
-        if is_grpo_training:
-            return self.grpo_forward(
-                input_ids,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                inputs_embeds,
-                labels,
-                use_cache,
-                output_attentions,
-                output_hidden_states,
-                cache_position,
-                logits_to_keep,
-                **loss_kwargs
-                )
-        else:
-            return self.original_forward(
-                input_ids,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                inputs_embeds,
-                labels,
-                use_cache,
-                output_attentions,
-                output_hidden_states,
-                cache_position,
-                logits_to_keep,
-                **loss_kwargs
-                )
-
+        fx = self.grpo_forward if is_grpo_training else self.original_forward
+        return fx(
+            input_ids = input_ids,
+            attention_mask = attention_mask,
+            position_ids = position_ids,
+            past_key_values = past_key_values,
+            inputs_embeds = inputs_embeds,
+            labels = labels,
+            use_cache = use_cache,
+            output_attentions = output_attentions,
+            output_hidden_states = output_hidden_states,
+            cache_position = cache_position,
+            logits_to_keep = logits_to_keep,
+            **loss_kwargs,
+        )
+    pass
     old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForCausalLM.forward).parameters
     new_keys = inspect.signature(forward_router).parameters
     if old_keys != new_keys:
