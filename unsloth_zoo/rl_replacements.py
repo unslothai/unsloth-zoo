@@ -305,6 +305,7 @@ RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 def grpo_accumulated_loss(
     trainer,
     input_ids,
+    attention_mask,
     logits_to_keep,
     completion_mask,
     advantages,
@@ -332,10 +333,17 @@ def grpo_accumulated_loss(
     with torch.amp.autocast(device_type = "cuda", dtype = trainer._autocast_dtype):
         # breakpoint()
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
-            ref_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
+            ref_hidden_states = trainer.model(
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                logits_to_keep = logits_to_keep + 1,
+            ).logits
         pass
-        
-        new_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
+        new_hidden_states = trainer.model(
+            input_ids = input_ids,
+            attention_mask = attention_mask,
+            logits_to_keep = logits_to_keep + 1,
+        ).logits
         
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
             new_hidden_states,
@@ -350,7 +358,6 @@ def grpo_accumulated_loss(
             n_chunks,
             kwargs # pass kwargs as a dict
         )
-
         return loss, completion_length, mean_kl
 
         # Old non efficient code path
