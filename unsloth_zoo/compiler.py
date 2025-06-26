@@ -638,6 +638,7 @@ loss = loss_fct(shift_logits, shift_labels)
 cross_entropy_replacement_1 = """
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
 RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+print(NOT_RETURN_LOGITS, RETURN_HIDDEN_STATES)
 
 n_items = None
 all_locals = locals()
@@ -662,8 +663,10 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
+    print(0)
 elif labels is None:
     logits = self.lm_head(hidden_states\\1)
+    print(1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
     loss = fast_linear_cross_entropy(
         hidden_states        = hidden_states\\1,
@@ -674,6 +677,7 @@ elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and no
         logit_scale_multiply = None if (\\2) == () else (\\2),
         logit_scale_divide   = None if (\\3) == () else (\\3),
     )
+    print(2)
 elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -682,6 +686,7 @@ elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
+    print(3)
 else:
     logits = self.lm_head(hidden_states\\1)
     torch._dynamo.mark_dynamic(logits, 1)
@@ -695,6 +700,7 @@ else:
         vocab_size           = (\\6),
         n_items              = n_items if n_items is not None else 0,
     )
+    print(4)
     # if (\\2) != ():
     #     logits = logits * (\\2)
     # if (\\3) != ():
@@ -726,6 +732,7 @@ if labels is not None:$SPACES$loss = self.loss_function($NEWLINES$$LOGITS$, $LAB
 cross_entropy_replacement_2 = """
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
 RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+print(NOT_RETURN_LOGITS, RETURN_HIDDEN_STATES)
 
 n_items = None
 if (\\9) != () and type(\\9) is dict:
@@ -753,8 +760,10 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
+    print(-1)
 elif labels is None:
     logits = self.lm_head(hidden_states\\1)
+    print(0)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and not requires_grad_:
     loss = fast_linear_cross_entropy(
         hidden_states        = hidden_states\\1,
@@ -765,6 +774,7 @@ elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and n
         logit_scale_multiply = None if (\\2) == () else (\\2),
         logit_scale_divide   = None if (\\3) == () else (\\3),
     )
+    print(1)
 elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -773,6 +783,7 @@ elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
+    print(2)
 elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
     logits = self.lm_head(hidden_states\\1)
     torch._dynamo.mark_dynamic(logits, 1)
@@ -786,8 +797,10 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         vocab_size           = (\\8),
         n_items              = n_items if n_items is not None else 0,
     )
+    print(3)
 else:
     logits = self.lm_head(hidden_states\\1)
+    print(4)
     if (\\2) != ():
         logits = logits * (\\2)
     if (\\3) != ():
@@ -821,6 +834,7 @@ loss = loss_fct(shift_logits, shift_labels)
 cross_entropy_replacement_3 = """
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
 RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+print(NOT_RETURN_LOGITS, RETURN_HIDDEN_STATES)
 
 all_locals = locals()
 n_items = None
@@ -842,7 +856,11 @@ pass
 
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
-elif labels is not None:
+    print(0)
+elif labels is None:
+    logits = self.lm_head(hidden_states\\1)
+    print(1)
+else:
     logits = self.lm_head(hidden_states\\1)
     torch._dynamo.mark_dynamic(logits, 1)
     torch._dynamo.mark_dynamic(labels, 1)
@@ -858,6 +876,7 @@ elif labels is not None:
         vocab_size           = (\\7),
         n_items              = n_items if n_items is not None else 0,
     )
+    print(2)
 """
 
 ce_finders = [
