@@ -379,7 +379,9 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                     torch.save(W.to(output_dtype), temp_file, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL)
                     W = torch.load(temp_file, map_location = "cpu", mmap = True, weights_only = False)
                 else:
-                    W = W.to(device = "cpu", dtype = output_dtype, non_blocking = True)
+                    # To enable fast async copy from CUDA to CPU, allocate a pinned (page-locked) buffer
+                    pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
+                    W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
             else:
                 if lora_key in converted_lora_weights:
                     lora_stats_info = converted_lora_weights[lora_key]
