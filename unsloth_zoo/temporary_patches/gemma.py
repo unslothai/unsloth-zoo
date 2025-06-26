@@ -189,42 +189,24 @@ def patch_Gemma3ForConditionalGeneration_forward_router():
             token_type_ids is None and
             (input_ids is not None or inputs_embeds is not None)
         )
-        if is_text_only:
-            return self.forward_llm(
-                input_ids,
-                pixel_values,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                token_type_ids,
-                cache_position,
-                inputs_embeds,
-                labels,
-                use_cache,
-                output_attentions,
-                output_hidden_states,
-                return_dict,
-                logits_to_keep,
-                **lm_kwargs,
-            )
-        else:
-            return self.forward_multimodal(
-                input_ids,
-                pixel_values,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                token_type_ids,
-                cache_position,
-                inputs_embeds,
-                labels,
-                use_cache,
-                output_attentions,
-                output_hidden_states,
-                return_dict,
-                logits_to_keep,
-                **lm_kwargs,
-            )
+        fx = self.forward_llm if is_text_only else self.forward_multimodal
+        return fx(
+            input_ids = input_ids,
+            pixel_values = pixel_values,
+            attention_mask = attention_mask,
+            position_ids = position_ids,
+            past_key_values = past_key_values,
+            token_type_ids = token_type_ids,
+            cache_position = cache_position,
+            inputs_embeds = inputs_embeds,
+            labels = labels,
+            use_cache = use_cache,
+            output_attentions = output_attentions,
+            output_hidden_states = output_hidden_states,
+            return_dict = return_dict,
+            logits_to_keep = logits_to_keep,
+            **lm_kwargs,
+        )
     pass
 
     old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration.forward).parameters
