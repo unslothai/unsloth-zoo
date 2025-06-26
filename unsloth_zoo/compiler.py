@@ -902,6 +902,7 @@ ce_finders = [
 
 def apply_fused_lm_head(forward, module = None):
     # All Unsloth Zoo code licensed under LGPLv3
+    UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
     for cross_entropy_find, cross_entropy_replacement in ce_finders:
         cross_entropy_find = cross_entropy_find.strip()\
             .replace("*", r"\*").replace("^", r"\^")\
