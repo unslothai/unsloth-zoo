@@ -853,12 +853,12 @@ else:
     loss = compiled_ce_loss_function(
         output_logits        = logits,
         output_labels        = labels,
-        mask                 = \\6,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
         vocab_size           = (\\7),
         n_items              = n_items if n_items is not None else 0,
+        mask                 = \\6,
     )
 """
 

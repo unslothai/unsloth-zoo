@@ -329,6 +329,7 @@ def compiled_ce_loss_function(
     logit_softcapping : float = 0,
     vocab_size : int = 0,
     n_items : int = 0,
+    mask : torch.Tensor = None,
 ):
     device = output_logits.device
     if logit_scale_multiply != 0:
@@ -343,6 +344,10 @@ def compiled_ce_loss_function(
     shift_logits = output_logits
     shift_labels = torch.empty_like(output_labels, device = device)
     shift_labels[..., :-1] = output_labels[..., 1:]
+    if mask is not None:
+        mask = mask.to(device = device)
+        shift_labels[..., :-1][mask[..., 1:] == 0] = -100
+    pass
     shift_labels[..., -1] = -100
     # shift_logits = output_logits[..., :-1, :].float().contiguous()
     # shift_labels = output_labels[..., 1:].contiguous()
