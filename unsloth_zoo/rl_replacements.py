@@ -67,34 +67,53 @@ def grpo_compute_loss(
     max_completion_length = kwargs.get("max_completion_length", 8192)
     delta = kwargs.get("delta", None)
     temperature = kwargs.get("temperature", 1.0)
+    logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
+    logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
+    logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
+
+    input_ids = input_ids.unsqueeze(-1)
+
+    # Optional logit softcapping and logit dividing
+    if logit_scale_multiply != 0: new_logits = new_logits * logit_scale_multiply
+    if logit_scale_divide   != 0: new_logits = new_logits / logit_scale_divide
+    if logit_softcapping    != 0: new_logits = new_logits * torch.tanh(new_logits / logit_softcapping)
 
     new_logits = new_logits.to(torch.float32)
     # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-    if temperature != 1.0:
-        new_logits = new_logits / temperature
-    input_ids  = input_ids.unsqueeze(-1)
+    if temperature != 1.0: new_logits = new_logits / temperature
+    new_x = torch.gather(new_logits, dim = -1, index = input_ids).squeeze(-1)
+    new = new_x - torch.logsumexp(new_logits, dim = -1)
 
     # x_i - logsumexp(x_i)
     with torch.no_grad():
         if beta != 0.0:
             assert ref_logits is not None, "ref_logits should not be None when beta != 0.0"
+            
+            # Optional logit softcapping and logit dividing
+            if logit_scale_multiply != 0: ref_logits = ref_logits * logit_scale_multiply
+            if logit_scale_divide   != 0: ref_logits = ref_logits / logit_scale_divide
+            if logit_softcapping    != 0: ref_logits = ref_logits * torch.tanh(ref_logits / logit_softcapping)
+
             ref_logits = ref_logits.to(torch.float32)
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            if temperature != 1.0:
-                ref_logits = ref_logits / temperature
+            if temperature != 1.0: ref_logits = ref_logits / temperature
             ref_x = torch.gather(ref_logits, dim = -1, index = input_ids).squeeze(-1)
             ref = ref_x - torch.logsumexp(ref_logits, dim = -1)
+        pass
+
         if old_logits is not None:
+            # Optional logit softcapping and logit dividing
+            if logit_scale_multiply != 0: old_logits = old_logits * logit_scale_multiply
+            if logit_scale_divide   != 0: old_logits = old_logits / logit_scale_divide
+            if logit_softcapping    != 0: old_logits = old_logits * torch.tanh(old_logits / logit_softcapping)
+
             old_logits = old_logits.to(torch.float32)
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            if temperature != 1.0:
-                old_logits = old_logits / temperature
+            if temperature != 1.0: old_logits = old_logits / temperature
             old_x = torch.gather(old_logits, dim = -1, index = input_ids).squeeze(-1)
             old = old_x - torch.logsumexp(old_logits, dim = -1)
-
-
-    new_x = torch.gather(new_logits, dim = -1, index = input_ids).squeeze(-1)
-    new = new_x - torch.logsumexp(new_logits, dim = -1)
+        pass
+    pass
 
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
@@ -118,12 +137,11 @@ def grpo_compute_loss(
         loss_1 = torch.clamp(coef_1, max=delta) * advantages.unsqueeze(1)
     else:
         loss_1 = coef_1 * advantages.unsqueeze(1)
+    pass
 
-    
     # Must detach - otherwise gradients are not propagated correctly!
     # exp(x - x) == 1
     # loss_i = torch.exp(new - new.detach()) * advantages.unsqueeze(1)
-    
 
     loss_2 = coef_2 * advantages.unsqueeze(1)
     loss_i = -torch.min(loss_1, loss_2)
