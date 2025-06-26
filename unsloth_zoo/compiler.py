@@ -662,8 +662,6 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
-    logits.__is_hidden_state = True
-    print("!!!!!!!!!!!!")
 elif labels is None:
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
@@ -755,8 +753,6 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
-    logits.__is_hidden_state = True
-    print("!!!!!!!!!!!!")
 elif labels is None:
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and not requires_grad_:
@@ -846,8 +842,6 @@ pass
 
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
-    logits.__is_hidden_state = True
-    print("!!!!!!!!!!!!")
 elif labels is not None:
     logits = self.lm_head(hidden_states\\1)
     torch._dynamo.mark_dynamic(logits, 1)
