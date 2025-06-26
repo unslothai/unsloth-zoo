@@ -1093,15 +1093,13 @@ pass
 
 # Fix attention_mask not masking out labels for VLMs
 def apply_mask_attention_mask_out(source):
-    if not len(re.findall(r"attention_mask[\s]{1,}\=attention_mask[\s]{1,}\,\n", source)): return source
-    if not len(re.findall(r"labels[\s]{1,}\=labels[\s]{1,}\,\n", source)): return source
-    if "shift_attention_mask" in source or \
-        "shift_logits = shift_logits" in source or \
-        "shift_labels = shift_labels" in source:
-
+    if not len(re.findall(r"attention_mask[\s]{0,}\=attention_mask[\s]{0,}\,\n", source)): return source
+    if not len(re.findall(r"labels[\s]{0,}\=labels[\s]{0,}\,\n", source)): return source
+    if "ForConditionalGeneration" in source:
         source = re.sub(
-            r"attention_mask[\s]{1,}\=attention_mask[\s]{1,}\,\n",
-            "attention_mask = mask_attention_mask_out(labels = labels, attention_mask = attention_mask)"
+            r"attention_mask[\s]{0,}\=attention_mask[\s]{0,}\,\n",
+            "attention_mask=mask_attention_mask_out(labels = labels, attention_mask = attention_mask),\n",
+            source,
         )
     return source
 pass
