@@ -31,7 +31,6 @@ def patch_Gemma3nForConditionalGeneration_forward():
     try: import transformers.models.gemma3n.modeling_gemma3n
     except: return
     from transformers.models.gemma3n.modeling_gemma3n import (
-        StaticCache,
         Cache,
         Gemma3nCausalLMOutputWithPast,
     )
