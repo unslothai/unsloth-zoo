@@ -1916,7 +1916,7 @@ def unsloth_compile_transformers(
                 except:
                     continue
                 new_source = apply_fused_lm_head(source, module)
-                print(new_source)
+                # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:
                     new_module = create_standalone_class(
