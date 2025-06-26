@@ -330,6 +330,7 @@ def compiled_ce_loss_function(
     vocab_size : int = 0,
     n_items : int = 0,
     mask : torch.Tensor = None,
+    requires_grad_ : bool = False,
 ):
     device = output_logits.device
     if logit_scale_multiply != 0:

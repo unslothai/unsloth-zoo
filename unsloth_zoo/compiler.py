@@ -694,6 +694,7 @@ else:
         logit_softcapping    = (\\4) if (\\4) != () else 0,
         vocab_size           = (\\6),
         n_items              = n_items if n_items is not None else 0,
+        requires_grad_       = requires_grad_,
     )
     # if (\\2) != ():
     #     logits = logits * (\\2)
@@ -785,6 +786,7 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
         vocab_size           = (\\8),
         n_items              = n_items if n_items is not None else 0,
+        requires_grad_       = requires_grad_,
     )
 else:
     logits = self.lm_head(hidden_states\\1)
@@ -859,6 +861,7 @@ else:
         vocab_size           = (\\7),
         n_items              = n_items if n_items is not None else 0,
         mask                 = \\6,
+        requires_grad_       = requires_grad_,
     )
 """
 
