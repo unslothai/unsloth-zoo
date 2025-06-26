@@ -64,6 +64,7 @@ from transformers.modeling_utils import PushToHubMixin
 import json
 import os
 from pathlib import Path
+from typing import Union, List, Optional
 import tempfile
 from peft import PeftModelForCausalLM, PeftModel
 
@@ -378,7 +379,9 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                     torch.save(W.to(output_dtype), temp_file, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL)
                     W = torch.load(temp_file, map_location = "cpu", mmap = True, weights_only = False)
                 else:
-                    W = W.to(device = "cpu", dtype = output_dtype, non_blocking = True)
+                    # To enable fast async copy from CUDA to CPU, allocate a pinned (page-locked) buffer
+                    pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
+                    W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
             else:
                 if lora_key in converted_lora_weights:
                     lora_stats_info = converted_lora_weights[lora_key]
@@ -863,10 +866,10 @@ pass
 
 def _try_copy_all_from_cache(
     repo_id: str,
-    filenames_to_check: list[str],
+    filenames_to_check: List[str],
     target_dir_str: str, # Expect string path for target directory
-    hf_cache_dir: Path | None,
-    token: str | None,
+    hf_cache_dir: Optional[Path],
+    token: Optional[str],
 ) -> bool:
     """
     Checks if ALL specified files exist in the HF cache. If yes, creates the
@@ -930,7 +933,7 @@ def _try_copy_all_from_cache(
         return False
 pass
 
-def _copy_file_from_source(src_path: str | Path, target_dir_str: str, filename: str):
+def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, filename: str):
     """Copies a file from src_path to target_dir_str/filename using os.path."""
     src_path = Path(src_path) # Keep Path for source checking ease
     dst_path = os.path.join(target_dir_str, filename) # Use os.path.join for destination
@@ -946,7 +949,7 @@ def _copy_file_from_source(src_path: str | Path, target_dir_str: str, filename: 
         raise IOError(f"Failed to copy {src_path} to {dst_path}: {e}") from e
 pass
 
-def _get_hf_cache_dir() -> Path | None:
+def _get_hf_cache_dir() -> Optional[Path]:
     """Determines the Hugging Face Hub cache directory."""
     potential_paths = []
     if "HF_HUB_CACHE" in os.environ:
