@@ -122,7 +122,7 @@ pass
 
 
 def fetch_image(
-    ele: Dict[Union[Tuple[str, str], Image.Image]],
+    ele: Dict,
     size_factor: int = IMAGE_FACTOR,
 ) -> Image.Image:
     if "image" in ele:
