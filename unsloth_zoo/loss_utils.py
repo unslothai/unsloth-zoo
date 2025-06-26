@@ -67,6 +67,13 @@ __all__ = [
     "_unsloth_get_batch_samples",
 ]
 
+torch_compile_options = {
+    "epilogue_fusion"   : True,
+    "max_autotune"      : False,
+    "shape_padding"     : True,
+    "trace.enabled"     : os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1",
+    "triton.cudagraphs" : False,
+}
 
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -114,13 +121,6 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         UnslothForCausalLMLoss = torch._disable_dynamo(UnslothForCausalLMLoss)
     
     elif torch_compile:
-        torch_compile_options = {
-            "epilogue_fusion"   : True,
-            "max_autotune"      : False,
-            "shape_padding"     : True,
-            "trace.enabled"     : os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1",
-            "triton.cudagraphs" : False,
-        }
         UnslothForCausalLMLoss = torch.compile(
             UnslothForCausalLMLoss,
             dynamic = True,
@@ -319,6 +319,61 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     pass
     return batch_samples, num_items_in_batch
 pass
+
+
+def compiled_ce_loss_function(
+    output_logits : torch.Tensor,
+    output_labels : torch.Tensor,
+    logit_scale_multiply : float = 0,
+    logit_scale_divide : float = 0,
+    logit_softcapping : float = 0,
+    vocab_size : int = 0,
+    n_items : int = 0,
+):
+    device = output_logits.device
+    if logit_scale_multiply != 0:
+        output_logits = output_logits * logit_scale_multiply
+    if logit_scale_divide != 0:
+        output_logits = output_logits / logit_scale_divide
+    if logit_softcapping != 0:
+        output_logits = output_logits / logit_softcapping
+        output_logits = torch.tanh(output_logits)
+        output_logits = output_logits * logit_softcapping
+
+    shift_logits = output_logits
+    shift_labels = torch.empty_like(output_labels, device = device)
+    shift_labels[..., :-1] = output_labels[..., 1:]
+    shift_labels[..., -1] = -100
+    # shift_logits = output_logits[..., :-1, :].float().contiguous()
+    # shift_labels = output_labels[..., 1:].contiguous()
+
+    shift_logits = shift_logits.view(-1, vocab_size)
+    shift_labels = shift_labels.view(-1)
+
+    n_chunks = int(math.ceil((vocab_size / 262144) * 8))
+    if requires_grad_: n_chunks += 2
+    __shift_logits = torch.chunk(shift_logits, n_chunks, dim = 0)
+    __shift_labels = torch.chunk(shift_labels, n_chunks, dim = 0)
+    loss = 0.0
+    for (_shift_logits, _shift_labels) in zip(__shift_logits, __shift_labels):
+        loss += torch.nn.functional.cross_entropy(
+            input  = _shift_logits.float().contiguous(),
+            target = _shift_labels.contiguous(),
+            reduction = 'sum',
+        )
+    pass
+    if n_items != 0:
+        loss = loss / n_items
+    else:
+        loss = loss / (shift_labels != -100).sum()
+    return loss
+pass
+compiled_ce_loss_function = torch.compile(
+    compiled_ce_loss_function,
+    fullgraph = False,
+    dynamic = True,
+    options = torch_compile_options,
+)
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
