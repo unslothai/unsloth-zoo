@@ -1447,6 +1447,27 @@ def patch_gradient_accumulation(modeling_file, module):
     return source
 pass
 
+
+# Pre fix up some modules like Gemma3n
+def fixup_fused_lm_head(source):
+    # Gemma 3N
+    source = source.replace(
+        "if (final_logit_softcapping := self.config.get_text_config().final_logit_softcapping) is not None:",
+        "if self.config.get_text_config().final_logit_softcapping is not None:",
+    )
+    source = source.replace(
+        "logits = logits / final_logit_softcapping",
+        "logits = logits / self.config.get_text_config().final_logit_softcapping",
+    )
+    source = source.replace(
+        "logits = logits * final_logit_softcapping",
+        "logits = logits * self.config.get_text_config().final_logit_softcapping",
+    )
+    # END Gemma 3N fixes
+    return source
+pass
+
+
 # if module ends with any of these, disable compile
 DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
@@ -1920,7 +1941,10 @@ def unsloth_compile_transformers(
                     source = inspect.getsource(module_class.forward)
                 except:
                     continue
-                new_source = apply_fused_lm_head(source, module)
+                # Fix some arguments up like for Gemma 3N
+                new_source = fixup_fused_lm_head(source)
+                # Apply fused LM transforms
+                new_source = apply_fused_lm_head(new_source, module)
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:
