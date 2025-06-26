@@ -606,6 +606,12 @@ for j, function in enumerate(functions):
 pass
 
 
+def mask_attention_mask_out(labels = None, attention_mask = None):
+    if labels is not None and attention_mask is not None:
+        attention_mask = attention_mask.to(device = labels.device)
+        labels[attention_mask == 0] = -100
+    return labels
+pass
 
 """
 
@@ -1075,6 +1081,21 @@ def test_apply_fused_lm_head():
         # print(apply_fused_lm_head(forward, name))
         # print("=" * 30)
     pass
+pass
+
+# Fix attention_mask not masking out labels for VLMs
+def apply_mask_attention_mask_out(source):
+    if not len(re.findall(r"attention_mask[\s]{1,}\=attention_mask[\s]{1,}\,\n", source)): return source
+    if not len(re.findall(r"labels[\s]{1,}\=labels[\s]{1,}\,\n", source)): return source
+    if "shift_attention_mask" in source or \
+        "shift_logits = shift_logits" in source or \
+        "shift_labels = shift_labels" in source:
+
+        source = re.sub(
+            r"attention_mask[\s]{1,}\=attention_mask[\s]{1,}\,\n",
+            "attention_mask = mask_attention_mask_out(labels = labels, attention_mask = attention_mask)"
+        )
+    return source
 pass
 
 
@@ -1877,6 +1898,7 @@ def unsloth_compile_transformers(
                 except:
                     continue
                 new_source = apply_fused_lm_head(source, module)
+                new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:
                     new_module = create_standalone_class(
                         module,
