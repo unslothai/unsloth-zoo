@@ -320,13 +320,16 @@ def grpo_accumulated_loss(
     if n_chunks == -1: n_chunks = bsz
     n_chunks = factors[min(np.searchsorted(factors, n_chunks), len(factors)-1)]
 
-    mixed_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
+    if not hasattr(trainer, '_autocast_dtype'):
+        trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
+        if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = torch.float16
+    pass
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
     completion_input_ids = input_ids[:, -logits_to_keep:]
     lm_head = trainer.model.get_output_embeddings().weight
 
-    with torch.amp.autocast(device_type = "cuda", dtype = mixed_dtype):
+    with torch.amp.autocast(device_type = "cuda", dtype = trainer._autocast_dtype):
         # breakpoint()
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
             ref_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
