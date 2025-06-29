@@ -228,47 +228,73 @@ def no_update_causal_mask(*args, **kwargs): return None
 # Patch SDPA
 def replace_with_grouped_query_attention(module, source):
     # All Unsloth Zoo code licensed under LGPLv3
-    if "enable_gqa" not in torch.nn.functional.scaled_dot_product_attention.__doc__: return source
+    if "enable_gqa" not in torch.nn.functional.scaled_dot_product_attention.__doc__:
+        return source
 
-    grouped_query_attention_finder = \
-        r"(key_states \= repeat_kv[^\n]{1,}\n[\s]{1,}"\
-        r"value_states \= repeat_kv[^\n]{1,}\n[\s]{1,}"\
-        r"(.+?)"\
-        r"query_states \= query_states\.contiguous\(\)\n[\s]{1,}"\
-        r"key_states \= key_states\.contiguous\(\)\n[\s]{1,}"\
+    grouped_query_attention_finder = (
+        r"(key_states \= repeat_kv[^\n]{1,}\n[\s]{1,}"
+        r"value_states \= repeat_kv[^\n]{1,}\n[\s]{1,}"
+        r"(.+?)"
+        r"query_states \= query_states\.contiguous\(\)\n[\s]{1,}"
+        r"key_states \= key_states\.contiguous\(\)\n[\s]{1,}"
         r"value_states \= value_states\.contiguous\(\))"
+    )
 
-    found = re.findall(grouped_query_attention_finder, source, flags = re.DOTALL | re.MULTILINE,)
+    found = re.findall(grouped_query_attention_finder, source, flags=re.DOTALL | re.MULTILINE)
     if len(found) == 1:
         found = found[0]
         # Should be == 2, but Llama has key_states = self.k_norm(key_states)
         if found[0].count("key_states = ") >= 2 and found[0].count("value_states = ") >= 2:
             print(f"Unsloth: Transforming {module}.")
-            all_source = source
             source = re.sub(
                 grouped_query_attention_finder,
                 r"\2pass\n",
                 source,
-                flags = re.DOTALL | re.MULTILINE,
+                flags=re.DOTALL | re.MULTILINE,
             )
-            source = source\
-                .replace(
-                    "dropout_p=self.dropout if self.training else 0.0,",
-                    "dropout_p=self.dropout if self.training else 0.0, "\
-                    "enable_gqa=self.num_key_value_groups != 1,",
-                ).replace(
-                    "dropout_p=self.attention_dropout if self.training else 0.0,",
-                    "dropout_p=self.attention_dropout if self.training else 0.0, "\
-                    "enable_gqa=self.num_key_value_groups != 1,",
-                )
-        pass
-    pass
 
+            # Safe injection of enable_gqa
+            def _patch_sdpa(m: re.Match) -> str:
+                arg_str = m.group(1)
+
+                # Split args while respecting nested parentheses
+                args, depth, buf = [], 0, ""
+                for ch in arg_str:
+                    if ch == "," and depth == 0:
+                        args.append(buf.strip())
+                        buf = ""
+                        continue
+                    buf += ch
+                    if ch in "([": depth += 1
+                    if ch in ")]": depth -= 1
+                if buf.strip():
+                    args.append(buf.strip())
+
+                # Skip if already patched
+                if any(a.lstrip().startswith("enable_gqa=") for a in args):
+                    return m.group(0)
+
+                # If attn_mask is still positional (first extra arg after value_states) → make it keyword
+                kw_mask_present = any(a.lstrip().startswith("attn_mask=") for a in args)
+                if not kw_mask_present and len(args) > 3 and "=" not in args[3]:
+                    args[3] = f"attn_mask={args[3]}"
+
+                # Append the new keyword
+                args.append("enable_gqa=self.num_key_value_groups != 1")
+                return "scaled_dot_product_attention(" + ", ".join(args) + ")"
+
+            source = re.sub(
+                r"scaled_dot_product_attention\(([^)]+)\)",
+                _patch_sdpa,
+                source,
+                flags=re.DOTALL,
+            )
+            
     source = re.sub(
         r"if output_attentions\:.+?return super\(\)\.forward.+?\)",
         "if output_attentions: raise RuntimeError('Unsloth: Not supported')",
         source,
-        flags = re.DOTALL | re.MULTILINE,
+        flags=re.DOTALL | re.MULTILINE,
     )
     return source
 pass
