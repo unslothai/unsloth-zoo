@@ -35,13 +35,15 @@ def patch_Gemma3nConvNormAct_forward():
         return
     # Counteract high weights in Conv layers for Gemma 3N by forcing to float32
     def forward(self, x):
-        with torch.autocast(device_type = "cuda", dtype = torch.float16, enabled = False):
+        old_dtype = x.dtype
+        x = x.to(torch.float32)
+        with torch.autocast(device_type = "cuda", dtype = torch.float32, enabled = False):
             x = self.conv(x)
         x = self.bn(x)
         aa = getattr(self, 'aa', None)
         if aa is not None:
             x = self.aa(x)
-        return x
+        return x.to(old_dtype)
     pass
     old_keys = inspect.signature(timm.layers.conv_bn_act.ConvNormAct.forward).parameters
     new_keys = inspect.signature(forward).parameters
@@ -49,6 +51,7 @@ def patch_Gemma3nConvNormAct_forward():
         if UNSLOTH_ENABLE_LOGGING:
             print("Unsloth: Failed to patch patch_Gemma3nConvNormAct_forward.")
     else:
+        forward = torch.compile(forward, fullgraph = False, dynamic = True, options = torch_compile_options)
         timm.layers.conv_bn_act.ConvNormAct.forward = forward
     return
 pass
