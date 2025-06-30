@@ -228,7 +228,6 @@ def requires_grad_for_gradient_checkpointing(model):
     if param is None: return
 
     name = re.sub(r"\.([\d]{1,})\.", r"[\1].", name)
-    name = "model.base_model.model"
     name_components = name.split(".")
 
     if len(name_components) == 0:
