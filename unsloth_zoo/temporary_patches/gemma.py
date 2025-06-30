@@ -144,8 +144,8 @@ def patch_Gemma3Processor():
         text_inputs["token_type_ids"] = mm_token_type_ids#.tolist()
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
     pass
-    old_keys = inspect.signature(transformers.models.gemma3.processing_gemma3.Gemma3Processor.__call__).parameters
-    new_keys = inspect.signature(__call__).parameters
+    old_keys = inspect.signature(transformers.models.gemma3.processing_gemma3.Gemma3Processor.__call__).parameters.keys()
+    new_keys = inspect.signature(__call__).parameters.keys()
     if old_keys != new_keys:
         if UNSLOTH_ENABLE_LOGGING:
             print("Unsloth: Failed to patch Gemma3Processor.")
