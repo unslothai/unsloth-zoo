@@ -37,7 +37,7 @@ def patch_Gemma3nConvNormAct_forward():
     def forward(self, x):
         old_dtype = x.dtype
         x = x.to(torch.float32)
-        with torch.autocast(device_type = "cuda", dtype = torch.float32, enabled = False):
+        with torch.autocast(device_type = "cuda", dtype = torch.float32, enabled = True):
             x = self.conv(x)
         x = self.bn(x)
         aa = getattr(self, 'aa', None)
