@@ -28,8 +28,12 @@ logger = logging.getLogger(__name__)
 
 
 def patch_Gemma3nConvNormAct_forward():
-    try: import timm.layers.conv_bn_act
-    except: return
+    try:
+        import timm.layers.conv_bn_act
+        timm.layers.conv_bn_act.ConvNormAct
+    except:
+        return
+    # Counteract high weights in Conv layers for Gemma 3N by forcing to float32
     def forward(self, x):
         with torch.autocast(device_type = "cuda", dtype = torch.float16, enabled = False):
             x = self.conv(x)
@@ -48,4 +52,4 @@ def patch_Gemma3nConvNormAct_forward():
         timm.layers.conv_bn_act.ConvNormAct.forward = forward
     return
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3nConvNormAct_forward)
+# TEMPORARY_PATCHES.append(patch_Gemma3nConvNormAct_forward)
