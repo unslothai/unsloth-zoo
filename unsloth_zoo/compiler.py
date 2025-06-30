@@ -1501,6 +1501,7 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
     except:
         if UNSLOTH_ENABLE_LOGGING:
             print("Unsloth: Failed compiling timm.layers.fast_norm")
+    pass
     # Try compiling norms and activation combinations
     try:
         import timm.layers.norm_act
@@ -1521,6 +1522,9 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
             if UNSLOTH_ENABLE_LOGGING:
                 print(f"Unsloth: Compiled timm.layers.norm_act.{norm}")
         pass
+    except:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed compiling timm.layers.norm_act")
     pass
     # Compile EfficientNet blocks
     try:
