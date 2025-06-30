@@ -1468,6 +1468,87 @@ def fixup_fused_lm_head(source):
 pass
 
 
+# =====================================
+# Image models inside timm
+def rms_norm2d(
+    x: torch.Tensor,
+    normalized_shape: List[int],
+    weight: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+):
+    assert len(normalized_shape) == 1
+    original_dtype = x.dtype
+    v = x.to(torch.float32).pow(2)
+    v = torch.mean(v, dim=1, keepdim=True)
+    x = x.to(torch.float32) * torch.rsqrt(v + eps)
+    if weight is not None:
+        x = x.to(torch.float32) * weight.to(torch.float32).reshape(1, -1, 1, 1)
+    return x.to(original_dtype)
+pass
+
+
+def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
+    try:
+        import timm
+    except:
+        return
+    try:
+        import timm.layers.fast_norm
+        timm.layers.fast_norm.is_fast_norm = lambda *args, **kwargs: False
+        timm.layers.fast_norm.rms_norm2d = rms_norm2d
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Compiled timm.layers.fast_norm")
+    except:
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Failed compiling timm.layers.fast_norm")
+    # Try compiling norms and activation combinations
+    try:
+        import timm.layers.norm_act
+        norms = dir(timm.layers.norm_act)
+        norms = [x for x in norms if "Act" in x]
+        for norm in norms:
+            try:
+                exec(f"from timm.layers.norm_act import {norm}")
+            except:
+                if UNSLOTH_ENABLE_LOGGING:
+                    print(f"Unsloth: Failed compiling from timm.layers.norm_act import {norm}")
+                continue
+            pass
+            forward = eval(norm).forward
+            if hasattr(forward, "get_compiler_config"): continue
+            forward = torch.compile(forward, fullgraph = True, dynamic = None, options = torch_compile_options)
+            exec(f"timm.layers.norm_act.{norm}.forward = forward")
+            if UNSLOTH_ENABLE_LOGGING:
+                print(f"Unsloth: Compiled timm.layers.norm_act.{norm}")
+        pass
+    pass
+    # Compile EfficientNet blocks
+    try:
+        import timm.models._efficientnet_blocks
+        efficientnet_blocks = inspect.getsource(timm.models._efficientnet_blocks)
+
+        blocks = re.findall(r"class ([^ ]{1,})\(.*?nn\.Module\)\:", efficientnet_blocks)
+        for block in blocks:
+            try:
+                exec(f"from timm.models._efficientnet_blocks import {block}")
+            except:
+                if UNSLOTH_ENABLE_LOGGING:
+                    print(f"Unsloth: Failed compiling from timm.models._efficientnet_blocks import {block}")
+                continue
+            pass
+            forward = eval(block).forward
+            if hasattr(forward, "get_compiler_config"): continue
+            forward = torch.compile(forward, fullgraph = True, dynamic = None, options = torch_compile_options)
+            exec(f"timm.models._efficientnet_blocks.{block}.forward = forward")
+            if UNSLOTH_ENABLE_LOGGING:
+                print(f"Unsloth: Compiled timm.models._efficientnet_blocks.{block}")
+    except:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed compiling timm.models._efficientnet_blocks")
+    pass
+pass
+
+
 # if module ends with any of these, disable compile
 DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
@@ -1560,6 +1641,9 @@ def unsloth_compile_transformers(
         "triton.enable_persistent_tma_matmul" : True,
         "triton.autotune_at_compile_time"     : True,
     }
+
+    # Compile timm models
+    compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
 
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
