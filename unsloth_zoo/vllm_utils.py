@@ -169,7 +169,6 @@ if importlib.util.find_spec("vllm") is not None:
                               out_dim_1,
                               dtype=inference_dtype,
                               device=x.device)
-            print("A", out.shape)
             apply_bnb_4bit(bf_x, qweight, offsets, out)
             out = out.to(original_type)
 
