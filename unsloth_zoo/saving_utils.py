@@ -689,10 +689,11 @@ def merge_and_overwrite_lora(
     if tokenizer is not None: tokenizer.save_pretrained(save_directory = save_directory,)
 
     # --- Handle 4-bit merging first ---
-    if save_method == "merged_4bit":
+    if save_method == "merged_4bit" or save_method == "forced_merged_4bit":
+        base_model = model.base_model if isinstance(model, PeftModel) else model
         print(f"Unsloth: Merging LoRA weights into 4bit model...")
-        if not isinstance(model, PeftModelForCausalLM):
-             raise TypeError("Model must be a PeftModelForCausalLM for 'merged_4bit' save.")
+        if not isinstance(model, PeftModelForCausalLM) or not isinstance(model, PeftModel):
+             raise TypeError("Model must be a PeftModelForCausalLM or PeftModel for 'merged_4bit' save.")
         if not getattr(model.config, "quantization_config", None):
              raise ValueError("Model does not appear to be quantized. Cannot use 'merged_4bit'.")
 
