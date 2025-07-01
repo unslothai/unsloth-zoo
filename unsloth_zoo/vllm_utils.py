@@ -116,6 +116,7 @@ if importlib.util.find_spec("vllm") is not None:
                               out_dim_1,
                               dtype=inference_dtype,
                               device=x.device)
+            print(out.shape)
 
             current_index = 0
             for i in range(len(quant_states)):
