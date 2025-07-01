@@ -58,7 +58,7 @@ pass
 # TEMPORARY_PATCHES.append(patch_Gemma3nConvNormAct_forward)
 
 
-def patch_Gemma3nTextAltUp_predict():
+def patch_Gemma3nTextAltUp_functions():
     try:
         import transformers.models.gemma3n.modeling_gemma3n
         transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp
@@ -74,7 +74,7 @@ def patch_Gemma3nTextAltUp_predict():
                 print("Unsloth: Patched Gemma3nTextAltUp.predict")
     pass
     if hasattr(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "correct"):
-        correct = transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.predict
+        correct = transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.correct
         if not hasattr(correct, "get_compiler_config"):
             transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.correct = \
                 torch.compile(correct, fullgraph = False, dynamic = True, options = torch_compile_options)
@@ -82,7 +82,7 @@ def patch_Gemma3nTextAltUp_predict():
                 print("Unsloth: Patched Gemma3nTextAltUp.correct")
     pass
     if hasattr(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "scale_corrected_output"):
-        scale_corrected_output = transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.predict
+        scale_corrected_output = transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.scale_corrected_output
         if not hasattr(scale_corrected_output, "get_compiler_config"):
             transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.scale_corrected_output = \
                 torch.compile(scale_corrected_output, fullgraph = False, dynamic = True, options = torch_compile_options)
@@ -91,4 +91,4 @@ def patch_Gemma3nTextAltUp_predict():
     pass
     return
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3nTextAltUp_predict)
+TEMPORARY_PATCHES.append(patch_Gemma3nTextAltUp_functions)
