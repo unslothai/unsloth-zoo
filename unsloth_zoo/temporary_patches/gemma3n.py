@@ -70,18 +70,24 @@ def patch_Gemma3nTextAltUp_predict():
         if not hasattr(predict, "get_compiler_config"):
             transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.predict = \
                 torch.compile(predict, fullgraph = False, dynamic = True, options = torch_compile_options)
+            if UNSLOTH_ENABLE_LOGGING:
+                print("Unsloth: Patched Gemma3nTextAltUp.predict")
     pass
     if hasattr(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "correct"):
         correct = transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.predict
         if not hasattr(correct, "get_compiler_config"):
             transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.correct = \
                 torch.compile(correct, fullgraph = False, dynamic = True, options = torch_compile_options)
+            if UNSLOTH_ENABLE_LOGGING:
+                print("Unsloth: Patched Gemma3nTextAltUp.correct")
     pass
     if hasattr(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "scale_corrected_output"):
         scale_corrected_output = transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.predict
         if not hasattr(scale_corrected_output, "get_compiler_config"):
             transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.scale_corrected_output = \
                 torch.compile(scale_corrected_output, fullgraph = False, dynamic = True, options = torch_compile_options)
+            if UNSLOTH_ENABLE_LOGGING:
+                print("Unsloth: Patched Gemma3nTextAltUp.scale_corrected_output")
     pass
     return
 pass
