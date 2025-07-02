@@ -19,6 +19,7 @@ import torch.nn as nn
 import inspect
 from typing import List, Optional, Tuple, Union
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
+from .utils import patch_function
 
 
 def patch_SmolVLMForConditionalGeneration_forward():
@@ -168,43 +169,17 @@ pass
 TEMPORARY_PATCHES.append(patch_SmolVLMForConditionalGeneration_forward)
 
 
-def patch_CsmBackboneModelEmbeddings_forward():
-    try:
-        import transformers.models.csm.modeling_csm
-    except:
-        return
-
-
-    def forward(self, input_ids):
-        input_embeds = self.embed_audio_tokens(input_ids + self.audio_tokens_offsets)
-        # fix for dtype cast
-        dtype = input_embeds.dtype
-        input_embeds = input_embeds.sum(dim=2).to(dtype)
-        return input_embeds
-
-    old_keys = inspect.signature(
-        transformers.models.csm.modeling_csm.CsmBackboneModelEmbeddings.forward
-    ).parameters
-    new_keys = inspect.signature(forward).parameters
-
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch CsmBackboneModelEmbeddings forward.")
-    else:
-        transformers.models.csm.modeling_csm.CsmBackboneModelEmbeddings.forward = forward
-pass
-TEMPORARY_PATCHES.append(patch_CsmBackboneModelEmbeddings_forward)
-
-
 def patch_CsmDepthDecoderForCausalLM_forward():
     try:
         import transformers.models.csm.modeling_csm
-    except:
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+        from transformers.models.csm.modeling_csm import Cache, Unpack, KwargsForCausalLM
+        from transformers.loss.loss_utils import ForCausalLMLoss
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed to patch CsmDepthDecoderForCausalLM forward during import: {str(e)}")
         return
 
-    from transformers.modeling_outputs import CausalLMOutputWithPast
-    from transformers.models.csm.modeling_csm import Cache, Unpack, KwargsForCausalLM
-    from transformers.loss.loss_utils import ForCausalLMLoss
 
     def forward(
         self,
@@ -276,16 +251,8 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         )
     pass
 
-    old_keys = inspect.signature(
-        transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM.forward
-    ).parameters
-    new_keys = inspect.signature(forward).parameters
 
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch CsmDepthDecoderForCausalLM forward.")
-    else:
-        transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM.forward = forward
+    patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
 
@@ -293,11 +260,13 @@ TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
 def patch_CsmForConditionalGeneration_forward():
     try:
         import transformers.models.csm.modeling_csm
-    except:
+        from transformers.models.csm.modeling_csm import Cache, Unpack, KwargsForCausalLM, CsmOutputWithPast
+        from transformers.loss.loss_utils import ForCausalLMLoss
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed to patch CsmForConditionalGeneration forward during import: {str(e)}")
         return
 
-    from transformers.models.csm.modeling_csm import Cache, Unpack, KwargsForCausalLM, CsmOutputWithPast
-    from transformers.loss.loss_utils import ForCausalLMLoss
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -414,16 +383,7 @@ def patch_CsmForConditionalGeneration_forward():
         )
     pass
 
-    old_keys = inspect.signature(
-        transformers.models.csm.modeling_csm.CsmForConditionalGeneration.forward
-    ).parameters
-    new_keys = inspect.signature(forward).parameters
-
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch CsmForConditionalGeneration forward.")
-    else:
-        transformers.models.csm.modeling_csm.CsmForConditionalGeneration.forward = forward
+    patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
 
@@ -472,22 +432,23 @@ def patch_CsmForConditionalGeneration_merge():
             # =======================================
             # TODO: @eustlb, this should be batched !!!
             # but requires making sure batched inference of the codec model works as intended
-            audio_tokens_list = []
-            for batch_input_values, batch_input_values_cutoffs in zip(input_values, input_values_cutoffs):
-                batch_input_values_cutoffs = batch_input_values_cutoffs[batch_input_values_cutoffs >= 0]
-                for i in range(batch_input_values_cutoffs.shape[0] - 1):
-                    start_idx = batch_input_values_cutoffs[i]
-                    end_idx = batch_input_values_cutoffs[i + 1]
-                    audio_batch = batch_input_values[..., start_idx:end_idx]
-                    codec_outputs = self.codec_model.encode(audio_batch.unsqueeze(0))
-                    codebook_ids = codec_outputs.audio_codes.transpose(1, -1)
-                    audio_tokens_list.append(codebook_ids[0])
+            with torch.no_grad():
+                audio_tokens_list = []
+                for batch_input_values, batch_input_values_cutoffs in zip(input_values, input_values_cutoffs):
+                    batch_input_values_cutoffs = batch_input_values_cutoffs[batch_input_values_cutoffs >= 0]
+                    for i in range(batch_input_values_cutoffs.shape[0] - 1):
+                        start_idx = batch_input_values_cutoffs[i]
+                        end_idx = batch_input_values_cutoffs[i + 1]
+                        audio_batch = batch_input_values[..., start_idx:end_idx]
+                        codec_outputs = self.codec_model.encode(audio_batch.unsqueeze(0))
+                        codebook_ids = codec_outputs.audio_codes.transpose(1, -1)
+                        audio_tokens_list.append(codebook_ids[0])
 
-            max_audio_frames = max(el.shape[0] for el in audio_tokens_list)
-            batched_audio_token_ids = torch.stack(
-                [torch.nn.functional.pad(el, (0, 0, 0, max_audio_frames - el.shape[0])) for el in audio_tokens_list]
-            )
-            audio_codes_mask = self.codec_model.get_audio_codes_mask(input_values_mask)
+                max_audio_frames = max(el.shape[0] for el in audio_tokens_list)
+                batched_audio_token_ids = torch.stack(
+                    [torch.nn.functional.pad(el, (0, 0, 0, max_audio_frames - el.shape[0])) for el in audio_tokens_list]
+                )
+                audio_codes_mask = self.codec_model.get_audio_codes_mask(input_values_mask)
             # =======================================
             audio_token_id = self.config.audio_token_id
             audio_token_mask = input_ids == audio_token_id
@@ -510,7 +471,7 @@ def patch_CsmForConditionalGeneration_merge():
                 labels_expanded = labels.unsqueeze(-1).repeat(1, 1, self.config.num_codebooks)
                 labels_expanded[audio_token_mask] = batched_audio_token_ids[audio_codes_mask]
                 # fix make sure to set eos_token_id as a valid label to predict
-                labels_expanded[audio_eos_token_mask] = self.config.codebook_eos_token_id
+                labels_expanded[audio_eos_token_mask] = audio_eos_frame_ids
                 # mask depth decoder
                 depth_decoder_ignore_frames_idxs = (labels == -101).nonzero(as_tuple=True)
                 labels_expanded[depth_decoder_ignore_frames_idxs[0], depth_decoder_ignore_frames_idxs[1], 1:] = -100
@@ -518,16 +479,8 @@ def patch_CsmForConditionalGeneration_merge():
 
         return {"inputs_embeds": inputs_embeds, "labels": labels}
     pass
-    old_keys = inspect.signature(
-        transformers.models.csm.modeling_csm.CsmForConditionalGeneration._merge_input_ids_with_input_values
-    ).parameters
-    new_keys = inspect.signature(_merge_input_ids_with_input_values).parameters
+    patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "_merge_input_ids_with_input_values", _merge_input_ids_with_input_values)
 
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch CsmForConditionalGeneration _merge_input_ids_with_input_values.")
-    else:
-        transformers.models.csm.modeling_csm.CsmForConditionalGeneration._merge_input_ids_with_input_values = _merge_input_ids_with_input_values
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_merge)
 
