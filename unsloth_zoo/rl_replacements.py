@@ -59,32 +59,61 @@ def grpo_compute_loss(
     advantages,
     **kwargs
 ):
+    # All Unsloth Zoo code licensed under LGPLv3
     # Set defaults for optional arguments
-    loss_type = kwargs.get("loss_type", "bnpo")
+    loss_type = kwargs.get("loss_type", "grpo")
     epsilon_low = kwargs.get("epsilon_low", 0.2)
     epsilon_high = kwargs.get("epsilon_high", 0.2)
     max_completion_length = kwargs.get("max_completion_length", 8192)
     delta = kwargs.get("delta", None)
+    temperature = kwargs.get("temperature", 1.0)
+    logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
+    logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
+    logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
 
-    # All Unsloth Zoo code licensed under LGPLv3
+    input_ids = input_ids.unsqueeze(-1)
+
+    # Optional logit softcapping and logit dividing
+    if logit_scale_multiply != 0: new_logits = new_logits * logit_scale_multiply
+    if logit_scale_divide   != 0: new_logits = new_logits / logit_scale_divide
+    if logit_softcapping    != 0: new_logits = new_logits * torch.tanh(new_logits / logit_softcapping)
+
     new_logits = new_logits.to(torch.float32)
-    input_ids  = input_ids.unsqueeze(-1)
+    # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
+    if temperature != 1.0: new_logits = new_logits / temperature
+    new_x = torch.gather(new_logits, dim = -1, index = input_ids).squeeze(-1)
+    new = new_x - torch.logsumexp(new_logits, dim = -1)
 
     # x_i - logsumexp(x_i)
-
     with torch.no_grad():
         if beta != 0.0:
             assert ref_logits is not None, "ref_logits should not be None when beta != 0.0"
+            
+            # Optional logit softcapping and logit dividing
+            if logit_scale_multiply != 0: ref_logits = ref_logits * logit_scale_multiply
+            if logit_scale_divide   != 0: ref_logits = ref_logits / logit_scale_divide
+            if logit_softcapping    != 0: ref_logits = ref_logits * torch.tanh(ref_logits / logit_softcapping)
+
             ref_logits = ref_logits.to(torch.float32)
+            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
+            if temperature != 1.0: ref_logits = ref_logits / temperature
             ref_x = torch.gather(ref_logits, dim = -1, index = input_ids).squeeze(-1)
             ref = ref_x - torch.logsumexp(ref_logits, dim = -1)
+        pass
+
         if old_logits is not None:
+            # Optional logit softcapping and logit dividing
+            if logit_scale_multiply != 0: old_logits = old_logits * logit_scale_multiply
+            if logit_scale_divide   != 0: old_logits = old_logits / logit_scale_divide
+            if logit_softcapping    != 0: old_logits = old_logits * torch.tanh(old_logits / logit_softcapping)
+
+            old_logits = old_logits.to(torch.float32)
+            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
+            if temperature != 1.0: old_logits = old_logits / temperature
             old_x = torch.gather(old_logits, dim = -1, index = input_ids).squeeze(-1)
             old = old_x - torch.logsumexp(old_logits, dim = -1)
-
-
-    new_x = torch.gather(new_logits, dim = -1, index = input_ids).squeeze(-1)
-    new = new_x - torch.logsumexp(new_logits, dim = -1)
+        pass
+    pass
 
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
@@ -108,12 +137,11 @@ def grpo_compute_loss(
         loss_1 = torch.clamp(coef_1, max=delta) * advantages.unsqueeze(1)
     else:
         loss_1 = coef_1 * advantages.unsqueeze(1)
+    pass
 
-    
     # Must detach - otherwise gradients are not propagated correctly!
     # exp(x - x) == 1
     # loss_i = torch.exp(new - new.detach()) * advantages.unsqueeze(1)
-    
 
     loss_2 = coef_2 * advantages.unsqueeze(1)
     loss_i = -torch.min(loss_1, loss_2)
@@ -161,13 +189,15 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     def forward(ctx, _new_hidden_states, _old_hidden_states, _ref_hidden_states, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None):
         if extra_kwargs is None:
             extra_kwargs = {}
-        def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states,input_ids, mask, advantages, scaling):
+        def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states, input_ids, mask, advantages, scaling):
             new_logits = torch.matmul(new_hidden_states, lm_head.t())
             new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-            with torch.no_grad(): 
-                ref_logits = torch.matmul(ref_hidden_states, lm_head.t())
-                ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-                old_logits = None
+            with torch.no_grad():
+                if beta != 0.0:
+                    ref_logits = torch.matmul(ref_hidden_states, lm_head.t())
+                    ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
+                else:
+                    ref_logits = None
                 if old_hidden_states is not None:
                     old_logits = torch.matmul(old_hidden_states, lm_head.t())
                     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
@@ -177,9 +207,17 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             #     old_logits = torch.matmul(old_hidden_states, lm_head.t()) #last logit already excluded
             #     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
             # else:
-            #     old_logits = Noneunsloth_zoo/rl_replacements.py
+            #     old_logits = None
+            # unsloth_zoo/rl_replacements.py
             loss, completion_length, mean_kl = grpo_compute_loss(
-                ref_logits, new_logits,old_logits, input_ids, mask, beta, advantages, **extra_kwargs
+                ref_logits,
+                new_logits,
+                old_logits,
+                input_ids,
+                mask,
+                beta,
+                advantages,
+                **extra_kwargs,
             )
 
             # Scale loss if needed for mixed precision training
@@ -267,6 +305,7 @@ RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 def grpo_accumulated_loss(
     trainer,
     input_ids,
+    attention_mask,
     logits_to_keep,
     completion_mask,
     advantages,
@@ -276,44 +315,67 @@ def grpo_accumulated_loss(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     bsz, qlen = input_ids.shape
-    
+
     # Find closest multiple
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
     n_chunks = factors[min(np.searchsorted(factors, n_chunks), len(factors)-1)]
 
-    mixed_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
+    if not hasattr(trainer, '_autocast_dtype'):
+        trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
+        if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = torch.float16
+    pass
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
     completion_input_ids = input_ids[:, -logits_to_keep:]
     lm_head = trainer.model.get_output_embeddings().weight
 
-    with torch.amp.autocast(device_type = "cuda", dtype = mixed_dtype):
-        #breakpoint()
+    with torch.amp.autocast(device_type = "cuda", dtype = trainer._autocast_dtype):
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
-            ref_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
+            ref_hidden_states = trainer.model(
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                logits_to_keep = logits_to_keep + 1,
+            ).logits
         pass
-        
-        new_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
-        
+        new_hidden_states = trainer.model(
+            input_ids = input_ids,
+            attention_mask = attention_mask,
+            logits_to_keep = logits_to_keep + 1,
+        ).logits
+
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
-            new_hidden_states, old_hidden_states ,ref_hidden_states, lm_head,
-            completion_input_ids, completion_mask, advantages, trainer.beta,
+            new_hidden_states,
+            old_hidden_states,
+            ref_hidden_states,
+            lm_head,
+            completion_input_ids,
+            completion_mask,
+            advantages,
+            trainer.beta,
             trainer.accelerator.scaler,
-            n_chunks, kwargs # pass kwargs as a dict
+            n_chunks,
+            kwargs # pass kwargs as a dict
         )
+    pass
+    # Must force not returning hidden states but logits otherwise gibberish
+    os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
+    return loss, completion_length, mean_kl
 
-        return loss, completion_length, mean_kl
-
-        # Old non efficient code path
-        new_logits = torch.matmul(new_hidden_states, lm_head.t())
-        new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-        old_logits = torch.matmul(old_hidden_states, lm_head.t())
-        old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-        loss, completion_length, mean_kl = grpo_compute_loss(
-            old_logits, new_logits, completion_input_ids, completion_mask, trainer.beta, advantages,
-        )
-        return loss, completion_length, mean_kl
+    # Old non efficient code path
+    new_logits = torch.matmul(new_hidden_states, lm_head.t())
+    new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
+    old_logits = torch.matmul(old_hidden_states, lm_head.t())
+    old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
+    loss, completion_length, mean_kl = grpo_compute_loss(
+        old_logits,
+        new_logits,
+        completion_input_ids,
+        completion_mask,
+        trainer.beta,
+        advantages,
+    )
+    return loss, completion_length, mean_kl
     pass
 pass
 RL_REPLACEMENTS["grpo_accumulated_loss"] = grpo_accumulated_loss

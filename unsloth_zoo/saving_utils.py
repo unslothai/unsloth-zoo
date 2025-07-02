@@ -64,6 +64,7 @@ from transformers.modeling_utils import PushToHubMixin
 import json
 import os
 from pathlib import Path
+from typing import Union, List, Optional
 import tempfile
 from peft import PeftModelForCausalLM, PeftModel
 
@@ -378,7 +379,9 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                     torch.save(W.to(output_dtype), temp_file, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL)
                     W = torch.load(temp_file, map_location = "cpu", mmap = True, weights_only = False)
                 else:
-                    W = W.to(device = "cpu", dtype = output_dtype, non_blocking = True)
+                    # To enable fast async copy from CUDA to CPU, allocate a pinned (page-locked) buffer
+                    pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
+                    W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
             else:
                 if lora_key in converted_lora_weights:
                     lora_stats_info = converted_lora_weights[lora_key]
@@ -507,9 +510,9 @@ def prepare_saving(
 
         # Too small - try using the temporary file system (sometimes large like Kaggle)
         try_temp_file = tempfile.TemporaryDirectory(ignore_cleanup_errors = True)
-        try_save_directory = temp_file.name
+        try_save_directory = try_temp_file.name
 
-        total, used, free = shutil.disk_usage(save_directory)
+        total, used, free = shutil.disk_usage(try_save_directory)
         free = int(free*0.95)
         if not push_to_hub and free > save_size: raise_upload_works()
         elif push_to_hub and free < save_size:
@@ -686,10 +689,11 @@ def merge_and_overwrite_lora(
     if tokenizer is not None: tokenizer.save_pretrained(save_directory = save_directory,)
 
     # --- Handle 4-bit merging first ---
-    if save_method == "merged_4bit":
+    if save_method == "merged_4bit" or save_method == "forced_merged_4bit":
+        base_model = model.base_model if isinstance(model, PeftModel) else model
         print(f"Unsloth: Merging LoRA weights into 4bit model...")
-        if not isinstance(model, PeftModelForCausalLM):
-             raise TypeError("Model must be a PeftModelForCausalLM for 'merged_4bit' save.")
+        if not isinstance(model, PeftModelForCausalLM) or not isinstance(model, PeftModel):
+             raise TypeError("Model must be a PeftModelForCausalLM or PeftModel for 'merged_4bit' save.")
         if not getattr(model.config, "quantization_config", None):
              raise ValueError("Model does not appear to be quantized. Cannot use 'merged_4bit'.")
 
@@ -863,10 +867,10 @@ pass
 
 def _try_copy_all_from_cache(
     repo_id: str,
-    filenames_to_check: list[str],
+    filenames_to_check: List[str],
     target_dir_str: str, # Expect string path for target directory
-    hf_cache_dir: Path | None,
-    token: str | None,
+    hf_cache_dir: Optional[Path],
+    token: Optional[str],
 ) -> bool:
     """
     Checks if ALL specified files exist in the HF cache. If yes, creates the
@@ -930,7 +934,7 @@ def _try_copy_all_from_cache(
         return False
 pass
 
-def _copy_file_from_source(src_path: str | Path, target_dir_str: str, filename: str):
+def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, filename: str):
     """Copies a file from src_path to target_dir_str/filename using os.path."""
     src_path = Path(src_path) # Keep Path for source checking ease
     dst_path = os.path.join(target_dir_str, filename) # Use os.path.join for destination
@@ -946,7 +950,7 @@ def _copy_file_from_source(src_path: str | Path, target_dir_str: str, filename: 
         raise IOError(f"Failed to copy {src_path} to {dst_path}: {e}") from e
 pass
 
-def _get_hf_cache_dir() -> Path | None:
+def _get_hf_cache_dir() -> Optional[Path]:
     """Determines the Hugging Face Hub cache directory."""
     potential_paths = []
     if "HF_HUB_CACHE" in os.environ:
