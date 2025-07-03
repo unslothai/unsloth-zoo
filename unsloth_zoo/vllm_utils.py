@@ -70,6 +70,7 @@ def get_mem_info():
         free_memory, total_memory = torch.xpu.mem_get_info()
     else:
         free_memory, total_memory = torch.cuda.mem_get_info()
+    return free_memory, total_memory
 
 
 if importlib.util.find_spec("vllm") is not None:
