@@ -48,6 +48,7 @@ import inspect
 from functools import partial
 from .utils import _get_dtype
 from .patching_utils import patch_model_and_tokenizer
+from unsloth import DEVICE_TYPE
 global LORA_REQUEST_ID
 
 # Ignore logging messages
@@ -774,7 +775,9 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         new_config,
         attn_implementation = "eager",
     )
-    new_model = new_model.to(device = "cuda:0", dtype = dtype)
+    device = "xpu:0" if DEVICE_TYPE == "xpu" else "cuda:0"
+    new_model = new_model.to(device = device, dtype = dtype)
+
     return new_model
 pass
 
@@ -860,7 +863,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
                 n_layers = config.num_hidden_layers
-                layer = Linear4bit(0, 0, device = "cuda:0", bias = has_bias, compute_dtype = compute_dtype, **kwargs)
+                device = "xpu:0" if DEVICE_TYPE == "xpu" else "cuda:0"
+                layer = Linear4bit(0, 0, device = device, bias = has_bias, compute_dtype = compute_dtype, **kwargs)
                 layer.in_features  = quant_state.shape[1]
                 layer.out_features = quant_state.shape[0]
                 layer.weight = Params4bit(data = weight, requires_grad = False, **kwargs)
@@ -872,7 +876,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.weight.to = partial(_override_to, layer.weight)
 
             elif not any(x in layer_name for x in layernorm_names):
-                layer = Linear(0, 0, device = "cuda:0", bias = has_bias)
+                device = "xpu:0" if DEVICE_TYPE == "xpu" else "cuda:0"
+                layer = Linear(0, 0, device = device, bias = has_bias)
                 layer.in_features  = weight.shape[1]
                 layer.out_features = weight.shape[0]
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
@@ -909,7 +914,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         weight = quant_state_dict["model.embed_tokens.weight"]
     else:
         weight = quant_state_dict["lm_head.weight"]
-    layer = Linear(0, 0, device = "cuda:0", bias = False)
+    device = "xpu:0" if DEVICE_TYPE == "xpu" else "cuda:0"
+    layer = Linear(0, 0, device = device, bias = False)
     layer.in_features  = weight.shape[1]
     layer.out_features = weight.shape[0]
     layer.weight = torch.nn.Parameter(weight, requires_grad = False)
@@ -934,11 +940,12 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     new_model.config = config
 
     # Fix up rotary_emb by re-initing them
+    device = "xpu:0" if DEVICE_TYPE == "xpu" else "cuda:0"
     for module in new_model.modules():
         if hasattr(module, "rotary_emb"):
             module.rotary_emb = module.rotary_emb.__class__(
                 config = config,
-                device = "cuda:0",
+                device = device,
             )
         pass
     pass
@@ -970,7 +977,11 @@ def approximate_vllm_memory_usage(
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
     load_in_4bit = "quantization_config" in config
-    free_memory, total_memory = torch.cuda.mem_get_info()
+    if DEVICE_TYPE == "xpu":
+        free_memory, total_memory = torch.xpu.mem_get_info()
+    else:
+        free_memory, total_memory = torch.cuda.mem_get_info()
+
     free_memory = gpu_memory_utilization * free_memory
 
     vocab_size = config.vocab_size
@@ -1083,8 +1094,9 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
-    major_version, minor_version = torch.cuda.get_device_capability()
-    if major_version < 7: raise NotImplementedError("Unsloth: Your GPU is too old!")
+    if DEVICE_TYPE == "cuda":
+        major_version, minor_version = torch.cuda.get_device_capability()
+        if major_version < 7: raise NotImplementedError("Unsloth: Your GPU is too old!")
 
     # Float8 KV cache only works for 8.0 or higher
     if float8_kv_cache and major_version < 8:
@@ -1118,8 +1130,11 @@ def load_vllm(
     pass
 
     # Get correct dtype
-    if major_version >= 8: _dtype = torch.bfloat16
-    else: _dtype = torch.float16
+    if DEVICE_TYPE == "cuda" and major_version >= 8: _dtype = torch.bfloat16
+    elif DEVICE_TYPE == "xpu":
+        _dtype = torch.bfloat16
+    else:
+        _dtype = torch.float16
     if dtype == torch.bfloat16 and _dtype == torch.float16:
         print("Unsloth: We switched to dtype = torch.float16 since your GPU does not support torch.bfloat16")
         dtype = torch.float16
@@ -1130,7 +1145,11 @@ def load_vllm(
     else:
         raise NotImplementedError(f"Unsloth: We do not support dtype = {dtype} yet!")
 
-    free_memory, total_memory = torch.cuda.mem_get_info()
+    if DEVICE_TYPE == "xpu":
+        free_memory, total_memory = torch.xpu.mem_get_info()
+    else:
+        free_memory, total_memory = torch.cuda.mem_get_info()
+
     total_memory_gb = round(total_memory / 1024 / 1024 / 1024, 2)
     use_bitsandbytes = use_bitsandbytes or \
         model_name.lower().endswith("-bnb-4bit")
@@ -1158,9 +1177,12 @@ def load_vllm(
 
     # Prefix Caching fails for V100, Titan X CUDA Compute Capability 7.0
     # See https://github.com/huggingface/trl/issues/2798
-    major_version, minor_version = torch.cuda.get_device_capability()
-    if (major_version < 7) or (major_version == 7 and minor_version < 5):
-        print("Unsloth: Your GPU does not support prefix caching - will disable!")
+    if DEVICE_TYPE == "cuda":
+        major_version, minor_version = torch.cuda.get_device_capability()
+        if (major_version < 7) or (major_version == 7 and minor_version < 5):
+            print("Unsloth: Your GPU does not support prefix caching - will disable!")
+            enable_prefix_caching = False
+    elif DEVICE_TYPE == "xpu":
         enable_prefix_caching = False
     pass
 
@@ -1223,6 +1245,10 @@ def load_vllm(
     elif RAM_GB <= 48: swap_space = 4
     else: swap_space = 6
 
+    if DEVICE_TYPE == "xpu":
+        major_version = "xpu"
+        minor_version = "xpu"
+
     print(
         f"Unsloth: vLLM loading {model_name} with actual GPU utilization = {round(actual_gpu_memory_utilization*100, 2)}%\n"\
         f"Unsloth: Your GPU has CUDA compute capability {major_version}.{minor_version} with VRAM = {total_memory_gb} GB.\n"\
@@ -1231,7 +1257,7 @@ def load_vllm(
     )
 
     # Get device as well
-    device = "cuda:0"
+    device = "cuda:0" if DEVICE_TYPE == "cuda" else "xpu:0"
 
     if compilation_config == 3:
         try:
