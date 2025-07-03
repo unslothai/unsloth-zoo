@@ -357,17 +357,18 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
     import pickle
     limit = 700 * 1024 * 1024  # 700MB
 
-    # Create temp file in same directory for atomic rename
-    temp_filename = filename + '.tmp'
-
     try:
+        # Use system temp directory to avoid permission issues
+        with tempfile.NamedTemporaryFile(suffix='.safetensors', delete=False) as temp_file:
+            temp_filename = temp_file.name
+
         with safe_open(filename, framework="pt", device="cpu") as file:
             safetensor_keys = list(file.keys())
             converted_lora_weights = _convert_lora_keys_to_safetensor_format(
                 lora_weights, safetensor_keys, model_class_name=model_class_name)
 
             for key in safetensor_keys:
-                W = file.get_tensor(key)  # No clone needed - file locking solved by temp file
+                W = file.get_tensor(key)
                 lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
                 lora_stats = converted_lora_weights.get(lora_key, None)
 
@@ -375,38 +376,37 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                     count += 1
                     W = _merge_lora(W, lora_stats, key)
 
-                    # PRESERVE ORIGINAL MEMORY MANAGEMENT LOGIC
                     if psutil.virtual_memory().available <= limit:
                         temp_file = tempfile.NamedTemporaryFile(suffix=".pt")
                         torch.save(W.to(output_dtype), temp_file, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
                         W = torch.load(temp_file, map_location="cpu", mmap=True, weights_only=False)
                     else:
-                        # To enable fast async copy from CUDA to CPU, allocate a pinned (page-locked) buffer
                         pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
                         W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
                 else:
-                    # PRESERVE ORIGINAL ELSE CLAUSE
                     if lora_key in converted_lora_weights:
                         lora_stats_info = converted_lora_weights[lora_key]
 
                 tensors[key] = W
 
-        # Save to temporary file (avoids Windows file locking issue)
+        # Save to temp file in system temp directory
         save_file(tensors, temp_filename, metadata={"format": "pt"})
 
-        # Atomic replace
-        if os.name == 'nt':
-            if os.path.exists(filename):
-                os.remove(filename)
-        os.rename(temp_filename, filename)
+        # Copy temp file to target location
+        shutil.copy2(temp_filename, filename)
 
     except Exception as e:
-        # Cleanup temp file on error
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
         raise e
+    finally:
+        # Cleanup temp file
+        if 'temp_filename' in locals() and os.path.exists(temp_filename):
+            try:
+                os.remove(temp_filename)
+            except:
+                pass  # Ignore cleanup errors
 
     return count
+pass
 from huggingface_hub import (
     split_state_dict_into_shards_factory,
     get_torch_storage_size,
