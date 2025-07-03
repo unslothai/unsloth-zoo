@@ -1261,7 +1261,7 @@ def load_vllm(
     )
 
     # Get device as well
-    device = "cuda:0" if DEVICE_TYPE == "cuda" else "xpu:0"
+    device = get_target_device()
 
     if compilation_config == 3:
         try:
