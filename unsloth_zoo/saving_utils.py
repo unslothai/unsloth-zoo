@@ -347,63 +347,107 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 pass
 
 
+import os
+from collections import OrderedDict
+import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
+from tqdm.auto import tqdm as ProgressBar
+import tempfile
+import gc
+import time
+
 @torch.inference_mode
 def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype, model_class_name):
-    filename = os.path.join(save_directory, filename)
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Merges LoRA and overwrites the safetensors file it was merged to
+    filename_original = os.path.join(save_directory, filename)  # Original file path
     tensors = OrderedDict()
     count = 0
     import psutil
-    import tempfile
     import pickle
     limit = 700 * 1024 * 1024  # 700MB
 
-    try:
-        # Use system temp directory to avoid permission issues
-        with tempfile.NamedTemporaryFile(suffix='.safetensors', delete=False) as temp_file:
-            temp_filename = temp_file.name
+    # Convert lora_weights to safetensor format
+    converted_lora_weights = _convert_lora_keys_to_safetensor_format(
+        lora_weights, [], model_class_name=model_class_name)
 
-        with safe_open(filename, framework="pt", device="cpu") as file:
-            safetensor_keys = list(file.keys())
-            converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-                lora_weights, safetensor_keys, model_class_name=model_class_name)
+    with safe_open(filename_original, framework="pt", device="cpu") as file:  # Open original file for reading
+        safetensor_keys = list(file.keys())
 
-            for key in safetensor_keys:
-                W = file.get_tensor(key)
-                lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
-                lora_stats = converted_lora_weights.get(lora_key, None)
+        # Update converted_lora_weights with actual safetensor keys
+        converted_lora_weights = _convert_lora_keys_to_safetensor_format(
+            lora_weights, safetensor_keys, model_class_name=model_class_name)
 
-                if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                    count += 1
-                    W = _merge_lora(W, lora_stats, key)
+        for key in safetensor_keys:
+            W = file.get_tensor(key)
+            # Remove .weight suffix to match LoRA key format
+            lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
+            lora_stats = converted_lora_weights.get(lora_key, None)
 
-                    if psutil.virtual_memory().available <= limit:
-                        temp_file = tempfile.NamedTemporaryFile(suffix=".pt")
-                        torch.save(W.to(output_dtype), temp_file, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
-                        W = torch.load(temp_file, map_location="cpu", mmap=True, weights_only=False)
-                    else:
-                        pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
-                        W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
+            if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                count += 1
+                W = _merge_lora(W, lora_stats, key)  # Assume _merge_lora is defined elsewhere
+                if psutil.virtual_memory().available <= limit:
+                    temp_file = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)  # Create temporary file
+                    temp_filename = temp_file.name  # Get temporary file name
+                    torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+                    W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
+                    temp_file.close()  # Close temporary file
+                    # Clean up the temporary pickle file
+                    try:
+                        os.remove(temp_filename)
+                    except:
+                        pass
                 else:
-                    if lora_key in converted_lora_weights:
-                        lora_stats_info = converted_lora_weights[lora_key]
+                    # To enable fast async copy from CUDA to CPU, allocate a pinned (page-locked) buffer
+                    pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
+                    W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
+            else:
+                if lora_key in converted_lora_weights:
+                    lora_stats_info = converted_lora_weights[lora_key]
 
-                tensors[key] = W
+            tensors[key] = W
 
-        # Save to temp file in system temp directory
-        save_file(tensors, temp_filename, metadata={"format": "pt"})
+    # CRITICAL: Force cleanup to release file handles on Windows
+    if os.name == 'nt':
+        gc.collect()
+        time.sleep(0.1)  # Give Windows a moment to release file handles
 
-        # Copy temp file to target location
-        shutil.copy2(temp_filename, filename)
+    # Create a temporary file in the same directory for atomic rename
+    with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
+        temp_filename_safetensors = tmpfile.name
 
-    except Exception as e:
-        raise e
-    finally:
-        # Cleanup temp file
-        if 'temp_filename' in locals() and os.path.exists(temp_filename):
-            try:
-                os.remove(temp_filename)
-            except:
-                pass  # Ignore cleanup errors
+    save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})  # Save to the temporary safetensors file
+
+    # Replace the original file with the temporary file
+    try:
+        os.replace(temp_filename_safetensors, filename_original)  # Attempt atomic rename
+    except OSError as e:
+        # If rename fails (e.g., due to permissions), fall back to copy and remove temporary file
+        print(f"Error renaming temporary file: {e}. Attempting copy and replace.")
+        import shutil
+
+        # On Windows, we might still have the file locking issue with copy
+        if os.name == 'nt':
+            # Try a few times with delays
+            for attempt in range(3):
+                try:
+                    shutil.copy2(temp_filename_safetensors, filename_original)
+                    break
+                except PermissionError:
+                    if attempt == 2:  # Last attempt
+                        raise
+                    time.sleep(0.5)
+                    gc.collect()
+        else:
+            shutil.copy2(temp_filename_safetensors, filename_original)
+
+        # Clean up temp file
+        try:
+            os.remove(temp_filename_safetensors)
+        except:
+            pass
 
     return count
 pass
