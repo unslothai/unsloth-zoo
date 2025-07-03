@@ -349,50 +349,64 @@ pass
 
 @torch.inference_mode
 def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype, model_class_name):
-    # All Unsloth Zoo code licensed under LGPLv3
-    # Merges LoRA and overwrites the safetensors file it was merged to
     filename = os.path.join(save_directory, filename)
     tensors = OrderedDict()
     count = 0
     import psutil
     import tempfile
     import pickle
-    limit = 700 * 1024 * 1024 # 700MB
-    with safe_open(filename, framework = "pt", device = "cpu") as file:
-        safetensor_keys = list(file.keys())
+    limit = 700 * 1024 * 1024  # 700MB
 
-        # Convert LoRA keys to match safetensor format
-        converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-            lora_weights, safetensor_keys, model_class_name=model_class_name)
+    # Create temp file in same directory for atomic rename
+    temp_filename = filename + '.tmp'
 
-        for key in safetensor_keys:
-            W = file.get_tensor(key)
-            # Remove .weight suffix to match LoRA key format
-            lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
-            lora_stats = converted_lora_weights.get(lora_key, None)
+    try:
+        with safe_open(filename, framework="pt", device="cpu") as file:
+            safetensor_keys = list(file.keys())
+            converted_lora_weights = _convert_lora_keys_to_safetensor_format(
+                lora_weights, safetensor_keys, model_class_name=model_class_name)
 
-            if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                count += 1
-                W = _merge_lora(W, lora_stats, key)
-                if psutil.virtual_memory().available <= limit:
-                    temp_file = tempfile.NamedTemporaryFile(suffix = ".pt")
-                    torch.save(W.to(output_dtype), temp_file, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL)
-                    W = torch.load(temp_file, map_location = "cpu", mmap = True, weights_only = False)
+            for key in safetensor_keys:
+                W = file.get_tensor(key)  # No clone needed - file locking solved by temp file
+                lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
+                lora_stats = converted_lora_weights.get(lora_key, None)
+
+                if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                    count += 1
+                    W = _merge_lora(W, lora_stats, key)
+
+                    # PRESERVE ORIGINAL MEMORY MANAGEMENT LOGIC
+                    if psutil.virtual_memory().available <= limit:
+                        temp_file = tempfile.NamedTemporaryFile(suffix=".pt")
+                        torch.save(W.to(output_dtype), temp_file, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+                        W = torch.load(temp_file, map_location="cpu", mmap=True, weights_only=False)
+                    else:
+                        # To enable fast async copy from CUDA to CPU, allocate a pinned (page-locked) buffer
+                        pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
+                        W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
                 else:
-                    # To enable fast async copy from CUDA to CPU, allocate a pinned (page-locked) buffer
-                    pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
-                    W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
-            else:
-                if lora_key in converted_lora_weights:
-                    lora_stats_info = converted_lora_weights[lora_key]
-            tensors[key] = W
-        pass
-    pass
+                    # PRESERVE ORIGINAL ELSE CLAUSE
+                    if lora_key in converted_lora_weights:
+                        lora_stats_info = converted_lora_weights[lora_key]
 
-    save_file(tensors, filename, metadata = {"format": "pt"})
+                tensors[key] = W
+
+        # Save to temporary file (avoids Windows file locking issue)
+        save_file(tensors, temp_filename, metadata={"format": "pt"})
+
+        # Atomic replace
+        if os.name == 'nt':
+            if os.path.exists(filename):
+                os.remove(filename)
+        os.rename(temp_filename, filename)
+
+    except Exception as e:
+        # Cleanup temp file on error
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
+        raise e
+
     return count
-pass
-
 from huggingface_hub import (
     split_state_dict_into_shards_factory,
     get_torch_storage_size,
