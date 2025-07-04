@@ -92,3 +92,45 @@ def patch_Gemma3nTextAltUp_functions():
     return
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3nTextAltUp_functions)
+
+def patch_Gemma3nModel_get_image_features():
+    try:
+        import transformers.models.gemma3n.modeling_gemma3n
+        transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel.get_image_features
+    except:
+        return
+    def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Projects the last hidden state from the vision model into language model space.
+
+        Args:
+            pixel_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
+               The tensors corresponding to the input images.
+
+        Returns:
+            image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
+        """
+        vision_outputs = self.vision_tower(
+            pixel_values=pixel_values, do_pooling=False, return_dict=True
+        ).last_hidden_state
+        # Convert from (batch, channels, height, width) to (batch, height * width, channels) where:
+        # height == width and height * width == Gemma3nConfig.vision_soft_tokens_per_image.
+        vision_outputs = vision_outputs.reshape(
+            vision_outputs.shape[0],
+            self.config.vision_config.hidden_size,
+            self.config.vision_soft_tokens_per_image,
+        ).permute(0, 2, 1)
+        # Normalize and embed the soft tokens into language model space.
+        # vision_outputs *= self.config.vision_config.hidden_size**0.5
+        return self.embed_vision(inputs_embeds=vision_outputs)
+    pass
+    old_keys = inspect.signature(transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel.get_image_features).parameters
+    new_keys = inspect.signature(get_image_features).parameters
+    if old_keys != new_keys:
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Failed to patch Gemma3nModel.get_image_features.")
+    else:
+        transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel.get_image_features = get_image_features
+    return
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3nModel_get_image_features)
