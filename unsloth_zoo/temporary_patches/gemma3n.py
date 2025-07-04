@@ -49,10 +49,12 @@ def patch_Gemma3nConvNormAct_forward():
     new_keys = inspect.signature(forward).parameters
     if old_keys != new_keys:
         if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch patch_Gemma3nConvNormAct_forward.")
+            print("Unsloth: Failed to patch Gemma3nConvNormAct.forward.")
     else:
         forward = torch.compile(forward, fullgraph = False, dynamic = True, options = torch_compile_options)
         timm.layers.conv_bn_act.ConvNormAct.forward = forward
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Patched Gemma3nConvNormAct.forward.")
     return
 pass
 # TEMPORARY_PATCHES.append(patch_Gemma3nConvNormAct_forward)
@@ -131,6 +133,8 @@ def patch_Gemma3nModel_get_image_features():
             print("Unsloth: Failed to patch Gemma3nModel.get_image_features.")
     else:
         transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel.get_image_features = get_image_features
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Patched Gemma3nModel.get_image_features.")
     return
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3nModel_get_image_features)
