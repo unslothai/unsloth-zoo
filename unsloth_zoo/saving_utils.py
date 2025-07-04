@@ -347,13 +347,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 pass
 
 
-import os
-from collections import OrderedDict
 import torch
-from safetensors import safe_open
-from safetensors.torch import save_file
-from tqdm.auto import tqdm as ProgressBar
-import tempfile
 import gc
 import time
 
