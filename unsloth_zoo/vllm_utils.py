@@ -922,6 +922,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         weight = quant_state_dict["model.embed_tokens.weight"]
     else:
         weight = quant_state_dict["lm_head.weight"]
+
     layer = Linear(0, 0, device = get_target_device(), bias = False)
     layer.in_features  = weight.shape[1]
     layer.out_features = weight.shape[0]
@@ -947,11 +948,13 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     new_model.config = config
 
     # Fix up rotary_emb by re-initing them
+    device = "xpu:0" if DEVICE_TYPE == "xpu" else "cuda:0"
     for module in new_model.modules():
         if hasattr(module, "rotary_emb"):
             module.rotary_emb = module.rotary_emb.__class__(
                 config = config,
                 device = get_target_device(),
+
             )
         pass
     pass
@@ -1183,7 +1186,8 @@ def load_vllm(
             print("Unsloth: Your GPU does not support prefix caching - will disable!")
             enable_prefix_caching = False
     elif DEVICE_TYPE == "xpu":
-        enable_prefix_caching = True
+        enable_prefix_caching = False
+
     pass
 
     # Use VLLM_USE_V1 for vllm >= 0.7.4 and CUDA >= 8.0
@@ -1254,6 +1258,8 @@ def load_vllm(
         major_version, minor_version = torch.cuda.get_device_capability()
         message = f"{platform} compute capability {major_version}.{minor_version}"
 
+
+
     print(
         f"Unsloth: vLLM loading {model_name} with actual GPU utilization = {round(actual_gpu_memory_utilization*100, 2)}%\n"\
         f"Unsloth: Your GPU has {message} with VRAM = {total_memory_gb} GB.\n"\
@@ -1262,7 +1268,11 @@ def load_vllm(
     )
 
     # Get device as well
+<<<<<<< HEAD
     device = get_target_device()
+=======
+    device = "cuda:0" if DEVICE_TYPE == "cuda" else "xpu:0"
+>>>>>>> main
 
     if compilation_config == 3:
         try:
