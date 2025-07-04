@@ -148,9 +148,11 @@ def patch_Gemma3Processor():
     new_keys = inspect.signature(__call__).parameters.keys()
     if old_keys != new_keys:
         if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch Gemma3Processor.")
+            print("Unsloth: Failed to patch Gemma3Processor.__call__.")
     else:
         transformers.models.gemma3.processing_gemma3.Gemma3Processor.__call__ = __call__
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Patched Gemma3Processor.__call__.")
     return
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Processor)
@@ -242,6 +244,8 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
                 print("Unsloth: Failed to patch Gemma3Model.")
         else:
             transformers.models.gemma3.modeling_gemma3.Gemma3Model._update_causal_mask = _update_causal_mask
+            if UNSLOTH_ENABLE_LOGGING:
+                print("Unsloth: Patched Gemma3Model._update_causal_mask.")
     else:
         old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration._update_causal_mask).parameters
         new_keys = inspect.signature(_update_causal_mask).parameters
@@ -250,6 +254,8 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
                 print("Unsloth: Failed to patch Gemma3ForConditionalGeneration._update_causal_mask.")
         else:
             transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration._update_causal_mask = _update_causal_mask
+            if UNSLOTH_ENABLE_LOGGING:
+                print("Unsloth: Patched Gemma3ForConditionalGeneration._update_causal_mask.")
     return
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
@@ -275,6 +281,8 @@ def patch_Gemma3TextScaledWordEmbedding():
     else:
         forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
         transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding.forward = forward
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Patched Gemma3TextScaledWordEmbedding.forward.")
     return
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
@@ -312,6 +320,8 @@ def patch_Gemma3RMSNorm():
     else:
         forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
         transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm.forward = forward
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Patched Gemma3RMSNorm.forward.")
     return
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
@@ -347,7 +357,8 @@ def patch_Gemma3MLP():
     else:
         forward = torch.compile(forward, fullgraph = False, dynamic = True, options = torch_compile_options)
         transformers.models.gemma3.modeling_gemma3.Gemma3MLP.forward = forward
-
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Patched Gemma3MLP.forward.")
     return
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
