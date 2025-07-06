@@ -420,6 +420,7 @@ def patch_vllm_enable_sleep_mode():
     from typing import Optional, Union, Tuple
 
     logger = init_logger(__name__)
+    print(f"Unsloth: Patching vLLM enable sleep mode")
 
     def sleep(
             self,
@@ -615,6 +616,10 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     pass
 
     assert(config is not None)
+    if hasattr(config, "text_config"):
+        config = config.text_config
+    pass
+
     vocab_size = config.vocab_size
 
     state_dict = OrderedDict()
@@ -656,8 +661,16 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
         pass
     pass
 
+    print(f'Unsloth: vllm internals: {vllm_internals}')
     # Embedding
-    embed_tokens = vllm_internals.model.embed_tokens
+    if hasattr(vllm_internals, "model"):
+        vllm_internal_model = vllm_internals.model
+    else:
+        if hasattr(vllm_internals, "language_model"):
+            vllm_internal_model = vllm_internals.language_model.model
+        else:
+            raise RuntimeError(f'Unsloth: Cannot find vllm_internal_model!')
+    embed_tokens = vllm_internal_model.embed_tokens
     embed_tokens = getattr(embed_tokens, "base_layer", embed_tokens).weight.data
 
     # Counteract vLLM padding vocabs for LoRA
@@ -665,22 +678,38 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     state_dict["model.embed_tokens.weight"] = embed_tokens
     quant_state_dict["model.embed_tokens.weight"] = state_dict["model.embed_tokens.weight"]
 
+    from vllm.model_executor.models.mllama import MllamaCrossAttentionDecoderLayer
+
     # All layers
     skipped_layernorms = []
-    for kk in range(len(vllm_internals.model.layers)):
-        proj = vllm_internals.model.layers[kk].self_attn.qkv_proj
-        get_state_dict(f"model.layers.{kk}.self_attn.q_proj", 0, state_dict, proj)
-        get_state_dict(f"model.layers.{kk}.self_attn.k_proj", 1, state_dict, proj)
-        get_state_dict(f"model.layers.{kk}.self_attn.v_proj", 2, state_dict, proj)
+    for kk in range(len(vllm_internal_model.layers)):
+        if isinstance(vllm_internal_model.layers[kk],MllamaCrossAttentionDecoderLayer):
+            proj = vllm_internal_model.layers[kk].cross_attn.qkv_proj
+            get_state_dict(f"model.layers.{kk}.cross_attn.qkv_proj", 0, state_dict, proj)
 
-        proj = vllm_internals.model.layers[kk].self_attn.o_proj
-        get_state_dict(f"model.layers.{kk}.self_attn.o_proj", 0, state_dict, proj)
+            # proj = vllm_internal_model.layers[kk].cross_attn.k_proj
+            # get_state_dict(f"model.layers.{kk}.cross_attn.k_proj", 1, state_dict, proj)
 
-        proj = vllm_internals.model.layers[kk].mlp.gate_up_proj
+            # proj = vllm_internal_model.layers[kk].cross_attn.v_proj
+            # get_state_dict(f"model.layers.{kk}.cross_attn.v_proj", 2, state_dict, proj)
+
+            proj = vllm_internal_model.layers[kk].cross_attn.o_proj
+            get_state_dict(f"model.layers.{kk}.cross_attn.o_proj", 0, state_dict, proj)
+            
+        else:
+            proj = vllm_internal_model.layers[kk].self_attn.qkv_proj
+            get_state_dict(f"model.layers.{kk}.self_attn.q_proj", 0, state_dict, proj)
+            get_state_dict(f"model.layers.{kk}.self_attn.k_proj", 1, state_dict, proj)
+            get_state_dict(f"model.layers.{kk}.self_attn.v_proj", 2, state_dict, proj)
+
+            proj = vllm_internal_model.layers[kk].self_attn.o_proj
+            get_state_dict(f"model.layers.{kk}.self_attn.o_proj", 0, state_dict, proj)
+
+        proj = vllm_internal_model.layers[kk].mlp.gate_up_proj
         get_state_dict(f"model.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
         get_state_dict(f"model.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
 
-        proj = vllm_internals.model.layers[kk].mlp.down_proj
+        proj = vllm_internal_model.layers[kk].mlp.down_proj
         get_state_dict(f"model.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
 
         for layernorm_name in [
@@ -690,6 +719,8 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
             f"model.layers.{kk}.post_feedforward_layernorm", # Gemma3
             f"model.layers.{kk}.self_attn.q_norm", # Qwen3, Gemma3
             f"model.layers.{kk}.self_attn.k_norm", # Qwen3, Gemma3
+            f"model.layers.{kk}.cross_attn.q_norm", # Llama3.2
+            f"model.layers.{kk}.cross_attn.k_norm", # Llama3.2
         ]:
             vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].")
             vllm_name = f"vllm_internals.{vllm_name}"
@@ -704,12 +735,12 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     pass
 
     # Norm
-    state_dict["model.norm.weight"] = vllm_internals.model.norm.weight.data
+    state_dict["model.norm.weight"] = vllm_internal_model.norm.weight.data
     quant_state_dict["model.norm.weight"] = state_dict["model.norm.weight"]
 
     # LM Head
     if getattr(config, "tie_word_embeddings", True) is False:
-        lm_head = vllm_internals.lm_head
+        lm_head = vllm_internals.lm_head if hasattr(vllm_internals, "lm_head") else vllm_internals.language_model.lm_head
         lm_head = getattr(lm_head, "base_layer", lm_head).weight.data
 
         # Counteract vLLM padding vocabs for LoRA
@@ -759,21 +790,33 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     # Empty model from config
     new_config = deepcopy(config)
-    new_config.intermediate_size = 0
-    new_config.hidden_size = 0
-    new_config.vocab_size = 1
-    new_config.pad_token_id = 0
+    is_mllama = hasattr(new_config, "vision_config")
+    new_text_config = new_config.text_config if is_mllama else new_config
+    new_text_config.intermediate_size = 0
+    new_text_config.hidden_size = 1
+    new_text_config.num_attention_heads = 1
+    new_text_config.vocab_size = 1
+    new_text_config.pad_token_id = 0
 
     # Set attention module head_dim
     # Otherwise will get error if (head_dim)**-0.5 is seen like in Qwen
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    new_config.update({"head_dim" : head_dim})
-
-    from transformers import AutoModelForCausalLM
-    new_model = AutoModelForCausalLM.from_config(
-        new_config,
-        attn_implementation = "eager",
-    )
+    try:
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    except:
+        head_dim = getattr(config.text_config, "head_dim", config.text_config.hidden_size // config.text_config.num_attention_heads)
+    new_text_config.update({"head_dim" : head_dim})
+    from transformers import AutoModelForCausalLM, MllamaForConditionalGeneration
+    if not is_mllama:
+        new_model = AutoModelForCausalLM.from_config(
+            new_config,
+            attn_implementation = "eager",
+        )
+    else:
+        new_config._attn_implementation = "eager"
+        new_model = MllamaForConditionalGeneration(
+            new_config,
+        )
+    pass
     new_model = new_model.to(device = "cuda:0", dtype = dtype)
     return new_model
 pass
@@ -806,20 +849,21 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     from bitsandbytes.nn.modules import Linear4bit, Params4bit
     from torch.nn.modules import Linear
 
+    model_prefix = "model" if not hasattr(config, "vision_config") else "model.language_model"
     layer_names = [
-        "model.layers.{kk}.self_attn.q_proj",
-        "model.layers.{kk}.self_attn.k_proj",
-        "model.layers.{kk}.self_attn.v_proj",
-        "model.layers.{kk}.self_attn.o_proj",
-        "model.layers.{kk}.mlp.gate_proj",
-        "model.layers.{kk}.mlp.up_proj",
-        "model.layers.{kk}.mlp.down_proj",
-        "model.layers.{kk}.input_layernorm",
-        "model.layers.{kk}.post_attention_layernorm",
-        "model.layers.{kk}.pre_feedforward_layernorm", # Gemma3
-        "model.layers.{kk}.post_feedforward_layernorm", # Gemma3
-        "model.layers.{kk}.self_attn.q_norm", # Qwen3, Gemma3
-        "model.layers.{kk}.self_attn.k_norm", # Qwen3, Gemma3
+        "{model_prefix}.layers.{kk}.self_attn.q_proj",
+        "{model_prefix}.layers.{kk}.self_attn.k_proj",
+        "{model_prefix}.layers.{kk}.self_attn.v_proj",
+        "{model_prefix}.layers.{kk}.self_attn.o_proj",
+        "{model_prefix}.layers.{kk}.mlp.gate_proj",
+        "{model_prefix}.layers.{kk}.mlp.up_proj",
+        "{model_prefix}.layers.{kk}.mlp.down_proj",
+        "{model_prefix}.layers.{kk}.input_layernorm",
+        "{model_prefix}.layers.{kk}.post_attention_layernorm",
+        "{model_prefix}.layers.{kk}.pre_feedforward_layernorm", # Gemma3
+        "{model_prefix}.layers.{kk}.post_feedforward_layernorm", # Gemma3
+        "{model_prefix}.layers.{kk}.self_attn.q_norm", # Qwen3, Gemma3
+        "{model_prefix}.layers.{kk}.self_attn.k_norm", # Qwen3, Gemma3
     ]
     layernorm_names = [
         "input_layernorm",
@@ -837,9 +881,10 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     pass
 
     skipped_layernorms = []
-    for kk in range(config.num_hidden_layers):
+    n_layers = config.num_hidden_layers if hasattr(config, "num_hidden_layers") else config.text_config.num_hidden_layers
+    for kk in range(n_layers):
         for layer_name in layer_names:
-            layer_name = layer_name.format(kk = kk)
+            layer_name = layer_name.format(model_prefix = model_prefix, kk = kk)
             if f"{layer_name}.weight" not in quant_state_dict:
                 skipped_layernorms.append(layer_name.split(".")[-1])
                 continue
@@ -859,7 +904,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             if f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
-                n_layers = config.num_hidden_layers
                 layer = Linear4bit(0, 0, device = "cuda:0", bias = has_bias, compute_dtype = compute_dtype, **kwargs)
                 layer.in_features  = quant_state.shape[1]
                 layer.out_features = quant_state.shape[0]
@@ -888,17 +932,17 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             
             # Convert model.layers.0.self_attn.q_proj to model.layers[0].self_attn.q_proj
             layer_name = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
-            exec(f"new_model.{layer_name} = layer")
+            exec(f"new_model.model.language_model.{layer_name} = layer")
         pass
     pass
 
     # Norm
     norm = quant_state_dict["model.norm.weight"]
     norm = torch.nn.Parameter(norm, requires_grad = False)
-    new_model.model.norm.weight = norm
+    new_model.model.language_model.norm.weight = norm
 
     # Embeddings
-    new_model.model.embed_tokens = torch.nn.Embedding.from_pretrained(
+    new_model.model.language_model.embed_tokens = torch.nn.Embedding.from_pretrained(
         quant_state_dict["model.embed_tokens.weight"],
         freeze = True,
         padding_idx = config.pad_token_id,
@@ -937,7 +981,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     for module in new_model.modules():
         if hasattr(module, "rotary_emb"):
             module.rotary_emb = module.rotary_emb.__class__(
-                config = config,
+                config = config.text_config,
                 device = "cuda:0",
             )
         pass
@@ -1093,7 +1137,7 @@ def load_vllm(
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
     approximate_vllm_memory_usage(
-        config, 
+        config if not hasattr(config, "text_config") else config.text_config, 
         max_seq_length = max_seq_length,
         gpu_memory_utilization = gpu_memory_utilization,
         enable_lora = enable_lora,
@@ -1188,6 +1232,10 @@ def load_vllm(
     elif memory_left_for_kv_cache_gb <= 80: approx_max_num_seqs = 368 # + 32
     else: approx_max_num_seqs = 400 # + 32
 
+    if hasattr(config, "vision_config"):
+        print(f'Unsloth: Vision config found, setting approx_max_num_seqs to 16')
+        approx_max_num_seqs = 16
+
     # float8 KV cache can fit more sequences in 1 go so more throughput
     if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
 
@@ -1273,7 +1321,7 @@ def load_vllm(
         kv_cache_dtype         = "fp8" if float8_kv_cache else "auto",
         dtype                  = dtype,
 
-        max_num_batched_tokens = chunked_prefill_tokens, # Max tokens for chunked prefill default 2048
+        max_num_batched_tokens = 8192, # Max tokens for chunked prefill default 2048
         max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM
         max_logprobs           = max_logprobs, # Disallow logprobs being returned
         seed                   = random_state, # Default is 0
