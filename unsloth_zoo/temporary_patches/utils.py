@@ -14,17 +14,156 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+__all__ = [
+    "patch_function",
+    "KWARGS_TYPE",
+    "raise_error"
+    "Unpack",
+    "Cache",
+    "DynamicCache",
+    "HybridCache",
+    "StaticCache",
+    "TextInput",
+    "PreTokenizedInput",
+    "ImageInput",
+    "ImagesKwargs",
+    "MultiModalData",
+    "ProcessingKwargs",
+    "ProcessorMixin",
+]
 import inspect
 import typing as t
 from typing import Any, Callable, Dict, List, Tuple
+try:
+    t._TypedDictMeta
+except:
+    raise RuntimeError("Unsloth: typing._TypedDictMeta does not exist! File a bug report immediately thank you!")
+
 import logging
+from packaging.version import Version
 from .common import UNSLOTH_ENABLE_LOGGING
-
 logger = logging.getLogger(__name__)
-
 EMPTY = inspect._empty
 
+def raise_error(f: str, exception: Any):
+    # Raises error only if logging is on
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.error(
+            f"==================\n"\
+            f"Failed to patch {f}. Error\n"\
+            f"{str(exception)}\n"\
+            f"==================\n"
+        )
+    return
+pass
 
+# Get Unpack
+try:
+    from transformers.processing_utils import Unpack
+    assert \
+        type(Unpack) is type(t.Unpack), \
+        "Unsloth: Unpack type changed! Please file a bug report asap!"
+except Exception as e:
+    raise RuntimeError(
+        f"Unsloth: Unpack has been moved! Other error = {str(e)}.\n"\
+        "Please file a bug report asap!"
+    )
+pass
+KWARGS_TYPE = t.Unpack[t._TypedDictMeta]
+
+# Latest transformers 4.54.0 changed to TransformersKwargs
+TransformersKwargs = "TransformersKwargs"
+try:
+    from transformers.utils import TransformersKwargs
+    assert \
+        type(TransformersKwargs) is t._TypedDictMeta, \
+        "Unsloth: TransformersKwargs type changed! Please file a bug report asap!"
+except Exception as e:
+    if Version(transformers.__version__) >= Version("4.54.0.dev0"):
+        raise RuntimeError(
+            f"Unsloth: TransformersKwargs has been moved! Other error = {str(e)}.\n"\
+            "Please file a bug report asap!"
+        )
+    else:
+        pass
+pass
+
+# Get FlashAttentionKwargs
+FlashAttentionKwargs = "FlashAttentionKwargs"
+try:
+    from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+    assert \
+        type(FlashAttentionKwargs) is t._TypedDictMeta, \
+        "Unsloth: FlashAttentionKwargs type changed! Please file a bug report asap!"
+except:
+    # No more FlashAttentionKwargs can ignore!
+    pass
+pass
+
+# Get Cache
+Cache = t.Any
+try: from transformers.cache_utils import Cache
+except: pass
+DynamicCache = t.Any
+try: from transformers.cache_utils import DynamicCache
+except: pass
+HybridCache = t.Any
+try: from transformers.cache_utils import HybridCache
+except: pass
+StaticCache = t.Any
+try: from transformers.cache_utils import StaticCache
+except: pass
+
+# Get text and image utils and typings
+TextInput = str
+try: from transformers.tokenization_utils_base import TextInput
+except: pass
+PreTokenizedInput = List[str]
+try: from transformers.tokenization_utils_base import PreTokenizedInput
+except: pass
+ImageInput = t.Any
+try: from transformers.image_utils import ImageInput
+except: pass
+ImagesKwargs = t.Any
+try: from transformers.processing_utils import ImagesKwargs
+except: pass
+MultiModalData = t.Any
+try: from transformers.processing_utils import MultiModalData
+except: pass
+ProcessingKwargs = t.Any
+try: from transformers.processing_utils import ProcessingKwargs
+except: pass
+ProcessorMixin = t.Any
+try: from transformers.processing_utils import ProcessorMixin
+except: pass
+
+# Normalize common built-in types to their typing equivalents
+VAR_KEYWORD_ID = inspect.Parameter.VAR_KEYWORD.value
+TYPE_MAPPINGS = {
+    torch.Tensor         : torch.Tensor,
+    torch.IntTensor      : torch.Tensor,
+    torch.FloatTensor    : torch.Tensor,
+    list                 : t.List,
+    dict                 : t.Dict,
+    set                  : t.Set,
+    tuple                : t.Tuple,
+    frozenset            : t.FrozenSet,
+    Unpack               : t.Unpack,
+    TransformersKwargs   : t._TypedDictMeta,
+    FlashAttentionKwargs : t._TypedDictMeta,
+    KWARGS_TYPING        : t.Unpack[t._TypedDictMeta],
+    Cache                : t.Any,
+    DynamicCache         : t.Any,
+    HybridCache          : t.Any,
+    StaticCache          : t.Any,
+    # TextInput          : t.Any, # Already is str
+    # PreTokenizedInput  : t.Any, # Already is List[str]
+    ImageInput           : t.Any,
+    ImagesKwargs         : t.Any,
+    MultiModalData       : t.Any,
+    ProcessingKwargs     : t.Any,
+    ProcessorMixin       : t.Any,
+}
 def canonicalize_annotation(annotation: Any) -> Any:
     """
     Canonicalize type annotations for consistent comparison.
@@ -36,18 +175,11 @@ def canonicalize_annotation(annotation: Any) -> Any:
     if hasattr(t, "get_origin"):
         origin = t.get_origin(annotation)
         if origin is not None:
-            args = tuple(canonicalize_annotation(arg) for arg in t.get_args(annotation))
+            args = t.get_args(annotation)
+            args = tuple(canonicalize_annotation(arg) for arg in args)
             return (origin, args)
-
-    # Normalize common built-in types to their typing equivalents
-    type_mappings = {
-        list: t.List,
-        dict: t.Dict,
-        set: t.Set,
-        tuple: t.Tuple,
-    }
-
-    return type_mappings.get(annotation, annotation)
+    return TYPE_MAPPINGS.get(annotation, annotation)
+pass
 
 
 def get_function_fingerprint(func: Callable) -> List[Dict[str, Any]]:
@@ -58,22 +190,49 @@ def get_function_fingerprint(func: Callable) -> List[Dict[str, Any]]:
     try:
         signature = inspect.signature(func)
     except (ValueError, TypeError) as e:
-        raise ValueError(f"Cannot inspect function signature: {e}")
-
+        raise ValueError(f"Unsloth: Cannot inspect function signature: {e}")
     fingerprint = []
-    for param in signature.parameters.values():
+    signature_parameters = signature.parameters.values()
+    
+    for kk, param in enumerate(signature_parameters):
+        param_name = str(param.name)
+        param_kind = param.kind.value # 4 is type VAR_KEYWORD **kwargs
+        annotation = param.annotation
+
+        # If **kwargs is seen, then canonicalize name to simply kwargs
+        if "kwargs" in param_name.lower():
+            param_name = "kwargs"
+            # Also if no type set, set it to a default
+            if \
+                (param_kind == VAR_KEYWORD_ID) and \
+                (annotation == EMPTY) and \
+                (len(signature_parameters)-1 == kk):
+                annotation = (t.Unpack, (t._TypedDictMeta,),)
+        pass
+        # If name is simply x, and annotation is empty, set to torch.Tensor
+        # For eg def forward(self, x)
+        if \
+            (param_name == "x") and \
+            (len(signature_parameters) == 2) and \
+            (func.__name__ == "forward") and \
+            (annotation == EMPTY):
+            annotation = torch.Tensor
+        pass
         fingerprint.append({
-            'name': param.name,
-            'kind': param.kind.value,  # Use .value for cleaner comparison
-            'is_required': param.default is EMPTY,  # True = required
-            'annotation': canonicalize_annotation(param.annotation),
+            'name': param_name,
+            'kind': param_kind,
+            'is_required': param.default is EMPTY, # True = required
+            'annotation' : canonicalize_annotation(annotation),
         })
-
     return fingerprint
+pass
 
 
-def can_safely_patch(original_func: Callable, new_func: Callable, 
-                    match_level: str = "strict") -> Tuple[bool, str]:
+def can_safely_patch(
+    original_func: Callable,
+    new_func: Callable, 
+    match_level: str = "strict",
+) -> Tuple[bool, str]:
     """
     Check if it's safe to patch original_func with new_func.
     """
@@ -101,9 +260,13 @@ def can_safely_patch(original_func: Callable, new_func: Callable,
             return False, f"Parameter '{old_param['name']}' type annotation changed: {old_param['annotation']} -> {new_param['annotation']}"
 
     return True, ""
+pass
 
 
-def _get_unique_storage_name(target_obj: Any, attr_name: str) -> str:
+def _get_unique_storage_name(
+    target_obj: Any,
+    attr_name: str,
+) -> str:
     """
     Generate a unique name for storing the original function.
     """
@@ -120,11 +283,17 @@ def _get_unique_storage_name(target_obj: Any, attr_name: str) -> str:
         return f"_original_{module_name}_{obj_name}_{attr_name}"
     else:
         return f"_original_{obj_name}_{attr_name}"
+pass
 
 
-def patch_function(target_obj: Any, attr_name: str, new_func: Callable, 
-                  force: bool = False, store_original: bool = True, 
-                  match_level: str = "strict") -> bool:
+def patch_function(
+    target_obj: Any,
+    attr_name: str,
+    new_func: Callable, 
+    force: bool = False,
+    store_original: bool = True, 
+    match_level: str = "strict",
+) -> bool:
     """
     Patch a function/method on an object.
     """
@@ -141,6 +310,7 @@ def patch_function(target_obj: Any, attr_name: str, new_func: Callable,
         setattr(target_obj, unique_name, original_func)
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Stored original as {unique_name}")
+    pass
 
     if not force:
         is_safe, reason = can_safely_patch(original_func, new_func, match_level)
@@ -148,7 +318,7 @@ def patch_function(target_obj: Any, attr_name: str, new_func: Callable,
             if UNSLOTH_ENABLE_LOGGING:
                 logger.error(f"Unsloth: Patch of {attr_name} skipped: {reason}")
             return False
-
+    pass
     try:
         setattr(target_obj, attr_name, new_func)
         return True
@@ -156,12 +326,16 @@ def patch_function(target_obj: Any, attr_name: str, new_func: Callable,
         if UNSLOTH_ENABLE_LOGGING:
             logger.error(f"Unsloth: Failed to patch {attr_name}: {e}")
         return False
+    pass
+pass
 
 
-def patch_multiple(patches: List[Tuple[Any, str, Callable]], 
-                  force: bool = False, 
-                  fail_fast: bool = True,
-                  match_level: str = "strict") -> Dict[str, bool]:
+def patch_multiple(
+    patches: List[Tuple[Any, str, Callable]], 
+    force: bool = False, 
+    fail_fast: bool = True,
+    match_level: str = "strict",
+) -> Dict[str, bool]:
     """
     Apply multiple patches at once.
     """
@@ -178,9 +352,13 @@ def patch_multiple(patches: List[Tuple[Any, str, Callable]],
             break
 
     return results
+pass
 
 
-def restore_original(target_obj: Any, attr_name: str) -> bool:
+def restore_original(
+    target_obj: Any,
+    attr_name: str,
+) -> bool:
     """
     Restore original function if it was stored.
     """
@@ -202,6 +380,7 @@ def restore_original(target_obj: Any, attr_name: str) -> bool:
         if UNSLOTH_ENABLE_LOGGING:
             logger.error(f"Unsloth: Failed to restore {attr_name}: {e}")
         return False
+pass
 
 
 def list_stored_originals(target_obj: Any) -> List[str]:
@@ -219,6 +398,7 @@ def list_stored_originals(target_obj: Any) -> List[str]:
                 stored.append(method_name)
 
     return sorted(list(set(stored)))  # Remove duplicates and sort
+pass
 
 
 def restore_multiple(target_objs_and_attrs: List[Tuple[Any, str]]) -> Dict[str, bool]:
@@ -232,3 +412,4 @@ def restore_multiple(target_objs_and_attrs: List[Tuple[Any, str]]) -> Dict[str, 
         results[key] = restore_original(target_obj, attr_name)
 
     return results
+pass

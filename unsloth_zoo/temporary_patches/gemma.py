@@ -21,34 +21,37 @@ import torch
 import torch.nn as nn
 import os
 import logging
-
-from .common import TEMPORARY_PATCHES, torch_compile_options, UNSLOTH_ENABLE_LOGGING
-
-logger = logging.getLogger(__name__)
+from .common import (
+    TEMPORARY_PATCHES,
+    torch_compile_options,
+)
+from .utils import (
+    KWARGS_TYPE,
+    raise_error,
+    ImageInput,
+    PreTokenizedInput,
+    TextInput,
+    StaticCache,
+    HybridCache,
+)
 
 
 def patch_Gemma3Processor():
     try:
         import transformers.models.gemma3.processing_gemma3
-    except:
-        return
-    from transformers.models.gemma3.processing_gemma3 import (
-        ImageInput,
-        PreTokenizedInput,
-        Unpack,
-        Gemma3ProcessorKwargs,
-        make_nested_list_of_images,
-        TextInput,
-        BatchFeature,
-        to_py_obj,
-    )
+        from transformers.image_utils import make_nested_list_of_images
+        from transformers.feature_extraction_utils import BatchFeature
+        from transformers.utils import to_py_obj
+    except Exception as e:
+        return raise_error("Gemma3Processor.__call__", e)
+
     def __call__(
         self,
         images: ImageInput = None,
         text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
-        videos=None,
-        audio=None,
-        **kwargs: Unpack[Gemma3ProcessorKwargs],
+        videos = None,
+        audio = None,
+        **kwargs: KWARGS_TYPE,
     ) -> BatchFeature:
         if text is None and images is None:
             raise ValueError("Provide at least one of `text` or `images`.")
@@ -144,28 +147,20 @@ def patch_Gemma3Processor():
         text_inputs["token_type_ids"] = mm_token_type_ids#.tolist()
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
     pass
-    old_keys = inspect.signature(transformers.models.gemma3.processing_gemma3.Gemma3Processor.__call__).parameters.keys()
-    new_keys = inspect.signature(__call__).parameters.keys()
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch Gemma3Processor.__call__.")
-    else:
-        transformers.models.gemma3.processing_gemma3.Gemma3Processor.__call__ = __call__
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Patched Gemma3Processor.__call__.")
-    return
+    patch_function(transformers.models.gemma3.processing_gemma3.Gemma3Processor, "__call__", __call__)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
 
 def patch_Gemma3ForConditionalGeneration_causal_mask():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try: import transformers.models.gemma3.modeling_gemma3
-    except: return
-    from transformers.models.gemma3.modeling_gemma3 import (
-        StaticCache,
-        HybridCache,
-    )
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3Model
+        transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration
+    except Exception as e:
+        return raise_error("Gemma3ForConditionalGeneration._update_causal_mask", e)
+
     def _update_causal_mask(
         self,
         attention_mask,
@@ -235,36 +230,22 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
 
         return causal_mask
     pass
-
     if hasattr(transformers.models.gemma3.modeling_gemma3, "Gemma3Model"):
-        old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3Model._update_causal_mask).parameters
-        new_keys = inspect.signature(_update_causal_mask).parameters
-        if old_keys != new_keys:
-            if UNSLOTH_ENABLE_LOGGING:
-                print("Unsloth: Failed to patch Gemma3Model.")
-        else:
-            transformers.models.gemma3.modeling_gemma3.Gemma3Model._update_causal_mask = _update_causal_mask
-            if UNSLOTH_ENABLE_LOGGING:
-                print("Unsloth: Patched Gemma3Model._update_causal_mask.")
+        patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Model, "_update_causal_mask", _update_causal_mask)
     else:
-        old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration._update_causal_mask).parameters
-        new_keys = inspect.signature(_update_causal_mask).parameters
-        if old_keys != new_keys:
-            if UNSLOTH_ENABLE_LOGGING:
-                print("Unsloth: Failed to patch Gemma3ForConditionalGeneration._update_causal_mask.")
-        else:
-            transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration._update_causal_mask = _update_causal_mask
-            if UNSLOTH_ENABLE_LOGGING:
-                print("Unsloth: Patched Gemma3ForConditionalGeneration._update_causal_mask.")
-    return
+        patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration, "_update_causal_mask", _update_causal_mask)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
 
 
 def patch_Gemma3TextScaledWordEmbedding():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try: import transformers.models.gemma3.modeling_gemma3
-    except: return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding
+    except Exception as e:
+        return raise_error("Gemma3ForConditionalGeneration._update_causal_mask", e)
+
     def forward(self, input_ids: torch.Tensor):
         input_embeds = torch.nn.functional.embedding(
             input_ids,
@@ -273,27 +254,19 @@ def patch_Gemma3TextScaledWordEmbedding():
         )
         return input_embeds.to(torch.float32) * self.embed_scale
     pass
-    old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding.forward).parameters
-    new_keys = inspect.signature(forward).parameters
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch Gemma3TextScaledWordEmbedding.")
-    else:
-        forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
-        transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding.forward = forward
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Patched Gemma3TextScaledWordEmbedding.forward.")
-    return
+    forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
 
 def patch_Gemma3RMSNorm():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try: import transformers.models.gemma3.modeling_gemma3
-    except: return
-
-    original_rmsnorm_forward = transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm.forward
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm
+    except Exception as e:
+        return raise_error("Gemma3RMSNorm.forward", e)
 
     def forward(self, x): # x can be fp32 (from embeddings) or fp16 (from MLP/Attn)
         # Internals in fp32
@@ -312,27 +285,19 @@ def patch_Gemma3RMSNorm():
 
         return clamped_output_fp32.to(torch.float16) # Output fp16
     pass
-    old_keys = inspect.signature(original_rmsnorm_forward).parameters
-    new_keys = inspect.signature(forward).parameters
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch Gemma3RMSNorm (adjusted). Signature mismatch.")
-    else:
-        forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
-        transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm.forward = forward
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Patched Gemma3RMSNorm.forward.")
-    return
+    forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
 
 def patch_Gemma3MLP():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try: import transformers.models.gemma3.modeling_gemma3
-    except: return
-
-    original_mlp_forward = transformers.models.gemma3.modeling_gemma3.Gemma3MLP.forward
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3MLP
+    except Exception as e:
+        return raise_error("Gemma3MLP.forward", e)
 
     def forward(self, x): # x is fp16 from RMSNorm
         gate_proj_out = self.gate_proj(x)
@@ -349,17 +314,8 @@ def patch_Gemma3MLP():
         down_proj_out = self.down_proj(intermediate_fp16)
         return down_proj_out
     pass
-
-    old_keys = inspect.signature(original_mlp_forward).parameters
-    new_keys = inspect.signature(forward).parameters
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING: print("Unsloth: Failed to patch Gemma3MLP")
-    else:
-        forward = torch.compile(forward, fullgraph = False, dynamic = True, options = torch_compile_options)
-        transformers.models.gemma3.modeling_gemma3.Gemma3MLP.forward = forward
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Patched Gemma3MLP.forward.")
-    return
+    forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 

@@ -18,20 +18,52 @@ __all__ = [
     "TEMPORARY_PATCHES", 
     "torch_compile_options",
     "UNSLOTH_ENABLE_LOGGING",
+    "get_torch_compile_options",
 ]
 
 import os
-UNSLOTH_COMPILE_DEBUG         = os.environ.get("UNSLOTH_COMPILE_DEBUG",         "0") == "1"
-UNSLOTH_COMPILE_MAXIMUM       = os.environ.get("UNSLOTH_COMPILE_MAXIMUM",       "0") == "1"
-UNSLOTH_COMPILE_IGNORE_ERRORS = os.environ.get("UNSLOTH_COMPILE_IGNORE_ERRORS", "0") == "1"
-UNSLOTH_ENABLE_LOGGING        = os.environ.get("UNSLOTH_ENABLE_LOGGING",        "0") == "1"
-torch_compile_options = {
-    "epilogue_fusion"   : True,
-    "max_autotune"      : UNSLOTH_COMPILE_MAXIMUM,
-    "shape_padding"     : True,
-    "trace.enabled"     : UNSLOTH_COMPILE_DEBUG,
-    "triton.cudagraphs" : False,
-}
+UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+
+def get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False,
+    shape_padding = True,
+    debug = False,
+    cudagraphs = False,
+):
+    UNSLOTH_COMPILE_DEBUG         = os.environ.get("UNSLOTH_COMPILE_DEBUG",         "0") == "1"
+    UNSLOTH_COMPILE_MAXIMUM       = os.environ.get("UNSLOTH_COMPILE_MAXIMUM",       "0") == "1"
+    UNSLOTH_COMPILE_IGNORE_ERRORS = os.environ.get("UNSLOTH_COMPILE_IGNORE_ERRORS", "0") == "1"
+    torch_compile_options = {
+        "epilogue_fusion"           : epilogue_fusion,
+        "max_autotune"              : max_autotune,
+        "shape_padding"             : shape_padding,
+        "trace.enabled"             : UNSLOTH_COMPILE_DEBUG or debug,
+        "triton.cudagraphs"         : cudagraphs,
+        "debug"                     : UNSLOTH_COMPILE_DEBUG or debug,
+        "dce"                       : True,
+        "memory_planning"           : True,
+        "coordinate_descent_tuning" : UNSLOTH_COMPILE_MAXIMUM,
+        "trace.graph_diagram"       : UNSLOTH_COMPILE_DEBUG or debug,
+        # "compile_threads"           : 24, # Auto detects via https://github.com/unslothai/unsloth-zoo/pull/187
+        "combo_kernels"             : False, # Causes incompatible gradient sizes on 2.6
+        "group_fusion"              : True,
+        "disable_progress"          : not UNSLOTH_ENABLE_LOGGING,
+        "verbose_progress"          : UNSLOTH_ENABLE_LOGGING,
+        "triton.multi_kernel"       : False, # Sometimes fails
+        "triton.use_block_ptr"      : False,
+        "triton.enable_persistent_tma_matmul" : True,
+        "triton.autotune_at_compile_time"     : True,
+    }
+    return torch_compile_options
+pass
+torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False,
+    shape_padding = True,
+    debug = False,
+    cudagraphs = False,
+)
 
 global TEMPORARY_PATCHES
 TEMPORARY_PATCHES = []
