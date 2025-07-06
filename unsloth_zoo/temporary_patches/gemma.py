@@ -31,6 +31,7 @@ from .utils import (
     ImageInput,
     PreTokenizedInput,
     TextInput,
+    Cache,
     StaticCache,
     HybridCache,
 )
@@ -322,49 +323,26 @@ TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
 def patch_Gemma3Attention():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-
     try:
         import transformers.models.gemma3.modeling_gemma3
-    except:
-        return
-    import typing
-    from transformers.models.gemma3.modeling_gemma3 import (
-        Cache, Unpack, FlashAttentionKwargs, apply_rotary_pos_emb,
-    )
-
+        transformers.models.gemma3.modeling_gemma3.Gemma3Attention
+        from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
+    except Exception as e:
+        return raise_error("Gemma3Attention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-    original_hf_attention_forward = transformers.models.gemma3.modeling_gemma3.Gemma3Attention.forward
+    scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
 
-    def forward(
+    def prepare(
         self,
-        hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-
-        bsz, q_len, _ = hidden_states.shape
-        input_shape = hidden_states.shape[:-1] # For reshaping o_proj output later
-
-        # Determine head shapes
-        # Assuming these attributes are standard for Gemma3Attention
-        # If not, they might come from self.config
-        num_heads = getattr(self, "num_heads", self.config.num_attention_heads)
-        num_key_value_heads = getattr(self, "num_key_value_heads", self.config.num_key_value_heads)
-        head_dim = self.head_dim
-
-        # For projections view: (bsz, q_len, num_specific_heads, head_dim)
-        query_hidden_shape = (bsz, q_len, num_heads, head_dim)
-        kv_hidden_shape    = (bsz, q_len, num_key_value_heads, head_dim)
-
-        # 1. Projections (q, k, v) in fp16
-        # hidden_states is already fp16. Weights of q_proj, k_proj, v_proj are fp16.
-        query_states_fp16 = self.q_proj(hidden_states) # output fp16
-        key_states_fp16 = self.k_proj(hidden_states)     # output fp16
-        value_states_fp16 = self.v_proj(hidden_states)   # output fp16
-
+        hidden_states,
+        query_states_fp16,
+        key_states_fp16,
+        value_states_fp16,
+        query_hidden_shape,
+        kv_hidden_shape,
+        position_embeddings,
+        attention_mask,
+    ):
         # 2. Upcast Q, K, V for norm and RoPE, and then transpose for attention
         # (bsz, num_specific_heads, q_len, head_dim)
         query_states_fp32 = query_states_fp16.view(query_hidden_shape).to(torch.float32).transpose(1, 2)
@@ -387,6 +365,92 @@ def patch_Gemma3Attention():
         sin_fp32 = sin.to(torch.float32)
         query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos_fp32, sin_fp32)
 
+        # 6. Core Attention mechanism (SDPA) in fp32
+        attn_mask_for_sdpa = attention_mask
+        if attn_mask_for_sdpa is not None:
+            attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
+        return (
+            query_states_fp32,
+            key_states_fp32,
+            value_states_fp32,
+            cos_fp32,
+            sin_fp32,
+            attn_mask_for_sdpa,
+        )
+    pass
+    prepare = torch.compile(prepare, fullgraph = True, dynamic = True, options = torch_compile_options)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+
+        bsz, q_len, _ = hidden_states.shape
+        input_shape = hidden_states.shape[:-1] # For reshaping o_proj output later
+
+        # Determine head shapes
+        # Assuming these attributes are standard for Gemma3Attention
+        # If not, they might come from self.config
+        num_heads = getattr(self, "num_heads", self.config.num_attention_heads)
+        num_key_value_heads = getattr(self, "num_key_value_heads", self.config.num_key_value_heads)
+        head_dim = self.head_dim
+
+        # For projections view: (bsz, q_len, num_specific_heads, head_dim)
+        query_hidden_shape = (bsz, q_len, num_heads, head_dim)
+        kv_hidden_shape    = (bsz, q_len, num_key_value_heads, head_dim)
+
+        # 1. Projections (q, k, v) in fp16
+        # hidden_states is already fp16. Weights of q_proj, k_proj, v_proj are fp16.
+        query_states_fp16 = self.q_proj(hidden_states) # output fp16
+        key_states_fp16   = self.k_proj(hidden_states) # output fp16
+        value_states_fp16 = self.v_proj(hidden_states) # output fp16
+
+        # 2. Upcast Q, K, V for norm and RoPE, and then transpose for attention
+        # (bsz, num_specific_heads, q_len, head_dim)
+        # query_states_fp32 = query_states_fp16.view(query_hidden_shape).to(torch.float32).transpose(1, 2)
+        # key_states_fp32   = key_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2)
+        # value_states_fp32 = value_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2) # V for attention also fp32
+
+        # # 3. Normalization (q_norm, k_norm are RMSNorms)
+        # query_norm_out_fp16 = self.q_norm(query_states_fp32)
+        # key_norm_out_fp16   = self.k_norm(key_states_fp32)
+
+        # query_states_fp32 = query_norm_out_fp16.to(torch.float32)
+        # key_states_fp32   = key_norm_out_fp16.to(torch.float32)
+
+        # # 4. Rotary Positional Embeddings in fp32
+        # if not (isinstance(position_embeddings, tuple) and len(position_embeddings) == 2):
+        #     raise ValueError("Position embeddings not provided as (cos, sin) tuple to Gemma3Attention")
+
+        # cos, sin = position_embeddings
+        # cos_fp32 = cos.to(torch.float32)
+        # sin_fp32 = sin.to(torch.float32)
+        # query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos_fp32, sin_fp32)
+
+        (
+            query_states_fp32,
+            key_states_fp32,
+            value_states_fp32,
+            cos_fp32,
+            sin_fp32,
+            attn_mask_for_sdpa,
+        ) = prepare(
+            self,
+            hidden_states,
+            query_states_fp16,
+            key_states_fp16,
+            value_states_fp16,
+            query_hidden_shape,
+            kv_hidden_shape,
+            position_embeddings,
+            attention_mask,
+        )
+
         # 5. KV Cache update (using fp32 K, V)
         if past_key_value is not None:
             cache_kwargs = {
@@ -400,9 +464,9 @@ def patch_Gemma3Attention():
             )
 
         # 6. Core Attention mechanism (SDPA) in fp32
-        attn_mask_for_sdpa = attention_mask
-        if attn_mask_for_sdpa is not None:
-            attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
+        # attn_mask_for_sdpa = attention_mask
+        # if attn_mask_for_sdpa is not None:
+        #     attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
 
         output_attentions = kwargs.get("output_attentions", False)
 
@@ -434,18 +498,6 @@ def patch_Gemma3Attention():
 
         return attn_output_projected, attn_weights # 3-tuple return
     pass
-
-    old_keys_sig = inspect.signature(original_hf_attention_forward)
-    new_keys_sig = inspect.signature(forward)
-
-    if old_keys_sig.parameters != new_keys_sig.parameters or old_keys_sig.return_annotation != new_keys_sig.return_annotation:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch Gemma3Attention (adjusted for signature matching). Signature mismatch with original HF method.")
-    else:
-        forward = torch.compiler.disable(forward, recursive = False)
-        transformers.models.gemma3.modeling_gemma3.Gemma3Attention.forward = forward
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Patched Gemma3Attention.forward (adjusted for signature matching, output fp16).")
-    return
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention)
