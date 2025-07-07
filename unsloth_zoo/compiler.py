@@ -339,7 +339,12 @@ def create_new_function(
     items = [x for x in functions if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))]
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source: items += ["SiglipEncoder"]
+    # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
+    if "create_causal_mask" in new_source: items += ["create_causal_mask"]
+    if "create_masks_for_generate" in new_source: items += ["create_masks_for_generate"]
+    if "create_sliding_window_causal_mask" in new_source: items += ["create_sliding_window_causal_mask"]
 
+    # Full import script
     imports = "from torch import Tensor\n"
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
