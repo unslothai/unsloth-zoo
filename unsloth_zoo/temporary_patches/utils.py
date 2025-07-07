@@ -284,6 +284,7 @@ def canonicalize_annotation(annotation: Any) -> Any:
             "Kwargs" in str(annotation[1][0]):
             annotation = (t.Unpack, (t._TypedDictMeta),)
 
+        # (typing.Unpack, <class 'typing._TypedDictMeta'>,)
         elif annotation[0] == t.Unpack and \
             type(annotation[1]) is type and \
             "Kwargs" in str(annotation[1]):
