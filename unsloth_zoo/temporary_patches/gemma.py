@@ -50,7 +50,7 @@ def patch_Gemma3Processor():
         text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
         videos = None,
         audio = None,
-        **kwargs: Gemma3ProcessorKwargs,
+        **kwargs: Unpack[Gemma3ProcessorKwargs],
     ) -> BatchFeature:
         if text is None and images is None:
             raise ValueError("Provide at least one of `text` or `images`.")
