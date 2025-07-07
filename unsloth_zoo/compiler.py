@@ -119,7 +119,7 @@ if importlib.util.find_spec("unsloth_studio") is None:
 else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
-from typing import List, Dict, Tuple, Optional, Any, Callable
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import math
 """
 
