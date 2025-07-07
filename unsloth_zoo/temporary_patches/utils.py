@@ -346,7 +346,7 @@ def removed_flags(
 ) -> List[str]:
     old_params = set(x["name"] for x in old_fp)
     new_params = set(x["name"] for x in new_fp)
-    removed_params = list(old_params - new_params)
+    removed_params = list(old_params ^ new_params)
     removed_params.sort()
     return tuple(removed_params)
 pass
