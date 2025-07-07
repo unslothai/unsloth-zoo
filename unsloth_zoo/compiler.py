@@ -316,7 +316,8 @@ def get_mask_functions():
         import transformers.masking_utils
         masking_utils = dir(transformers.masking_utils)
         return [x for x in masking_utils if x.startswith("create")]
-    return []
+    except:
+        return []
 pass
 
 def create_new_function(
