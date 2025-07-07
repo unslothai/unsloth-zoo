@@ -2222,6 +2222,7 @@ def unsloth_compile_transformers(
             else:
                 print(f"Unsloth: Cannot compile function {module} since disabled keyword is in it.")
             all_standalone_classes[module] = source
+            print(all_standalone_classes[module])
         pass
     pass
 
