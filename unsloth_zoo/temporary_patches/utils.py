@@ -331,6 +331,8 @@ def can_safely_patch(
         return False, f"Signature inspection failed: {e}"
 
     if len(old_fp) != len(new_fp):
+        print(old_fp)
+        print(new_fp)
         return False, f"Parameter count mismatch: {len(old_fp)} vs {len(new_fp)}"
 
     for old_param, new_param in zip(old_fp, new_fp):
@@ -418,7 +420,7 @@ def patch_function(
         is_safe, reason = can_safely_patch(original_func, new_func, match_level)
         if not is_safe:
             if UNSLOTH_ENABLE_LOGGING:
-                logger.error(f"Unsloth: Patch of {target_obj.__name__}.{attr_name} skipped: {reason}")
+                logger.error(f"Unsloth: Skipped {target_obj.__name__}.{attr_name}\nReason: {reason}")
             return False
     pass
     try:
