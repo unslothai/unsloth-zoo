@@ -386,7 +386,7 @@ def patch_function(
     """
     if not hasattr(target_obj, attr_name):
         if UNSLOTH_ENABLE_LOGGING:
-            logger.error(f"Unsloth: Attribute '{attr_name}' not found on {target_obj}")
+            logger.error(f"Unsloth: Attribute '{attr_name}' not found on {target_obj.__name__}")
         return False
 
     original_func = getattr(target_obj, attr_name)
@@ -418,17 +418,17 @@ def patch_function(
         is_safe, reason = can_safely_patch(original_func, new_func, match_level)
         if not is_safe:
             if UNSLOTH_ENABLE_LOGGING:
-                logger.error(f"Unsloth: Patch of {attr_name} skipped: {reason}")
+                logger.error(f"Unsloth: Patch of {target_obj.__name__}.{attr_name} skipped: {reason}")
             return False
     pass
     try:
         setattr(target_obj, attr_name, new_func)
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Patched {attr_name}.")
+            logger.info(f"Unsloth: Patched {target_obj.__name__}.{attr_name}.")
         return True
     except Exception as e:
         if UNSLOTH_ENABLE_LOGGING:
-            logger.error(f"Unsloth: Failed to patch {attr_name}: {e}")
+            logger.error(f"Unsloth: Failed to patch {target_obj.__name__}.{attr_name}: {e}")
         return False
     pass
 pass
