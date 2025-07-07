@@ -269,11 +269,20 @@ def _canonicalize_annotation(annotation: Any) -> Any:
 pass
 def canonicalize_annotation(annotation: Any) -> Any:
     annotation = _canonicalize_annotation(annotation)
-    # Fix up reordering of Union with sorting
-    # Union[str, List[str], list[str]] gets reduced to Union[str, list[str]]
-    # due to duplicates. We also sort Unions
-    if type(annotation) is tuple and len(annotation) == 2 and annotation[0] == t.Union:
-        annotation = (annotation[0], tuple(set(annotation[1])),)
+    if type(annotation) is tuple and len(annotation) == 2:
+        # Fix up reordering of Union with sorting
+        # Union[str, List[str], list[str]] gets reduced to Union[str, list[str]]
+        # due to duplicates. We also sort Unions
+        if annotation[0] == t.Union:
+            annotation = (annotation[0], tuple(set(annotation[1])),)
+        # Fix up kwargs
+        # (typing.Unpack, (<class 'transformers.models.csm.modeling_csm.KwargsForCausalLM'>,)) to
+        # (typing.Unpack, (<class 'typing._TypedDictMeta'>,))
+        elif annotation[0] == t.Unpack and \
+            type(annotation[1]) is tuple and \
+            len(annotation[1]) == 1 and \
+            "Kwargs" in str(annotation[1][0]):
+            annotation = (t.Unpack, (t._TypedDictMeta),)
     return annotation
 pass
 
