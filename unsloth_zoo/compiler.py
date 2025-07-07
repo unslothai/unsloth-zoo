@@ -93,6 +93,8 @@ DISABLED_KEYWORDS = [
     "select_best_resolution", # Llava NeXT errors out
     "original_aspect_ratio > current_aspect_ratio",  # Llava NeXT errors out
     "causal_mask[start:end, start:end] = 0", # Pixtral Dynamic slicing on data-dependent value is not supported
+    "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", # Gemma3 create_masks_for_generate
+    "create_causal_mask(**mask_kwargs)", # Gemma3 create_masks_for_generate
 ]
 
 _license_header = """
@@ -2212,10 +2214,6 @@ def unsloth_compile_transformers(
                     bad = True
                     break
             pass
-            # Remove functions which return itself
-            # https://github.com/huggingface/transformers/blob/896e9cea1ade521b2648f4798218550f6c72190c/src/transformers/models/gemma3/modeling_gemma3.py#L1179
-            # Gemma3 def create_masks_for_generate(): return create_masks_for_generate()
-            print(source)
             if not bad:
                 source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
