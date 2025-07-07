@@ -140,7 +140,8 @@ try:
         type(TransformersKwargs) is t._TypedDictMeta, \
         "Unsloth: TransformersKwargs type changed! Please file a bug report asap!"
 except Exception as e:
-    if Version(transformers.__version__) >= Version("4.54.0.dev0"):
+    from transformers import __version__ as transformers_version
+    if Version(transformers_version) >= Version("4.54.0.dev0"):
         raise RuntimeError(
             f"Unsloth: TransformersKwargs has been moved! Other error = {str(e)}.\n"\
             "Please file a bug report asap!"
@@ -230,7 +231,7 @@ TYPE_MAPPINGS = {
     tuple                : t.Tuple,
     frozenset            : t.FrozenSet,
     Unpack               : t.Unpack,
-    KWARGS_TYPING        : t.Unpack[t._TypedDictMeta],
+    KWARGS_TYPE          : t.Unpack[t._TypedDictMeta],
     Cache                : t.Any,
     DynamicCache         : t.Any,
     HybridCache          : t.Any,
