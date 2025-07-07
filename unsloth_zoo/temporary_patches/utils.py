@@ -360,7 +360,10 @@ def can_safely_patch(
 
         # For strict matching, also check type annotations
         if match_level == "strict" and old_param['annotation'] != new_param['annotation']:
-            return False, f"Parameter '{old_param['name']}' type annotation changed: {old_param['annotation']} -> {new_param['annotation']}"
+            return False, \
+            f"Parameter '{old_param['name']}' type annotation changed from:\n"\
+            f"{old_param['annotation']} to\n"\
+            f"{new_param['annotation']}"
 
     return True, ""
 pass
