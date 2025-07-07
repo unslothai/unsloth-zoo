@@ -95,7 +95,6 @@ def patch_Gemma3Processor():
 
             # Replace image tokens by the full expanded sequence
             batch_num_crops = to_py_obj(image_inputs.pop("num_crops"))
-            print(batch_num_crops)
             text_with_crops = text
             for batch_idx, (prompt, images_for_item, num_crops_for_item) in enumerate(zip(text, batched_images, batch_num_crops)):
                 image_indexes = [m.start() for m in re.finditer(self.boi_token, prompt)]
@@ -128,6 +127,7 @@ def patch_Gemma3Processor():
 
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
         # text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"], return_tensors="np")
+        return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", True)
 
         text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
         # Fix double BOS tokens
@@ -137,7 +137,6 @@ def patch_Gemma3Processor():
 
         # Add token type ids manually, as tokenizer can't do arbitrary position token types
         # [TODO] FAILS for batched tokens since text_inputs["input_ids"] is a list of lists, so np.array creates an object!
-        return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", True)
         if return_mm_token_type_ids:
             input_ids = text_inputs["input_ids"]
             image_token_id = self.image_token_id
