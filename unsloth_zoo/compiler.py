@@ -309,6 +309,16 @@ def get_compile_folder(use_tempfile = False):
     return location, UNSLOTH_COMPILE_USE_TEMP
 pass
 
+# Mask creation functions
+@functools.lru_cache(1)
+def get_mask_functions():
+    try:
+        import transformers.masking_utils
+        masking_utils = dir(transformers.masking_utils)
+        return [x for x in masking_utils if x.startswith("create")]
+    return []
+pass
+
 def create_new_function(
     name,
     new_source,
@@ -340,6 +350,7 @@ def create_new_function(
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source: items += ["SiglipEncoder"]
     # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
+    
     if "create_causal_mask" in new_source: items += ["create_causal_mask"]
     if "create_masks_for_generate" in new_source: items += ["create_masks_for_generate"]
     if "create_sliding_window_causal_mask" in new_source: items += ["create_sliding_window_causal_mask"]
@@ -2227,7 +2238,6 @@ def unsloth_compile_transformers(
             else:
                 print(f"Unsloth: Cannot compile function {module} since disabled keyword is in it.")
             all_standalone_classes[module] = source
-            print(all_standalone_classes[module])
         pass
     pass
 
