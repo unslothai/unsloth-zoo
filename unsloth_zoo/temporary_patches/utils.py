@@ -282,13 +282,13 @@ def canonicalize_annotation(annotation: Any) -> Any:
             type(annotation[1]) is tuple and \
             len(annotation[1]) == 1 and \
             "Kwargs" in str(annotation[1][0]):
-            annotation = (t.Unpack, (t._TypedDictMeta),)
+            annotation = (t.Unpack, (t._TypedDictMeta,),)
 
         # (typing.Unpack, <class 'typing._TypedDictMeta'>,)
         elif annotation[0] == t.Unpack and \
             type(annotation[1]) is type and \
             "Kwargs" in str(annotation[1]):
-            annotation = (t.Unpack, t._TypedDictMeta,)
+            annotation = (t.Unpack, (t._TypedDictMeta,),)
 
     return annotation
 pass
