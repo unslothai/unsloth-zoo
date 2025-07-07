@@ -803,9 +803,12 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     try:
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     except:
-        head_dim = getattr(config.text_config, "head_dim", config.text_config.hidden_size // config.text_config.num_attention_heads)
+        if hasattr(config, "text_config"):
+            head_dim = getattr(config.text_config, "head_dim", config.text_config.hidden_size // config.text_config.num_attention_heads)
+        else:
+            raise ValueError("No head_dim found in config. Please check if the config is correct.")
     new_text_config.update({"head_dim" : head_dim})
-    from transformers import AutoModelForCausalLM, MllamaForConditionalGeneration
+    from transformers import AutoModelForCausalLM, AutoModel
     if not is_mllama:
         new_model = AutoModelForCausalLM.from_config(
             new_config,
@@ -813,8 +816,9 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         )
     else:
         new_config._attn_implementation = "eager"
-        new_model = MllamaForConditionalGeneration(
+        new_model = AutoModel.from_config(
             new_config,
+            attn_implementation = "eager",
         )
     pass
     new_model = new_model.to(device = "cuda:0", dtype = dtype)
@@ -932,21 +936,21 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             
             # Convert model.layers.0.self_attn.q_proj to model.layers[0].self_attn.q_proj
             layer_name = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
-            exec(f"new_model.model.language_model.{layer_name} = layer")
+            exec(f"new_model.model.language_model.{layer_name} = layer") if hasattr(new_model, "model") and hasattr(new_model.model, "language_model") else exec(f"new_model.{layer_name} = layer")
         pass
     pass
 
     # Norm
     norm = quant_state_dict["model.norm.weight"]
     norm = torch.nn.Parameter(norm, requires_grad = False)
-    new_model.model.language_model.norm.weight = norm
+    eval(f"new_model.{model_prefix}.norm.weight = norm")
 
     # Embeddings
-    new_model.model.language_model.embed_tokens = torch.nn.Embedding.from_pretrained(
-        quant_state_dict["model.embed_tokens.weight"],
+    eval(f"new_model.{model_prefix}.embed_tokens = torch.nn.Embedding.from_pretrained(
+        quant_state_dict['model.embed_tokens.weight'],
         freeze = True,
         padding_idx = config.pad_token_id,
-    )
+    )")
 
     # LM Head
     if getattr(config, "tie_word_embeddings", False):
@@ -981,7 +985,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     for module in new_model.modules():
         if hasattr(module, "rotary_emb"):
             module.rotary_emb = module.rotary_emb.__class__(
-                config = config.text_config,
+                config = config.text_config if hasattr(config, "text_config") else config,
                 device = "cuda:0",
             )
         pass
@@ -1134,10 +1138,15 @@ def load_vllm(
     if float8_kv_cache and major_version < 8:
         raise NotImplementedError("Unsloth: Your GPU is too old for float8 KV cache! Set it to False.")
 
+    if hasattr(config, "text_config"):
+        mem_config = config.text_config
+    else:
+        mem_config = config
+
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
     approximate_vllm_memory_usage(
-        config if not hasattr(config, "text_config") else config.text_config, 
+        mem_config, 
         max_seq_length = max_seq_length,
         gpu_memory_utilization = gpu_memory_utilization,
         enable_lora = enable_lora,
