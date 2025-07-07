@@ -95,6 +95,7 @@ def patch_Gemma3Processor():
 
             # Replace image tokens by the full expanded sequence
             batch_num_crops = to_py_obj(image_inputs.pop("num_crops"))
+            print(batch_num_crops)
             text_with_crops = text
             for batch_idx, (prompt, images_for_item, num_crops_for_item) in enumerate(zip(text, batched_images, batch_num_crops)):
                 image_indexes = [m.start() for m in re.finditer(self.boi_token, prompt)]
@@ -128,23 +129,24 @@ def patch_Gemma3Processor():
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
         # text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"], return_tensors="np")
 
-        # Fix double BOS tokens
-        bos = self.tokenizer.bos_token
-        n = len(bos)
-        text = [x[i + n:] if (i := x.find(bos)) != -1 else x for x in text]
-
         text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
+        # Fix double BOS tokens
+        double_bos_token_id = [self.tokenizer.bos_token_id]*2
+        input_ids = text_inputs["input_ids"]
+        text_inputs["input_ids"] = [x[1:] if x[:2] == double_bos_token_id else x for x in input_ids]
 
         # Add token type ids manually, as tokenizer can't do arbitrary position token types
         # [TODO] FAILS for batched tokens since text_inputs["input_ids"] is a list of lists, so np.array creates an object!
-        input_ids = text_inputs["input_ids"]
-        image_token_id = self.image_token_id
-        mm_token_type_ids = [[1 if y == image_token_id else 0 for y in x] for x in input_ids]
-        # array_ids = np.array(text_inputs["input_ids"])
-        # mm_token_type_ids = np.zeros_like(text_inputs["input_ids"])
-        # mm_token_type_ids[array_ids == self.image_token_id] = 1
-        # text_inputs = {k: v.tolist() for k, v in text_inputs.items()}  # in case user requested list inputs
-        text_inputs["token_type_ids"] = mm_token_type_ids#.tolist()
+        return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", True)
+        if return_mm_token_type_ids:
+            input_ids = text_inputs["input_ids"]
+            image_token_id = self.image_token_id
+            mm_token_type_ids = [[1 if y == image_token_id else 0 for y in x] for x in input_ids]
+            # array_ids = np.array(text_inputs["input_ids"])
+            # mm_token_type_ids = np.zeros_like(text_inputs["input_ids"])
+            # mm_token_type_ids[array_ids == self.image_token_id] = 1
+            # text_inputs = {k: v.tolist() for k, v in text_inputs.items()}  # in case user requested list inputs
+            text_inputs["token_type_ids"] = mm_token_type_ids#.tolist()
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
     pass
     patch_function(transformers.models.gemma3.processing_gemma3.Gemma3Processor, "__call__", __call__)
