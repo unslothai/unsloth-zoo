@@ -59,7 +59,7 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: KWARGS_TYPE,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        kwargs = process_output_options(locals(), kwargs)
+        kwargs = process_output_options(self, locals(), kwargs)
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -160,7 +160,7 @@ def patch_CsmForConditionalGeneration_forward():
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: KWARGS_TYPE,
     ) -> Union[Tuple, CsmOutputWithPast]:
-        kwargs = process_output_options(locals(), kwargs)
+        kwargs = process_output_options(self, locals(), kwargs)
 
         if input_ids is not None and input_ids.ndim == 2:
             merged_inputs = self._merge_input_ids_with_input_values(
