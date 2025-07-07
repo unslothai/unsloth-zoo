@@ -2212,6 +2212,10 @@ def unsloth_compile_transformers(
                     bad = True
                     break
             pass
+            # Remove functions which return itself
+            # https://github.com/huggingface/transformers/blob/896e9cea1ade521b2648f4798218550f6c72190c/src/transformers/models/gemma3/modeling_gemma3.py#L1179
+            # Gemma3 def create_masks_for_generate(): return create_masks_for_generate()
+            print(source)
             if not bad:
                 source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
