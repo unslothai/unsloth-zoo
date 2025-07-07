@@ -342,6 +342,7 @@ def create_new_function(
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
     imports += "from torch.nn import functional as F\n"
+    imports += "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     imports += f"from {model_location} import (" + ", ".join(x for x in items) + ")" if len(items) != 0 else ""
     new_source = imports + "\n\n" + new_source
     new_source = prepend + new_source + append
