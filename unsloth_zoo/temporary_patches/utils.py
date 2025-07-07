@@ -16,6 +16,8 @@
 
 __all__ = [
     "patch_function",
+    "process_return",
+    "process_output_options",
     "KWARGS_TYPE",
     "raise_error"
     "Unpack",
@@ -33,6 +35,7 @@ __all__ = [
 ]
 import inspect
 import typing as t
+import torch
 from typing import Any, Callable, Dict, List, Tuple
 try:
     t._TypedDictMeta
@@ -41,7 +44,7 @@ except:
 
 import logging
 from packaging.version import Version
-from .common import UNSLOTH_ENABLE_LOGGING
+from .common import UNSLOTH_ENABLE_LOGGING, torch_compile_options
 logger = logging.getLogger(__name__)
 EMPTY = inspect._empty
 
@@ -55,6 +58,40 @@ def raise_error(f: str, exception: Any):
             f"==================\n"
         )
     return
+pass
+
+# Output classes sometimes might remove objects, so we make a fastpath
+global PROCESS_RETURN_ALLOWED_TYPES
+PROCESS_RETURN_ALLOWED_TYPES = {}
+def process_return(
+    output_class : type,
+    return_dict : Dict,
+) -> Any:
+    """ CausalLMOutputWithPast(...) might change arguments! """
+    try:
+        if output_class in PROCESS_RETURN_ALLOWED_TYPES:
+            allowed_keys = PROCESS_RETURN_ALLOWED_TYPES[output_class]
+            chosen_keys = allowed_keys & return_dict.keys()
+            return_dict = {key : return_dict[key] for key in chosen_keys}
+        return output_class(**return_dict)
+    except:
+        # We inspect the argument then only allow those arguments
+        return_dict_keys = return_dict.keys()
+        allowed_keys = set(inspect.signature(output_class).parameters.keys())
+        chosen_keys  = allowed_keys & return_dict_keys
+        return_dict  = {key : return_dict[key] for key in chosen_keys}
+        logger.warning_once(
+            f"Unsloth: Returning {output_class.__name__} changed return args.\n"\
+            f"Previously we wanted {return_dict_keys}\n"\
+            f"Now we can only use  {allowed_keys}\n"\
+            f"These keys are gone: {return_dict_keys - allowed_keys}"
+        )
+        try:
+            PROCESS_RETURN_ALLOWED_TYPES[output_class] = allowed_keys
+            return output_class(**return_dict)
+        except Exception as e:
+            raise RuntimeError(str(e))
+    pass
 pass
 
 # Get Unpack
@@ -71,8 +108,32 @@ except Exception as e:
 pass
 KWARGS_TYPE = t.Unpack[t._TypedDictMeta]
 
+
+# Sometimes output classes change! Account for this
+def process_output_options(
+    self : Any,
+    locals_items : Dict,
+    kwargs : Dict,
+) -> Dict:
+    """ Latest transformers also deletes output_attentions and output_hidden_states """
+    # Preserve old transformers style
+    # 4.54.0 removes output_attentions and output_hidden_states
+    output_attentions    = locals_items.get("output_attentions",    False)
+    output_hidden_states = locals_items.get("output_hidden_states", False)
+
+    output_attentions = output_attentions if output_attentions is not None else getattr(self.config, "output_attentions", False)
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else getattr(self.config, "output_hidden_states", False)
+    )
+    # Move to kwargs
+    kwargs["output_attentions"]    = output_attentions
+    kwargs["output_hidden_states"] = output_hidden_states
+    return kwargs
+pass
+
+
 # Latest transformers 4.54.0 changed to TransformersKwargs
-TransformersKwargs = "TransformersKwargs"
+TransformersKwargs = t._TypedDictMeta
 try:
     from transformers.utils import TransformersKwargs
     assert \
@@ -89,7 +150,7 @@ except Exception as e:
 pass
 
 # Get FlashAttentionKwargs
-FlashAttentionKwargs = "FlashAttentionKwargs"
+FlashAttentionKwargs = t._TypedDictMeta
 try:
     from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
     assert \
@@ -98,6 +159,26 @@ try:
 except:
     # No more FlashAttentionKwargs can ignore!
     pass
+pass
+
+# Get LossKwargs and KwargsForCausalLM
+LossKwargs = t._TypedDictMeta
+KwargsForCausalLM = t._TypedDictMeta
+try:
+    from transformers.utils import LossKwargs
+    assert \
+        type(LossKwargs) is t._TypedDictMeta, \
+        "Unsloth: LossKwargs type changed! Please file a bug report asap!"
+    if FlashAttentionKwargs != t._TypedDictMeta:
+        class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
+except:
+    # New transformers changed KwargsForCausalLM to TransformersKwargs
+    KwargsForCausalLM = TransformersKwargs
+    if KwargsForCausalLM == t._TypedDictMeta:
+        logger.error(
+            "Unsloth: KwargsForCausalLM cannot be inherited from "\
+            f"TransformersKwargs since it's of type = {type(TransformersKwargs)}"
+        )
 pass
 
 # Get Cache
@@ -149,21 +230,24 @@ TYPE_MAPPINGS = {
     tuple                : t.Tuple,
     frozenset            : t.FrozenSet,
     Unpack               : t.Unpack,
-    TransformersKwargs   : t._TypedDictMeta,
-    FlashAttentionKwargs : t._TypedDictMeta,
     KWARGS_TYPING        : t.Unpack[t._TypedDictMeta],
     Cache                : t.Any,
     DynamicCache         : t.Any,
     HybridCache          : t.Any,
     StaticCache          : t.Any,
-    # TextInput          : t.Any, # Already is str
-    # PreTokenizedInput  : t.Any, # Already is List[str]
     ImageInput           : t.Any,
     ImagesKwargs         : t.Any,
     MultiModalData       : t.Any,
     ProcessingKwargs     : t.Any,
     ProcessorMixin       : t.Any,
 }
+if TextInput         != str:       TYPE_MAPPINGS[TextInput]         = t.Any
+if PreTokenizedInput != List[str]: TYPE_MAPPINGS[PreTokenizedInput] = t.Any
+
+if TransformersKwargs   != t._TypedDictMeta: TYPE_MAPPINGS[TransformersKwargs]   = t._TypedDictMeta
+if FlashAttentionKwargs != t._TypedDictMeta: TYPE_MAPPINGS[FlashAttentionKwargs] = t._TypedDictMeta
+if LossKwargs           != t._TypedDictMeta: TYPE_MAPPINGS[LossKwargs]           = t._TypedDictMeta
+
 def canonicalize_annotation(annotation: Any) -> Any:
     """
     Canonicalize type annotations for consistent comparison.
@@ -293,6 +377,8 @@ def patch_function(
     force: bool = False,
     store_original: bool = True, 
     match_level: str = "strict",
+    fullgraph = None,
+    dynamic = True,
 ) -> bool:
     """
     Patch a function/method on an object.
@@ -304,12 +390,27 @@ def patch_function(
 
     original_func = getattr(target_obj, attr_name)
 
+    # torch.compile function if requested
+    if fullgraph is not None and type(fullgraph) is bool:
+        # Get wrapped function if already compiled
+        if hasattr(new_func, "get_compiler_config"):
+            new_func = new_func.__wrapped__
+        if hasattr(original_func, "get_compiler_config"):
+            original_func = original_func.__wrapped__
+        new_func = torch.compile(
+            new_func,
+            fullgraph = fullgraph,
+            dynamic = dynamic,
+            options = torch_compile_options,
+        )
+    pass
+
     # Store original for potential restoration with unique name
     if store_original:
         unique_name = _get_unique_storage_name(target_obj, attr_name)
         setattr(target_obj, unique_name, original_func)
-        if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Stored original as {unique_name}")
+        # if UNSLOTH_ENABLE_LOGGING:
+        #     logger.info(f"Unsloth: Stored original as {unique_name}")
     pass
 
     if not force:
@@ -321,6 +422,8 @@ def patch_function(
     pass
     try:
         setattr(target_obj, attr_name, new_func)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: Patched {attr_name}.")
         return True
     except Exception as e:
         if UNSLOTH_ENABLE_LOGGING:
@@ -335,6 +438,8 @@ def patch_multiple(
     force: bool = False, 
     fail_fast: bool = True,
     match_level: str = "strict",
+    fullgraph = None,
+    dynamic = True,
 ) -> Dict[str, bool]:
     """
     Apply multiple patches at once.
@@ -343,7 +448,15 @@ def patch_multiple(
 
     for target_obj, attr_name, new_func in patches:
         key = f"{getattr(target_obj, '__name__', str(target_obj))}.{attr_name}"
-        success = patch_function(target_obj, attr_name, new_func, force=force, match_level=match_level)
+        success = patch_function(
+            target_obj,
+            attr_name,
+            new_func,
+            force = force,
+            match_level = match_level,
+            fullgraph = fullgraph,
+            dynamic = dynamic,
+        )
         results[key] = success
 
         if fail_fast and not success:

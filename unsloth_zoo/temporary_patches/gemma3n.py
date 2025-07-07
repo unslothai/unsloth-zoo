@@ -14,25 +14,23 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import re
-from typing import Union, List, Optional, Tuple
-import inspect
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import torch
 import torch.nn as nn
-import os
-import logging
-
-from .common import TEMPORARY_PATCHES, torch_compile_options, UNSLOTH_ENABLE_LOGGING
-
-logger = logging.getLogger(__name__)
-
+from .common import TEMPORARY_PATCHES, torch_compile_options
+from .utils import (
+    patch_function,
+    KWARGS_TYPE,
+    raise_error,
+)
 
 def patch_Gemma3nConvNormAct_forward():
     try:
         import timm.layers.conv_bn_act
         timm.layers.conv_bn_act.ConvNormAct
-    except:
-        return
+    except Exception as e:
+        return raise_error("timm.layers.conv_bn_act.ConvNormAct", e)
+
     # Counteract high weights in Conv layers for Gemma 3N by forcing to float32
     def forward(self, x):
         old_dtype = x.dtype
@@ -45,96 +43,24 @@ def patch_Gemma3nConvNormAct_forward():
             x = self.aa(x)
         return x.to(old_dtype)
     pass
-    old_keys = inspect.signature(timm.layers.conv_bn_act.ConvNormAct.forward).parameters
-    new_keys = inspect.signature(forward).parameters
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch Gemma3nConvNormAct.forward.")
-    else:
-        forward = torch.compile(forward, fullgraph = False, dynamic = True, options = torch_compile_options)
-        timm.layers.conv_bn_act.ConvNormAct.forward = forward
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Patched Gemma3nConvNormAct.forward.")
-    return
+    patch_function(timm.layers.conv_bn_act.ConvNormAct, "forward", forward, fullgraph = True)
 pass
+# We only execute this for float16 so it's not always executed
 # TEMPORARY_PATCHES.append(patch_Gemma3nConvNormAct_forward)
 
 
 def patch_Gemma3nTextAltUp_functions():
     try:
         import transformers.models.gemma3n.modeling_gemma3n
-        transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp
-    except:
-        return
+        from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
+    except Exception as e:
+        return raise_error("Gemma3nTextAltUp", e)
 
-    if hasattr(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "predict"):
-        predict = transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.predict
-        if not hasattr(predict, "get_compiler_config"):
-            transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.predict = \
-                torch.compile(predict, fullgraph = False, dynamic = True, options = torch_compile_options)
-            if UNSLOTH_ENABLE_LOGGING:
-                print("Unsloth: Patched Gemma3nTextAltUp.predict")
-    pass
-    if hasattr(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "correct"):
-        correct = transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.correct
-        if not hasattr(correct, "get_compiler_config"):
-            transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.correct = \
-                torch.compile(correct, fullgraph = False, dynamic = True, options = torch_compile_options)
-            if UNSLOTH_ENABLE_LOGGING:
-                print("Unsloth: Patched Gemma3nTextAltUp.correct")
-    pass
-    if hasattr(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "scale_corrected_output"):
-        scale_corrected_output = transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.scale_corrected_output
-        if not hasattr(scale_corrected_output, "get_compiler_config"):
-            transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp.scale_corrected_output = \
-                torch.compile(scale_corrected_output, fullgraph = False, dynamic = True, options = torch_compile_options)
-            if UNSLOTH_ENABLE_LOGGING:
-                print("Unsloth: Patched Gemma3nTextAltUp.scale_corrected_output")
-    pass
-    return
+    if hasattr(Gemma3nTextAltUp, "predict"):
+        patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "predict", Gemma3nTextAltUp.predict, fullgraph = True)
+    if hasattr(Gemma3nTextAltUp, "correct"):
+        patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "correct", Gemma3nTextAltUp.correct, fullgraph = True)
+    if hasattr(Gemma3nTextAltUp, "scale_corrected_output"):
+        patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "scale_corrected_output", Gemma3nTextAltUp.scale_corrected_output, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3nTextAltUp_functions)
-
-def patch_Gemma3nModel_get_image_features():
-    try:
-        import transformers.models.gemma3n.modeling_gemma3n
-        transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel.get_image_features
-    except:
-        return
-    def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """
-        Projects the last hidden state from the vision model into language model space.
-
-        Args:
-            pixel_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
-               The tensors corresponding to the input images.
-
-        Returns:
-            image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
-        """
-        vision_outputs = self.vision_tower(
-            pixel_values=pixel_values, do_pooling=False, return_dict=True
-        ).last_hidden_state
-        # Convert from (batch, channels, height, width) to (batch, height * width, channels) where:
-        # height == width and height * width == Gemma3nConfig.vision_soft_tokens_per_image.
-        vision_outputs = vision_outputs.reshape(
-            vision_outputs.shape[0],
-            self.config.vision_config.hidden_size,
-            self.config.vision_soft_tokens_per_image,
-        ).permute(0, 2, 1)
-        # Normalize and embed the soft tokens into language model space.
-        # vision_outputs *= self.config.vision_config.hidden_size**0.5
-        return self.embed_vision(inputs_embeds=vision_outputs)
-    pass
-    old_keys = inspect.signature(transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel.get_image_features).parameters
-    new_keys = inspect.signature(get_image_features).parameters
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch Gemma3nModel.get_image_features.")
-    else:
-        transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel.get_image_features = get_image_features
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Patched Gemma3nModel.get_image_features.")
-    return
-pass
-TEMPORARY_PATCHES.append(patch_Gemma3nModel_get_image_features)

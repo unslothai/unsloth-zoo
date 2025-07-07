@@ -21,7 +21,7 @@ __all__ = [
     "create_new_function",
 ]
 
-from typing import List, Dict, Tuple, Optional, Any, Callable
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import inspect
 import re
 import importlib

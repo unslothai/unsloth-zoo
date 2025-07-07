@@ -14,18 +14,14 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import re
-from typing import Union, List, Optional, Tuple
-import inspect
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import torch
 import torch.nn as nn
 import os
-import logging
-from .common import (
-    TEMPORARY_PATCHES,
-    torch_compile_options,
-)
+from .common import TEMPORARY_PATCHES, torch_compile_options
 from .utils import (
+    patch_function,
+    process_output_options,
     KWARGS_TYPE,
     raise_error,
     ImageInput,
@@ -38,6 +34,7 @@ from .utils import (
 
 
 def patch_Gemma3Processor():
+    import re
     try:
         import transformers.models.gemma3.processing_gemma3
         from transformers.image_utils import make_nested_list_of_images
@@ -255,8 +252,7 @@ def patch_Gemma3TextScaledWordEmbedding():
         )
         return input_embeds.to(torch.float32) * self.embed_scale
     pass
-    forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
@@ -286,8 +282,7 @@ def patch_Gemma3RMSNorm():
 
         return clamped_output_fp32.to(torch.float16) # Output fp16
     pass
-    forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
@@ -315,8 +310,7 @@ def patch_Gemma3MLP():
         down_proj_out = self.down_proj(intermediate_fp16)
         return down_proj_out
     pass
-    forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 

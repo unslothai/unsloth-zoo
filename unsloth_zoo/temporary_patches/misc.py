@@ -17,25 +17,30 @@
 import torch
 import torch.nn as nn
 import inspect
-from typing import List, Optional, Tuple, Union
-from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
-from .utils import patch_function
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+from .common import TEMPORARY_PATCHES, torch_compile_options
+from .utils import (
+    patch_function,
+    process_output_options,
+    process_return,
+    KWARGS_TYPE,
+    raise_error,
+    ImageInput,
+    PreTokenizedInput,
+    TextInput,
+    Cache,
+    StaticCache,
+    HybridCache,
+)
 
 
 def patch_CsmDepthDecoderForCausalLM_forward():
     try:
         import transformers.models.csm.modeling_csm
         from transformers.modeling_outputs import CausalLMOutputWithPast
-        from transformers.models.csm.modeling_csm import (
-            Cache,
-            Unpack,
-            KwargsForCausalLM,
-        )
         from transformers.loss.loss_utils import ForCausalLMLoss
     except Exception as e:
-        if UNSLOTH_ENABLE_LOGGING:
-            print(f"Unsloth: Failed to patch CsmDepthDecoderForCausalLM forward during import: {str(e)}")
-        return
+        return raise_error("CsmDepthDecoderForCausalLM.forward", e)
 
     def forward(
         self,
@@ -51,26 +56,23 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[KwargsForCausalLM],
+        **kwargs: KWARGS_TYPE,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        kwargs = process_output_options(locals(), kwargs)
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
-            input_ids=input_ids,
-            backbone_last_hidden_state=backbone_last_hidden_state,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            cache_position=cache_position,
+            input_ids = input_ids,
+            backbone_last_hidden_state = backbone_last_hidden_state,
+            attention_mask = attention_mask,
+            position_ids = position_ids,
+            past_key_values = past_key_values,
+            inputs_embeds = inputs_embeds,
+            use_cache = use_cache,
+            # Moved outputs to kwargs since transformers 4.54.0 deletes them
+            # output_attentions = output_attentions,
+            # output_hidden_states = output_hidden_states,
+            cache_position = cache_position,
             **kwargs,
         )
 
@@ -97,16 +99,36 @@ def patch_CsmDepthDecoderForCausalLM_forward():
                 logits=logits, labels=None, vocab_size=self.config.vocab_size, shift_labels=shift_labels, **kwargs
             )
 
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        return process_return(CausalLMOutputWithPast, {
+            "loss" : loss,
+            "logits" : logits,
+            "past_key_values" : outputs.past_key_values,
+            "hidden_states" : outputs.hidden_states,
+            "attentions" : outputs.attentions,
+        })
     pass
+    success = patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward)
+    if success: return
 
-
+    # New transformers removes output_attentions and output_hidden_states
+    old_forward = forward
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        backbone_last_hidden_state: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        # output_attentions: Optional[bool] = None,
+        # output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: KWARGS_TYPE,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        return old_forward(**locals())
     patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
@@ -115,12 +137,10 @@ TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
 def patch_CsmForConditionalGeneration_forward():
     try:
         import transformers.models.csm.modeling_csm
-        from transformers.models.csm.modeling_csm import Cache, Unpack, KwargsForCausalLM, CsmOutputWithPast
+        from transformers.models.csm.modeling_csm import CsmOutputWithPast
         from transformers.loss.loss_utils import ForCausalLMLoss
     except Exception as e:
-        if UNSLOTH_ENABLE_LOGGING:
-            print(f"Unsloth: Failed to patch CsmForConditionalGeneration forward during import: {str(e)}")
-        return
+        return raise_error("CsmForConditionalGeneration.forward", e)
 
     def forward(
         self,
@@ -137,13 +157,9 @@ def patch_CsmForConditionalGeneration_forward():
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[KwargsForCausalLM],
+        **kwargs: KWARGS_TYPE,
     ) -> Union[Tuple, CsmOutputWithPast]:
-
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        kwargs = process_output_options(locals(), kwargs)
 
         if input_ids is not None and input_ids.ndim == 2:
             merged_inputs = self._merge_input_ids_with_input_values(
@@ -154,15 +170,16 @@ def patch_CsmForConditionalGeneration_forward():
             input_ids = None
 
         backbone_outputs = self.backbone_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            cache_position=cache_position,
+            input_ids = input_ids,
+            attention_mask = attention_mask,
+            position_ids = position_ids,
+            past_key_values = past_key_values,
+            inputs_embeds = inputs_embeds,
+            use_cache = use_cache,
+            # Moved outputs to kwargs since transformers 4.54.0 deletes them
+            # output_attentions = output_attentions,
+            # output_hidden_states = output_hidden_states,
+            cache_position = cache_position,
             **kwargs,
         )
 
@@ -203,15 +220,18 @@ def patch_CsmForConditionalGeneration_forward():
 
             # make sure return_dict is set to True
             depth_decoder_kwargs.pop('return_dict', None)
+            # Move output_attentions and output_hidden_states since transformers 4.54 deletes them
+            depth_decoder_kwargs["output_attentions"   ] = output_attentions
+            depth_decoder_kwargs["output_hidden_states"] = output_hidden_states
 
             depth_decoder_outputs = self.depth_decoder(
-                input_ids=depth_decoder_input_ids,
-                backbone_last_hidden_state=backbone_last_hidden_states,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=True,
-                labels=depth_decoder_labels,
+                input_ids = depth_decoder_input_ids,
+                backbone_last_hidden_state = backbone_last_hidden_states,
+                use_cache = use_cache,
+                # output_attentions=output_attentions,
+                # output_hidden_states=output_hidden_states,
+                return_dict = True,
+                labels = depth_decoder_labels,
                 # Fix: explicitly pass kwargs to depth decoder to get access to num_items_in_batch
                 **depth_decoder_kwargs,
             )
@@ -219,37 +239,57 @@ def patch_CsmForConditionalGeneration_forward():
             depth_decoder_loss = depth_decoder_outputs.loss
             loss = backbone_loss + depth_decoder_loss
 
-        return CsmOutputWithPast(
-            loss=loss,
-            backbone_loss=backbone_loss,
-            depth_decoder_loss=depth_decoder_loss,
-            logits=backbone_logits,
-            past_key_values=backbone_outputs.past_key_values,
-            hidden_states=backbone_outputs.hidden_states,
-            attentions=backbone_outputs.attentions,
-            depth_decoder_logits=depth_decoder_outputs.logits if depth_decoder_outputs is not None else None,
-            depth_decoder_past_key_values=depth_decoder_outputs.past_key_values
+        return process_return(CsmOutputWithPast, {
+            "loss" : loss,
+            "backbone_loss" : backbone_loss,
+            "depth_decoder_loss" : depth_decoder_loss,
+            "logits" : backbone_logits,
+            "past_key_values" : backbone_outputs.past_key_values,
+            "hidden_states" : backbone_outputs.hidden_states,
+            "attentions" : backbone_outputs.attentions,
+            "depth_decoder_logits" : depth_decoder_outputs.logits if depth_decoder_outputs is not None else None,
+            "depth_decoder_past_key_values" : depth_decoder_outputs.past_key_values
             if depth_decoder_outputs is not None
             else None,
-            depth_decoder_hidden_states=depth_decoder_outputs.hidden_states
+            "depth_decoder_hidden_states" : depth_decoder_outputs.hidden_states
             if depth_decoder_outputs is not None
             else None,
-            depth_decoder_attentions=depth_decoder_outputs.attentions if depth_decoder_outputs is not None else None,
-        )
+            "depth_decoder_attentions" : depth_decoder_outputs.attentions if depth_decoder_outputs is not None else None,
+        })
     pass
+    success = patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward)
+    if success: return
 
+    # New transformers removes output_attentions and output_hidden_states
+    old_forward = forward
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        input_values: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        input_values_cutoffs: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        # output_attentions: Optional[bool] = None,
+        # output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: KWARGS_TYPE,
+    ) -> Union[Tuple, CsmOutputWithPast]:
+        return old_forward(**locals())
     patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
 
 
 def patch_CsmForConditionalGeneration_merge():
-
     try:
         import transformers.models.csm.modeling_csm
-    except:
-        return
-
+    except Exception as e:
+        return raise_error("CsmForConditionalGeneration._merge_input_ids_with_input_values", e)
 
     def _merge_input_ids_with_input_values(
         self,
@@ -335,13 +375,13 @@ def patch_CsmForConditionalGeneration_merge():
         return {"inputs_embeds": inputs_embeds, "labels": labels}
     pass
     patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "_merge_input_ids_with_input_values", _merge_input_ids_with_input_values)
-
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_merge)
 
 
 def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     try:
+        import transformers.models.granitemoehybrid.modeling_granitemoehybrid
         from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
             GraniteMoeHybridMambaLayer,
             HybridMambaAttentionDynamicCache,
@@ -525,16 +565,6 @@ def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
                 out = self.out_proj(scan_output)
         return out
     pass
-
-    old_keys = inspect.signature(
-        GraniteMoeHybridMambaLayer.cuda_kernels_forward
-    ).parameters
-    new_keys = inspect.signature(cuda_kernels_forward).parameters
-
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch GraniteMoeHybridMambaLayer cuda_kernels_forward.")
-    else:
-        GraniteMoeHybridMambaLayer.cuda_kernels_forward = cuda_kernels_forward
+    patch_function(transformers.models.granitemoehybrid.modeling_granitemoehybrid.GraniteMoeHybridMambaLayer, "cuda_kernels_forward", cuda_kernels_forward)
 pass
 TEMPORARY_PATCHES.append(patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward)
