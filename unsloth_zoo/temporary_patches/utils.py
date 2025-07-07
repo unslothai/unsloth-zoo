@@ -46,6 +46,8 @@ import logging
 from packaging.version import Version
 from .common import UNSLOTH_ENABLE_LOGGING, torch_compile_options
 logger = logging.getLogger(__name__)
+if UNSLOTH_ENABLE_LOGGING:
+    logger.setLevel(logging.DEBUG)
 EMPTY = inspect._empty
 
 def raise_error(f: str, exception: Any):
@@ -313,6 +315,18 @@ def get_function_fingerprint(func: Callable) -> List[Dict[str, Any]]:
 pass
 
 
+def removed_flags(
+    old_fp : List[Dict],
+    new_fp : List[Dict],
+) -> List[str]:
+    old_params = set(x["name"] for x in old_fp)
+    new_params = set(x["name"] for x in new_fp)
+    removed_params = list(old_params - new_params)
+    removed_params.sort()
+    return tuple(removed_params)
+pass
+
+
 def can_safely_patch(
     original_func: Callable,
     new_func: Callable, 
@@ -331,8 +345,10 @@ def can_safely_patch(
         return False, f"Signature inspection failed: {e}"
 
     if len(old_fp) != len(new_fp):
-        print(old_fp)
-        print(new_fp)
+        # New transformers 4.54.0 removed output_attentions and output_hidden_states
+        # We check it and ignore if the old function has both these, and the new removed them
+        if removed_flags(old_fp, new_fp) == ("output_attentions", "output_hidden_states",):
+            return False, f"New function removed output_attentions and output_hidden_states"
         return False, f"Parameter count mismatch: {len(old_fp)} vs {len(new_fp)}"
 
     for old_param, new_param in zip(old_fp, new_fp):
