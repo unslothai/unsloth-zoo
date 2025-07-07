@@ -350,11 +350,10 @@ def create_new_function(
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source: items += ["SiglipEncoder"]
     # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
-    
-    if "create_causal_mask" in new_source: items += ["create_causal_mask"]
-    if "create_masks_for_generate" in new_source: items += ["create_masks_for_generate"]
-    if "create_sliding_window_causal_mask" in new_source: items += ["create_sliding_window_causal_mask"]
-
+    mask_functions = get_mask_functions()
+    for mask_function in mask_functions:
+        if mask_function in new_source: items += [mask_function]
+    pass
     # Full import script
     imports = "from torch import Tensor\n"
     imports += "import torch\n"
@@ -2180,6 +2179,7 @@ def unsloth_compile_transformers(
 
     # All other functions
     if compile_function_calls:
+        mask_functions = get_mask_functions()
         # Fix up function signatures
         for module in called_functions:
             function = eval(f"{model_location}.{module}")
@@ -2237,7 +2237,16 @@ def unsloth_compile_transformers(
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(f"Unsloth: Cannot compile function {module} since disabled keyword is in it.")
-            all_standalone_classes[module] = source
+            # Skip mask creation functions
+            bad = False
+            for mask_function in mask_functions:
+                if mask_function == module:
+                    bad = True
+                    print(f"Unsloth: Will skip copying source of {module}.")
+                    break
+            pass
+            if not bad:
+                all_standalone_classes[module] = source
         pass
     pass
 
