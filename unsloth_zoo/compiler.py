@@ -1626,7 +1626,7 @@ def unsloth_compile_transformers(
 
     # Use transformers model_type logger to suppress message: Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
     exec("model_logger.addFilter(HideLoggingMessage('use_cache'))", globals(), locals())
-    # Use transformers model_type logger to suppress message: RYou have set `compile_config`, but we are unable to meet the criteria for compilation.
+    # Use transformers model_type logger to suppress message: You have set `compile_config`, but we are unable to meet the criteria for compilation.
     exec("model_logger.addFilter(HideLoggingMessage('compile_config'))", globals(), locals())
 
     # Instead of Inductor Compilation:
