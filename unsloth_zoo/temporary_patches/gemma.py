@@ -37,6 +37,7 @@ def patch_Gemma3Processor():
     import re
     try:
         import transformers.models.gemma3.processing_gemma3
+        from transformers.models.gemma3.processing_gemma3 import Gemma3ProcessorKwargs
         from transformers.image_utils import make_nested_list_of_images
         from transformers.feature_extraction_utils import BatchFeature
         from transformers.utils import to_py_obj
@@ -49,7 +50,7 @@ def patch_Gemma3Processor():
         text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
         videos = None,
         audio = None,
-        **kwargs: KWARGS_TYPE,
+        **kwargs: Gemma3ProcessorKwargs,
     ) -> BatchFeature:
         if text is None and images is None:
             raise ValueError("Provide at least one of `text` or `images`.")
