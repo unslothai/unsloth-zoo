@@ -330,7 +330,7 @@ def grpo_accumulated_loss(
     completion_input_ids = input_ids[:, -logits_to_keep:]
     lm_head = trainer.model.get_output_embeddings().weight
 
-    with torch.amp.autocast(device_type = DEVICE_TYPE, dtype = trainer._autocast_dtype):
+    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
             ref_hidden_states = trainer.model(
                 input_ids = input_ids,
