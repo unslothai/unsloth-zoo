@@ -1186,7 +1186,7 @@ def load_vllm(
             print("Unsloth: Your GPU does not support prefix caching - will disable!")
             enable_prefix_caching = False
     elif DEVICE_TYPE == "xpu":
-        enable_prefix_caching = False
+        enable_prefix_caching = True
 
     pass
 
@@ -1268,11 +1268,7 @@ def load_vllm(
     )
 
     # Get device as well
-<<<<<<< HEAD
     device = get_target_device()
-=======
-    device = "cuda:0" if DEVICE_TYPE == "cuda" else "xpu:0"
->>>>>>> main
 
     if compilation_config == 3:
         try:
