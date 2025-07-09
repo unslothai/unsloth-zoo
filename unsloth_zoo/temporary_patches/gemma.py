@@ -228,7 +228,7 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
             causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
                 padding_mask, min_dtype
             )
-        print(1)
+
         return causal_mask
     pass
     if hasattr(transformers.models.gemma3.modeling_gemma3, "Gemma3Model"):
@@ -253,10 +253,9 @@ def patch_Gemma3TextScaledWordEmbedding():
             weight = self.weight,
             padding_idx = self.padding_idx,
         )
-        print(2)
         return input_embeds.to(torch.float32) * self.embed_scale
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = None)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
@@ -283,10 +282,10 @@ def patch_Gemma3RMSNorm():
         fp16_max = torch.finfo(torch.float16).max
         fp16_min = torch.finfo(torch.float16).min
         clamped_output_fp32 = torch.clamp(output_fp32, min=fp16_min, max=fp16_max)
-        print(3)
+
         return clamped_output_fp32.to(torch.float16) # Output fp16
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = None)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
@@ -312,10 +311,9 @@ def patch_Gemma3MLP():
         # Downcast and down_proj
         intermediate_fp16 = intermediate_fp32.to(torch.float16)
         down_proj_out = self.down_proj(intermediate_fp16)
-        print(4)
         return down_proj_out
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = None)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
@@ -493,7 +491,7 @@ def patch_Gemma3Attention():
 
         # 8. Output Projection (o_proj) in fp16
         attn_output_projected = self.o_proj(attn_output_fp16) # fp16 output
-        print(5)
+
         return attn_output_projected, attn_weights # 3-tuple return
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
