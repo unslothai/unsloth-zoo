@@ -154,7 +154,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
 
 def patch_Gemma3ForConditionalGeneration_causal_mask():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    # if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3Model
@@ -240,7 +240,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
 
 
 def patch_Gemma3TextScaledWordEmbedding():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    # if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding
@@ -261,7 +261,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
 
 def patch_Gemma3RMSNorm():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    # if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm
@@ -291,7 +291,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
 
 def patch_Gemma3MLP():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    # if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3MLP
@@ -319,7 +319,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
 
 def patch_Gemma3Attention():
-    # if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3Attention
@@ -496,4 +496,4 @@ def patch_Gemma3Attention():
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3Attention)
+# TEMPORARY_PATCHES.append(patch_Gemma3Attention)
