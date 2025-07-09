@@ -20,10 +20,7 @@ import os
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
 from . import DEVICE_TYPE
-
-if DEVICE_TYPE == "cuda":
-    major, minor = torch.cuda.get_device_capability()
-
+from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 import inspect
 
 global HAS_CUT_CROSS_ENTROPY
@@ -41,6 +38,7 @@ if UNSLOTH_STUDIO_ENABLED:
 pass
 
 if DEVICE_TYPE == "cuda":
+    major, minor = torch.cuda.get_device_capability()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
         (not (Version(triton_version) < Version("3.0.0"))):
@@ -66,14 +64,6 @@ __all__ = [
     "fast_linear_cross_entropy",
     "_unsloth_get_batch_samples",
 ]
-
-torch_compile_options = {
-    "epilogue_fusion"   : True,
-    "max_autotune"      : False,
-    "shape_padding"     : True,
-    "trace.enabled"     : os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1",
-    "triton.cudagraphs" : False,
-}
 
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -317,6 +307,8 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         except Exception as exception:
             raise RuntimeError(exception)
     pass
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
     return batch_samples, num_items_in_batch
 pass
 
