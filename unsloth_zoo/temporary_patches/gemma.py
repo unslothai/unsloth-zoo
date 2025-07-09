@@ -256,7 +256,7 @@ def patch_Gemma3TextScaledWordEmbedding():
         print(2)
         return input_embeds.to(torch.float32) * self.embed_scale
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = None)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
@@ -286,7 +286,7 @@ def patch_Gemma3RMSNorm():
         print(3)
         return clamped_output_fp32.to(torch.float16) # Output fp16
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = None)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
@@ -315,7 +315,7 @@ def patch_Gemma3MLP():
         print(4)
         return down_proj_out
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = None)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
