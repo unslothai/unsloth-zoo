@@ -42,12 +42,9 @@ try:
 except:
     raise RuntimeError("Unsloth: typing._TypedDictMeta does not exist! File a bug report immediately thank you!")
 
-import logging
 from packaging.version import Version
-from .common import UNSLOTH_ENABLE_LOGGING, torch_compile_options
-logger = logging.getLogger(__name__)
-if UNSLOTH_ENABLE_LOGGING:
-    logger.setLevel(logging.DEBUG)
+from .common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+
 EMPTY = inspect._empty
 
 def raise_error(f: str, exception: Any):

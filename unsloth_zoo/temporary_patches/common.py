@@ -19,10 +19,15 @@ __all__ = [
     "torch_compile_options",
     "UNSLOTH_ENABLE_LOGGING",
     "get_torch_compile_options",
+    "logger",
 ]
 
 import os
+import logging
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+logger = logging.getLogger(__name__)
+if UNSLOTH_ENABLE_LOGGING:
+    logger.setLevel(logging.DEBUG)
 
 def get_torch_compile_options(
     epilogue_fusion = True,
