@@ -14,40 +14,43 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import re
-from typing import Union, List, Optional, Tuple
-import inspect
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import torch
 import torch.nn as nn
 import os
-import logging
-
-from .common import TEMPORARY_PATCHES, torch_compile_options, UNSLOTH_ENABLE_LOGGING
-
-logger = logging.getLogger(__name__)
+from .common import TEMPORARY_PATCHES, torch_compile_options
+from .utils import (
+    patch_function,
+    process_output_options,
+    KWARGS_TYPE,
+    raise_error,
+    ImageInput,
+    PreTokenizedInput,
+    TextInput,
+    Cache,
+    StaticCache,
+    HybridCache,
+    Unpack,
+)
 
 
 def patch_Gemma3Processor():
+    import re
     try:
         import transformers.models.gemma3.processing_gemma3
-    except:
-        return
-    from transformers.models.gemma3.processing_gemma3 import (
-        ImageInput,
-        PreTokenizedInput,
-        Unpack,
-        Gemma3ProcessorKwargs,
-        make_nested_list_of_images,
-        TextInput,
-        BatchFeature,
-        to_py_obj,
-    )
+        from transformers.models.gemma3.processing_gemma3 import Gemma3ProcessorKwargs
+        from transformers.image_utils import make_nested_list_of_images
+        from transformers.feature_extraction_utils import BatchFeature
+        from transformers.utils import to_py_obj
+    except Exception as e:
+        return raise_error("Gemma3Processor.__call__", e)
+
     def __call__(
         self,
         images: ImageInput = None,
         text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
-        videos=None,
-        audio=None,
+        videos = None,
+        audio = None,
         **kwargs: Unpack[Gemma3ProcessorKwargs],
     ) -> BatchFeature:
         if text is None and images is None:
@@ -124,46 +127,41 @@ def patch_Gemma3Processor():
 
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
         # text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"], return_tensors="np")
-
-        # Fix double BOS tokens
-        bos = self.tokenizer.bos_token
-        n = len(bos)
-        text = [x[i + n:] if (i := x.find(bos)) != -1 else x for x in text]
+        return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", True)
 
         text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
+        # Fix double BOS tokens
+        double_bos_token_id = [self.tokenizer.bos_token_id]*2
+        input_ids = text_inputs["input_ids"]
+        text_inputs["input_ids"] = [x[1:] if x[:2] == double_bos_token_id else x for x in input_ids]
 
         # Add token type ids manually, as tokenizer can't do arbitrary position token types
         # [TODO] FAILS for batched tokens since text_inputs["input_ids"] is a list of lists, so np.array creates an object!
-        input_ids = text_inputs["input_ids"]
-        image_token_id = self.image_token_id
-        mm_token_type_ids = [[1 if y == image_token_id else 0 for y in x] for x in input_ids]
-        # array_ids = np.array(text_inputs["input_ids"])
-        # mm_token_type_ids = np.zeros_like(text_inputs["input_ids"])
-        # mm_token_type_ids[array_ids == self.image_token_id] = 1
-        # text_inputs = {k: v.tolist() for k, v in text_inputs.items()}  # in case user requested list inputs
-        text_inputs["token_type_ids"] = mm_token_type_ids#.tolist()
+        if return_mm_token_type_ids:
+            input_ids = text_inputs["input_ids"]
+            image_token_id = self.image_token_id
+            mm_token_type_ids = [[1 if y == image_token_id else 0 for y in x] for x in input_ids]
+            # array_ids = np.array(text_inputs["input_ids"])
+            # mm_token_type_ids = np.zeros_like(text_inputs["input_ids"])
+            # mm_token_type_ids[array_ids == self.image_token_id] = 1
+            # text_inputs = {k: v.tolist() for k, v in text_inputs.items()}  # in case user requested list inputs
+            text_inputs["token_type_ids"] = mm_token_type_ids#.tolist()
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
     pass
-    old_keys = inspect.signature(transformers.models.gemma3.processing_gemma3.Gemma3Processor.__call__).parameters.keys()
-    new_keys = inspect.signature(__call__).parameters.keys()
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch Gemma3Processor.")
-    else:
-        transformers.models.gemma3.processing_gemma3.Gemma3Processor.__call__ = __call__
-    return
+    patch_function(transformers.models.gemma3.processing_gemma3.Gemma3Processor, "__call__", __call__)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
 
 def patch_Gemma3ForConditionalGeneration_causal_mask():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try: import transformers.models.gemma3.modeling_gemma3
-    except: return
-    from transformers.models.gemma3.modeling_gemma3 import (
-        StaticCache,
-        HybridCache,
-    )
+    # if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3Model
+        transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration
+    except Exception as e:
+        return raise_error("Gemma3ForConditionalGeneration._update_causal_mask", e)
+
     def _update_causal_mask(
         self,
         attention_mask,
@@ -233,32 +231,22 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
 
         return causal_mask
     pass
-
     if hasattr(transformers.models.gemma3.modeling_gemma3, "Gemma3Model"):
-        old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3Model._update_causal_mask).parameters
-        new_keys = inspect.signature(_update_causal_mask).parameters
-        if old_keys != new_keys:
-            if UNSLOTH_ENABLE_LOGGING:
-                print("Unsloth: Failed to patch Gemma3Model.")
-        else:
-            transformers.models.gemma3.modeling_gemma3.Gemma3Model._update_causal_mask = _update_causal_mask
+        patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Model, "_update_causal_mask", _update_causal_mask)
     else:
-        old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration._update_causal_mask).parameters
-        new_keys = inspect.signature(_update_causal_mask).parameters
-        if old_keys != new_keys:
-            if UNSLOTH_ENABLE_LOGGING:
-                print("Unsloth: Failed to patch Gemma3ForConditionalGeneration._update_causal_mask.")
-        else:
-            transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration._update_causal_mask = _update_causal_mask
-    return
+        patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration, "_update_causal_mask", _update_causal_mask)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
 
 
 def patch_Gemma3TextScaledWordEmbedding():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try: import transformers.models.gemma3.modeling_gemma3
-    except: return
+    # if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding
+    except Exception as e:
+        return raise_error("Gemma3ForConditionalGeneration._update_causal_mask", e)
+
     def forward(self, input_ids: torch.Tensor):
         input_embeds = torch.nn.functional.embedding(
             input_ids,
@@ -267,25 +255,18 @@ def patch_Gemma3TextScaledWordEmbedding():
         )
         return input_embeds.to(torch.float32) * self.embed_scale
     pass
-    old_keys = inspect.signature(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding.forward).parameters
-    new_keys = inspect.signature(forward).parameters
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch Gemma3TextScaledWordEmbedding.")
-    else:
-        forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
-        transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding.forward = forward
-    return
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
 
 def patch_Gemma3RMSNorm():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try: import transformers.models.gemma3.modeling_gemma3
-    except: return
-
-    original_rmsnorm_forward = transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm.forward
+    # if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm
+    except Exception as e:
+        return raise_error("Gemma3RMSNorm.forward", e)
 
     def forward(self, x): # x can be fp32 (from embeddings) or fp16 (from MLP/Attn)
         # Internals in fp32
@@ -304,25 +285,18 @@ def patch_Gemma3RMSNorm():
 
         return clamped_output_fp32.to(torch.float16) # Output fp16
     pass
-    old_keys = inspect.signature(original_rmsnorm_forward).parameters
-    new_keys = inspect.signature(forward).parameters
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch Gemma3RMSNorm (adjusted). Signature mismatch.")
-    else:
-        forward = torch.compile(forward, fullgraph = True, dynamic = True, options = torch_compile_options)
-        transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm.forward = forward
-    return
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
 
 def patch_Gemma3MLP():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try: import transformers.models.gemma3.modeling_gemma3
-    except: return
-
-    original_mlp_forward = transformers.models.gemma3.modeling_gemma3.Gemma3MLP.forward
+    # if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3MLP
+    except Exception as e:
+        return raise_error("Gemma3MLP.forward", e)
 
     def forward(self, x): # x is fp16 from RMSNorm
         gate_proj_out = self.gate_proj(x)
@@ -339,34 +313,69 @@ def patch_Gemma3MLP():
         down_proj_out = self.down_proj(intermediate_fp16)
         return down_proj_out
     pass
-
-    old_keys = inspect.signature(original_mlp_forward).parameters
-    new_keys = inspect.signature(forward).parameters
-    if old_keys != new_keys:
-        if UNSLOTH_ENABLE_LOGGING: print("Unsloth: Failed to patch Gemma3MLP")
-    else:
-        forward = torch.compile(forward, fullgraph = False, dynamic = True, options = torch_compile_options)
-        transformers.models.gemma3.modeling_gemma3.Gemma3MLP.forward = forward
-
-    return
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
 
 def patch_Gemma3Attention():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-
+    # if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
         import transformers.models.gemma3.modeling_gemma3
-    except:
-        return
-    import typing
-    from transformers.models.gemma3.modeling_gemma3 import (
-        Cache, Unpack, FlashAttentionKwargs, apply_rotary_pos_emb,
-    )
-
+        transformers.models.gemma3.modeling_gemma3.Gemma3Attention
+        from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS, eager_attention_forward
+    except Exception as e:
+        return raise_error("Gemma3Attention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-    original_hf_attention_forward = transformers.models.gemma3.modeling_gemma3.Gemma3Attention.forward
+    scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
+
+    def prepare(
+        self,
+        hidden_states,
+        query_states_fp16,
+        key_states_fp16,
+        value_states_fp16,
+        query_hidden_shape,
+        kv_hidden_shape,
+        position_embeddings,
+        attention_mask,
+    ):
+        # 2. Upcast Q, K, V for norm and RoPE, and then transpose for attention
+        # (bsz, num_specific_heads, q_len, head_dim)
+        query_states_fp32 = query_states_fp16.view(query_hidden_shape).to(torch.float32).transpose(1, 2)
+        key_states_fp32   = key_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2)
+        value_states_fp32 = value_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2) # V for attention also fp32
+
+        # 3. Normalization (q_norm, k_norm are RMSNorms)
+        query_norm_out_fp16 = self.q_norm(query_states_fp32)
+        key_norm_out_fp16   = self.k_norm(key_states_fp32)
+
+        query_states_fp32 = query_norm_out_fp16.to(torch.float32)
+        key_states_fp32   = key_norm_out_fp16.to(torch.float32)
+
+        # 4. Rotary Positional Embeddings in fp32
+        if not (isinstance(position_embeddings, tuple) and len(position_embeddings) == 2):
+            raise ValueError("Position embeddings not provided as (cos, sin) tuple to Gemma3Attention")
+
+        cos, sin = position_embeddings
+        cos_fp32 = cos.to(torch.float32)
+        sin_fp32 = sin.to(torch.float32)
+        query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos = cos_fp32, sin = sin_fp32)
+
+        # 6. Core Attention mechanism (SDPA) in fp32
+        attn_mask_for_sdpa = attention_mask
+        if attn_mask_for_sdpa is not None:
+            attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
+        return (
+            query_states_fp32,
+            key_states_fp32,
+            value_states_fp32,
+            cos_fp32,
+            sin_fp32,
+            attn_mask_for_sdpa,
+        )
+    pass
+    prepare = torch.compile(prepare, fullgraph = True, dynamic = True, options = torch_compile_options)
 
     def forward(
         self,
@@ -375,8 +384,47 @@ def patch_Gemma3Attention():
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        # print(attention_interface)
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=self.attention_dropout if self.training else 0.0,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
 
         bsz, q_len, _ = hidden_states.shape
         input_shape = hidden_states.shape[:-1] # For reshaping o_proj output later
@@ -395,8 +443,8 @@ def patch_Gemma3Attention():
         # 1. Projections (q, k, v) in fp16
         # hidden_states is already fp16. Weights of q_proj, k_proj, v_proj are fp16.
         query_states_fp16 = self.q_proj(hidden_states) # output fp16
-        key_states_fp16 = self.k_proj(hidden_states)     # output fp16
-        value_states_fp16 = self.v_proj(hidden_states)   # output fp16
+        key_states_fp16   = self.k_proj(hidden_states) # output fp16
+        value_states_fp16 = self.v_proj(hidden_states) # output fp16
 
         # 2. Upcast Q, K, V for norm and RoPE, and then transpose for attention
         # (bsz, num_specific_heads, q_len, head_dim)
@@ -418,7 +466,26 @@ def patch_Gemma3Attention():
         cos, sin = position_embeddings
         cos_fp32 = cos.to(torch.float32)
         sin_fp32 = sin.to(torch.float32)
-        query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos_fp32, sin_fp32)
+        query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos = cos_fp32, sin = sin_fp32)
+
+        # (
+        #     query_states_fp32,
+        #     key_states_fp32,
+        #     value_states_fp32,
+        #     cos_fp32,
+        #     sin_fp32,
+        #     attn_mask_for_sdpa,
+        # ) = prepare(
+        #     self,
+        #     hidden_states,
+        #     query_states_fp16,
+        #     key_states_fp16,
+        #     value_states_fp16,
+        #     query_hidden_shape,
+        #     kv_hidden_shape,
+        #     position_embeddings,
+        #     attention_mask,
+        # )
 
         # 5. KV Cache update (using fp32 K, V)
         if past_key_value is not None:
@@ -434,21 +501,20 @@ def patch_Gemma3Attention():
 
         # 6. Core Attention mechanism (SDPA) in fp32
         attn_mask_for_sdpa = attention_mask
-        if attn_mask_for_sdpa is not None:
+        if attn_mask_for_sdpa is not None and attn_mask_for_sdpa.dtype != torch.bool:
             attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
 
-        output_attentions = kwargs.get("output_attentions", False)
-
+        # output_attentions = kwargs.get("output_attentions", False)
         attn_output_fp32 = scaled_dot_product_attention(
             query_states_fp32,
             key_states_fp32,
             value_states_fp32,
-            attn_mask=attn_mask_for_sdpa,
-            dropout_p=self.attention_dropout if self.training else 0.0,
+            attn_mask = attn_mask_for_sdpa,
+            dropout_p = self.attention_dropout if self.training else 0.0,
             # is_causal=False, # Mask handles causality. If mask is None and q_len > 1, this might be true.
                                # Gemma3's _update_causal_mask provides the explicit mask.
-            scale=getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
-            enable_gqa=getattr(self, "num_key_value_groups", 1) != 1,
+            scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
+            enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
         )
         attn_weights = None # Defaulting to None
 
@@ -467,18 +533,6 @@ def patch_Gemma3Attention():
 
         return attn_output_projected, attn_weights # 3-tuple return
     pass
-
-    old_keys_sig = inspect.signature(original_hf_attention_forward)
-    new_keys_sig = inspect.signature(forward)
-
-    if old_keys_sig.parameters != new_keys_sig.parameters or old_keys_sig.return_annotation != new_keys_sig.return_annotation:
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Failed to patch Gemma3Attention (adjusted for signature matching). Signature mismatch with original HF method.")
-    else:
-        forward = torch.compiler.disable(forward, recursive = False)
-        transformers.models.gemma3.modeling_gemma3.Gemma3Attention.forward = forward
-        if UNSLOTH_ENABLE_LOGGING:
-            print("Unsloth: Patched Gemma3Attention.forward (adjusted for signature matching, output fp16).")
-    return
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention)
