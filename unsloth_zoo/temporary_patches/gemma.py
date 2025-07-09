@@ -409,7 +409,7 @@ def patch_Gemma3Attention():
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        print(attention_interface)
+        # print(attention_interface)
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
