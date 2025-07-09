@@ -966,13 +966,13 @@ def approximate_vllm_memory_usage(
     max_loras = 1,
     float8_kv_cache = False,
     account_for_gradients = True,
+    load_in_4bit = False
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
-    load_in_4bit = "quantization_config" in config
+    load_in_4bit |= "quantization_config" in config
     free_memory, total_memory = torch.cuda.mem_get_info()
     free_memory = gpu_memory_utilization * free_memory
-
     vocab_size = config.vocab_size
     hd = config.hidden_size
     context_length = config.max_position_embeddings
@@ -1027,9 +1027,9 @@ def approximate_vllm_memory_usage(
     # 2 bytes = float16
     total_quantizable_elements = (qkvo + mlp)*n_layers * 2
     total_float16_elements     = (layernorms + embed_tokens + lm_head)*2
-    factor = 16/5 if load_in_4bit else 1 # Should be 4.5 but use 5
+    factor = 4.5/16 if load_in_4bit else 1 
     bytes_for_model = \
-        total_quantizable_elements / factor + total_float16_elements + lora_elements
+        total_quantizable_elements * factor + total_float16_elements + lora_elements
 
     # KV cache size (float16 is 2 bytes. float8 is 1.25 bytes)
     float_bytes = 1.25 if float8_kv_cache else 2
@@ -1090,6 +1090,7 @@ def load_vllm(
     if float8_kv_cache and major_version < 8:
         raise NotImplementedError("Unsloth: Your GPU is too old for float8 KV cache! Set it to False.")
 
+    use_bitsandbytes |= model_name.lower().endswith("-bnb-4bit")
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
     approximate_vllm_memory_usage(
@@ -1101,6 +1102,7 @@ def load_vllm(
         max_loras = max_loras,
         float8_kv_cache = float8_kv_cache,
         account_for_gradients = training,
+        load_in_4bit = use_bitsandbytes
     )
 
     # Check max_num_batched_tokens for max_seq_length
@@ -1132,8 +1134,6 @@ def load_vllm(
 
     free_memory, total_memory = torch.cuda.mem_get_info()
     total_memory_gb = round(total_memory / 1024 / 1024 / 1024, 2)
-    use_bitsandbytes = use_bitsandbytes or \
-        model_name.lower().endswith("-bnb-4bit")
 
     # Fix up vLLM compute_dtype for bitsandbytes
     BitsAndBytesConfig = patch_vllm_compute_dtype(dtype)
