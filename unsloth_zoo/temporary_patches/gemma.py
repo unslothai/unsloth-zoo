@@ -420,6 +420,7 @@ def patch_Gemma3Attention():
         #     sliding_window=self.sliding_window,
         #     **kwargs,
         # )
+        is_causal = is_causal = query_states.shape[2] > 1 and attention_mask is None and getattr(self, "is_causal", True)
         attn_output = scaled_dot_product_attention(
             query_states,
             key_states,
@@ -430,6 +431,7 @@ def patch_Gemma3Attention():
                                # Gemma3's _update_causal_mask provides the explicit mask.
             scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
             enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+            is_causal = is_causal,
         )
         attn_weights = None
 
