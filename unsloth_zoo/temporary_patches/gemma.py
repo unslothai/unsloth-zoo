@@ -236,7 +236,7 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
     else:
         patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration, "_update_causal_mask", _update_causal_mask)
 pass
-# TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
+TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
 
 
 def patch_Gemma3TextScaledWordEmbedding():
@@ -257,7 +257,7 @@ def patch_Gemma3TextScaledWordEmbedding():
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
 pass
-# TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
+TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
 
 def patch_Gemma3RMSNorm():
