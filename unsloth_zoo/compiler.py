@@ -124,7 +124,7 @@ pass
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import math
 
-UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
+UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 
 """
 
@@ -679,7 +679,7 @@ if n_items is None:
             n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
             break
 pass
-if UNSLOTH_COMPILE_DISABLE:
+if UNSLOTH_ENABLE_LOGGING:
     print("n_items = ", n_items)
 
 requires_grad_ = self.lm_head.weight.requires_grad
@@ -773,7 +773,7 @@ if n_items is None:
                 n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
                 break
 pass
-if UNSLOTH_COMPILE_DISABLE:
+if UNSLOTH_ENABLE_LOGGING:
     print("n_items = ", n_items)
 
 requires_grad_ = self.lm_head.weight.requires_grad
@@ -868,7 +868,7 @@ if n_items is None:
             n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
             break
 pass
-if UNSLOTH_COMPILE_DISABLE:
+if UNSLOTH_ENABLE_LOGGING:
     print("n_items = ", n_items)
 
 requires_grad_ = self.lm_head.weight.requires_grad
