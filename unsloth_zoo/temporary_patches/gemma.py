@@ -409,17 +409,29 @@ def patch_Gemma3Attention():
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, attn_weights = attention_interface(
-            self,
+        # attn_output, attn_weights = attention_interface(
+        #     self,
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attention_mask,
+        #     dropout=self.attention_dropout if self.training else 0.0,
+        #     scaling=self.scaling,
+        #     sliding_window=self.sliding_window,
+        #     **kwargs,
+        # )
+        attn_output = scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            attention_mask,
-            dropout=self.attention_dropout if self.training else 0.0,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **kwargs,
+            attn_mask = attention_mask,
+            dropout_p = self.attention_dropout if self.training else 0.0,
+            # is_causal=False, # Mask handles causality. If mask is None and q_len > 1, this might be true.
+                               # Gemma3's _update_causal_mask provides the explicit mask.
+            scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
+            enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
         )
+        attn_weights = None
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
