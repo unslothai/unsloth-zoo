@@ -287,7 +287,7 @@ def patch_Gemma3RMSNorm():
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
 pass
-# TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
+TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
 
 def patch_Gemma3MLP():
@@ -315,7 +315,7 @@ def patch_Gemma3MLP():
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
 pass
-# TEMPORARY_PATCHES.append(patch_Gemma3MLP)
+TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
 
 def patch_Gemma3Attention():
@@ -462,21 +462,22 @@ def patch_Gemma3Attention():
 
         # 6. Core Attention mechanism (SDPA) in fp32
         attn_mask_for_sdpa = attention_mask
+        print(attn_mask_for_sdpa)
         if attn_mask_for_sdpa is not None:
             attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
 
-        output_attentions = kwargs.get("output_attentions", False)
+        # output_attentions = kwargs.get("output_attentions", False)
 
         attn_output_fp32 = scaled_dot_product_attention(
             query_states_fp32,
             key_states_fp32,
             value_states_fp32,
-            attn_mask=attn_mask_for_sdpa,
-            dropout_p=self.attention_dropout if self.training else 0.0,
+            attn_mask = attn_mask_for_sdpa,
+            dropout_p = self.attention_dropout if self.training else 0.0,
             # is_causal=False, # Mask handles causality. If mask is None and q_len > 1, this might be true.
                                # Gemma3's _update_causal_mask provides the explicit mask.
-            scale=getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
-            enable_gqa=getattr(self, "num_key_value_groups", 1) != 1,
+            scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
+            enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
         )
         attn_weights = None # Defaulting to None
 
@@ -497,4 +498,4 @@ def patch_Gemma3Attention():
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
 pass
-# TEMPORARY_PATCHES.append(patch_Gemma3Attention)
+TEMPORARY_PATCHES.append(patch_Gemma3Attention)
