@@ -20,14 +20,7 @@ import os
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
 from . import DEVICE_TYPE
-from .temporary_patches.common import (
-    torch_compile_options,
-    UNSLOTH_ENABLE_LOGGING,
-)
-
-if DEVICE_TYPE == "cuda":
-    major, minor = torch.cuda.get_device_capability()
-
+from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 import inspect
 
 global HAS_CUT_CROSS_ENTROPY
@@ -45,6 +38,7 @@ if UNSLOTH_STUDIO_ENABLED:
 pass
 
 if DEVICE_TYPE == "cuda":
+    major, minor = torch.cuda.get_device_capability()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
         (not (Version(triton_version) < Version("3.0.0"))):
