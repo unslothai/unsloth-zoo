@@ -23,7 +23,7 @@ import inspect
 import os
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
-
+from unsloth import DEVICE_TYPE
 RL_REPLACEMENTS = dict()
 
 torch_compile_options = {
@@ -330,7 +330,7 @@ def grpo_accumulated_loss(
     completion_input_ids = input_ids[:, -logits_to_keep:]
     lm_head = trainer.model.get_output_embeddings().weight
 
-    with torch.amp.autocast(device_type = "cuda", dtype = trainer._autocast_dtype):
+    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
             ref_hidden_states = trainer.model(
                 input_ids = input_ids,
