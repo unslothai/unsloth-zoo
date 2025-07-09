@@ -414,7 +414,7 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
 
     save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})  # Save to the temporary safetensors file
 
-    # Replace the original file with the temporary file
+    # Replace the temporary file with the original file
     try:
         os.replace(temp_filename_safetensors, filename_original)  # Attempt atomic rename
     except OSError as e:
