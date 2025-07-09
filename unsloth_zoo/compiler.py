@@ -679,8 +679,6 @@ if n_items is None:
             n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
             break
 pass
-if UNSLOTH_ENABLE_LOGGING:
-    print("n_items = ", n_items)
 
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
@@ -773,8 +771,6 @@ if n_items is None:
                 n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
                 break
 pass
-if UNSLOTH_ENABLE_LOGGING:
-    print("n_items = ", n_items)
 
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
@@ -868,8 +864,6 @@ if n_items is None:
             n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
             break
 pass
-if UNSLOTH_ENABLE_LOGGING:
-    print("n_items = ", n_items)
 
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32

@@ -150,7 +150,7 @@ def patch_Gemma3Processor():
     pass
     patch_function(transformers.models.gemma3.processing_gemma3.Gemma3Processor, "__call__", __call__)
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3Processor)
+# TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
 
 def patch_Gemma3ForConditionalGeneration_causal_mask():
@@ -236,7 +236,7 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
     else:
         patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration, "_update_causal_mask", _update_causal_mask)
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
+# TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
 
 
 def patch_Gemma3TextScaledWordEmbedding():
@@ -257,7 +257,7 @@ def patch_Gemma3TextScaledWordEmbedding():
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
+# TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
 
 def patch_Gemma3RMSNorm():
@@ -287,7 +287,7 @@ def patch_Gemma3RMSNorm():
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
+# TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
 
 def patch_Gemma3MLP():
@@ -315,7 +315,7 @@ def patch_Gemma3MLP():
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3MLP)
+# TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
 
 def patch_Gemma3Attention():
@@ -497,4 +497,4 @@ def patch_Gemma3Attention():
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3Attention)
+# TEMPORARY_PATCHES.append(patch_Gemma3Attention)
