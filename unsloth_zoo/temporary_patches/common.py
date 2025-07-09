@@ -48,19 +48,19 @@ def get_torch_compile_options(
         "trace.enabled"             : UNSLOTH_COMPILE_DEBUG or debug,
         "triton.cudagraphs"         : cudagraphs,
         "debug"                     : UNSLOTH_COMPILE_DEBUG or debug,
-        "dce"                       : True,
-        "memory_planning"           : True,
+        "dce"                       : False,
+        "memory_planning"           : False,
         "coordinate_descent_tuning" : UNSLOTH_COMPILE_MAXIMUM,
         "trace.graph_diagram"       : UNSLOTH_COMPILE_DEBUG or debug,
         # "compile_threads"           : 24, # Auto detects via https://github.com/unslothai/unsloth-zoo/pull/187
         "combo_kernels"             : False, # Causes incompatible gradient sizes on 2.6
-        "group_fusion"              : True,
+        "group_fusion"              : False,
         "disable_progress"          : not UNSLOTH_ENABLE_LOGGING,
         "verbose_progress"          : UNSLOTH_ENABLE_LOGGING,
         "triton.multi_kernel"       : False, # Sometimes fails
         "triton.use_block_ptr"      : False,
-        "triton.enable_persistent_tma_matmul" : True,
-        "triton.autotune_at_compile_time"     : True,
+        "triton.enable_persistent_tma_matmul" : False,
+        "triton.autotune_at_compile_time"     : False,
     }
     return torch_compile_options
 pass
