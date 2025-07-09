@@ -462,12 +462,10 @@ def patch_Gemma3Attention():
 
         # 6. Core Attention mechanism (SDPA) in fp32
         attn_mask_for_sdpa = attention_mask
-        print(attn_mask_for_sdpa)
-        if attn_mask_for_sdpa is not None:
+        if attn_mask_for_sdpa is not None and attn_mask_for_sdpa.dtype != torch.bool:
             attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
 
         # output_attentions = kwargs.get("output_attentions", False)
-
         attn_output_fp32 = scaled_dot_product_attention(
             query_states_fp32,
             key_states_fp32,
