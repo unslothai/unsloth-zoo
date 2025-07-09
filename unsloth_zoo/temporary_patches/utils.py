@@ -43,7 +43,7 @@ except:
     raise RuntimeError("Unsloth: typing._TypedDictMeta does not exist! File a bug report immediately thank you!")
 
 from packaging.version import Version
-from .common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
 
 EMPTY = inspect._empty
 
@@ -435,7 +435,7 @@ def patch_function(
     original_func = getattr(target_obj, attr_name)
 
     # torch.compile function if requested
-    if fullgraph is not None and type(fullgraph) is bool:
+    if fullgraph is not None and type(fullgraph) is bool and not UNSLOTH_COMPILE_DISABLE:
         # Get wrapped function if already compiled
         if hasattr(new_func, "get_compiler_config"):
             new_func = new_func.__wrapped__
