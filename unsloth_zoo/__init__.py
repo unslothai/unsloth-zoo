@@ -16,6 +16,29 @@
 
 __version__ = "2025.7.1"
 
+import os
+# Hugging Face Hub faster downloads
+if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+pass
+
+# More stable downloads
+if os.environ.get("UNSLOTH_STABLE_DOWNLOADS", "0") == "1":
+    os.environ["HF_HUB_ETAG_TIMEOUT"] = "30" # Default is 10 seconds
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30" # Default is 10 seconds
+    os.environ["HF_HUB_DISABLE_XET"] = "1" # Disable XET
+pass
+
+# Disable XET Cache for now
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+os.environ["HF_XET_CHUNK_CACHE_SIZE_BYTES"] = "0"
+os.environ["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] = "0"
+os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = "64"
+# More verbose HF Hub info
+if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+    os.environ["HF_HUB_VERBOSITY"] = "info"
+pass
+
 from importlib.util import find_spec
 if find_spec("unsloth") is None:
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
@@ -32,7 +55,6 @@ def get_device_type():
 pass
 DEVICE_TYPE : str = get_device_type()
 
-import os
 if not ("UNSLOTH_IS_PRESENT" in os.environ):
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
 pass
