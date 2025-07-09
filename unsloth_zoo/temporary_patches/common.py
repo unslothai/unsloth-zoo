@@ -25,7 +25,7 @@ __all__ = [
 
 import os
 import logging
-UNSLOTH_ENABLE_LOGGING  = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+UNSLOTH_ENABLE_LOGGING  = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
 UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
 logger = logging.getLogger(__name__)
 if UNSLOTH_ENABLE_LOGGING:
