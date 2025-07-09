@@ -327,7 +327,7 @@ def patch_Gemma3Attention():
     except Exception as e:
         return raise_error("Gemma3Attention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-    scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
+    # scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
 
     def prepare(
         self,
@@ -360,7 +360,7 @@ def patch_Gemma3Attention():
         cos, sin = position_embeddings
         cos_fp32 = cos.to(torch.float32)
         sin_fp32 = sin.to(torch.float32)
-        query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos_fp32, sin_fp32)
+        query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos = cos_fp32, sin = sin_fp32)
 
         # 6. Core Attention mechanism (SDPA) in fp32
         attn_mask_for_sdpa = attention_mask
@@ -427,7 +427,7 @@ def patch_Gemma3Attention():
         cos, sin = position_embeddings
         cos_fp32 = cos.to(torch.float32)
         sin_fp32 = sin.to(torch.float32)
-        query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos_fp32, sin_fp32)
+        query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos = cos_fp32, sin = sin_fp32)
 
         # (
         #     query_states_fp32,
