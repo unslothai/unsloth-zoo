@@ -38,7 +38,7 @@ import typing as t
 import torch
 from typing import Any, Callable, Dict, List, Tuple
 try:
-    t_TypedDictMeta = t.TypedDictMeta
+    t_TypedDictMeta = t._TypedDictMeta
 except:
     from typing_extensions import _TypedDictMeta as t_TypedDictMeta
 
