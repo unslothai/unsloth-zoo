@@ -39,6 +39,25 @@ if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
     os.environ["HF_HUB_VERBOSITY"] = "info"
 pass
 
+# More logging for Triton
+os.environ["TRITON_DISABLE_LINE_INFO"] = "1" # Reduces Triton binary size
+os.environ["TRITON_FRONT_END_DEBUGGING"] = "0" # Disables debugging
+
+if (os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1") or \
+    (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
+    os.environ["TRITON_PRINT_AUTOTUNING"] = "1" # Prints out Triton best configs
+    os.environ["TRITON_DISABLE_LINE_INFO"] = "0" # Enables Triton line info
+    os.environ["TRITON_FRONT_END_DEBUGGING"] = "0" # Debugging
+    os.environ["TRITON_ALWAYS_COMPILE"] = "1" # Always compile kernels
+pass
+
+# Triton compile debugging
+if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
+    os.environ["TRITON_ENABLE_LLVM_DEBUG"] = "1" # Lots of debugging info
+    os.environ["TRITON_INTERPRET"] = "1" # Can add print statements!
+pass
+
+
 from importlib.util import find_spec
 if find_spec("unsloth") is None:
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
