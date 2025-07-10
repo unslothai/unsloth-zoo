@@ -328,6 +328,7 @@ def patch_Gemma3Attention():
         return raise_error("Gemma3Attention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
+    torch_jit_is_tracing = torch.jit.is_tracing
 
     def prepare(
         self,
@@ -364,12 +365,12 @@ def patch_Gemma3Attention():
 
         # 6. Core Attention mechanism (SDPA) in fp32
         attn_mask_for_sdpa = attention_mask
-        if attn_mask_for_sdpa is not None:
-            attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
+        # if attn_mask_for_sdpa is not None:
+        #     attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
         return (
-            query_states_fp32,
-            key_states_fp32,
-            value_states_fp32,
+            query_states_fp32.contiguous(),
+            key_states_fp32.contiguous(),
+            value_states_fp32.contiguous(),
             cos_fp32,
             sin_fp32,
             attn_mask_for_sdpa,
@@ -386,63 +387,6 @@ def patch_Gemma3Attention():
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        # print(attention_interface)
-        is_causal = query_states.shape[2] > 1 and attention_mask is None and getattr(self, "is_causal", True)
-        # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
-        # We convert it to a bool for the SDPA kernel that only accepts bools.
-        if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
-
-        attn_output = scaled_dot_product_attention(
-            query_states.contiguous(),
-            key_states.contiguous(),
-            value_states.contiguous(),
-            attn_mask = attention_mask,
-            dropout_p = self.attention_dropout if self.training else 0.0,
-            is_causal = is_causal,
-            scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
-            enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
-        )
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_weights = None # Defaulting to None
-        # attn_output, attn_weights = attention_interface(
-        #     self,
-        #     query_states,
-        #     key_states,
-        #     value_states,
-        #     attention_mask,
-        #     dropout=self.attention_dropout if self.training else 0.0,
-        #     scaling=self.scaling,
-        #     sliding_window=self.sliding_window,
-        #     **kwargs,
-        # )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
-
         bsz, q_len, _ = hidden_states.shape
         input_shape = hidden_states.shape[:-1] # For reshaping o_proj output later
 
@@ -522,14 +466,17 @@ def patch_Gemma3Attention():
             attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
 
         # output_attentions = kwargs.get("output_attentions", False)
+        is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
+        # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
+        # We convert it to a bool for the SDPA kernel that only accepts bools.
+        if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
         attn_output_fp32 = scaled_dot_product_attention(
-            query_states_fp32,
-            key_states_fp32,
-            value_states_fp32,
+            query_states_fp32.contiguous(),
+            key_states_fp32.contiguous(),
+            value_states_fp32.contiguous(),
             attn_mask = attn_mask_for_sdpa,
             dropout_p = self.attention_dropout if self.training else 0.0,
-            # is_causal=False, # Mask handles causality. If mask is None and q_len > 1, this might be true.
-                               # Gemma3's _update_causal_mask provides the explicit mask.
+            is_causal = is_causal,
             scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
             enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
         )
