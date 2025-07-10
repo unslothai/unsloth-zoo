@@ -63,6 +63,8 @@ __all__ = [
     "fused_linear_cross_entropy",
     "fast_linear_cross_entropy",
     "_unsloth_get_batch_samples",
+    "compiled_fused_ce_loss_function",
+    "compiled_ce_loss_function",
 ]
 
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
@@ -367,6 +369,82 @@ def compiled_ce_loss_function(
     return loss
 pass
 compiled_ce_loss_function = torch.compile(
+    compiled_ce_loss_function,
+    fullgraph = False,
+    dynamic = True,
+    options = torch_compile_options,
+)
+
+
+def compiled_fused_ce_loss_function(
+    hidden_states : torch.Tensor,
+    lm_head_weight : torch.Tensor,
+    lm_head_bias : torch.Tensor,
+    output_labels : torch.Tensor,
+    logit_scale_multiply : float = 0,
+    logit_scale_divide : float = 0,
+    logit_softcapping : float = 0,
+    vocab_size : int = 0,
+    n_items : int = 0,
+    mask : torch.Tensor = None,
+    requires_grad_ : bool = False,
+):
+    device = lm_head_weight.device
+
+    # Get shifted labels first
+    shift_labels = torch.empty_like(output_labels, device = device)
+    shift_labels[..., :-1] = output_labels[..., 1:]
+    if mask is not None:
+        mask = mask.to(device = device)
+        shift_labels[..., :-1][mask[..., 1:] == 0] = -100
+    pass
+    shift_labels[..., -1] = -100
+    shift_labels = shift_labels.view(-1)
+
+    # Decide on chunk size
+    n_chunks = int(torch.ceil((torch.tensor(vocab_size) / 262144) * 8))
+    if requires_grad_: n_chunks += 2
+
+    # Chunk hidden_states and labels
+    bsz, qlen, hd = hidden_states.shape
+    hidden_states = hidden_states.view(-1, hd)
+    __shift_states = torch.chunk(hidden_states, n_chunks, dim = 0)
+    __shift_labels = torch.chunk(shift_labels,  n_chunks, dim = 0)
+    loss = 0.0
+
+    # Chunk hidden states and logits
+    for (_shift_states, _shift_labels) in zip(__shift_states, __shift_labels):
+
+        _shift_logits = torch.nn.functional.linear(
+            _shift_states,
+            lm_head_weight,
+            lm_head_bias,
+        )
+
+        # Apply softcapping and other functions
+        if logit_scale_multiply != 0:
+            _shift_logits = _shift_logits * logit_scale_multiply
+        if logit_scale_divide != 0:
+            _shift_logits = _shift_logits / logit_scale_divide
+        if logit_softcapping != 0:
+            _shift_logits = _shift_logits / logit_softcapping
+            _shift_logits = torch.tanh(_shift_logits)
+            _shift_logits = _shift_logits * logit_softcapping
+
+        loss += torch.nn.functional.cross_entropy(
+            input  = _shift_logits.float().contiguous(),
+            target = _shift_labels.contiguous(),
+            reduction = 'sum',
+        )
+    pass
+
+    if n_items != 0:
+        loss = loss / n_items
+    else:
+        loss = loss / (shift_labels != -100).sum()
+    return loss
+pass
+compiled_fused_ce_loss_function = torch.compile(
     compiled_ce_loss_function,
     fullgraph = False,
     dynamic = True,
