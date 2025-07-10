@@ -35,6 +35,7 @@ import time
 import logging
 import tempfile
 import sys
+import textwrap
 from .utils import (
     Version,
     is_main_process,
@@ -134,7 +135,8 @@ import os
 import torch
 from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
-    compiled_ce_loss_function,
+    unsloth_compiled_ce_loss_function,
+    unsloth_compiled_fused_ce_loss_function,
 )
 
 if UNSLOTH_STUDIO_ENABLED:
@@ -409,6 +411,8 @@ def create_new_function(
                 if versioning[:versioning.find('__UNSLOTH_VERSIONING__')] != versions:
                     overwrite = True
     pass
+    if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
+        overwrite = False
 
     # Check location
     def write_file(function_location, write_new_source):
@@ -706,11 +710,17 @@ elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
 else:
-    logits = self.lm_head(hidden_states\\1)
-    torch._dynamo.mark_dynamic(logits, 1)
+    lm_head_weight = self.lm_head.weight
+    lm_head_bias   = getattr(self.lm_head, "bias", None)
+
+    # ========= NEW fused =========
+    _hidden_states = hidden_states\\1
+    torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
-    loss = compiled_ce_loss_function(
-        output_logits        = logits,
+    loss = unsloth_compiled_fused_ce_loss_function(
+        hidden_states        = _hidden_states,
+        lm_head_weight       = lm_head_weight,
+        lm_head_bias         = lm_head_bias,
         output_labels        = labels,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
@@ -719,6 +729,23 @@ else:
         n_items              = n_items if n_items is not None else 0,
         requires_grad_       = requires_grad_,
     )
+
+    # ========= OLD non fused =========
+    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
+    # torch._dynamo.mark_dynamic(logits, 1)
+    # torch._dynamo.mark_dynamic(labels, 1)
+    # loss = unsloth_compiled_ce_loss_function(
+    #     output_logits        = logits,
+    #     output_labels        = labels,
+    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
+    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
+    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
+    #     vocab_size           = (\\6),
+    #     n_items              = n_items if n_items is not None else 0,
+    #     requires_grad_       = requires_grad_,
+    # )
+
+
     # if (\\2) != ():
     #     logits = logits * (\\2)
     # if (\\3) != ():
@@ -798,11 +825,17 @@ elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
 elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
-    logits = self.lm_head(hidden_states\\1)
-    torch._dynamo.mark_dynamic(logits, 1)
+    lm_head_weight = self.lm_head.weight
+    lm_head_bias   = getattr(self.lm_head, "bias", None)
+
+    # ========= NEW fused =========
+    _hidden_states = hidden_states\\1
+    torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
-    loss = compiled_ce_loss_function(
-        output_logits        = logits,
+    loss = unsloth_compiled_fused_ce_loss_function(
+        hidden_states        = _hidden_states,
+        lm_head_weight       = lm_head_weight,
+        lm_head_bias         = lm_head_bias,
         output_labels        = labels,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
@@ -811,6 +844,22 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         n_items              = n_items if n_items is not None else 0,
         requires_grad_       = requires_grad_,
     )
+
+
+    # ========= OLD non fused =========
+    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
+    # torch._dynamo.mark_dynamic(logits, 1)
+    # torch._dynamo.mark_dynamic(labels, 1)
+    # loss = unsloth_compiled_ce_loss_function(
+    #     output_logits        = logits,
+    #     output_labels        = labels,
+    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
+    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
+    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
+    #     vocab_size           = (\\8),
+    #     n_items              = n_items if n_items is not None else 0,
+    #     requires_grad_       = requires_grad_,
+    # )
 else:
     logits = self.lm_head(hidden_states\\1)
     if (\\2) != ():
@@ -873,13 +922,19 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     logits = self.lm_head(hidden_states\\1)
 else:
-    logits = self.lm_head(hidden_states\\1)
-    torch._dynamo.mark_dynamic(logits, 1)
+    lm_head_weight = self.lm_head.weight
+    lm_head_bias   = getattr(self.lm_head, "bias", None)
+
+    # ========= NEW fused =========
+    _hidden_states = hidden_states\\1
+    torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
         torch._dynamo.mark_dynamic(attention_mask, 1)
-    loss = compiled_ce_loss_function(
-        output_logits        = logits,
+    loss = unsloth_compiled_fused_ce_loss_function(
+        hidden_states        = _hidden_states,
+        lm_head_weight       = lm_head_weight,
+        lm_head_bias         = lm_head_bias,
         output_labels        = labels,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
@@ -889,6 +944,24 @@ else:
         mask                 = \\6,
         requires_grad_       = requires_grad_,
     )
+
+    # ========= OLD non fused =========
+    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
+    # torch._dynamo.mark_dynamic(logits, 1)
+    # torch._dynamo.mark_dynamic(labels, 1)
+    # if attention_mask is not None:
+    #     torch._dynamo.mark_dynamic(attention_mask, 1)
+    # loss = unsloth_compiled_ce_loss_function(
+    #     output_logits        = logits,
+    #     output_labels        = labels,
+    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
+    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
+    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
+    #     vocab_size           = (\\7),
+    #     n_items              = n_items if n_items is not None else 0,
+    #     mask                 = \\6,
+    #     requires_grad_       = requires_grad_,
+    # )
 """
 
 ce_finders = [
@@ -1137,8 +1210,8 @@ def apply_mask_attention_mask_out(source):
     if not len(re.findall(r"labels[\s]{0,}\=labels[\s]{0,}\,\n", source)): return source
     if "ForConditionalGeneration" in source:
         source = re.sub(
-            r"attention_mask[\s]{0,}\=attention_mask[\s]{0,}\,\n",
-            "attention_mask=mask_attention_mask_out(labels = labels, attention_mask = attention_mask),\n",
+            r"labels[\s]{0,}\=labels[\s]{0,}\,\n",
+            "labels=mask_attention_mask_out(labels = labels, attention_mask = attention_mask),\n",
             source,
         )
     return source
@@ -1178,6 +1251,42 @@ def convert_attention_masks_to_bool(module, old_source):
 pass
 
 
+# We need to manually replace some items
+# For example HF 4.53.1 breaks Qwen2VL since None wasn't provided
+custom_gradient_checkpointing_replacements = [
+    (
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )""",
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb=rotary_pos_emb,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )""",
+    ),
+    (
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                **kwargs,
+            )""",
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb=rotary_pos_emb,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                **kwargs,
+            )""",
+    )
+]
 replace_gradient_checkpointing = """
 for LAYER in MODULELIST_ITEM:
 $if self.gradient_checkpointing and self.training:
@@ -1195,6 +1304,11 @@ def patch_gradient_checkpointing(module, source):
     try: forward = inspect.getsource(source.forward)
     except: return None
     if "_gradient_checkpointing_func" in forward: return None
+
+    # Fix Qwen2 missing None for gradient checkpointing
+    for custom_find, custom_replace in custom_gradient_checkpointing_replacements:
+        forward = forward.replace(custom_find, custom_replace)
+    pass
 
     # No gradient checkpointing?
     modulelist_items = re.findall(r"(self\.[^\s]{1,}) = .*?nn\.ModuleList\(", init)
@@ -1229,6 +1343,44 @@ def patch_gradient_checkpointing(module, source):
     return init, forward
 pass
 
+DTYPE_MISMATCH_FIND = """
+attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+"""
+
+DTYPE_MISMATCH_REPLACE = """
+if attention_mask_tensor.dtype == torch.bool:
+    attention_mask_tensor = attention_mask_tensor.int()
+elif torch.is_floating_point(attention_mask_tensor):
+    attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+    attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+"""
+
+def patch_finfo_attention_mask_dtype_mismatch(module, source):
+    try:
+        old_block = textwrap.dedent(DTYPE_MISMATCH_FIND).strip()
+        new_block = textwrap.dedent(DTYPE_MISMATCH_REPLACE).strip()
+        if not old_block or not new_block:
+            return source
+
+        first_line = old_block.split('\n')[0]
+        if not first_line:
+            return source
+
+        for line in source.split('\n'):
+            if first_line in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                break
+        else:
+            return source
+
+        indented_old = textwrap.indent(old_block, indent)
+        indented_new = textwrap.indent(new_block, indent)
+
+        return source.replace(indented_old, indented_new)
+    except:
+        return source
+pass
 
 # Torch.compiling makes things slower - rather just leave it as addmm
 COMPILED_LORA_FORWARD = """
@@ -1734,7 +1886,7 @@ def unsloth_compile_transformers(
         except: continue
         if "_gradient_checkpointing_func" in source:
             gradient_checkpointed_modules.append(module)
-        elif "scaled_dot_product_attention" in source:
+        elif "scaled_dot_product_attention" in source or "ALL_ATTENTION_FUNCTIONS" in source:
             scaled_dot_product_attention_modules.append(module)
         elif "nn.functional.softmax" in source or "flash_attn_varlen_func" in source or "_flash_attention_forward" in source:
             full_attention_modules.append(module)
@@ -2098,6 +2250,32 @@ def unsloth_compile_transformers(
             )
             all_standalone_classes[module] = new_module
             print(f"Unsloth: Patched {module} by adding gradient checkpointing")
+        pass
+    pass
+
+    # torch.finfo fix for transformers > 4.52.4 affect qwen2vl, qwen25vl, and glm4vl
+    for module in other_classes:
+        if module in all_standalone_classes:
+            source = all_standalone_classes[module]
+        else:
+            module_cls = eval(f"{model_location}.{module}")
+            if hasattr(module_cls, "forward"):
+                source = inspect.getsource(module_cls.forward)
+            else:
+                continue
+            new_source = patch_finfo_attention_mask_dtype_mismatch(module, source)
+            if new_source != source:
+                new_module = create_standalone_class(
+                    module,
+                    model_location,
+                    functions,
+                    fullgraph = False,
+                    disable = True,
+                    forward_source = new_source,
+                )
+                all_standalone_classes[module] = new_module
+                print(f"Unsloth: Patched {module} by fixing finfo dtype mismatch in attention mask")
+            pass
         pass
     pass
 
