@@ -845,19 +845,19 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
 
 
     # ========= OLD non fused =========
-    logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
-    torch._dynamo.mark_dynamic(logits, 1)
-    torch._dynamo.mark_dynamic(labels, 1)
-    loss = compiled_ce_loss_function(
-        output_logits        = logits,
-        output_labels        = labels,
-        logit_scale_multiply = (\\2) if (\\2) != () else 0,
-        logit_scale_divide   = (\\3) if (\\3) != () else 0,
-        logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
-        vocab_size           = (\\8),
-        n_items              = n_items if n_items is not None else 0,
-        requires_grad_       = requires_grad_,
-    )
+    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
+    # torch._dynamo.mark_dynamic(logits, 1)
+    # torch._dynamo.mark_dynamic(labels, 1)
+    # loss = compiled_ce_loss_function(
+    #     output_logits        = logits,
+    #     output_labels        = labels,
+    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
+    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
+    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
+    #     vocab_size           = (\\8),
+    #     n_items              = n_items if n_items is not None else 0,
+    #     requires_grad_       = requires_grad_,
+    # )
 else:
     logits = self.lm_head(hidden_states\\1)
     if (\\2) != ():
