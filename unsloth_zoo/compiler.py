@@ -1252,8 +1252,8 @@ pass
 
 
 replace_gradient_checkpointing = """
-KWARGS_OPTIONAL
 for LAYER in MODULELIST_ITEM:
+$KWARGS_OPTIONAL
 $if self.gradient_checkpointing and self.training:
 $    hidden_states = self._gradient_checkpointing_func(
 $        LAYER.__call__, ARGS
