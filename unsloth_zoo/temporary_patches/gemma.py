@@ -150,7 +150,7 @@ def patch_Gemma3Processor():
     pass
     patch_function(transformers.models.gemma3.processing_gemma3.Gemma3Processor, "__call__", __call__)
 pass
-# TEMPORARY_PATCHES.append(patch_Gemma3Processor)
+TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
 
 def patch_Gemma3ForConditionalGeneration_causal_mask():
