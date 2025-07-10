@@ -410,17 +410,35 @@ def patch_Gemma3Attention():
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         # print(attention_interface)
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=self.attention_dropout if self.training else 0.0,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **kwargs,
+        is_causal = query_states.shape[2] > 1 and attention_mask is None and getattr(self, "is_causal", True)
+        # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
+        # We convert it to a bool for the SDPA kernel that only accepts bools.
+        if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
+
+        attn_output = scaled_dot_product_attention(
+            query_states.contiguous(),
+            key_states.contiguous(),
+            value_states.contiguous(),
+            attn_mask = attention_mask,
+            dropout_p = self.attention_dropout if self.training else 0.0,
+            is_causal = is_causal,
+            scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
+            enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
         )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        
+        # attn_weights = None # Defaulting to None
+        # attn_output, attn_weights = attention_interface(
+        #     self,
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attention_mask,
+        #     dropout=self.attention_dropout if self.training else 0.0,
+        #     scaling=self.scaling,
+        #     sliding_window=self.sliding_window,
+        #     **kwargs,
+        # )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
