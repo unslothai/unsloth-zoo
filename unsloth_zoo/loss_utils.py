@@ -445,7 +445,7 @@ def compiled_fused_ce_loss_function(
     return loss
 pass
 compiled_fused_ce_loss_function = torch.compile(
-    compiled_ce_loss_function,
+    compiled_fused_ce_loss_function,
     fullgraph = False,
     dynamic = True,
     options = torch_compile_options,
