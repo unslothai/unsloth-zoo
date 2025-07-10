@@ -1304,7 +1304,7 @@ def patch_gradient_checkpointing(module, source):
     replacer = replacer\
         .replace("LAYER", layer).replace("MODULELIST_ITEM", modulelist_item)\
         .replace("ARGS", args).replace("$", spaces)\
-        .replace(KWARGS_OPTIONAL, KWARGS_OPTIONAL)
+        .replace("KWARGS_OPTIONAL", KWARGS_OPTIONAL)
     forward = forward.replace(forward[span[0] : span[1]], replacer)
 
     # Also fix init
