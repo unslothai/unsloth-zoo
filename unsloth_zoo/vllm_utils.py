@@ -802,48 +802,81 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     # Empty model from config
     new_config = deepcopy(config)
-    is_mllama = hasattr(new_config, "vision_config")
-    new_text_config = new_config.text_config if is_mllama else new_config
-    new_text_config.intermediate_size = 0
-    new_text_config.hidden_size = 1
-    new_text_config.num_attention_heads = 1
-    new_text_config.vocab_size = 1
-    new_text_config.pad_token_id = 0
+    new_config.intermediate_size = 0
+    new_config.hidden_size = 0
+    new_config.vocab_size = 1
+    new_config.pad_token_id = 0
 
     # Set attention module head_dim
     # Otherwise will get error if (head_dim)**-0.5 is seen like in Qwen
-    try:
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    except:
-        if hasattr(config, "text_config"):
-            head_dim = getattr(config.text_config, "head_dim", config.text_config.hidden_size // config.text_config.num_attention_heads)
-        else:
-            raise ValueError("No head_dim found in config. Please check if the config is correct.")
-    new_text_config.update({"head_dim" : head_dim})
-    from transformers import AutoModelForCausalLM, AutoModel
-    if not is_mllama:
-        new_model = AutoModelForCausalLM.from_config(
-            new_config,
-            attn_implementation = "eager",
-        )
-    else:
-        new_config._attn_implementation = "eager"
-        new_model = AutoModel.from_config(
-            new_config,
-            attn_implementation = "eager",
-        )
-    pass
-    new_model = new_model.to(device = "cuda:0", dtype = dtype)
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    new_config.update({"head_dim" : head_dim})
+
+    from transformers import AutoModelForCausalLM
+    new_model = AutoModelForCausalLM.from_config(
+        new_config,
+        attn_implementation = "eager",
+    )
     return new_model
 pass
 
+
+@torch.inference_mode
+def create_empty_qwen2_5_vl(config, dtype = torch.float16):
+    from transformers import Qwen2_5_VLForConditionalGeneration
+    new_config = deepcopy(config)
+    new_config.num_hidden_layers = 1
+    new_config.num_attention_heads = 1
+    new_config.num_key_value_heads = 1
+    new_config.intermediate_size = 0
+    new_config.vision_config.hidden_size = 1
+    new_config.vision_config.intermediate_size = 0
+    new_config.vision_config.out_hidden_size = 1
+
+    new_model = Qwen2_5_VLForConditionalGeneration.from_config(new_config)
+    return new_model
+pass
+
+@torch.inference_mode
+def create_empty_mllama(config, dtype = torch.float16):
+    from transformers import MllamaForConditionalGeneration
+    new_config = deepcopy(config)
+
+    new_config.text_config.num_hidden_layers = 1
+    new_config.text_config.num_attention_heads = 1
+    new_config.text_config.num_key_value_heads = 1
+    new_config.text_config.intermediate_size = 0
+
+    new_config.vision_config.num_hidden_layers = 1
+    new_config.vision_config.num_attention_heads = 1
+    new_config.vision_config.num_key_value_heads = 1
+    new_config.vision_config.intermediate_size = 0
+    new_config.vision_config.num_global_layers = 1
+    new_config.vision_config.vision_output_dim = 1
+
+    new_model = MllamaForConditionalGeneration.from_config(new_config)
+
+    return new_model
+pass
+
+@torch.inference_mode
+def create_empty_model(config, dtype = torch.float16):
+    model_type = config.model_type
+    if model_type == "mllama":
+        return create_empty_mllama(config, dtype)
+    elif model_type == "qwen2_5_vl":
+        return create_empty_qwen2_5_vl(config, dtype)
+    else:
+        return create_empty_causal_lm(config, dtype)
+pass
 
 @torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
     config.update({"torch_dtype" : dtype}) # Do not use config file's dtype!
-    new_model = create_empty_causal_lm(config, dtype)
+    new_model = create_empty_model(config, dtype)
+    new_model = new_model.to(device = get_target_device(), dtype = dtype)
     quantization_config = getattr(config, "quantization_config", {})
     kwargs = dict()
     compute_dtype = dtype  # Do not use config file's dtype!
