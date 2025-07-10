@@ -21,7 +21,7 @@ __all__ = [
     "create_new_function",
 ]
 
-from typing import List, Dict, Tuple, Optional, Any, Callable
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import inspect
 import re
 import importlib
@@ -35,6 +35,7 @@ import time
 import logging
 import tempfile
 import sys
+import textwrap
 from .utils import (
     Version,
     is_main_process,
@@ -93,6 +94,8 @@ DISABLED_KEYWORDS = [
     "select_best_resolution", # Llava NeXT errors out
     "original_aspect_ratio > current_aspect_ratio",  # Llava NeXT errors out
     "causal_mask[start:end, start:end] = 0", # Pixtral Dynamic slicing on data-dependent value is not supported
+    "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", # Gemma3 create_masks_for_generate
+    "create_causal_mask(**mask_kwargs)", # Gemma3 create_masks_for_generate
 ]
 
 _license_header = """
@@ -119,8 +122,11 @@ if importlib.util.find_spec("unsloth_studio") is None:
 else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
-from typing import List, Dict, Tuple, Optional, Any, Callable
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import math
+
+UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+
 """
 
 _disabled_sdpa_code = f"""{_license_header}
@@ -307,6 +313,17 @@ def get_compile_folder(use_tempfile = False):
     return location, UNSLOTH_COMPILE_USE_TEMP
 pass
 
+# Mask creation functions
+@functools.lru_cache(1)
+def get_mask_functions():
+    try:
+        import transformers.masking_utils
+        masking_utils = dir(transformers.masking_utils)
+        return [x for x in masking_utils if x.startswith("create")]
+    except:
+        return []
+pass
+
 def create_new_function(
     name,
     new_source,
@@ -337,11 +354,17 @@ def create_new_function(
     items = [x for x in functions if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))]
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source: items += ["SiglipEncoder"]
-
+    # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
+    mask_functions = get_mask_functions()
+    for mask_function in mask_functions:
+        if mask_function in new_source: items += [mask_function]
+    pass
+    # Full import script
     imports = "from torch import Tensor\n"
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
     imports += "from torch.nn import functional as F\n"
+    imports += "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     imports += f"from {model_location} import (" + ", ".join(x for x in items) + ")" if len(items) != 0 else ""
     new_source = imports + "\n\n" + new_source
     new_source = prepend + new_source + append
@@ -1207,6 +1230,43 @@ def patch_gradient_checkpointing(module, source):
     return init, forward
 pass
 
+DTYPE_MISMATCH_FIND = """
+attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+"""
+
+DTYPE_MISMATCH_REPLACE = """
+if attention_mask_tensor.dtype == torch.bool:
+    attention_mask_tensor = attention_mask_tensor.int()
+elif torch.is_floating_point(attention_mask_tensor):
+    attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+    attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+"""
+
+def patch_finfo_attention_mask_dtype_mismatch(module, source):
+    try:
+        old_block = textwrap.dedent(DTYPE_MISMATCH_FIND).strip()
+        new_block = textwrap.dedent(DTYPE_MISMATCH_REPLACE).strip()
+        if not old_block or not new_block:
+            return source
+
+        first_line = old_block.split('\n')[0]
+        if not first_line:
+            return source
+
+        for line in source.split('\n'):
+            if first_line in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                break
+        else:
+            return source
+
+        indented_old = textwrap.indent(old_block, indent)
+        indented_new = textwrap.indent(new_block, indent)
+
+        return source.replace(indented_old, indented_new)
+    except:
+        return source
 
 # Torch.compiling makes things slower - rather just leave it as addmm
 COMPILED_LORA_FORWARD = """
@@ -1240,15 +1300,16 @@ pass
 COMPILED_LORA_FORWARD_forced_float32 = """
 torch_addmm = torch.addmm
 torch_add   = torch.add
+torch_float16 = torch.float16
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
-    xA = dropout(x.to(torch.float16)) @ lora_A.weight.to(torch.float16).t()
+    xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
     # output = result + scaling * xA @ lora_B.weight.t()
     shape = result.shape
     output = torch_addmm(
-        result.view(-1, shape[-1]),
+        result.view(-1, shape[-1]).to(torch_float16),
         xA.view(-1, xA.shape[-1]),
-        lora_B.weight.to(torch.float16).t(),
+        lora_B.weight.to(torch_float16).t(),
         alpha = scaling,
         beta = 1,
     ).view(shape)
@@ -1257,7 +1318,7 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     if bias is not None:
         output = torch_add(
         output,
-        bias.to(torch.float16),
+        bias.to(torch_float16),
         alpha = scaling,
     )
     return output
@@ -1605,8 +1666,10 @@ def unsloth_compile_transformers(
     modeling_file = eval(model_location)
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"): return
 
-    # Use transformers model_type logger to supress message: Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
-    exec("model_logger.addFilter(HideLoggingMessage('`use_cache`'))", globals(), locals())
+    # Use transformers model_type logger to suppress message: Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
+    exec("model_logger.addFilter(HideLoggingMessage('use_cache'))", globals(), locals())
+    # Use transformers model_type logger to suppress message: You have set `compile_config`, but we are unable to meet the criteria for compilation.
+    exec("model_logger.addFilter(HideLoggingMessage('compile_config'))", globals(), locals())
 
     # Instead of Inductor Compilation:
     try:
@@ -1636,7 +1699,7 @@ def unsloth_compile_transformers(
         "memory_planning"           : True,
         "coordinate_descent_tuning" : UNSLOTH_COMPILE_MAXIMUM,
         "trace.graph_diagram"       : UNSLOTH_COMPILE_DEBUG or debug,
-        "compile_threads"           : 24,
+        # "compile_threads"           : 24, # Auto detects via https://github.com/unslothai/unsloth-zoo/pull/187
         "combo_kernels"             : False, # Causes incompatible gradient sizes on 2.6
         "group_fusion"              : True,
         "disable_progress"          : not UNSLOTH_ENABLE_LOGGING,
@@ -1709,7 +1772,7 @@ def unsloth_compile_transformers(
         except: continue
         if "_gradient_checkpointing_func" in source:
             gradient_checkpointed_modules.append(module)
-        elif "scaled_dot_product_attention" in source:
+        elif "scaled_dot_product_attention" in source or "ALL_ATTENTION_FUNCTIONS" in source:
             scaled_dot_product_attention_modules.append(module)
         elif "nn.functional.softmax" in source or "flash_attn_varlen_func" in source or "_flash_attention_forward" in source:
             full_attention_modules.append(module)
@@ -2076,6 +2139,32 @@ def unsloth_compile_transformers(
         pass
     pass
 
+    # torch.finfo fix for transformers > 4.52.4 affect qwen2vl, qwen25vl, and glm4vl
+    for module in other_classes:
+        if module in all_standalone_classes:
+            source = all_standalone_classes[module]
+        else:
+            module_cls = eval(f"{model_location}.{module}")
+            if hasattr(module_cls, "forward"):
+                source = inspect.getsource(module_cls.forward)
+            else:
+                continue
+            new_source = patch_finfo_attention_mask_dtype_mismatch(module, source)
+            if new_source != source:
+                new_module = create_standalone_class(
+                    module,
+                    model_location,
+                    functions,
+                    fullgraph = False,
+                    disable = True,
+                    forward_source = new_source,
+                )
+                all_standalone_classes[module] = new_module
+                print(f"Unsloth: Patched {module} by fixing finfo dtype mismatch in attention mask")
+            pass
+        pass
+    pass
+
     # Manually replace hand written parts
     if manual_replacements:
         for module in compiler_replacements:
@@ -2159,6 +2248,7 @@ def unsloth_compile_transformers(
 
     # All other functions
     if compile_function_calls:
+        mask_functions = get_mask_functions()
         # Fix up function signatures
         for module in called_functions:
             function = eval(f"{model_location}.{module}")
@@ -2216,7 +2306,16 @@ def unsloth_compile_transformers(
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(f"Unsloth: Cannot compile function {module} since disabled keyword is in it.")
-            all_standalone_classes[module] = source
+            # Skip mask creation functions
+            bad = False
+            for mask_function in mask_functions:
+                if mask_function == module:
+                    bad = True
+                    print(f"Unsloth: Will skip copying source of {module}.")
+                    break
+            pass
+            if not bad:
+                all_standalone_classes[module] = source
         pass
     pass
 

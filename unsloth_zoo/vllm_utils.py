@@ -48,6 +48,7 @@ import inspect
 from functools import partial
 from .utils import _get_dtype
 from .patching_utils import patch_model_and_tokenizer
+from unsloth import DEVICE_TYPE
 global LORA_REQUEST_ID
 
 # Ignore logging messages
@@ -60,6 +61,17 @@ pass
 def _return_nothing(*args, **kwargs): return None
 def _return_self(self, *args, **kwargs): return self
 def _return_self_tokenizer(self, *args, **kwargs): return self.tokenizer
+
+def get_target_device(index = 0):
+    return torch.device(DEVICE_TYPE, index)
+
+def get_mem_info():
+    if DEVICE_TYPE == "xpu":
+        free_memory, total_memory = torch.xpu.mem_get_info()
+    else:
+        free_memory, total_memory = torch.cuda.mem_get_info()
+    return free_memory, total_memory
+
 
 if importlib.util.find_spec("vllm") is not None:
 
@@ -76,7 +88,7 @@ if importlib.util.find_spec("vllm") is not None:
         # Allow certain layers to not be quantized
         components = set(".".join(components[:i+1]) for i in range(len(components)))
         unsloth_check = len(set(llm_int8_skip_modules) & components) != 0
-        
+
         return vllm_check or unsloth_check
     pass
 
@@ -234,7 +246,7 @@ if importlib.util.find_spec("vllm") is not None:
         import vllm.transformers_utils.tokenizer
         vllm.transformers_utils.tokenizer.get_lora_tokenizer = _return_nothing
         vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing
-        
+
         try:
             import vllm.transformers_utils.tokenizer_group.tokenizer_group
             vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer = _return_nothing
@@ -470,10 +482,10 @@ def patch_vllm_enable_sleep_mode():
                 data.cpu_backup_tensor = cpu_backup_tensor
                 cpu_offloads += 1
             logger.debug(f"data's tag is {data.tag} and is offloaded to cpu? {data.tag in offload_tags}")
-            
+
             unmap_and_release(handle)
             true_offloads += 1
-        
+
 
         logger.debug(f'CPU offloads {cpu_offloads} true offloads {true_offloads} total {total_offloads}')
         gc.collect()
@@ -482,16 +494,16 @@ def patch_vllm_enable_sleep_mode():
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
         """
         Wake up the allocator from sleep mode.
-        All data that is previously offloaded will be loaded back to GPU 
+        All data that is previously offloaded will be loaded back to GPU
         memory, and the rest of the data will have empty memory.
-        
+
         :param tags: The tags of the memory allocation that will be loaded
             back to GPU memory. If None, all memory allocation will be loaded
             back to GPU memory.
         """
         delete_memory()
         for ptr, data in self.pointer_to_data.items():
-            if data.tag == "weights": 
+            if data.tag == "weights":
                 # In unsloth's case we have weights managed by unsloth. So we neither offload/delete them nor onload/create them here.
                 continue
             if tags is None or data.tag in tags:
@@ -567,9 +579,9 @@ def vllm_dynamic_quant_supported(
     if "quantization_config" not in config: return True
 
     llm_int8_skip_modules = config.quantization_config.get("llm_int8_skip_modules", {})
-    
+
     # Only allow layer modules ie model.layers.1.mlp or model.layers.1.self_attn
-    
+
     # Exclude model.layers.27.mlp.gate_proj
     parent_llm_int8_skip_modules = []
     for module in llm_int8_skip_modules:
@@ -695,7 +707,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
 
             proj = vllm_internal_model.layers[kk].cross_attn.o_proj
             get_state_dict(f"model.layers.{kk}.cross_attn.o_proj", 0, state_dict, proj)
-            
+
         else:
             proj = vllm_internal_model.layers[kk].self_attn.qkv_proj
             get_state_dict(f"model.layers.{kk}.self_attn.q_proj", 0, state_dict, proj)
@@ -908,7 +920,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             if f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
-                layer = Linear4bit(0, 0, device = "cuda:0", bias = has_bias, compute_dtype = compute_dtype, **kwargs)
+                layer = Linear4bit(0, 0, device = get_target_device(), bias = has_bias, compute_dtype = compute_dtype, **kwargs)
                 layer.in_features  = quant_state.shape[1]
                 layer.out_features = quant_state.shape[0]
                 layer.weight = Params4bit(data = weight, requires_grad = False, **kwargs)
@@ -920,7 +932,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.weight.to = partial(_override_to, layer.weight)
 
             elif not any(x in layer_name for x in layernorm_names):
-                layer = Linear(0, 0, device = "cuda:0", bias = has_bias)
+                layer = Linear(0, 0, device = get_target_device(), bias = has_bias)
                 layer.in_features  = weight.shape[1]
                 layer.out_features = weight.shape[0]
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
@@ -933,7 +945,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 exec(f"new_model.{layer_name}.weight = weight")
                 continue
             pass
-            
+
             # Convert model.layers.0.self_attn.q_proj to model.layers[0].self_attn.q_proj
             layer_name = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
             exec(f"new_model.model.language_model.{layer_name} = layer") if hasattr(new_model, "model") and hasattr(new_model.model, "language_model") else exec(f"new_model.{layer_name} = layer")
@@ -957,7 +969,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         weight = quant_state_dict["model.embed_tokens.weight"]
     else:
         weight = quant_state_dict["lm_head.weight"]
-    layer = Linear(0, 0, device = "cuda:0", bias = False)
+
+    layer = Linear(0, 0, device = get_target_device(), bias = False)
     layer.in_features  = weight.shape[1]
     layer.out_features = weight.shape[0]
     layer.weight = torch.nn.Parameter(weight, requires_grad = False)
@@ -982,11 +995,12 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     new_model.config = config
 
     # Fix up rotary_emb by re-initing them
+    device = "xpu:0" if DEVICE_TYPE == "xpu" else "cuda:0"
     for module in new_model.modules():
         if hasattr(module, "rotary_emb"):
             module.rotary_emb = module.rotary_emb.__class__(
                 config = config.text_config if hasattr(config, "text_config") else config,
-                device = "cuda:0",
+                device = get_target_device(),
             )
         pass
     pass
@@ -1006,7 +1020,7 @@ pass
 
 
 def approximate_vllm_memory_usage(
-    config, 
+    config,
     max_seq_length = 2048,
     gpu_memory_utilization = 0.8,
     enable_lora = True,
@@ -1018,7 +1032,8 @@ def approximate_vllm_memory_usage(
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
     load_in_4bit = "quantization_config" in config
-    free_memory, total_memory = torch.cuda.mem_get_info()
+    free_memory, total_memory = get_mem_info()
+
     free_memory = gpu_memory_utilization * free_memory
 
     vocab_size = config.vocab_size
@@ -1131,12 +1146,13 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
-    major_version, minor_version = torch.cuda.get_device_capability()
-    if major_version < 7: raise NotImplementedError("Unsloth: Your GPU is too old!")
+    if DEVICE_TYPE == "cuda":
+        major_version, minor_version = torch.cuda.get_device_capability()
+        if major_version < 7: raise NotImplementedError("Unsloth: Your GPU is too old!")
 
-    # Float8 KV cache only works for 8.0 or higher
-    if float8_kv_cache and major_version < 8:
-        raise NotImplementedError("Unsloth: Your GPU is too old for float8 KV cache! Set it to False.")
+        # Float8 KV cache only works for 8.0 or higher
+        if float8_kv_cache and major_version < 8:
+            raise NotImplementedError("Unsloth: Your GPU is too old for float8 KV cache! Set it to False.")
 
     if hasattr(config, "text_config"):
         mem_config = config.text_config
@@ -1146,7 +1162,7 @@ def load_vllm(
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
     approximate_vllm_memory_usage(
-        mem_config, 
+        mem_config,
         max_seq_length = max_seq_length,
         gpu_memory_utilization = gpu_memory_utilization,
         enable_lora = enable_lora,
@@ -1171,8 +1187,11 @@ def load_vllm(
     pass
 
     # Get correct dtype
-    if major_version >= 8: _dtype = torch.bfloat16
-    else: _dtype = torch.float16
+    if DEVICE_TYPE == "cuda" and major_version >= 8: _dtype = torch.bfloat16
+    elif DEVICE_TYPE == "xpu":
+        _dtype = torch.bfloat16
+    else:
+        _dtype = torch.float16
     if dtype == torch.bfloat16 and _dtype == torch.float16:
         print("Unsloth: We switched to dtype = torch.float16 since your GPU does not support torch.bfloat16")
         dtype = torch.float16
@@ -1183,7 +1202,8 @@ def load_vllm(
     else:
         raise NotImplementedError(f"Unsloth: We do not support dtype = {dtype} yet!")
 
-    free_memory, total_memory = torch.cuda.mem_get_info()
+    free_memory, total_memory = get_mem_info()
+
     total_memory_gb = round(total_memory / 1024 / 1024 / 1024, 2)
     use_bitsandbytes = use_bitsandbytes or \
         model_name.lower().endswith("-bnb-4bit")
@@ -1211,10 +1231,14 @@ def load_vllm(
 
     # Prefix Caching fails for V100, Titan X CUDA Compute Capability 7.0
     # See https://github.com/huggingface/trl/issues/2798
-    major_version, minor_version = torch.cuda.get_device_capability()
-    if (major_version < 7) or (major_version == 7 and minor_version < 5):
-        print("Unsloth: Your GPU does not support prefix caching - will disable!")
-        enable_prefix_caching = False
+    if DEVICE_TYPE == "cuda":
+        major_version, minor_version = torch.cuda.get_device_capability()
+        if (major_version < 7) or (major_version == 7 and minor_version < 5):
+            print("Unsloth: Your GPU does not support prefix caching - will disable!")
+            enable_prefix_caching = False
+    elif DEVICE_TYPE == "xpu":
+        enable_prefix_caching = True
+
     pass
 
     # Use VLLM_USE_V1 for vllm >= 0.7.4 and CUDA >= 8.0
@@ -1280,15 +1304,26 @@ def load_vllm(
     elif RAM_GB <= 48: swap_space = 4
     else: swap_space = 6
 
+    if DEVICE_TYPE == "xpu":
+        platform = "Intel GPU"
+        gpu_eu_count = torch.xpu.get_device_properties(0).gpu_eu_count
+        message = f"{platform} has eu:{gpu_eu_count}"
+    else:
+        platform = "CUDA"
+        major_version, minor_version = torch.cuda.get_device_capability()
+        message = f"{platform} compute capability {major_version}.{minor_version}"
+
+
+
     print(
         f"Unsloth: vLLM loading {model_name} with actual GPU utilization = {round(actual_gpu_memory_utilization*100, 2)}%\n"\
-        f"Unsloth: Your GPU has CUDA compute capability {major_version}.{minor_version} with VRAM = {total_memory_gb} GB.\n"\
+        f"Unsloth: Your GPU has {message} with VRAM = {total_memory_gb} GB.\n"\
         f"Unsloth: Using conservativeness = {conservativeness}. Chunked prefill tokens = {chunked_prefill_tokens}. Num Sequences = {approx_max_num_seqs}.\n"\
         f"Unsloth: vLLM's KV Cache can use up to {round(memory_left_for_kv_cache_gb, 2)} GB. Also swap space = {swap_space} GB."
     )
 
     # Get device as well
-    device = "cuda:0"
+    device = get_target_device()
 
     if compilation_config == 3:
         try:
@@ -1389,7 +1424,7 @@ def load_vllm(
             error = str(error)
             if trials >= 2:
                 raise RuntimeError(error)
-            
+
             if "gpu_memory_utilization" in error or "memory" in error:
                 approx_max_num_seqs = int(approx_max_num_seqs * 0.75)
                 engine_args["max_num_seqs"] = approx_max_num_seqs
@@ -1470,7 +1505,7 @@ def prepare_vllm_lora_loading(model):
     model_loras_A, model_loras_B = [], []
     vllm_loras_A,  vllm_loras_B  = [], []
     vllm_model = model.vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
-    
+
     # Go through all layers!
     for v_layer, m_layer in zip(vllm_model .model.layers, model.model.model.layers):
         model_loras_A.append(m_layer.self_attn.q_proj.lora_A.default.weight)
@@ -1676,7 +1711,7 @@ def generate_batches(llm, inputs, n_batches = None, lora_request = None, *args, 
         if "UNSLOTH_VLLM_BATCHES" in os.environ:
             n_batches = int(os.environ["UNSLOTH_VLLM_BATCHES"])
         else:
-            free_memory, total_memory = torch.cuda.mem_get_info()
+            free_memory, total_memory = get_mem_info()
             total_memory_gb = round(total_memory / 1024 / 1024 / 1024, 2)
             if   total_memory_gb <=  8: n_batches = llm.approx_max_num_seqs // 10
             elif total_memory_gb <= 16: n_batches = llm.approx_max_num_seqs // 5
@@ -1757,7 +1792,7 @@ def _test_same_model(model, new_model, input_ids):
         print(i, end = ",")
         residualA = A
         residualB = B
-        
+
         torch.testing.assert_close(old.input_layernorm.weight, new.input_layernorm.weight)
         A = old.input_layernorm(A)
         B = new.input_layernorm(B)
@@ -1765,7 +1800,7 @@ def _test_same_model(model, new_model, input_ids):
         AA, _ = old.self_attn(A.clone(), attention_mask = None, position_embeddings = rotary_A)
         BB, _ = new.self_attn(B.clone(), attention_mask = None, position_embeddings = rotary_B)
         torch.testing.assert_close(AA, BB, rtol = 0.01, atol = 0.005)
-        
+
         torch.testing.assert_close(df(old.self_attn.q_proj), df(new.self_attn.q_proj))
         torch.testing.assert_close(df(old.self_attn.k_proj), df(new.self_attn.k_proj))
         torch.testing.assert_close(df(old.self_attn.v_proj), df(new.self_attn.v_proj))
@@ -2008,7 +2043,7 @@ def test_get_vllm_state_dict():
     # All Unsloth Zoo code licensed under LGPLv3
     patch_vllm()
 
-    free_memory, total_memory = torch.cuda.mem_get_info()
+    free_memory, total_memory = get_mem_info()
 
     model_names = [
         ("unsloth/Llama-3.2-1B-Instruct-bnb-4bit", 100,),
