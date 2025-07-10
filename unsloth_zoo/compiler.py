@@ -634,15 +634,7 @@ pass
 
 
 def mask_attention_mask_out(labels = None, attention_mask = None):
-    print(1)
-    print(1)
     if labels is not None and attention_mask is not None:
-        print(attention_mask, attention_mask.device, attention_mask.shape)
-        print(labels, labels.device, labels.shape)
-        print(attention_mask, attention_mask.device, attention_mask.shape)
-        print(labels, labels.device, labels.shape)
-        print(attention_mask, attention_mask.device, attention_mask.shape)
-        print(labels, labels.device, labels.shape)
         attention_mask = attention_mask.to(device = labels.device)
         labels[attention_mask == 0] = -100
     return labels
@@ -1218,8 +1210,8 @@ def apply_mask_attention_mask_out(source):
     if not len(re.findall(r"labels[\s]{0,}\=labels[\s]{0,}\,\n", source)): return source
     if "ForConditionalGeneration" in source:
         source = re.sub(
-            r"attention_mask[\s]{0,}\=attention_mask[\s]{0,}\,\n",
-            "attention_mask=mask_attention_mask_out(labels = labels, attention_mask = attention_mask),\n",
+            r"labels[\s]{0,}\=labels[\s]{0,}\,\n",
+            "labels=mask_attention_mask_out(labels = labels, attention_mask = attention_mask),\n",
             source,
         )
     return source
