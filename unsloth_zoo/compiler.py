@@ -411,6 +411,8 @@ def create_new_function(
                 if versioning[:versioning.find('__UNSLOTH_VERSIONING__')] != versions:
                     overwrite = True
     pass
+    if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
+        overwrite = False
 
     # Check location
     def write_file(function_location, write_new_source):
@@ -1251,7 +1253,7 @@ pass
 
 replace_gradient_checkpointing = """
 for LAYER in MODULELIST_ITEM:
-$if self.gradient_checkpointing and self.training:
+$if self.gradient_checkpointing and self.training and hasattr(self, "_gradient_checkpointing_func"):
 $    hidden_states = self._gradient_checkpointing_func(
 $        LAYER.__call__, ARGS
 $    )
