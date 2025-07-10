@@ -634,7 +634,13 @@ pass
 
 
 def mask_attention_mask_out(labels = None, attention_mask = None):
+    print(1)
+    print(1)
     if labels is not None and attention_mask is not None:
+        print(attention_mask, attention_mask.device, attention_mask.shape)
+        print(labels, labels.device, labels.shape)
+        print(attention_mask, attention_mask.device, attention_mask.shape)
+        print(labels, labels.device, labels.shape)
         print(attention_mask, attention_mask.device, attention_mask.shape)
         print(labels, labels.device, labels.shape)
         attention_mask = attention_mask.to(device = labels.device)
@@ -1255,7 +1261,7 @@ pass
 
 replace_gradient_checkpointing = """
 for LAYER in MODULELIST_ITEM:
-$if self.gradient_checkpointing and self.training and hasattr(self, "_gradient_checkpointing_func"):
+$if self.gradient_checkpointing and self.training:
 $    hidden_states = self._gradient_checkpointing_func(
 $        LAYER.__call__, ARGS
 $    )
