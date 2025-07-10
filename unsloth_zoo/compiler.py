@@ -635,6 +635,8 @@ pass
 
 def mask_attention_mask_out(labels = None, attention_mask = None):
     if labels is not None and attention_mask is not None:
+        print(attention_mask, attention_mask.device, attention_mask.shape)
+        print(labels, labels.device, labels.shape)
         attention_mask = attention_mask.to(device = labels.device)
         labels[attention_mask == 0] = -100
     return labels
