@@ -220,7 +220,7 @@ def verify_and_set_device(module,):
     if len(set_of_devices) > 1:
         raise ValueError(f"Unsloth: All parameters of {module} should be on the same device")
     device = set_of_devices.pop()
-    module._per_layer_device = device
+    module._per_layer_device_index = device.index
 pass
 
 def patch_model_and_tokenizer(
