@@ -135,8 +135,8 @@ import os
 import torch
 from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
-    compiled_ce_loss_function,
-    compiled_fused_ce_loss_function,
+    unsloth_compiled_ce_loss_function,
+    unsloth_compiled_fused_ce_loss_function,
 )
 
 if UNSLOTH_STUDIO_ENABLED:
@@ -712,10 +712,10 @@ else:
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
-    _hidden_states = hidden_states\\1.to(lm_head_weight.device)
+    _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
-    loss = compiled_fused_ce_loss_function(
+    loss = unsloth_compiled_fused_ce_loss_function(
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
@@ -732,7 +732,7 @@ else:
     # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
     # torch._dynamo.mark_dynamic(logits, 1)
     # torch._dynamo.mark_dynamic(labels, 1)
-    # loss = compiled_ce_loss_function(
+    # loss = unsloth_compiled_ce_loss_function(
     #     output_logits        = logits,
     #     output_labels        = labels,
     #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
@@ -827,10 +827,10 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
-    _hidden_states = hidden_states\\1.to(lm_head_weight.device)
+    _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
-    loss = compiled_fused_ce_loss_function(
+    loss = unsloth_compiled_fused_ce_loss_function(
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
@@ -848,7 +848,7 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
     # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
     # torch._dynamo.mark_dynamic(logits, 1)
     # torch._dynamo.mark_dynamic(labels, 1)
-    # loss = compiled_ce_loss_function(
+    # loss = unsloth_compiled_ce_loss_function(
     #     output_logits        = logits,
     #     output_labels        = labels,
     #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
@@ -924,12 +924,12 @@ else:
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
-    _hidden_states = hidden_states\\1.to(lm_head_weight.device)
+    _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
         torch._dynamo.mark_dynamic(attention_mask, 1)
-    loss = compiled_fused_ce_loss_function(
+    loss = unsloth_compiled_fused_ce_loss_function(
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
@@ -949,7 +949,7 @@ else:
     # torch._dynamo.mark_dynamic(labels, 1)
     # if attention_mask is not None:
     #     torch._dynamo.mark_dynamic(attention_mask, 1)
-    # loss = compiled_ce_loss_function(
+    # loss = unsloth_compiled_ce_loss_function(
     #     output_logits        = logits,
     #     output_labels        = labels,
     #     logit_scale_multiply = (\\2) if (\\2) != () else 0,

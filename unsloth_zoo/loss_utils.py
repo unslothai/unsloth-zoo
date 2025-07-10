@@ -63,8 +63,8 @@ __all__ = [
     "fused_linear_cross_entropy",
     "fast_linear_cross_entropy",
     "_unsloth_get_batch_samples",
-    "compiled_fused_ce_loss_function",
-    "compiled_ce_loss_function",
+    "unsloth_compiled_fused_ce_loss_function",
+    "unsloth_compiled_ce_loss_function",
 ]
 
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
@@ -315,7 +315,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 pass
 
 
-def compiled_ce_loss_function(
+def unsloth_compiled_ce_loss_function(
     output_logits : torch.Tensor,
     output_labels : torch.Tensor,
     logit_scale_multiply : float = 0,
@@ -368,15 +368,15 @@ def compiled_ce_loss_function(
         loss = loss / (shift_labels != -100).sum()
     return loss
 pass
-compiled_ce_loss_function = torch.compile(
-    compiled_ce_loss_function,
+unsloth_compiled_ce_loss_function = torch.compile(
+    unsloth_compiled_ce_loss_function,
     fullgraph = False,
     dynamic = True,
     options = torch_compile_options,
 )
 
 
-def compiled_fused_ce_loss_function(
+def unsloth_compiled_fused_ce_loss_function(
     hidden_states : torch.Tensor,
     lm_head_weight : torch.Tensor,
     lm_head_bias : torch.Tensor,
@@ -416,7 +416,7 @@ def compiled_fused_ce_loss_function(
     for (_shift_states, _shift_labels) in zip(__shift_states, __shift_labels):
 
         _shift_logits = torch.nn.functional.linear(
-            _shift_states,
+            _shift_states.to(lm_head_weight.device),
             lm_head_weight,
             lm_head_bias,
         )
@@ -444,8 +444,8 @@ def compiled_fused_ce_loss_function(
         loss = loss / (shift_labels != -100).sum()
     return loss
 pass
-compiled_fused_ce_loss_function = torch.compile(
-    compiled_fused_ce_loss_function,
+unsloth_compiled_fused_ce_loss_function = torch.compile(
+    unsloth_compiled_fused_ce_loss_function,
     fullgraph = False,
     dynamic = True,
     options = torch_compile_options,
