@@ -1252,6 +1252,7 @@ pass
 
 
 replace_gradient_checkpointing = """
+KWARGS_OPTIONAL
 for LAYER in MODULELIST_ITEM:
 $if self.gradient_checkpointing and self.training:
 $    hidden_states = self._gradient_checkpointing_func(
@@ -1289,6 +1290,11 @@ def patch_gradient_checkpointing(module, source):
     replacer = replace_gradient_checkpointing.strip()
 
     # Gradient checkpointing calling must remove arg=arg convention
+
+    # We first see if **kwargs is present, and we move it into kwargs
+    if "**kwargs" in args:
+        kwargs_move = re.findall(r"([^\s]{1,})[\s]?\=[\s]?\1", args)
+        print(kwargs_move)
     args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
 
     replacer = replacer\
