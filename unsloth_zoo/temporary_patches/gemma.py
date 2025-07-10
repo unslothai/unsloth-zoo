@@ -365,8 +365,8 @@ def patch_Gemma3Attention():
 
         # 6. Core Attention mechanism (SDPA) in fp32
         attn_mask_for_sdpa = attention_mask
-        # if attn_mask_for_sdpa is not None:
-        #     attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
+        if attn_mask_for_sdpa is not None and attn_mask_for_sdpa.dtype != torch.bool:
+            attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
         return (
             query_states_fp32.contiguous(),
             key_states_fp32.contiguous(),
@@ -409,6 +409,7 @@ def patch_Gemma3Attention():
 
         # 2. Upcast Q, K, V for norm and RoPE, and then transpose for attention
         # (bsz, num_specific_heads, q_len, head_dim)
+        """ ####### REPLACED WITH TORCH_COMPILED_MODULE
         query_states_fp32 = query_states_fp16.view(query_hidden_shape).to(torch.float32).transpose(1, 2)
         key_states_fp32   = key_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2)
         value_states_fp32 = value_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2) # V for attention also fp32
@@ -428,25 +429,25 @@ def patch_Gemma3Attention():
         cos_fp32 = cos.to(torch.float32)
         sin_fp32 = sin.to(torch.float32)
         query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos = cos_fp32, sin = sin_fp32)
-
-        # (
-        #     query_states_fp32,
-        #     key_states_fp32,
-        #     value_states_fp32,
-        #     cos_fp32,
-        #     sin_fp32,
-        #     attn_mask_for_sdpa,
-        # ) = prepare(
-        #     self,
-        #     hidden_states,
-        #     query_states_fp16,
-        #     key_states_fp16,
-        #     value_states_fp16,
-        #     query_hidden_shape,
-        #     kv_hidden_shape,
-        #     position_embeddings,
-        #     attention_mask,
-        # )
+        """
+        (
+            query_states_fp32,
+            key_states_fp32,
+            value_states_fp32,
+            cos_fp32,
+            sin_fp32,
+            attn_mask_for_sdpa,
+        ) = prepare(
+            self,
+            hidden_states,
+            query_states_fp16,
+            key_states_fp16,
+            value_states_fp16,
+            query_hidden_shape,
+            kv_hidden_shape,
+            position_embeddings,
+            attention_mask,
+        )
 
         # 5. KV Cache update (using fp32 K, V)
         if past_key_value is not None:
@@ -461,10 +462,11 @@ def patch_Gemma3Attention():
             )
 
         # 6. Core Attention mechanism (SDPA) in fp32
+        """ ####### REPLACED WITH TORCH_COMPILED_MODULE
         attn_mask_for_sdpa = attention_mask
         if attn_mask_for_sdpa is not None and attn_mask_for_sdpa.dtype != torch.bool:
             attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
-
+        """
         # output_attentions = kwargs.get("output_attentions", False)
         is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
         # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
