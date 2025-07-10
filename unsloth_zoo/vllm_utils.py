@@ -865,7 +865,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     from bitsandbytes.nn.modules import Linear4bit, Params4bit
     from torch.nn.modules import Linear
 
-    model_prefix = "model" if not hasattr(config, "vision_config") else "model.language_model"
+    model_type = config.model_type
+
+    model_prefix = "model.language_model" if model_type == "mllama" else "model"
     layer_names = [
         "{model_prefix}.layers.{kk}.self_attn.q_proj",
         "{model_prefix}.layers.{kk}.self_attn.k_proj",
@@ -952,17 +954,19 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         pass
     pass
 
+    text_model = new_model.language_model if model_type == "mllama" else new_model.model
+
     # Norm
     norm = quant_state_dict["model.norm.weight"]
     norm = torch.nn.Parameter(norm, requires_grad = False)
-    eval(f"new_model.{model_prefix}.norm.weight = norm")
+    text_model.norm.weight = norm
 
     # Embeddings
-    eval(f"new_model.{model_prefix}.embed_tokens = torch.nn.Embedding.from_pretrained(
+    text_model.embed_tokens = torch.nn.Embedding.from_pretrained( \
         quant_state_dict['model.embed_tokens.weight'],
         freeze = True,
         padding_idx = config.pad_token_id,
-    )")
+    )
 
     # LM Head
     if getattr(config, "tie_word_embeddings", False):
@@ -995,7 +999,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     new_model.config = config
 
     # Fix up rotary_emb by re-initing them
-    device = "xpu:0" if DEVICE_TYPE == "xpu" else "cuda:0"
     for module in new_model.modules():
         if hasattr(module, "rotary_emb"):
             module.rotary_emb = module.rotary_emb.__class__(
