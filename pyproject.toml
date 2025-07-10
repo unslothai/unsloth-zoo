@@ -44,6 +44,7 @@ dependencies = [
     "pillow",
     "regex",
     "msgspec",
+    "typing_extensions",
 ]
 
 [tool.setuptools.dynamic]
