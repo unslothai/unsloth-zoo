@@ -192,6 +192,36 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     pass
 pass
 
+def get_model(model):
+    found_layers = False
+    x = model
+    while True:
+        if hasattr(x, "layers"):
+            found_layers = True
+            break
+        elif hasattr(x, "model"):
+            x = x.model
+        elif hasattr(x, "base_model"):
+            x = x.base_model
+        elif hasattr(x, "language_model"):
+            x = x.language_model
+        else:
+            break
+    pass
+    return x, found_layers
+pass
+
+
+def verify_and_set_device(module,):
+    """
+    Verify that all parameters of a module are on the same device.
+    """
+    set_of_devices = set(x.device for x in module.parameters())
+    if len(set_of_devices) > 1:
+        raise ValueError(f"Unsloth: All parameters of {module} should be on the same device")
+    device = set_of_devices.pop()
+    module._per_layer_device_index = device.index
+pass
 
 def patch_model_and_tokenizer(
     model,
@@ -393,6 +423,13 @@ def patch_model_and_tokenizer(
     # Must tie lm_head and embed_tokens if they are tied!
     # Otherwise error will occur on saving models ie use save_model
     if is_tied: model.tie_weights()
+
+    # For pipeline parallel models, we need to set the device for each layer for easier access later
+    x, found_layers = get_model(model)
+    if found_layers:
+        for layer in x.layers:
+            verify_and_set_device(layer)
+    pass
 
     # Clear deleted GPU items
     for _ in range(3):
