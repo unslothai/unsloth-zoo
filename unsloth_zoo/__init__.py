@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.7.1"
+__version__ = "2025.7.2"
 
 import os
 # Hugging Face Hub faster downloads
@@ -55,6 +55,7 @@ pass
 if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
     os.environ["TRITON_ENABLE_LLVM_DEBUG"] = "1" # Lots of debugging info
     os.environ["TRITON_INTERPRET"] = "1" # Can add print statements!
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1" # Blocking calls for debugging
 pass
 
 
