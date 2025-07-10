@@ -1266,7 +1266,25 @@ custom_gradient_checkpointing_replacements = [
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb=None,
                 position_embeddings=position_embeddings,
-                **kwargs,)""",
+                **kwargs,
+            )""",
+    ),
+    (
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                **kwargs,
+            )""",
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb=None,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                **kwargs,
+            )""",
     )
 ]
 replace_gradient_checkpointing = """
