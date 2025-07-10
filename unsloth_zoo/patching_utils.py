@@ -216,7 +216,7 @@ def verify_and_set_device(module,):
     """
     Verify that all parameters of a module are on the same device.
     """
-    set_of_devices = set([x.device for x in module.parameters()])
+    set_of_devices = set(x.device for x in module.parameters())
     if len(set_of_devices) > 1:
         raise ValueError(f"Unsloth: All parameters of {module} should be on the same device")
     device = set_of_devices.pop()
