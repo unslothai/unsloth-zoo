@@ -161,7 +161,6 @@ def patch_Gemma3ForConditionalGeneration():
     except:
         return
     from transformers.models.gemma3.modeling_gemma3 import (
-        HybridCache,
         Gemma3CausalLMOutputWithPast,
         logger,
         is_torchdynamo_compiling,
@@ -410,12 +409,13 @@ TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration)
 
 def patch_Gemma3ForConditionalGeneration_causal_mask():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try: import transformers.models.gemma3.modeling_gemma3
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        import transformers.cache_utils
     except: return
-    from transformers.models.gemma3.modeling_gemma3 import (
-        StaticCache,
-        HybridCache,
-    )
+    from transformers.models.gemma3.modeling_gemma3 import StaticCache
+    from transformers.cache_utils import HybridCache
+    
     def _update_causal_mask(
         self,
         attention_mask,
