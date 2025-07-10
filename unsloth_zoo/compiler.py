@@ -1294,12 +1294,17 @@ def patch_gradient_checkpointing(module, source):
     # We first see if **kwargs is present, and we move it into kwargs
     if "**kwargs" in args:
         kwargs_move = re.findall(r"([^\s]{1,})[\s]?\=[\s]?\1", args)
-        print(kwargs_move)
-    args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
+        KWARGS_OPTIONAL = "\n".join(f"kwargs["{x}"] = x" for x in kwargs_move)
+        KWARGS_OPTIONAL = "\n" + KWARGS_OPTIONAL + "\n"
+        args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1\,", r"", args)
+    else:
+        KWARGS_OPTIONAL = ""
+        args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
 
     replacer = replacer\
         .replace("LAYER", layer).replace("MODULELIST_ITEM", modulelist_item)\
-        .replace("ARGS", args).replace("$", spaces)
+        .replace("ARGS", args).replace("$", spaces)\
+        .replace(KWARGS_OPTIONAL, KWARGS_OPTIONAL)
     forward = forward.replace(forward[span[0] : span[1]], replacer)
 
     # Also fix init
