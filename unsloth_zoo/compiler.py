@@ -1251,9 +1251,25 @@ def convert_attention_masks_to_bool(module, old_source):
 pass
 
 
+# We need to manually replace some items
+# For example HF 4.53.1 breaks Qwen2VL since None wasn't provided
+custom_gradient_checkpointing_replacements = [
+    (
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb=None,
+                position_embeddings=position_embeddings,
+                **kwargs,)""",
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                **kwargs,)""",
+    )
+]
 replace_gradient_checkpointing = """
 for LAYER in MODULELIST_ITEM:
-$KWARGS_OPTIONAL
 $if self.gradient_checkpointing and self.training:
 $    hidden_states = self._gradient_checkpointing_func(
 $        LAYER.__call__, ARGS
@@ -1269,6 +1285,11 @@ def patch_gradient_checkpointing(module, source):
     try: forward = inspect.getsource(source.forward)
     except: return None
     if "_gradient_checkpointing_func" in forward: return None
+
+    # Fix Qwen2 missing None for gradient checkpointing
+    for custom_find, custom_replace in custom_gradient_checkpointing_replacements:
+        forward = forward.replace(custom_find, custom_replace)
+    pass
 
     # No gradient checkpointing?
     modulelist_items = re.findall(r"(self\.[^\s]{1,}) = .*?nn\.ModuleList\(", init)
@@ -1290,19 +1311,9 @@ def patch_gradient_checkpointing(module, source):
     replacer = replace_gradient_checkpointing.strip()
 
     # Gradient checkpointing calling must remove arg=arg convention
-
-    # We first see if **kwargs is present, and we move it into kwargs
-    if "**kwargs" in args:
-        kwargs_move = re.findall(r"([^\s]{1,})[\s]?\=[\s]?\1", args)
-        KWARGS_OPTIONAL = "\n".join(f"$kwargs['{x}'] = {x}" for x in kwargs_move)
-        KWARGS_OPTIONAL = "\n" + KWARGS_OPTIONAL + "\n"
-        args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1\,", r"", args)
-    else:
-        KWARGS_OPTIONAL = ""
-        args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
+    args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
 
     replacer = replacer\
-        .replace("KWARGS_OPTIONAL", KWARGS_OPTIONAL)\
         .replace("LAYER", layer).replace("MODULELIST_ITEM", modulelist_item)\
         .replace("ARGS", args).replace("$", spaces)
     forward = forward.replace(forward[span[0] : span[1]], replacer)
@@ -1350,6 +1361,7 @@ def patch_finfo_attention_mask_dtype_mismatch(module, source):
         return source.replace(indented_old, indented_new)
     except:
         return source
+pass
 
 # Torch.compiling makes things slower - rather just leave it as addmm
 COMPILED_LORA_FORWARD = """
