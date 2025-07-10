@@ -35,6 +35,7 @@ import time
 import logging
 import tempfile
 import sys
+import textwrap
 from .utils import (
     Version,
     is_main_process,
@@ -1229,6 +1230,43 @@ def patch_gradient_checkpointing(module, source):
     return init, forward
 pass
 
+DTYPE_MISMATCH_FIND = """
+attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+"""
+
+DTYPE_MISMATCH_REPLACE = """
+if attention_mask_tensor.dtype == torch.bool:
+    attention_mask_tensor = attention_mask_tensor.int()
+elif torch.is_floating_point(attention_mask_tensor):
+    attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+    attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+"""
+
+def patch_finfo_attention_mask_dtype_mismatch(module, source):
+    try:
+        old_block = textwrap.dedent(DTYPE_MISMATCH_FIND).strip()
+        new_block = textwrap.dedent(DTYPE_MISMATCH_REPLACE).strip()
+        if not old_block or not new_block:
+            return source
+
+        first_line = old_block.split('\n')[0]
+        if not first_line:
+            return source
+
+        for line in source.split('\n'):
+            if first_line in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                break
+        else:
+            return source
+
+        indented_old = textwrap.indent(old_block, indent)
+        indented_new = textwrap.indent(new_block, indent)
+
+        return source.replace(indented_old, indented_new)
+    except:
+        return source
 
 # Torch.compiling makes things slower - rather just leave it as addmm
 COMPILED_LORA_FORWARD = """
@@ -2098,6 +2136,32 @@ def unsloth_compile_transformers(
             )
             all_standalone_classes[module] = new_module
             print(f"Unsloth: Patched {module} by adding gradient checkpointing")
+        pass
+    pass
+
+    # torch.finfo fix for transformers > 4.52.4 affect qwen2vl, qwen25vl, and glm4vl
+    for module in other_classes:
+        if module in all_standalone_classes:
+            source = all_standalone_classes[module]
+        else:
+            module_cls = eval(f"{model_location}.{module}")
+            if hasattr(module_cls, "forward"):
+                source = inspect.getsource(module_cls.forward)
+            else:
+                continue
+            new_source = patch_finfo_attention_mask_dtype_mismatch(module, source)
+            if new_source != source:
+                new_module = create_standalone_class(
+                    module,
+                    model_location,
+                    functions,
+                    fullgraph = False,
+                    disable = True,
+                    forward_source = new_source,
+                )
+                all_standalone_classes[module] = new_module
+                print(f"Unsloth: Patched {module} by fixing finfo dtype mismatch in attention mask")
+            pass
         pass
     pass
 
