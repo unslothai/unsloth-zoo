@@ -1294,7 +1294,7 @@ def patch_gradient_checkpointing(module, source):
     # We first see if **kwargs is present, and we move it into kwargs
     if "**kwargs" in args:
         kwargs_move = re.findall(r"([^\s]{1,})[\s]?\=[\s]?\1", args)
-        KWARGS_OPTIONAL = "\n".join(f"kwargs["{x}"] = x" for x in kwargs_move)
+        KWARGS_OPTIONAL = "\n".join(f"kwargs['{x}'] = x" for x in kwargs_move)
         KWARGS_OPTIONAL = "\n" + KWARGS_OPTIONAL + "\n"
         args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1\,", r"", args)
     else:
