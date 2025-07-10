@@ -426,8 +426,7 @@ def patch_Gemma3Attention():
             enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
         )
         attn_output = attn_output.transpose(1, 2).contiguous()
-        
-        # attn_weights = None # Defaulting to None
+        attn_weights = None # Defaulting to None
         # attn_output, attn_weights = attention_interface(
         #     self,
         #     query_states,
