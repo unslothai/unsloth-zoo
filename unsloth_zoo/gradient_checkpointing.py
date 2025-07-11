@@ -780,7 +780,7 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None):
         torch.utils.checkpoint.CheckpointFunction = UnslothCheckpointFunction
 
     if torch.utils.checkpoint.checkpoint.__name__ != "unsloth_checkpoint":
-        torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint
+        torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
         torch.utils.checkpoint.checkpoint = unsloth_checkpoint
 pass
 
@@ -803,9 +803,9 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         GPU_BUFFERS = None
 
     if (torch.utils.checkpoint.checkpoint.__name__ == "unsloth_checkpoint") and \
-        hasattr(torch.utils, "_old_checkpoint"):
+        hasattr(torch.utils.checkpoint, "_old_checkpoint"):
 
-        torch.utils.checkpoint = torch.utils._old_checkpoint
+        torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
 pass
 
 
