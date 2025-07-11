@@ -793,8 +793,11 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         torch.utils.checkpoint.CheckpointFunction = torch.utils.checkpoint._old_CheckpointFunction
         global CPU_BUFFERS
         global GPU_BUFFERS
-        for i in range(len(CPU_BUFFERS)): CPU_BUFFERS[i] = None
-        for i in range(len(GPU_BUFFERS)): GPU_BUFFERS[i] = None
+        for i in range(len(CPU_BUFFERS)):
+            if hasattr(CPU_BUFFERS[i], "resize_"): CPU_BUFFERS[i].resize_(0)
+            if hasattr(GPU_BUFFERS[i], "resize_"): GPU_BUFFERS[i].resize_(0)
+            if type(CPU_BUFFERS) is list: CPU_BUFFERS[i] = None
+            if type(GPU_BUFFERS) is list: GPU_BUFFERS[i] = None
         CPU_BUFFERS = None
         GPU_BUFFERS = None
 
