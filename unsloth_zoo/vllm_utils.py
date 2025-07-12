@@ -673,7 +673,6 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
         pass
     pass
 
-    print(f'Unsloth: vllm internals: {vllm_internals}')
     # Embedding
     if hasattr(vllm_internals, "model"):
         vllm_internal_model = vllm_internals.model
@@ -798,7 +797,7 @@ pass
 
 
 @torch.inference_mode
-def create_empty_causal_lm(config, dtype = torch.float16):
+def create_empty_causal_lm(quant_state_dict, config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     # Empty model from config
     new_config = deepcopy(config)
@@ -817,12 +816,41 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         new_config,
         attn_implementation = "eager",
     )
-    return new_model
+
+    layer_names = [
+        "model.layers.{kk}.self_attn.q_proj",
+        "model.layers.{kk}.self_attn.k_proj",
+        "model.layers.{kk}.self_attn.v_proj",
+        "model.layers.{kk}.self_attn.o_proj",
+        "model.layers.{kk}.mlp.gate_proj",
+        "model.layers.{kk}.mlp.up_proj",
+        "model.layers.{kk}.mlp.down_proj",
+        "model.layers.{kk}.input_layernorm",
+        "model.layers.{kk}.post_attention_layernorm",
+        "model.layers.{kk}.pre_feedforward_layernorm", # Gemma3
+        "model.layers.{kk}.post_feedforward_layernorm", # Gemma3
+        "model.layers.{kk}.self_attn.q_norm", # Qwen3, Gemma3
+        "model.layers.{kk}.self_attn.k_norm", # Qwen3, Gemma3
+    ]
+
+    # Norm
+    norm = quant_state_dict["model.norm.weight"]
+    norm = torch.nn.Parameter(norm, requires_grad = False)
+    exec(norm_setter)
+
+    # Embeddings
+    new_model.model.embed_tokens = torch.nn.Embedding.from_pretrained(
+        quant_state_dict["model.embed_tokens.weight"],
+        freeze = True,
+        padding_idx = config.pad_token_id,
+    )
+
+    return new_model, layer_names, config.num_hidden_layers
 pass
 
 
 @torch.inference_mode
-def create_empty_qwen2_5_vl(config, dtype = torch.float16):
+def create_empty_qwen2_5_vl(quant_state_dict, config, dtype = torch.float16):
     from transformers import Qwen2_5_VLForConditionalGeneration
     new_config = deepcopy(config)
     new_config.num_hidden_layers = 1
@@ -833,12 +861,39 @@ def create_empty_qwen2_5_vl(config, dtype = torch.float16):
     new_config.vision_config.intermediate_size = 0
     new_config.vision_config.out_hidden_size = 1
 
-    new_model = Qwen2_5_VLForConditionalGeneration.from_config(new_config)
-    return new_model
+    new_model = Qwen2_5_VLForConditionalGeneration(new_config)
+
+    layer_names = [
+        "model.language_model.layers.{kk}.self_attn.q_proj",
+        "model.language_model.layers.{kk}.self_attn.k_proj",
+        "model.language_model.layers.{kk}.self_attn.v_proj",
+        "model.language_model.layers.{kk}.self_attn.o_proj",
+        "model.vision_model.layers.{kk}.mlp.gate_proj",
+        "model.vision_model.layers.{kk}.mlp.up_proj",
+        "model.vision_model.layers.{kk}.mlp.down_proj",
+        "model.vision_model.layers.{kk}.input_layernorm",
+        "model.layers.{kk}.input_layernorm",
+        "model.layers.{kk}.post_attention_layernorm",
+
+        "model.visual.blocks.{kk}.norm1",
+        "model.visual.blocks.{kk}.norm2",
+        "model.visual.blocks.{kk}.attn.qkv",
+        "model.visual.blocks.{kk}.attn.proj",
+        "model.visual.blocks.{kk}.mlp.gate_proj",
+        "model.visual.blocks.{kk}.mlp.up_proj",
+        "model.visual.blocks.{kk}.mlp.down_proj",
+
+        "model.merger.ln_q",
+        "model.merger.mlp.0",
+        "model.merger.mlp.2",
+    ]
+
+    layers = max(config.num_hidden_layers, config.text_config.num_hidden_layers, config.vision_config.depth)
+    return new_model, layer_names, layers
 pass
 
 @torch.inference_mode
-def create_empty_mllama(config, dtype = torch.float16):
+def create_empty_mllama(quant_state_dict, config, dtype = torch.float16):
     from transformers import MllamaForConditionalGeneration
     new_config = deepcopy(config)
 
@@ -854,18 +909,97 @@ def create_empty_mllama(config, dtype = torch.float16):
     new_config.vision_config.num_global_layers = 1
     new_config.vision_config.vision_output_dim = 1
 
-    new_model = MllamaForConditionalGeneration.from_config(new_config)
+    new_model = MllamaForConditionalGeneration(new_config)
 
-    return new_model
+    layer_names = [
+        "model.language_model.layers.{kk}.self_attn.q_proj",
+        "model.language_model.layers.{kk}.self_attn.k_proj",
+        "model.language_model.layers.{kk}.self_attn.v_proj",
+        "model.language_model.layers.{kk}.self_attn.o_proj",
+        "model.language_model.layers.{kk}.mlp.gate_proj",
+        "model.language_model.layers.{kk}.mlp.up_proj",
+        "model.language_model.layers.{kk}.mlp.down_proj",
+        "model.language_model.layers.{kk}.self_attn.q_norm",
+        "model.language_model.layers.{kk}.self_attn.k_norm",
+        "model.language_model.layers.{kk}.input_layernorm",
+        "model.language_model.layers.{kk}.post_attention_layernorm",
+    ]
+
+    base_layer_names = [
+        "model.vision_model.{module}.layers.{kk}.self_attn.q_proj",
+        "model.vision_model.{module}.layers.{kk}.self_attn.k_proj",
+        "model.vision_model.{module}.layers.{kk}.self_attn.v_proj",
+        "model.vision_model.{module}.layers.{kk}.self_attn.o_proj",
+        "model.vision_model.{module}.layers.{kk}.mlp.fc1",
+        "model.vision_model.{module}.layers.{kk}.mlp.fc2",
+        "model.vision_model.{module}.layers.{kk}.input_layernorm",
+        "model.vision_model.{module}.layers.{kk}.post_attention_layernorm",
+    ]
+    modules = ["transformer", "global_transformer"]
+    additional_layer_names = [
+        name.replace("{module}", module)
+        for module in modules
+        for name in base_layer_names
+    ]
+    layer_names.extend(additional_layer_names)
+    num_layers = max(config.text_config.num_hidden_layers, config.vision_config.num_hidden_layers)
+    return new_model, layer_names, num_layers
+pass
+
+def create_empty_gemma3(quant_state_dict, config, dtype = torch.float16):
+    from transformers import Gemma3ForConditionalGeneration
+    new_config = deepcopy(config)
+
+    new_config.text_config.num_hidden_layers = 1
+    new_config.text_config.num_attention_heads = 1
+    new_config.text_config.intermediate_size = 0
+    new_config.vision_config.num_hidden_layers = 1
+
+    new_config.vision_config.num_attention_heads = 1
+    new_config.vision_config.intermediate_size = 0
+    new_config.vision_config.num_global_layers = 1
+    new_config.vision_config.vision_output_dim = 1
+
+    new_model = Gemma3ForConditionalGeneration(new_config)
+
+    layer_names = [
+        "model.language_model.layers.{kk}.self_attn.q_proj",
+        "model.language_model.layers.{kk}.self_attn.k_proj",
+        "model.language_model.layers.{kk}.self_attn.v_proj",
+        "model.language_model.layers.{kk}.self_attn.o_proj",
+        "model.language_model.layers.{kk}.mlp.gate_proj",
+        "model.language_model.layers.{kk}.mlp.up_proj",
+        "model.language_model.layers.{kk}.mlp.down_proj",
+        "model.language_model.layers.{kk}.input_layernorm",
+        "model.language_model.layers.{kk}.post_attention_layernorm",
+        "model.language_model.layers.{kk}.pre_feedforward_layernorm",
+        "model.language_model.layers.{kk}.post_feedforward_layernorm",
+        "model.language_model.layers.{kk}.self_attn.q_norm",
+        "model.language_model.layers.{kk}.self_attn.k_norm",
+
+        "model.vision_tower.vision_model.encoder.layers.{kk}.self_attn.q_proj",
+        "model.vision_tower.vision_model.encoder.layers.{kk}.self_attn.k_proj",
+        "model.vision_tower.vision_model.encoder.layers.{kk}.self_attn.v_proj",
+        "model.vision_tower.vision_model.encoder.layers.{kk}.self_attn.out_proj",
+        "model.vision_tower.vision_model.encoder.layers.{kk}.post_layernorm",
+        "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc1",
+        "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc2",
+    ]
+
+    num_layers = max(config.text_config.num_hidden_layers, config.vision_config.num_hidden_layers)
+
+    return new_model, layer_names, num_layers
 pass
 
 @torch.inference_mode
-def create_empty_model(config, dtype = torch.float16):
+def create_empty_model(quant_state_dict, config, dtype = torch.float16):
     model_type = config.model_type
     if model_type == "mllama":
-        return create_empty_mllama(config, dtype)
+        return create_empty_mllama(quant_state_dict, config, dtype)
     elif model_type == "qwen2_5_vl":
-        return create_empty_qwen2_5_vl(config, dtype)
+        return create_empty_qwen2_5_vl(quant_state_dict, config, dtype)
+    elif model_type == "gemma3":
+        return create_empty_gemma3(quant_state_dict, config, dtype)
     else:
         return create_empty_causal_lm(config, dtype)
 pass
@@ -875,7 +1009,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
     config.update({"torch_dtype" : dtype}) # Do not use config file's dtype!
-    new_model = create_empty_model(config, dtype)
+    new_model, layer_names, layer_count = create_empty_model(quant_state_dict, config, dtype)
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
     quantization_config = getattr(config, "quantization_config", {})
     kwargs = dict()
@@ -898,24 +1032,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     from bitsandbytes.nn.modules import Linear4bit, Params4bit
     from torch.nn.modules import Linear
 
-    model_type = config.model_type
-
-    model_prefix = "model.language_model" if model_type == "mllama" else "model"
-    layer_names = [
-        "{model_prefix}.layers.{kk}.self_attn.q_proj",
-        "{model_prefix}.layers.{kk}.self_attn.k_proj",
-        "{model_prefix}.layers.{kk}.self_attn.v_proj",
-        "{model_prefix}.layers.{kk}.self_attn.o_proj",
-        "{model_prefix}.layers.{kk}.mlp.gate_proj",
-        "{model_prefix}.layers.{kk}.mlp.up_proj",
-        "{model_prefix}.layers.{kk}.mlp.down_proj",
-        "{model_prefix}.layers.{kk}.input_layernorm",
-        "{model_prefix}.layers.{kk}.post_attention_layernorm",
-        "{model_prefix}.layers.{kk}.pre_feedforward_layernorm", # Gemma3
-        "{model_prefix}.layers.{kk}.post_feedforward_layernorm", # Gemma3
-        "{model_prefix}.layers.{kk}.self_attn.q_norm", # Qwen3, Gemma3
-        "{model_prefix}.layers.{kk}.self_attn.k_norm", # Qwen3, Gemma3
-    ]
     layernorm_names = [
         "input_layernorm",
         "post_attention_layernorm",
@@ -932,10 +1048,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     pass
 
     skipped_layernorms = []
-    n_layers = config.num_hidden_layers if hasattr(config, "num_hidden_layers") else config.text_config.num_hidden_layers
-    for kk in range(n_layers):
+    for kk in range(layer_count):
         for layer_name in layer_names:
-            layer_name = layer_name.format(model_prefix = model_prefix, kk = kk)
+            layer_name = layer_name.format(kk = kk)
             if f"{layer_name}.weight" not in quant_state_dict:
                 skipped_layernorms.append(layer_name.split(".")[-1])
                 continue
@@ -955,6 +1070,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             if f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
+                n_layers = config.num_hidden_layers
                 layer = Linear4bit(0, 0, device = get_target_device(), bias = has_bias, compute_dtype = compute_dtype, **kwargs)
                 layer.in_features  = quant_state.shape[1]
                 layer.out_features = quant_state.shape[0]
@@ -983,20 +1099,12 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
             # Convert model.layers.0.self_attn.q_proj to model.layers[0].self_attn.q_proj
             layer_name = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
-            exec(f"new_model.model.language_model.{layer_name} = layer") if hasattr(new_model, "model") and hasattr(new_model.model, "language_model") else exec(f"new_model.{layer_name} = layer")
+            exec(f"new_model.{layer_name} = layer")
         pass
     pass
 
-    text_model = new_model.language_model if model_type == "mllama" else new_model.model
-
-    # Norm
-    norm = quant_state_dict["model.norm.weight"]
-    norm = torch.nn.Parameter(norm, requires_grad = False)
-    text_model.norm.weight = norm
-
-    # Embeddings
-    text_model.embed_tokens = torch.nn.Embedding.from_pretrained( \
-        quant_state_dict['model.embed_tokens.weight'],
+    new_model.model.embed_tokens = torch.nn.Embedding.from_pretrained(
+        quant_state_dict["model.embed_tokens.weight"],
         freeze = True,
         padding_idx = config.pad_token_id,
     )
@@ -1031,11 +1139,18 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         if hasattr(module, key): exec(f"module.{key} = {value}")
     new_model.config = config
 
+    rope_config = getattr(config, "text_config", config) #try using text config for VLMs
     # Fix up rotary_emb by re-initing them
     for module in new_model.modules():
         if hasattr(module, "rotary_emb"):
             module.rotary_emb = module.rotary_emb.__class__(
-                config = config.text_config if hasattr(config, "text_config") else config,
+                config = rope_config,
+                device = get_target_device(),
+            )
+        if hasattr(module, "rotary_emb_local"):
+            # gemma3 has a rotary_emb_local
+            module.rotary_emb_local = module.rotary_emb_local.__class__(
+                config = rope_config,
                 device = get_target_device(),
             )
         pass
