@@ -48,8 +48,9 @@ import inspect
 from functools import partial
 from .utils import _get_dtype
 from .patching_utils import patch_model_and_tokenizer
-from unsloth import DEVICE_TYPE
+# from unsloth import DEVICE_TYPE
 global LORA_REQUEST_ID
+DEVICE_TYPE = "cuda"
 
 # Ignore logging messages
 import logging
@@ -608,23 +609,37 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     # vllm_state_dict = {}
     try:
         llm_engine = getattr(llm, "llm_engine", getattr(llm, "engine", llm))
-        vllm_internals = llm_engine.model_executor.driver_worker.model_runner.model
+
+        # Check if it's a V1 engine
+        if hasattr(llm_engine, "engine_core"):
+            # V1 engine - check if it's InprocClient or MPClient
+            engine_core = llm_engine.engine_core
+            if hasattr(engine_core, "engine_core"):
+                # InprocClient - direct access to engine_core
+                vllm_internals = engine_core.engine_core.model_executor.driver_worker.model_runner.model
+            elif hasattr(llm_engine, "model_executor"):
+                # V1 engine with model_executor attribute (non-multiprocessing)
+                vllm_internals = llm_engine.model_executor.driver_worker.model_runner.model
+            else:
+                # Multiprocessing mode - no direct access to model
+                raise NotImplementedError(
+                    f"Unsloth: V1 engine multiprocessing mode is not supported for state dict extraction.\n"
+                    f"To fix this, you need to disable multiprocessing by setting the environment variable:\n"
+                    f"os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'\n"
+                    f"Alternatively, you can call patch_vllm() before loading the model:\n"
+                    f"from unsloth_zoo.vllm_utils import patch_vllm\n"
+                    f"patch_vllm()\n"
+                    f"Then recreate your vLLM model."
+                )
+        else:
+            # V0 engine structure
+            vllm_internals = llm_engine.model_executor.driver_worker.model_runner.model
 
         # for name, p in vllm_internals.named_parameters():
         #     vllm_state_dict[name] = p
-    except:
-        # Using a new VLLM version must use collective_rpc
-        try:
-            vllm_state_dict = {}
-            gpu_ids = llm.collective_rpc("report_device_id", args = tuple())
-            weights = llm.collective_rpc("get_weight_ipc_handles", args = tuple())[0]
-            weights = weights[gpu_ids[0]]
-            for weight_name, (to_cuda_fx, cuda_data,) in weights.items():
-                vllm_state_dict[weight_name] = to_cuda_fx(*cuda_data)
-            pass
-            raise NotImplementedError("Unsloth: Currently vLLM RPC is not yet fully enabled!")
-        except Exception as e:
-            raise RuntimeError(f"Unsloth: Cannot get internal vLLM states with error = {str(e)}")
+    except Exception as e:
+        # If we can't access the model directly, raise a more informative error
+        raise RuntimeError(f"Unsloth: Cannot access vLLM internal model. This might be due to a vLLM version incompatibility. Error: {str(e)}")
     pass
 
     assert(config is not None)
@@ -836,7 +851,7 @@ def create_empty_causal_lm(quant_state_dict, config, dtype = torch.float16):
     # Norm
     norm = quant_state_dict["model.norm.weight"]
     norm = torch.nn.Parameter(norm, requires_grad = False)
-    exec(norm_setter)
+    new_model.norm.weight = norm
 
     # Embeddings
     new_model.model.embed_tokens = torch.nn.Embedding.from_pretrained(
@@ -887,6 +902,11 @@ def create_empty_qwen2_5_vl(quant_state_dict, config, dtype = torch.float16):
         "model.merger.mlp.0",
         "model.merger.mlp.2",
     ]
+
+    # Norm
+    norm = quant_state_dict["model.language_model.norm.weight"]
+    norm = torch.nn.Parameter(norm, requires_grad = False)
+    new_model.model.langauage_model.norm.weight = norm
 
     layers = max(config.num_hidden_layers, config.text_config.num_hidden_layers, config.vision_config.depth)
     return new_model, layer_names, layers
@@ -942,6 +962,12 @@ def create_empty_mllama(quant_state_dict, config, dtype = torch.float16):
         for name in base_layer_names
     ]
     layer_names.extend(additional_layer_names)
+
+    # Norm
+    norm = quant_state_dict["model.language_model.norm.weight"]
+    norm = torch.nn.Parameter(norm, requires_grad = False)
+    new_model.model.langauage_model.norm.weight = norm
+
     num_layers = max(config.text_config.num_hidden_layers, config.vision_config.num_hidden_layers)
     return new_model, layer_names, num_layers
 pass
@@ -986,6 +1012,11 @@ def create_empty_gemma3(quant_state_dict, config, dtype = torch.float16):
         "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc2",
     ]
 
+    # Norm
+    norm = quant_state_dict["model.language_model.norm.weight"]
+    norm = torch.nn.Parameter(norm, requires_grad = False)
+    new_model.model.langauage_model.norm.weight = norm
+
     num_layers = max(config.text_config.num_hidden_layers, config.vision_config.num_hidden_layers)
 
     return new_model, layer_names, num_layers
@@ -1001,7 +1032,7 @@ def create_empty_model(quant_state_dict, config, dtype = torch.float16):
     elif model_type == "gemma3":
         return create_empty_gemma3(quant_state_dict, config, dtype)
     else:
-        return create_empty_causal_lm(config, dtype)
+        return create_empty_causal_lm(quant_state_dict, config, dtype)
 pass
 
 @torch.inference_mode
@@ -1194,11 +1225,13 @@ def approximate_vllm_memory_usage(
     n_layers = config.num_hidden_layers
     n_kv_heads = getattr(config, "num_key_value_heads", 1)
     n_heads    = getattr(config, "num_attention_heads", 1)
+    hs = getattr(config, "head_dim", hd//n_heads) # For gemma, hs*nh!=hd
     # Group Query Attention
-    kv_size = hd // n_heads * n_kv_heads
+    kv_size = hs * n_kv_heads
+    q_size = hs * n_heads
 
     # Modules
-    qkvo = hd + kv_size + kv_size + hd
+    qkvo = q_size + kv_size + kv_size + q_size
     qkvo = qkvo * hd
     mlp  = (hd * mlp_size) * 3
     layernorms = 2 * hd
@@ -1223,8 +1256,8 @@ def approximate_vllm_memory_usage(
     parameter_lora_elements = lora_elements*4
 
     # Activation memory - assume bsz=2
-    bsz = 2
-    activation_qkv  = max_seq_length * bsz * (hd + kv_size + kv_size)
+    bsz = 1 # vLLM profile step only assumes 1 sequence of max_model_len
+    activation_qkv  = max_seq_length * bsz * (q_size + kv_size + kv_size)
     residual_memory = (max_seq_length * bsz)*2
     activation_mlp  = max_seq_length * bsz * (mlp_size + mlp_size)
     weights = mlp_size * hd
@@ -1532,7 +1565,7 @@ def load_vllm(
         # max_seq_len_to_capture fails for V1
         # max_seq_len_to_capture = min(8192, max_seq_length + 256), # Default is 8192 for CUDAGraphs
         compilation_config     = compilation_config, # 0, 1, 2, 3
-        enforce_eager          = enforce_eager,
+        enforce_eager          = True,
         swap_space             = swap_space, # Low memory devices like Colab (13GB) default 4GB
         device                 = device,
         # New vLLM versions need to pass this in!
@@ -1566,6 +1599,7 @@ def load_vllm(
             pass
             break
         except Exception as error:
+            print(f"Error occured loading vLLM: {error}")
             trials += 1
             # Cleanup
             for _ in range(3):
@@ -1573,7 +1607,7 @@ def load_vllm(
                 torch.cuda.empty_cache()
             pass
             error = str(error)
-            if trials >= 2:
+            if trials >= 0:
                 raise RuntimeError(error)
 
             if "gpu_memory_utilization" in error or "memory" in error:
@@ -2052,6 +2086,7 @@ def _test_get_vllm_state_dict(
     conservativeness = 1.0,
     float8_kv_cache = False,
     unsloth_vllm_standby = False,
+    load_in_4bit = False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if model is allowed to be used in vLLM
@@ -2097,16 +2132,18 @@ def _test_get_vllm_state_dict(
         param.requires_grad_(False)
     model, _ = patch_model_and_tokenizer(model, None)
 
+    # Patch vLLM to disable multiprocessing for state dict extraction
+    patch_vllm()
+
     llm = load_vllm(
         model_name             = model_name,
         config                 = config,
         gpu_memory_utilization = gpu_memory_utilization,
-        max_seq_length         = 2048,
         dtype                  = dtype,
-        disable_log_stats      = False,
-        float8_kv_cache        = float8_kv_cache,
         conservativeness       = conservativeness,
-        enable_sleep_mode      = unsloth_vllm_standby,
+        float8_kv_cache        = float8_kv_cache,
+        unsloth_vllm_standby   = unsloth_vllm_standby,
+        use_bitsandbytes       = load_in_4bit,
     )
 
     state_dict, quant_state_dict = get_vllm_state_dict(
