@@ -880,7 +880,9 @@ def create_empty_qwen2_5_vl(quant_state_dict, config, dtype = torch.float16):
     new_config.num_attention_heads = 1
     new_config.num_key_value_heads = 1
     new_config.intermediate_size = 0
-    new_config.vision_config.hidden_size = 1
+
+    new_config.vision_config.dim = 1
+    new_config.vision_config.num_heads = 1
     new_config.vision_config.intermediate_size = 0
     new_config.vision_config.out_hidden_size = 1
 
@@ -893,12 +895,7 @@ def create_empty_qwen2_5_vl(quant_state_dict, config, dtype = torch.float16):
                   layer_config['vision_layers'] +
                   layer_config['additional_layers'])
 
-    # Norm
-    norm = quant_state_dict["model.language_model.norm.weight"]
-    norm = torch.nn.Parameter(norm, requires_grad = False)
-    new_model.model.language_model.norm.weight = norm
-
-    layers = get_model_layer_counts(config)
+    layers = max(get_model_layer_counts(config).values())
     return new_model, layer_names, layers
 pass
 
@@ -928,12 +925,7 @@ def create_empty_mllama(quant_state_dict, config, dtype = torch.float16):
                   layer_config['vision_layers'] +
                   layer_config['additional_layers'])
 
-    # Norm
-    norm = quant_state_dict["model.language_model.norm.weight"]
-    norm = torch.nn.Parameter(norm, requires_grad = False)
-    new_model.model.language_model.norm.weight = norm
-
-    num_layers = get_model_layer_counts(config)
+    num_layers = max(get_model_layer_counts(config).values())
     return new_model, layer_names, num_layers
 pass
 
@@ -959,11 +951,6 @@ def create_empty_gemma3(quant_state_dict, config, dtype = torch.float16):
                   layer_config['layernorms'] +
                   layer_config['vision_layers'] +
                   layer_config['additional_layers'])
-
-    # Norm
-    norm = quant_state_dict["model.language_model.norm.weight"]
-    norm = torch.nn.Parameter(norm, requires_grad = False)
-    new_model.model.language_model.norm.weight = norm
 
     num_layers = max(get_model_layer_counts(config).values())
 
@@ -1054,6 +1041,14 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         "post_feedforward_layernorm",
         "q_norm",
         "k_norm",
+        # Vision / multimodal norms
+        "layer_norm1",       # Gemma-3 vision encoder
+        "layer_norm2",       # Gemma-3 vision encoder
+        "post_layernorm",    # Gemma-3 vision encoder per-layer norm
+        "mm_soft_emb_norm",  # Gemma-3 multimodal projector norm,
+        "norm1",              # Qwen2.5-VL vision encoder
+        "norm2",              # Qwen2.5-VL vision encoder
+        "norm",
     ]
     # Override .to("cuda") to disable it otherwise we'll get
     # ValueError: Blockwise quantization only supports 16/32-bit floats, but got torch.uint8
@@ -1065,6 +1060,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     skipped_layernorms = []
     for kk in range(layer_count):
         for layer_name in layer_names:
+            if "kk" not in layer_name: # skip those that are not per layer
+                continue
             layer_name = layer_name.format(kk = kk)
             if f"{layer_name}.weight" not in quant_state_dict:
                 skipped_layernorms.append(layer_name.split(".")[-1])
@@ -1103,11 +1100,16 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
                 layer.bias = bias
             else:
-                # Layernorms
-                weight = torch.nn.Parameter(weight, requires_grad = False)
-                layer_name = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
-                exec(f"new_model.{layer_name}.weight = None")
-                exec(f"new_model.{layer_name}.weight = weight")
+                # LayerNorms (including vision norms)
+                weight_param = torch.nn.Parameter(weight, requires_grad=False)
+                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
+                # Set weight
+                exec(f"new_model.{layer_name_br}.weight = None")
+                exec(f"new_model.{layer_name_br}.weight = weight_param")
+                # Set bias if it exists
+                if bias is not None:
+                    exec(f"new_model.{layer_name_br}.bias = None")
+                    exec(f"new_model.{layer_name_br}.bias = bias")
                 continue
             pass
 
@@ -2202,20 +2204,24 @@ def _test_get_vllm_state_dict(
     delete_vllm(llm)
 
     # Delete model as well
-    model.model.embed_tokens.weight = None
-    new_model.model.embed_tokens.weight = None
+    try:
+        model.model.embed_tokens.weight = None
+        new_model.model.embed_tokens.weight = None
 
-    for i in range(len(model.model.layers)):
-        model.model.layers[i] = None
-        new_model.model.layers[i] = None
-    pass
+        for i in range(len(model.model.layers)):
+            model.model.layers[i] = None
+            new_model.model.layers[i] = None
+        pass
 
-    model.model.norm.weight = None
-    new_model.model.norm.weight = None
-    model.lm_head.weight = None
-    new_model.lm_head.weight = None
-    model.model = None
-    new_model.model = None
+        model.model.norm.weight = None
+        new_model.model.norm.weight = None
+        model.lm_head.weight = None
+        new_model.lm_head.weight = None
+        model.model = None
+        new_model.model = None
+    except:
+        pass
+
     del model
     del new_model
     print(f'Test passed!')
@@ -2357,9 +2363,10 @@ def get_model_layer_config(model_type, config=None):
             "model.visual.blocks.{kk}.norm2",
         ])
         base_config['additional_layers'].extend([
-            "model.merger.ln_q",
-            "model.merger.mlp.0",
-            "model.merger.mlp.2",
+            "model.visual.merger.ln_q",
+            "model.visual.merger.mlp.0",
+            "model.visual.merger.mlp.2",
+            "model.visual.patch_embed.proj",
         ])
 
     elif model_type == "gemma3":
@@ -2378,6 +2385,8 @@ def get_model_layer_config(model_type, config=None):
             "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc1",
             "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc2",
             "model.vision_tower.vision_model.encoder.layers.{kk}.post_layernorm",
+            "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm1",
+            "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm2",
         ])
 
     # Add some common additional norms for causal LM models
@@ -2466,49 +2475,53 @@ def extract_mllama_vision_layers(vllm_internals, state_dict, quant_state_dict, g
 def extract_qwen2_5_vl_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict):
     """Extract vision layers for qwen2_5_vl models."""
     try:
-        # Visual blocks
-        if hasattr(vllm_internals, "visual") and hasattr(vllm_internals.visual, "blocks"):
-            for kk in range(len(vllm_internals.visual.blocks)):
-                block = vllm_internals.visual.blocks[kk]
-                prefix = f"model.visual.blocks.{kk}"
+        for kk in range(len(vllm_internals.visual.blocks)):
+            block = vllm_internals.visual.blocks[kk]
+            prefix = f"model.visual.blocks.{kk}"
 
-                # Visual attention
-                if hasattr(block, "attn"):
-                    if hasattr(block.attn, "qkv"):
-                        get_state_dict(f"{prefix}.attn.qkv", 0, state_dict, block.attn.qkv)
-                    if hasattr(block.attn, "proj"):
-                        get_state_dict(f"{prefix}.attn.proj", 0, state_dict, block.attn.proj)
+            # Visual attention
+            get_state_dict(f"{prefix}.attn.qkv", 0, state_dict, block.attn.qkv)
+            get_state_dict(f"{prefix}.attn.proj", 0, state_dict, block.attn.proj)
 
-                # Visual MLP
-                if hasattr(block, "mlp"):
-                    if hasattr(block.mlp, "gate_proj"):
-                        get_state_dict(f"{prefix}.mlp.gate_proj", 0, state_dict, block.mlp.gate_proj)
-                    if hasattr(block.mlp, "up_proj"):
-                        get_state_dict(f"{prefix}.mlp.up_proj", 0, state_dict, block.mlp.up_proj)
-                    if hasattr(block.mlp, "down_proj"):
-                        get_state_dict(f"{prefix}.mlp.down_proj", 0, state_dict, block.mlp.down_proj)
+            # Visual MLP
+            get_state_dict(f"{prefix}.mlp.gate_proj", 0, state_dict, block.mlp.gate_proj)
+            get_state_dict(f"{prefix}.mlp.up_proj", 0, state_dict, block.mlp.up_proj)
+            get_state_dict(f"{prefix}.mlp.down_proj", 0, state_dict, block.mlp.down_proj)
 
-                # Visual norms
-                for norm_name in ["norm1", "norm2"]:
-                    if hasattr(block, norm_name):
-                        norm = getattr(block, norm_name)
-                        if hasattr(norm, "weight"):
-                            state_dict[f"{prefix}.{norm_name}.weight"] = norm.weight.data
-                            quant_state_dict[f"{prefix}.{norm_name}.weight"] = state_dict[f"{prefix}.{norm_name}.weight"]
+            # Visual norms
+            for norm_name in ["norm1", "norm2"]:
+                norm = getattr(block, norm_name)
+                if hasattr(norm, "weight"):
+                    state_dict[f"{prefix}.{norm_name}.weight"] = norm.weight.data
+                    quant_state_dict[f"{prefix}.{norm_name}.weight"] = state_dict[f"{prefix}.{norm_name}.weight"]
 
-        # Merger layers
-        if hasattr(vllm_internals, "merger"):
-            merger = vllm_internals.merger
+        # New: Correctly extract visual.merger and patch_embed weights with proper prefixes
+        visual_attr = getattr(vllm_internals, "visual", None)
+        if visual_attr is not None:
+            # Proper merger extraction under model.visual.merger.*
+            merger = visual_attr.merger
+            merger_prefix = "model.visual.merger"
+
             if hasattr(merger, "ln_q") and hasattr(merger.ln_q, "weight"):
-                state_dict["model.merger.ln_q.weight"] = merger.ln_q.weight.data
-                quant_state_dict["model.merger.ln_q.weight"] = state_dict["model.merger.ln_q.weight"]
+                state_dict[f"{merger_prefix}.ln_q.weight"] = merger.ln_q.weight.data
+                quant_state_dict[f"{merger_prefix}.ln_q.weight"] = state_dict[f"{merger_prefix}.ln_q.weight"]
 
-            if hasattr(merger, "mlp"):
-                mlp = merger.mlp
-                if hasattr(mlp, "0"):
-                    get_state_dict("model.merger.mlp.0", 0, state_dict, mlp[0])
-                if hasattr(mlp, "2"):
-                    get_state_dict("model.merger.mlp.2", 0, state_dict, mlp[2])
+            mlp = merger.mlp
+            if len(mlp) > 0:
+                get_state_dict(f"{merger_prefix}.mlp.0", 0, state_dict, mlp[0])
+            if len(mlp) > 2:
+                get_state_dict(f"{merger_prefix}.mlp.2", 0, state_dict, mlp[2])
+
+            # Patch embedding conv3d (proj) under model.visual.patch_embed.proj.*
+            if hasattr(visual_attr, "patch_embed") and hasattr(visual_attr.patch_embed, "proj"):
+                pe_proj = visual_attr.patch_embed.proj
+                pe_prefix = "model.visual.patch_embed.proj"
+                state_dict[f"{pe_prefix}.weight"] = pe_proj.weight.data
+                quant_state_dict[f"{pe_prefix}.weight"] = state_dict[f"{pe_prefix}.weight"]
+                if pe_proj.bias is not None:
+                    state_dict[f"{pe_prefix}.bias"] = pe_proj.bias.data
+                    quant_state_dict[f"{pe_prefix}.bias"] = state_dict[f"{pe_prefix}.bias"]
+
     except Exception as e:
         print(f"Unsloth: Could not extract vision layers for qwen2_5_vl: {e}")
 
