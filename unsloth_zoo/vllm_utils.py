@@ -655,7 +655,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
 
-    def get_state_dict(prefix, kk, state_dict, proj):
+    def get_state_dict(prefix, kk, state_dict, proj, slice_weights=True):
         proj = getattr(proj, "base_layer", proj)
         qweight = proj.weight
         if hasattr(proj, "output_sizes"):
@@ -668,17 +668,33 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
             # Bitsandbytes quantizations
             quant_states = qweight.bnb_quant_state
             offsets = qweight.bnb_shard_offsets
-            state_dict[prefix + ".weight"] = qweight[offsets[kk] : offsets[kk + 1]]
-            quant_state_dict[prefix + ".weight.quant_state"] = quant_states[kk]
-            quant_state_dict[prefix + ".weight"] = state_dict[prefix + ".weight"]
-            quant_state = quant_states[kk].as_dict(packed = True)
-            for k, v in quant_state.items():
-                state_dict[prefix + ".weight." + k] = v
+            if slice_weights:
+                state_dict[prefix + ".weight"] = qweight[offsets[kk] : offsets[kk + 1]]
+                quant_state_dict[prefix + ".weight.quant_state"] = quant_states[kk]
+                quant_state_dict[prefix + ".weight"] = state_dict[prefix + ".weight"]
+                quant_state = quant_states[kk].as_dict(packed = True)
+                for k, v in quant_state.items():
+                    state_dict[prefix + ".weight." + k] = v
+            else:
+                # Extract full weight for unified layers (e.g., vision QKV)
+                state_dict[prefix + ".weight"] = qweight
+                quant_state_dict[prefix + ".weight"] = state_dict[prefix + ".weight"]
+                # For full weights, we need to handle all quant states if they exist
+                if hasattr(qweight, "bnb_quant_state"):
+                    # Use the first quant state as representative for full weight
+                    quant_state_dict[prefix + ".weight.quant_state"] = quant_states[0]
+                    quant_state = quant_states[0].as_dict(packed = True)
+                    for k, v in quant_state.items():
+                        state_dict[prefix + ".weight." + k] = v
             pass
         else:
             # Normal FP16 weights
             qweight.requires_grad_(False) # Disable grad - sometimes vLLM forgets
-            state_dict[prefix + ".weight"] = qweight[dim_offsets[kk] : dim_offsets[kk + 1]]
+            if slice_weights:
+                state_dict[prefix + ".weight"] = qweight[dim_offsets[kk] : dim_offsets[kk + 1]]
+            else:
+                # Extract full weight for unified layers (e.g., vision QKV)
+                state_dict[prefix + ".weight"] = qweight
             quant_state_dict[prefix + ".weight"] = state_dict[prefix + ".weight"]
         pass
 
@@ -686,7 +702,11 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
         bias = getattr(proj, "bias", None)
         if bias is not None:
             bias.requires_grad_(False) # Disable grad - sometimes vLLM forgets
-            state_dict[prefix + ".bias"] = bias[dim_offsets[kk] : dim_offsets[kk + 1]]
+            if slice_weights:
+                state_dict[prefix + ".bias"] = bias[dim_offsets[kk] : dim_offsets[kk + 1]]
+            else:
+                # Extract full bias for unified layers
+                state_dict[prefix + ".bias"] = bias
             quant_state_dict[prefix + ".bias"] = state_dict[prefix + ".bias"]
         pass
     pass
@@ -768,8 +788,6 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
         extract_qwen2_5_vl_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
     elif model_type == "gemma3":
         extract_gemma3_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
-        state_dict[f'model.multi_modal_projector.mm_input_projection_weight'] = vllm_internals.multi_modal_projector.mm_input_projection_weight.data
-        state_dict[f'model.multi_modal_projector.mm_soft_emb_norm.weight'] = vllm_internals.multi_modal_projector.mm_soft_emb_norm.weight.data
 
     # Norm
     # For Gemma3 and similar multimodal models, norm should be under model.norm
@@ -780,12 +798,18 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
 
     # LM Head
     if getattr(config, "tie_word_embeddings", True) is False:
-        if hasattr(vllm_text_model, "lm_head"):
-            lm_head = vllm_text_model.lm_head
+        lm_head = [module for name, module in vllm_internals.named_modules() if "lm_head" in name]
+        if len(lm_head) == 0:
+            print(f"Unsloth: Cannot find lm_head in vllm_internals")
+        else:
+            if len(lm_head) > 1:
+                print(f"Unsloth: Found multiple lm_heads in vllm_internals, will use the first one")
+            lm_head = lm_head[0]
             lm_head = getattr(lm_head, "base_layer", lm_head).weight.data
 
             # Counteract vLLM padding vocabs for LoRA
-            if vocab_size is not None: lm_head = lm_head[:vocab_size]
+            if vocab_size is not None:
+                lm_head = lm_head[:vocab_size]
 
             state_dict["lm_head.weight"] = lm_head
             quant_state_dict["lm_head.weight"] = state_dict["lm_head.weight"]
@@ -809,36 +833,27 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
     difference = new_state_dict.keys() ^ old_state_dict.keys()
     difference -= set(("lm_head.weight","model.language_model.lm_head.weight"))
     if len(difference) != 0:
-        # missing from new_state_dict
-        hf_keys = set(old_state_dict.keys())
-        vllm_keys = set(new_state_dict.keys())
-        # Get the keys that are in hf but not in vllm
-        missing_from_vllm = hf_keys - vllm_keys
-
-        # Get the keys that are in vllm but not in hf
-        missing_from_hf = vllm_keys - hf_keys
-
-        print(f'missing from vllm: {missing_from_vllm} \n\n\n')
-        print(f'missing from hf: {missing_from_hf}')
-
-        raise RuntimeError(f"Unsloth: Failed comparing state_dict with {len(difference)}")
-
-        # raise RuntimeError(f"Unsloth: Failed comparing state_dict with {difference}")
+        raise RuntimeError(f"Unsloth: Failed comparing state_dict with {difference}")
     pass
+
+    failures = {}
 
     for key in old_state_dict:
         try:
             torch.testing.assert_close(old_state_dict[key], new_state_dict[key], check_stride = True)
         except Exception as error:
             print(f"Unsloth: {key} failed to assert_close")
-            # if key == "lm_head.weight":
-            #     # Maybe tied embeddings?
-            #     key1 = key if key in old_state_dict else "model.embed_tokens.weight"
-            #     key2 = key if key in new_state_dict else "model.embed_tokens.weight"
-            #     torch.testing.assert_close(old_state_dict[key1], new_state_dict[key2], check_stride = True)
-            # else:
-            #     raise RuntimeError(f"[{key}]\n{str(error)}")
+            if key == "lm_head.weight":
+                # Maybe tied embeddings?
+                key1 = next(k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight") if k in old_state_dict)
+                key2 = next(k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight") if k in new_state_dict)
+                torch.testing.assert_close(old_state_dict[key1], new_state_dict[key2], check_stride = True)
+            else:
+                failures[key] = error
         pass
+    if len(failures) > 0:
+        error_message = "\n".join([f"[{key}]\n{str(error)}" for key, error in failures.items()])
+        raise RuntimeError(f"Unsloth: Failed comparing state_dict with {len(failures)}: {error_message}")
     pass
 pass
 
@@ -977,11 +992,12 @@ def set_norm_embeddings_and_lmhead(new_model, quant_state_dict, config):
     else:
         language_model_prefix = "model"
         language_model = new_model.model
+
     # Embeddings
     language_model.embed_tokens = torch.nn.Embedding.from_pretrained(
         quant_state_dict[f"{language_model_prefix}.embed_tokens.weight"],
         freeze = True,
-        padding_idx = config.pad_token_id,
+        padding_idx = getattr(config, 'pad_token_id', None),
     )
 
     # Norm
@@ -993,7 +1009,7 @@ def set_norm_embeddings_and_lmhead(new_model, quant_state_dict, config):
     if getattr(config, "tie_word_embeddings", False):
         weight = quant_state_dict[f"{language_model_prefix}.embed_tokens.weight"]
     else:
-        weight = quant_state_dict[f"{language_model_prefix}.lm_head.weight"]
+        weight = quant_state_dict["lm_head.weight"]
 
     from torch.nn import Linear
 
@@ -1003,6 +1019,16 @@ def set_norm_embeddings_and_lmhead(new_model, quant_state_dict, config):
     layer.weight = torch.nn.Parameter(weight, requires_grad = False)
     language_model.lm_head = layer
     if getattr(config, "tie_word_embeddings", False): language_model.tie_weights()
+pass
+
+def set_additional_modules(new_model, quant_state_dict, config):
+    additional_keys = set(
+        x for x in quant_state_dict.keys()
+        if not any(substr in x for substr in ("layers", "lm_head", "embed_tokens"))
+    )
+    for key in additional_keys:
+        exec(f"new_{key}.data = quant_state_dict[key]")
+    pass
 pass
 
 
@@ -1121,6 +1147,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
     set_norm_embeddings_and_lmhead(new_model, quant_state_dict, config)
 
+    set_additional_modules(new_model, quant_state_dict, config)
 
     # Fix up config items with correct items
     config_as_dict = config.to_dict()
@@ -1418,9 +1445,15 @@ def load_vllm(
     elif memory_left_for_kv_cache_gb <= 80: approx_max_num_seqs = 368 # + 32
     else: approx_max_num_seqs = 400 # + 32
 
+    max_num_batched_tokens = 2048
+
     if hasattr(config, "vision_config"):
+        # In vLLM profiling, each sequence contributes to an image. Which is generally in the order of thousand tokens.
+        # We don't want to go beyond 16 sequences for vision models.
+        # TODO: In vLLM V1, iirc, the profiling sets a cap on the max seqs based on the budget. Check it out.
         print(f'Unsloth: Vision config found, setting approx_max_num_seqs to 16')
         approx_max_num_seqs = 16
+        max_num_batched_tokens = 8192 # Single image would contribute to 6404 tokens in Llama 3.2 for eg. So have some more for text
 
     # float8 KV cache can fit more sequences in 1 go so more throughput
     if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
@@ -1518,7 +1551,7 @@ def load_vllm(
         kv_cache_dtype         = "fp8" if float8_kv_cache else "auto",
         dtype                  = dtype,
 
-        max_num_batched_tokens = 8192, # Max tokens for chunked prefill default 2048
+        max_num_batched_tokens = max_num_batched_tokens,
         max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM
         max_logprobs           = max_logprobs, # Disallow logprobs being returned
         seed                   = random_state, # Default is 0
@@ -2479,11 +2512,14 @@ def extract_qwen2_5_vl_vision_layers(vllm_internals, state_dict, quant_state_dic
             block = vllm_internals.visual.blocks[kk]
             prefix = f"model.visual.blocks.{kk}"
 
-            # Visual attention
-            get_state_dict(f"{prefix}.attn.qkv", 0, state_dict, block.attn.qkv)
+            # Visual attention - vLLM uses QKVParallelLinear, HF expects unified QKV
+            # Use slice_weights=False to get the full unified QKV weight
+            get_state_dict(f"{prefix}.attn.qkv", 0, state_dict, block.attn.qkv, slice_weights=False)
+
+            # Extract projection layer using get_state_dict to handle tensor parallelism
             get_state_dict(f"{prefix}.attn.proj", 0, state_dict, block.attn.proj)
 
-            # Visual MLP
+            # Visual MLP - use get_state_dict to handle tensor parallelism
             get_state_dict(f"{prefix}.mlp.gate_proj", 0, state_dict, block.mlp.gate_proj)
             get_state_dict(f"{prefix}.mlp.up_proj", 0, state_dict, block.mlp.up_proj)
             get_state_dict(f"{prefix}.mlp.down_proj", 0, state_dict, block.mlp.down_proj)
@@ -2495,32 +2531,26 @@ def extract_qwen2_5_vl_vision_layers(vllm_internals, state_dict, quant_state_dic
                     state_dict[f"{prefix}.{norm_name}.weight"] = norm.weight.data
                     quant_state_dict[f"{prefix}.{norm_name}.weight"] = state_dict[f"{prefix}.{norm_name}.weight"]
 
-        # New: Correctly extract visual.merger and patch_embed weights with proper prefixes
+        # Extract visual.merger and patch_embed weights with proper tensor parallelism handling
         visual_attr = getattr(vllm_internals, "visual", None)
         if visual_attr is not None:
-            # Proper merger extraction under model.visual.merger.*
+            # Merger extraction under model.visual.merger.*
             merger = visual_attr.merger
             merger_prefix = "model.visual.merger"
 
             if hasattr(merger, "ln_q") and hasattr(merger.ln_q, "weight"):
-                state_dict[f"{merger_prefix}.ln_q.weight"] = merger.ln_q.weight.data
-                quant_state_dict[f"{merger_prefix}.ln_q.weight"] = state_dict[f"{merger_prefix}.ln_q.weight"]
+                get_state_dict(f"{merger_prefix}.ln_q", 0, state_dict, merger.ln_q, slice_weights=False)
 
+            # Extract MLP layers using get_state_dict
             mlp = merger.mlp
-            if len(mlp) > 0:
+            if len(mlp) > 0 and hasattr(mlp[0], 'weight'):
                 get_state_dict(f"{merger_prefix}.mlp.0", 0, state_dict, mlp[0])
-            if len(mlp) > 2:
+            if len(mlp) > 2 and hasattr(mlp[2], 'weight'):
+                # mlp[2] is RowParallelLinear - use get_state_dict to handle tensor parallelism
                 get_state_dict(f"{merger_prefix}.mlp.2", 0, state_dict, mlp[2])
 
-            # Patch embedding conv3d (proj) under model.visual.patch_embed.proj.*
             if hasattr(visual_attr, "patch_embed") and hasattr(visual_attr.patch_embed, "proj"):
-                pe_proj = visual_attr.patch_embed.proj
-                pe_prefix = "model.visual.patch_embed.proj"
-                state_dict[f"{pe_prefix}.weight"] = pe_proj.weight.data
-                quant_state_dict[f"{pe_prefix}.weight"] = state_dict[f"{pe_prefix}.weight"]
-                if pe_proj.bias is not None:
-                    state_dict[f"{pe_prefix}.bias"] = pe_proj.bias.data
-                    quant_state_dict[f"{pe_prefix}.bias"] = state_dict[f"{pe_prefix}.bias"]
+                get_state_dict("model.visual.patch_embed.proj", 0, state_dict, visual_attr.patch_embed.proj, slice_weights=False)
 
     except Exception as e:
         print(f"Unsloth: Could not extract vision layers for qwen2_5_vl: {e}")
@@ -2528,41 +2558,90 @@ def extract_qwen2_5_vl_vision_layers(vllm_internals, state_dict, quant_state_dic
 def extract_gemma3_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict):
     """Extract vision layers for gemma3 models."""
     try:
-        vision_model = vllm_internals.vision_tower.vision_model
-        for kk in range(len(vision_model.encoder.layers)):
-            layer = vision_model.encoder.layers[kk]
-            prefix = f"model.vision_tower.vision_model.encoder.layers.{kk}"
 
-            # for proj_name in ["q_proj", "k_proj", "v_proj"]:
-            #     if hasattr(layer.self_attn, proj_name):
-            #         get_state_dict(f"{prefix}.self_attn.{proj_name}", 0, state_dict, getattr(layer.self_attn, proj_name))
-            proj = layer.self_attn.qkv_proj
-            get_state_dict(f"{prefix}.self_attn.q_proj", 0, state_dict, proj)
-            get_state_dict(f"{prefix}.self_attn.k_proj", 1, state_dict, proj)
-            get_state_dict(f"{prefix}.self_attn.v_proj", 2, state_dict, proj)
-            get_state_dict(f"{prefix}.self_attn.out_proj", 0, state_dict, layer.self_attn.out_proj)
+        # Vision encoder layers
+        if hasattr(vllm_internals, "vision_tower"):
+            vision_model = vllm_internals.vision_tower.vision_model
 
-            get_state_dict(f"{prefix}.mlp.fc1", 0, state_dict, layer.mlp.fc1)
-            get_state_dict(f"{prefix}.mlp.fc2", 0, state_dict, layer.mlp.fc2)
+            for kk in range(len(vision_model.encoder.layers)):
+                layer = vision_model.encoder.layers[kk]
+                prefix = f"model.vision_tower.vision_model.encoder.layers.{kk}"
 
-            # Extract all layer norms and their biases if they exist
-            for norm_name in ["layer_norm1", "layer_norm2"]:
-                if hasattr(layer, norm_name):
-                    norm_layer = getattr(layer, norm_name)
-                    if hasattr(norm_layer, "weight"):
-                        state_dict[f"{prefix}.{norm_name}.weight"] = norm_layer.weight.data
-                        quant_state_dict[f"{prefix}.{norm_name}.weight"] = state_dict[f"{prefix}.{norm_name}.weight"]
-                    if hasattr(norm_layer, "bias") and norm_layer.bias is not None:
-                        state_dict[f"{prefix}.{norm_name}.bias"] = norm_layer.bias.data
-                        quant_state_dict[f"{prefix}.{norm_name}.bias"] = state_dict[f"{prefix}.{norm_name}.bias"]
+                # Vision attention layers (QKV unified in vLLM)
+                if hasattr(layer.self_attn, "qkv_proj"):
+                    proj = layer.self_attn.qkv_proj
+                    get_state_dict(f"{prefix}.self_attn.q_proj", 0, state_dict, proj)
+                    get_state_dict(f"{prefix}.self_attn.k_proj", 1, state_dict, proj)
+                    get_state_dict(f"{prefix}.self_attn.v_proj", 2, state_dict, proj)
 
-        state_dict[f"model.vision_tower.vision_model.post_layernorm.weight"] = vision_model.post_layernorm.weight.data
-        state_dict[f"model.vision_tower.vision_model.post_layernorm.bias"] = vision_model.post_layernorm.bias.data
+                if hasattr(layer.self_attn, "out_proj"):
+                    get_state_dict(f"{prefix}.self_attn.out_proj", 0, state_dict, layer.self_attn.out_proj)
 
-        state_dict[f"model.vision_tower.vision_model.embeddings.patch_embedding.weight"] = vision_model.embeddings.patch_embedding.weight.data
-        state_dict[f"model.vision_tower.vision_model.embeddings.patch_embedding.bias"] = vision_model.embeddings.patch_embedding.bias.data
+                # Vision MLP layers - moved inside the loop
+                get_state_dict(f"{prefix}.mlp.fc1", 0, state_dict, layer.mlp.fc1)
+                get_state_dict(f"{prefix}.mlp.fc2", 0, state_dict, layer.mlp.fc2)
 
-        state_dict[f"model.vision_tower.vision_model.embeddings.position_embedding.weight"] = vision_model.embeddings.position_embedding.weight.data
+                # Vision layernorms - extract manually to handle different layer types
+                for norm_name in ["layer_norm1", "layer_norm2"]:
+                    if hasattr(layer, norm_name):
+                        norm = getattr(layer, norm_name)
+                        if hasattr(norm, "weight"):
+                            state_dict[f"{prefix}.{norm_name}.weight"] = norm.weight.data
+                            quant_state_dict[f"{prefix}.{norm_name}.weight"] = state_dict[f"{prefix}.{norm_name}.weight"]
+                        if hasattr(norm, "bias") and norm.bias is not None:
+                            state_dict[f"{prefix}.{norm_name}.bias"] = norm.bias.data
+                            quant_state_dict[f"{prefix}.{norm_name}.bias"] = state_dict[f"{prefix}.{norm_name}.bias"]
+
+            # Extract vision embeddings and post norm
+            if hasattr(vision_model, "embeddings"):
+                embeddings = vision_model.embeddings
+
+                # Patch embedding (Conv2d)
+                if hasattr(embeddings, "patch_embedding"):
+                    patch_embedding = embeddings.patch_embedding
+                    state_dict["model.vision_tower.vision_model.embeddings.patch_embedding.weight"] = patch_embedding.weight.data
+                    quant_state_dict["model.vision_tower.vision_model.embeddings.patch_embedding.weight"] = state_dict["model.vision_tower.vision_model.embeddings.patch_embedding.weight"]
+                    if hasattr(patch_embedding, "bias") and patch_embedding.bias is not None:
+                        state_dict["model.vision_tower.vision_model.embeddings.patch_embedding.bias"] = patch_embedding.bias.data
+                        quant_state_dict["model.vision_tower.vision_model.embeddings.patch_embedding.bias"] = state_dict["model.vision_tower.vision_model.embeddings.patch_embedding.bias"]
+
+                # Position embedding (Embedding)
+                if hasattr(embeddings, "position_embedding"):
+                    position_embedding = embeddings.position_embedding
+                    state_dict["model.vision_tower.vision_model.embeddings.position_embedding.weight"] = position_embedding.weight.data
+                    quant_state_dict["model.vision_tower.vision_model.embeddings.position_embedding.weight"] = state_dict["model.vision_tower.vision_model.embeddings.position_embedding.weight"]
+
+            # Post layernorm
+            if hasattr(vision_model, "post_layernorm"):
+                post_layernorm = vision_model.post_layernorm
+                state_dict["model.vision_tower.vision_model.post_layernorm.weight"] = post_layernorm.weight.data
+                quant_state_dict["model.vision_tower.vision_model.post_layernorm.weight"] = state_dict["model.vision_tower.vision_model.post_layernorm.weight"]
+                if hasattr(post_layernorm, "bias") and post_layernorm.bias is not None:
+                    state_dict["model.vision_tower.vision_model.post_layernorm.bias"] = post_layernorm.bias.data
+                    quant_state_dict["model.vision_tower.vision_model.post_layernorm.bias"] = state_dict["model.vision_tower.vision_model.post_layernorm.bias"]
+
+        # Extract multi-modal projector components
+        if hasattr(vllm_internals, "multi_modal_projector"):
+            multi_modal_projector = vllm_internals.multi_modal_projector
+            print(f"Unsloth Debug: multi_modal_projector type: {type(multi_modal_projector)}")
+            print(f"Unsloth Debug: multi_modal_projector attributes: {dir(multi_modal_projector)}")
+
+            # Extract mm_input_projection_weight if it exists
+            if hasattr(multi_modal_projector, "mm_input_projection_weight"):
+                state_dict["model.multi_modal_projector.mm_input_projection_weight"] = multi_modal_projector.mm_input_projection_weight.data
+                quant_state_dict["model.multi_modal_projector.mm_input_projection_weight"] = state_dict["model.multi_modal_projector.mm_input_projection_weight"]
+            else:
+                print("Unsloth Debug: mm_input_projection_weight not found")
+
+            # Extract mm_soft_emb_norm
+            if hasattr(multi_modal_projector, "mm_soft_emb_norm"):
+                mm_soft_emb_norm = multi_modal_projector.mm_soft_emb_norm
+                state_dict["model.multi_modal_projector.mm_soft_emb_norm.weight"] = mm_soft_emb_norm.weight.data
+                quant_state_dict["model.multi_modal_projector.mm_soft_emb_norm.weight"] = state_dict["model.multi_modal_projector.mm_soft_emb_norm.weight"]
+            else:
+                print("Unsloth Debug: mm_soft_emb_norm not found")
+        else:
+            print("Unsloth Debug: multi_modal_projector not found in vllm_internals")
 
     except Exception as e:
         print(f"Unsloth: Could not extract vision layers for gemma3: {e}")
