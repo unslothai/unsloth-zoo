@@ -432,7 +432,7 @@ def patch_vllm_enable_sleep_mode():
     from typing import Optional, Union, Tuple
 
     logger = init_logger(__name__)
-    print(f"Unsloth: Patching vLLM enable sleep mode")
+    print(f"Unsloth: Enabling vLLM standby mode")
 
     def sleep(
             self,
@@ -2640,25 +2640,17 @@ def extract_gemma3_vision_layers(vllm_internals, state_dict, quant_state_dict, g
         # Extract multi-modal projector components
         if hasattr(vllm_internals, "multi_modal_projector"):
             multi_modal_projector = vllm_internals.multi_modal_projector
-            print(f"Unsloth Debug: multi_modal_projector type: {type(multi_modal_projector)}")
-            print(f"Unsloth Debug: multi_modal_projector attributes: {dir(multi_modal_projector)}")
 
             # Extract mm_input_projection_weight if it exists
             if hasattr(multi_modal_projector, "mm_input_projection_weight"):
                 state_dict["model.multi_modal_projector.mm_input_projection_weight"] = multi_modal_projector.mm_input_projection_weight.data
                 quant_state_dict["model.multi_modal_projector.mm_input_projection_weight"] = state_dict["model.multi_modal_projector.mm_input_projection_weight"]
-            else:
-                print("Unsloth Debug: mm_input_projection_weight not found")
 
             # Extract mm_soft_emb_norm
             if hasattr(multi_modal_projector, "mm_soft_emb_norm"):
                 mm_soft_emb_norm = multi_modal_projector.mm_soft_emb_norm
                 state_dict["model.multi_modal_projector.mm_soft_emb_norm.weight"] = mm_soft_emb_norm.weight.data
                 quant_state_dict["model.multi_modal_projector.mm_soft_emb_norm.weight"] = state_dict["model.multi_modal_projector.mm_soft_emb_norm.weight"]
-            else:
-                print("Unsloth Debug: mm_soft_emb_norm not found")
-        else:
-            print("Unsloth Debug: multi_modal_projector not found in vllm_internals")
 
     except Exception as e:
         print(f"Unsloth: Could not extract vision layers for gemma3: {e}")
