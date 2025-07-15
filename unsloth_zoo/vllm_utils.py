@@ -717,9 +717,6 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     # Use get_state_dict for consistent extraction and automatic truncation
     get_state_dict(f"{vllm_text_model_prefix}.embed_tokens", 0, state_dict, embed_tokens, slice_weights=False)
 
-    from vllm.model_executor.models.mllama import MllamaCrossAttentionDecoderLayer
-
-
     # Get layer configuration for this model type
     layer_config = get_model_layer_config(model_type, text_config)
 
@@ -816,7 +813,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
         missing_from_vllm = new_state_dict.keys() - old_state_dict.keys()
         missing_from_hf = old_state_dict.keys() - new_state_dict.keys()
         print(f'Unsloth: Failed comparing state_dict with Missing from vllm: {missing_from_vllm}\nMissing from hf: {missing_from_hf}')
-        raise RuntimeError(f"Unsloth: Failed comparing state_dict with {difference}\nMissing from vllm: {missing_from_vllm}\nMissing from hf: {missing_from_hf}")
+        raise RuntimeError(f"Unsloth: Failed comparing state_dict with {difference}")
     pass
 
     failures = {}
@@ -848,7 +845,7 @@ pass
 
 
 @torch.inference_mode
-def create_empty_causal_lm(quant_state_dict, config, dtype = torch.float16):
+def create_empty_causal_lm(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     # Empty model from config
     new_config = deepcopy(config)
@@ -877,10 +874,10 @@ pass
 
 
 @torch.inference_mode
-def create_empty_qwen2_5_vl(quant_state_dict, config, dtype = torch.float16):
+def create_empty_qwen2_5_vl(config, dtype = torch.float16):
     from transformers import Qwen2_5_VLForConditionalGeneration
     new_config = deepcopy(config)
-    # new_config.num_hidden_layers = 1
+
     new_config.num_attention_heads = 1
     new_config.num_key_value_heads = 1
     new_config.intermediate_size = 0
@@ -904,20 +901,17 @@ def create_empty_qwen2_5_vl(quant_state_dict, config, dtype = torch.float16):
 pass
 
 @torch.inference_mode
-def create_empty_mllama(quant_state_dict, config, dtype = torch.float16):
+def create_empty_mllama(config, dtype = torch.float16):
     from transformers import MllamaForConditionalGeneration
     new_config = deepcopy(config)
 
-    # new_config.text_config.num_hidden_layers = 1
     new_config.text_config.num_attention_heads = 1
     new_config.text_config.num_key_value_heads = 1
     new_config.text_config.intermediate_size = 0
 
-    # new_config.vision_config.num_hidden_layers = 1
     new_config.vision_config.num_attention_heads = 1
     new_config.vision_config.num_key_value_heads = 1
     new_config.vision_config.intermediate_size = 0
-    # new_config.vision_config.num_global_layers = 1
     new_config.vision_config.vision_output_dim = 1
 
     new_model = MllamaForConditionalGeneration(new_config)
@@ -933,18 +927,15 @@ def create_empty_mllama(quant_state_dict, config, dtype = torch.float16):
     return new_model, layer_names, num_layers
 pass
 
-def create_empty_gemma3mm(quant_state_dict, config, dtype = torch.float16):
+def create_empty_gemma3mm(config, dtype = torch.float16):
     from transformers import Gemma3ForConditionalGeneration
     new_config = deepcopy(config)
 
-    # new_config.text_config.num_hidden_layers = 1
     new_config.text_config.num_attention_heads = 1
     new_config.text_config.intermediate_size = 1
-    # new_config.vision_config.num_hidden_layers = 1
 
     new_config.vision_config.num_attention_heads = 1
     new_config.vision_config.intermediate_size = 1
-    # new_config.vision_config.num_global_layers = 1
     new_config.vision_config.vision_output_dim = 1
 
     new_model = Gemma3ForConditionalGeneration(new_config)
@@ -962,16 +953,16 @@ def create_empty_gemma3mm(quant_state_dict, config, dtype = torch.float16):
 pass
 
 @torch.inference_mode
-def create_empty_model(quant_state_dict, config, dtype = torch.float16, is_vision_model = False):
+def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     model_type = config.model_type
     if not is_vision_model:
-        return create_empty_causal_lm(quant_state_dict, config, dtype)
+        return create_empty_causal_lm(config, dtype)
     elif model_type == "mllama":
-        return create_empty_mllama(quant_state_dict, config, dtype)
+        return create_empty_mllama(config, dtype)
     elif model_type == "qwen2_5_vl":
-        return create_empty_qwen2_5_vl(quant_state_dict, config, dtype)
+        return create_empty_qwen2_5_vl(config, dtype)
     elif model_type == "gemma3":
-        return create_empty_gemma3mm(quant_state_dict, config, dtype)
+        return create_empty_gemma3mm(config, dtype)
     else:
         raise ValueError(f"Unsloth: Unsupported model type: {model_type}")
 
@@ -1032,6 +1023,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
                 language_model.tie_weights()
 
     # Process additional keys
+    # For eg, `merger` in qwen2.5-vl or probably any other projection modules
     additional_keys = set(
         x for x in quant_state_dict.keys()
         if not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head"))
@@ -1052,7 +1044,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
     config.update({"torch_dtype" : dtype}) # Do not use config file's dtype!
-    new_model, layer_names, layer_count = create_empty_model(quant_state_dict, config, dtype, is_vision_model)
+    new_model, layer_names, layer_count = create_empty_model(config, dtype, is_vision_model)
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
     quantization_config = getattr(config, "quantization_config", {})
     kwargs = dict()
@@ -1180,18 +1172,18 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         if hasattr(module, key): exec(f"module.{key} = {value}")
     new_model.config = config
 
-    rope_config = getattr(config, "text_config", config) #try using text config for VLMs
+    text_config = getattr(config, "text_config", config) #try using text config for VLMs
     # Fix up rotary_emb by re-initing them
     for module in new_model.modules():
         if hasattr(module, "rotary_emb"):
             module.rotary_emb = module.rotary_emb.__class__(
-                config = rope_config,
+                config = text_config,
                 device = get_target_device(),
             )
         if hasattr(module, "rotary_emb_local"):
             # gemma3 has a rotary_emb_local
             module.rotary_emb_local = module.rotary_emb_local.__class__(
-                config = rope_config,
+                config = text_config,
                 device = get_target_device(),
             )
         pass
@@ -1465,7 +1457,7 @@ def load_vllm(
         # In vLLM profiling, each sequence contributes to an image. Which is generally in the order of thousand tokens.
         # We don't want to go beyond 16 sequences for vision models.
         # TODO: In vLLM V1, iirc, the profiling sets a cap on the max seqs based on the budget. Check it out.
-        print(f'Unsloth: Vision config found, setting approx_max_num_seqs to 16')
+        print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 16')
         approx_max_num_seqs = 16
         max_num_batched_tokens = 8192 # Single image would contribute to 6404 tokens in Llama 3.2 for eg. So have some more for text
 
@@ -1615,7 +1607,7 @@ def load_vllm(
             pass
             break
         except Exception as error:
-            print(f"Error occured loading vLLM: {error}")
+            print(f"Error occured loading vLLM: {error}", "will retry" if trials < 2 else "")
             trials += 1
             # Cleanup
             for _ in range(3):
@@ -1623,7 +1615,7 @@ def load_vllm(
                 torch.cuda.empty_cache()
             pass
             error = str(error)
-            if trials >= 0:
+            if trials >= 2:
                 raise RuntimeError(error)
 
             if "gpu_memory_utilization" in error or "memory" in error:
