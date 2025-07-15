@@ -1214,6 +1214,7 @@ def approximate_vllm_memory_usage(
     account_for_gradients = True,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
+    # Gets approximate max model length and max num sequences
     load_in_4bit = "quantization_config" in config
     free_memory, total_memory = get_mem_info()
 
@@ -1226,13 +1227,11 @@ def approximate_vllm_memory_usage(
     n_layers = config.num_hidden_layers
     n_kv_heads = getattr(config, "num_key_value_heads", 1)
     n_heads    = getattr(config, "num_attention_heads", 1)
-    hs = getattr(config, "head_dim", hd//n_heads) # For gemma, hs*nh!=hd
     # Group Query Attention
-    kv_size = hs * n_kv_heads
-    q_size = hs * n_heads
+    kv_size = hd // n_heads * n_kv_heads
 
     # Modules
-    qkvo = q_size + kv_size + kv_size + q_size
+    qkvo = hd + kv_size + kv_size + hd
     qkvo = qkvo * hd
     mlp  = (hd * mlp_size) * 3
     layernorms = 2 * hd
@@ -1257,8 +1256,8 @@ def approximate_vllm_memory_usage(
     parameter_lora_elements = lora_elements*4
 
     # Activation memory - assume bsz=2
-    bsz = 1 # vLLM profile step only assumes 1 sequence of max_model_len
-    activation_qkv  = max_seq_length * bsz * (q_size + kv_size + kv_size)
+    bsz = 2
+    activation_qkv  = max_seq_length * bsz * (hd + kv_size + kv_size)
     residual_memory = (max_seq_length * bsz)*2
     activation_mlp  = max_seq_length * bsz * (mlp_size + mlp_size)
     weights = mlp_size * hd
