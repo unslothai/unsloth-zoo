@@ -48,9 +48,8 @@ import inspect
 from functools import partial
 from .utils import _get_dtype
 from .patching_utils import patch_model_and_tokenizer
-# from unsloth import DEVICE_TYPE
+from unsloth import DEVICE_TYPE
 global LORA_REQUEST_ID
-DEVICE_TYPE = "cuda"
 
 # Ignore logging messages
 import logging
