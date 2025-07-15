@@ -610,29 +610,12 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     try:
         llm_engine = getattr(llm, "llm_engine", getattr(llm, "engine", llm))
 
-        # Check if it's a V1 engine
+        # Handle V1 vs V0 engines
         if hasattr(llm_engine, "engine_core"):
-            # V1 engine - check if it's InprocClient or MPClient
-            engine_core = llm_engine.engine_core
-            if hasattr(engine_core, "engine_core"):
-                # InprocClient - direct access to engine_core
-                vllm_internals = engine_core.engine_core.model_executor.driver_worker.model_runner.model
-            elif hasattr(llm_engine, "model_executor"):
-                # V1 engine with model_executor attribute (non-multiprocessing)
-                vllm_internals = llm_engine.model_executor.driver_worker.model_runner.model
-            else:
-                # Multiprocessing mode - no direct access to model
-                raise NotImplementedError(
-                    f"Unsloth: V1 engine multiprocessing mode is not supported for state dict extraction.\n"
-                    f"To fix this, you need to disable multiprocessing by setting the environment variable:\n"
-                    f"os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'\n"
-                    f"Alternatively, you can call patch_vllm() before loading the model:\n"
-                    f"from unsloth_zoo.vllm_utils import patch_vllm\n"
-                    f"patch_vllm()\n"
-                    f"Then recreate your vLLM model."
-                )
+            # V1 engine - access through engine_core (multiprocessing is disabled by patch_vllm)
+            vllm_internals = llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner.model
         else:
-            # V0 engine structure
+            # V0 engine - direct access
             vllm_internals = llm_engine.model_executor.driver_worker.model_runner.model
 
         # for name, p in vllm_internals.named_parameters():
@@ -646,13 +629,15 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
 
     assert(config is not None)
 
-    # Determine model type from config
+    # Determine model type from config BEFORE reassigning config
     model_type = getattr(config, "model_type", "causal_lm")
-    if hasattr(config, "text_config"):
-        config = config.text_config
-    pass
 
-    vocab_size = config.vocab_size
+    # Keep the original config for model_type but use text_config for vocab_size etc
+    text_config = config
+    if hasattr(config, "text_config"):
+        text_config = config.text_config
+
+    vocab_size = text_config.vocab_size
 
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
@@ -737,7 +722,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
 
 
     # Get layer configuration for this model type
-    layer_config = get_model_layer_config(model_type, config)
+    layer_config = get_model_layer_config(model_type, text_config)
 
     # All layers
     skipped_layernorms = []
@@ -802,7 +787,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
 
     # LM Head - Use get_state_dict for consistency
 
-    if not getattr(config, "tie_word_embeddings", False):
+    if not getattr(text_config, "tie_word_embeddings", False):
         lm_layer = [mod for name,mod in vllm_internals.named_modules() if "lm_head" in name]
         # Use get_state_dict for consistent extraction and automatic truncation
         get_state_dict("lm_head", 0, state_dict, lm_layer[0], slice_weights=False)
@@ -2224,6 +2209,7 @@ def _test_get_vllm_state_dict(
         llm,
         return_state_dict = True,
         config = config,
+        is_vision_model = is_vision_model,
     )
     assert_same_state_dict(model.state_dict(), state_dict)
 
