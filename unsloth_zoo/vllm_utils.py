@@ -947,7 +947,7 @@ def create_empty_mllama(quant_state_dict, config, dtype = torch.float16):
     return new_model, layer_names, num_layers
 pass
 
-def create_empty_gemma3(quant_state_dict, config, dtype = torch.float16):
+def create_empty_gemma3mm(quant_state_dict, config, dtype = torch.float16):
     from transformers import Gemma3ForConditionalGeneration
     new_config = deepcopy(config)
 
@@ -976,16 +976,19 @@ def create_empty_gemma3(quant_state_dict, config, dtype = torch.float16):
 pass
 
 @torch.inference_mode
-def create_empty_model(quant_state_dict, config, dtype = torch.float16):
+def create_empty_model(quant_state_dict, config, dtype = torch.float16, is_vision_model = False):
     model_type = config.model_type
-    if model_type == "mllama":
+    if not is_vision_model:
+        return create_empty_causal_lm(quant_state_dict, config, dtype)
+    elif model_type == "mllama":
         return create_empty_mllama(quant_state_dict, config, dtype)
     elif model_type == "qwen2_5_vl":
         return create_empty_qwen2_5_vl(quant_state_dict, config, dtype)
     elif model_type == "gemma3":
-        return create_empty_gemma3(quant_state_dict, config, dtype)
+        return create_empty_gemma3mm(quant_state_dict, config, dtype)
     else:
-        return create_empty_causal_lm(quant_state_dict, config, dtype)
+        raise ValueError(f"Unsloth: Unsupported model type: {model_type}")
+
 pass
 
 def set_additional_modules(new_model, quant_state_dict, config):
@@ -1059,11 +1062,11 @@ def set_additional_modules(new_model, quant_state_dict, config):
 pass
 
 @torch.inference_mode
-def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None):
+def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
     config.update({"torch_dtype" : dtype}) # Do not use config file's dtype!
-    new_model, layer_names, layer_count = create_empty_model(quant_state_dict, config, dtype)
+    new_model, layer_names, layer_count = create_empty_model(quant_state_dict, config, dtype, is_vision_model)
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
     quantization_config = getattr(config, "quantization_config", {})
     kwargs = dict()
@@ -1342,6 +1345,7 @@ def load_vllm(
     max_logprobs           : int  = 0,
     use_bitsandbytes       : bool = True,
     unsloth_vllm_standby   : bool = False,
+    is_vision_model        : bool = False,
     return_args            : bool = False, # Just return args
 ):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1471,7 +1475,7 @@ def load_vllm(
 
     max_num_batched_tokens = 2048
 
-    if hasattr(config, "vision_config"):
+    if is_vision_model:
         # In vLLM profiling, each sequence contributes to an image. Which is generally in the order of thousand tokens.
         # We don't want to go beyond 16 sequences for vision models.
         # TODO: In vLLM V1, iirc, the profiling sets a cap on the max seqs based on the budget. Check it out.
@@ -2125,6 +2129,7 @@ def _test_get_vllm_state_dict(
     unsloth_vllm_standby = False,
     load_in_4bit = False,
     skip_generation = False,
+    is_vision_model = False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if model is allowed to be used in vLLM
@@ -2220,7 +2225,7 @@ def _test_get_vllm_state_dict(
     )
     assert_same_state_dict(model.state_dict(), state_dict)
 
-    new_model = convert_vllm_to_huggingface(quant_state_dict, config, dtype)
+    new_model = convert_vllm_to_huggingface(quant_state_dict, config, dtype, is_vision_model = is_vision_model)
     assert_same_state_dict(model.state_dict(), new_model.state_dict())
 
     # Run the model as well
