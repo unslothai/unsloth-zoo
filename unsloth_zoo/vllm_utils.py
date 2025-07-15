@@ -551,6 +551,7 @@ pass
 def patch_vllm(debug = True):
     # Temporary patch to disable multiprocessing for vLLM
     # Allows accessing model_executor
+    print(f'Unsloth: Patching vLLM')
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     if debug:
         os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
@@ -602,7 +603,7 @@ pass
 
 
 @torch.inference_mode
-def get_vllm_state_dict(llm, return_state_dict = False, config = None):
+def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
     # vllm_state_dict = {}
@@ -783,13 +784,14 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
     pass
 
-    # Handle vision-specific layers using dedicated functions
-    if model_type == "mllama":
-        extract_mllama_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
-    elif model_type == "qwen2_5_vl":
-        extract_qwen2_5_vl_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
-    elif model_type == "gemma3":
-        extract_gemma3_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
+    if is_vision_model:
+        # Handle vision-specific layers using dedicated functions
+        if model_type == "mllama":
+            extract_mllama_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
+        elif model_type == "qwen2_5_vl":
+            extract_qwen2_5_vl_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
+        elif model_type == "gemma3":
+            extract_gemma3_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
 
     # Norm
     # For Gemma3 and similar multimodal models, norm should be under model.norm
