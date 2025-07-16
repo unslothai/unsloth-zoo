@@ -48,7 +48,8 @@ import inspect
 from functools import partial
 from .utils import _get_dtype
 from .patching_utils import patch_model_and_tokenizer
-from unsloth import DEVICE_TYPE
+# from unsloth import DEVICE_TYPE
+DEVICE_TYPE = "cuda"
 global LORA_REQUEST_ID
 
 # Ignore logging messages
@@ -932,6 +933,7 @@ def create_empty_gemma3mm(config, dtype = torch.float16):
     new_config = deepcopy(config)
 
     new_config.text_config.num_attention_heads = 1
+    new_config.text_config.num_key_value_heads = 1
     new_config.text_config.intermediate_size = 1
 
     new_config.vision_config.num_attention_heads = 1
@@ -1155,21 +1157,34 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     set_additional_modules(new_model, quant_state_dict, config)
 
 
-    # Fix up config items with correct items
+    # Extract config attributes for setting on modules
     config_as_dict = config.to_dict()
+    config_flat = {}
+    def _flatten(d):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                _flatten(v)
+            elif isinstance(k, str):
+                config_flat[k] = v
+    _flatten(config_as_dict)
+
+    # For VLMs which have vision_config and text_config, we want to extract keys from nested structure
+    config_as_dict = config_as_dict | config_flat
+
     for module in new_model.modules():
+        # Set individual config attributes that the module expects
         for key, value in config_as_dict.items():
-            if hasattr(module, key): exec(f"module.{key} = {value}")
+            if hasattr(module, key): setattr(module, key, value)
         if hasattr(module, "config"): module.config = config
     pass
     for param in new_model.parameters():
         for key, value in config_as_dict.items():
-            if hasattr(param, key): exec(f"param.{key} = {value}")
+            if hasattr(param, key): setattr(param, key, value)
         if hasattr(param, "config"): param.config = config
     pass
     module = new_model
     for key, value in config_as_dict.items():
-        if hasattr(module, key): exec(f"module.{key} = {value}")
+        if hasattr(module, key): setattr(module, key, value)
     new_model.config = config
 
     text_config = getattr(config, "text_config", config) #try using text config for VLMs

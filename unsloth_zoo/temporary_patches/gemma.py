@@ -410,6 +410,7 @@ def patch_Gemma3Attention():
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         # print(attention_interface)
+        #breakpoint()
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
