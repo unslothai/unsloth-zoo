@@ -599,7 +599,7 @@ def create_standalone_class(
     # This fixes some weird OOBs accesses for Gemma 3N for example
     if disable is not None:
         source = re.sub(
-            r"input_ids - self\.([A-Za-z\_])",
+            r"input_ids - self\.([A-Za-z\_]{1,})",
             r"input_ids - torch.tensor(\1)",
             source,
         )
