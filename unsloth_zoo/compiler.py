@@ -127,6 +127,11 @@ import math
 
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 
+import logging
+logger = logging.getLogger(__name__)
+if UNSLOTH_ENABLE_LOGGING:
+    logger.setLevel(logging.DEBUG)
+
 global INFERENCE_RUNS
 INFERENCE_RUNS = 0
 
@@ -701,9 +706,13 @@ elif labels is None:
     global INFERENCE_RUNS
     if INFERENCE_RUNS == 4:
         # Skip guards and fail on recompiles after 4 token inferences
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs")
         torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
     elif DYNAMO_STANCE.stance == "default":
         # Reset compiler stance
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: Reseting compiler guards")
         torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
         INFERENCE_RUNS = 0
     INFERENCE_RUNS += 1
@@ -828,9 +837,13 @@ elif labels is None:
     global INFERENCE_RUNS
     if INFERENCE_RUNS == 4:
         # Skip guards and fail on recompiles after 4 token inferences
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs")
         torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
     elif DYNAMO_STANCE.stance == "default":
         # Reset compiler stance
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: Reseting compiler guards")
         torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
         INFERENCE_RUNS = 0
     INFERENCE_RUNS += 1
@@ -955,9 +968,13 @@ elif labels is None:
     global INFERENCE_RUNS
     if INFERENCE_RUNS == 4:
         # Skip guards and fail on recompiles after 4 token inferences
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs")
         torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
     elif DYNAMO_STANCE.stance == "default":
         # Reset compiler stance
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: Reseting compiler guards")
         torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
         INFERENCE_RUNS = 0
     INFERENCE_RUNS += 1
