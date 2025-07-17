@@ -658,6 +658,7 @@ __DYNAMO__RECOMPILING__ = """
     # Set compiler stance to fail on recompiles for inference
     global DYNAMO_STANCE
     global INFERENCE_RUNS
+    print(f"INFERENCE_RUNS = {INFERENCE_RUNS}")
     if INFERENCE_RUNS == 4:
         # Skip guards and fail on recompiles after 4 token inferences
         torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
