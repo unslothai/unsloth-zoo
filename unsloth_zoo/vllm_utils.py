@@ -1023,14 +1023,16 @@ def test_model_conversion(original_model, new_model):
     return True
 
 
-@torch.inference_mode
+@torch.inference_mode()
 def create_empty_causal_lm(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     from transformers import AutoModelForCausalLM
     try:
-        with torch.device("meta"):
+        from accelerate import init_empty_weights
+        with init_empty_weights():
             original_meta_model = AutoModelForCausalLM.from_config(config)
-    except Exception:
+    except Exception as e:
+        print(f"Failed to create original_meta_model for AutoModelForCausalLM. Error {e}")
         original_meta_model = None
 
     new_config = deepcopy(config)
@@ -1040,7 +1042,6 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     new_config.pad_token_id = 0
 
     # Set attention module head_dim
-    # Otherwise will get error if (head_dim)**-0.5 is seen like in Qwen
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})
 
@@ -1054,126 +1055,106 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     layer_names = layer_config['standard_layers'] + layer_config['layernorms']
 
     return new_model, original_meta_model, layer_names, config.num_hidden_layers
-pass
 
 
-@torch.inference_mode
-def create_empty_qwen2_5_vl(config, dtype = torch.float16):
-    # All Unsloth Zoo code licensed under LGPLv3
-    from transformers import Qwen2_5_VLForConditionalGeneration
-    try:
-        with torch.device("meta"):
-            original_meta_model = Qwen2_5_VLForConditionalGeneration(config)
-    except Exception:
-        original_meta_model = None
-
-    new_config = deepcopy(config)
-
-    new_config.num_attention_heads = 1
-    new_config.num_key_value_heads = 1
-    new_config.intermediate_size = 0
-
-    new_config.vision_config.dim = 1
-    new_config.vision_config.num_heads = 1
-    new_config.vision_config.intermediate_size = 0
-    new_config.vision_config.out_hidden_size = 1
-
-    new_model = Qwen2_5_VLForConditionalGeneration(new_config)
-
-    # Get layer names from config
-    layer_config = get_model_layer_config("qwen2_5_vl", config)
-    layer_names = (layer_config['standard_layers'] +
-                  layer_config['layernorms'] +
-                  layer_config['vision_layers'] +
-                  layer_config['additional_layers'])
-
-    layers = max(get_model_layer_counts(config).values())
-    return new_model, original_meta_model, layer_names, layers
-pass
-
-@torch.inference_mode
-def create_empty_mllama(config, dtype = torch.float16):
-    # All Unsloth Zoo code licensed under LGPLv3
-    from transformers import MllamaForConditionalGeneration
-    try:
-        with torch.device("meta"):
-            original_meta_model = MllamaForConditionalGeneration(config)
-    except Exception:
-        original_meta_model = None
-
-    new_config = deepcopy(config)
-
-    new_config.text_config.num_attention_heads = 1
-    new_config.text_config.num_key_value_heads = 1
-    new_config.text_config.intermediate_size = 0
-
-    new_config.vision_config.num_attention_heads = 1
-    new_config.vision_config.num_key_value_heads = 1
-    new_config.vision_config.intermediate_size = 0
-    new_config.vision_config.vision_output_dim = 1
-
-    new_model = MllamaForConditionalGeneration(new_config)
-
-    # Get layer names from config
-    layer_config = get_model_layer_config("mllama", config)
-    layer_names = (layer_config['standard_layers'] +
-                  layer_config['layernorms'] +
-                  layer_config['vision_layers'] +
-                  layer_config['additional_layers'])
-
-    num_layers = max(get_model_layer_counts(config).values())
-    return new_model, original_meta_model, layer_names, num_layers
-pass
-
-def create_empty_gemma3mm(config, dtype = torch.float16):
-    # All Unsloth Zoo code licensed under LGPLv3
-    from transformers import Gemma3ForConditionalGeneration
-    try:
-        with torch.device("meta"):
-            original_meta_model = Gemma3ForConditionalGeneration(config)
-    except Exception:
-        original_meta_model = None
-
-    new_config = deepcopy(config)
-
-    new_config.text_config.num_attention_heads = 1
-    new_config.text_config.num_key_value_heads = 1
-    new_config.text_config.intermediate_size = 1
-
-    new_config.vision_config.num_attention_heads = 1
-    new_config.vision_config.intermediate_size = 1
-    new_config.vision_config.vision_output_dim = 1
-
-    new_model = Gemma3ForConditionalGeneration(new_config)
-
-    # Get layer names from config
-    layer_config = get_model_layer_config("gemma3", config)
-    layer_names = (layer_config['standard_layers'] +
-                  layer_config['layernorms'] +
-                  layer_config['vision_layers'] +
-                  layer_config['additional_layers'])
-
-    num_layers = max(get_model_layer_counts(config).values())
-
-    return new_model, original_meta_model, layer_names, num_layers
-pass
-
-@torch.inference_mode
-def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
+@torch.inference_mode()
+def create_empty_vision_model(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     model_type = config.model_type
-    if not is_vision_model:
-        return create_empty_causal_lm(config, dtype)
-    elif model_type == "mllama":
-        return create_empty_mllama(config, dtype)
-    elif model_type == "qwen2_5_vl":
-        return create_empty_qwen2_5_vl(config, dtype)
-    elif model_type == "gemma3":
-        return create_empty_gemma3mm(config, dtype)
-    else:
-        raise ValueError(f"Unsloth: Unsupported model type: {model_type}")
 
-pass
+    from transformers.models.siglip.modeling_siglip import SiglipVisionModel
+
+    # Patch SiglipVisionModel to skip weight init on meta device.
+    if not hasattr(SiglipVisionModel, "_original_initialize_weights"):
+        SiglipVisionModel._original_initialize_weights = SiglipVisionModel._init_weights
+        # Patch _init_weights to a no-op with correct signature
+        def _init_weights(self, module):
+            return
+        SiglipVisionModel._init_weights = _init_weights
+
+    if model_type == "qwen2_5_vl":
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        model_cls = Qwen2_5_VLForConditionalGeneration
+    elif model_type == "mllama":
+        from transformers import MllamaForConditionalGeneration
+        model_cls = MllamaForConditionalGeneration
+    elif model_type == "gemma3":
+        from transformers import Gemma3ForConditionalGeneration
+        model_cls = Gemma3ForConditionalGeneration
+    else:
+        raise ValueError(f"Unsloth: Unsupported vision model type: {model_type}")
+
+    try:
+        # Use accelerate's init_empty_weights, not transformers.modeling_utils
+        from accelerate import init_empty_weights
+        with init_empty_weights():
+            original_meta_model = model_cls(config)
+            print(f'Initialised dummy model for config')
+    except Exception as e:
+        print(f"Failed to create original_meta_model for {model_cls.__name__}. Error {e}")
+        import traceback
+        traceback.print_exc()
+        original_meta_model = None
+
+    # Restore original SiglipVisionModel weight init
+    if hasattr(SiglipVisionModel, "_original_initialize_weights"):
+        SiglipVisionModel._init_weights = SiglipVisionModel._original_initialize_weights
+        del SiglipVisionModel._original_initialize_weights
+
+
+    new_config = deepcopy(config)
+
+    # Set minimal sizes for different model types
+    if model_type == "qwen2_5_vl":
+        new_config.num_attention_heads = 1
+        new_config.num_key_value_heads = 1
+        new_config.intermediate_size = 0
+        new_config.vision_config.dim = 1
+        new_config.vision_config.num_heads = 1
+        new_config.vision_config.intermediate_size = 1  # Must be non-zero for MLP layers
+        new_config.vision_config.out_hidden_size = 1
+        text_layers = config.text_config.num_hidden_layers
+        vision_layers = config.vision_config.depth
+    elif model_type == "mllama":
+        new_config.text_config.num_attention_heads = 1
+        new_config.text_config.num_key_value_heads = 1
+        new_config.text_config.intermediate_size = 0
+        new_config.vision_config.num_attention_heads = 1
+        new_config.vision_config.num_key_value_heads = 1
+        new_config.vision_config.intermediate_size = 0
+        new_config.vision_config.vision_output_dim = 1
+        text_layers = config.text_config.num_hidden_layers
+        vision_layers = config.vision_config.num_hidden_layers
+    elif model_type == "gemma3":
+        new_config.text_config.num_attention_heads = 1
+        new_config.text_config.num_key_value_heads = 1
+        new_config.text_config.intermediate_size = 1
+        new_config.vision_config.num_attention_heads = 1
+        new_config.vision_config.intermediate_size = 1
+        new_config.vision_config.vision_output_dim = 1
+        text_layers = config.text_config.num_hidden_layers
+        vision_layers = config.vision_config.num_hidden_layers
+
+    num_layers = max(text_layers, vision_layers)
+    new_model = model_cls(new_config)
+
+    # Get layer names from config
+    layer_config = get_model_layer_config(model_type, config)
+    layer_names = (layer_config['standard_layers'] +
+                  layer_config['layernorms'] +
+                  layer_config['vision_layers'] +
+                  layer_config['additional_layers'])
+
+    return new_model, original_meta_model, layer_names, num_layers
+
+
+@torch.inference_mode()
+def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if is_vision_model:
+        return create_empty_vision_model(config, dtype)
+    else:
+        return create_empty_causal_lm(config, dtype)
 
 def set_additional_modules(new_model, quant_state_dict, config):
     if hasattr(new_model, "language_model"):
@@ -1808,7 +1789,6 @@ def load_vllm(
             pass
             break
         except Exception as error:
-            print(f"Error occured loading vLLM: {error}", "will retry" if trials < 2 else "")
             trials += 1
             # Cleanup
             for _ in range(3):
@@ -1816,7 +1796,9 @@ def load_vllm(
                 torch.cuda.empty_cache()
             pass
             error = str(error)
-            if trials >= 2:
+            if trials >= 2 or unsloth_vllm_standby:
+                # Sleep mode uses CuMemAllocator which can't run multiple instances in single process.
+                # We can't do retry because vLLM will fail to load with said error.
                 raise RuntimeError(error)
 
             if "gpu_memory_utilization" in error or "memory" in error:
@@ -2323,6 +2305,7 @@ def _test_get_vllm_state_dict(
         trust_remote_code = False,
         attn_implementation = "sdpa",
     )
+
     if not vllm_dynamic_quant_supported(model_name, config):
         raise NotImplementedError(f"Unsloth: Dynamic quant of {model_name} not supported in vLLM")
 
