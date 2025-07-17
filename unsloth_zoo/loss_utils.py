@@ -313,7 +313,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     mark_dynamic(attention_mask, 1)
                     token_count &= (attention_mask[..., 1:] != 0)
                 if "token_type_ids" in x:
-                    token_type_ids = kwargs["token_type_ids"]
+                    token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)
                     mark_dynamic(token_type_ids, 1)
                 token_counts.append(token_count.sum())
