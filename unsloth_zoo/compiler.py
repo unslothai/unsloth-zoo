@@ -709,7 +709,7 @@ elif labels is None:
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Removing compiler guards after 4 inference runs at INFERENCE_RUNS = {INFERENCE_RUNS}")
         torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
-    elif DYNAMO_STANCE.stance == "default":
+    elif DYNAMO_STANCE.stance == "default" and INFERENCE_RUNS > 4:
         # Reset compiler stance
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Reseting compiler guards at INFERENCE_RUNS = {INFERENCE_RUNS}")
@@ -840,7 +840,7 @@ elif labels is None:
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Removing compiler guards after 4 inference runs at INFERENCE_RUNS = {INFERENCE_RUNS}")
         torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
-    elif DYNAMO_STANCE.stance == "default":
+    elif DYNAMO_STANCE.stance == "default" and INFERENCE_RUNS > 4:
         # Reset compiler stance
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Reseting compiler guards at INFERENCE_RUNS = {INFERENCE_RUNS}")
@@ -971,7 +971,7 @@ elif labels is None:
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Removing compiler guards after 4 inference runs")
         torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
-    elif DYNAMO_STANCE.stance == "default":
+    elif DYNAMO_STANCE.stance == "default" and INFERENCE_RUNS > 4:
         # Reset compiler stance
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Reseting compiler guards at INFERENCE_RUNS = {INFERENCE_RUNS}")
