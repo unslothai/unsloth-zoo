@@ -338,7 +338,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = True)
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Skipping torch.compile guards after 8 steps at TRAINING_ITERATIONS = {TRAINING_ITERATIONS}")
-    elif TRAINING_ITERATIONS > 8 and DYNAMO_STANCE.skip_guard_eval_unsafe == False:
+    elif DYNAMO_STANCE.skip_guard_eval_unsafe == False and TRAINING_ITERATIONS > 8:
         # Reset TRAINING_ITERATIONS
         torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
         TRAINING_ITERATIONS = 0
