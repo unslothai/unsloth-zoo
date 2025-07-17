@@ -780,7 +780,7 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None):
         torch.utils.checkpoint.CheckpointFunction = UnslothCheckpointFunction
 
     if torch.utils.checkpoint.checkpoint.__name__ != "unsloth_checkpoint":
-        torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint
+        torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
         torch.utils.checkpoint.checkpoint = unsloth_checkpoint
 pass
 
@@ -793,15 +793,19 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         torch.utils.checkpoint.CheckpointFunction = torch.utils.checkpoint._old_CheckpointFunction
         global CPU_BUFFERS
         global GPU_BUFFERS
-        for i in range(len(CPU_BUFFERS)): CPU_BUFFERS[i] = None
-        for i in range(len(GPU_BUFFERS)): GPU_BUFFERS[i] = None
+        for i in range(len(CPU_BUFFERS)):
+            if hasattr(CPU_BUFFERS[i], "resize_"): CPU_BUFFERS[i].resize_(0)
+            if type(CPU_BUFFERS) is list: CPU_BUFFERS[i] = None
+        for i in range(len(GPU_BUFFERS)):
+            if hasattr(GPU_BUFFERS[i], "resize_"): GPU_BUFFERS[i].resize_(0)
+            if type(GPU_BUFFERS) is list: GPU_BUFFERS[i] = None
         CPU_BUFFERS = None
         GPU_BUFFERS = None
 
     if (torch.utils.checkpoint.checkpoint.__name__ == "unsloth_checkpoint") and \
-        hasattr(torch.utils, "_old_checkpoint"):
+        hasattr(torch.utils.checkpoint, "_old_checkpoint"):
 
-        torch.utils.checkpoint = torch.utils._old_checkpoint
+        torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
 pass
 
 

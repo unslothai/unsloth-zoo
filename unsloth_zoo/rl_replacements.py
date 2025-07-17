@@ -24,15 +24,8 @@ import os
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from unsloth import DEVICE_TYPE
+from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()
-
-torch_compile_options = {
-    "epilogue_fusion"   : True,
-    "max_autotune"      : False, # Disable Triton mm kernels
-    "shape_padding"     : True,
-    "trace.enabled"     : False,
-    "triton.cudagraphs" : False,
-}
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
@@ -45,7 +38,29 @@ def selective_log_softmax(logits, index):
     per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
     return per_token_logps
 pass
-RL_REPLACEMENTS["selective_log_softmax"] = selective_log_softmax
+
+# More memory efficient by chunking on (bsz+qlen) dimension
+# Exactly equivalent to the above
+@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+def chunked_selective_log_softmax(logits, index):
+    # Split into 4 chunks only
+    chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = 4, dim = 0)
+    chunked_index  = torch.chunk(index.reshape(-1), chunks = 4, dim = 0)
+    all_per_token_logps = []
+    # Below loop does the same as selective_log_softmax(chunk_logits, chunk_index)
+    for chunk_logits, chunk_index in zip(chunked_logits, chunked_index):
+        chunk_logits = chunk_logits.to(torch.float32)
+        selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
+        logsumexp_values = torch.logsumexp(chunk_logits, dim = -1)
+        per_token_logps = selected_logits - logsumexp_values
+        all_per_token_logps.append(per_token_logps)
+    pass
+    all_per_token_logps = torch.concat(all_per_token_logps)
+    all_per_token_logps = all_per_token_logps.reshape((logits.shape[0], logits.shape[1]))
+    return all_per_token_logps
+pass
+
+RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
 
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
