@@ -130,6 +130,9 @@ UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 global INFERENCE_RUNS
 INFERENCE_RUNS = 0
 
+global DYNAMO_STANCE
+from torch._dynamo.eval_frame import _stance as DYNAMO_STANCE
+
 """
 
 _disabled_sdpa_code = f"""{_license_header}
@@ -693,6 +696,18 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
+    # Set compiler stance to fail on recompiles for inference
+    global DYNAMO_STANCE
+    global INFERENCE_RUNS
+    if INFERENCE_RUNS == 4:
+        # Skip guards and fail on recompiles after 4 token inferences
+        torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
+    elif DYNAMO_STANCE.stance == "default":
+        # Reset compiler stance
+        torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
+        INFERENCE_RUNS = 0
+    INFERENCE_RUNS += 1
+
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
     loss = fast_linear_cross_entropy(
@@ -808,6 +823,18 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
+    # Set compiler stance to fail on recompiles for inference
+    global DYNAMO_STANCE
+    global INFERENCE_RUNS
+    if INFERENCE_RUNS == 4:
+        # Skip guards and fail on recompiles after 4 token inferences
+        torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
+    elif DYNAMO_STANCE.stance == "default":
+        # Reset compiler stance
+        torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
+        INFERENCE_RUNS = 0
+    INFERENCE_RUNS += 1
+
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and not requires_grad_:
     loss = fast_linear_cross_entropy(
@@ -923,6 +950,18 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
+    # Set compiler stance to fail on recompiles for inference
+    global DYNAMO_STANCE
+    global INFERENCE_RUNS
+    if INFERENCE_RUNS == 4:
+        # Skip guards and fail on recompiles after 4 token inferences
+        torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
+    elif DYNAMO_STANCE.stance == "default":
+        # Reset compiler stance
+        torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
+        INFERENCE_RUNS = 0
+    INFERENCE_RUNS += 1
+
     logits = self.lm_head(hidden_states\\1)
 else:
     lm_head_weight = self.lm_head.weight

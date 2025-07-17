@@ -237,6 +237,9 @@ ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
 
+global DYNAMO_STANCE
+from torch._dynamo.eval_frame import _stance as DYNAMO_STANCE
+
 mark_static  = torch._dynamo.mark_static
 mark_dynamic = torch._dynamo.mark_dynamic
 
@@ -329,16 +332,19 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     pass
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
-    # Increment counter
+    
+    # Increment counter and set compiler stance
+    global DYNAMO_STANCE
     global TRAINING_ITERATIONS
     if TRAINING_ITERATIONS == 8:
         # Skip guards after 8 warmup runs
-        try:
-            torch.compiler.set_stance(skip_guard_eval_unsafe = True)
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.info(f"Unsloth: Skipping torch.compile guards after 8 steps")
-        except:
-            pass
+        torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = True)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: Skipping torch.compile guards after 8 steps")
+    elif TRAINING_ITERATIONS > 8 and DYNAMO_STANCE.skip_guard_eval_unsafe == False:
+        # Reset TRAINING_ITERATIONS
+        torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
+        TRAINING_ITERATIONS = 0
     TRAINING_ITERATIONS += 1
     return batch_samples, num_items_in_batch
 pass
