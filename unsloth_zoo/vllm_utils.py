@@ -1169,7 +1169,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
     language_model.embed_tokens = torch.nn.Embedding.from_pretrained(
         quant_state_dict[embed_tokens_key],
         freeze = True,
-        padding_idx = getattr(config, 'pad_token_id', None),
+        padding_idx = config.pad_token_id,
     )
 
     # Norm
@@ -1189,9 +1189,13 @@ def set_additional_modules(new_model, quant_state_dict, config):
         weight = quant_state_dict[lmhead_key]
         from torch.nn import Linear
 
-        # Create lm_head with correct dimensions
-        layer = Linear(weight.shape[1], weight.shape[0], device = get_target_device(), bias = False)
-        layer.weight = torch.nn.Parameter(weight, requires_grad = False)
+        # Create Linear layer with zero dimensions to avoid any weight allocation
+        layer = Linear(0, 0, device=weight.device, bias=False)
+        # Set correct dimensions
+        layer.in_features = weight.shape[1]
+        layer.out_features = weight.shape[0]
+        # Assign the weight directly (no deletion needed since no weight was allocated)
+        layer.weight = torch.nn.Parameter(weight, requires_grad=False)
 
         # Set lm_head at the correct level
         if hasattr(new_model, "lm_head"):
