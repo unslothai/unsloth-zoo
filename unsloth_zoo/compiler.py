@@ -1931,8 +1931,10 @@ def unsloth_compile_transformers(
         ("causal_conv1d_fn" in full_source or "causal_conv1d_update" in full_source):
 
         print(
+            "**********\n"\
             "Unsloth: Please install `causal_conv1d` to speed up Mamba training via `pip install causal_conv1d`\n"\
-            "If you don't, training will still work, just might be slower for Mamba type models."
+            "If you don't, training will still work, just might be slower for Mamba type models.\n"\
+            "**********\n"
         )
     pass
 
