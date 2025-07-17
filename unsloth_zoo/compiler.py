@@ -129,9 +129,9 @@ import math
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 
 import logging
-logger = logging.getLogger(__name__)
+logger_compiler = logging.getLogger(__name__)
 if UNSLOTH_ENABLE_LOGGING:
-    logger.setLevel(logging.DEBUG)
+    logger_compiler.setLevel(logging.DEBUG)
 
 global INFERENCE_RUNS
 INFERENCE_RUNS = 0
@@ -662,18 +662,22 @@ __DYNAMO__RECOMPILING__ = """
         torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
         print("!!!!!!!!!!!!!!")
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Removing compiler guards after 2 inference runs. "\\
-                        f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
-                        f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}")
+            logger_compiler.info(
+                f"Unsloth: Removing compiler guards after 2 inference runs. "\\
+                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+            )
     elif old_stance == "eager_on_recompile":
         pass
     elif old_stance == "default" and INFERENCE_RUNS > 2:
         # Reset compiler stance
         torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Reseting guards. "\\
-                        f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
-                        f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}")
+            logger_compiler.info(
+                f"Unsloth: Reseting guards. "\\
+                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+            )
         INFERENCE_RUNS = 0
     INFERENCE_RUNS += 1
 """
