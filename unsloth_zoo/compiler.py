@@ -135,7 +135,7 @@ if UNSLOTH_ENABLE_LOGGING:
 global INFERENCE_RUNS
 INFERENCE_RUNS = 0
 
-from torch._dynamo.eval_frame import _stance
+import torch._dynamo.eval_frame as torch_dynamo_eval_frame
 
 """
 
@@ -657,7 +657,7 @@ __DYNAMO__RECOMPILING__ = """
     # Set compiler stance to fail on recompiles for inference
     global INFERENCE_RUNS
     print(f"INFERENCE_RUNS = {INFERENCE_RUNS}")
-    old_stance = _stance.stance
+    old_stance = torch_dynamo_eval_frame._stance.stance
     if INFERENCE_RUNS == 4:
         # Skip guards and fail on recompiles after 4 token inferences
         torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
