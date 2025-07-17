@@ -307,18 +307,15 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     input_ids = x["input_ids"]
                     mark_static (input_ids, 0)
                     mark_dynamic(input_ids, 1)
-                    print(0)
                 if "attention_mask" in x:
                     attention_mask = x["attention_mask"]
                     mark_static (attention_mask, 0)
                     mark_dynamic(attention_mask, 1)
                     token_count &= (attention_mask[..., 1:] != 0)
-                    print(1)
                 if "token_type_ids" in x:
                     token_type_ids = kwargs["token_type_ids"]
                     mark_static (token_type_ids, 0)
                     mark_dynamic(token_type_ids, 1)
-                    print(2)
                 token_counts.append(token_count.sum())
             pass
             num_items_in_batch = sum(token_counts)
