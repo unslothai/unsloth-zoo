@@ -135,7 +135,6 @@ if UNSLOTH_ENABLE_LOGGING:
 global INFERENCE_RUNS
 INFERENCE_RUNS = 0
 
-global DYNAMO_STANCE
 from torch._dynamo.eval_frame import _stance as DYNAMO_STANCE
 
 """
@@ -656,7 +655,6 @@ pass
 __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
-    global DYNAMO_STANCE
     global INFERENCE_RUNS
     print(f"INFERENCE_RUNS = {INFERENCE_RUNS}")
     old_stance = DYNAMO_STANCE.stance
