@@ -2339,41 +2339,31 @@ def _test_get_vllm_state_dict(
     patch_bitsandbytes_quant_state()
     # patch_bitsandbytes_compute_dtype(dtype)
     model_type = getattr(config, "model_type", "causal_lm")
-    if model_type == "mllama":
-        from transformers import MllamaForConditionalGeneration
-        model = MllamaForConditionalGeneration.from_pretrained(
-            model_name,
-            device_map          = "sequential",
-            torch_dtype         = dtype,
-            attn_implementation = "sdpa",
-            **kwargs,
-        )
-    elif model_type == "qwen2_5_vl":
-        from transformers import Qwen2_5_VLForConditionalGeneration
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_name,
-            device_map          = "sequential",
-            torch_dtype         = dtype,
-            attn_implementation = "sdpa",
-            **kwargs,
-        )
-    elif model_type == "gemma3" and hasattr(config, "vision_config"):
-        from transformers import Gemma3ForConditionalGeneration
-        model = Gemma3ForConditionalGeneration.from_pretrained(
-            model_name,
-            device_map          = "sequential",
-            torch_dtype         = dtype,
-            attn_implementation = "sdpa",
-            **kwargs,
-        )
+
+    if not is_vision_model:
+        model_class = AutoModelForCausalLM
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map          = "sequential",
-            torch_dtype         = dtype,
-            attn_implementation = "sdpa",
-            **kwargs,
-        )
+        if model_type == "qwen2_5_vl":
+            from transformers import Qwen2_5_VLForConditionalGeneration
+            model_class = Qwen2_5_VLForConditionalGeneration
+        elif model_type == "gemma3":
+            from transformers import Gemma3ForConditionalGeneration
+            model_class = Gemma3ForConditionalGeneration
+        elif model_type == "mllama":
+            from transformers import MllamaForConditionalGeneration
+            model_class = MllamaForConditionalGeneration
+        else:
+            raise ValueError(f"Unsloth: Model type {model_type} not supported for vision models")
+
+    model = model_class.from_pretrained(
+        model_name,
+        device_map          = "auto",
+        torch_dtype         = dtype,
+        attn_implementation = "sdpa",
+        low_cpu_mem_usage   = True,
+        **kwargs,
+    )
+
     # unpatch_bitsandbytes_compute_dtype()
     for param in model.parameters():
         param.requires_grad_(False)
