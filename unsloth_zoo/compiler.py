@@ -653,6 +653,29 @@ pass
 
 """
 
+__DYNAMO__RECOMPILING__ = """
+
+    # Set compiler stance to fail on recompiles for inference
+    global DYNAMO_STANCE
+    global INFERENCE_RUNS
+    if INFERENCE_RUNS == 4:
+        # Skip guards and fail on recompiles after 4 token inferences
+        torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs."\\
+                        f"DYNAMO_STANCE.stance = {DYNAMO_STANCE.stance}"\\
+                        f"DYNAMO_STANCE.skip_guard_eval_unsafe = {DYNAMO_STANCE.skip_guard_eval_unsafe}")
+    elif DYNAMO_STANCE.stance == "default" and INFERENCE_RUNS > 4:
+        # Reset compiler stance
+        torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: Reseting guards."\\
+                        f"DYNAMO_STANCE.stance = {DYNAMO_STANCE.stance}"\\
+                        f"DYNAMO_STANCE.skip_guard_eval_unsafe = {DYNAMO_STANCE.skip_guard_eval_unsafe}")
+        INFERENCE_RUNS = 0
+    INFERENCE_RUNS += 1
+"""
+
 # Replace Cross Entropy cells with fused linear lm heads
 cross_entropy_find_1 = """
 logits = self.lm_head(hidden_states$INDEXING$
@@ -701,22 +724,7 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
-    # Set compiler stance to fail on recompiles for inference
-    global DYNAMO_STANCE
-    global INFERENCE_RUNS
-    if INFERENCE_RUNS == 4:
-        # Skip guards and fail on recompiles after 4 token inferences
-        if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs at INFERENCE_RUNS = {INFERENCE_RUNS}")
-        torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
-    elif DYNAMO_STANCE.stance == "default" and INFERENCE_RUNS > 4:
-        # Reset compiler stance
-        if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Reseting compiler guards at INFERENCE_RUNS = {INFERENCE_RUNS}")
-        torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
-        INFERENCE_RUNS = 0
-    INFERENCE_RUNS += 1
-
+    __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
     loss = fast_linear_cross_entropy(
@@ -790,7 +798,7 @@ else:
     # shift_labels = shift_labels.to(shift_logits.device)
     # loss = loss_fct(shift_logits, shift_labels)
     # if n_items is not None: loss = loss / n_items
-"""
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_2 = """
 logits = self.lm_head(hidden_states$INDEXING$
@@ -832,22 +840,7 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
-    # Set compiler stance to fail on recompiles for inference
-    global DYNAMO_STANCE
-    global INFERENCE_RUNS
-    if INFERENCE_RUNS == 4:
-        # Skip guards and fail on recompiles after 4 token inferences
-        if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs at INFERENCE_RUNS = {INFERENCE_RUNS}")
-        torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
-    elif DYNAMO_STANCE.stance == "default" and INFERENCE_RUNS > 4:
-        # Reset compiler stance
-        if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Reseting compiler guards at INFERENCE_RUNS = {INFERENCE_RUNS}")
-        torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
-        INFERENCE_RUNS = 0
-    INFERENCE_RUNS += 1
-
+    __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and not requires_grad_:
     loss = fast_linear_cross_entropy(
@@ -914,7 +907,7 @@ else:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
     loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
-"""
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_3 = """
 $OUTPUTLOGITS$
@@ -963,22 +956,7 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
-    # Set compiler stance to fail on recompiles for inference
-    global DYNAMO_STANCE
-    global INFERENCE_RUNS
-    if INFERENCE_RUNS == 4:
-        # Skip guards and fail on recompiles after 4 token inferences
-        if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs")
-        torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
-    elif DYNAMO_STANCE.stance == "default" and INFERENCE_RUNS > 4:
-        # Reset compiler stance
-        if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Reseting compiler guards at INFERENCE_RUNS = {INFERENCE_RUNS}")
-        torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
-        INFERENCE_RUNS = 0
-    INFERENCE_RUNS += 1
-
+    __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
 else:
     lm_head_weight = self.lm_head.weight
@@ -1021,7 +999,7 @@ else:
     #     mask                 = \\6,
     #     requires_grad_       = requires_grad_,
     # )
-"""
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 ce_finders = [
     (cross_entropy_find_1, cross_entropy_replacement_1,),
