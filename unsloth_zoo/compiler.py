@@ -116,6 +116,7 @@ _license_header = """
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import os
+import torch
 import importlib.util
 if importlib.util.find_spec("unsloth_studio") is None:
     UNSLOTH_STUDIO_ENABLED = False
@@ -142,8 +143,6 @@ torch_compiler_set_stance = torch.compiler.set_stance
 
 _disabled_sdpa_code = f"""{_license_header}
 
-import os
-import torch
 from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
     unsloth_compiled_ce_loss_function,
