@@ -92,8 +92,29 @@ if importlib.util.find_spec("vllm") is not None:
         return vllm_check or unsloth_check
     pass
 
-    import vllm.model_executor.layers.quantization.bitsandbytes
+    # Since https://github.com/vllm-project/vllm/blob/4959915089f1bcf011f082136464e48b76c7e3d9/vllm/model_executor/model_loader/bitsandbytes_loader.py
+    # vLLM dequantizes the Double quant scalars on the fly
+    # We disable this
+    def dequantize_dq(quant_states):
+        return quant_states
+    def _dequantize_dq(self, quant_states):
+        return quant_states
 
+    import vllm.model_executor.model_loader.bitsandbytes_loader
+    if hasattr(
+        vllm.model_executor.model_loader.bitsandbytes_loader,
+        "dequantize_dq",
+    ):
+        vllm.model_executor.model_loader.bitsandbytes_loader.dequantize_dq = dequantize_dq
+    elif hasattr(
+        vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader,
+        "_dequantize_dq",
+    ):
+        vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader._dequantize_dq = _dequantize_dq
+    pass
+
+    # Patch apply_bnb_4bit
+    import vllm.model_executor.layers.quantization.bitsandbytes
     if not hasattr(
         vllm.model_executor.layers.quantization.bitsandbytes,
         "apply_bnb_4bit"
