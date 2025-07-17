@@ -528,9 +528,6 @@ def create_standalone_class(
     # We disable this for nn.Embedding modules if torch is older than 2.5 since
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
         disable = True
-    # For cuda_kernels_forward, we disable
-    if "cuda_kernels_forward" in source:
-        disable = True
 
     source = re.sub(
         "def forward",
@@ -540,6 +537,10 @@ def create_standalone_class(
     spaces = re.search(r"[^\s\n]", source).span(0)[0]
     source = source.split("\n")
     source = "\n".join(x[spaces:] for x in source)
+
+    # For cuda_kernels_forward, we disable
+    if "cuda_kernels_forward" in source:
+        disable = True
 
     if disable is not None:
         compile = \
