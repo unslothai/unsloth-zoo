@@ -546,6 +546,11 @@ def create_standalone_class(
     else:
         compile = ""
 
+    # For cuda_kernels_forward, we disable
+    if "cuda_kernels_forward" in source:
+        disable = True
+    pass
+
     # Create new forward calling optimized function
     parameters = inspect.signature(f.forward).parameters
     # .parameters removes **kwargs and *args so we get it back!
