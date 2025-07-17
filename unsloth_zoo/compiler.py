@@ -707,12 +707,12 @@ elif labels is None:
     if INFERENCE_RUNS == 4:
         # Skip guards and fail on recompiles after 4 token inferences
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs")
+            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs at INFERENCE_RUNS = {INFERENCE_RUNS}")
         torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
     elif DYNAMO_STANCE.stance == "default":
         # Reset compiler stance
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Reseting compiler guards")
+            logger.info(f"Unsloth: Reseting compiler guards at INFERENCE_RUNS = {INFERENCE_RUNS}")
         torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
         INFERENCE_RUNS = 0
     INFERENCE_RUNS += 1
@@ -838,12 +838,12 @@ elif labels is None:
     if INFERENCE_RUNS == 4:
         # Skip guards and fail on recompiles after 4 token inferences
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs")
+            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs at INFERENCE_RUNS = {INFERENCE_RUNS}")
         torch.compiler.set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
     elif DYNAMO_STANCE.stance == "default":
         # Reset compiler stance
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Reseting compiler guards")
+            logger.info(f"Unsloth: Reseting compiler guards at INFERENCE_RUNS = {INFERENCE_RUNS}")
         torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
         INFERENCE_RUNS = 0
     INFERENCE_RUNS += 1
@@ -974,7 +974,7 @@ elif labels is None:
     elif DYNAMO_STANCE.stance == "default":
         # Reset compiler stance
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Reseting compiler guards")
+            logger.info(f"Unsloth: Reseting compiler guards at INFERENCE_RUNS = {INFERENCE_RUNS}")
         torch.compiler.set_stance(stance = "default", skip_guard_eval_unsafe = False)
         INFERENCE_RUNS = 0
     INFERENCE_RUNS += 1
