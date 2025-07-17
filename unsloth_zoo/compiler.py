@@ -657,16 +657,16 @@ __DYNAMO__RECOMPILING__ = """
     # Set compiler stance to fail on recompiles for inference
     global INFERENCE_RUNS
     old_stance = torch_dynamo_eval_frame._stance.stance
-    if INFERENCE_RUNS == 2:
-        # Skip guards and fail on recompiles after 4 token inferences
+    if INFERENCE_RUNS == 1:
+        # Skip guards and fail on recompiles after 1 token inference
         torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Unsloth: Removing compiler guards after 4 inference runs. "\\
+            logger.info(f"Unsloth: Removing compiler guards after 1 inference runs. "\\
                         f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
                         f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}")
     elif old_stance == "eager_on_recompile":
         pass
-    elif old_stance == "default" and INFERENCE_RUNS > 2:
+    elif old_stance == "default" and INFERENCE_RUNS > 1:
         # Reset compiler stance
         torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
         if UNSLOTH_ENABLE_LOGGING:
