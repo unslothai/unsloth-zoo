@@ -237,6 +237,9 @@ ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
 
+mark_static  = torch._dynamo.mark_static
+mark_dynamic = torch._dynamo.mark_dynamic
+
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
@@ -293,23 +296,26 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     # Get num_items_in_batch
     if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
         try:
-            if not "attention_mask" in batch_samples[0]: is_vlm = False
-            if not is_vlm:
-                for x in batch_samples:
-                    labels = x["labels"]
+            token_counts = []
+            for x in batch_samples:
+                labels = x["labels"]
+                token_count = (labels[..., 1:] != -100)
+                if "input_ids" in x:
                     input_ids = x["input_ids"]
-                    print(labels.shape)
-                    print(input_ids.shape)
-                    (labels[..., 1:] != -100).sum()
-                num_items_in_batch = sum(
-                    [(x["labels"][..., 1:] != -100)\
-                    .sum() for x in batch_samples]
-                )
-            else:
-                num_items_in_batch = sum(
-                    [((x["labels"][..., 1:] != -100) & (x["attention_mask"][..., 1:] != 0))\
-                    .sum() for x in batch_samples]
-                )
+                    mark_static (input_ids, 0)
+                    mark_dynamic(input_ids, 1)
+                if "attention_mask" in x:
+                    attention_mask = x["attention_mask"]
+                    mark_static (attention_mask, 0)
+                    mark_dynamic(attention_mask, 1)
+                    token_count &= (attention_mask[..., 1:] != 0)
+                if "token_type_ids" in x:
+                    token_type_ids = kwargs["token_type_ids"]
+                    mark_static (token_type_ids, 0)
+                    mark_dynamic(token_type_ids, 1)
+                token_counts.append(token_count.sum())
+            pass
+            num_items_in_batch = sum(token_counts)
 
             if self.args.average_tokens_across_devices:
                 num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
