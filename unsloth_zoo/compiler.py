@@ -530,6 +530,10 @@ def create_standalone_class(
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
         disable = True
 
+    # Disable if cuda_kernels_forward is seen
+    if "cuda_kernels_forward" in forward_source:
+        disable = True
+
     source = re.sub(
         "def forward",
         f"def {module}_forward",
