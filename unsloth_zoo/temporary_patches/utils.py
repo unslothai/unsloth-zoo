@@ -38,9 +38,9 @@ import typing as t
 import torch
 from typing import Any, Callable, Dict, List, Tuple
 try:
-    t._TypedDictMeta
+    t_TypedDictMeta = t._TypedDictMeta
 except:
-    raise RuntimeError("Unsloth: typing._TypedDictMeta does not exist! File a bug report immediately thank you!")
+    from typing_extensions import _TypedDictMeta as t_TypedDictMeta
 
 from packaging.version import Version
 from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
@@ -94,10 +94,15 @@ def process_return(
 pass
 
 # Get Unpack
+# Python 3.10 doesnt have t_Unpack!
+try:
+    t_Unpack = t.Unpack
+except:
+    from typing_extensions import Unpack as t_Unpack
 try:
     from transformers.processing_utils import Unpack
     assert \
-        type(Unpack) is type(t.Unpack), \
+        type(Unpack) is type(t_Unpack), \
         "Unsloth: Unpack type changed! Please file a bug report asap!"
 except Exception as e:
     raise RuntimeError(
@@ -105,7 +110,7 @@ except Exception as e:
         "Please file a bug report asap!"
     )
 pass
-KWARGS_TYPE = t.Unpack[t._TypedDictMeta]
+KWARGS_TYPE = t_Unpack[t_TypedDictMeta]
 
 
 # Sometimes output classes change! Account for this
@@ -132,11 +137,11 @@ pass
 
 
 # Latest transformers 4.54.0 changed to TransformersKwargs
-TransformersKwargs = t._TypedDictMeta
+TransformersKwargs = t_TypedDictMeta
 try:
     from transformers.utils import TransformersKwargs
     assert \
-        type(TransformersKwargs) is t._TypedDictMeta, \
+        type(TransformersKwargs) is t_TypedDictMeta, \
         "Unsloth: TransformersKwargs type changed! Please file a bug report asap!"
 except Exception as e:
     from transformers import __version__ as transformers_version
@@ -150,11 +155,11 @@ except Exception as e:
 pass
 
 # Get FlashAttentionKwargs
-FlashAttentionKwargs = t._TypedDictMeta
+FlashAttentionKwargs = t_TypedDictMeta
 try:
     from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
     assert \
-        type(FlashAttentionKwargs) is t._TypedDictMeta, \
+        type(FlashAttentionKwargs) is t_TypedDictMeta, \
         "Unsloth: FlashAttentionKwargs type changed! Please file a bug report asap!"
 except:
     # No more FlashAttentionKwargs can ignore!
@@ -162,19 +167,19 @@ except:
 pass
 
 # Get LossKwargs and KwargsForCausalLM
-LossKwargs = t._TypedDictMeta
-KwargsForCausalLM = t._TypedDictMeta
+LossKwargs = t_TypedDictMeta
+KwargsForCausalLM = t_TypedDictMeta
 try:
     from transformers.utils import LossKwargs
     assert \
-        type(LossKwargs) is t._TypedDictMeta, \
+        type(LossKwargs) is t_TypedDictMeta, \
         "Unsloth: LossKwargs type changed! Please file a bug report asap!"
-    if FlashAttentionKwargs != t._TypedDictMeta:
+    if FlashAttentionKwargs != t_TypedDictMeta:
         class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 except:
     # New transformers changed KwargsForCausalLM to TransformersKwargs
     KwargsForCausalLM = TransformersKwargs
-    if KwargsForCausalLM == t._TypedDictMeta:
+    if KwargsForCausalLM == t_TypedDictMeta:
         logger.error(
             "Unsloth: KwargsForCausalLM cannot be inherited from "\
             f"TransformersKwargs since it's of type = {type(TransformersKwargs)}"
@@ -229,8 +234,8 @@ TYPE_MAPPINGS = {
     set                  : t.Set,
     tuple                : t.Tuple,
     frozenset            : t.FrozenSet,
-    Unpack               : t.Unpack,
-    KWARGS_TYPE          : t.Unpack[t._TypedDictMeta],
+    Unpack               : t_Unpack,
+    KWARGS_TYPE          : t_Unpack[t_TypedDictMeta],
     Cache                : t.Any,
     DynamicCache         : t.Any,
     HybridCache          : t.Any,
@@ -244,9 +249,9 @@ TYPE_MAPPINGS = {
 if TextInput         != str:       TYPE_MAPPINGS[TextInput]         = t.Any
 if PreTokenizedInput != List[str]: TYPE_MAPPINGS[PreTokenizedInput] = t.Any
 
-if TransformersKwargs   != t._TypedDictMeta: TYPE_MAPPINGS[TransformersKwargs]   = t._TypedDictMeta
-if FlashAttentionKwargs != t._TypedDictMeta: TYPE_MAPPINGS[FlashAttentionKwargs] = t._TypedDictMeta
-if LossKwargs           != t._TypedDictMeta: TYPE_MAPPINGS[LossKwargs]           = t._TypedDictMeta
+if TransformersKwargs   != t_TypedDictMeta: TYPE_MAPPINGS[TransformersKwargs]   = t_TypedDictMeta
+if FlashAttentionKwargs != t_TypedDictMeta: TYPE_MAPPINGS[FlashAttentionKwargs] = t_TypedDictMeta
+if LossKwargs           != t_TypedDictMeta: TYPE_MAPPINGS[LossKwargs]           = t_TypedDictMeta
 
 def _canonicalize_annotation(annotation: Any) -> Any:
     """
@@ -275,17 +280,17 @@ def canonicalize_annotation(annotation: Any) -> Any:
         # Fix up kwargs
         # (typing.Unpack, (<class 'transformers.models.csm.modeling_csm.KwargsForCausalLM'>,)) to
         # (typing.Unpack, (<class 'typing._TypedDictMeta'>,))
-        elif annotation[0] == t.Unpack and \
+        elif annotation[0] == t_Unpack and \
             type(annotation[1]) is tuple and \
             len(annotation[1]) == 1 and \
             "Kwargs" in str(annotation[1][0]):
-            annotation = (t.Unpack, (t._TypedDictMeta,),)
+            annotation = (t_Unpack, (t_TypedDictMeta,),)
 
         # (typing.Unpack, <class 'typing._TypedDictMeta'>,)
-        elif annotation[0] == t.Unpack and \
+        elif annotation[0] == t_Unpack and \
             type(annotation[1]) is type and \
             "Kwargs" in str(annotation[1]):
-            annotation = (t.Unpack, (t._TypedDictMeta,),)
+            annotation = (t_Unpack, (t_TypedDictMeta,),)
 
     return annotation
 pass
@@ -316,7 +321,7 @@ def get_function_fingerprint(func: Callable) -> List[Dict[str, Any]]:
                 (param_kind == VAR_KEYWORD_ID) and \
                 (annotation == EMPTY) and \
                 (len(signature_parameters)-1 == kk):
-                annotation = (t.Unpack, (t._TypedDictMeta,),)
+                annotation = (t_Unpack, (t_TypedDictMeta,),)
         pass
         # If name is simply x, and annotation is empty, set to torch.Tensor
         # For eg def forward(self, x)

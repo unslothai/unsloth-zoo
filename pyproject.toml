@@ -22,7 +22,7 @@ classifiers = [
     "Programming Language :: Python",
 ]
 dependencies = [
-    "torch<=2.7.0",
+    "torch>=2.4.0",
     "triton ; platform_system == 'Linux'",
     "triton_windows ; platform_system == 'Windows'",
     "packaging>=24.1",
@@ -44,6 +44,7 @@ dependencies = [
     "pillow",
     "regex",
     "msgspec",
+    "typing_extensions",
 ]
 
 [tool.setuptools.dynamic]
