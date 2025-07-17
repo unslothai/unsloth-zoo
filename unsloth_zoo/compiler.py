@@ -127,6 +127,9 @@ import math
 
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 
+global INFERENCE_RUNS
+INFERENCE_RUNS = 0
+
 """
 
 _disabled_sdpa_code = f"""{_license_header}
