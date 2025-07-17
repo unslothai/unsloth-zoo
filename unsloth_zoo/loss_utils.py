@@ -234,6 +234,9 @@ pass
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
+global TRAINING_ITERATIONS
+TRAINING_ITERATIONS = 0
+
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
@@ -292,6 +295,12 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         try:
             if not "attention_mask" in batch_samples[0]: is_vlm = False
             if not is_vlm:
+                for x in batch_samples:
+                    labels = x["labels"]
+                    input_ids = x["input_ids"]
+                    print(labels.shape)
+                    print(input_ids.shape)
+                    (labels[..., 1:] != -100).sum()
                 num_items_in_batch = sum(
                     [(x["labels"][..., 1:] != -100)\
                     .sum() for x in batch_samples]
@@ -311,6 +320,17 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     pass
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
+    # Increment counter
+    global TRAINING_ITERATIONS
+    if TRAINING_ITERATIONS == 8:
+        # Skip guards after 8 warmup runs
+        try:
+            torch.compiler.set_stance(skip_guard_eval_unsafe = True)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.info(f"Unsloth: Skipping torch.compile guards after 8 steps")
+        except:
+            pass
+    TRAINING_ITERATIONS += 1
     return batch_samples, num_items_in_batch
 pass
 
