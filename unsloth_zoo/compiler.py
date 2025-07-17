@@ -598,7 +598,7 @@ def create_standalone_class(
     # This fixes some weird OOBs accesses for Gemma 3N for example
     source = re.sub(
         r"self\.([A-Za-z\_]{0,}embedding)\(input_ids (\-|\+) (self\.[A-Za-z\_]{1,})\)",
-        "self.\1((input_ids \2 \3).clamp_(0, self.\1.num_embeddings))",
+        r"self.\1((input_ids \2 \3).clamp_(0, self.\1.num_embeddings))",
         source,
     )
     return source
