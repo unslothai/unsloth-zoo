@@ -590,6 +590,15 @@ def create_standalone_class(
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
+
+    # Force integers to be torch.tensor(...) to fix torch 2.7
+    # This fixes some weird OOBs accesses for Gemma 3N for example
+    if disable is not None:
+        source = re.sub(
+            r"input_ids - self\.([A-Za-z\_])",
+            r"input_ids - torch.tensor(\1)",
+            source,
+        )
     return source
 pass
 
