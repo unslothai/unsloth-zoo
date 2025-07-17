@@ -1056,6 +1056,13 @@ def create_empty_causal_lm(config, dtype = torch.float16):
 
     return new_model, original_meta_model, layer_names, config.num_hidden_layers
 
+def _set_config_attrs(config_obj, attrs_to_set):
+    """Helper to set multiple attributes on a config object if they exist."""
+    for attr, value in attrs_to_set.items():
+        if hasattr(config_obj, attr):
+            setattr(config_obj, attr, value)
+pass
+
 
 @torch.inference_mode()
 def create_empty_vision_model(config, dtype = torch.float16):
@@ -1104,36 +1111,37 @@ def create_empty_vision_model(config, dtype = torch.float16):
 
     new_config = deepcopy(config)
 
+    # Common text attributes
+    _set_config_attrs(new_config.text_config, {
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "hidden_size": 1,
+        "vocab_size": 8,
+        "intermediate_size": 1,
+        "head_dim": 1,
+        "pad_token_id": 1,
+    })
+
+    # Common vision attributes
+    _set_config_attrs(new_config.vision_config, {
+        "hidden_size": 1,
+        "intermediate_size": 1,
+        "patch_size": 1,
+        "image_size": 1,
+        "vision_output_dim": 1,
+        # The following are different names for the same concept
+        "num_heads": 1,
+        "attention_heads": 1,
+        "num_attention_heads": 1,
+    })
+
+    text_layers = config.text_config.num_hidden_layers
+    vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
+
     # Set minimal sizes for different model types
     if model_type == "qwen2_5_vl":
-        new_config.num_attention_heads = 1
-        new_config.num_key_value_heads = 1
-        new_config.intermediate_size = 0
-        new_config.vision_config.dim = 1
-        new_config.vision_config.num_heads = 1
-        new_config.vision_config.intermediate_size = 1  # Must be non-zero for MLP layers
         new_config.vision_config.out_hidden_size = 1
-        text_layers = config.text_config.num_hidden_layers
-        vision_layers = config.vision_config.depth
-    elif model_type == "mllama":
-        new_config.text_config.num_attention_heads = 1
-        new_config.text_config.num_key_value_heads = 1
-        new_config.text_config.intermediate_size = 0
-        new_config.vision_config.num_attention_heads = 1
-        new_config.vision_config.num_key_value_heads = 1
-        new_config.vision_config.intermediate_size = 0
-        new_config.vision_config.vision_output_dim = 1
-        text_layers = config.text_config.num_hidden_layers
-        vision_layers = config.vision_config.num_hidden_layers
-    elif model_type == "gemma3":
-        new_config.text_config.num_attention_heads = 1
-        new_config.text_config.num_key_value_heads = 1
-        new_config.text_config.intermediate_size = 1
-        new_config.vision_config.num_attention_heads = 1
-        new_config.vision_config.intermediate_size = 1
-        new_config.vision_config.vision_output_dim = 1
-        text_layers = config.text_config.num_hidden_layers
-        vision_layers = config.vision_config.num_hidden_layers
+
 
     num_layers = max(text_layers, vision_layers)
     new_model = model_cls(new_config)
@@ -1156,6 +1164,7 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     else:
         return create_empty_causal_lm(config, dtype)
 
+@torch.inference_mode()
 def set_additional_modules(new_model, quant_state_dict, config):
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
