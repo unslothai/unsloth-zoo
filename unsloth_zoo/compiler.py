@@ -96,7 +96,6 @@ DISABLED_KEYWORDS = [
     "causal_mask[start:end, start:end] = 0", # Pixtral Dynamic slicing on data-dependent value is not supported
     "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", # Gemma3 create_masks_for_generate
     "create_causal_mask(**mask_kwargs)", # Gemma3 create_masks_for_generate
-    "cuda_kernels_forward", # Has CUDA forwards like causal_conv1d_update causal_conv1d_fn
 ]
 
 _license_header = """
@@ -528,10 +527,6 @@ def create_standalone_class(
 
     # We disable this for nn.Embedding modules if torch is older than 2.5 since
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
-        disable = True
-
-    # Disable if cuda_kernels_forward is seen
-    if "cuda_kernels_forward" in forward_source:
         disable = True
 
     source = re.sub(
@@ -1785,6 +1780,21 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
 pass
 
 
+def compile_causal_conv1d():
+    # For Liquid, Falcon and other Mamba type models
+    # We disable compiling on them!
+    try:
+        import causal_conv1d
+        causal_conv1d.causal_conv1d_fn     = \
+            torch.compiler.disable(causal_conv1d.causal_conv1d_fn,     recursive = True)
+        causal_conv1d.causal_conv1d_update = \
+            torch.compiler.disable(causal_conv1d.causal_conv1d_update, recursive = True)
+        return True
+    except:
+        return False
+pass
+
+
 # if module ends with any of these, disable compile
 DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
@@ -1883,6 +1893,9 @@ def unsloth_compile_transformers(
     # Compile timm models
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
 
+    # Disable compiling mamba type models
+    has_causal_conv1d = compile_causal_conv1d()
+
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
     if "UNSLOTH_RETURN_LOGITS" not in os.environ:
@@ -1912,6 +1925,16 @@ def unsloth_compile_transformers(
     # Order functions by ascending order
     functions = list(np.array(functions)[np.argsort([full_source.find(x) for x in functions])])
     ordered_functions = functions.copy()
+
+    # If mamba type, but no fast causal functions, warn!
+    if not has_causal_conv1d and \
+        ("causal_conv1d_fn" in full_source or "causal_conv1d_update" in full_source):
+
+        print(
+            "Unsloth: Please install `causal_conv1d` to speed up Mamba training via `pip install causal_conv1d`\n"\
+            "If you don't, training will still work, just might be slower for Mamba type models."
+        )
+    pass
 
     # Get class LlamaAttention(nn.Module)
     torch_modules = re.findall(r"class ([^\s]{1,})\(.+?\.Module\)", full_source)
