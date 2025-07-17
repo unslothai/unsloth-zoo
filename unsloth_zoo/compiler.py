@@ -656,7 +656,6 @@ __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
     global INFERENCE_RUNS
-    print(f"INFERENCE_RUNS = {INFERENCE_RUNS}")
     old_stance = torch_dynamo_eval_frame._stance.stance
     if INFERENCE_RUNS == 2:
         # Skip guards and fail on recompiles after 4 token inferences
