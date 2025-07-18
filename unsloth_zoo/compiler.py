@@ -96,6 +96,7 @@ DISABLED_KEYWORDS = [
     "causal_mask[start:end, start:end] = 0", # Pixtral Dynamic slicing on data-dependent value is not supported
     "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", # Gemma3 create_masks_for_generate
     "create_causal_mask(**mask_kwargs)", # Gemma3 create_masks_for_generate
+    "compute_mup_vector", # used in falcon h1 init and not needed to compile + inductor complains
 ]
 
 _license_header = """
@@ -116,6 +117,7 @@ _license_header = """
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import os
+import torch
 import importlib.util
 if importlib.util.find_spec("unsloth_studio") is None:
     UNSLOTH_STUDIO_ENABLED = False
@@ -127,12 +129,21 @@ import math
 
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 
+import logging
+logger_compiler = logging.getLogger(__name__)
+if UNSLOTH_ENABLE_LOGGING:
+    logger_compiler.setLevel(logging.DEBUG)
+
+global INFERENCE_RUNS
+INFERENCE_RUNS = 0
+
+import torch._dynamo.eval_frame as torch_dynamo_eval_frame
+torch_compiler_set_stance = torch.compiler.set_stance
+
 """
 
 _disabled_sdpa_code = f"""{_license_header}
 
-import os
-import torch
 from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
     unsloth_compiled_ce_loss_function,
@@ -528,6 +539,10 @@ def create_standalone_class(
     source = source.split("\n")
     source = "\n".join(x[spaces:] for x in source)
 
+    # For cuda_kernels_forward, we disable
+    if "cuda_kernels_forward" in source:
+        disable = True
+
     if disable is not None:
         compile = \
             f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)" \
@@ -579,6 +594,14 @@ def create_standalone_class(
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
+
+    # Force embeddings with offsets to clamp_(0, max_size)
+    # This fixes some weird OOBs accesses for Gemma 3N for example
+    source = re.sub(
+        r"self\.([A-Za-z\_]{0,}embedding)\(input_ids (\-|\+) (self\.[A-Za-z\_]{1,})\)",
+        r"self.\1((input_ids \2 \3).clamp_(0))",
+        source,
+    )
     return source
 pass
 
@@ -642,6 +665,35 @@ pass
 
 """
 
+__DYNAMO__RECOMPILING__ = """
+
+    # Set compiler stance to fail on recompiles for inference
+    global INFERENCE_RUNS
+    old_stance = torch_dynamo_eval_frame._stance.stance
+    if INFERENCE_RUNS == 1:
+        # Skip guards and return to eager -> we still need guards!
+        torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger_compiler.info(
+                f"Unsloth: Removing compiler guards after 1 inference run. "\\
+                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+            )
+    elif old_stance == "eager_on_recompile":
+        pass
+    elif old_stance == "default" and INFERENCE_RUNS > 1:
+        # Reset compiler stance
+        torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger_compiler.info(
+                f"Unsloth: Reseting guards. "\\
+                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+            )
+        INFERENCE_RUNS = 0
+    INFERENCE_RUNS += 1
+"""
+
 # Replace Cross Entropy cells with fused linear lm heads
 cross_entropy_find_1 = """
 logits = self.lm_head(hidden_states$INDEXING$
@@ -690,6 +742,7 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
+    __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
     loss = fast_linear_cross_entropy(
@@ -763,7 +816,7 @@ else:
     # shift_labels = shift_labels.to(shift_logits.device)
     # loss = loss_fct(shift_logits, shift_labels)
     # if n_items is not None: loss = loss / n_items
-"""
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_2 = """
 logits = self.lm_head(hidden_states$INDEXING$
@@ -805,6 +858,7 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
+    __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and not requires_grad_:
     loss = fast_linear_cross_entropy(
@@ -871,7 +925,7 @@ else:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
     loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
-"""
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_3 = """
 $OUTPUTLOGITS$
@@ -920,6 +974,7 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
+    __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
 else:
     lm_head_weight = self.lm_head.weight
@@ -962,7 +1017,7 @@ else:
     #     mask                 = \\6,
     #     requires_grad_       = requires_grad_,
     # )
-"""
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 ce_finders = [
     (cross_entropy_find_1, cross_entropy_replacement_1,),
@@ -1317,7 +1372,7 @@ def patch_gradient_checkpointing(module, source):
 
     # Check in forward source
     finder = \
-        r"for ([^\s]{1,}) in " + modulelist_item + "\:[\n]" + \
+        r"for ([^\s]{1,}) in " + modulelist_item + r"\:[\n]" + \
         r"([\s]{4,})hidden_states = \1\(([^\)]{1,})\)"
     find = re.findall(finder, forward)
     if len(find) == 0:
@@ -1604,13 +1659,13 @@ def patch_gradient_accumulation(modeling_file, module):
 
         total_has_kwargs = True
         print(f"Unsloth: Patching {inner_class.__name__} within {module.__name__} to fix gradient accumulation.")
-        regex_find = f"{call_class}\(([^\)]{{1,}})\)"
+        regex_find = rf"{call_class}\(([^\)]{{1,}})\)"
         source = re.sub(regex_find, rf"{call_class}(\1, **kwargs)", source, flags = re.DOTALL | re.MULTILINE)
     pass
 
     if total_has_kwargs:
         # Fix **kwargs for function def
-        regex_find = "def forward\(([^\)]{1,})\)"
+        regex_find = r"def forward\(([^\)]{1,})\)"
         source = re.sub(regex_find, r"def forward(\1, **kwargs)", source, flags = re.DOTALL | re.MULTILINE)
 
         # Remove double commas
@@ -1729,6 +1784,21 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
 pass
 
 
+def compile_causal_conv1d():
+    # For Liquid, Falcon and other Mamba type models
+    # We disable compiling on them!
+    try:
+        import causal_conv1d
+        causal_conv1d.causal_conv1d_fn     = \
+            torch.compiler.disable(causal_conv1d.causal_conv1d_fn,     recursive = True)
+        causal_conv1d.causal_conv1d_update = \
+            torch.compiler.disable(causal_conv1d.causal_conv1d_update, recursive = True)
+        return True
+    except:
+        return False
+pass
+
+
 # if module ends with any of these, disable compile
 DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
@@ -1827,6 +1897,9 @@ def unsloth_compile_transformers(
     # Compile timm models
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
 
+    # Disable compiling mamba type models
+    has_causal_conv1d = compile_causal_conv1d()
+
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
     if "UNSLOTH_RETURN_LOGITS" not in os.environ:
@@ -1857,11 +1930,23 @@ def unsloth_compile_transformers(
     functions = list(np.array(functions)[np.argsort([full_source.find(x) for x in functions])])
     ordered_functions = functions.copy()
 
+    # If mamba type, but no fast causal functions, warn!
+    if not has_causal_conv1d and \
+        ("causal_conv1d_fn" in full_source or "causal_conv1d_update" in full_source):
+
+        print(
+            "**********\n"\
+            "Unsloth: Please install `causal_conv1d` to speed up Mamba training via `pip install causal_conv1d`\n"\
+            "If you don't, training will still work, just might be slower for Mamba type models.\n"\
+            "**********\n"
+        )
+    pass
+
     # Get class LlamaAttention(nn.Module)
     torch_modules = re.findall(r"class ([^\s]{1,})\(.+?\.Module\)", full_source)
     # Also get class LlamaSdpaAttention(LlamaAttention)
     inherited_class = "(?:" + "|".join(re.findall(r"class ([^\s]{1,})\(.+?\.Module\)", full_source)) + ")"
-    inherited_modules = re.findall(r"class ([^\s]{1,})\(" + inherited_class + "\)", full_source)
+    inherited_modules = re.findall(r"class ([^\s]{1,})\(" + inherited_class + r"\)", full_source)
     # OrderedSet
     torch_modules = list(dict.fromkeys(torch_modules + inherited_modules))
     # Get all functions as well
@@ -1915,7 +2000,7 @@ def unsloth_compile_transformers(
         # Start of text
         defined = re.findall(r"\bdef[\s]{1,}" + re.escape(function),full_source, flags = re.DOTALL)
         # Disable self.
-        called = re.findall(r"[\s]{1,}" + re.escape(function) + "\(.+?\)", full_source, flags = re.DOTALL)
+        called = re.findall(r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags = re.DOTALL)
         if len(defined) != 0 and len(called) != 0:
             called_functions.append(function)
     pass
