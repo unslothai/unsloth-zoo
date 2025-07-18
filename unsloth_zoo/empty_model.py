@@ -145,6 +145,12 @@ def copy_attributes(original_model, new_model):
 
             try:
                 original_val = getattr(original_module, attr)
+
+                if original_model.config.model_type == 'gemma3' and attr == 'embed_scale':
+                    # Gemma3 has this value as tensor. We generally skip copying tensors.
+                    # We might want to force copy this attribute
+                    setattr(module, attr, original_val)
+
                 if is_comparable(original_val):
                     setattr(module, attr, original_val)
                     copied_count += 1
@@ -186,8 +192,11 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         original_meta_model = None
 
     new_config = deepcopy(config)
-    new_config.intermediate_size = 0
-    new_config.hidden_size = 0
+    new_config.intermediate_size = 1
+    new_config.hidden_size = 1
+    new_config.num_attention_heads = 1
+    new_config.num_key_value_heads = 1
+    new_config.head_dim = 1
     new_config.vocab_size = 1
     new_config.pad_token_id = 0
 
