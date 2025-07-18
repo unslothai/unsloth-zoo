@@ -98,6 +98,9 @@ DISABLED_KEYWORDS = [
     "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", # Gemma3 create_masks_for_generate
     "create_causal_mask(**mask_kwargs)", # Gemma3 create_masks_for_generate
     "compute_mup_vector", # used in falcon h1 init and not needed to compile + inductor complains
+    "pad_tensor_by_size", #falcon h1
+    "reshape_into_chunks", #falcon h1
+    "apply_mask_to_padding_states", #falcon h1
 ]
 
 _license_header = """
@@ -337,6 +340,32 @@ def get_mask_functions():
         return []
 pass
 
+
+def get_cuda_kernels_source(module, source):
+    disable = False
+    if "cuda_kernels_forward" in source:
+        disable = True
+    major, minor = torch.cuda.get_device_capability()
+    if module == "FalconH1Mixer" and (major <= 7 and minor <= 5):
+        try:
+            new_source = source
+
+            # train with compiled torch_forward, but inference with cuda_kernels_forward
+            new_source = new_source.replace(
+                'if is_fast_path_available and "cuda" in self.in_proj.weight.device.type:',
+                'if is_fast_path_available and "cuda" in self.in_proj.weight.device.type and not self.training:'
+            )
+
+        except Exception as e:
+            if os.getenv("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+                print(f"Unsloth: Error removing cuda_kernels_forward for {module}: {e}")
+            pass
+            return source, disable
+        source = new_source
+    pass
+    return source, disable
+pass
+
 def create_new_function(
     name,
     new_source,
@@ -541,8 +570,9 @@ def create_standalone_class(
     source = "\n".join(x[spaces:] for x in source)
 
     # For cuda_kernels_forward, we disable
-    if "cuda_kernels_forward" in source:
-        disable = True
+    if 'cuda_kernels_forward' in source:
+        source, kernel_disable = get_cuda_kernels_source(module, source)
+        disable = disable or kernel_disable
 
     if disable is not None:
         compile = \
@@ -1784,8 +1814,7 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
     pass
 pass
 
-
-def compile_causal_conv1d():
+def compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING):
     # For Liquid, Falcon and other Mamba type models
     # We disable compiling on them!
     try:
@@ -1794,8 +1823,42 @@ def compile_causal_conv1d():
             torch.compiler.disable(causal_conv1d.causal_conv1d_fn,     recursive = True)
         causal_conv1d.causal_conv1d_update = \
             torch.compiler.disable(causal_conv1d.causal_conv1d_update, recursive = True)
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Disabled compiling causal_conv1d")
+        return True
+    except Exception as e:
+        print(e, str(e))
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed compiling causal_conv1d")
+        return False
+pass
+
+def compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING):
+    # For Liquid, Falcon and other Mamba type models
+    # We disable compiling on them!
+    try:
+        import mamba_ssm
+        mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined        = \
+            torch.compiler.disable(
+                mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined,
+                recursive = True
+            )
+        mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined = \
+            torch.compiler.disable(
+            mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined,
+            recursive = True
+            )
+        mamba_ssm.ops.triton.selective_state_update.selective_state_update = \
+            torch.compiler.disable(
+                mamba_ssm.ops.triton.selective_state_update.selective_state_update,
+                recursive = True
+            )
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Disabled compiling mamba_ssm")
         return True
     except:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed compiling mamba_ssm")
         return False
 pass
 
@@ -1892,7 +1955,8 @@ def unsloth_compile_transformers(
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
 
     # Disable compiling mamba type models
-    has_causal_conv1d = compile_causal_conv1d()
+    has_causal_conv1d = compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING)
+    has_mamba_ssm = compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING)
 
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
@@ -1931,6 +1995,17 @@ def unsloth_compile_transformers(
         print(
             "**********\n"\
             "Unsloth: Please install `causal_conv1d` to speed up Mamba training via `pip install causal_conv1d`\n"\
+            "If you don't, training will still work, just might be slower for Mamba type models.\n"\
+            "**********\n"
+        )
+    pass
+
+    # If mamba type, but no fast causal functions, warn!
+    if not has_mamba_ssm and \
+        ("mamba_chunk_scan_combined" in full_source or "mamba_split_conv1d_scan_combined" in full_source or "selective_state_update" in full_source):
+        print(
+            "**********\n"\
+            "Unsloth: Please install `mamba_ssm` to speed up Mamba training via `pip install mamba_ssm`\n"\
             "If you don't, training will still work, just might be slower for Mamba type models.\n"\
             "**********\n"
         )

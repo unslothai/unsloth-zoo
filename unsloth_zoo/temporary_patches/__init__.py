@@ -19,3 +19,4 @@ from .common import *
 from .gemma import *
 from .misc import *
 from .gemma3n import *
+from .falcon_h1 import *
