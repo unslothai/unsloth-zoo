@@ -103,6 +103,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
             compiled_autograd_verbose = False, # Produces too much code
             aot_joint_graph = False, # Produces too much code
             aot_graphs = False,  # Produces too much code
+            perf_hints = True, # Performance improvement hints
         )
         torch._dynamo.config.verbose = True
     else:
@@ -163,6 +164,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         f"config.cuda.compile_opt_level = {'-O2' if O3 else '-O1'}",
         # Capture torch.arange(...), torch.zeros(...)
         "config.capture_dynamic_output_shape_ops = True",
+        "config.emulate_precision_casts = False", # Force X.to(f32).to(f16) instead of X.to(f16)
     ]
     # Torch dynamo arguments
     torch_dynamo_arguments = [
@@ -177,6 +179,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # https://pytorch.org/tutorials/intermediate/compiled_autograd_tutorial.html
         "config.recompile_limit = 8", # Reduce recompiles to 8 - then will do eager
         "config.allow_unspec_int_on_nn_module = True", # Integers in modules will auto wrap torch.tensor(self.vocab_size)
+        "config.optimize_ddp = True", # Optimizes DDP
     ]
     if not debug and ignore_errors:
         # Have to explicitly set it!
