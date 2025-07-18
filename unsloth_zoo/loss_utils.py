@@ -313,7 +313,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     mark_dynamic(attention_mask, 1)
                     token_count &= (attention_mask[..., 1:] != 0)
                 if "token_type_ids" in x:
-                    token_type_ids = kwargs["token_type_ids"]
+                    token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)
                     mark_dynamic(token_type_ids, 1)
                 token_counts.append(token_count.sum())
@@ -330,20 +330,21 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
     
+    # [TODO] Unfortunately skip_guard_eval_unsafe = True fails
     # Increment counter and set compiler stance
-    if not hasattr(self.model, "vllm_engine"):
-        # Only for non vLLM runs! Otherwise errors out
-        global TRAINING_ITERATIONS
-        if TRAINING_ITERATIONS == 16:
-            # Skip guards after 16 warmup runs
-            torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = True)
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.info(f"Unsloth: Skipping torch.compile guards after 16 steps at TRAINING_ITERATIONS = {TRAINING_ITERATIONS}")
-        elif torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe == False and TRAINING_ITERATIONS > 16:
-            # Reset TRAINING_ITERATIONS
-            torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
-            TRAINING_ITERATIONS = 0
-        TRAINING_ITERATIONS += 1
+    # if not hasattr(self.model, "vllm_engine"):
+    #     # Only for non vLLM runs! Otherwise errors out
+    #     global TRAINING_ITERATIONS
+    #     if TRAINING_ITERATIONS == 16:
+    #         # Skip guards after 16 warmup runs
+    #         torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = True)
+    #         if UNSLOTH_ENABLE_LOGGING:
+    #             logger.info(f"Unsloth: Skipping torch.compile guards after 16 steps at TRAINING_ITERATIONS = {TRAINING_ITERATIONS}")
+    #     elif torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe == False and TRAINING_ITERATIONS > 16:
+    #         # Reset TRAINING_ITERATIONS
+    #         torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+    #         TRAINING_ITERATIONS = 0
+    #     TRAINING_ITERATIONS += 1
     return batch_samples, num_items_in_batch
 pass
 

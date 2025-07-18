@@ -96,6 +96,7 @@ DISABLED_KEYWORDS = [
     "causal_mask[start:end, start:end] = 0", # Pixtral Dynamic slicing on data-dependent value is not supported
     "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", # Gemma3 create_masks_for_generate
     "create_causal_mask(**mask_kwargs)", # Gemma3 create_masks_for_generate
+    "compute_mup_vector", # used in falcon h1 init and not needed to compile + inductor complains
 ]
 
 _license_header = """
@@ -669,18 +670,18 @@ __DYNAMO__RECOMPILING__ = """
     # Set compiler stance to fail on recompiles for inference
     global INFERENCE_RUNS
     old_stance = torch_dynamo_eval_frame._stance.stance
-    if INFERENCE_RUNS == 32:
-        # Skip guards and fail on recompiles after 32 token inferences
-        torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
+    if INFERENCE_RUNS == 1:
+        # Skip guards and return to eager -> we still need guards!
+        torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
         if UNSLOTH_ENABLE_LOGGING:
             logger_compiler.info(
-                f"Unsloth: Removing compiler guards after 32 inference runs. "\\
+                f"Unsloth: Removing compiler guards after 1 inference run. "\\
                 f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
                 f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
             )
     elif old_stance == "eager_on_recompile":
         pass
-    elif old_stance == "default" and INFERENCE_RUNS > 32:
+    elif old_stance == "default" and INFERENCE_RUNS > 1:
         # Reset compiler stance
         torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
         if UNSLOTH_ENABLE_LOGGING:

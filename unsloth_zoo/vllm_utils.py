@@ -71,7 +71,7 @@ def get_mem_info():
     else:
         free_memory, total_memory = torch.cuda.mem_get_info()
     return free_memory, total_memory
-
+pass
 
 if importlib.util.find_spec("vllm") is not None:
 
@@ -99,19 +99,21 @@ if importlib.util.find_spec("vllm") is not None:
         return quant_states
     def _dequantize_dq(self, quant_states):
         return quant_states
-
-    import vllm.model_executor.model_loader.bitsandbytes_loader
-    if hasattr(
-        vllm.model_executor.model_loader.bitsandbytes_loader,
-        "dequantize_dq",
-    ):
-        vllm.model_executor.model_loader.bitsandbytes_loader.dequantize_dq = dequantize_dq
-    elif hasattr(
-        vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader,
-        "_dequantize_dq",
-    ):
-        vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader._dequantize_dq = _dequantize_dq
-    pass
+    try:
+        import vllm.model_executor.model_loader.bitsandbytes_loader
+        if hasattr(
+            vllm.model_executor.model_loader.bitsandbytes_loader,
+            "dequantize_dq",
+        ):
+            vllm.model_executor.model_loader.bitsandbytes_loader.dequantize_dq = dequantize_dq
+        elif hasattr(
+            vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader,
+            "_dequantize_dq",
+        ):
+            vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader._dequantize_dq = _dequantize_dq
+        pass
+    except:
+        pass
 
     # Patch apply_bnb_4bit
     import vllm.model_executor.layers.quantization.bitsandbytes
