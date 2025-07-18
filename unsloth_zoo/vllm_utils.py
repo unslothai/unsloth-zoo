@@ -100,18 +100,26 @@ if importlib.util.find_spec("vllm") is not None:
     def _dequantize_dq(self, quant_states):
         return quant_states
 
-    import vllm.model_executor.model_loader.bitsandbytes_loader
-    if hasattr(
-        vllm.model_executor.model_loader.bitsandbytes_loader,
-        "dequantize_dq",
-    ):
-        vllm.model_executor.model_loader.bitsandbytes_loader.dequantize_dq = dequantize_dq
-    elif hasattr(
-        vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader,
-        "_dequantize_dq",
-    ):
-        vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader._dequantize_dq = _dequantize_dq
-    pass
+    # Only on old vllm
+    # Check if vllm is more than 0.9.0
+    from importlib.metadata import version as importlib_version
+    from packaging.version import Version
+
+    vllm_version = Version(importlib_version("vllm"))
+    is_vllm_new = vllm_version > Version("0.9.0")
+    if is_vllm_new:
+        import vllm.model_executor.model_loader.bitsandbytes_loader
+        if hasattr(
+            vllm.model_executor.model_loader.bitsandbytes_loader,
+            "dequantize_dq",
+        ):
+            vllm.model_executor.model_loader.bitsandbytes_loader.dequantize_dq = dequantize_dq
+        elif hasattr(
+            vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader,
+            "_dequantize_dq",
+        ):
+            vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader._dequantize_dq = _dequantize_dq
+        pass
 
     # Patch apply_bnb_4bit
     import vllm.model_executor.layers.quantization.bitsandbytes
