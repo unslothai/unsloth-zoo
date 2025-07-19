@@ -48,6 +48,7 @@ import inspect
 from functools import partial
 from .utils import _get_dtype
 from .patching_utils import patch_model_and_tokenizer
+from .temporary_patches.common import get_torch_compile_options
 from unsloth import DEVICE_TYPE
 global LORA_REQUEST_ID
 
@@ -1280,8 +1281,7 @@ def load_vllm(
         platform = "CUDA"
         major_version, minor_version = torch.cuda.get_device_capability()
         message = f"{platform} compute capability {major_version}.{minor_version}"
-
-
+    pass
 
     print(
         f"Unsloth: vLLM loading {model_name} with actual GPU utilization = {round(actual_gpu_memory_utilization*100, 2)}%\n"\
@@ -1307,18 +1307,20 @@ def load_vllm(
                 full_cuda_graph = False,
                 use_cudagraph = True,
                 use_inductor = True,
-                inductor_compile_config = {
-                    "debug" : False,
-                    "dce" : True,
-                    "coordinate_descent_tuning" : True,
-                    "trace.enabled" : False,
-                    "trace.graph_diagram" : False,
-                    "triton.cudagraphs" : True,
-                    "compile_threads" : 48,
-                    "max_autotune" : False, # Way too slow
-                    "disable_progress" : False,
-                    "verbose_progress" : True,
-                }
+                inductor_compile_config = get_torch_compile_options(
+                    epilogue_fusion = True,
+                    max_autotune = False, # Too slow
+                    shape_padding = True,
+                    debug = False,
+                    cudagraphs = True,
+                    coordinate_descent_tuning = True,
+                    logging = True, # Enable compile logs
+                    combo_kernels = True,
+                    group_fusion = True,
+                    memory_planning = True,
+                    multi_kernel = True,
+                    use_block_ptr = True,
+                )
             )
         except:
             pass
