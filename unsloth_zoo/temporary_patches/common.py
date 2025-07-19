@@ -39,7 +39,7 @@ def determine_compile_threads():
     # Windows thread count = 1. See https://github.com/unslothai/unsloth-zoo/pull/187
     if sys.platform == "win32": return 1
     cpu_count = os.cpu_count()
-    return max(8, cpu_count)
+    return max(8, cpu_count + 8)
 pass
 
 def get_torch_compile_options(
@@ -89,7 +89,7 @@ def get_torch_compile_options(
         "group_fusion"              : group_fusion,
         "disable_progress"          : not logging,
         "verbose_progress"          : logging,
-        "triton.multi_kernel"       : multi_kernel, # Sometimes fails
+        "triton.multi_kernel"       : multi_kernel, # RuntimeError: name 'multi_kernel_0' is not defined
         "triton.use_block_ptr"      : use_block_ptr,
         "triton.enable_persistent_tma_matmul" : True,
         "triton.autotune_at_compile_time"     : True,

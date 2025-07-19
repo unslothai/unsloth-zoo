@@ -1318,7 +1318,7 @@ def load_vllm(
                     combo_kernels = True,
                     group_fusion = True,
                     memory_planning = True,
-                    multi_kernel = True,
+                    multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
                     use_block_ptr = True,
                 )
             )
