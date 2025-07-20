@@ -577,7 +577,7 @@ def patch_vllm_graph_capture():
 
         if not self.use_cuda_graph:
             logger.warning(
-                "Skipping CUDA graph capture. To turn on CUDA graph capture, "
+                "Unsloth: Skipping CUDA graph capture. To turn on CUDA graph capture, "
                 "set -O %s and ensure `use_cudagraph` was not manually set to "
                 "False", CompilationLevel.PIECEWISE)
             return
@@ -598,7 +598,7 @@ def patch_vllm_graph_capture():
                 compilation_cases = tqdm(
                     list(compilation_cases),
                     disable=not self.load_config.use_tqdm_on_load,
-                    desc="Capturing CUDA graph shapes")
+                    desc="Unsloth: Capturing CUDA graph shapes")
             for num_tokens in compilation_cases:
                 for _ in range(
                         self.compilation_config.cudagraph_num_of_warmups):
@@ -613,11 +613,53 @@ def patch_vllm_graph_capture():
         elapsed_time = end_time - start_time
 
         logger.info(
-            "Patched graph capturing finished in %.0f secs.",
+            "Unsloth: Patched graph capturing finished in %.0f secs.",
             elapsed_time)
 
     GPUModelRunner.capture_model = _capture_model_patched
-pass
+
+
+def patch_vllm_v0_graph_capture():
+    from vllm.worker.model_runner import GPUModelRunnerBase, logger
+    from contextlib import contextmanager
+    import gc
+    import time
+    from functools import wraps
+
+    print('Unsloth: Patching vLLM v0.x graph capture with a decorator.')
+
+    original_capture_model = GPUModelRunnerBase.capture_model
+
+    @contextmanager
+    def suppress_gc_collect():
+        """
+        Temporarily disable ``gc.collect`` to speed up CUDA graph capture.
+        """
+        original_gc_collect = gc.collect
+        gc.collect = lambda: None
+        try:
+            yield
+        finally:
+            gc.collect = original_gc_collect
+
+    @wraps(original_capture_model)
+    def capture_model_wrapper(self, *args, **kwargs):
+        # The original capture_model function already has logging and a
+        # tqdm progress bar. We just wrap it to suppress GC and add our
+        # own logging.
+        logger.info("Unsloth: Running patched vLLM V0 `capture_model`.")
+        start_time = time.perf_counter()
+
+        with suppress_gc_collect():
+            result = original_capture_model(self, *args, **kwargs)
+
+        end_time = time.perf_counter()
+        logger.info(
+            "Unsloth: Patched vLLM v0.x graph capture finished in %.0f secs.",
+            end_time - start_time)
+        return result
+
+    GPUModelRunnerBase.capture_model = capture_model_wrapper
 
 def patch_vllm(debug = True):
     # Temporary patch to disable multiprocessing for vLLM
@@ -633,6 +675,7 @@ def patch_vllm(debug = True):
     patch_vllm_lora_load_tensors()
     patch_vllm_enable_sleep_mode()
     patch_vllm_graph_capture()
+    patch_vllm_v0_graph_capture()
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
 pass
