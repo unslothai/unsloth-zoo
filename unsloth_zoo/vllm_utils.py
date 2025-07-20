@@ -611,6 +611,9 @@ def patch_vllm_graph_capture():
                 "Unsloth: Patched vLLM v1 graph capture finished in %.0f secs.",
                 end_time - start_time
             )
+            for _ in range(2):
+                gc.collect()
+                torch.cuda.empty_cache()
             return result
         pass
         GPUModelRunner.capture_model = capture_model_wrapper_v1
@@ -636,6 +639,9 @@ def patch_vllm_graph_capture():
                 "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
                 end_time - start_time
             )
+            for _ in range(2):
+                gc.collect()
+                torch.cuda.empty_cache()
             return result
         pass
         GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
