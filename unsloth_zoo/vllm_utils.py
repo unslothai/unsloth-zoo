@@ -572,6 +572,11 @@ pass
 
 
 def patch_vllm_graph_capture():
+    """
+    Temporarily disable ``gc.collect`` to speed up CUDA graph capture.
+    This is a workaround to avoid the overhead of garbage collection
+    during the graph capture with torch.compile.
+    """
     from contextlib import contextmanager
     import gc
     import time
@@ -579,24 +584,18 @@ def patch_vllm_graph_capture():
 
     @contextmanager
     def suppress_gc_collect():
-        """
-        Temporarily disable ``gc.collect`` to speed up CUDA graph capture.
-        This is a workaround to avoid the overhead of garbage collection
-        during the graph capture with torch.compile.
-        """
         original_gc_collect = gc.collect
         gc.collect = lambda: None
         try:
             yield
         finally:
             gc.collect = original_gc_collect
+    pass
 
     # Patch vLLM v1
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
-
         print('Unsloth: Patching vLLM v1 graph capture')
-
         original_capture_model_v1 = GPUModelRunner.capture_model
 
         @wraps(original_capture_model_v1)
@@ -610,9 +609,10 @@ def patch_vllm_graph_capture():
             end_time = time.perf_counter()
             logger.info(
                 "Unsloth: Patched vLLM v1 graph capture finished in %.0f secs.",
-                end_time - start_time)
+                end_time - start_time
+            )
             return result
-
+        pass
         GPUModelRunner.capture_model = capture_model_wrapper_v1
     except Exception as e:
         print(f"Unsloth: Could not patch vLLM V1 graph capture: {e}")
@@ -620,9 +620,7 @@ def patch_vllm_graph_capture():
     # Also patch vLLM v0
     try:
         from vllm.worker.model_runner import GPUModelRunnerBase, logger
-
         print('Unsloth: Patching vLLM v0 graph capture')
-
         original_capture_model_v0 = GPUModelRunnerBase.capture_model
 
         @wraps(original_capture_model_v0)
@@ -636,13 +634,15 @@ def patch_vllm_graph_capture():
             end_time = time.perf_counter()
             logger.info(
                 "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
-                end_time - start_time)
+                end_time - start_time
+            )
             return result
-
+        pass
         GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
     except Exception as e:
         print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
 pass
+
 
 def patch_vllm(debug = True):
     # Temporary patch to disable multiprocessing for vLLM
