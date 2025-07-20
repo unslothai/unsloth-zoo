@@ -50,6 +50,7 @@ from packaging.version import Version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
+from .temporary_patches.common import get_torch_compile_options
 
 # Compiled cache location
 global COMBINED_UNSLOTH_NAME
@@ -1872,27 +1873,20 @@ def unsloth_compile_transformers(
     UNSLOTH_COMPILE_MAXIMUM       = os.environ.get("UNSLOTH_COMPILE_MAXIMUM",       "0") == "1"
     UNSLOTH_COMPILE_IGNORE_ERRORS = os.environ.get("UNSLOTH_COMPILE_IGNORE_ERRORS", "0") == "1"
     UNSLOTH_ENABLE_LOGGING        = os.environ.get("UNSLOTH_ENABLE_LOGGING",        "0") == "1"
-    torch_compile_options = {
-        "epilogue_fusion"           : epilogue_fusion,
-        "max_autotune"              : max_autotune,
-        "shape_padding"             : shape_padding,
-        "trace.enabled"             : UNSLOTH_COMPILE_DEBUG or debug,
-        "triton.cudagraphs"         : cudagraphs,
-        "debug"                     : UNSLOTH_COMPILE_DEBUG or debug,
-        "dce"                       : True,
-        "memory_planning"           : True,
-        "coordinate_descent_tuning" : UNSLOTH_COMPILE_MAXIMUM,
-        "trace.graph_diagram"       : UNSLOTH_COMPILE_DEBUG or debug,
-        # "compile_threads"           : 24, # Auto detects via https://github.com/unslothai/unsloth-zoo/pull/187
-        "combo_kernels"             : False, # Causes incompatible gradient sizes on 2.6
-        "group_fusion"              : True,
-        "disable_progress"          : not UNSLOTH_ENABLE_LOGGING,
-        "verbose_progress"          : UNSLOTH_ENABLE_LOGGING,
-        "triton.multi_kernel"       : False, # Sometimes fails
-        "triton.use_block_ptr"      : False,
-        "triton.enable_persistent_tma_matmul" : True,
-        "triton.autotune_at_compile_time"     : True,
-    }
+    torch_compile_options = get_torch_compile_options(
+        epilogue_fusion = epilogue_fusion,
+        max_autotune = max_autotune,
+        shape_padding = shape_padding,
+        debug = UNSLOTH_COMPILE_DEBUG,
+        cudagraphs = cudagraphs,
+        coordinate_descent_tuning = UNSLOTH_COMPILE_MAXIMUM,
+        logging = UNSLOTH_ENABLE_LOGGING,
+        combo_kernels = False, # Causes incompatible gradient sizes on 2.6
+        group_fusion = True,
+        memory_planning = True,
+        multi_kernel = False, # Sometimes fails
+        use_block_ptr = False, # Sometimes fails
+    )
 
     # Compile timm models
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)

@@ -48,6 +48,10 @@ import inspect
 from functools import partial
 from .utils import _get_dtype
 from .patching_utils import patch_model_and_tokenizer
+from .temporary_patches.common import (
+    get_torch_compile_options,
+    UNSLOTH_ENABLE_LOGGING,
+)
 from unsloth import DEVICE_TYPE
 global LORA_REQUEST_ID
 
@@ -74,6 +78,24 @@ def get_mem_info():
 pass
 
 if importlib.util.find_spec("vllm") is not None:
+
+    # Patch excessive warning messages
+    if not UNSLOTH_ENABLE_LOGGING:
+        # Disable all not supported messages
+        # Regarding multimodal models, vLLM currently only supports adding LoRA to language model.
+        try:
+            from vllm.worker.model_runner import logger as vllm_logger
+            vllm_logger.addFilter(HideLoggingMessage("only supports adding LoRA"))
+            del vllm_logger
+        except:
+            pass
+        try:
+            from vllm.v1.worker.lora_model_runner_mixin import logger as vllm_logger
+            vllm_logger.addFilter(HideLoggingMessage("only supports adding LoRA"))
+            del vllm_logger
+        except:
+            pass
+    pass
 
     # Allow unsloth dynamic quants to work
     def is_layer_skipped_bnb(prefix: str, llm_int8_skip_modules):
@@ -507,11 +529,12 @@ def patch_vllm_enable_sleep_mode():
 
             unmap_and_release(handle)
             true_offloads += 1
-
+        pass
 
         logger.debug(f'CPU offloads {cpu_offloads} true offloads {true_offloads} total {total_offloads}')
         gc.collect()
         torch.cuda.empty_cache()
+    pass
 
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
         """
@@ -539,6 +562,9 @@ def patch_vllm_enable_sleep_mode():
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
                         data.cpu_backup_tensor = None
+            pass
+        pass
+    pass
 
     def delete_memory():
         torch.cuda.empty_cache()
@@ -563,6 +589,7 @@ def patch_vllm_enable_sleep_mode():
                 kv_cache_count += 1
         logger.debug(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
         logger.debug(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
+    pass
 
     CuMemAllocator.sleep = sleep
     CuMemAllocator.wake_up = wake_up
@@ -571,6 +598,11 @@ pass
 
 
 def patch_vllm_graph_capture():
+    """
+    Temporarily disable ``gc.collect`` to speed up CUDA graph capture.
+    This is a workaround to avoid the overhead of garbage collection
+    during the graph capture with torch.compile.
+    """
     from contextlib import contextmanager
     import gc
     import time
@@ -578,24 +610,18 @@ def patch_vllm_graph_capture():
 
     @contextmanager
     def suppress_gc_collect():
-        """
-        Temporarily disable ``gc.collect`` to speed up CUDA graph capture.
-        This is a workaround to avoid the overhead of garbage collection
-        during the graph capture with torch.compile.
-        """
         original_gc_collect = gc.collect
         gc.collect = lambda: None
         try:
             yield
         finally:
             gc.collect = original_gc_collect
+    pass
 
     # Patch vLLM v1
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
-
         print('Unsloth: Patching vLLM v1 graph capture')
-
         original_capture_model_v1 = GPUModelRunner.capture_model
 
         @wraps(original_capture_model_v1)
@@ -609,9 +635,13 @@ def patch_vllm_graph_capture():
             end_time = time.perf_counter()
             logger.info(
                 "Unsloth: Patched vLLM v1 graph capture finished in %.0f secs.",
-                end_time - start_time)
+                end_time - start_time
+            )
+            for _ in range(2):
+                gc.collect()
+                torch.cuda.empty_cache()
             return result
-
+        pass
         GPUModelRunner.capture_model = capture_model_wrapper_v1
     except Exception as e:
         print(f"Unsloth: Could not patch vLLM V1 graph capture: {e}")
@@ -619,9 +649,7 @@ def patch_vllm_graph_capture():
     # Also patch vLLM v0
     try:
         from vllm.worker.model_runner import GPUModelRunnerBase, logger
-
         print('Unsloth: Patching vLLM v0 graph capture')
-
         original_capture_model_v0 = GPUModelRunnerBase.capture_model
 
         @wraps(original_capture_model_v0)
@@ -635,13 +663,18 @@ def patch_vllm_graph_capture():
             end_time = time.perf_counter()
             logger.info(
                 "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
-                end_time - start_time)
+                end_time - start_time
+            )
+            for _ in range(2):
+                gc.collect()
+                torch.cuda.empty_cache()
             return result
-
+        pass
         GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
     except Exception as e:
         print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
 pass
+
 
 def patch_vllm(debug = True):
     # Temporary patch to disable multiprocessing for vLLM
@@ -1354,8 +1387,7 @@ def load_vllm(
         platform = "CUDA"
         major_version, minor_version = torch.cuda.get_device_capability()
         message = f"{platform} compute capability {major_version}.{minor_version}"
-
-
+    pass
 
     print(
         f"Unsloth: vLLM loading {model_name} with actual GPU utilization = {round(actual_gpu_memory_utilization*100, 2)}%\n"\
@@ -1381,18 +1413,20 @@ def load_vllm(
                 full_cuda_graph = False,
                 use_cudagraph = True,
                 use_inductor = True,
-                inductor_compile_config = {
-                    "debug" : False,
-                    "dce" : True,
-                    "coordinate_descent_tuning" : True,
-                    "trace.enabled" : False,
-                    "trace.graph_diagram" : False,
-                    "triton.cudagraphs" : True,
-                    "compile_threads" : 48,
-                    "max_autotune" : False, # Way too slow
-                    "disable_progress" : False,
-                    "verbose_progress" : True,
-                }
+                inductor_compile_config = get_torch_compile_options(
+                    epilogue_fusion = True,
+                    max_autotune = False, # Too slow
+                    shape_padding = True,
+                    debug = False,
+                    cudagraphs = True,
+                    coordinate_descent_tuning = True,
+                    logging = True, # Enable compile logs
+                    combo_kernels = True,
+                    group_fusion = True,
+                    memory_planning = True,
+                    multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
+                    use_block_ptr = True,
+                )
             )
         except:
             pass
