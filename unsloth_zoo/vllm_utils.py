@@ -88,7 +88,7 @@ if importlib.util.find_spec("vllm") is not None:
         # Allow certain layers to not be quantized
         components = set(".".join(components[:i+1]) for i in range(len(components)))
         unsloth_check = len(set(llm_int8_skip_modules) & components) != 0
-        
+
         return vllm_check or unsloth_check
     pass
 
@@ -269,7 +269,7 @@ if importlib.util.find_spec("vllm") is not None:
         import vllm.transformers_utils.tokenizer
         vllm.transformers_utils.tokenizer.get_lora_tokenizer = _return_nothing
         vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing
-        
+
         try:
             import vllm.transformers_utils.tokenizer_group.tokenizer_group
             vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer = _return_nothing
@@ -504,10 +504,10 @@ def patch_vllm_enable_sleep_mode():
                 data.cpu_backup_tensor = cpu_backup_tensor
                 cpu_offloads += 1
             logger.debug(f"data's tag is {data.tag} and is offloaded to cpu? {data.tag in offload_tags}")
-            
+
             unmap_and_release(handle)
             true_offloads += 1
-        
+
 
         logger.debug(f'CPU offloads {cpu_offloads} true offloads {true_offloads} total {total_offloads}')
         gc.collect()
@@ -516,16 +516,16 @@ def patch_vllm_enable_sleep_mode():
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
         """
         Wake up the allocator from sleep mode.
-        All data that is previously offloaded will be loaded back to GPU 
+        All data that is previously offloaded will be loaded back to GPU
         memory, and the rest of the data will have empty memory.
-        
+
         :param tags: The tags of the memory allocation that will be loaded
             back to GPU memory. If None, all memory allocation will be loaded
             back to GPU memory.
         """
         delete_memory()
         for ptr, data in self.pointer_to_data.items():
-            if data.tag == "weights": 
+            if data.tag == "weights":
                 # In unsloth's case we have weights managed by unsloth. So we neither offload/delete them nor onload/create them here.
                 continue
             if tags is None or data.tag in tags:
@@ -570,6 +570,79 @@ def patch_vllm_enable_sleep_mode():
 pass
 
 
+def patch_vllm_graph_capture():
+    from contextlib import contextmanager
+    import gc
+    import time
+    from functools import wraps
+
+    @contextmanager
+    def suppress_gc_collect():
+        """
+        Temporarily disable ``gc.collect`` to speed up CUDA graph capture.
+        This is a workaround to avoid the overhead of garbage collection
+        during the graph capture with torch.compile.
+        """
+        original_gc_collect = gc.collect
+        gc.collect = lambda: None
+        try:
+            yield
+        finally:
+            gc.collect = original_gc_collect
+
+    # Patch vLLM v1
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
+
+        print('Unsloth: Patching vLLM v1 graph capture')
+
+        original_capture_model_v1 = GPUModelRunner.capture_model
+
+        @wraps(original_capture_model_v1)
+        def capture_model_wrapper_v1(self, *args, **kwargs):
+            logger.info("Unsloth: Running patched vLLM v1 `capture_model`.")
+            start_time = time.perf_counter()
+
+            with suppress_gc_collect():
+                result = original_capture_model_v1(self, *args, **kwargs)
+
+            end_time = time.perf_counter()
+            logger.info(
+                "Unsloth: Patched vLLM v1 graph capture finished in %.0f secs.",
+                end_time - start_time)
+            return result
+
+        GPUModelRunner.capture_model = capture_model_wrapper_v1
+    except Exception as e:
+        print(f"Unsloth: Could not patch vLLM V1 graph capture: {e}")
+
+    # Also patch vLLM v0
+    try:
+        from vllm.worker.model_runner import GPUModelRunnerBase, logger
+
+        print('Unsloth: Patching vLLM v0 graph capture')
+
+        original_capture_model_v0 = GPUModelRunnerBase.capture_model
+
+        @wraps(original_capture_model_v0)
+        def capture_model_wrapper_v0(self, *args, **kwargs):
+            logger.info("Unsloth: Running patched vLLM v0 `capture_model`.")
+            start_time = time.perf_counter()
+
+            with suppress_gc_collect():
+                result = original_capture_model_v0(self, *args, **kwargs)
+
+            end_time = time.perf_counter()
+            logger.info(
+                "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
+                end_time - start_time)
+            return result
+
+        GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
+    except Exception as e:
+        print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
+pass
+
 def patch_vllm(debug = True):
     # Temporary patch to disable multiprocessing for vLLM
     # Allows accessing model_executor
@@ -583,6 +656,7 @@ def patch_vllm(debug = True):
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
     patch_vllm_enable_sleep_mode()
+    patch_vllm_graph_capture()
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
 pass
@@ -601,9 +675,9 @@ def vllm_dynamic_quant_supported(
     if "quantization_config" not in config: return True
 
     llm_int8_skip_modules = config.quantization_config.get("llm_int8_skip_modules", {})
-    
+
     # Only allow layer modules ie model.layers.1.mlp or model.layers.1.self_attn
-    
+
     # Exclude model.layers.27.mlp.gate_proj
     parent_llm_int8_skip_modules = []
     for module in llm_int8_skip_modules:
@@ -921,7 +995,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 exec(f"new_model.{layer_name}.weight = weight")
                 continue
             pass
-            
+
             # Convert model.layers.0.self_attn.q_proj to model.layers[0].self_attn.q_proj
             layer_name = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
             exec(f"new_model.{layer_name} = layer")
@@ -997,7 +1071,7 @@ pass
 
 
 def approximate_vllm_memory_usage(
-    config, 
+    config,
     max_seq_length = 2048,
     gpu_memory_utilization = 0.8,
     enable_lora = True,
@@ -1134,7 +1208,7 @@ def load_vllm(
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
     approximate_vllm_memory_usage(
-        config, 
+        config,
         max_seq_length = max_seq_length,
         gpu_memory_utilization = gpu_memory_utilization,
         enable_lora = enable_lora,
@@ -1392,7 +1466,7 @@ def load_vllm(
             error = str(error)
             if trials >= 2:
                 raise RuntimeError(error)
-            
+
             if "gpu_memory_utilization" in error or "memory" in error:
                 approx_max_num_seqs = int(approx_max_num_seqs * 0.75)
                 engine_args["max_num_seqs"] = approx_max_num_seqs
@@ -1473,7 +1547,7 @@ def prepare_vllm_lora_loading(model):
     model_loras_A, model_loras_B = [], []
     vllm_loras_A,  vllm_loras_B  = [], []
     vllm_model = model.vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
-    
+
     # Go through all layers!
     for v_layer, m_layer in zip(vllm_model .model.layers, model.model.model.layers):
         model_loras_A.append(m_layer.self_attn.q_proj.lora_A.default.weight)
@@ -1760,7 +1834,7 @@ def _test_same_model(model, new_model, input_ids):
         print(i, end = ",")
         residualA = A
         residualB = B
-        
+
         torch.testing.assert_close(old.input_layernorm.weight, new.input_layernorm.weight)
         A = old.input_layernorm(A)
         B = new.input_layernorm(B)
@@ -1768,7 +1842,7 @@ def _test_same_model(model, new_model, input_ids):
         AA, _ = old.self_attn(A.clone(), attention_mask = None, position_embeddings = rotary_A)
         BB, _ = new.self_attn(B.clone(), attention_mask = None, position_embeddings = rotary_B)
         torch.testing.assert_close(AA, BB, rtol = 0.01, atol = 0.005)
-        
+
         torch.testing.assert_close(df(old.self_attn.q_proj), df(new.self_attn.q_proj))
         torch.testing.assert_close(df(old.self_attn.k_proj), df(new.self_attn.k_proj))
         torch.testing.assert_close(df(old.self_attn.v_proj), df(new.self_attn.v_proj))
