@@ -470,8 +470,6 @@ else:
     pass
 pass
 
-global pointers
-
 def patch_vllm_enable_sleep_mode():
     from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map
     from vllm.logger import init_logger
@@ -503,7 +501,6 @@ def patch_vllm_enable_sleep_mode():
 
         logger.debug(f'Sleeping allocator with tags: {offload_tags}')
         set_of_tags = set([data.tag for _, data in self.pointer_to_data.items()])
-        print(set_of_tags)
         logger.debug(f'Set of tags {set_of_tags} and len of data {len(self.pointer_to_data.items())}')
 
         self.print_memory_summary()
@@ -511,9 +508,6 @@ def patch_vllm_enable_sleep_mode():
         true_offloads = 0
         total_offloads = 0
 
-        global pointers
-        pointers = self
-        raise
         for ptr, data in self.pointer_to_data.items():
             total_offloads += 1
             handle = data.handle
