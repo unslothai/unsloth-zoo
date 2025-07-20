@@ -501,6 +501,7 @@ def patch_vllm_enable_sleep_mode():
 
         logger.debug(f'Sleeping allocator with tags: {offload_tags}')
         set_of_tags = set([data.tag for _, data in self.pointer_to_data.items()])
+        print("set_of_tags", set_of_tags)
         logger.debug(f'Set of tags {set_of_tags} and len of data {len(self.pointer_to_data.items())}')
 
         self.print_memory_summary()
