@@ -1482,6 +1482,7 @@ def load_vllm(
     if return_args: return engine_args
 
     # Keep trying until success (2 times)
+    print(engine_args)
     trials = 0
     while True:
         try:
