@@ -449,6 +449,8 @@ else:
     pass
 pass
 
+global pointers
+
 def patch_vllm_enable_sleep_mode():
     from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map
     from vllm.logger import init_logger
@@ -487,6 +489,9 @@ def patch_vllm_enable_sleep_mode():
         true_offloads = 0
         total_offloads = 0
 
+        global pointers
+        pointers = self
+        raise
         for ptr, data in self.pointer_to_data.items():
             total_offloads += 1
             handle = data.handle
