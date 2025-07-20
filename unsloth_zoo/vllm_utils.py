@@ -48,7 +48,10 @@ import inspect
 from functools import partial
 from .utils import _get_dtype
 from .patching_utils import patch_model_and_tokenizer
-from .temporary_patches.common import get_torch_compile_options
+from .temporary_patches.common import (
+    get_torch_compile_options,
+    UNSLOTH_ENABLE_LOGGING,
+)
 from unsloth import DEVICE_TYPE
 global LORA_REQUEST_ID
 
@@ -75,6 +78,24 @@ def get_mem_info():
 pass
 
 if importlib.util.find_spec("vllm") is not None:
+
+    # Patch excessive warning messages
+    if not UNSLOTH_ENABLE_LOGGING:
+        # Disable all not supported messages
+        # Regarding multimodal models, vLLM currently only supports adding LoRA to language model.
+        try:
+            from vllm.worker.model_runner import logger as vllm_logger
+            vllm_logger.addFilter(HideLoggingMessage("only supports adding LoRA"))
+            del vllm_logger
+        except:
+            pass
+        try:
+            from vllm.v1.worker.lora_model_runner_mixin import logger as vllm_logger
+            vllm_logger.addFilter(HideLoggingMessage("only supports adding LoRA"))
+            del vllm_logger
+        except:
+            pass
+    pass
 
     # Allow unsloth dynamic quants to work
     def is_layer_skipped_bnb(prefix: str, llm_int8_skip_modules):
