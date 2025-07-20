@@ -482,6 +482,7 @@ def patch_vllm_enable_sleep_mode():
 
         logger.debug(f'Sleeping allocator with tags: {offload_tags}')
         set_of_tags = set([data.tag for _, data in self.pointer_to_data.items()])
+        print(set_of_tags)
         logger.debug(f'Set of tags {set_of_tags} and len of data {len(self.pointer_to_data.items())}')
 
         self.print_memory_summary()
@@ -513,11 +514,12 @@ def patch_vllm_enable_sleep_mode():
 
             unmap_and_release(handle)
             true_offloads += 1
-
+        pass
 
         logger.debug(f'CPU offloads {cpu_offloads} true offloads {true_offloads} total {total_offloads}')
         gc.collect()
         torch.cuda.empty_cache()
+    pass
 
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
         """
@@ -545,6 +547,9 @@ def patch_vllm_enable_sleep_mode():
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
                         data.cpu_backup_tensor = None
+            pass
+        pass
+    pass
 
     def delete_memory():
         torch.cuda.empty_cache()
@@ -569,6 +574,7 @@ def patch_vllm_enable_sleep_mode():
                 kv_cache_count += 1
         logger.debug(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
         logger.debug(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
+    pass
 
     CuMemAllocator.sleep = sleep
     CuMemAllocator.wake_up = wake_up
