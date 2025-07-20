@@ -616,7 +616,7 @@ def patch_vllm_graph_capture():
                 torch.cuda.empty_cache()
             return result
         pass
-        GPUModelRunner.capture_model = capture_model_wrapper_v1
+        # GPUModelRunner.capture_model = capture_model_wrapper_v1
     except Exception as e:
         print(f"Unsloth: Could not patch vLLM V1 graph capture: {e}")
 
@@ -644,7 +644,7 @@ def patch_vllm_graph_capture():
                 torch.cuda.empty_cache()
             return result
         pass
-        GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
+        # GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
     except Exception as e:
         print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
 pass
