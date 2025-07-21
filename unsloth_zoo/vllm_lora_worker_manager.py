@@ -126,7 +126,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
                     lora_model_id=lora_request.lora_int_id,
                     tensors=lora_request.lora_tensors,
                     peft_helper=peft_helper,
-                    device="cuda",
+                    device="cpu",
                     dtype=self.lora_config.lora_dtype,
                     embeddings=lora_request.lora_embeddings,
                     target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
@@ -140,7 +140,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
                     expected_lora_modules,
                     peft_helper=peft_helper,
                     lora_model_id=lora_request.lora_int_id,
-                    device="cuda",
+                    device="cpu",
                     dtype=self.lora_config.lora_dtype,
                     target_embedding_padding=self.vocab_size +
                     self.lora_config.lora_extra_vocab_size,
