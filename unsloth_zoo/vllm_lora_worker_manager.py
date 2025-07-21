@@ -19,6 +19,7 @@ from vllm.lora.utils import get_adapter_absolute_path
 
 logger = init_logger(__name__)
 
+import inspect
 
 class WorkerLoRAManager(AbstractWorkerManager):
     """WorkerLoRAManager that manages LoRA models on the worker side.
@@ -175,7 +176,8 @@ class WorkerLoRAManager(AbstractWorkerManager):
             dummy_lora = self._cached_dummy_lora.clone(
                 lora_request.lora_int_id)
         else:
-            print("$$$")
+            parameters = inspect.signature(self._adapter_manager.create_dummy_lora).parameters
+            print(parameters)
             dummy_lora = self._adapter_manager.create_dummy_lora(
                 lora_request.lora_int_id, rank, 1, self.embedding_modules)
             if self._cached_dummy_lora is None:
