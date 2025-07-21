@@ -319,6 +319,7 @@ if importlib.util.find_spec("vllm") is not None:
         vllm.lora.worker_manager.LoRARequest = PatchedLoRARequest
         vllm.lora.worker_manager.WorkerLoRAManager = PatchedWorkerLoRAManager
         vllm.lora.worker_manager.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
+        print(vllm.lora.worker_manager.WorkerLoRAManager)
     pass
 
     def set_inductor_config(config, runtime_shape):
