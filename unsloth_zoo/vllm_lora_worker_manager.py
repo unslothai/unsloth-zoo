@@ -82,6 +82,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
         return lora_manager.model
 
     def _load_adapter(self, lora_request: LoRARequest) -> LoRAModel:
+        print("$$$$$$$")
         try:
             model = self._adapter_manager.model
             try:

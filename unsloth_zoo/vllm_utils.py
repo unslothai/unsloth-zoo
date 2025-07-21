@@ -1780,7 +1780,6 @@ def load_lora(model, save_directory, load_tensors = False):
     LORA_REQUEST_ID += 1
     # Set model's current LoRA adapater
     # model.vllm_engine.vllm_lora_request = lora_request
-    print(lora_request)
     return lora_request
 pass
 
