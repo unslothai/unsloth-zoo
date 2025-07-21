@@ -597,10 +597,10 @@ def patch_vllm_enable_sleep_mode():
             elif data.tag == "kv_cache":
                 kv_cache_total += size
                 kv_cache_count += 1
-        # logger.debug(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
-        # logger.debug(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
-        print(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
-        print(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
+        logger.debug(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
+        logger.debug(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
+        # print(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
+        # print(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
     pass
 
     CuMemAllocator.sleep = sleep
