@@ -39,7 +39,7 @@ def determine_compile_threads():
     # Windows thread count = 1. See https://github.com/unslothai/unsloth-zoo/pull/187
     if sys.platform == "win32": return 1
     cpu_count = os.cpu_count()
-    return min(48, max(4, cpu_count))
+    return min(32, max(4, cpu_count))
 pass
 
 def get_torch_compile_options(
