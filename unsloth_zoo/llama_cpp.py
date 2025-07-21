@@ -678,6 +678,7 @@ def convert_to_gguf(
     for python in ["python", "python3"]:
         try:
             command = f"{python} {conversion_filename} {args} {input_folder}"
+            print(command)
             metadata = _convert_to_gguf(
                 command,
                 output_filename,
