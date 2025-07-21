@@ -20,6 +20,15 @@ from vllm.lora.utils import get_adapter_absolute_path
 logger = init_logger(__name__)
 
 import inspect
+import functools
+
+@functools.lru_cache(1)
+def dummy_lora_has_scaling_factor(create_dummy_lora):
+    # create_dummy_lora(self, lora_id, rank, scaling_factor, embedding_modules)
+    # create_dummy_lora(self, lora_id, rank, embedding_modules)
+    keys = inspect.signature(create_dummy_lora).parameters.keys()
+    return "scaling_factor" in keys
+pass
 
 class WorkerLoRAManager(AbstractWorkerManager):
     """WorkerLoRAManager that manages LoRA models on the worker side.
@@ -176,10 +185,21 @@ class WorkerLoRAManager(AbstractWorkerManager):
             dummy_lora = self._cached_dummy_lora.clone(
                 lora_request.lora_int_id)
         else:
-            parameters = inspect.signature(self._adapter_manager.create_dummy_lora).parameters
-            print(parameters)
-            dummy_lora = self._adapter_manager.create_dummy_lora(
-                lora_request.lora_int_id, rank, 1, self.embedding_modules)
+            f = self._adapter_manager.create_dummy_lora
+            if dummy_lora_has_scaling_factor(f):
+                dummy_lora = f(
+                    lora_id = lora_request.lora_int_id,
+                    rank = rank,
+                    scaling_factor = 1,
+                    scaling_factor = self.embedding_modules,
+                )
+            else:
+                dummy_lora = f(
+                    lora_id = lora_request.lora_int_id,
+                    rank = rank,
+                    # scaling_factor = 1,
+                    scaling_factor = self.embedding_modules,
+                )
             if self._cached_dummy_lora is None:
                 self._cached_dummy_lora = dummy_lora
         return self._adapter_manager.add_adapter(dummy_lora)
