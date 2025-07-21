@@ -251,6 +251,7 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
             self.add_adapter(lora)
 
     def add_adapter(self, lora_request: LoRARequest) -> bool:
+        print("$$$1")
         if lora_request.lora_int_id not in self.list_adapters():
             # Load the new adapter first to ensure it is actually valid, before
             # evicting any existing adapters.
