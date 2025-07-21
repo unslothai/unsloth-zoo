@@ -191,14 +191,14 @@ class WorkerLoRAManager(AbstractWorkerManager):
                     lora_id = lora_request.lora_int_id,
                     rank = rank,
                     scaling_factor = 1,
-                    scaling_factor = self.embedding_modules,
+                    embedding_modules = self.embedding_modules,
                 )
             else:
                 dummy_lora = f(
                     lora_id = lora_request.lora_int_id,
                     rank = rank,
                     # scaling_factor = 1,
-                    scaling_factor = self.embedding_modules,
+                    embedding_modules = self.embedding_modules,
                 )
             if self._cached_dummy_lora is None:
                 self._cached_dummy_lora = dummy_lora
