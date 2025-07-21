@@ -1482,7 +1482,6 @@ def load_vllm(
     if return_args: return engine_args
 
     # Keep trying until success (2 times)
-    print(engine_args)
     trials = 0
     while True:
         try:
@@ -1730,6 +1729,7 @@ pass
 
 @torch.inference_mode
 def load_lora(model, save_directory, load_tensors = False):
+    print(model, save_directory, load_tensors)
     # vllm_lora_already_loaded(model)
     # Check internally if model has hot loaded LoRAs
     # if load_tensors and hasattr(model, "saved_vllm_lora_request"):# vllm_lora_already_loaded(model):
@@ -1780,6 +1780,7 @@ def load_lora(model, save_directory, load_tensors = False):
     LORA_REQUEST_ID += 1
     # Set model's current LoRA adapater
     # model.vllm_engine.vllm_lora_request = lora_request
+    print(lora_request)
     return lora_request
 pass
 
