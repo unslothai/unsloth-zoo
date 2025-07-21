@@ -197,6 +197,9 @@ class WorkerLoRAManager(AbstractWorkerManager):
                               self.remove_adapter, self.add_adapter)
 
     def add_adapter(self, adapter_request: Any) -> bool:
+        print("$$$")
+        print("$$$")
+        print("$$$")
         return add_adapter_worker(adapter_request, self.list_adapters,
                                   self._load_adapter,
                                   self._adapter_manager.add_adapter,
@@ -225,6 +228,9 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
         self,
         model: torch.nn.Module,
     ) -> Any:
+        print("$$$")
+        print("$$$")
+        print("$$$")
         lora_manager = create_lora_manager(
             model,
             lora_manager_cls=self._manager_cls,
@@ -238,6 +244,9 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
         return lora_manager.model
 
     def _apply_adapters(self, lora_requests: Set[LoRARequest]) -> None:
+        print("$$$")
+        print("$$$")
+        print("$$$")
         loras_map = {
             lora_request.lora_int_id: lora_request
             for lora_request in lora_requests if lora_request
@@ -251,7 +260,10 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
             self.add_adapter(lora)
 
     def add_adapter(self, lora_request: LoRARequest) -> bool:
-        print("$$$1")
+        print("$$$")
+        print("$$$")
+        print("$$$")
+        print("$$$")
         if lora_request.lora_int_id not in self.list_adapters():
             # Load the new adapter first to ensure it is actually valid, before
             # evicting any existing adapters.
