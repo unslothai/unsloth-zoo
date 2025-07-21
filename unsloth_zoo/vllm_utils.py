@@ -1434,7 +1434,7 @@ def load_vllm(
                     cudagraphs = True,
                     coordinate_descent_tuning = True,
                     logging = True, # Enable compile logs
-                    combo_kernels = True,
+                    combo_kernels = False, # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
                     group_fusion = True,
                     memory_planning = True,
                     multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
