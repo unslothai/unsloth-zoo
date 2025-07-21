@@ -126,7 +126,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
                     lora_model_id=lora_request.lora_int_id,
                     tensors=lora_request.lora_tensors,
                     peft_helper=peft_helper,
-                    device="cpu",
+                    device=None, # Keep whatever the original device was
                     dtype=self.lora_config.lora_dtype,
                     embeddings=lora_request.lora_embeddings,
                     target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
@@ -140,7 +140,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
                     expected_lora_modules,
                     peft_helper=peft_helper,
                     lora_model_id=lora_request.lora_int_id,
-                    device="cpu",
+                    device="cpu", # Local checkpoint is CPU
                     dtype=self.lora_config.lora_dtype,
                     target_embedding_padding=self.vocab_size +
                     self.lora_config.lora_extra_vocab_size,
@@ -175,6 +175,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
             dummy_lora = self._cached_dummy_lora.clone(
                 lora_request.lora_int_id)
         else:
+            print("$$$")
             dummy_lora = self._adapter_manager.create_dummy_lora(
                 lora_request.lora_int_id, rank, 1, self.embedding_modules)
             if self._cached_dummy_lora is None:
