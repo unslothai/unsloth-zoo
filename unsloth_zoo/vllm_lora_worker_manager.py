@@ -103,17 +103,14 @@ class WorkerLoRAManager(AbstractWorkerManager):
             expected_lora_modules = list(set(expected_lora_modules))
 
             if lora_request.lora_path:
-                print("$$$$", lora_request.lora_path)
                 lora_path = get_adapter_absolute_path(lora_request.lora_path)
-                print("$$$$", lora_path)
 
                 peft_helper = PEFTHelper.from_local_dir(
                     lora_path, self.max_position_embeddings)
-                print("$$$$", peft_helper)
             else:
                 lora_request.lora_config["vllm_max_position_embeddings"] = self.max_position_embeddings
                 peft_helper = PEFTHelper.from_dict(lora_request.config)
-    
+            print("$$$$$", peft_helper)
             # Validates the LoRA configuration against requirements before
             # loading weights, throwing an exception if validation fails.
             peft_helper.validate_legal(self.lora_config)
