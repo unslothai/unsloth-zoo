@@ -1401,7 +1401,7 @@ def load_vllm(
         # TODO: In vLLM V1, iirc, the profiling sets a cap on the max seqs based on the budget. Check it out.
         print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 16')
         approx_max_num_seqs = 16
-        max_num_batched_tokens = 8192 # Single image would contribute to 6404 tokens in Llama 3.2 for eg. So have some more for text
+        max_num_batched_tokens = max(8192, max_seq_length) # Single image would contribute to 6404 tokens in Llama 3.2 for eg. So have some more for text
 
     # float8 KV cache can fit more sequences in 1 go so more throughput
     if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
