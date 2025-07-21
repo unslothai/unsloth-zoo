@@ -320,6 +320,16 @@ if importlib.util.find_spec("vllm") is not None:
         vllm.lora.worker_manager.LoRARequest = PatchedLoRARequest
         vllm.lora.worker_manager.WorkerLoRAManager = PatchedWorkerLoRAManager
         vllm.lora.worker_manager.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
+        try:
+            import vllm.v1.worker.lora_model_runner_mixin
+            vllm.v1.worker.lora_model_runner_mixin.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
+        except:
+            pass
+        try:
+            import vllm.worker.model_runner
+            vllm.worker.model_runner.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
+        except:
+            pass
     pass
 
     def set_inductor_config(config, runtime_shape):
@@ -591,6 +601,8 @@ def patch_vllm_enable_sleep_mode():
                 kv_cache_count += 1
         logger.debug(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
         logger.debug(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
+        # print(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
+        # print(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
     pass
 
     CuMemAllocator.sleep = sleep
@@ -1468,7 +1480,7 @@ def load_vllm(
                     cudagraphs = True,
                     coordinate_descent_tuning = True,
                     logging = True, # Enable compile logs
-                    combo_kernels = True,
+                    combo_kernels = False, # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
                     group_fusion = True,
                     memory_planning = True,
                     multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
