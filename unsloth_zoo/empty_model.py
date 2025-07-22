@@ -33,6 +33,7 @@ def compare_dicts(orig_dict, new_dict, prefix=""):
             print(f"Dict key {key_path} type mismatch: original {type(orig_val)} != new model {type(new_val)}")
 
 def compare_attributes(original_model, new_model):
+    from transformers.configuration_utils import PretrainedConfig
     print("=== ATTRIBUTE COMPARISON REPORT ===")
     missing_attrs = []
     type_mismatches = []
@@ -85,6 +86,12 @@ def compare_attributes(original_model, new_model):
             except Exception as e:
                 type_mismatches.append(f"{name}.{attr}: comparison failed - {str(e)}")
 
+            try:
+                if isinstance(original_val, PretrainedConfig) and isinstance(new_val, PretrainedConfig):
+                    compare_dicts(original_val.to_dict(), new_val.to_dict(), prefix=f"{name}.{attr}")
+            except Exception as e:
+                type_mismatches.append(f"{name}.{attr}: comparison failed - {str(e)}")
+
     # Print summary
     if missing_attrs:
         print(f"\n🚨 MISSING ATTRIBUTES ({len(missing_attrs)}):")
@@ -124,6 +131,7 @@ def _extract_all_config_keys(config):
     return keys
 
 def copy_attributes(original_model, new_model):
+    from transformers.configuration_utils import PretrainedConfig
     if original_model is None or new_model is None:
         print("Cannot copy attributes: one of the models is None")
         return
@@ -164,6 +172,10 @@ def copy_attributes(original_model, new_model):
                         skipped_count += 1
                         skipped_attrs.append(f"{attr} (dict not in config)")
                         dict_skipped_count += 1
+                elif isinstance(original_val, PretrainedConfig):
+                    # Sometimes the .config in original model is of config class and not a dict. Copy it as is.
+                    setattr(module, attr, deepcopy(original_val))
+                    copied_count += 1
             except:
                 skipped_count += 1
                 skipped_attrs.append(attr)
