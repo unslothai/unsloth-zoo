@@ -1399,28 +1399,28 @@ def load_vllm(
         # In vLLM profiling, each sequence contributes to an image. Which is generally in the order of thousand tokens.
         # We don't want to go beyond 16 sequences for vision models.
         # TODO: In vLLM V1, iirc, the profiling sets a cap on the max seqs based on the budget. Check it out.
-        print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 16')
-        approx_max_num_seqs = 16
-        max_num_batched_tokens = max(8192, max_seq_length) # Single image would contribute to 6404 tokens in Llama 3.2 for eg. So have some more for text
+        print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
+        approx_max_num_seqs = 1
+        # Single image would contribute to 6404 tokens in Llama 3.2 for eg. So have some more for text
+        # For qwen 2.5 VL, this single image/video contributes to 16Ki tokens
+        max_num_batched_tokens = max(8192, max_seq_length)
 
     # float8 KV cache can fit more sequences in 1 go so more throughput
     if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
 
     # vLLM default max_num_batched_tokens is 2048
     chunked_prefill_tokens = 2048
-    if   memory_left_for_kv_cache_gb <=  8: chunked_prefill_tokens = 1024 # + 0
-    elif memory_left_for_kv_cache_gb <= 12: chunked_prefill_tokens = 1536 # + 512
-    elif memory_left_for_kv_cache_gb <= 16: chunked_prefill_tokens = 2048 # + 512
-    elif memory_left_for_kv_cache_gb <= 24: chunked_prefill_tokens = 3072 # + 1024
-    elif memory_left_for_kv_cache_gb <= 40: chunked_prefill_tokens = 4096 # + 1024
-    elif memory_left_for_kv_cache_gb <= 48: chunked_prefill_tokens = 4608 # + 512
-    elif memory_left_for_kv_cache_gb <= 80: chunked_prefill_tokens = 8192 # + 4096
-    else: chunked_prefill_tokens = 8192 # + 0
+    if not is_vision_model:
+        if   memory_left_for_kv_cache_gb <=  8: chunked_prefill_tokens = 1024 # + 0
+        elif memory_left_for_kv_cache_gb <= 12: chunked_prefill_tokens = 1536 # + 512
+        elif memory_left_for_kv_cache_gb <= 16: chunked_prefill_tokens = 2048 # + 512
+        elif memory_left_for_kv_cache_gb <= 24: chunked_prefill_tokens = 3072 # + 1024
+        elif memory_left_for_kv_cache_gb <= 40: chunked_prefill_tokens = 4096 # + 1024
+        elif memory_left_for_kv_cache_gb <= 48: chunked_prefill_tokens = 4608 # + 512
+        elif memory_left_for_kv_cache_gb <= 80: chunked_prefill_tokens = 8192 # + 4096
+        else: chunked_prefill_tokens = 8192 # + 0
 
-    # vLLM errors out from max_seq_length (2048) being bigger than chunked_prefill_tokens (1024)
-    if max_seq_length > chunked_prefill_tokens:
-        chunked_prefill_tokens = max_seq_length
-    elif chunked_prefill_tokens > max_seq_length:
+        # vLLM errors out from max_seq_length (2048) being bigger than chunked_prefill_tokens (1024)
         chunked_prefill_tokens = max_seq_length
 
     # Scale num_seqs by conservativeness
@@ -1512,7 +1512,7 @@ def load_vllm(
 
         disable_log_stats      = disable_log_stats,
         enable_prefix_caching  = enable_prefix_caching,
-        # enable_chunked_prefill = True, # LoRA fails with chunked prefill as at Feb 2025
+        enable_chunked_prefill = True, # LoRA fails with chunked prefill as at Feb 2025
         # max_seq_len_to_capture fails for V1
         # max_seq_len_to_capture = min(8192, max_seq_length + 256), # Default is 8192 for CUDAGraphs
         compilation_config     = compilation_config, # 0, 1, 2, 3
@@ -1523,8 +1523,14 @@ def load_vllm(
         # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
         enable_sleep_mode      = unsloth_vllm_standby,
     )
+    if is_vision_model:
+        # To reduce memory usage, we limit the number of images/videos per prompt
+        # TODO: Make it configurable by user
+        engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
+
     if unsloth_vllm_standby and "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
         del os.environ['PYTORCH_CUDA_ALLOC_CONF'] # Disable expandable segments cuz https://github.com/pytorch/pytorch/issues/147851
+
     good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
     old_keys = engine_args.keys()
     for key in old_keys:
