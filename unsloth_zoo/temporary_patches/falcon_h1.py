@@ -78,12 +78,9 @@ def patch_FalconH1Mixer_torch_forward():
         self,
         states,
         A_cumsum,
+        padded_A_cumsum,
         C_chunks,
     ):
-        prev_states = torch.zeros_like(states[:, :1])
-        states = torch.cat([prev_states, states], dim=1)  # prepend
-        padded_A_cumsum = torch.nn.functional.pad(A_cumsum[:, :, :, -1], (1,0))
-        padded_A_cumsum = segment_sum(padded_A_cumsum)
         decay_chunk = torch.exp(padded_A_cumsum).transpose(1, 3)
         new_states = (decay_chunk[..., None, None] * states[:, :, None, ...]).sum(dim=1)
         states, ssm_state = new_states[:, :-1], new_states[:, -1]
@@ -94,14 +91,12 @@ def patch_FalconH1Mixer_torch_forward():
         Y_off = (C_times_states.sum(-1) *
                  state_decay_out.permute(0, 2, 3, 1)[..., None])
         return Y_off, ssm_state
-    
 
     _get_data_hidden_states_dt = torch.compile(_get_data_hidden_states_dt, fullgraph = True, dynamic = True, options = torch_compile_options)
     _conv1d                    = torch.compile(_conv1d, fullgraph = True, dynamic = True, options = torch_compile_options)
     _kern_dt_and_A_and_hs      = torch.compile(_kern_dt_and_A_and_hs, fullgraph = True, dynamic = True, options = torch_compile_options)
     _kern_intra_chunk          = torch.compile(_kern_intra_chunk, fullgraph = True, dynamic = True, options = torch_compile_options)
-
-    #_kern_inter_chunk          = torch.compile(_kern_inter_chunk, fullgraph = True, dynamic = True, options = torch_compile_options)
+    _kern_inter_chunk          = torch.compile(_kern_inter_chunk, fullgraph = False, dynamic = True)
 
     def torch_forward(
         self,
@@ -225,9 +220,13 @@ def patch_FalconH1Mixer_torch_forward():
             # if use_precomputed_states:
             #     prev_states = cache_params.ssm_states[self.layer_idx][:, None, ...].to(device=hidden_states.device)
             # else:
+            prev_states = torch.zeros_like(states_chunks[:, :1])
+            states_chunks = torch.cat([prev_states, states_chunks], dim=1)  # prepend
+            padded_A_cumsum = torch.nn.functional.pad(A_cumsum[:, :, :, -1], (1,0))
+            padded_A_cumsum = segment_sum(padded_A_cumsum)
 
             Y_off, ssm_state = _kern_inter_chunk(
-                self, states_chunks, A_cumsum, C
+                self, states_chunks, A_cumsum, padded_A_cumsum, C
             )
 
             y = Y_diag + Y_off
