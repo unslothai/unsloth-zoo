@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 if UNSLOTH_ENABLE_LOGGING:
     logger.setLevel(logging.DEBUG)
 
+# Get only allowed options
+import inspect
+inductor_config_source = inspect.getsource(torch._inductor.config)
+
 @functools.lru_cache(1)
 def determine_compile_threads():
     # See https://github.com/pytorch/pytorch/blob/ab2294d8289a7757a2fc321cdefac88e2b378edf/torch/_inductor/config.py#L771
@@ -60,6 +64,10 @@ def get_torch_compile_options(
     UNSLOTH_COMPILE_MAXIMUM       = os.environ.get("UNSLOTH_COMPILE_MAXIMUM",       "0") == "1"
     UNSLOTH_COMPILE_IGNORE_ERRORS = os.environ.get("UNSLOTH_COMPILE_IGNORE_ERRORS", "0") == "1"
     if UNSLOTH_ENABLE_LOGGING: logging = True
+
+    # https://github.com/pytorch/pytorch/blob/c665594c1edca9a507b0ec8b18ab74a0ecb65bc3/torch/_inductor/config.py#L1283
+    # Needs integer
+    multi_kernel = 1 if multi_kernel else 0
 
     # Instead of Inductor Compilation:
     try:
@@ -94,7 +102,12 @@ def get_torch_compile_options(
         "triton.enable_persistent_tma_matmul" : True,
         "triton.autotune_at_compile_time"     : True,
     }
-    return torch_compile_options
+    final_torch_compile_options = {}
+    for key, value in torch_compile_options.items():
+        splits = key.split(".")
+        if all(k in inductor_config_source for k in splits):
+            final_torch_compile_options[key] = value
+    return final_torch_compile_options
 pass
 torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
