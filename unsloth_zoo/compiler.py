@@ -57,7 +57,13 @@ global COMBINED_UNSLOTH_NAME
 COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
 
 global UNSLOTH_COMPILE_LOCATION
-UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
+if 'UNSLOTH_COMPILE_LOCATION' not in globals():
+    _loc = os.getenv("UNSLOTH_COMPILE_LOCATION", None)
+    if _loc:
+        UNSLOTH_COMPILE_LOCATION = _loc
+    else:
+        UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
+
 
 global UNSLOTH_COMPILE_USE_TEMP
 UNSLOTH_COMPILE_USE_TEMP = False
@@ -142,14 +148,9 @@ if UNSLOTH_ENABLE_LOGGING:
 global INFERENCE_RUNS
 INFERENCE_RUNS = 0
 
-try:
-    import torch._dynamo.eval_frame as torch_dynamo_eval_frame
-    torch_dynamo_eval_frame._stance.stance
-    torch_compiler_set_stance = torch.compiler.set_stance
-except:
-    torch_dynamo_eval_frame = None
-    torch_compiler_set_stance = None
-pass
+import torch._dynamo.eval_frame as torch_dynamo_eval_frame
+torch_compiler_set_stance = torch.compiler.set_stance
+
 """
 
 _disabled_sdpa_code = f"""{_license_header}
@@ -679,11 +680,8 @@ __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
     global INFERENCE_RUNS
-    if torch_dynamo_eval_frame is not None:
-        old_stance = torch_dynamo_eval_frame._stance.stance
-    else:
-        old_stance = None
-    if old_stance is not None and INFERENCE_RUNS == 1:
+    old_stance = torch_dynamo_eval_frame._stance.stance
+    if INFERENCE_RUNS == 1:
         # Skip guards and return to eager -> we still need guards!
         torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
         if UNSLOTH_ENABLE_LOGGING:
