@@ -237,8 +237,9 @@ ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
 
-import torch._dynamo.eval_frame as torch_dynamo_eval_frame
-torch_compiler_set_stance = torch.compiler.set_stance
+# Cannot use sadly
+# import torch._dynamo.eval_frame as torch_dynamo_eval_frame
+# torch_compiler_set_stance = torch.compiler.set_stance
 
 mark_static  = torch._dynamo.mark_static
 mark_dynamic = torch._dynamo.mark_dynamic
