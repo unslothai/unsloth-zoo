@@ -57,7 +57,12 @@ global COMBINED_UNSLOTH_NAME
 COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
 
 global UNSLOTH_COMPILE_LOCATION
-UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
+if 'UNSLOTH_COMPILE_LOCATION' not in globals():
+    _loc = os.getenv("UNSLOTH_COMPILE_LOCATION", None)
+    if _loc:
+        UNSLOTH_COMPILE_LOCATION = _loc
+    else:
+        UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
 
 global UNSLOTH_COMPILE_USE_TEMP
 UNSLOTH_COMPILE_USE_TEMP = False
