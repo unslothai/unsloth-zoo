@@ -35,6 +35,7 @@ if UNSLOTH_ENABLE_LOGGING:
 
 # Get only allowed options
 import inspect
+import torch
 inductor_config_source = inspect.getsource(torch._inductor.config)
 
 @functools.lru_cache(1)
