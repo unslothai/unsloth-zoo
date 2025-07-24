@@ -437,6 +437,10 @@ def get_model_layer_config(model_type, config=None):
             'layernorms': [
                 f"{prefix}.layers.{{kk}}.input_layernorm",
                 f"{prefix}.layers.{{kk}}.post_attention_layernorm",
+                f"{prefix}.layers.{{kk}}.pre_feedforward_layernorm",
+                f"{prefix}.layers.{{kk}}.post_feedforward_layernorm",
+                f"{prefix}.layers.{{kk}}.self_attn.q_norm",
+                f"{prefix}.layers.{{kk}}.self_attn.k_norm",
             ],
             'vision_layers': [],
             'additional_layers': [],
