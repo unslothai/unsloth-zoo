@@ -164,7 +164,11 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         f"config.cuda.compile_opt_level = {'-O2' if O3 else '-O1'}",
         # See torch.compile, the missing manual
         # https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8
-        f"config.emulate_precision_casts = {not debug}", # Force X.to(f32).to(f16) instead of X.to(f16)
+        # f"config.emulate_precision_casts = {not debug}", # Force X.to(f32).to(f16) instead of X.to(f16)
+        # when setting to not debug aka True, we get errors on torch2.6 
+        # TypeError: ValueRangeAnalysis.to_dtype() got an unexpected keyword argument 'use_compute_types'
+        # this keyword exists in torch2.7.0 but not in torch2.6.0 so set to False until torch2.6.0 is deprecated.
+        "config.emulate_precision_casts = False", # Force X.to(f32).to(f16) instead of X.to(f16)
     ]
     # Torch dynamo arguments
     torch_dynamo_arguments = [
