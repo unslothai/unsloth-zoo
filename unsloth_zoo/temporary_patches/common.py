@@ -103,12 +103,10 @@ def get_torch_compile_options(
         "triton.enable_persistent_tma_matmul" : True,
         "triton.autotune_at_compile_time"     : True,
         "triton.cooperative_reductions"       : True,
-
-        # "reorder_for_compute_comm_overlap"    : True,
+        # "reorder_for_compute_comm_overlap"  : True, # Fails for single GPU
         "cuda.compile_opt_level"              : "-O2",
         "cuda.enable_cuda_lto"                : True,
-
-        "cuda.use_fast_math"                  : True, # Disable fast math
+        # "cuda.use_fast_math"                : True, # Disable fast math
         # Causes incompatible gradient sizes on 2.6
         # And TypeError: bad operand type for unary -: 'SymbolicCallArg'
         "combo_kernels"                       : False,
