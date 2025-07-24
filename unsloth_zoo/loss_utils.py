@@ -563,8 +563,8 @@ pass
 _unsloth_compiled_fused_ce_loss_function = torch.compile(
     _unsloth_compiled_fused_ce_loss_function,
     fullgraph = True,
-    dynamic = True,
-    options = torch_compile_options,
+    dynamic = None,
+    options = {"trace.enabled" : True,},
 )
 
 def _unsloth_compiled_unchunked_fused_ce_loss_function(
