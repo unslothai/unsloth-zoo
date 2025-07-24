@@ -18,6 +18,7 @@ import torch
 from packaging.version import Version
 import os
 import math
+import functools
 from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
