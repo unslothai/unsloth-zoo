@@ -611,7 +611,7 @@ def _unsloth_compiled_unchunked_fused_ce_loss_function(
         _shift_logits = torch.tanh(_shift_logits)
         _shift_logits = _shift_logits * logit_softcapping
 
-    loss += torch.nn.functional.cross_entropy(
+    loss = torch.nn.functional.cross_entropy(
         input  = _shift_logits.float().contiguous(),
         target = _shift_labels.contiguous(),
         reduction = 'sum',
