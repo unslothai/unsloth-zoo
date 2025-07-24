@@ -595,7 +595,7 @@ def _unsloth_compiled_unchunked_fused_ce_loss_function(
     bsz, qlen, hd = hidden_states.shape
     hidden_states = hidden_states.view(-1, hd)
 
-    _shift_logits = torch.nn.functional.linear(
+    shift_logits = torch.nn.functional.linear(
         hidden_states.to(lm_head_weight.device),
         lm_head_weight,
         lm_head_bias,
@@ -603,17 +603,17 @@ def _unsloth_compiled_unchunked_fused_ce_loss_function(
 
     # Apply softcapping and other functions
     if logit_scale_multiply != 0:
-        _shift_logits = _shift_logits * logit_scale_multiply
+        shift_logits = shift_logits * logit_scale_multiply
     if logit_scale_divide != 0:
-        _shift_logits = _shift_logits / logit_scale_divide
+        shift_logits = shift_logits / logit_scale_divide
     if logit_softcapping != 0:
-        _shift_logits = _shift_logits / logit_softcapping
-        _shift_logits = torch.tanh(_shift_logits)
-        _shift_logits = _shift_logits * logit_softcapping
+        shift_logits = shift_logits / logit_softcapping
+        shift_logits = torch.tanh(shift_logits)
+        shift_logits = shift_logits * logit_softcapping
 
     loss = torch.nn.functional.cross_entropy(
-        input  = _shift_logits.float().contiguous(),
-        target = _shift_labels.contiguous(),
+        input  = shift_logits.float().contiguous(),
+        target = shift_labels.contiguous(),
         reduction = 'sum',
     )
     divisor = n_items if n_items is not None else (shift_labels != -100).sum()
