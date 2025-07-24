@@ -53,7 +53,9 @@ pass
 
 # Triton compile debugging
 if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
-    os.environ["TRITON_ENABLE_LLVM_DEBUG"] = "0" # Lots of debugging info
+    # Lots of debugging info
+    # BUT weirdly blocks torch.compile, so we disable
+    os.environ["TRITON_ENABLE_LLVM_DEBUG"] = "0"
     # Can add print statements, but slower so disable
     # Also fails on get_int1_ty for example (bool)
     os.environ["TRITON_INTERPRET"] = "0"
