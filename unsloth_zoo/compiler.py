@@ -792,7 +792,7 @@ else:
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
         vocab_size           = (\\6),
-        n_items              = n_items if n_items is not None else 0,
+        n_items              = n_items,
         requires_grad_       = requires_grad_,
     )
 
@@ -807,7 +807,7 @@ else:
     #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
     #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
     #     vocab_size           = (\\6),
-    #     n_items              = n_items if n_items is not None else 0,
+    #     n_items              = n_items,
     #     requires_grad_       = requires_grad_,
     # )
 
@@ -908,7 +908,7 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
         vocab_size           = (\\8),
-        n_items              = n_items if n_items is not None else 0,
+        n_items              = n_items,
         requires_grad_       = requires_grad_,
     )
 
@@ -924,7 +924,7 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
     #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
     #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
     #     vocab_size           = (\\8),
-    #     n_items              = n_items if n_items is not None else 0,
+    #     n_items              = n_items,
     #     requires_grad_       = requires_grad_,
     # )
 else:
@@ -1008,7 +1008,7 @@ else:
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
         vocab_size           = (\\7),
-        n_items              = n_items if n_items is not None else 0,
+        n_items              = n_items,
         mask                 = \\6,
         requires_grad_       = requires_grad_,
     )
@@ -1026,7 +1026,7 @@ else:
     #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
     #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
     #     vocab_size           = (\\7),
-    #     n_items              = n_items if n_items is not None else 0,
+    #     n_items              = n_items,
     #     mask                 = \\6,
     #     requires_grad_       = requires_grad_,
     # )

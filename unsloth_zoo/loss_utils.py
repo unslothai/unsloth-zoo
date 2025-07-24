@@ -17,6 +17,7 @@
 import torch
 from packaging.version import Version
 import os
+from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
 from . import DEVICE_TYPE
@@ -357,7 +358,7 @@ def unsloth_compiled_ce_loss_function(
     logit_scale_divide : float = 0,
     logit_softcapping : float = 0,
     vocab_size : int = 0,
-    n_items : int = 0,
+    n_items : Optional[int] = 0,
     mask : torch.Tensor = None,
     requires_grad_ : bool = False,
 ):
@@ -398,8 +399,7 @@ def unsloth_compiled_ce_loss_function(
             reduction = 'sum',
         )
     pass
-    torch._check_is_size(n_items)
-    divisor = n_items if n_items != 0 else (shift_labels != -100).sum()
+    divisor = n_items if n_items is not None else (shift_labels != -100).sum()
     loss = loss / torch.tensor(divisor, dtype = torch.float32)
     return loss
 pass
@@ -420,7 +420,7 @@ def unsloth_compiled_fused_ce_loss_function(
     logit_scale_divide : float = 0,
     logit_softcapping : float = 0,
     vocab_size : int = 0,
-    n_items : int = 0,
+    n_items : Optional[int] = 0,
     mask : torch.Tensor = None,
     requires_grad_ : bool = False,
 ):
@@ -473,8 +473,7 @@ def unsloth_compiled_fused_ce_loss_function(
             reduction = 'sum',
         )
     pass
-    torch._check_is_size(n_items)
-    divisor = n_items if n_items != 0 else (shift_labels != -100).sum()
+    divisor = n_items if n_items is not None else (shift_labels != -100).sum()
     loss = loss / torch.tensor(divisor, dtype = torch.float32)
     return loss
 pass
