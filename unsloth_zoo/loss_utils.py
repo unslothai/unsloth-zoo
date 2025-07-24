@@ -17,6 +17,7 @@
 import torch
 from packaging.version import Version
 import os
+import math
 from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
@@ -411,7 +412,7 @@ unsloth_compiled_ce_loss_function = torch.compile(
 )
 
 
-def unsloth_compiled_fused_ce_loss_function(
+def _unsloth_compiled_fused_ce_loss_function(
     hidden_states : torch.Tensor,
     lm_head_weight : torch.Tensor,
     lm_head_bias : torch.Tensor,
@@ -419,10 +420,9 @@ def unsloth_compiled_fused_ce_loss_function(
     logit_scale_multiply : float = 0,
     logit_scale_divide : float = 0,
     logit_softcapping : float = 0,
-    vocab_size : int = 0,
     n_items : Optional[int] = 0,
     mask : torch.Tensor = None,
-    requires_grad_ : bool = False,
+    n_chunks : int = 8,
 ):
     device = lm_head_weight.device
 
@@ -436,14 +436,10 @@ def unsloth_compiled_fused_ce_loss_function(
     shift_labels[..., -1] = -100
     shift_labels = shift_labels.view(-1)
 
-    # Decide on chunk size
-    torch._check_is_size(vocab_size)
-    n_chunks = int(torch.ceil((torch.tensor(vocab_size) / 262144) * 8))
-    if requires_grad_: n_chunks += 2
-
     # Chunk hidden_states and labels
     bsz, qlen, hd = hidden_states.shape
     hidden_states = hidden_states.view(-1, hd)
+    torch._check_is_size(n_chunks)
     __shift_states = torch.chunk(hidden_states, n_chunks, dim = 0)
     __shift_labels = torch.chunk(shift_labels,  n_chunks, dim = 0)
     loss = 0.0
@@ -477,13 +473,49 @@ def unsloth_compiled_fused_ce_loss_function(
     loss = loss / torch.tensor(divisor, dtype = torch.float32)
     return loss
 pass
-unsloth_compiled_fused_ce_loss_function = torch.compile(
-    unsloth_compiled_fused_ce_loss_function,
-    fullgraph = False,
+_unsloth_compiled_fused_ce_loss_function = torch.compile(
+    _unsloth_compiled_fused_ce_loss_function,
+    fullgraph = True,
     dynamic = True,
     options = torch_compile_options,
 )
 
+
+@functools.cache
+def _get_chunk_size(vocab_size : int, requires_grad_ : bool):
+    n_chunks = int(math.ceil((vocab_size / 262144) * 8))
+    if requires_grad_: n_chunks += 2
+    return n_chunks
+pass
+
+def unsloth_compiled_fused_ce_loss_function(
+    hidden_states : torch.Tensor,
+    lm_head_weight : torch.Tensor,
+    lm_head_bias : torch.Tensor,
+    output_labels : torch.Tensor,
+    logit_scale_multiply : float = 0,
+    logit_scale_divide : float = 0,
+    logit_softcapping : float = 0,
+    vocab_size : int = 0,
+    n_items : Optional[int] = 0,
+    mask : torch.Tensor = None,
+    requires_grad_ : bool = False,
+)
+    # Decide on chunk size
+    return _unsloth_compiled_fused_ce_loss_function(
+        hidden_states = hidden_states,
+        lm_head_weight = lm_head_weight,
+        lm_head_bias = lm_head_bias,
+        output_labels = output_labels,
+        logit_scale_multiply = logit_scale_multiply,
+        logit_scale_divide = logit_scale_divide,
+        logit_softcapping = logit_softcapping,
+        n_items = n_items,
+        mask = mask,
+        n_chunks = _get_chunk_size(vocab_size, requires_grad_),
+    )
+pass
+    
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
