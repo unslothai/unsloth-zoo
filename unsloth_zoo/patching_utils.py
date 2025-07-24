@@ -166,7 +166,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         "config.capture_dynamic_output_shape_ops = True",
         # Captures .item() for eg
         # n_chunks = int(torch.ceil((torch.tensor(vocab_size) / 262144) * 8))
-        # "config.capture_scalar_outputs = True",
+        "config.capture_scalar_outputs = True",
         "config.emulate_precision_casts = False", # Force X.to(f32).to(f16) instead of X.to(f16)
     ]
     # Torch dynamo arguments
