@@ -104,7 +104,7 @@ def get_torch_compile_options(
         "triton.autotune_at_compile_time"     : True,
         "triton.cooperative_reductions"       : True,
 
-        "reorder_for_compute_comm_overlap"    : True,
+        # "reorder_for_compute_comm_overlap"    : True,
         "cuda.compile_opt_level"              : "-O2",
         "cuda.enable_cuda_lto"                : True,
 
