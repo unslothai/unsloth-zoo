@@ -382,6 +382,7 @@ def unsloth_compiled_ce_loss_function(
     # shift_logits = output_logits[..., :-1, :].float().contiguous()
     # shift_labels = output_labels[..., 1:].contiguous()
 
+    torch._check_is_size(vocab_size)
     shift_logits = shift_logits.view(-1, vocab_size)
     shift_labels = shift_labels.view(-1)
 
@@ -397,10 +398,9 @@ def unsloth_compiled_ce_loss_function(
             reduction = 'sum',
         )
     pass
-    if n_items != 0:
-        loss = loss / n_items
-    else:
-        loss = loss / (shift_labels != -100).sum()
+    torch._check_is_size(n_items)
+    divisor = n_items if n_items != 0 else (shift_labels != -100).sum()
+    loss = loss / torch.tensor(divisor, dtype = torch.float32)
     return loss
 pass
 unsloth_compiled_ce_loss_function = torch.compile(
@@ -437,6 +437,7 @@ def unsloth_compiled_fused_ce_loss_function(
     shift_labels = shift_labels.view(-1)
 
     # Decide on chunk size
+    torch._check_is_size(vocab_size)
     n_chunks = int(torch.ceil((torch.tensor(vocab_size) / 262144) * 8))
     if requires_grad_: n_chunks += 2
 
@@ -472,11 +473,9 @@ def unsloth_compiled_fused_ce_loss_function(
             reduction = 'sum',
         )
     pass
-
-    if n_items != 0:
-        loss = loss / n_items
-    else:
-        loss = loss / (shift_labels != -100).sum()
+    torch._check_is_size(n_items)
+    divisor = n_items if n_items != 0 else (shift_labels != -100).sum()
+    loss = loss / torch.tensor(divisor, dtype = torch.float32)
     return loss
 pass
 unsloth_compiled_fused_ce_loss_function = torch.compile(
