@@ -57,7 +57,7 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
     # Can add print statements, but slower so disable
     # Also fails on get_int1_ty for example (bool)
     os.environ["TRITON_INTERPRET"] = "0"
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "0" # Blocking calls for debugging
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1" # Blocking calls for debugging
 pass
 
 
