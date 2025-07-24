@@ -500,7 +500,7 @@ def unsloth_compiled_fused_ce_loss_function(
     n_items : Optional[int] = 0,
     mask : torch.Tensor = None,
     requires_grad_ : bool = False,
-)
+):
     # Decide on chunk size
     return _unsloth_compiled_fused_ce_loss_function(
         hidden_states = hidden_states,
