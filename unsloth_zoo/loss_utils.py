@@ -353,7 +353,15 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 pass
 
 
-def unsloth_compiled_ce_loss_function(
+@functools.cache
+def _get_chunk_size(vocab_size : int, requires_grad_ : bool):
+    n_chunks = int(math.ceil((vocab_size / 262144) * 8))
+    if requires_grad_: n_chunks += 2
+    return n_chunks
+pass
+
+
+def _unsloth_compiled_unchunked_ce_loss_function(
     output_logits : torch.Tensor,
     output_labels : torch.Tensor,
     logit_scale_multiply : float = 0,
@@ -362,7 +370,7 @@ def unsloth_compiled_ce_loss_function(
     vocab_size : int = 0,
     n_items : Optional[int] = 0,
     mask : torch.Tensor = None,
-    requires_grad_ : bool = False,
+    n_chunks : int = 0,
 ):
     device = output_logits.device
     if logit_scale_multiply != 0:
@@ -388,9 +396,58 @@ def unsloth_compiled_ce_loss_function(
     torch._check_is_size(vocab_size)
     shift_logits = shift_logits.view(-1, vocab_size)
     shift_labels = shift_labels.view(-1)
+    loss = torch.nn.functional.cross_entropy(
+        input  = shift_logits.float().contiguous(),
+        target = shift_labels.contiguous(),
+        reduction = 'sum',
+    )
+    divisor = n_items if n_items is not None else (shift_labels != -100).sum()
+    loss = loss / torch.tensor(divisor, dtype = torch.float32)
+    return loss
+pass
+_unsloth_compiled_unchunked_ce_loss_function = torch.compile(
+    _unsloth_compiled_unchunked_ce_loss_function,
+    fullgraph = True,
+    dynamic = True,
+    options = torch_compile_options,
+)
 
-    n_chunks = int(torch.ceil((torch.tensor(vocab_size) / 262144) * 8))
-    if requires_grad_: n_chunks += 2
+def _unsloth_compiled_ce_loss_function(
+    output_logits : torch.Tensor,
+    output_labels : torch.Tensor,
+    logit_scale_multiply : float = 0,
+    logit_scale_divide : float = 0,
+    logit_softcapping : float = 0,
+    vocab_size : int = 0,
+    n_items : Optional[int] = 0,
+    mask : torch.Tensor = None,
+    n_chunks : int = 8,
+):
+    device = output_logits.device
+    if logit_scale_multiply != 0:
+        output_logits = output_logits * logit_scale_multiply
+    if logit_scale_divide != 0:
+        output_logits = output_logits / logit_scale_divide
+    if logit_softcapping != 0:
+        output_logits = output_logits / logit_softcapping
+        output_logits = torch.tanh(output_logits)
+        output_logits = output_logits * logit_softcapping
+
+    shift_logits = output_logits
+    shift_labels = torch.empty_like(output_labels, device = device)
+    shift_labels[..., :-1] = output_labels[..., 1:]
+    if mask is not None:
+        mask = mask.to(device = device)
+        shift_labels[..., :-1][mask[..., 1:] == 0] = -100
+    pass
+    shift_labels[..., -1] = -100
+    # shift_logits = output_logits[..., :-1, :].float().contiguous()
+    # shift_labels = output_labels[..., 1:].contiguous()
+
+    torch._check_is_size(vocab_size)
+    shift_logits = shift_logits.view(-1, vocab_size)
+    shift_labels = shift_labels.view(-1)
+    torch._check_is_size(n_chunks)
     __shift_logits = torch.chunk(shift_logits, n_chunks, dim = 0)
     __shift_labels = torch.chunk(shift_labels, n_chunks, dim = 0)
     loss = 0.0
@@ -405,12 +462,41 @@ def unsloth_compiled_ce_loss_function(
     loss = loss / torch.tensor(divisor, dtype = torch.float32)
     return loss
 pass
-unsloth_compiled_ce_loss_function = torch.compile(
-    unsloth_compiled_ce_loss_function,
-    fullgraph = False,
+_unsloth_compiled_ce_loss_function = torch.compile(
+    _unsloth_compiled_ce_loss_function,
+    fullgraph = True,
     dynamic = True,
     options = torch_compile_options,
 )
+
+def unsloth_compiled_ce_loss_function(
+    output_logits : torch.Tensor,
+    output_labels : torch.Tensor,
+    logit_scale_multiply : float = 0,
+    logit_scale_divide : float = 0,
+    logit_softcapping : float = 0,
+    vocab_size : int = 0,
+    n_items : Optional[int] = 0,
+    mask : torch.Tensor = None,
+    requires_grad_ : bool = False,
+):
+    bsz, qlen, hd = output_logits.shape
+    ce_loss_function = \
+        _unsloth_compiled_ce_loss_function \
+        if bsz*qlen >= 512 else \
+        _unsloth_compiled_unchunked_ce_loss_function
+    return ce_loss_function(
+        output_logits = output_logits,
+        output_labels = output_labels,
+        logit_scale_multiply = logit_scale_multiply,
+        logit_scale_divide = logit_scale_divide,
+        logit_softcapping = logit_softcapping,
+        vocab_size = vocab_size,
+        n_items = n_items,
+        mask = mask,
+        n_chunks = _get_chunk_size(vocab_size, requires_grad_),
+    )
+pass
 
 
 def _unsloth_compiled_fused_ce_loss_function(
@@ -481,13 +567,65 @@ _unsloth_compiled_fused_ce_loss_function = torch.compile(
     options = torch_compile_options,
 )
 
+def _unsloth_compiled_unchunked_fused_ce_loss_function(
+    hidden_states : torch.Tensor,
+    lm_head_weight : torch.Tensor,
+    lm_head_bias : torch.Tensor,
+    output_labels : torch.Tensor,
+    logit_scale_multiply : float = 0,
+    logit_scale_divide : float = 0,
+    logit_softcapping : float = 0,
+    n_items : Optional[int] = 0,
+    mask : torch.Tensor = None,
+    n_chunks : int = 8,
+):
+    device = lm_head_weight.device
 
-@functools.cache
-def _get_chunk_size(vocab_size : int, requires_grad_ : bool):
-    n_chunks = int(math.ceil((vocab_size / 262144) * 8))
-    if requires_grad_: n_chunks += 2
-    return n_chunks
+    # Get shifted labels first
+    shift_labels = torch.empty_like(output_labels, device = device)
+    shift_labels[..., :-1] = output_labels[..., 1:]
+    if mask is not None:
+        mask = mask.to(device = device)
+        shift_labels[..., :-1][mask[..., 1:] == 0] = -100
+    pass
+    shift_labels[..., -1] = -100
+    shift_labels = shift_labels.view(-1)
+
+    # Chunk hidden_states and labels
+    bsz, qlen, hd = hidden_states.shape
+    hidden_states = hidden_states.view(-1, hd)
+
+    _shift_logits = torch.nn.functional.linear(
+        hidden_states.to(lm_head_weight.device),
+        lm_head_weight,
+        lm_head_bias,
+    )
+
+    # Apply softcapping and other functions
+    if logit_scale_multiply != 0:
+        _shift_logits = _shift_logits * logit_scale_multiply
+    if logit_scale_divide != 0:
+        _shift_logits = _shift_logits / logit_scale_divide
+    if logit_softcapping != 0:
+        _shift_logits = _shift_logits / logit_softcapping
+        _shift_logits = torch.tanh(_shift_logits)
+        _shift_logits = _shift_logits * logit_softcapping
+
+    loss += torch.nn.functional.cross_entropy(
+        input  = _shift_logits.float().contiguous(),
+        target = _shift_labels.contiguous(),
+        reduction = 'sum',
+    )
+    divisor = n_items if n_items is not None else (shift_labels != -100).sum()
+    loss = loss / torch.tensor(divisor, dtype = torch.float32)
+    return loss
 pass
+_unsloth_compiled_unchunked_fused_ce_loss_function = torch.compile(
+    _unsloth_compiled_unchunked_fused_ce_loss_function,
+    fullgraph = True,
+    dynamic = True,
+    options = torch_compile_options,
+)
 
 def unsloth_compiled_fused_ce_loss_function(
     hidden_states : torch.Tensor,
@@ -503,7 +641,12 @@ def unsloth_compiled_fused_ce_loss_function(
     requires_grad_ : bool = False,
 ):
     # Decide on chunk size
-    return _unsloth_compiled_fused_ce_loss_function(
+    bsz, qlen, hd = hidden_states.shape
+    ce_loss_function = \
+        _unsloth_compiled_fused_ce_loss_function \
+        if bsz*qlen >= 512 else \
+        _unsloth_compiled_unchunked_fused_ce_loss_function
+    return ce_loss_function(
         hidden_states = hidden_states,
         lm_head_weight = lm_head_weight,
         lm_head_bias = lm_head_bias,
