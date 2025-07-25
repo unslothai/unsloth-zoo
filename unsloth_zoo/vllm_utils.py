@@ -1479,7 +1479,7 @@ def load_vllm(
     if unsloth_vllm_standby and "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
         del os.environ['PYTORCH_CUDA_ALLOC_CONF'] # Disable expandable segments cuz https://github.com/pytorch/pytorch/issues/147851
     good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
-    old_keys = engine_args.keys()
+    old_keys = list(engine_args.keys())
     for key in old_keys:
         if key not in good_keys:
             del engine_args[key]
