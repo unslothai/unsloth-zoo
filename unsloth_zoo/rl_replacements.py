@@ -288,17 +288,18 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         scaling = scaler.get_scale() if scaler is not None else 1.0
 
         # Force torch.compile to use dynamic shapes for seqlen dim
-        mark_dynamic = lambda x: torch._dynamo.mark_dynamic(x, 1)
+        # mark_dynamic = lambda x: torch._dynamo.mark_dynamic(x, 1)
 
         for (grad_inputs_j, new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j,  input_ids_j, mask_j, advantages_j,) in \
             zip(grad_inputs_chunks, new_hidden_states, old_hidden_states, ref_hidden_states, input_ids, mask, advantages):
 
-            mark_dynamic(new_hidden_states_j)
-            mark_dynamic(ref_hidden_states_j)
-            if old_hidden_states_j is not None:
-                mark_dynamic(old_hidden_states_j)
-            mark_dynamic(input_ids_j)
-            mark_dynamic(mask_j)
+            # Marking these as dynamic results in ConstraintViolationError/RelaxedUnspecConstraint
+            # mark_dynamic(new_hidden_states_j)
+            # mark_dynamic(ref_hidden_states_j)
+            # if old_hidden_states_j is not None:
+            #     mark_dynamic(old_hidden_states_j)
+            # mark_dynamic(input_ids_j)
+            # mark_dynamic(mask_j)
 
 
             grad_inputs_j.copy_(accumulate_chunk(new_hidden_states_j, old_hidden_states_j,ref_hidden_states_j,  input_ids_j, mask_j, advantages_j, scaling))
