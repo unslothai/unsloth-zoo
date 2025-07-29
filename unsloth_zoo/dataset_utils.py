@@ -477,7 +477,12 @@ pass
 
 
 from datasets import (Dataset, IterableDataset,)
-from trl.trainer.utils import ConstantLengthDataset
+try:
+    from trl.trainer.utils import ConstantLengthDataset
+except:
+    # TRL 0.20.0 removes ConstantLengthDataset
+    ConstantLengthDataset = None
+
 # Faster SFTTrainer prepare_dataset
 def sft_prepare_dataset(
     self,
