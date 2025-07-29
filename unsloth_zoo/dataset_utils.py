@@ -477,7 +477,6 @@ pass
 
 
 from datasets import (Dataset, IterableDataset,)
-from trl.trainer.utils import ConstantLengthDataset
 # Faster SFTTrainer prepare_dataset
 def sft_prepare_dataset(
     self,
@@ -489,7 +488,6 @@ def sft_prepare_dataset(
     dataset_name: str,
 ) -> Union[Dataset, IterableDataset]:
     # All Unsloth Zoo code licensed under LGPLv3
-    if isinstance(dataset, ConstantLengthDataset): return dataset
 
     map_kwargs = {}
     use_desc = isinstance(dataset, Dataset)
