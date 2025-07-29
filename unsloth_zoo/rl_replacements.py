@@ -255,7 +255,16 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         accumulated_completion_length = torch.zeros(1, device = device)
         accumulated_mean_kl           = torch.zeros(1, device = device)
 
-        def accumulate_chunk(new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j, input_ids_j, mask_j, advantages_j, scaling):
+        def accumulate_chunk(
+            new_hidden_states_j,
+            old_hidden_states_j,
+            ref_hidden_states_j,
+            input_ids_j,
+            mask_j,
+            advantages_j,
+            scaling,
+            grad_inputs_j,
+        ):
             (chunk_grad_input,), (chunk_loss, (unscaled_loss, chunk_completion_length, chunk_mean_kl,)) = torch.func.grad_and_value(
                 compute_loss,
                 argnums = (0,),
@@ -264,12 +273,14 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             accumulated_loss             .add_(unscaled_loss)
             accumulated_completion_length.add_(chunk_completion_length)
             accumulated_mean_kl          .add_(chunk_mean_kl)
-            return chunk_grad_input
+            grad_inputs_j[:] = chunk_grad_input
         pass
 
         accumulate_chunk = torch.compile(
             accumulate_chunk,
             fullgraph = True,
+            # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
+            dynamic = True,
             options = torch_compile_options,
         )
 
@@ -293,7 +304,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         for (grad_inputs_j, new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j,  input_ids_j, mask_j, advantages_j,) in \
             zip(grad_inputs_chunks, new_hidden_states, old_hidden_states, ref_hidden_states, input_ids, mask, advantages):
 
-            # Marking these as dynamic results in ConstraintViolationError/RelaxedUnspecConstraint
+            # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
+
             # mark_dynamic(new_hidden_states_j)
             # mark_dynamic(ref_hidden_states_j)
             # if old_hidden_states_j is not None:
@@ -301,8 +313,16 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             # mark_dynamic(input_ids_j)
             # mark_dynamic(mask_j)
 
-
-            grad_inputs_j.copy_(accumulate_chunk(new_hidden_states_j, old_hidden_states_j,ref_hidden_states_j,  input_ids_j, mask_j, advantages_j, scaling))
+            accumulate_chunk(
+                new_hidden_states_j,
+                old_hidden_states_j,
+                ref_hidden_states_j,
+                input_ids_j,
+                mask_j,
+                advantages_j,
+                scaling,
+                grad_inputs_j,
+            )
         pass
 
         grad_inputs                  .div_(n_chunks)
