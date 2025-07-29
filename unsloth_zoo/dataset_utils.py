@@ -494,7 +494,10 @@ def sft_prepare_dataset(
     dataset_name: str,
 ) -> Union[Dataset, IterableDataset]:
     # All Unsloth Zoo code licensed under LGPLv3
-    if isinstance(dataset, ConstantLengthDataset): return dataset
+    try:
+        if isinstance(dataset, ConstantLengthDataset): return dataset
+    except:
+        pass
 
     map_kwargs = {}
     use_desc = isinstance(dataset, Dataset)
