@@ -367,12 +367,21 @@ def grpo_accumulated_loss(
     lm_head = trainer.model.get_output_embeddings().weight
 
     with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):
-        with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
-            ref_hidden_states = trainer.model(
-                input_ids = input_ids,
-                attention_mask = attention_mask,
-                logits_to_keep = logits_to_keep + 1,
-            ).logits
+        with torch.inference_mode():
+            unwarp_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
+            if unwarp_model._hf_peft_config_loaded:
+                with unwarp_model.disable_adapters():
+                    ref_hidden_states = trainer.model(
+                        input_ids = input_ids,
+                        attention_mask = attention_mask,
+                        logits_to_keep = logits_to_keep + 1,
+                    ).logits
+            else:
+                ref_hidden_states = trainer.model(
+                    input_ids = input_ids,
+                    attention_mask = attention_mask,
+                    logits_to_keep = logits_to_keep + 1,
+                ).logits
         pass
         new_hidden_states = trainer.model(
             input_ids = input_ids,
