@@ -181,12 +181,7 @@ def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> L
         for message in conversation:
             if isinstance(message["content"], list):
                 for ele in message["content"]:
-                    if (
-                        "image" in ele
-                        or "image_url" in ele
-                        or "video" in ele
-                        or ele["type"] in ("image", "image_url", "video")
-                    ):
+                    if ele["type"] in ("image", "image_url", "video"):
                         vision_infos.append(ele)
     return vision_infos
 pass
