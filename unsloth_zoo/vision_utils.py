@@ -194,6 +194,7 @@ pass
 
 def process_vision_info(
     conversations: Union[List[Dict], List[List[Dict]]],
+    factor: int = IMAGE_FACTOR,
 ) -> Tuple[Union[List[Image.Image], None], Union[List[Union[torch.Tensor, List[Image.Image]]], None]]:
     vision_infos = extract_vision_info(conversations)
     ## Read images or videos
@@ -201,7 +202,7 @@ def process_vision_info(
     video_inputs = []
     for vision_info in vision_infos:
         if "image" in vision_info or "image_url" in vision_info:
-            image_inputs.append(fetch_image(vision_info))
+            image_inputs.append(fetch_image(vision_info, factor))
         elif "video" in vision_info:
             video_inputs.append(fetch_video(vision_info))
         else:
@@ -260,7 +261,7 @@ class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = \
         "padding_token_ids", "dtype", "ignore_index", \
-        "processor", "formatting_func", "image_size", \
+        "processor", "formatting_func", "image_size", "factor", \
         "max_seq_length", "truncation", "train_on_responses_only", \
         "num_proc", "assistant_single_content",
 
@@ -300,6 +301,23 @@ class UnslothVisionDataCollator:
             except:
                 print("Unsloth: Model does not have a default image size - using 512")
                 self.image_size = 512
+
+            if hasattr(model.config.vision_config, "patch_size"):
+                patch_size = model.config.vision_config.patch_size
+            else:
+                print("Unsloth: Model does not have a default patch size - using IMAGE_FACTOR")
+                patch_size = IMAGE_FACTOR
+
+            if hasattr(model.config, "spatial_merge_size"):
+                spatial_merge_size = model.config.spatial_merge_size
+            elif hasattr(model.config.vision_config, "spatial_merge_size"):
+                spatial_merge_size = model.config.vision_config.spatial_merge_size
+            else:
+                print("Unsloth: Model does not have a default spatial merge size - using 1")
+                spatial_merge_size = 1
+
+            self.factor = patch_size * spatial_merge_size
+
         elif resize == "max":
             self.image_size = None
         elif type(resize) is tuple or type(resize) is list:
@@ -423,11 +441,12 @@ class UnslothVisionDataCollator:
                 add_generation_prompt = False,
             )
             texts.append(message)
+            factor = self.factor
             # Dataset with 2 columns messages / images
             if "images" in example:
                 image = [example["images"][0]]
             else:
-                image, video = process_vision_info(messages)
+                image, video = process_vision_info(messages, factor)
                 if image is None: image = []
             pass
             # Resize images
@@ -437,11 +456,21 @@ class UnslothVisionDataCollator:
                 for i, img in enumerate(image):
                     if type(image_size) is tuple:
                         image[i] = img.resize(image_size, LANCZOS)
-                    elif img.size[0] > image_size:
+                    elif max(img.size) > image_size:
                         if hasattr(img, "resize"):
-                            wpercent = image_size / img.size[0]
-                            hsize = int(img.size[1] * wpercent)
-                            image[i] = img.resize((image_size, hsize), LANCZOS)
+                            # Calculate image resize ratio
+                            ratio = image_size / max(img.size)
+
+                            # New image size keeping aspect ratio
+                            new_width = round(img.size[0] * ratio)
+                            new_height = round(img.size[1] * ratio)
+
+                            # Adjust the dimensions to the closest multiple of factor
+                            new_width = round(new_width / factor) * factor
+                            new_height = round(new_height / factor) * factor
+                            
+                            image[i] = img.resize((new_width, new_height), Image.LANCZOS)
+
             pass
             images.append(image)
         pass
@@ -483,3 +512,4 @@ class UnslothVisionDataCollator:
         return batch
     pass
 pass
+
