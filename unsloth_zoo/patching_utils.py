@@ -186,9 +186,9 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         f"config.optimize_ddp = {not debug}", # Optimizes DDP, but can error out so disable on debug
         # Captures .item() for eg
         # n_chunks = int(torch.ceil((torch.tensor(vocab_size) / 262144) * 8))
-        "config.capture_scalar_outputs = True",
-        # Capture torch.arange(...), torch.zeros(...)
-        "config.capture_dynamic_output_shape_ops = True",
+        # "config.capture_scalar_outputs = True",
+        # # Capture torch.arange(...), torch.zeros(...)
+        # "config.capture_dynamic_output_shape_ops = True",
     ]
     if not debug and ignore_errors:
         # Have to explicitly set it!
