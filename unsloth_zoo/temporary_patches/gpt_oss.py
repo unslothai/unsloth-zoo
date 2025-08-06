@@ -316,7 +316,7 @@ def load_gpt_oss_MXFP4(
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     model = AutoModelForCausalLM.from_pretrained(
-        model_id,
+        model_name,
         device_map = "cpu", # Use CPU to first make fake space
         torch_dtype = torch_dtype,
         use_kernels = False,
