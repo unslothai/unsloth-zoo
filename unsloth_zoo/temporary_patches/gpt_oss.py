@@ -346,6 +346,8 @@ def load_gpt_oss_MXFP4(
         device_map = device_map if n_devices <= 1 else "auto",
         preload_module_classes = preload_module_classes,
     )
+    # Must bypass device_map check for training
+    os.environ["ACCELERATE_BYPASS_DEVICE_MAP"] = "true"
     return model
 pass
 
