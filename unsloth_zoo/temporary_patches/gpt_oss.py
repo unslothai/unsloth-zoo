@@ -202,10 +202,13 @@ def patch_GptOssExperts_MXFP4():
             with torch.no_grad():
                 expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
                 expert_mask = expert_mask.permute(2, 1, 0)
-                # we sum on the top_k and on the sequence lenght to get which experts
+                # we sum on the top_k and on the sequence length to get which experts
                 # are hit this time around
                 expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
             for expert_idx in expert_hitted[:]:
+                _expert_idx = expert_idx.item()
+                torch._check_is_size(_expert_idx)
+                torch._check(_expert_idx <= 512) # Large number for expert check
                 with torch.no_grad():
                     _, token_idx = torch.where(expert_mask[expert_idx[0]])
                 current_state = hidden_states[token_idx]
