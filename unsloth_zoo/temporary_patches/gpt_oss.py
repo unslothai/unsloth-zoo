@@ -316,7 +316,7 @@ def load_gpt_oss_MXFP4(
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     model = AutoModelForCausalLM.from_pretrained(
-        model_id,
+        model_name,
         device_map = "cpu", # Use CPU to first make fake space
         torch_dtype = torch_dtype,
         use_kernels = False,
@@ -343,9 +343,11 @@ def load_gpt_oss_MXFP4(
     model = load_checkpoint_and_dispatch(
         model,
         checkpoint = checkpoint_location,
-        device_map = device_map if device_count <= 1 else "auto",
+        device_map = device_map if n_devices <= 1 else "auto",
         preload_module_classes = preload_module_classes,
     )
+    # Must bypass device_map check for training
+    os.environ["ACCELERATE_BYPASS_DEVICE_MAP"] = "true"
     return model
 pass
 
