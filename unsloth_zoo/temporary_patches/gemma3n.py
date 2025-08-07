@@ -114,7 +114,6 @@ def patch_Gemma3nModel_get_placeholder_mask():
 
         return special_image_mask, special_audio_mask
     pass
-    # fullgraph not used here as it breaks due to dynamic shapes
     patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel, "get_placeholder_mask", get_placeholder_mask, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3nModel_get_placeholder_mask)
