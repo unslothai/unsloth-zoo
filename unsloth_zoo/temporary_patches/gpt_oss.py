@@ -445,12 +445,6 @@ class UnslothGptOssMLP(nn.Module):
 pass
 
 def patch_gpt_oss_linearized():
-    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
-    if "gpt-oss" in model_name and model_name.endswith("-unsloth-bnb-4bit"):
-        pass
-    else:
-        return
-
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
         from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts, GptOssTopKRouter, GptOssMLP
