@@ -329,7 +329,7 @@ class GptOssExperts(nn.Module):
         weighted_output = out * routing_weights
         return weighted_output.to(hidden_states.dtype)
 
-    @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
+    # @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
     def inference_forward(
         self,
         hidden_states,
