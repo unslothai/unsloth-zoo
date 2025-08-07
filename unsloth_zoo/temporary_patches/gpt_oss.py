@@ -406,8 +406,10 @@ class UnslothGptOssExperts(nn.Module):
             # mixed = (outs * rw).sum(dim=0)
             # return mixed.view(batch_size, -1, self.hidden_size)
             return self.inference_forward(
-                hidden_states,
-                routing_weights,
+                hidden_states = hidden_states,
+                routing_weights = routing_weights,
+                num_experts = num_experts,
+                batch_size = batch_size,
             )
 pass
 
@@ -430,6 +432,18 @@ class UnslothGptOssTopKRouter(nn.Module):
 pass
 
 
+class UnslothGptOssMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.router = UnslothGptOssTopKRouter(config)
+        self.experts = UnslothGptOssExperts(config)
+
+    def forward(self, hidden_states):
+        router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
+        routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
+        return routed_out, router_scores
+pass
+
 def patch_gpt_oss_linearized():
     model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
     if "gpt-oss" in model_name and model_name.endswith("-unsloth-bnb-4bit"):
@@ -439,7 +453,7 @@ def patch_gpt_oss_linearized():
 
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
-        from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts, GptOssTopKRouter
+        from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts, GptOssTopKRouter, GptOssMLP
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
 
@@ -447,6 +461,8 @@ def patch_gpt_oss_linearized():
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = UnslothGptOssExperts
     if not GptOssTopKRouter.__name__.startswith("Unsloth"):
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = UnslothGptOssTopKRouter
+    if not GptOssMLP.__name__.startswith("Unsloth"):
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP = UnslothGptOssMLP
     return
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
