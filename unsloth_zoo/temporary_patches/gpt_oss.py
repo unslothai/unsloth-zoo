@@ -350,7 +350,6 @@ class GptOssExperts(nn.Module):
         mixed = (outs * rw).sum(dim=0)
         return mixed.view(batch_size, -1, self.hidden_size)
 
-    @torch.compiler.disable
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -431,6 +430,18 @@ class GptOssTopKRouter(nn.Module):
         return router_scores, router_indices
 pass
 
+class GptOssMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.router = GptOssTopKRouter(config)
+        self.experts = GptOssExperts(config)
+
+    def forward(self, hidden_states):
+        router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
+        routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
+        return routed_out, router_scores
+pass
+
 def patch_gpt_oss_linearized():
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
@@ -438,6 +449,7 @@ def patch_gpt_oss_linearized():
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExperts
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP = GptOssMLP
     return
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
