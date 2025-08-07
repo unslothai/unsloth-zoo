@@ -108,7 +108,7 @@ except ImportError as e:
     e = str(e)
     if "cannot import name '_center' from 'numpy._core.umath'" in e:
         raise RuntimeError(
-            f"You might have used uv to install packages, and they broke numpy."
+            f"You might have used uv to install packages, and they broke numpy. Try restarting your runtime."
         )
     elif "Unpack" not in e:
         raise Exception(e)
