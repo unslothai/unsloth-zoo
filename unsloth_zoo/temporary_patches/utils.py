@@ -105,6 +105,13 @@ try:
         type(Unpack) is type(t_Unpack), \
         "Unsloth: Unpack type changed! Please file a bug report asap!"
 except ImportError as e:
+    e = str(e)
+    if "cannot import name '_center' from 'numpy._core.umath'" in e:
+        raise RuntimeError(
+            f"You might have used uv to install packages, and they broke numpy."
+        )
+    elif "Unpack" not in e:
+        raise Exception(e)
     raise RuntimeError(
         f"Unsloth: Unpack has been moved! Other error = {str(e)}.\n"\
         "Please file a bug report asap!"
