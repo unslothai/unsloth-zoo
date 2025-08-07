@@ -39,8 +39,14 @@ def patch_gpt_oss():
         import transformers.quantizers.quantizer_mxfp4
         def is_kernels_available(): return True
         transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
+
+    try:
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
+    except Exception as e:
+        return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
     try:
         from triton_kernels import matmul_ogs, swiglu
