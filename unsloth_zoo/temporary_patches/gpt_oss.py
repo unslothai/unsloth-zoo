@@ -334,6 +334,8 @@ class GptOssExperts(nn.Module):
         self,
         hidden_states,
         routing_weights,
+        num_experts,
+        batch_size,
     ):
         X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
         gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
