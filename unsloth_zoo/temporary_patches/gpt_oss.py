@@ -310,48 +310,6 @@ class GptOssExperts(nn.Module):
             for _ in range(self.num_experts)
         ])
 
-    @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
-    def training_forward(
-        self,
-        hidden_states,
-        current_state,
-        gate_up_proj,
-        down_proj,
-        routing_weights,
-    ):
-        gate_up = gate_up_proj(current_state)
-        gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-        gate = gate.clamp(min=None, max=self.limit)
-        up = up.clamp(min=-self.limit, max=self.limit)
-        glu = gate * torch.sigmoid(gate * self.alpha)
-        gated_output = (up + 1) * glu
-        out = down_proj(gated_output)
-        weighted_output = out * routing_weights
-        return weighted_output.to(hidden_states.dtype)
-
-    # @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
-    def inference_forward(
-        self,
-        hidden_states,
-        routing_weights,
-        num_experts,
-        batch_size,
-    ):
-        X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
-        gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
-        gate_up = torch.stack(gate_up_list, dim=0)
-        gate = gate_up[..., ::2]
-        up_h = gate_up[..., 1::2]
-        gate = gate.clamp(max=self.limit)
-        up_h = up_h.clamp(min=-self.limit, max=self.limit)
-        glu = gate * torch.sigmoid(gate * self.alpha)
-        fused = (up_h + 1) * glu
-        out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
-        outs = torch.stack(out_list, dim=0)
-        rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-        mixed = (outs * rw).sum(dim=0)
-        return mixed.view(batch_size, -1, self.hidden_size)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -372,46 +330,33 @@ class GptOssExperts(nn.Module):
             for expert_idx in expert_hitted[:]:
                 with torch.no_grad():
                     _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                # current_state = hidden_states[token_idx]
-                # gate_up = self.gate_up_projs[expert_idx](current_state)
-                # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                # gate = gate.clamp(min=None, max=self.limit)
-                # up = up.clamp(min=-self.limit, max=self.limit)
-                # glu = gate * torch.sigmoid(gate * self.alpha)
-                # gated_output = (up + 1) * glu
-                # out = self.down_projs[expert_idx](gated_output)
-                # weighted_output = out * routing_weights[token_idx, expert_idx, None]
-                weighted_output = self.training_forward(
-                    hidden_states = hidden_states,
-                    current_state = hidden_states[token_idx],
-                    gate_up_proj = self.gate_up_projs[expert_idx],
-                    down_proj = self.down_projs[expert_idx],
-                    routing_weights = routing_weights[token_idx, expert_idx, None],
-                )
+                current_state = hidden_states[token_idx]
+                gate_up = self.gate_up_projs[expert_idx](current_state)
+                gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                gate = gate.clamp(min=None, max=self.limit)
+                up = up.clamp(min=-self.limit, max=self.limit)
+                glu = gate * torch.sigmoid(gate * self.alpha)
+                gated_output = (up + 1) * glu
+                out = self.down_projs[expert_idx](gated_output)
+                weighted_output = out * routing_weights[token_idx, expert_idx, None]
                 next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
             next_states = next_states.view(batch_size, -1, self.hidden_size)
             return next_states
         else:
-            # X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
-            # gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
-            # gate_up = torch.stack(gate_up_list, dim=0)
-            # gate = gate_up[..., ::2]
-            # up_h = gate_up[..., 1::2]
-            # gate = gate.clamp(max=self.limit)
-            # up_h = up_h.clamp(min=-self.limit, max=self.limit)
-            # glu = gate * torch.sigmoid(gate * self.alpha)
-            # fused = (up_h + 1) * glu
-            # out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
-            # outs = torch.stack(out_list, dim=0)
-            # rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-            # mixed = (outs * rw).sum(dim=0)
-            # return mixed.view(batch_size, -1, self.hidden_size)
-            return self.inference_forward(
-                hidden_states = hidden_states,
-                routing_weights = routing_weights,
-                num_experts = num_experts,
-                batch_size = batch_size,
-            )
+            X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+            gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
+            gate_up = torch.stack(gate_up_list, dim=0)
+            gate = gate_up[..., ::2]
+            up_h = gate_up[..., 1::2]
+            gate = gate.clamp(max=self.limit)
+            up_h = up_h.clamp(min=-self.limit, max=self.limit)
+            glu = gate * torch.sigmoid(gate * self.alpha)
+            fused = (up_h + 1) * glu
+            out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
+            outs = torch.stack(out_list, dim=0)
+            rw = routing_weights.transpose(0, 1).unsqueeze(-1)
+            mixed = (outs * rw).sum(dim=0)
+            return mixed.view(batch_size, -1, self.hidden_size)
 pass
 
 class GptOssTopKRouter(nn.Module):
