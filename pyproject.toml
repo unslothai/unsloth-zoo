@@ -57,7 +57,7 @@ include-package-data = false
 exclude = ["images*"]
 
 [project.optional-dependencies]
-base = [
+huggingface = [
     "packaging>=24.1",
     "tyro",
     "transformers>=4.51.3,!=4.47.0,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3",
@@ -78,6 +78,9 @@ base = [
     "regex",
     "msgspec",
     "typing_extensions",
+]
+base = [
+    "unsloth_zoo[huggingface]",
 ]
 
 [project.urls]
