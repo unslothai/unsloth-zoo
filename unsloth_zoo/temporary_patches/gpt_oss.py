@@ -145,7 +145,8 @@ def patch_gpt_oss():
                     precision_config=self.down_proj_precision_config,
                     gammas=routing_data.gate_scal,
                 )
-        return intermediate_cache3
+            return intermediate_cache3
+        pass
     patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
 
     try:
