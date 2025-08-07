@@ -24,108 +24,164 @@ from .utils import (
     patch_function,
     KWARGS_TYPE,
     raise_error,
+    logger,
 )
+torch_cuda_device = torch.cuda.device
 
-def patch_GptOssExperts_MXFP4():
-    if "gpt-oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
-        return
-    if "-bnb-4bit" in os.environ.get("UNSLOTH_MODEL_NAME", ""):
-        # We do NOT use MXFP4 to BF16 upcast
-        return
+
+def patch_gpt_oss():
     try:
-        import transformers.models.gpt_oss.modeling_gpt_oss
-        transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
+        import triton_kernels
     except Exception as e:
-        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts", e)
+        return raise_error("Please install triton_kernels", e)
+
+    try:
+        import transformers.quantizers.quantizer_mxfp4
+        def is_kernels_available(): return True
+        transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
+    except Exception as e:
+        return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
+
+    try:
+        from triton_kernels import matmul_ogs, swiglu
+        FnSpecs, FusedActivation, matmul_ogs = (
+            matmul_ogs.FnSpecs,
+            matmul_ogs.FusedActivation,
+            matmul_ogs.matmul_ogs,
+        )
+        swiglu_fn = swiglu.swiglu_fn
+    except Exception as e:
+        return raise_error("triton_kernels", e)
+
     try:
         import transformers.integrations.mxfp4
-        transformers.integrations.mxfp4.dequantize
     except Exception as e:
-        return raise_error("transformers.integrations.mxfp4.dequantize", e)
+        return raise_error("transformers.integrations.mxfp4", e)
 
-    def convert_moe_packed_tensors(
-        blocks,
-        scales,
-        dtype: torch.dtype = torch.bfloat16,
-        rows_per_chunk: int = 32768 * 1024,
-        target_device = "cuda",
-    ) -> torch.Tensor:
-        import math
+    def swizzle_mxfp4(w, w_scale):
+        from triton_kernels import tensor, tensor_details
+        FP4, convert_layout, wrap_torch_tensor = (
+            tensor.FP4,
+            tensor.convert_layout,
+            tensor.wrap_torch_tensor,
+        )
+        layout = tensor_details.layout
+        StridedLayout = tensor_details.layout.StridedLayout
 
-        assert blocks.shape[:-1] == scales.shape, f"{blocks.shape=} does not match {scales.shape=}"
+        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
+        w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
+        # TODO : add that when we are actually sure that it works on B200
+        # if torch.cuda.get_device_capability()[0] == 10:
+        #     constraints = {
+        #         "is_persistent": True,
+        #         "epilogue_subtile": 1,
+        #     }
+        #     opt_flags.update_opt_flags_constraints(constraints)
+        # # transpose the tensor so that the quantization axis is on dim1
 
-        # Check if blocks and scales are on CPU, and move to GPU if so
-        if not blocks.is_cuda and torch.cuda.is_available():
-            blocks = blocks.to("cuda", non_blocking = True)
-            scales = scales.cuda()
+        # TODO: there is still an issue with the scales on hopper
+        # scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(mx_axis=1, num_warps=8)
+        # w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout, **scale_layout_opts)
+        w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
+        return w, w_scale
+    patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4)
 
-        scales = scales.to(torch.int32) - 127
+    class Mxfp4GptOssExperts(nn.Module):
+        def __init__(self, config):
+            super().__init__()
 
-        FP4_VALUES = [
-            +0.0,
-            +0.5,
-            +1.0,
-            +1.5,
-            +2.0,
-            +3.0,
-            +4.0,
-            +6.0,
-            -0.0,
-            -0.5,
-            -1.0,
-            -1.5,
-            -2.0,
-            -3.0,
-            -4.0,
-            -6.0,
-        ]
-        lut = torch.tensor(FP4_VALUES, dtype=dtype, device=blocks.device)
+            self.num_experts = config.num_local_experts
+            self.intermediate_size = config.intermediate_size
+            self.hidden_size = config.hidden_size
 
-        *prefix_shape, G, B = blocks.shape
-        rows_total = math.prod(prefix_shape) * G
+            self.gate_up_proj_blocks = nn.Parameter(
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, 16, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.gate_up_proj_scales = nn.Parameter(
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.gate_up_proj_bias = nn.Parameter(
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32), requires_grad=False
+            )
 
-        blocks = blocks.reshape(rows_total, B)
-        scales = scales.reshape(rows_total, 1)
+            self.down_proj_blocks = nn.Parameter(
+                torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16), dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.down_proj_scales = nn.Parameter(
+                torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.down_proj_bias = nn.Parameter(
+                torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32), requires_grad=False
+            )
+            self.alpha = 1.702
 
-        out = torch.empty(rows_total, B * 2, dtype=dtype, device=blocks.device)
+            self.gate_up_proj_precision_config = None
+            self.down_proj_precision_config = None
 
-        for r0 in range(0, rows_total, rows_per_chunk):
-            r1 = min(r0 + rows_per_chunk, rows_total)
+        def forward(self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx) -> torch.Tensor:
+            with torch_cuda_device(hidden_states.device):
+                if not hasattr(self, "act"):
+                    self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, None), 2)
+                intermediate_cache1 = matmul_ogs(
+                    hidden_states.to(torch.bfloat16),
+                    self.gate_up_proj,
+                    self.gate_up_proj_bias,
+                    routing_data,
+                    gather_indx=gather_idx,
+                    precision_config=self.gate_up_proj_precision_config,
+                    gammas=None,
+                    fused_activation=self.act,
+                )
+                intermediate_cache3 = matmul_ogs(
+                    intermediate_cache1,
+                    self.down_proj,
+                    self.down_proj_bias,
+                    routing_data,
+                    scatter_indx=scatter_idx,
+                    precision_config=self.down_proj_precision_config,
+                    gammas=routing_data.gate_scal,
+                )
+        return intermediate_cache3
+    patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
 
-            blk = blocks[r0:r1]
-            exp = scales[r0:r1]
+    try:
+        routing = triton_kernels.routing.routing
+        routing = torch.compiler.disable(routing)
+    except Exception as e:
+        return raise_error("triton_kernels.routing.routing", e)
 
-            # nibble indices -> int64
-            idx_lo = (blk & 0x0F).to(torch.long)
-            idx_hi = (blk >> 4).to(torch.long)
+    def mlp_forward(self, hidden_states):
+        batch_size = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(-1, self.router.hidden_dim)
+        router_logits = nn.functional.linear(hidden_states, self.router.weight, self.router.bias)
 
-            sub = out[r0:r1]
-            sub[:, 0::2] = lut[idx_lo]
-            sub[:, 1::2] = lut[idx_hi]
+        with torch_cuda_device(router_logits.device):
+            routing_data, gather_idx, scatter_idx = routing(router_logits, self.router.top_k)
 
-            torch.ldexp(sub, exp, out=sub)
-            del idx_lo, idx_hi, blk, exp, sub
+        routed_out = self.experts(hidden_states, routing_data, gather_idx, scatter_idx)
+        routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)
+        return routed_out, router_logits
+    patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward)
 
-        out = out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
+    try:
+        PrecisionConfig, FlexCtx, InFlexData = (
+            triton_kernels.matmul_ogs.PrecisionConfig,
+            triton_kernels.matmul_ogs.FlexCtx,
+            triton_kernels.matmul_ogs.InFlexData,
+        )
+    except Exception as e:
+        return raise_error("triton_kernels.matmul_ogs", e)
 
-        # TODO: Delete after making sure this is not necessary! since we go back to cpu in the end in create_quantized_param using .to(target_device)
-        # Move back to CPU if needed
-        # if need_to_move_back:
-        #     out = out.cpu()
-        del blocks, scales, lut
-        out = out.transpose(1, 2).contiguous().to(target_device)
-        return out
-    pass
+    try:
+        from transformers.integrations.tensor_parallel import shard_and_distribute_module
+    except Exception as e:
+        return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
 
-
-    def delay_dequantize(module, param_name, param_value, target_device, dq_param_name, **kwargs):
-        # print("Delaying dequantizing")
-        # print(param_name, param_value.device, param_value.shape, target_device, dq_param_name)
-        try:
-            from transformers.integrations.tensor_parallel import shard_and_distribute_module
-        except:
-            shard_and_distribute_module = lambda *args, **kwargs: ""
-
+    def load_and_swizzle_mxfp4(module, param_name, param_value, target_device, **kwargs):
         model = kwargs.get("model", None)
         empty_param = kwargs.get("empty_param", None)
         casting_dtype = kwargs.get("casting_dtype", None)
@@ -136,340 +192,92 @@ def patch_GptOssExperts_MXFP4():
         for proj in ["gate_up_proj", "down_proj"]:
             if proj in param_name:
                 if device_mesh is not None:
-                    param_value = shard_and_distribute_module(
-                        model,
-                        param_value,
-                        empty_param,
-                        dq_param_name,
-                        casting_dtype,
-                        to_contiguous,
-                        rank,
-                        device_mesh,
-                        set_param=False,
+                    shard_and_distribute_module(
+                        model, param_value, empty_param, param_name, casting_dtype, to_contiguous, rank, device_mesh
                     )
+                else:
+                    setattr(module, param_name.rsplit(".", 1)[1], torch.nn.Parameter(param_value, requires_grad=False))
                 blocks_attr = f"{proj}_blocks"
                 scales_attr = f"{proj}_scales"
-                setattr(module, param_name.rsplit(".", 1)[1], param_value)
-                if hasattr(module, blocks_attr) and hasattr(module, scales_attr):
-                    # dequantized = convert_moe_packed_tensors(getattr(module, blocks_attr), getattr(module, scales_attr))
-                    # dequantized = dequantized.transpose(1, 2).contiguous().to(target_device)
-                    # dequantized = convert_moe_packed_tensors(getattr(module, blocks_attr), getattr(module, scales_attr), target_device = target_device)
-                    # TODO: this is perhaps necessary since if target_device is cpu, and the param was on gpu
-                    if target_device == "cpu" and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    # setattr(module, proj, torch.nn.Parameter(dequantized))
-                    setattr(module, proj, torch.nn.Parameter(torch.zeros(0), requires_grad = False))
-                    # delattr(module, blocks_attr)
-                    # delattr(module, scales_attr)
-                    block = getattr(module, blocks_attr)
-                    block.pin_memory()
-                    setattr(module, blocks_attr, torch.nn.Parameter(block, requires_grad = False))
-                    scale = getattr(module, scales_attr)
-                    scale = scale.to("cuda", non_blocking = True)
-                    setattr(module, scales_attr, torch.nn.Parameter(scale, requires_grad = False))
+                blocks = getattr(module, blocks_attr)
+                scales = getattr(module, scales_attr)
+                # Check if both blocks and scales both not on on meta device
+                if blocks.device.type != "meta" and scales.device.type != "meta":
+                    # need it for ep
+                    local_experts = blocks.size(0)
+                    if proj == "gate_up_proj":
+                        blocks = blocks.view(local_experts, module.intermediate_size * 2, -1)
+                    else:
+                        blocks = blocks.view(local_experts, -1, module.intermediate_size // 2)
+                    # TODO: we need to have the weights on cuda, refactor later
+                    if getattr(target_device, "type", target_device) == "cpu":
+                        target_device = "cuda"
+                    # TODO: check why we still do move the tensors despite the context manager
+                    blocks = blocks.to(target_device)
+                    scales = scales.to(target_device)
+                    with torch.cuda.device(target_device):
+                        triton_weight_tensor, weight_scale = swizzle_mxfp4(
+                            blocks.transpose(-2, -1), scales.transpose(-2, -1)
+                        )
+
+                    # need to overwrite the shapes for the kernels
+                    if proj == "gate_up_proj":
+                        triton_weight_tensor.shape = torch.Size(
+                            [local_experts, module.hidden_size, module.intermediate_size * 2]
+                        )
+                    else:
+                        triton_weight_tensor.shape = torch.Size(
+                            [local_experts, module.intermediate_size, module.hidden_size]
+                        )
+
+                    # triton_weight_tensor is what needs to be passed in oai kernels. It stores the data, the shapes and any more objects. It is like a subtensor
+                    setattr(module, proj, triton_weight_tensor)
+                    setattr(
+                        module,
+                        f"{proj}_precision_config",
+                        PrecisionConfig(weight_scale=weight_scale, flex_ctx=FlexCtx(rhs_data=InFlexData())),
+                    )
+
+                    # delete blocks and scales
+                    delattr(module, scales_attr)
+                    delattr(module, blocks_attr)
+                    # setattr(module, blocks_attr, torch.nn.Parameter(triton_weight_tensor.storage.data, requires_grad=False))
+                    del blocks
     pass
-    patch_function(transformers.integrations.mxfp4, "dequantize", delay_dequantize, fullgraph = False)
+    patch_function(transformers.integrations.mxfp4, "load_and_swizzle_mxfp4", load_and_swizzle_mxfp4)
 
+    try:
+        from transformers.integrations.mxfp4 import _replace_with_mxfp4_linear
+    except Exception as e:
+        return raise_error("transformers.integrations.mxfp4._replace_with_mxfp4_linear", e)
 
-    # transformers/models/gpt_oss/modeling_gpt_oss.py GptOssExperts
-    # GptOssExperts.forward
-    def GptOssExperts_forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
-        """
-        When training is is more efficient to just loop over the experts and compute the output for each expert
-        as otherwise the memory would explode.
-
-        For inference we can sacrifice some memory and compute the output for all experts at once. By repeating the inputs.
-
-        Args:
-            hidden_states (torch.Tensor): (batch_size, seq_len, hidden_size)
-            selected_experts (torch.Tensor): (batch_size * token_num, top_k)
-            routing_weights (torch.Tensor): (batch_size * token_num, num_experts)
-        Returns:
-            torch.Tensor
-        """
-        batch_size = hidden_states.shape[0]
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)  # (num_tokens, hidden_size)
-        num_experts = routing_weights.shape[1]
-
-        if hasattr(self, "down_proj_blocks"):
-            down_proj_blocks = self.down_proj_blocks.to(hidden_states.device, non_blocking = True)
-        if hasattr(self, "gate_up_proj_blocks"):
-            gate_up_proj = convert_moe_packed_tensors(self.gate_up_proj_blocks, self.gate_up_proj_scales, dtype = hidden_states.dtype, target_device = hidden_states.device)
-        else:
-            gate_up_proj = self.gate_up_proj
-        if self.training:
-            next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
-            with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                # we sum on the top_k and on the sequence length to get which experts
-                # are hit this time around
-                expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            for expert_idx in expert_hitted[:]:
-                _expert_idx = expert_idx.item()
-                torch._check_is_size(_expert_idx)
-                torch._check(_expert_idx <= 512) # Large number for expert check
-                with torch.no_grad():
-                    _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                current_state = hidden_states[token_idx]
-                gate_up = current_state @ gate_up_proj[expert_idx] + self.gate_up_proj_bias[expert_idx]
-                gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                gate = gate.clamp(min=None, max=self.limit)
-                up = up.clamp(min=-self.limit, max=self.limit)
-                glu = gate * torch.sigmoid(gate * self.alpha)
-                gated_output = (up + 1) * glu
-
-                if hasattr(self, "down_proj_blocks"):
-                    down_proj = convert_moe_packed_tensors(self.down_proj_blocks, self.down_proj_scales, dtype = hidden_states.dtype, target_device = hidden_states.device)
-                else:
-                    down_proj = self.down_proj
-                out = gated_output @ down_proj[expert_idx] + self.down_proj_bias[expert_idx]
-                del down_proj
-                weighted_output = out[0] * routing_weights[token_idx, expert_idx, None]
-                next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
-            next_states = next_states.view(batch_size, -1, self.hidden_size)
-        else:
-            hidden_states = hidden_states.repeat(num_experts, 1)
-            hidden_states = hidden_states.view(num_experts, -1, self.hidden_size)
-            gate_up = torch.bmm(hidden_states, gate_up_proj) + self.gate_up_proj_bias[..., None, :]
-            del gate_up_proj
-
-            gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-            gate = gate.clamp(min=None, max=self.limit)
-            up = up.clamp(min=-self.limit, max=self.limit)
-            glu = gate * torch.sigmoid(gate * self.alpha)
-
-            if hasattr(self, "down_proj_blocks"):
-                down_proj = convert_moe_packed_tensors(self.down_proj_blocks, self.down_proj_scales, dtype = hidden_states.dtype, target_device = hidden_states.device)
-            else:
-                down_proj = self.down_proj
-            next_states = torch.bmm(((up + 1) * glu), down_proj)
-            del down_proj
-
-            next_states = next_states + self.down_proj_bias[..., None, :]
-            next_states = next_states.view(num_experts, batch_size, -1, self.hidden_size)
-            next_states = next_states * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
-            next_states = next_states.sum(dim=0)
-        return next_states
-    pass
-    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts, "forward", GptOssExperts_forward, fullgraph = True)
-pass
-TEMPORARY_PATCHES.append(patch_GptOssExperts_MXFP4)
-
-
-def load_gpt_oss_MXFP4(
-    model_name = "unsloth/gpt-oss-20b",
-    torch_dtype = torch.float16,
-):
-    """ Loads GPT models with on the fly MXFP4->BF16 conversion"""
-    assert "gpt-oss" in model_name
-    from transformers import AutoConfig
-    config = AutoConfig.from_pretrained(model_name)
-    num_hidden_layers = config.num_hidden_layers
-    n_devices = torch.cuda.device_count()
-    free_memory = [torch.cuda.mem_get_info(torch.cuda.device(i))[0] for i in range(n_devices)]
-    free_memory = sum(free_memory) / 1024 / 1024 / 1024
-
-    # Split balanced for now
-    if free_memory <= 12:
-        # Move down_proj to cpu
-        down_proj_blocks_split = "cpu"
-        # Offload all of gate_up_proj_blocks
-        n_gate_up_proj_blocks_offload = num_hidden_layers
-    elif free_memory <= 16:
-        # Move down_proj to cpu
-        down_proj_blocks_split = "cpu"
-        # Offload 1/2 of gate_up_proj_blocks
-        n_gate_up_proj_blocks_offload = int(num_hidden_layers * 0.7)
-    else:
-        down_proj_blocks_split = "x"
-        n_gate_up_proj_blocks_offload = 0
-    pass
-
-    device_map = {}
-    device_map[f"model.embed_tokens"] = 0
-    device_map[f"model.rotary_emb"] = 0
-    for i in range(num_hidden_layers):
-        x = (i * n_devices) // num_hidden_layers
-        device_map[f"model.layers.{i}.self_attn"] = x
-        device_map[f"model.layers.{i}.input_layernorm"] = x
-        device_map[f"model.layers.{i}.mlp.router"] = x
-        device_map[f"model.layers.{i}.post_attention_layernorm"] = x
-        device_map[f"model.layers.{i}.mlp.experts.gate_up_proj_scales"] = x
-        device_map[f"model.layers.{i}.mlp.experts.down_proj_scales"] = x
-        device_map[f"model.layers.{i}.mlp.experts.gate_up_proj_bias"] = x
-        device_map[f"model.layers.{i}.mlp.experts.down_proj_bias"] = x
-        device_map[f"model.layers.{i}.mlp.experts.gate_up_proj"] = x
-        device_map[f"model.layers.{i}.mlp.experts.down_proj"] = x
-        device_map[f"model.layers.{i}.mlp.experts.gate_up_proj_blocks"] = x
-
-    # down_proj_blocks / gate_up_proj_blocks go to CPU if needed
-    for i in range(num_hidden_layers):
-        x = (i * n_devices) // num_hidden_layers
-
-        device_map[f"model.layers.{i}.mlp.experts.down_proj_blocks"] = "cpu" if down_proj_blocks_split == "cpu" else x
-
-        if i < n_gate_up_proj_blocks_offload:
-            device_map[f"model.layers.{i}.mlp.experts.gate_up_proj_blocks"] = "cpu"
-        else:
-            device_map[f"model.layers.{i}.mlp.experts.gate_up_proj_blocks"] = x
-    pass
-    device_map[f"model.norm"] = n_devices-1
-    device_map[f"lm_head"] = n_devices-1
-
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map = "cpu", # Use CPU to first make fake space
-        torch_dtype = torch_dtype,
-        use_kernels = False,
-    )
-    model = model.cuda()
-    # Get downloaded model location - hack since SHA is used
-    # so no downloading is done below!
-    from huggingface_hub import snapshot_download
-    checkpoint_location = snapshot_download(
-        repo_id = model.config._name_or_path,
-        revision = getattr(model.config, "revision", "main"),
-        allow_patterns = ["model*safetensors"],
-    )
-
-    # Force move to CPU and not fake device
-    preload_module_classes = set()
-    for name, module in model.named_modules():
-        if name in device_map and device_map[name] == "cpu":
-            preload_module_classes.add(module.__class__.__name__)
-    preload_module_classes = list(preload_module_classes)
-
-    # Actually load the weights into CPU / CUDA
-    from accelerate import load_checkpoint_and_dispatch
-    model = load_checkpoint_and_dispatch(
+    def replace_with_mxfp4_linear(
         model,
-        checkpoint = checkpoint_location,
-        device_map = device_map if n_devices <= 1 else "auto",
-        preload_module_classes = preload_module_classes,
-    )
-    # Must bypass device_map check for training
-    os.environ["ACCELERATE_BYPASS_DEVICE_MAP"] = "true"
-    return model
+        modules_to_not_convert=None,
+        current_key_name=None,
+        quantization_config=None,
+        config=None,
+    ):
+        if quantization_config.dequantize: return model
+        modules_to_not_convert = ["lm_head"] if modules_to_not_convert is None else modules_to_not_convert
+        if quantization_config.modules_to_not_convert is not None:
+            modules_to_not_convert.extend(quantization_config.modules_to_not_convert)
+        modules_to_not_convert = list(set(modules_to_not_convert))
+        model, has_been_replaced = _replace_with_mxfp4_linear(
+            model,
+            modules_to_not_convert,
+            current_key_name,
+            quantization_config,
+            config=config,
+        )
+        if not has_been_replaced:
+            logger.warning_once(
+                "You are loading your model using mixed-precision FP4 quantization but no linear modules were found in your model."
+                " Please double check your model architecture, or submit an issue on github if you think this is"
+                " a bug."
+            )
+
+        return model
+    patch_function(transformers.integrations.mxfp4, "replace_with_mxfp4_linear", replace_with_mxfp4_linear)
 pass
-
-class GptOssExperts(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-
-        self.num_experts = config.num_local_experts
-        self.hidden_size = config.hidden_size
-        self.expert_dim = config.intermediate_size
-        self.alpha = 1.702
-        self.limit = 7.0
-        self.dtype = config.torch_dtype
-
-        self.gate_up_projs = nn.ModuleList([
-            nn.Linear(self.hidden_size, 2 * self.expert_dim, dtype=self.dtype)
-            for _ in range(self.num_experts)
-        ])
-        self.down_projs = nn.ModuleList([
-            nn.Linear(self.expert_dim, self.hidden_size, dtype=self.dtype)
-            for _ in range(self.num_experts)
-        ])
-
-    def forward(self,
-                hidden_states: torch.Tensor,
-                router_indices = None,
-                routing_weights = None
-                ) -> torch.Tensor:
-
-        batch_size = hidden_states.shape[0]
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
-        num_experts = routing_weights.shape[1]
-
-        if self.training:
-            next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
-            with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            for expert_idx in expert_hitted[:]:
-                with torch.no_grad():
-                    _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                current_state = hidden_states[token_idx]
-                gate_up = self.gate_up_projs[expert_idx](current_state)
-                gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                gate = gate.clamp(min=None, max=self.limit)
-                up = up.clamp(min=-self.limit, max=self.limit)
-                glu = gate * torch.sigmoid(gate * self.alpha)
-                gated_output = (up + 1) * glu
-                out = self.down_projs[expert_idx](gated_output)
-                weighted_output = out * routing_weights[token_idx, expert_idx, None]
-                next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
-            next_states = next_states.view(batch_size, -1, self.hidden_size)
-            return next_states
-
-        else:
-            X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
-            gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
-            gate_up = torch.stack(gate_up_list, dim=0)
-            gate = gate_up[..., ::2]
-            up_h = gate_up[..., 1::2]
-            gate = gate.clamp(max=self.limit)
-            up_h = up_h.clamp(min=-self.limit, max=self.limit)
-            glu = gate * torch.sigmoid(gate * self.alpha)
-            fused = (up_h + 1) * glu
-            out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
-            outs = torch.stack(out_list, dim=0)
-            rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-            mixed = (outs * rw).sum(dim=0)
-            return mixed.view(batch_size, -1, self.hidden_size)
-pass
-
-class GptOssTopKRouter(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
-        self.hidden_dim = config.hidden_size
-        self.linear = nn.Linear(self.hidden_dim, self.num_experts, dtype=config.torch_dtype)
-
-    def forward(self, hidden_states):
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = self.linear(hidden_states)  # (batch_size * seq_len, num_experts)
-        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
-        router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
-        return router_scores, router_indices
-pass
-
-
-def patch_GptOssExperts_bitsandbytes():
-    if "gpt-oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
-        return
-    if "-bnb-4bit" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
-        # We only use this for bnb-4bit models
-        return
-    try:
-        import transformers.models.gpt_oss.modeling_gpt_oss
-        transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
-    except Exception as e:
-        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts", e)
-
-    try:
-        import transformers.models.gpt_oss.modeling_gpt_oss
-        transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter
-    except Exception as e:
-        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter", e)
-    try:
-        import transformers.integrations.mxfp4
-        transformers.integrations.mxfp4.dequantize
-    except Exception as e:
-        return raise_error("transformers.integrations.mxfp4.dequantize", e)
-
-
-
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExperts
-    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts, "forward", GptOssExperts.forward, fullgraph = True)
-
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
-    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter, "forward", GptOssTopKRouter.forward, fullgraph = True)
-pass
-TEMPORARY_PATCHES.append(patch_GptOssExperts_bitsandbytes)
+TEMPORARY_PATCHES.append(patch_gpt_oss)
