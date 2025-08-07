@@ -290,7 +290,7 @@ pass
 TEMPORARY_PATCHES.append(patch_gpt_oss)
 
 
-class UnslothGptOssExperts(nn.Module):
+class GptOssExperts(nn.Module):
     def __init__(self, config):
         super().__init__()
 
@@ -413,7 +413,7 @@ class UnslothGptOssExperts(nn.Module):
             )
 pass
 
-class UnslothGptOssTopKRouter(nn.Module):
+class GptOssTopKRouter(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.top_k = config.num_experts_per_tok
@@ -431,32 +431,13 @@ class UnslothGptOssTopKRouter(nn.Module):
         return router_scores, router_indices
 pass
 
-
-class UnslothGptOssMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.router = UnslothGptOssTopKRouter(config)
-        self.experts = UnslothGptOssExperts(config)
-
-    def forward(self, hidden_states):
-        router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
-        routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
-        return routed_out, router_scores
-pass
-
 def patch_gpt_oss_linearized():
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
-        from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts, GptOssTopKRouter, GptOssMLP
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
-
-    if not GptOssExperts.__name__.startswith("Unsloth"):
-        transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = UnslothGptOssExperts
-    if not GptOssTopKRouter.__name__.startswith("Unsloth"):
-        transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = UnslothGptOssTopKRouter
-    if not GptOssMLP.__name__.startswith("Unsloth"):
-        transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP = UnslothGptOssMLP
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExperts
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
     return
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
