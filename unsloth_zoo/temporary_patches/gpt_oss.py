@@ -152,6 +152,7 @@ def patch_gpt_oss():
                     precision_config=self.gate_up_proj_precision_config,
                     gammas=None,
                 )
+                print("hidden_states", hidden_states.shape, "intermediate_cache1_new", intermediate_cache1_new.shape)
                 intermediate_cache3 = matmul_ogs(
                     intermediate_cache1,
                     self.down_proj,
