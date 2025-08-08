@@ -133,7 +133,7 @@ def patch_gpt_oss():
                 if not hasattr(self, "act"):
                     self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, None), 2)
                 intermediate_cache1 = matmul_ogs(
-                    hidden_states.to(torch.bfloat16),
+                    hidden_states,
                     self.gate_up_proj,
                     self.gate_up_proj_bias,
                     routing_data,
@@ -142,6 +142,8 @@ def patch_gpt_oss():
                     gammas=None,
                     fused_activation=self.act,
                 )
+                print("intermediate_cache1", intermediate_cache1.shape)
+                print("intermediate_cache1", intermediate_cache1.shape)
                 print(gather_idx, self.gate_up_proj_precision_config)
                 intermediate_cache3 = matmul_ogs(
                     intermediate_cache1,
