@@ -156,6 +156,7 @@ def patch_gpt_oss():
                     # fused_activation=self.act,
                     fused_activation=None,
                 )
+                print(self.gate_up_proj_precision_config)
                 intermediate_cache1 = swiglu_torch(
                     intermediate_cache1,
                     self.alpha,
@@ -170,6 +171,7 @@ def patch_gpt_oss():
                     precision_config=self.down_proj_precision_config,
                     gammas=routing_data.gate_scal,
                 )
+                print(self.down_proj_precision_config)
             return intermediate_cache3
         pass
     patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
