@@ -164,30 +164,30 @@ def patch_gpt_oss():
             )
             ctx.save_for_backward(
                 pre_activation,
-                gather_idx,
-                scatter_idx,
-                routing_data,
                 routing_data.gate_scal,
             )
-            ctx.self_class = self_class
+            ctx.self_class   = self_class
+            ctx.gather_idx   = gather_idx
+            ctx.scatter_idx  = scatter_idx
+            ctx.routing_data = routing_data
             return out
         pass
 
         @staticmethod
         def backward(ctx, grad_out):
-            pre_act, gather, scatter, routing_data, gamma = ctx.saved_tensors
+            pre_act, gamma = ctx.saved_tensors
 
             g2   = grad_out.index_select(0, scatter)
             g2  *= gamma
             g2   = g2.to(torch.bfloat16) # tl.dot_scaled upcasts to BF16 for old hardware
             Wd_T = ctx.self_class.down_proj.permute(0, 2, 1).contiguous()
-            g1   = matmul_ogs(g2, Wd_T, None, routing_data, gather_indx=scatter)
+            g1   = matmul_ogs(g2, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter)
             g1   = swiglu_torch_backward(pre_act, alpha, g1, getattr(self_class.down_proj, "limit", None))
             Wu_T = ctx.self_class.gate_up_proj.permute(0, 2, 1).contiguous()
-            dx_g = matmul_ogs(g1, Wu_T, None, routing, scatter_indx=gather)
+            dx_g = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather)
 
             d_hidden = torch.zeros_like(grad_out)
-            d_hidden.index_add_(0, gather, dx_g)
+            d_hidden.index_add_(0, ctx.gather, dx_g)
             return (d_hidden, None, None, None, None,)
         pass
     pass
