@@ -108,16 +108,16 @@ def patch_gpt_oss():
 
     @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
     def swiglu_torch_backward(pre_act, alpha, g1, limit=None):
-        g = pre_act[..., ::2].to(torch.float32)      # even positions
-        l = pre_act[..., 1::2].to(torch.float32)     # odd  positions
+        g = pre_act[..., ::2].to(torch.float32)  # even positions
+        l = pre_act[..., 1::2].to(torch.float32) # odd  positions
 
         if limit is not None: # obey the clipping rules you use in fwd
             g = g.clamp(max=limit)
             l = l.clamp(min=-limit, max=limit)
 
         h  = torch.sigmoid(alpha * g)
-        dg = (h + alpha * g * h * (1 - h)) * (l + 1)   # d/dg
-        dl = g * h                                     # d/dl
+        dg = (h + alpha * g * h * (1 - h)) * (l + 1) # d/dg
+        dl = g * h                                   # d/dl
 
         grad = torch.empty_like(pre_act)
         grad[..., ::2] = dg
