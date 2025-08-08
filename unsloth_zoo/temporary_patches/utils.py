@@ -32,6 +32,7 @@ __all__ = [
     "MultiModalData",
     "ProcessingKwargs",
     "ProcessorMixin",
+    "_get_unique_storage_name",
 ]
 import inspect
 import typing as t
