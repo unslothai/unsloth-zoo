@@ -167,7 +167,7 @@ def patch_gpt_oss():
                 gather_idx,
                 scatter_idx,
                 routing_data,
-                routing.gate_scal,
+                routing_data.gate_scal,
             )
             ctx.self_class = self_class
             return out
