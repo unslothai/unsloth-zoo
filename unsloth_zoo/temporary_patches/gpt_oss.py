@@ -465,7 +465,7 @@ class GptOssExperts(nn.Module):
                 # gated_output = (up + 1) * glu
                 out = self.down_projs[expert_idx](gated_output)
                 weighted_output = out * routing_weights[token_idx, expert_idx, None]
-                next_states.index_add_(0, token_idx, weighted_output)
+                next_states.index_add_(0, token_idx, weighted_output.to(torch.float32))
             next_states = next_states.view(batch_size, -1, self.hidden_size)
             return next_states.to(hidden_states.dtype)
         else:
