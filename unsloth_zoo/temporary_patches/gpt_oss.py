@@ -93,8 +93,7 @@ def patch_gpt_oss():
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4)
 
     @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
-    def swiglu_torch_forward(a, alpha, precision_config):
-        limit = getattr(precision_config, "limit", None)
+    def swiglu_torch_forward(a, alpha, limit=None):
         a_gelu = a[..., ::2].to(torch.float32)
         if limit is not None:
             a_gelu = a_gelu.clamp(max=limit)
@@ -105,6 +104,93 @@ def patch_gpt_oss():
         out_gelu = a_gelu * torch.sigmoid(alpha * a_gelu)
         out = out_gelu * (a_linear + 1)
         return out.to(a.dtype)
+    pass
+
+    @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
+    def swiglu_torch_backward(pre_act, alpha, g1, limit=None):
+        g = pre_act[..., ::2].to(torch.float32)      # even positions
+        l = pre_act[..., 1::2].to(torch.float32)     # odd  positions
+
+        if limit is not None: # obey the clipping rules you use in fwd
+            g = g.clamp(max=limit)
+            l = l.clamp(min=-limit, max=limit)
+
+        h  = torch.sigmoid(alpha * g)
+        dg = (h + alpha * g * h * (1 - h)) * (l + 1)   # d/dg
+        dl = g * h                                     # d/dl
+
+        grad = torch.empty_like(pre_act)
+        grad[..., ::2] = dg
+        grad[..., 1::2] = dl
+        return g1 * grad.to(g1.dtype)
+    pass
+
+    class Mxfp4GptOssExperts_Training(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx,
+            hidden_states,
+            self_class,
+            routing_data,
+            gather_idx,
+            scatter_idx,
+        ):
+            pre_activation = matmul_ogs(
+                hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
+                self_class.gate_up_proj,
+                self_class.gate_up_proj_bias,
+                routing_data,
+                gather_indx=gather_idx,
+                scatter_indx=None,
+                precision_config=self_class.gate_up_proj_precision_config,
+                gammas=None,
+                fused_activation=None,
+            )
+            swiglu_output = swiglu_torch_forward(
+                pre_activation,
+                self_class.alpha,
+                self_class.gate_up_proj_precision_config,
+            )
+            out = matmul_ogs(
+                swiglu_output,
+                self_class.down_proj,
+                self_class.down_proj_bias,
+                routing_data,
+                gather_indx=None,
+                scatter_indx=scatter_idx,
+                precision_config=self_class.down_proj_precision_config,
+                gammas=routing_data.gate_scal,
+                fused_activation=None,
+            )
+            ctx.save_for_backward(
+                pre_activation,
+                gather_idx,
+                scatter_idx,
+                routing_data,
+                routing.gate_scal,
+            )
+            ctx.self_class = self_class
+            return out
+        pass
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            pre_act, gather, scatter, routing_data, gamma = ctx.saved_tensors
+
+            g2   = grad_out.index_select(0, scatter)
+            g2  *= gamma
+            g2   = g2.to(torch.bfloat16) # tl.dot_scaled upcasts to BF16 for old hardware
+            Wd_T = ctx.self_class.down_proj.permute(0, 2, 1).contiguous()
+            g1   = matmul_ogs(g2, Wd_T, None, routing_data, gather_indx=scatter)
+            g1   = swiglu_torch_backward(pre_act, alpha, g1, limit)
+            Wu_T = ctx.self_class.gate_up_proj.permute(0, 2, 1).contiguous()
+            dx_g = matmul_ogs(g1, Wu_T, None, routing, scatter_indx=gather)
+
+            d_hidden = torch.zeros_like(grad_out)
+            d_hidden.index_add_(0, gather, dx_g)
+            return (d_hidden, None, None, None, None,)
+        pass
+    pass
 
     class Mxfp4GptOssExperts(nn.Module):
         def __init__(self, config):
@@ -146,31 +232,34 @@ def patch_gpt_oss():
             with torch_cuda_device(hidden_states.device):
                 if not hasattr(self, "act"):
                     self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, None), 2)
-                intermediate_cache1 = matmul_ogs(
-                    hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
-                    self.gate_up_proj,
-                    self.gate_up_proj_bias,
-                    routing_data,
-                    gather_indx=gather_idx,
-                    precision_config=self.gate_up_proj_precision_config,
-                    gammas=None,
-                    # fused_activation=self.act,
-                    fused_activation=None,
-                )
-                intermediate_cache1 = swiglu_torch_forward(
-                    intermediate_cache1,
-                    self.alpha,
-                    self.gate_up_proj_precision_config,
-                )
-                intermediate_cache3 = matmul_ogs(
-                    intermediate_cache1,
-                    self.down_proj,
-                    self.down_proj_bias,
-                    routing_data,
-                    scatter_indx=scatter_idx,
-                    precision_config=self.down_proj_precision_config,
-                    gammas=routing_data.gate_scal,
-                )
+                if not hidden_states.requires_grad:
+                    intermediate_cache1 = matmul_ogs(
+                        hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
+                        self.gate_up_proj,
+                        self.gate_up_proj_bias,
+                        routing_data,
+                        gather_indx=gather_idx,
+                        precision_config=self.gate_up_proj_precision_config,
+                        gammas=None,
+                        fused_activation=self.act,
+                    )
+                    intermediate_cache3 = matmul_ogs(
+                        intermediate_cache1,
+                        self.down_proj,
+                        self.down_proj_bias,
+                        routing_data,
+                        scatter_indx=scatter_idx,
+                        precision_config=self.down_proj_precision_config,
+                        gammas=routing_data.gate_scal,
+                    )
+                else:
+                    intermediate_cache3 = Mxfp4GptOssExperts_Training.apply(
+                        hidden_states,
+                        self,
+                        routing_data,
+                        gather_idx,
+                        scatter_idx,
+                    )
             return intermediate_cache3
         pass
     patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
