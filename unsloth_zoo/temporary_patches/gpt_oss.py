@@ -193,12 +193,12 @@ def patch_gpt_oss():
             grad_exp = grad_token.index_select(0, scatter_src)
             grad_exp.mul_(gamma.unsqueeze(-1))                        # (Texp, 1) → broadcast
             # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
-            Wd_T = ctx.self_class.down_proj.permute(0, 2, 1).contiguous() # (E, d_model, d_ff)
+            Wd_T = ctx.self_class.down_proj.data.permute(0, 2, 1).contiguous() # (E, d_model, d_ff)
             g1   = matmul_ogs(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
             # 3) activation derivative
             g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
             # 4) g1 · Wuᵀ  
-            Wu_T = ctx.self_class.gate_up_proj.permute(0, 2, 1).contiguous() # (E, 2*d_ff, d_model)
+            Wu_T = ctx.self_class.gate_up_proj.data.permute(0, 2, 1).contiguous() # (E, 2*d_ff, d_model)
             dx_exp = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather_idx)
 
             # 5) expert ➜ token (reverse of forward gather)
