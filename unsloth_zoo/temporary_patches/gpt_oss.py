@@ -167,14 +167,14 @@ def patch_gpt_oss():
                     gather_indx=gather_idx,
                     precision_config=self.gate_up_proj_precision_config,
                     gammas=None,
-                    fused_activation=self.act,
-                    # fused_activation=None,
+                    # fused_activation=self.act,
+                    fused_activation=None,
                 )
-                # intermediate_cache1 = swiglu_torch(
-                #     intermediate_cache1,
-                #     self.alpha,
-                #     self.gate_up_proj_precision_config,
-                # )
+                intermediate_cache1 = swiglu_torch(
+                    intermediate_cache1,
+                    self.alpha,
+                    self.gate_up_proj_precision_config,
+                )
                 intermediate_cache3 = matmul_ogs(
                     intermediate_cache1,
                     self.down_proj,
