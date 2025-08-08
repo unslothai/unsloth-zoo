@@ -93,7 +93,7 @@ def patch_gpt_oss():
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4)
 
     @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
-    def swiglu_torch_forward(a, alpha, limit=None):
+    def swiglu_torch_forward(a, alpha, limit):
         a_gelu = a[..., ::2].to(torch.float32)
         if limit is not None:
             a_gelu = a_gelu.clamp(max=limit)
@@ -107,7 +107,7 @@ def patch_gpt_oss():
     pass
 
     @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
-    def swiglu_torch_backward(pre_act, alpha, g1, limit=None):
+    def swiglu_torch_backward(pre_act, alpha, limit, g1):
         g, l = pre_act[..., ::2].to(torch.float32), pre_act[..., 1::2].to(torch.float32)
 
         if limit is not None:
@@ -193,7 +193,6 @@ def patch_gpt_oss():
             grad_exp = grad_token.index_select(0, scatter_src) * gamma
             # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
             Wd_T = ctx.self_class.down_proj.permute(0, 2, 1).contiguous() # (E, d_model, d_ff)
-            Wd_T = ctx.self_class.down_proj.permute(0, 2, 1).contiguous()
             g1   = matmul_ogs(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
             # 3) activation derivative
             g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
