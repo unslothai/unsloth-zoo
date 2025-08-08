@@ -92,6 +92,19 @@ def patch_gpt_oss():
         return w, w_scale
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4)
 
+    def swiglu_torch(a, alpha, precision_config):
+        limit = precision_config.limit
+        a_gelu = a[..., ::2]
+        if limit is not None:
+            a_gelu = a_gelu.clamp(max=limit)
+        a_linear = a[..., 1::2]
+        if limit is not None:
+            a_linear = a_linear.clamp(min=-limit, max=limit)
+
+        out_gelu = a_gelu * torch.sigmoid(alpha * a_gelu)
+        out = out_gelu * (a_linear + 1)
+        return out
+
     class Mxfp4GptOssExperts(nn.Module):
         def __init__(self, config):
             super().__init__()
@@ -140,7 +153,13 @@ def patch_gpt_oss():
                     gather_indx=gather_idx,
                     precision_config=self.gate_up_proj_precision_config,
                     gammas=None,
-                    fused_activation=self.act,
+                    # fused_activation=self.act,
+                    fused_activation=None,
+                )
+                intermediate_cache1 = swiglu_torch(
+                    intermediate_cache1,
+                    self.alpha,
+                    self.gate_up_proj_precision_config,
                 )
                 intermediate_cache3 = matmul_ogs(
                     intermediate_cache1,
