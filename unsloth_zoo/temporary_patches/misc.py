@@ -35,7 +35,7 @@ from .utils import (
     _get_unique_storage_name,
 )
 from textwrap import dedent
-
+import re
 
 def patch_merge_quantization_configs():
     # Fixes some issues with merging quantization configs
@@ -65,13 +65,20 @@ def patch_merge_quantization_configs():
 
     exec("from transformers.quantizers.auto import (" + ",".join(x for x in items if x in source) + ")", globals())
     source = dedent(source)
+    # Remove cls if classmethod
+    is_classmethod = source.startswith("@classmethod")
     source = source[source.find("def"):]
+    if is_classmethod:
+        matches = re.match(r"(def[\s]{1,}[^(]{1,}\()[\s]{0,}cls[\s]{0,}\,[\s]{0,}", source)
+        if matches is not None:
+            found, replace = matches.group(0), matches.group(1)
+            source = replace + source[len(found):]
     try:
         exec(source, globals())
     except Exception as e:
         return raise_error("", e)
 
-    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merge_quantization_configs, force = True)
+    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merge_quantization_configs)
 pass
 TEMPORARY_PATCHES.append(patch_merge_quantization_configs)
 
