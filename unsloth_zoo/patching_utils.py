@@ -181,14 +181,14 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # FAILS for Gemma!
         "config.compiled_autograd = False", # New Torch 2.4 feature which can compile backwards passes
         # https://pytorch.org/tutorials/intermediate/compiled_autograd_tutorial.html
-        "config.recompile_limit = 8", # Reduce recompiles to 8 - then will do eager
+        "config.recompile_limit = 16", # Reduce recompiles to 16 - then will do eager
         "config.allow_unspec_int_on_nn_module = True", # Integers in modules will auto wrap torch.tensor(self.vocab_size)
         f"config.optimize_ddp = {not debug}", # Optimizes DDP, but can error out so disable on debug
         # Captures .item() for eg
         # n_chunks = int(torch.ceil((torch.tensor(vocab_size) / 262144) * 8))
-        # "config.capture_scalar_outputs = True",
-        # # Capture torch.arange(...), torch.zeros(...)
-        # "config.capture_dynamic_output_shape_ops = True",
+        "config.capture_scalar_outputs = True",
+        # Capture torch.arange(...), torch.zeros(...)
+        "config.capture_dynamic_output_shape_ops = True",
     ]
     if not debug and ignore_errors:
         # Have to explicitly set it!
