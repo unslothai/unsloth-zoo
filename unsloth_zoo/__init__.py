@@ -91,3 +91,7 @@ pass
 # Log Unsloth-Zoo Utilities
 os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 del os
+
+from .temporary_patches import (
+    encode_conversations_with_harmony,
+)

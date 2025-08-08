@@ -184,6 +184,7 @@ def patch_gpt_oss():
 
         @staticmethod
         def backward(ctx, grad_token):
+            raise NotImplementedError("Backwards pass using MXFP4 is still under construction!")
             (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
             self_class = ctx.self_class
             limit = getattr(self_class.down_proj, "limit", None)
@@ -191,7 +192,6 @@ def patch_gpt_oss():
 
             # 1) token ➜ expert (reverse of forward scatter)
             grad_exp = grad_token.index_select(0, scatter_src)
-            print(grad_token.shape, grad_exp.shape, gamma.shape)
             grad_exp.mul_(gamma.unsqueeze(-1))
             # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
             Wd_T = ctx.self_class.down_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, d_model, d_ff)
@@ -535,3 +535,102 @@ def patch_gpt_oss_linearized():
     return
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
+
+
+def encode_conversations_with_harmony(
+    messages,
+    reasoning_effort = "medium",
+    add_generation_prompt = True,
+    tool_calls = None,
+    developer_instructions = None,
+    model_identity = "You are ChatGPT, a large language model trained by OpenAI.",
+):
+    from openai_harmony import (
+        Author,
+        Conversation,
+        DeveloperContent,
+        HarmonyEncodingName,
+        Message,
+        Role,
+        SystemContent,
+        ToolDescription,
+        load_harmony_encoding,
+        ReasoningEffort
+    )
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+
+    assert reasoning_effort in ("low", "medium", "high")
+
+    match reasoning_effort:
+        case "low":    harmony_reasoning = ReasoningEffort.LOW
+        case "medium": harmony_reasoning = ReasoningEffort.MEDIUM
+        case "high":   harmony_reasoning = ReasoningEffort.HIGH
+
+    convos = []
+
+    # Create system message
+    import datetime
+    today = datetime.datetime.today().strftime("%Y-%m-%d")
+    system = Message.from_role_and_content(Role.SYSTEM,
+        SystemContent.new()
+            .with_model_identity(model_identity)
+            .with_reasoning_effort(harmony_reasoning)
+            .with_conversation_start_date(today)
+            .with_knowledge_cutoff("2024-06")
+            .with_required_channels(["analysis", "commentary", "final"])
+    )
+    convos.append(system)
+
+    # Developer message and tool calling
+    dev = DeveloperContent.new()
+    if developer_instructions is not None: dev = dev.with_instructions(developer_instructions)
+    if tool_calls is not None:
+        new_tools = []
+        for function in tool_calls:
+            function = function["function"]
+            name = function["name"]
+            description = function["description"]
+            parameters = function["parameters"]
+            tool = ToolDescription.new(name, description, parameters)
+            new_tools.append(tool)
+        dev = dev.with_function_tools(new_tools)
+    pass
+    if developer_instructions is not None or tool_calls is not None:
+        dev = Message.from_role_and_content(Role.DEVELOPER, dev)
+        convos.append(dev)
+
+    for message in messages:
+        if message["role"] == "user":
+            convos.append(
+                Message.from_role_and_content(Role.USER, message["content"])
+            )
+        elif message["role"] == "assistant":
+            if "thinking" in message:
+                x = Message.from_role_and_content(Role.ASSISTANT, message["content"])
+                x = x.with_channel("analysis")
+            elif "tool_calls" in message:
+                x = Message.from_role_and_content(Role.ASSISTANT, message['tool_calls'][0]["arguments"])
+                x = x.with_channel("commentary")\
+                     .with_recipient(f"functions.{message['tool_calls'][0]['name']}")\
+                     .with_content_type("json")
+            else:
+                x = Message.from_role_and_content(Role.ASSISTANT, message["content"])
+                x = x.with_channel("final")
+            convos.append(x)
+        elif message["role"] == "tool":
+            x = Message.from_author_and_content(
+                    Author.new(Role.TOOL, f"functions.{message['name']}"),
+                    message["content"],
+                ).with_recipient("assistant").with_channel("commentary")
+            convos.append(x)
+    pass
+
+    # Create Harmony conversations
+    convos = Conversation.from_messages(convos)
+    if add_generation_prompt:
+        harmony_input_ids = encoding.render_conversation_for_completion(convos, Role.ASSISTANT)
+    else:
+        harmony_input_ids = encoding.render_conversation(convos)
+    harmony_decoded_text = encoding.decode(harmony_input_ids)
+    return harmony_decoded_text, harmony_input_ids
+pass
