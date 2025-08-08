@@ -190,7 +190,9 @@ def patch_gpt_oss():
             alpha = self_class.alpha
 
             # 1) token ➜ expert (reverse of forward scatter)
-            grad_exp = grad_token.index_select(0, scatter_src) * gamma
+            grad_exp = grad_token.index_select(0, scatter_src)
+            gamma_exp = gamma.index_select(0, scatter_src).unsqueeze(-1) # (Texp, 1)
+            grad_exp  = grad_exp * gamma_exp                             # broadcast OK
             # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
             Wd_T = ctx.self_class.down_proj.permute(0, 2, 1).contiguous() # (E, d_model, d_ff)
             g1   = matmul_ogs(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
