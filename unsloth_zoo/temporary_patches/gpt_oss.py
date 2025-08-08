@@ -417,8 +417,6 @@ pass
 TEMPORARY_PATCHES.append(patch_gpt_oss)
 
 
-def 
-
 class GptOssExperts(nn.Module):
     def __init__(self, config):
         super().__init__()
