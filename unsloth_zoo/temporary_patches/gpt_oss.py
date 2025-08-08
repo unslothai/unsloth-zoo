@@ -93,7 +93,7 @@ def patch_gpt_oss():
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4)
 
     def swiglu_torch(a, alpha, precision_config):
-        limit = precision_config.limit
+        limit = getattr(precision_config, "limit", None)
         a_gelu = a[..., ::2]
         if limit is not None:
             a_gelu = a_gelu.clamp(max=limit)
