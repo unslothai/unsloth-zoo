@@ -94,14 +94,24 @@ def get_torch_compile_options(
         "coordinate_descent_tuning" : coordinate_descent_tuning or UNSLOTH_COMPILE_MAXIMUM,
         "trace.graph_diagram"       : UNSLOTH_COMPILE_DEBUG or debug,
         "compile_threads"           : determine_compile_threads(), # Auto detects via https://github.com/unslothai/unsloth-zoo/pull/187
-        "combo_kernels"             : combo_kernels, # Causes incompatible gradient sizes on 2.6
-        "group_fusion"              : group_fusion,
+        "group_fusion"              : group_fusion, # [DEPRECATED]
         "disable_progress"          : not logging,
         "verbose_progress"          : logging,
+
         "triton.multi_kernel"       : multi_kernel, # RuntimeError: name 'multi_kernel_0' is not defined
         "triton.use_block_ptr"      : use_block_ptr,
         "triton.enable_persistent_tma_matmul" : True,
-        "triton.autotune_at_compile_time"     : True,
+        "triton.autotune_at_compile_time"     : False,
+        "triton.cooperative_reductions"       : False,
+        # "reorder_for_compute_comm_overlap"  : True, # Fails for single GPU
+        "cuda.compile_opt_level"              : "-O2",
+        "cuda.enable_cuda_lto"                : True,
+        # "cuda.use_fast_math"                : True, # Disable fast math
+        # Causes incompatible gradient sizes on 2.6
+        # And TypeError: bad operand type for unary -: 'SymbolicCallArg'
+        "combo_kernels"                       : False,
+        "benchmark_combo_kernel"              : True,
+        "combo_kernel_foreach_dynamic_shapes" : True,
     }
     final_torch_compile_options = {}
     for key, value in torch_compile_options.items():

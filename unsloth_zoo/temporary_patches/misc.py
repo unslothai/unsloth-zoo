@@ -32,7 +32,55 @@ from .utils import (
     StaticCache,
     HybridCache,
     Unpack,
+    _get_unique_storage_name,
 )
+from textwrap import dedent
+import re
+
+def patch_merge_quantization_configs():
+    # Fixes some issues with merging quantization configs
+    try:
+        import transformers.quantizers.auto
+    except Exception as e:
+        return raise_error("transformers.quantizers.auto", e)
+    try:
+        f = transformers.quantizers.auto.AutoHfQuantizer.merge_quantization_configs
+    except Exception as e:
+        return raise_error("transformers.quantizers.auto.AutoHfQuantizer.merge_quantization_configs", e)
+
+    # Fast return if already patched
+    unique_name = _get_unique_storage_name(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs")
+    if hasattr(transformers.quantizers.auto.AutoHfQuantizer, unique_name): return
+
+    source = inspect.getsource(f)
+    items = dir(transformers.quantizers.auto)
+
+    # Fix as at 7th August 2025
+    # ValueError: The model is quantized with Mxfp4Config but you are passing a NoneType config.
+    # Please make sure to pass the same quantization config class to `from_pretrained` with different loading attributes.
+    source = source.replace(
+        "if quantization_config.__class__.__name__ != quantization_config_from_args.__class__.__name__:",
+        "if quantization_config_from_args is not None and quantization_config.__class__.__name__ != quantization_config_from_args.__class__.__name__:",
+    )
+
+    exec("from transformers.quantizers.auto import (" + ",".join(x for x in items if x in source) + ")", globals())
+    source = dedent(source)
+    # Remove cls if classmethod
+    is_classmethod = source.startswith("@classmethod")
+    source = source[source.find("def"):]
+    if is_classmethod:
+        matches = re.match(r"(def[\s]{1,}[^(]{1,}\()[\s]{0,}cls[\s]{0,}\,[\s]{0,}", source)
+        if matches is not None:
+            found, replace = matches.group(0), matches.group(1)
+            source = replace + source[len(found):]
+    try:
+        exec(source, globals())
+    except Exception as e:
+        return raise_error("", e)
+
+    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merge_quantization_configs)
+pass
+TEMPORARY_PATCHES.append(patch_merge_quantization_configs)
 
 
 def patch_CsmDepthDecoderForCausalLM_forward():
