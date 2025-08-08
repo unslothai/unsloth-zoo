@@ -470,7 +470,7 @@ class GptOssExperts(nn.Module):
                 weighted_output = out * routing_weights[token_idx, expert_idx, None]
                 next_states.index_add_(0, token_idx, weighted_output.to(torch.float32))
             next_states = next_states.view(batch_size, -1, self.hidden_size)
-            return next_states.to(hidden_states.dtype)
+            return next_states.to(torch.bfloat16) # Must use bfloat16 otherwise overflows
         else:
             X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
@@ -486,7 +486,7 @@ class GptOssExperts(nn.Module):
             outs = torch.stack(out_list, dim=0)
             rw = routing_weights.transpose(0, 1).unsqueeze(-1)
             mixed = (outs * rw).sum(dim=0)
-            return mixed.view(batch_size, -1, self.hidden_size)
+            return mixed.view(batch_size, -1, self.hidden_size).to(torch.bfloat16) # Must use bfloat16 otherwise overflows
 pass
 
 class GptOssTopKRouter(nn.Module):
