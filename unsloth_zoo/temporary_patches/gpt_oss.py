@@ -28,7 +28,7 @@ from .utils import (
 )
 torch_cuda_device = torch.cuda.device
 
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
+# @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
 def swiglu_torch_forward(a, alpha, limit):
     a_gelu = a[..., ::2].to(torch.float32)
     if limit is not None:
