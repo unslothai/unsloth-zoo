@@ -537,14 +537,7 @@ pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
-def encode_conversations_with_harmony(
-    messages,
-    reasoning_effort = "medium",
-    add_generation_prompt = True,
-    tool_calls = None,
-    developer_instructions = None,
-    model_identity = "You are ChatGPT, a large language model trained by OpenAI.",
-):
+try:
     from openai_harmony import (
         Author,
         Conversation,
@@ -558,6 +551,20 @@ def encode_conversations_with_harmony(
         ReasoningEffort
     )
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+except:
+    pass
+def encode_conversations_with_harmony(
+    messages,
+    reasoning_effort = "medium",
+    add_generation_prompt = True,
+    tool_calls = None,
+    developer_instructions = None,
+    model_identity = "You are ChatGPT, a large language model trained by OpenAI.",
+):
+    try:
+        SystemContent
+    except:
+        raise ImportError("Please install openai_harmony via `pip install openai_harmony`")
 
     assert reasoning_effort in ("low", "medium", "high")
 
