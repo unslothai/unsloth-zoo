@@ -92,37 +92,19 @@ def patch_gpt_oss():
         return w, w_scale
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4)
 
-    def swiglu_torch(a, alpha, precision_config):
-        limit = getattr(precision_config, "limit", None)
-        a_gelu = a[..., ::2]
-        if limit is not None:
-            a_gelu = a_gelu.clamp(max=limit)
-        a_linear = a[..., 1::2]
-        if limit is not None:
-            a_linear = a_linear.clamp(min=-limit, max=limit)
-
-        out_gelu = a_gelu * torch.sigmoid(alpha * a_gelu)
-        out = out_gelu * (a_linear + 1)
-        return out
-
     @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
     def swiglu_torch_forward(a, alpha, precision_config):
         limit = getattr(precision_config, "limit", None)
         a_gelu = a[..., ::2].to(torch.float32)
         if limit is not None:
-            a_gelu = a_gelu.clamp_(max=limit)
+            a_gelu = a_gelu.clamp(max=limit)
         a_linear = a[..., 1::2].to(torch.float32)
         if limit is not None:
-            a_linear = a_linear.clamp_(min=-limit, max=limit)
+            a_linear = a_linear.clamp(min=-limit, max=limit)
 
-        # out_gelu = a_gelu * torch.sigmoid(alpha * a_gelu)
-        out_gelu = alpha * a_gelu
-        out_gelu = torch.sigmoid(out_gelu, out = out_gelu)
-        out_gelu *= a_gelu
-        # out = out_gelu * (a_linear + 1)
-        a_linear += 1
-        out_gelu *= a_linear
-        return out_gelu.to(a.dtype)
+        out_gelu = a_gelu * torch.sigmoid(alpha * a_gelu)
+        out = out_gelu * (a_linear + 1)
+        return out.to(a.dtype)
 
     class Mxfp4GptOssExperts(nn.Module):
         def __init__(self, config):
