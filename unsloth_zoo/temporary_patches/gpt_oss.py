@@ -171,7 +171,6 @@ def patch_gpt_oss():
 
         routed_out = self.experts(hidden_states, routing_data, gather_idx, scatter_idx)
         routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)
-        print("routed_out", "router_logits", routed_out.dtype, router_logits.dtype)
         return routed_out, router_logits
     patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward)
 
