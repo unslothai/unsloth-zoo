@@ -144,7 +144,7 @@ def patch_gpt_oss():
                 )
                 print("hidden_states", hidden_states.shape, "intermediate_cache1", intermediate_cache1.shape)
                 intermediate_cache1_new = matmul_ogs(
-                    hidden_states.to(torch.bfloat16).,
+                    hidden_states.to(torch.bfloat16),
                     self.gate_up_proj.storage.data.permute(0, 2, 1),
                     self.gate_up_proj_bias,
                     routing_data,
