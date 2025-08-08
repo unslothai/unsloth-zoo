@@ -149,7 +149,7 @@ def patch_gpt_oss():
             swiglu_output = swiglu_torch_forward(
                 pre_activation,
                 self_class.alpha,
-                self_class.gate_up_proj_precision_config,
+                getattr(self_class.gate_up_proj_precision_config, "limit", None),
             )
             out = matmul_ogs(
                 swiglu_output,
@@ -182,7 +182,7 @@ def patch_gpt_oss():
             g2   = g2.to(torch.bfloat16) # tl.dot_scaled upcasts to BF16 for old hardware
             Wd_T = ctx.self_class.down_proj.permute(0, 2, 1).contiguous()
             g1   = matmul_ogs(g2, Wd_T, None, routing_data, gather_indx=scatter)
-            g1   = swiglu_torch_backward(pre_act, alpha, g1, limit)
+            g1   = swiglu_torch_backward(pre_act, alpha, g1, getattr(self_class.down_proj, "limit", None))
             Wu_T = ctx.self_class.gate_up_proj.permute(0, 2, 1).contiguous()
             dx_g = matmul_ogs(g1, Wu_T, None, routing, scatter_indx=gather)
 
