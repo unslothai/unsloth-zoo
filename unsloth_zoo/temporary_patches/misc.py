@@ -71,7 +71,7 @@ def patch_merge_quantization_configs():
     except Exception as e:
         return raise_error("", e)
 
-    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merge_quantization_configs, match_level = "relaxed")
+    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merge_quantization_configs, force = True)
 pass
 TEMPORARY_PATCHES.append(patch_merge_quantization_configs)
 
