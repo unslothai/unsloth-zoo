@@ -135,6 +135,7 @@ def patch_gpt_oss():
             gather_idx,
             scatter_idx,
         ):
+            print(scatter_idx, gather_idx)
             pre_activation = matmul_ogs(
                 hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
                 self_class.gate_up_proj,
