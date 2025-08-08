@@ -352,6 +352,10 @@ def grpo_accumulated_loss(
     # All Unsloth Zoo code licensed under LGPLv3
     bsz, qlen = input_ids.shape
 
+    pixel_values = kwargs.get('pixel_values',None)
+    image_grid_thw = kwargs.get('image_grid_thw',None)
+    pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
+    image_sizes = kwargs.get('image_sizes',None)
     # Find closest multiple
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
@@ -366,17 +370,43 @@ def grpo_accumulated_loss(
     completion_input_ids = input_ids[:, -logits_to_keep:]
     lm_head = trainer.model.get_output_embeddings().weight
 
+    #breakpoint()
     with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):
+        with torch.inference_mode(): 
+                # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
+                # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
+                # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
+                # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
+                # old_per_token_logps to None.
+            generate_every = trainer.args.steps_per_generation * trainer.num_iterations  # generation frequency
+            if trainer.args.gradient_accumulation_steps % generate_every != 0:
+                old_hidden_states = trainer.model(
+                    input_ids = input_ids,
+                    attention_mask = attention_mask,
+                    pixel_values = pixel_values,
+                    image_grid_thw = image_grid_thw,
+                    pixel_attention_mask = pixel_attention_mask,
+                    image_sizes = image_sizes,
+                    logits_to_keep = logits_to_keep + 1,
+                ).logits    
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
             ref_hidden_states = trainer.model(
                 input_ids = input_ids,
                 attention_mask = attention_mask,
+                pixel_values = pixel_values,
+                image_grid_thw = image_grid_thw,
+                pixel_attention_mask = pixel_attention_mask,
+                image_sizes = image_sizes,
                 logits_to_keep = logits_to_keep + 1,
             ).logits
         pass
         new_hidden_states = trainer.model(
             input_ids = input_ids,
             attention_mask = attention_mask,
+            pixel_values = pixel_values,
+            image_grid_thw = image_grid_thw,
+            pixel_attention_mask = pixel_attention_mask,
+            image_sizes = image_sizes,
             logits_to_keep = logits_to_keep + 1,
         ).logits
 
@@ -394,8 +424,16 @@ def grpo_accumulated_loss(
             kwargs # pass kwargs as a dict
         )
     pass
+    #breakpoint()
+    # Some models like Qwen VL 2 don't have logits_to_keep parameter so you need to trim the output manually. Qwen VL 2.5 however does have it.
+    if ref_hidden_states.size(1) != logits_to_keep + 1 : 
+        ref_hidden_states = ref_hidden_states[:,-(logits_to_keep + 1):,:]
+        new_hidden_states = new_hidden_states[:,-(logits_to_keep + 1):,:]
+        if old_hidden_states is not None: 
+            old_hidden_states = old_hidden_states[:,-(logits_to_keep + 1):,:]
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
+
     return loss, completion_length, mean_kl
 
     # Old non efficient code path
