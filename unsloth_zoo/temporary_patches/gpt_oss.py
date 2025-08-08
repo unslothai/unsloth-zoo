@@ -168,7 +168,7 @@ def patch_gpt_oss():
                     precision_config=self.gate_up_proj_precision_config,
                     gammas=None,
                     fused_activation=self.act,
-                    fused_activation=None,
+                    # fused_activation=None,
                 )
                 # intermediate_cache1 = swiglu_torch(
                 #     intermediate_cache1,
