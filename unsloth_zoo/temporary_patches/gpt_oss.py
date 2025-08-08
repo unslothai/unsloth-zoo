@@ -177,7 +177,7 @@ def patch_gpt_oss():
         def backward(ctx, grad_out):
             pre_act, gamma = ctx.saved_tensors
 
-            g2   = grad_out.index_select(0, scatter)
+            g2   = grad_out.index_select(0, ctx.scatter)
             g2  *= gamma
             g2   = g2.to(torch.bfloat16) # tl.dot_scaled upcasts to BF16 for old hardware
             Wd_T = ctx.self_class.down_proj.permute(0, 2, 1).contiguous()
