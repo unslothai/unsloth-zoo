@@ -108,20 +108,25 @@ def patch_gpt_oss():
 
     @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
     def swiglu_torch_backward(pre_act, alpha, g1, limit=None):
-        g = pre_act[..., ::2].to(torch.float32)  # even positions
-        l = pre_act[..., 1::2].to(torch.float32) # odd  positions
+        g, l = pre_act[..., ::2].to(torch.float32), pre_act[..., 1::2].to(torch.float32)
 
-        if limit is not None: # obey the clipping rules you use in fwd
-            g = g.clamp(max=limit)
-            l = l.clamp(min=-limit, max=limit)
+        if limit is not None:
+            mask_g = g <= limit
+            mask_l = l.abs() <= limit
+            ḡ = torch.where(mask_g, g, limit)
+            l̄ = torch.where(mask_l, l, l.sign() * limit)
+        else:                                            # no clipping
+            mask_g = mask_l = torch.ones_like(g, dtype=bool)
+            ḡ, l̄ = g, l
 
-        h  = torch.sigmoid(alpha * g)
-        dg = (h + alpha * g * h * (1 - h)) * (l + 1) # d/dg
-        dl = g * h                                   # d/dl
+        σ   = torch.sigmoid(alpha * ḡ)
+        dg  = (σ + alpha * ḡ * σ * (1 - σ)) * (l̄ + 1)
+        dl  = ḡ * σ
+        dg  = torch.where(mask_g, dg, 0.)                # clamp-grad
+        dl  = torch.where(mask_l, dl, 0.)
 
         grad = torch.empty_like(pre_act)
-        grad[..., ::2] = dg
-        grad[..., 1::2] = dl
+        grad[..., ::2], grad[..., 1::2] = dg, dl
         return g1 * grad.to(g1.dtype)
     pass
 
@@ -135,7 +140,6 @@ def patch_gpt_oss():
             gather_idx,
             scatter_idx,
         ):
-            print(scatter_idx, gather_idx)
             pre_activation = matmul_ogs(
                 hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
                 self_class.gate_up_proj,
@@ -166,6 +170,10 @@ def patch_gpt_oss():
             ctx.save_for_backward(
                 pre_activation,
                 routing_data.gate_scal,
+                gather_idx.src_indx,
+                gather_idx.dst_indx,
+                scatter_idx.src_indx,
+                scatter_idx.dst_indx,
             )
             ctx.self_class   = self_class
             ctx.gather_idx   = gather_idx
@@ -176,20 +184,27 @@ def patch_gpt_oss():
 
         @staticmethod
         def backward(ctx, grad_out):
-            pre_act, gamma = ctx.saved_tensors
+            (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
+            self_class = ctx.self_class
+            limit = getattr(self_class.down_proj, "limit", None)
+            alpha = self_class.alpha
 
-            g2   = grad_out.index_select(0, ctx.scatter)
-            g2  *= gamma
-            g2   = g2.to(torch.bfloat16) # tl.dot_scaled upcasts to BF16 for old hardware
+            # 1) token ➜ expert (reverse of forward scatter)
+            grad_exp = grad_token.index_select(0, scatter_src) * gamma
+            # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
+            Wd_T = ctx.self_class.down_proj.permute(0, 2, 1).contiguous() # (E, d_model, d_ff)
             Wd_T = ctx.self_class.down_proj.permute(0, 2, 1).contiguous()
-            g1   = matmul_ogs(g2, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter)
-            g1   = swiglu_torch_backward(pre_act, alpha, g1, getattr(self_class.down_proj, "limit", None))
-            Wu_T = ctx.self_class.gate_up_proj.permute(0, 2, 1).contiguous()
-            dx_g = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather)
+            g1   = matmul_ogs(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
+            # 3) activation derivative
+            g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
+            # 4) g1 · Wuᵀ  
+            Wu_T = ctx.self_class.gate_up_proj.permute(0, 2, 1).contiguous() # (E, 2*d_ff, d_model)
+            dx_exp = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather_idx)
 
-            d_hidden = torch.zeros_like(grad_out)
-            d_hidden.index_add_(0, ctx.gather, dx_g)
-            return (d_hidden, None, None, None, None,)
+            # 5) expert ➜ token (reverse of forward gather)
+            dx_token = torch.zeros_like(grad_token)
+            dx_token.index_add_(0, gather_dst, dx_exp)
+            return (dx_token, None, None, None, None,)
         pass
     pass
 
