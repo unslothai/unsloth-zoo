@@ -497,7 +497,6 @@ class GptOssTopKRouter(nn.Module):
         self.hidden_dim = config.hidden_size
         self.linear = nn.Linear(self.hidden_dim, self.num_experts, dtype=config.torch_dtype)
 
-    @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = self.linear(hidden_states)  # (batch_size * seq_len, num_experts)
