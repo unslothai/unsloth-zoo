@@ -142,6 +142,7 @@ def patch_gpt_oss():
                     gammas=None,
                     fused_activation=self.act,
                 )
+                print(gather_idx, self.gate_up_proj_precision_config)
                 intermediate_cache3 = matmul_ogs(
                     intermediate_cache1,
                     self.down_proj,
@@ -151,6 +152,7 @@ def patch_gpt_oss():
                     precision_config=self.down_proj_precision_config,
                     gammas=routing_data.gate_scal,
                 )
+                print(scatter_idx, self.down_proj_precision_config)
             return intermediate_cache3
         pass
     patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
