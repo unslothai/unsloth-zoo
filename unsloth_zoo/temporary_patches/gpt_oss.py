@@ -253,6 +253,7 @@ def patch_gpt_oss():
                         gammas=routing_data.gate_scal,
                     )
                 else:
+                    print("TRAINING MOE")
                     intermediate_cache3 = Mxfp4GptOssExperts_Training.apply(
                         hidden_states,
                         self,
