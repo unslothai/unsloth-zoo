@@ -142,9 +142,16 @@ def patch_gpt_oss():
                     gammas=None,
                     fused_activation=self.act,
                 )
-                print("intermediate_cache1", intermediate_cache1.shape, intermediate_cache1.dtype)
-                print("intermediate_cache1", intermediate_cache1.shape, intermediate_cache1.dtype)
-                print(gather_idx, self.gate_up_proj_precision_config)
+                print("hidden_states", hidden_states.shape, "intermediate_cache1", intermediate_cache1.shape)
+                intermediate_cache1_new = matmul_ogs(
+                    hidden_states.to(torch.bfloat16).,
+                    self.gate_up_proj.storage.data.permute(0, 2, 1),
+                    self.gate_up_proj_bias,
+                    routing_data,
+                    gather_indx=gather_idx,
+                    precision_config=self.gate_up_proj_precision_config,
+                    gammas=None,
+                )
                 intermediate_cache3 = matmul_ogs(
                     intermediate_cache1,
                     self.down_proj,
