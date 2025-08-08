@@ -502,8 +502,8 @@ class GptOssTopKRouter(nn.Module):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = self.linear(hidden_states)  # (batch_size * seq_len, num_experts)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32)
-        router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value.to(hidden_states.dtype))
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(router_logits.dtype)
+        router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
         return router_scores, router_indices
 pass
 
