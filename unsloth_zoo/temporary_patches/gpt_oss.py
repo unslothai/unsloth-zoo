@@ -183,7 +183,7 @@ def patch_gpt_oss():
         pass
 
         @staticmethod
-        def backward(ctx, grad_out):
+        def backward(ctx, grad_token):
             (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
             self_class = ctx.self_class
             limit = getattr(self_class.down_proj, "limit", None)
