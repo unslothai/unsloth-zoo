@@ -28,6 +28,44 @@ from .utils import (
 )
 torch_cuda_device = torch.cuda.device
 
+@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
+def swiglu_torch_forward(a, alpha, limit):
+    a_gelu = a[..., ::2].to(torch.float32)
+    if limit is not None:
+        a_gelu = a_gelu.clamp(max=limit)
+    a_linear = a[..., 1::2].to(torch.float32)
+    if limit is not None:
+        a_linear = a_linear.clamp(min=-limit, max=limit)
+
+    out_gelu = a_gelu * torch.sigmoid(alpha * a_gelu)
+    out = out_gelu * (a_linear + 1)
+    return out.to(a.dtype)
+pass
+
+@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
+def swiglu_torch_backward(pre_act, alpha, limit, g1):
+    g, l = pre_act[..., ::2].to(torch.float32), pre_act[..., 1::2].to(torch.float32)
+
+    if limit is not None:
+        mask_g = g <= limit
+        mask_l = l.abs() <= limit
+        ḡ = torch.where(mask_g, g, limit)
+        l̄ = torch.where(mask_l, l, l.sign() * limit)
+    else:                                            # no clipping
+        mask_g = mask_l = torch.ones_like(g, dtype=bool)
+        ḡ, l̄ = g, l
+
+    σ   = torch.sigmoid(alpha * ḡ)
+    dg  = (σ + alpha * ḡ * σ * (1 - σ)) * (l̄ + 1)
+    dl  = ḡ * σ
+    dg  = torch.where(mask_g, dg, 0.)                # clamp-grad
+    dl  = torch.where(mask_l, dl, 0.)
+
+    grad = torch.empty_like(pre_act)
+    grad[..., ::2], grad[..., 1::2] = dg, dl
+    return g1 * grad.to(g1.dtype)
+pass
+
 
 def patch_gpt_oss():
     try:
@@ -92,44 +130,6 @@ def patch_gpt_oss():
         return w, w_scale
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4)
 
-    @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
-    def swiglu_torch_forward(a, alpha, limit):
-        a_gelu = a[..., ::2].to(torch.float32)
-        if limit is not None:
-            a_gelu = a_gelu.clamp(max=limit)
-        a_linear = a[..., 1::2].to(torch.float32)
-        if limit is not None:
-            a_linear = a_linear.clamp(min=-limit, max=limit)
-
-        out_gelu = a_gelu * torch.sigmoid(alpha * a_gelu)
-        out = out_gelu * (a_linear + 1)
-        return out.to(a.dtype)
-    pass
-
-    @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
-    def swiglu_torch_backward(pre_act, alpha, limit, g1):
-        g, l = pre_act[..., ::2].to(torch.float32), pre_act[..., 1::2].to(torch.float32)
-
-        if limit is not None:
-            mask_g = g <= limit
-            mask_l = l.abs() <= limit
-            ḡ = torch.where(mask_g, g, limit)
-            l̄ = torch.where(mask_l, l, l.sign() * limit)
-        else:                                            # no clipping
-            mask_g = mask_l = torch.ones_like(g, dtype=bool)
-            ḡ, l̄ = g, l
-
-        σ   = torch.sigmoid(alpha * ḡ)
-        dg  = (σ + alpha * ḡ * σ * (1 - σ)) * (l̄ + 1)
-        dl  = ḡ * σ
-        dg  = torch.where(mask_g, dg, 0.)                # clamp-grad
-        dl  = torch.where(mask_l, dl, 0.)
-
-        grad = torch.empty_like(pre_act)
-        grad[..., ::2], grad[..., 1::2] = dg, dl
-        return g1 * grad.to(g1.dtype)
-    pass
-
     class Mxfp4GptOssExperts_Training(torch.autograd.Function):
         @staticmethod
         def forward(
@@ -193,12 +193,12 @@ def patch_gpt_oss():
             grad_exp = grad_token.index_select(0, scatter_src)
             grad_exp.mul_(gamma.unsqueeze(-1))                        # (Texp, 1) → broadcast
             # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
-            Wd_T = ctx.self_class.down_proj.data.permute(0, 2, 1).contiguous() # (E, d_model, d_ff)
+            Wd_T = ctx.self_class.down_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, d_model, d_ff)
             g1   = matmul_ogs(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
             # 3) activation derivative
             g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
             # 4) g1 · Wuᵀ  
-            Wu_T = ctx.self_class.gate_up_proj.data.permute(0, 2, 1).contiguous() # (E, 2*d_ff, d_model)
+            Wu_T = ctx.self_class.gate_up_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, 2*d_ff, d_model)
             dx_exp = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather_idx)
 
             # 5) expert ➜ token (reverse of forward gather)
