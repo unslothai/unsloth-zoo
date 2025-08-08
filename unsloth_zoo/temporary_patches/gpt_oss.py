@@ -133,7 +133,7 @@ def patch_gpt_oss():
                 if not hasattr(self, "act"):
                     self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, None), 2)
                 intermediate_cache1 = matmul_ogs(
-                    hidden_states.to(torch.bfloat16),
+                    hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
                     self.gate_up_proj,
                     self.gate_up_proj_bias,
                     routing_data,
@@ -155,7 +155,7 @@ def patch_gpt_oss():
                     gammas=routing_data.gate_scal,
                 )
                 print(scatter_idx, self.down_proj_precision_config)
-            return intermediate_cache3.to(hidden_states.dtype)
+            return intermediate_cache3
         pass
     patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
 
@@ -175,6 +175,7 @@ def patch_gpt_oss():
 
         routed_out = self.experts(hidden_states, routing_data, gather_idx, scatter_idx)
         routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)
+        print("routed_out", "router_logits", routed_out.dtype, router_logits.dtype)
         return routed_out, router_logits
     patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward)
 
