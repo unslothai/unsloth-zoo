@@ -448,7 +448,7 @@ class GptOssExperts(nn.Module):
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         num_experts = routing_weights.shape[1]
-
+        final_dtype = torch.float32 if hidden_states.dtype == torch.float16 else torch.bfloat16
         if self.training:
             next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
             with torch.no_grad():
@@ -460,22 +460,22 @@ class GptOssExperts(nn.Module):
                     _, token_idx = torch.where(expert_mask[expert_idx[0]])
                 current_state = hidden_states[token_idx]
                 gate_up = self.gate_up_projs[expert_idx](current_state)
-                gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+                gated_output = swiglu_torch_forward(gate_up.to(torch.float32), self.alpha, self.limit)
                 # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
                 # gate = gate.clamp(min=None, max=self.limit)
                 # up = up.clamp(min=-self.limit, max=self.limit)
                 # glu = gate * torch.sigmoid(gate * self.alpha)
                 # gated_output = (up + 1) * glu
-                out = self.down_projs[expert_idx](gated_output)
-                weighted_output = out * routing_weights[token_idx, expert_idx, None]
-                next_states.index_add_(0, token_idx, weighted_output.to(torch.float32))
+                out = self.down_projs[expert_idx](gated_output).to(torch.float32)
+                weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+                next_states.index_add_(0, token_idx, weighted_output)
             next_states = next_states.view(batch_size, -1, self.hidden_size)
-            return next_states.to(hidden_states.dtype)
+            return next_states.to(final_dtype)
         else:
             X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
             gate_up = torch.stack(gate_up_list, dim=0)
-            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+            fused = swiglu_torch_forward(gate_up.to(torch.float32), self.alpha, self.limit)
             # gate = gate_up[..., ::2]
             # up_h = gate_up[..., 1::2]
             # gate = gate.clamp(max=self.limit)
@@ -485,8 +485,8 @@ class GptOssExperts(nn.Module):
             out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
             outs = torch.stack(out_list, dim=0)
             rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-            mixed = (outs * rw).sum(dim=0)
-            return mixed.view(batch_size, -1, self.hidden_size)
+            mixed = (outs.to(torch.float32) * rw.to(torch.float32)).sum(dim=0)
+            return mixed.view(batch_size, -1, self.hidden_size).to(final_dtype)
 pass
 
 class GptOssTopKRouter(nn.Module):
@@ -502,7 +502,7 @@ class GptOssTopKRouter(nn.Module):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = self.linear(hidden_states)  # (batch_size * seq_len, num_experts)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(router_logits.dtype)
         router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
         return router_scores, router_indices
 pass
@@ -520,11 +520,6 @@ class GptOssMLP(nn.Module):
 pass
 
 def patch_gpt_oss_linearized():
-    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
-    if "gpt-oss" in model_name and model_name.endswith("-unsloth-bnb-4bit"):
-        pass
-    else:
-        return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
     except Exception as e:

@@ -138,6 +138,7 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import math
 
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+UNSLOTH_ENABLE_CCE = os.environ.get("UNSLOTH_ENABLE_CCE", "1") == "1"
 
 import logging
 logger_compiler = logging.getLogger(__name__)
@@ -775,7 +776,7 @@ elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and no
         logit_scale_multiply = None if (\\2) == () else (\\2),
         logit_scale_divide   = None if (\\3) == () else (\\3),
     )
-elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -891,7 +892,7 @@ elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and n
         logit_scale_multiply = None if (\\2) == () else (\\2),
         logit_scale_divide   = None if (\\3) == () else (\\3),
     )
-elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
