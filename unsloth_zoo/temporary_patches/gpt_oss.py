@@ -142,8 +142,8 @@ def patch_gpt_oss():
                     gammas=None,
                     fused_activation=self.act,
                 )
-                print("intermediate_cache1", intermediate_cache1.shape)
-                print("intermediate_cache1", intermediate_cache1.shape)
+                print("intermediate_cache1", intermediate_cache1.shape, intermediate_cache1.dtype)
+                print("intermediate_cache1", intermediate_cache1.shape, intermediate_cache1.dtype)
                 print(gather_idx, self.gate_up_proj_precision_config)
                 intermediate_cache3 = matmul_ogs(
                     intermediate_cache1,
