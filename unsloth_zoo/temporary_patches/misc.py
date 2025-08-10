@@ -17,6 +17,7 @@
 import torch
 import torch.nn as nn
 import inspect
+import importlib
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 from .common import TEMPORARY_PATCHES, torch_compile_options
 from .utils import (
@@ -617,3 +618,45 @@ def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     patch_function(transformers.models.granitemoehybrid.modeling_granitemoehybrid.GraniteMoeHybridMambaLayer, "cuda_kernels_forward", cuda_kernels_forward)
 pass
 TEMPORARY_PATCHES.append(patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward)
+
+
+def fix_mamba_ssm_float32():
+    try:
+        import mamba_ssm.ops.triton.ssd_chunk_scan
+    except ImportError:
+        return
+    except Exception as e:
+        return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+
+    # Try getting file for mamba_ssm
+    try:
+        ssd_chunk_scan_file = inspect.getfile(mamba_ssm.ops.triton.ssd_chunk_scan)
+        with open(ssd_chunk_scan_file, "r") as file: file = file.read()
+    except Exception as e:
+        return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+
+    # Find dst +=|= tl.dot(a, b)
+    matches = list(re.finditer(
+        r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)",
+        file)
+    )
+    for match in matches:
+        old = match.group(0)
+        dst, adder, a, b = match.groups()
+        accumulator = '' if adder == "=" else f', acc = {dst}'
+        # Change to float32 if float16 seen otherwise leave as original precision
+        new = f" {dst} = tl.dot("\
+            f"{a}.to(tl.float32 if {a}.dtype == tl.float16 else {a}.dtype), "\
+            f"{b}.to(tl.float32 if {a}.dtype == tl.float16 else {a}.dtype)"\
+            f"{accumulator})"
+        file = file.replace(old, new)
+    pass
+
+    try:
+        # Reload module since we editted it
+        with open(ssd_chunk_scan_file, "w") as f: f.write(file)
+        importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
+    except Exception as e:
+        return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+pass
+TEMPORARY_PATCHES.append(fix_mamba_ssm_float32)
