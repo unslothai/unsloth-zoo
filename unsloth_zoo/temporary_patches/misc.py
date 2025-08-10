@@ -646,8 +646,8 @@ def fix_mamba_ssm_float32():
         accumulator = '' if adder == "=" else f', acc = {dst}'
         # Change to float32 if float16 seen otherwise leave as original precision
         new = f" {dst} = tl.dot("\
-            f"{a}.to(tl.float32 if {a}.dtype == tl.float16 else {a}.dtype), "\
-            f"{b}.to(tl.float32 if {a}.dtype == tl.float16 else {a}.dtype)"\
+            f"{a}.to(tl.float32), "\
+            f"{b}.to(tl.float32)"\
             f"{accumulator})"
         file = file.replace(old, new)
     pass
