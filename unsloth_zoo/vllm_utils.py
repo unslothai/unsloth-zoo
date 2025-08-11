@@ -53,7 +53,8 @@ from .temporary_patches.common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
 )
-from unsloth import DEVICE_TYPE
+# from unsloth import DEVICE_TYPE
+DEVICE_TYPE = "cuda"
 global LORA_REQUEST_ID
 
 # Ignore logging messages
@@ -911,13 +912,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
 
     if is_vision_model:
         # Handle vision-specific layers using dedicated functions
-        if model_type == "mllama":
-            extract_mllama_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
-        elif model_type == "qwen2_5_vl":
-            extract_qwen2_5_vl_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
-        elif model_type == "gemma3":
-            extract_gemma3_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
-
+        extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
     # Norm
     # For Gemma3 and similar multimodal models, norm should be under model.norm
     # For standard models, also under model.norm
@@ -954,9 +949,9 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
     difference = new_state_dict.keys() ^ old_state_dict.keys()
     difference -= set(("model.lm_head.weight","model.language_model.lm_head.weight", "lm_head.weight"))
     if len(difference) != 0:
-        missing_from_vllm = new_state_dict.keys() - old_state_dict.keys()
-        missing_from_hf = old_state_dict.keys() - new_state_dict.keys()
-        print(f'Unsloth: Failed comparing state_dict with Missing from vllm: {missing_from_vllm}\nMissing from hf: {missing_from_hf}')
+        missing_from_hf = new_state_dict.keys() - old_state_dict.keys()
+        missing_from_vllm = old_state_dict.keys() - new_state_dict.keys()
+        print(f'Unsloth: Failed comparing state_dict with Missing from hf: {missing_from_hf}\nMissing from vllm: {missing_from_vllm}')
         raise RuntimeError(f"Unsloth: Failed comparing state_dict with {difference}")
     pass
 
@@ -2130,6 +2125,7 @@ def _test_get_vllm_state_dict(
         else:
             raise ValueError(f"Unsloth: Model type {model_type} not supported for vision models")
 
+    print(f'Loading model with type {model_class}')
     model = model_class.from_pretrained(
         model_name,
         device_map          = "auto",
@@ -2142,7 +2138,7 @@ def _test_get_vllm_state_dict(
     # unpatch_bitsandbytes_compute_dtype()
     for param in model.parameters():
         param.requires_grad_(False)
-    model, _ = patch_model_and_tokenizer(model, None)
+    # model, _ = patch_model_and_tokenizer(model, None)
     model.eval()
 
     # Patch vLLM to disable multiprocessing for state dict extraction
