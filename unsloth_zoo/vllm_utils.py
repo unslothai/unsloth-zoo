@@ -53,8 +53,7 @@ from .temporary_patches.common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
 )
-# from unsloth import DEVICE_TYPE
-DEVICE_TYPE = "cuda"
+from unsloth import DEVICE_TYPE
 global LORA_REQUEST_ID
 
 # Ignore logging messages
@@ -2132,15 +2131,9 @@ def _test_get_vllm_state_dict(
     if not is_vision_model:
         model_class = AutoModelForCausalLM
     else:
-        if model_type == "qwen2_5_vl":
-            from transformers import Qwen2_5_VLForConditionalGeneration
-            model_class = Qwen2_5_VLForConditionalGeneration
-        elif model_type == "gemma3":
-            from transformers import Gemma3ForConditionalGeneration
-            model_class = Gemma3ForConditionalGeneration
-        elif model_type == "mllama":
-            from transformers import MllamaForConditionalGeneration
-            model_class = MllamaForConditionalGeneration
+        if model_type in ["qwen2_5_vl", "gemma3"]:
+            import transformers
+            model_class = getattr(transformers, config.architectures[0])
         else:
             raise ValueError(f"Unsloth: Model type {model_type} not supported for vision models")
 
@@ -2157,7 +2150,7 @@ def _test_get_vllm_state_dict(
     # unpatch_bitsandbytes_compute_dtype()
     for param in model.parameters():
         param.requires_grad_(False)
-    # model, _ = patch_model_and_tokenizer(model, None)
+    model, _ = patch_model_and_tokenizer(model, None)
     model.eval()
 
     # Patch vLLM to disable multiprocessing for state dict extraction
