@@ -220,8 +220,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     )
 
     # Get layer names from config
-    layer_config = get_model_layer_config("causal_lm", config)
-    layer_names = layer_config['standard_layers'] + layer_config['layernorms']
+    layer_config = get_model_layer_config()
+    layer_names = sum(layer_config.values(), [])
 
     return new_model, original_meta_model, layer_names, config.num_hidden_layers
 
@@ -248,17 +248,8 @@ def create_empty_vision_model(config, dtype = torch.float16):
             return
         SiglipVisionModel._init_weights = _init_weights
 
-    if model_type == "qwen2_5_vl":
-        from transformers import Qwen2_5_VLForConditionalGeneration
-        model_cls = Qwen2_5_VLForConditionalGeneration
-    elif model_type == "mllama":
-        from transformers import MllamaForConditionalGeneration
-        model_cls = MllamaForConditionalGeneration
-    elif model_type == "gemma3":
-        from transformers import Gemma3ForConditionalGeneration
-        model_cls = Gemma3ForConditionalGeneration
-    else:
-        raise ValueError(f"Unsloth: Unsupported vision model type: {model_type}")
+    import transformers
+    model_cls = getattr(transformers, config.architectures[0])
 
     try:
         # Use accelerate's init_empty_weights, not transformers.modeling_utils
@@ -316,11 +307,8 @@ def create_empty_vision_model(config, dtype = torch.float16):
     new_model = model_cls(new_config)
 
     # Get layer names from config
-    layer_config = get_model_layer_config(model_type, config)
-    layer_names = (layer_config['standard_layers'] +
-                  layer_config['layernorms'] +
-                  layer_config['vision_layers'] +
-                  layer_config['additional_layers'])
+    layer_config = get_model_layer_config()
+    layer_names = sum(layer_config.values(), [])
 
     return new_model, original_meta_model, layer_names, num_layers
 
@@ -408,15 +396,14 @@ def set_additional_modules(new_model, quant_state_dict, config):
     pass
 pass
 
-def get_unified_layer_config():
+def get_model_layer_config():
     """
     Returns a unified layer configuration containing the union of layer names
-    from all supported vision models.
+    from all supported vision models. Serves as a fallback.
 
     Returns:
         dict: Dictionary containing layer templates for different components.
     """
-    # Define all possible layer prefixes and templates
     layer_templates = {
         'standard_layers': {
             "model.language_model.layers.{kk}.self_attn.q_proj",
@@ -426,6 +413,7 @@ def get_unified_layer_config():
             "model.language_model.layers.{kk}.mlp.gate_proj",
             "model.language_model.layers.{kk}.mlp.up_proj",
             "model.language_model.layers.{kk}.mlp.down_proj",
+
             "model.layers.{kk}.self_attn.q_proj",
             "model.layers.{kk}.self_attn.k_proj",
             "model.layers.{kk}.self_attn.v_proj",
@@ -441,14 +429,14 @@ def get_unified_layer_config():
             "model.language_model.layers.{kk}.post_feedforward_layernorm",
             "model.language_model.layers.{kk}.self_attn.q_norm",
             "model.language_model.layers.{kk}.self_attn.k_norm",
-            "model.language_model.norm",
+            "model.language_model.layers.{kk}.cross_attn.q_norm",
+            "model.language_model.layers.{kk}.cross_attn.k_norm",
             "model.layers.{kk}.input_layernorm",
             "model.layers.{kk}.post_attention_layernorm",
             "model.layers.{kk}.pre_feedforward_layernorm",
             "model.layers.{kk}.post_feedforward_layernorm",
             "model.layers.{kk}.q_norm",
             "model.layers.{kk}.k_norm",
-            "model.visual.norm",
             "model.visual.blocks.{kk}.norm1",
             "model.visual.blocks.{kk}.norm2",
             "model.vision_tower.vision_model.encoder.layers.{kk}.post_layernorm",
@@ -456,58 +444,77 @@ def get_unified_layer_config():
             "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm2",
         },
         'vision_layers': {
-            # mllama & gemma3 style
+
+            # These will be used while converting from vLLM to HF
             "model.vision_model.transformer.layers.{kk}.self_attn.q_proj",
             "model.vision_model.transformer.layers.{kk}.self_attn.k_proj",
             "model.vision_model.transformer.layers.{kk}.self_attn.v_proj",
+            "model.vision_model.transformer.layers.{kk}.self_attn.qkv_proj", # for extracting from vLLM
             "model.vision_model.transformer.layers.{kk}.self_attn.o_proj",
+            'model.vision_model.global_transformer.layers.{kk}.gate_ffn',
+            'model.vision_model.global_transformer.layers.{kk}.gate_attn',
+            "model.vision_model.transformer.layers.{kk}.input_layernorm",
+            "model.vision_model.transformer.layers.{kk}.post_attention_layernorm",
+
             "model.vision_model.transformer.layers.{kk}.mlp.fc1",
             "model.vision_model.transformer.layers.{kk}.mlp.fc2",
+
+            "model.language_model.layers.{kk}.cross_attn.q_proj",
+            "model.language_model.layers.{kk}.cross_attn.k_proj",
+            "model.language_model.layers.{kk}.cross_attn.v_proj",
+            "model.language_model.layers.{kk}.cross_attn.qkv_proj",
+            "model.language_model.layers.{kk}.cross_attn.o_proj",
+            "model.language_model.layers.{kk}.cross_attn_input_layernorm",
+            "model.language_model.layers.{kk}.cross_attn_post_attention_layernorm",
+
             "model.vision_model.global_transformer.layers.{kk}.self_attn.q_proj",
             "model.vision_model.global_transformer.layers.{kk}.self_attn.k_proj",
             "model.vision_model.global_transformer.layers.{kk}.self_attn.v_proj",
+            "model.vision_model.global_transformer.layers.{kk}.self_attn.qkv_proj",
             "model.vision_model.global_transformer.layers.{kk}.self_attn.o_proj",
+
             "model.vision_model.global_transformer.layers.{kk}.mlp.fc1",
             "model.vision_model.global_transformer.layers.{kk}.mlp.fc2",
+
             "model.vision_tower.vision_model.encoder.layers.{kk}.self_attn.q_proj",
             "model.vision_tower.vision_model.encoder.layers.{kk}.self_attn.k_proj",
             "model.vision_tower.vision_model.encoder.layers.{kk}.self_attn.v_proj",
+            "model.vision_tower.vision_model.encoder.layers.{kk}.self_attn.qkv_proj",
             "model.vision_tower.vision_model.encoder.layers.{kk}.self_attn.out_proj",
+
             "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc1",
             "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc2",
+
             # qwen2.5_vl style
             "model.visual.blocks.{kk}.attn.qkv",
             "model.visual.blocks.{kk}.attn.proj",
+
             "model.visual.blocks.{kk}.mlp.gate_proj",
             "model.visual.blocks.{kk}.mlp.up_proj",
             "model.visual.blocks.{kk}.mlp.down_proj",
+
         },
         'additional_layers': {
-            "model.layers.{kk}.cross_attn.qkv_proj",
-            "model.layers.{kk}.cross_attn.o_proj",
-            "model.visual.merger.ln_q",
-            "model.visual.merger.mlp.0",
-            "model.visual.merger.mlp.2",
-            "model.visual.patch_embed.proj",
+            "model.visual.merger.mlp.{kk}",
+            "model.visual.merger.mlp.{kk}",
+            'model.language_model.layers.{kk}.cross_attn_mlp_gate',
+            'model.language_model.layers.{kk}.cross_attn_attn_gate',
         },
+        "non_layered_components":{
+            "model.language_model.norm",
+            "model.visual.norm",
+            "model.visual.merger.ln_q",
+            "model.visual.patch_embed.proj",
+            "model.multi_modal_projector.mm_soft_emb_norm",
+            "model.multi_modal_projector.mm_input_projection_weight",
+            "model.vision_tower.vision_model.embeddings.patch_embedding",
+            "model.vision_tower.vision_model.embeddings.position_embedding",
+            "model.vision_tower.vision_model.post_layernorm",
+            "model.multi_modal_projector.mm_input_projection_weight"
+        }
     }
-
     # Convert sets to sorted lists for deterministic order
     return {key: sorted(list(value)) for key, value in layer_templates.items()}
-
-
-def get_model_layer_config(model_type, config=None):
-    """
-    Returns a unified layer configuration for different model types.
-
-    Args:
-        model_type: Type of model ("causal_lm", "mllama", "qwen2_5_vl", "gemma3")
-        config: Model configuration (optional, not used in the unified version)
-
-    Returns:
-        dict: Dictionary containing layer templates for different components
-    """
-    return get_unified_layer_config()
 
 
 def get_model_layer_counts(config):
@@ -543,92 +550,79 @@ def get_model_layer_counts(config):
         return getattr(config, "num_hidden_layers", 32)
 
 
-def _get_nested_attr(obj, attr_path):
-    if attr_path.startswith('model.'):
-        attr_path = attr_path.replace('model.', '')
+def _get_nested_attr(obj, attr_path: str):
+    parts = attr_path.split(".")
+    if parts[0] == "model" and not hasattr(obj, "model"):
+        parts = parts[1:]
+    cur = obj
     try:
-        for attr in attr_path.split('.'):
-            if attr.isdigit(): # to handle modulelist
-                obj = obj[int(attr)]
+        for part in parts:
+            if part.isdigit():
+                cur = cur[int(part)]
             else:
-                obj = getattr(obj, attr)
-        return obj
-    except (AttributeError, IndexError, TypeError):
+                cur = getattr(cur, part)
+        return cur
+    except (AttributeError, IndexError):
         return None
+    return None
+
 
 def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict):
     """
-    Extracts vision layers for any supported vision model by dynamically checking
-    for the existence of layers from a unified configuration.
+    Extracts vision layers for any supported vision model by dynamically using
+    a model-specific configuration. This approach is more robust and avoids
+    failures by correctly identifying layer paths and parameters.
     """
-    layer_config = get_unified_layer_config()
-    all_layers = (
-        layer_config['vision_layers'] +
-        layer_config['layernorms'] +
-        layer_config['additional_layers']
+    model_type = vllm_internals.config.model_type
+    layer_config = get_model_layer_config()
+
+    all_layered_templates = (
+        layer_config.get('vision_layers', []) +
+        layer_config.get('layernorms', []) +
+        layer_config.get('additional_layers', [])
     )
 
     layer_counts = get_model_layer_counts(vllm_internals.config)
-    if isinstance(layer_counts, dict):
-        # For vision models, we might have different layer counts for different parts
-        num_layers_to_iterate = max(layer_counts.values())
-    else:
-        num_layers_to_iterate = layer_counts
+    num_layers_to_iterate = max(layer_counts.values()) if isinstance(layer_counts, dict) else layer_counts
 
+    # Process layered components
     for kk in range(num_layers_to_iterate):
-        for layer_template in all_layers:
+        for layer_template in all_layered_templates:
             layer_path = layer_template.format(kk=kk)
             layer_module = _get_nested_attr(vllm_internals, layer_path)
 
             if layer_module is not None:
-                # Handle special cases for unified QKV weights
-                if "qkv_proj" in layer_path or "attn.qkv" in layer_path:
-                    # mllama and qwen2.5_vl have combined QKV projections
-                    if vllm_internals.config.model_type in ["mllama", "gemma3"]:
+                if "qkv_proj" in layer_path:
+                    if model_type in ["mllama", "gemma3"]:
                          get_state_dict(f"{layer_path.replace('qkv_proj', 'q_proj')}", 0, state_dict, layer_module)
                          get_state_dict(f"{layer_path.replace('qkv_proj', 'k_proj')}", 1, state_dict, layer_module)
                          get_state_dict(f"{layer_path.replace('qkv_proj', 'v_proj')}", 2, state_dict, layer_module)
-                    elif "qwen2_5_vl" in vllm_internals.config.model_type:
+                    elif model_type == "qwen2_5_vl":
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
 
-                elif "fc1" in layer_path or "gate_proj" in layer_path:
-                     get_state_dict(layer_path, 0, state_dict, layer_module)
-                elif "fc2" in layer_path or "down_proj" in layer_path:
-                     get_state_dict(layer_path, 0, state_dict, layer_module)
-                elif "up_proj" in layer_path:
-                     get_state_dict(layer_path, 0, state_dict, layer_module)
-                elif "o_proj" in layer_path or "out_proj" in layer_path or "attn.proj" in layer_path:
+                elif "fc" in layer_path or "proj" in layer_path:
                     get_state_dict(layer_path, 0, state_dict, layer_module)
-
-                # Handle layernorms and other layers
-                else:
-                    is_norm = any(norm_name in layer_path for norm_name in ["layernorm", "norm"])
-                    if is_norm and hasattr(layer_module, 'weight'):
+                else: # Handle other layers, especially layernorms
+                    if hasattr(layer_module, 'weight'):
                         state_dict[f"{layer_path}.weight"] = layer_module.weight.data
                         quant_state_dict[f"{layer_path}.weight"] = state_dict[f"{layer_path}.weight"]
-                    elif hasattr(layer_module, 'weight'):
-                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
+                        if hasattr(layer_module, 'bias') and layer_module.bias is not None:
+                             state_dict[f"{layer_path}.bias"] = layer_module.bias.data
+                             quant_state_dict[f"{layer_path}.bias"] = state_dict[f"{layer_path}.bias"]
 
-
-    # Extract non-layered vision components
-    # (e.g., embeddings, projectors)
-    non_layered_components = [
-        "model.vision_tower.vision_model.embeddings.patch_embedding",
-        "model.vision_tower.vision_model.embeddings.position_embedding",
-        "model.vision_tower.vision_model.post_layernorm",
-        "model.multi_modal_projector.mm_input_projection_weight",
-        "model.multi_modal_projector.mm_soft_emb_norm.weight",
-        "model.visual.patch_embed.proj",
-        "model.visual.merger.ln_q",
-        "model.visual.merger.mlp.0",
-        "model.visual.merger.mlp.2",
-    ]
-
+    # Extract non-layered vision components using a more robust method
+    non_layered_components = layer_config.get('non_layered_components', [])
     for component_path in non_layered_components:
         component = _get_nested_attr(vllm_internals, component_path)
+
         if component is not None:
-             if "weight" in component_path and not component_path.endswith(".weight"):
+            if isinstance(component, torch.nn.Module):
+                for param_name, param in component.named_parameters():
+                    full_param_path = f"{component_path}.{param_name}"
+                    state_dict[full_param_path] = param.data
+                    quant_state_dict[full_param_path] = param.data
+            elif isinstance(component, torch.nn.Parameter):
                 state_dict[component_path] = component.data
-                quant_state_dict[component_path] = state_dict[component_path]
-             else:
-                get_state_dict(component_path, 0, state_dict, component, slice_weights=False)
+                quant_state_dict[component_path] = component.data
+            else:
+                print(f"Unsloth: Skipping non-layered component '{component_path}' of unexpected type: {type(component)}")

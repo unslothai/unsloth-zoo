@@ -787,64 +787,67 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     quant_state_dict = OrderedDict()
 
     def get_state_dict(prefix, kk, state_dict, proj, slice_weights=True):
-        proj = getattr(proj, "base_layer", proj)
-        qweight = proj.weight
+        try:
+            proj = getattr(proj, "base_layer", proj)
+            qweight = proj.weight
 
-        # Determine slicing offsets
-        output_sizes = getattr(proj, "output_sizes", None)
-        if output_sizes is not None:
-            dim_offsets = np.cumsum([0] + output_sizes)
-        else:
-            dim_offsets = [0, qweight.shape[0]]
-
-        # Handle quantized weights
-        quant_states = getattr(qweight, "bnb_quant_state", None)
-        if quant_states is not None:
-            offsets = qweight.bnb_shard_offsets
-            if slice_weights:
-                weight = qweight[offsets[kk] : offsets[kk + 1]]
-                quant_state_dict[prefix + ".weight.quant_state"] = quant_states[kk]
-                quant_state = quant_states[kk].as_dict(packed = True)
-                for k, v in quant_state.items():
-                    state_dict[prefix + ".weight." + k] = v
+            # Determine slicing offsets
+            output_sizes = getattr(proj, "output_sizes", None)
+            if output_sizes is not None:
+                dim_offsets = np.cumsum([0] + output_sizes)
             else:
-                weight = qweight
-                quant_state_dict[prefix + ".weight.quant_state"] = quant_states[0]
-                quant_state = quant_states[0].as_dict(packed = True)
-                for k, v in quant_state.items():
-                    state_dict[prefix + ".weight." + k] = v
-        else:
-            # Normal FP16 weights
-            qweight.requires_grad_(False)
-            if slice_weights:
-                weight = qweight[dim_offsets[kk] : dim_offsets[kk + 1]]
+                dim_offsets = [0, qweight.shape[0]]
+
+            # Handle quantized weights
+            quant_states = getattr(qweight, "bnb_quant_state", None)
+            if quant_states is not None:
+                offsets = qweight.bnb_shard_offsets
+                if slice_weights:
+                    weight = qweight[offsets[kk] : offsets[kk + 1]]
+                    quant_state_dict[prefix + ".weight.quant_state"] = quant_states[kk]
+                    quant_state = quant_states[kk].as_dict(packed = True)
+                    for k, v in quant_state.items():
+                        state_dict[prefix + ".weight." + k] = v
+                else:
+                    weight = qweight
+                    quant_state_dict[prefix + ".weight.quant_state"] = quant_states[0]
+                    quant_state = quant_states[0].as_dict(packed = True)
+                    for k, v in quant_state.items():
+                        state_dict[prefix + ".weight." + k] = v
             else:
-                weight = qweight
+                # Normal FP16 weights
+                qweight.requires_grad_(False)
+                if slice_weights:
+                    weight = qweight[dim_offsets[kk] : dim_offsets[kk + 1]]
+                else:
+                    weight = qweight
 
-        # Apply vocab_size truncation for embedding and lm_head layers
-        if vocab_size is not None and ("embed_tokens" in prefix or "lm_head" in prefix):
-            if weight.shape[0] > vocab_size:
-                weight = weight[:vocab_size]
-
-        state_dict[prefix + ".weight"] = weight
-        quant_state_dict[prefix + ".weight"] = weight
-
-        # Handle bias
-        bias = getattr(proj, "bias", None)
-        if bias is not None:
-            bias.requires_grad_(False)
-            if slice_weights:
-                bias_tensor = bias[dim_offsets[kk] : dim_offsets[kk + 1]]
-            else:
-                bias_tensor = bias
-
-            # Apply vocab_size truncation for bias as well
+            # Apply vocab_size truncation for embedding and lm_head layers
             if vocab_size is not None and ("embed_tokens" in prefix or "lm_head" in prefix):
-                if bias_tensor.shape[0] > vocab_size:
-                    bias_tensor = bias_tensor[:vocab_size]
+                if weight.shape[0] > vocab_size:
+                    weight = weight[:vocab_size]
 
-            state_dict[prefix + ".bias"] = bias_tensor
-            quant_state_dict[prefix + ".bias"] = bias_tensor
+            state_dict[prefix + ".weight"] = weight
+            quant_state_dict[prefix + ".weight"] = weight
+
+            # Handle bias
+            bias = getattr(proj, "bias", None)
+            if bias is not None:
+                bias.requires_grad_(False)
+                if slice_weights:
+                    bias_tensor = bias[dim_offsets[kk] : dim_offsets[kk + 1]]
+                else:
+                    bias_tensor = bias
+
+                # Apply vocab_size truncation for bias as well
+                if vocab_size is not None and ("embed_tokens" in prefix or "lm_head" in prefix):
+                    if bias_tensor.shape[0] > vocab_size:
+                        bias_tensor = bias_tensor[:vocab_size]
+
+                state_dict[prefix + ".bias"] = bias_tensor
+                quant_state_dict[prefix + ".bias"] = bias_tensor
+        except:
+            print(f'failed to extract weights for {prefix}')
     pass
 
     # Embedding
@@ -863,7 +866,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     get_state_dict(f"{vllm_text_model_prefix}.embed_tokens", 0, state_dict, embed_tokens, slice_weights=False)
 
     # Get layer configuration for this model type
-    layer_config = get_model_layer_config(model_type, text_config)
+    layer_config = get_model_layer_config()
 
     # All layers
     skipped_layernorms = []
@@ -873,14 +876,18 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
             qkv_proj = layer.self_attn.qkv_proj
             o_proj = layer.self_attn.o_proj
+
+            get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
+            get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
+            get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
         elif hasattr(layer, "cross_attn"):
-            prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
+            prefix = "{vllm_text_model_prefix}.layers.{kk}.cross_attn.qkv_proj.proj[{proj_name}]"
             qkv_proj = layer.cross_attn.qkv_proj
             o_proj = layer.cross_attn.o_proj
 
-        get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
-        get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
-        get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
+            get_state_dict(prefix.format(vllm_text_model_prefix=vllm_text_model_prefix,proj_name='q_proj_decoder'), 0, state_dict, qkv_proj)
+            get_state_dict(prefix.format(vllm_text_model_prefix=vllm_text_model_prefix,proj_name='kv_proj_encoder'), 0, state_dict, qkv_proj)
+            get_state_dict(prefix.format(vllm_text_model_prefix=vllm_text_model_prefix,proj_name='kv_proj_encoder'), 1, state_dict, qkv_proj)
 
         get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
@@ -1040,7 +1047,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 continue
             layer_name = layer_name.format(kk = kk)
             if f"{layer_name}.weight" not in quant_state_dict:
-                skipped_layernorms.append(layer_name.split(".")[-1])
+                if "norm" in layer_name:
+                    skipped_layernorms.append(layer_name.split(".")[-1])
                 continue
             pass
             weight = quant_state_dict[f"{layer_name}.weight"]
@@ -1090,7 +1098,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             pass
 
             # Convert model.layers.0.self_attn.q_proj to model.layers[0].self_attn.q_proj
-            layer_name = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
+            layer_name = re.sub(r"\.([\d]{1,})", lambda x: f"[{x.group(1)}]", layer_name)
             exec(f"new_model.{layer_name} = layer")
         pass
     pass
@@ -1295,19 +1303,28 @@ def load_vllm(
         account_for_gradients = training,
     )
 
-    # Check max_num_batched_tokens for max_seq_length
-    # Must be >= max_num_batched_tokens
-    if max_num_batched_tokens <= 0:
-        max_seq_length = 256
-        max_num_batched_tokens = 256
+    enable_chunked_prefill = True
+    is_mllama = "mllama" in config.model_type
+    if is_mllama:
+        # chunked prefill is not supported for vLLM V0.
+        enable_chunked_prefill = False
+        assert not enable_lora, "Unsloth: MLLama does not support LoRA with fast inference"
+        assert max_seq_length >= 8192, "Unsloth: MLLama requires max_seq_length >= 8192 for fast inference"
 
-    if max_num_batched_tokens <= max_seq_length:
-        print(
-            f"Unsloth: Your GPU cannot handle sequence lengths of {max_seq_length} due to limited GPU memory.\n"\
-            f"Unsloth: Your GPU can only handle approximately the maximum sequence length of {max_seq_length}."
-        )
-        max_seq_length = max_num_batched_tokens
-    pass
+    else:
+        # Check max_num_batched_tokens for max_seq_length
+        # Must be >= max_num_batched_tokens
+        if max_num_batched_tokens <= 0:
+            max_seq_length = 256
+            max_num_batched_tokens = 256
+
+        if max_num_batched_tokens <= max_seq_length:
+            print(
+                f"Unsloth: Your GPU cannot handle sequence lengths of {max_seq_length} due to limited GPU memory.\n"\
+                f"Unsloth: Your GPU can only handle approximately the maximum sequence length of {max_seq_length}."
+            )
+            max_seq_length = max_num_batched_tokens
+        pass
 
     # Get correct dtype
     if DEVICE_TYPE == "cuda" and major_version >= 8: _dtype = torch.bfloat16
@@ -1507,7 +1524,7 @@ def load_vllm(
 
         disable_log_stats      = disable_log_stats,
         enable_prefix_caching  = enable_prefix_caching,
-        enable_chunked_prefill = True, # LoRA fails with chunked prefill as at Feb 2025
+        enable_chunked_prefill = enable_chunked_prefill, # LoRA fails with chunked prefill as at Feb 2025
         # max_seq_len_to_capture fails for V1
         # max_seq_len_to_capture = min(8192, max_seq_length + 256), # Default is 8192 for CUDAGraphs
         compilation_config     = compilation_config, # 0, 1, 2, 3
@@ -2110,6 +2127,8 @@ def _test_get_vllm_state_dict(
     # patch_bitsandbytes_compute_dtype(dtype)
     model_type = getattr(config, "model_type", "causal_lm")
 
+    enable_lora = model_type != "mllama"
+
     if not is_vision_model:
         model_class = AutoModelForCausalLM
     else:
@@ -2153,6 +2172,8 @@ def _test_get_vllm_state_dict(
         float8_kv_cache        = float8_kv_cache,
         unsloth_vllm_standby   = unsloth_vllm_standby,
         use_bitsandbytes       = load_in_4bit,
+        is_vision_model        = is_vision_model,
+        enable_lora            = enable_lora,
     )
 
     state_dict, quant_state_dict = get_vllm_state_dict(
