@@ -53,7 +53,8 @@ from .temporary_patches.common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
 )
-from unsloth import DEVICE_TYPE
+# from unsloth import DEVICE_TYPE
+DEVICE_TYPE = "cuda"
 global LORA_REQUEST_ID
 
 # Ignore logging messages
@@ -880,13 +881,18 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
             get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
         elif hasattr(layer, "cross_attn"):
-            prefix = "{vllm_text_model_prefix}.layers.{kk}.cross_attn.qkv_proj.proj[{proj_name}]"
+            prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
             qkv_proj = layer.cross_attn.qkv_proj
             o_proj = layer.cross_attn.o_proj
+            name = re.sub(r"\.(\d+)\.", r"[\1].", prefix.replace('model.language_model','language_model.model', 1) + ".qkv_proj")
+            cross_attn_layer = eval(f'vllm_internals.{name}')
+            q_proj = cross_attn_layer.proj['q_proj_decoder']
+            kv_proj = cross_attn_layer.proj['kv_proj_encoder']
+            get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
+            get_state_dict(f"{prefix}.k_proj", 0, state_dict, kv_proj)
+            get_state_dict(f"{prefix}.v_proj", 1, state_dict, kv_proj)
 
-            get_state_dict(prefix.format(vllm_text_model_prefix=vllm_text_model_prefix,proj_name='q_proj_decoder'), 0, state_dict, qkv_proj)
-            get_state_dict(prefix.format(vllm_text_model_prefix=vllm_text_model_prefix,proj_name='kv_proj_encoder'), 0, state_dict, qkv_proj)
-            get_state_dict(prefix.format(vllm_text_model_prefix=vllm_text_model_prefix,proj_name='kv_proj_encoder'), 1, state_dict, qkv_proj)
+
 
         get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
@@ -2131,7 +2137,7 @@ def _test_get_vllm_state_dict(
     if not is_vision_model:
         model_class = AutoModelForCausalLM
     else:
-        if model_type in ["qwen2_5_vl", "gemma3"]:
+        if model_type in ["qwen2_5_vl", "gemma3", "mllama"]:
             import transformers
             model_class = getattr(transformers, config.architectures[0])
         else:
@@ -2150,7 +2156,7 @@ def _test_get_vllm_state_dict(
     # unpatch_bitsandbytes_compute_dtype()
     for param in model.parameters():
         param.requires_grad_(False)
-    model, _ = patch_model_and_tokenizer(model, None)
+    # model, _ = patch_model_and_tokenizer(model, None)
     model.eval()
 
     # Patch vLLM to disable multiprocessing for state dict extraction

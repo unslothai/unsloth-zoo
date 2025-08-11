@@ -451,10 +451,11 @@ def get_model_layer_config():
             "model.vision_model.transformer.layers.{kk}.self_attn.v_proj",
             "model.vision_model.transformer.layers.{kk}.self_attn.qkv_proj", # for extracting from vLLM
             "model.vision_model.transformer.layers.{kk}.self_attn.o_proj",
-            'model.vision_model.global_transformer.layers.{kk}.gate_ffn',
             'model.vision_model.global_transformer.layers.{kk}.gate_attn',
             "model.vision_model.transformer.layers.{kk}.input_layernorm",
             "model.vision_model.transformer.layers.{kk}.post_attention_layernorm",
+            "model.vision_model.global_transformer.layers.{kk}.input_layernorm",
+            "model.vision_model.global_transformer.layers.{kk}.post_attention_layernorm",
 
             "model.vision_model.transformer.layers.{kk}.mlp.fc1",
             "model.vision_model.transformer.layers.{kk}.mlp.fc2",
@@ -497,11 +498,16 @@ def get_model_layer_config():
         'additional_layers': {
             "model.visual.merger.mlp.{kk}",
             "model.visual.merger.mlp.{kk}",
-            'model.language_model.layers.{kk}.cross_attn_mlp_gate',
-            'model.language_model.layers.{kk}.cross_attn_attn_gate',
+            'model.language_model.model.layers.{kk}.cross_attn_mlp_gate',
+            'model.language_model.model.layers.{kk}.cross_attn_attn_gate',
+            'model.vision_model.global_transformer.layers.{kk}.gate_ffn',
         },
         "non_layered_components":{
+            "model.multi_modal_projector",
             "model.language_model.norm",
+            'model.vision_model.layernorm_pre',
+            'model.vision_model.layernorm_post',
+            'model.vision_model.class_embedding',
             "model.visual.norm",
             "model.visual.merger.ln_q",
             "model.visual.patch_embed.proj",
@@ -510,7 +516,13 @@ def get_model_layer_config():
             "model.vision_tower.vision_model.embeddings.patch_embedding",
             "model.vision_tower.vision_model.embeddings.position_embedding",
             "model.vision_tower.vision_model.post_layernorm",
-            "model.multi_modal_projector.mm_input_projection_weight"
+            "model.multi_modal_projector.mm_input_projection_weight",
+            "model.vision_model.post_tile_positional_embedding.gate",
+            "model.vision_model.gated_positional_embedding.tile_embedding",
+            "model.vision_model.pre_tile_positional_embedding.embedding",
+            "model.vision_model.gated_positional_embedding",
+            "model.vision_model.post_tile_positional_embedding.embedding",
+            "model.vision_model.pre_tile_positional_embedding.gate"
         }
     }
     # Convert sets to sorted lists for deterministic order
@@ -591,6 +603,11 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
             layer_path = layer_template.format(kk=kk)
             layer_module = _get_nested_attr(vllm_internals, layer_path)
 
+            if 'language_model.model' in layer_path:
+                # vLLM uses vllm_internals.language_model.model.layers while HF uses model.language_model.layers
+                layer_path = layer_path.replace('language_model.model', 'language_model')
+
+
             if layer_module is not None:
                 if "qkv_proj" in layer_path:
                     if model_type in ["mllama", "gemma3"]:
@@ -603,12 +620,18 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 elif "fc" in layer_path or "proj" in layer_path:
                     get_state_dict(layer_path, 0, state_dict, layer_module)
                 else: # Handle other layers, especially layernorms
-                    if hasattr(layer_module, 'weight'):
-                        state_dict[f"{layer_path}.weight"] = layer_module.weight.data
-                        quant_state_dict[f"{layer_path}.weight"] = state_dict[f"{layer_path}.weight"]
-                        if hasattr(layer_module, 'bias') and layer_module.bias is not None:
-                             state_dict[f"{layer_path}.bias"] = layer_module.bias.data
-                             quant_state_dict[f"{layer_path}.bias"] = state_dict[f"{layer_path}.bias"]
+                    if isinstance(layer_module, torch.nn.Module):
+                        if hasattr(layer_module, 'weight'):
+                            state_dict[f"{layer_path}.weight"] = layer_module.weight.data
+                            quant_state_dict[f"{layer_path}.weight"] = state_dict[f"{layer_path}.weight"]
+                            if hasattr(layer_module, 'bias') and layer_module.bias is not None:
+                                state_dict[f"{layer_path}.bias"] = layer_module.bias.data
+                                quant_state_dict[f"{layer_path}.bias"] = state_dict[f"{layer_path}.bias"]
+                    elif isinstance(layer_module, torch.nn.Parameter):
+                        state_dict[f"{layer_path}"] = layer_module.data
+                        quant_state_dict[f"{layer_path}"] = state_dict[f"{layer_path}"]
+                    else:
+                        print(f"Unsloth: Skipping layer '{layer_path}' of unexpected type: {type(layer_module)}")
 
     # Extract non-layered vision components using a more robust method
     non_layered_components = layer_config.get('non_layered_components', [])
@@ -626,3 +649,10 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 quant_state_dict[component_path] = component.data
             else:
                 print(f"Unsloth: Skipping non-layered component '{component_path}' of unexpected type: {type(component)}")
+
+    # for mllama. vLLM uses ColumnParallelConv2dPatch which has _linear.weight
+    # hf expects patch_embedding.weight
+    path = "model.vision_model.patch_embedding"
+    component = _get_nested_attr(vllm_internals, path)
+    if component is not None:
+        state_dict[f'{path}.weight'] = component._linear.weight
