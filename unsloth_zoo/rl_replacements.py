@@ -282,7 +282,10 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             old_hidden_states  = torch.chunk(_old_hidden_states, chunks = n_chunks, dim = 0)
         else: 
             old_hidden_states = [None] * n_chunks
-        ref_hidden_states  = torch.chunk(_ref_hidden_states, chunks = n_chunks, dim = 0)
+        if _ref_hidden_states is not None: 
+            ref_hidden_states  = torch.chunk(_ref_hidden_states, chunks = n_chunks, dim = 0)
+        else: 
+            ref_hidden_states = [None] * n_chunks
         input_ids          = torch.chunk(_input_ids,         chunks = n_chunks, dim = 0)
         mask               = torch.chunk(_mask,              chunks = n_chunks, dim = 0)
         advantages         = torch.chunk(_advantages,        chunks = n_chunks, dim = 0)
@@ -346,6 +349,7 @@ def grpo_accumulated_loss(
     completion_mask,
     advantages,
     old_hidden_states,
+    ref_hidden_states, 
     n_chunks = -1,
     **kwargs,
 ):
@@ -371,35 +375,7 @@ def grpo_accumulated_loss(
     lm_head = trainer.model.get_output_embeddings().weight
 
     #breakpoint()
-    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):
-        with torch.inference_mode(): 
-                # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
-                # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
-                # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
-                # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
-                # old_per_token_logps to None.
-            generate_every = trainer.args.steps_per_generation * trainer.num_iterations  # generation frequency
-            if trainer.args.gradient_accumulation_steps % generate_every != 0:
-                old_hidden_states = trainer.model(
-                    input_ids = input_ids,
-                    attention_mask = attention_mask,
-                    pixel_values = pixel_values,
-                    image_grid_thw = image_grid_thw,
-                    pixel_attention_mask = pixel_attention_mask,
-                    image_sizes = image_sizes,
-                    logits_to_keep = logits_to_keep + 1,
-                ).logits    
-        with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
-            ref_hidden_states = trainer.model(
-                input_ids = input_ids,
-                attention_mask = attention_mask,
-                pixel_values = pixel_values,
-                image_grid_thw = image_grid_thw,
-                pixel_attention_mask = pixel_attention_mask,
-                image_sizes = image_sizes,
-                logits_to_keep = logits_to_keep + 1,
-            ).logits
-        pass
+    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):  
         new_hidden_states = trainer.model(
             input_ids = input_ids,
             attention_mask = attention_mask,
@@ -410,6 +386,7 @@ def grpo_accumulated_loss(
             logits_to_keep = logits_to_keep + 1,
         ).logits
 
+        
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
             new_hidden_states,
             old_hidden_states,
@@ -426,8 +403,9 @@ def grpo_accumulated_loss(
     pass
     #breakpoint()
     # Some models like Qwen VL 2 don't have logits_to_keep parameter so you need to trim the output manually. Qwen VL 2.5 however does have it.
-    if ref_hidden_states.size(1) != logits_to_keep + 1 : 
-        ref_hidden_states = ref_hidden_states[:,-(logits_to_keep + 1):,:]
+    if new_hidden_states.size(1) != logits_to_keep + 1 : 
+        if ref_hidden_states is not None:
+            ref_hidden_states = ref_hidden_states[:,-(logits_to_keep + 1):,:]
         new_hidden_states = new_hidden_states[:,-(logits_to_keep + 1):,:]
         if old_hidden_states is not None: 
             old_hidden_states = old_hidden_states[:,-(logits_to_keep + 1):,:]
