@@ -85,6 +85,7 @@ def grpo_compute_loss(
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
     logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
+    importance_sampling_level = kwargs.get("loss_type", "token")
 
     input_ids = input_ids.unsqueeze(-1)
 
@@ -143,9 +144,23 @@ def grpo_compute_loss(
     # Below is forward KL (normal KL)
     # kl_i = torch.exp(old) * (old - new)
     if old_logits is not None: 
-        coef_1 = torch.exp(new - old)
+        log_ratio = torch.exp(new - old)
     else:
-        coef_1 = torch.exp(new - new.detach())
+        log_ratio = torch.exp(new - new.detach())
+
+    if importance_sampling_level == "token":
+        log_importance_weights = log_ratio
+    elif importance_sampling_level == "sequence":
+        log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+        log_importance_weights = log_importance_weights.unsqueeze(-1)
+    else:
+        raise ValueError(
+            f"Unknown importance sampling level: {importance_sampling_level}. Possible values are 'token' "
+            "and 'sequence'."
+        )
+
+    coef_1 =  torch.exp(log_importance_weights)
+
     coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
 
     if delta is not None:
