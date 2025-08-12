@@ -392,7 +392,11 @@ def set_additional_modules(new_model, quant_state_dict, config):
             replaced_key = re.sub(r"\.(\d+)\.", r"[\1].", key)
             exec(f"new_{replaced_key}.data = quant_state_dict[key]")
         except:
-            continue
+            try:
+                # sometimes it can be in new_model.model. instead of new_model.
+                exec(f"new_model.{replaced_key}.data = quant_state_dict[key]")
+            except:
+                continue
     pass
 pass
 
@@ -650,9 +654,11 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
             else:
                 print(f"Unsloth: Skipping non-layered component '{component_path}' of unexpected type: {type(component)}")
 
-    # for mllama. vLLM uses ColumnParallelConv2dPatch which has _linear.weight
-    # hf expects patch_embedding.weight
+    # for mllama. vLLM uses ColumnParallelConv2dPatch which has _linear.weight of shape torch.Size([1280, 588])
+    # hf expects patch_embedding.weight of shape torch.Size([1280, 3, 14, 14])
     path = "model.vision_model.patch_embedding"
     component = _get_nested_attr(vllm_internals, path)
     if component is not None:
-        state_dict[f'{path}.weight'] = component._linear.weight
+        weight = component._linear.weight
+        state_dict[f'{path}.weight'] = weight.reshape(weight.shape[0], 3, 14, 14)
+        quant_state_dict[f'{path}.weight'] = state_dict[f'{path}.weight']

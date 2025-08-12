@@ -786,7 +786,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
 
-    def get_state_dict(prefix, kk, state_dict, proj, slice_weights=True):
+    def get_state_dict(prefix, kk, state_dict, proj, slice_weights=True, slice_index=-1):
         try:
             proj = getattr(proj, "base_layer", proj)
             qweight = proj.weight
@@ -823,9 +823,12 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     weight = qweight
 
             # Apply vocab_size truncation for embedding and lm_head layers
-            if vocab_size is not None and ("embed_tokens" in prefix or "lm_head" in prefix):
-                if weight.shape[0] > vocab_size:
-                    weight = weight[:vocab_size]
+            # for mllama, prefer using org_vocab_size which is text_config.vocab_size + 8
+            # https://github.com/huggingface/transformers/blob/1cea763ba422b83778a8db0374ea90f43b09992b/src/transformers/models/mllama/modeling_mllama.py#L1147
+            shrink_size = getattr(proj,"org_vocab_size", vocab_size)
+            if shrink_size and ("embed_tokens" in prefix or "lm_head" in prefix):
+                if weight.shape[0] > shrink_size:
+                    weight = weight[:shrink_size]
 
             state_dict[prefix + ".weight"] = weight
             quant_state_dict[prefix + ".weight"] = weight
@@ -840,9 +843,9 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     bias_tensor = bias
 
                 # Apply vocab_size truncation for bias as well
-                if vocab_size is not None and ("embed_tokens" in prefix or "lm_head" in prefix):
-                    if bias_tensor.shape[0] > vocab_size:
-                        bias_tensor = bias_tensor[:vocab_size]
+                if shrink_size is not None and ("embed_tokens" in prefix or "lm_head" in prefix):
+                    if bias_tensor.shape[0] > shrink_size:
+                        bias_tensor = bias_tensor[:shrink_size]
 
                 state_dict[prefix + ".bias"] = bias_tensor
                 quant_state_dict[prefix + ".bias"] = bias_tensor
@@ -889,10 +892,8 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             q_proj = cross_attn_layer.proj['q_proj_decoder']
             kv_proj = cross_attn_layer.proj['kv_proj_encoder']
             get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
-            get_state_dict(f"{prefix}.k_proj", 0, state_dict, kv_proj)
-            get_state_dict(f"{prefix}.v_proj", 1, state_dict, kv_proj)
-
-
+            get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
+            get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
 
         get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
@@ -1051,12 +1052,23 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             if "kk" not in layer_name: # skip those that are not per layer
                 continue
             layer_name = layer_name.format(kk = kk)
-            if f"{layer_name}.weight" not in quant_state_dict:
-                if "norm" in layer_name:
-                    skipped_layernorms.append(layer_name.split(".")[-1])
-                continue
-            pass
-            weight = quant_state_dict[f"{layer_name}.weight"]
+
+            if 'language_model.model' in layer_name:
+                # vLLM uses vllm_internals.language_model.model.layers while HF uses model.language_model.layers
+                layer_name = layer_name.replace('language_model.model', 'language_model')
+
+            is_weight = True
+            if layer_name in quant_state_dict:
+                # for attirbutes of type nn.Parameter, there's no .weight
+                weight = quant_state_dict[layer_name]
+                is_weight = False
+            else:
+                if f"{layer_name}.weight" not in quant_state_dict:
+                    if "norm" in layer_name:
+                        skipped_layernorms.append(layer_name.split(".")[-1])
+                    continue
+                pass
+                weight = quant_state_dict[f"{layer_name}.weight"]
 
             if f"{layer_name}.bias" in quant_state_dict:
                 # Has bias!
@@ -1068,7 +1080,13 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 bias = None
             pass
 
-            if f"{layer_name}.weight.quant_state" in quant_state_dict:
+            if layer_name in quant_state_dict:
+                # for attirbutes of type nn.Parameter, there's no .weight
+                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
+                layer = torch.nn.Parameter(weight, requires_grad = False)
+                exec(f"new_model.{layer_name_br} = layer")
+                continue
+            elif f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
                 layer = Linear4bit(0, 0, device = get_target_device(), bias = has_bias, compute_dtype = compute_dtype, **kwargs)
