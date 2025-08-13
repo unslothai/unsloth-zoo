@@ -316,7 +316,7 @@ class UnslothFusedLoss(torch.autograd.Function):
             scaling = ctx.scaling if ctx.scaling is not None else 1.0
             torch._assert(torch.all(grad_output == scaling), f"Fused losses expect grad_output to be all {scaling}, but got {grad_output.ravel()[:10]}")
         (grad_inputs, grad_lm_head, grad_lm_head_bias, ) = ctx.saved_tensors
-        return (None, grad_inputs, grad_lm_head, grad_lm_head_bias, None, None, None, None, None, None, None, None,)
+        return (None, grad_inputs, grad_lm_head, grad_lm_head_bias, None, None, None, None, None, None, None, None, None,)
     pass
 pass
 
