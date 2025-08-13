@@ -85,7 +85,7 @@ def grpo_compute_loss(
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
     logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
-    importance_sampling_level = kwargs.get("loss_type", "token")
+    importance_sampling_level = kwargs.get("importance_sampling_level", "token")
 
     input_ids = input_ids.unsqueeze(-1)
 
