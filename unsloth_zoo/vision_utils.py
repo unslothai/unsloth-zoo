@@ -430,7 +430,7 @@ def get_video_reader_backend() -> str:
         video_reader_backend = "decord"
     else:
         video_reader_backend = "torchvision"
-    print(f"vision_utils using {video_reader_backend} to read video.", file=sys.stderr)
+    print(f"unsloth_zoo/vision_utils using {video_reader_backend} to read video.", file=sys.stderr)
     return video_reader_backend
 
 
