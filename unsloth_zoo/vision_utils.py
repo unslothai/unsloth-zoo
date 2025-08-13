@@ -28,6 +28,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 __all__ = [
     "process_vision_info",
@@ -55,7 +56,7 @@ IMAGE_TOKENS = [
     "<|IMG_PATCH|>",      # Cohere
 ]
 
-from __future__ import annotations
+
 
 import base64
 import copy
