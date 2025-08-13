@@ -305,6 +305,7 @@ class UnslothFusedLoss(torch.autograd.Function):
             )
         pass
         ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
+        ctx.scaling = scaling
         return accumulated_loss
     pass
 
@@ -312,7 +313,8 @@ class UnslothFusedLoss(torch.autograd.Function):
     def backward(ctx, grad_output,):
         # grad_output is assumed to be always = 1
         if UNSLOTH_ENABLE_LOGGING:
-            torch._assert(torch.all(grad_output == 1.0), f"Fused losses expect grad_output to be all 1, but got {grad_output.ravel()[:10]}")
+            scaling = ctx.scaling if ctx.scaling is not None else 1.0
+            torch._assert(torch.all(grad_output == scaling), f"Fused losses expect grad_output to be all {scaling}, but got {grad_output.ravel()[:10]}")
         (grad_inputs, grad_lm_head, grad_lm_head_bias, ) = ctx.saved_tensors
         return (None, grad_inputs, grad_lm_head, grad_lm_head_bias, None, None, None, None, None, None, None, None,)
     pass
@@ -346,7 +348,6 @@ def unsloth_fused_ce_loss(
     # Get mixed precision scaling if seen
     scaling = scaler.get_scale() if scaler is not None else scaling
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
-    print(scaling)
     return apply_autograd_function(UnslothFusedLoss, dict(
         loss_function = compute_fused_ce_loss,
         hidden_states = hidden_states,
