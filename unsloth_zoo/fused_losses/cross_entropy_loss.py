@@ -331,6 +331,7 @@ def unsloth_fused_ce_loss(
     scaling        : Optional[float] = None,
     target_gb      : Optional[int] = 1,
     torch_compile  : Optional[bool] = True,
+    overwrite      : Optional[bool] = False,
     **kwargs,
 ):
     """
@@ -360,6 +361,7 @@ def unsloth_fused_ce_loss(
         shift_labels = True,
         target_gb = target_gb,
         torch_compile = torch_compile,
+        overwrite = overwrite,
         extra_kwargs = kwargs,
     ))
 pass
