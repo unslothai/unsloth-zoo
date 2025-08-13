@@ -29,7 +29,7 @@ from .utils import (
 torch_cuda_device = torch.cuda.device
 
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
-def swiglu_torch_forward(a, alpha, limit):
+def swiglu_torch_forward(a, alpha, limit, dtype = None):
     a_gelu = a[..., ::2].to(torch.float32)
     if limit is not None:
         a_gelu = a_gelu.clamp(max=limit)
@@ -39,7 +39,7 @@ def swiglu_torch_forward(a, alpha, limit):
 
     out_gelu = a_gelu * torch.sigmoid(alpha * a_gelu)
     out = out_gelu * (a_linear + 1)
-    return out.to(a.dtype)
+    return out.to(a.dtype if dtype is None else dtype)
 pass
 
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
@@ -460,7 +460,7 @@ class GptOssExperts(nn.Module):
                     _, token_idx = torch.where(expert_mask[expert_idx[0]])
                 current_state = hidden_states[token_idx]
                 gate_up = self.gate_up_projs[expert_idx](current_state)
-                gated_output = swiglu_torch_forward(gate_up.to(torch.float32), self.alpha, self.limit)
+                gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
                 # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
                 # gate = gate.clamp(min=None, max=self.limit)
                 # up = up.clamp(min=-self.limit, max=self.limit)
@@ -475,7 +475,7 @@ class GptOssExperts(nn.Module):
             X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
             gate_up = torch.stack(gate_up_list, dim=0)
-            fused = swiglu_torch_forward(gate_up.to(torch.float32), self.alpha, self.limit)
+            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
             # gate = gate_up[..., ::2]
             # up_h = gate_up[..., 1::2]
             # gate = gate.clamp(max=self.limit)
@@ -500,7 +500,7 @@ class GptOssTopKRouter(nn.Module):
     @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = self.linear(hidden_states)  # (batch_size * seq_len, num_experts)
+        router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
         router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(router_logits.dtype)
         router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
