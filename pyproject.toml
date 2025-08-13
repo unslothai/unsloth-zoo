@@ -7,7 +7,7 @@ name = "unsloth_zoo"
 dynamic = ["version"]
 description = "Utils for Unsloth"
 readme = "README.md"
-requires-python = ">=3.9,<3.13"
+requires-python = ">=3.9,<3.14"
 license = "LGPL-3.0-or-later"
 keywords = ["ai", "llm",]
 authors = [
