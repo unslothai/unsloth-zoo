@@ -302,7 +302,7 @@ def patch_Gemma3MLP():
         gate_proj_out = self.gate_proj(x)
         up_proj_out = self.up_proj(x)
 
-        #  Upcast to fp32
+        # Upcast to fp32
         gate_proj_fp32 = gate_proj_out.to(torch.float32)
         up_proj_fp32 = up_proj_out.to(torch.float32)
         activated_fp32 = self.act_fn(gate_proj_fp32) # Activation in fp32
