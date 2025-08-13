@@ -520,6 +520,8 @@ class GptOssMLP(nn.Module):
 pass
 
 def patch_gpt_oss_linearized():
+    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
+    if not model_name.endswith("-bnb-4bit"): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
     except Exception as e:
