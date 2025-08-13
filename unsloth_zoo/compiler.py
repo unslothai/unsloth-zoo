@@ -139,6 +139,7 @@ import math
 
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_CCE = os.environ.get("UNSLOTH_ENABLE_CCE", "1") == "1"
+UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
 
 import logging
 logger_compiler = logging.getLogger(__name__)
@@ -162,8 +163,7 @@ _disabled_sdpa_code = f"""{_license_header}
 
 from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
-    unsloth_compiled_ce_loss_function,
-    unsloth_compiled_fused_ce_loss_function,
+    unsloth_fused_ce_loss,
 )
 
 if UNSLOTH_STUDIO_ENABLED:
@@ -766,16 +766,6 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
-elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
-    loss = fast_linear_cross_entropy(
-        hidden_states        = hidden_states\\1,
-        lm_head              = self.lm_head,
-        labels               = labels,
-        num_items_in_batch   = n_items,
-        logit_softcapping    = None if (\\4) == () else (\\4),
-        logit_scale_multiply = None if (\\2) == () else (\\2),
-        logit_scale_divide   = None if (\\3) == () else (\\3),
-    )
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -792,52 +782,21 @@ else:
     _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
-    loss = unsloth_compiled_fused_ce_loss_function(
+    loss = unsloth_fused_ce_loss(
+        trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        output_labels        = labels,
+        labels               = labels,
+        mask                 = None,
+        n_items              = n_items,
+        scaling              = getattr(self, "accelerator_scaler"),
+        target_gb            = 1,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
-        vocab_size           = (\\6),
-        n_items              = n_items,
-        requires_grad_       = requires_grad_,
     )
-
-    # ========= OLD non fused =========
-    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
-    # torch._dynamo.mark_dynamic(logits, 1)
-    # torch._dynamo.mark_dynamic(labels, 1)
-    # loss = unsloth_compiled_ce_loss_function(
-    #     output_logits        = logits,
-    #     output_labels        = labels,
-    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
-    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
-    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
-    #     vocab_size           = (\\6),
-    #     n_items              = n_items,
-    #     requires_grad_       = requires_grad_,
-    # )
-
-
-    # if (\\2) != ():
-    #     logits = logits * (\\2)
-    # if (\\3) != ():
-    #     logits = logits / (\\3)
-    # if (\\4) != ():
-    #     logits = logits / (\\4)
-    #     logits = torch.tanh(logits)
-    #     logits = logits * (\\4)
-    # shift_logits = logits[..., :-1, :].float().contiguous()
-    # shift_labels = labels[..., 1:].contiguous()
-    # reduction = 'mean' if n_items is None else 'sum'
-    # loss_fct = torch.nn.CrossEntropyLoss(reduction = reduction)
-    # shift_logits = shift_logits.view(-1, \\6)
-    # shift_labels = shift_labels.view(-1)
-    # shift_labels = shift_labels.to(shift_logits.device)
-    # loss = loss_fct(shift_logits, shift_labels)
-    # if n_items is not None: loss = loss / n_items
 """.replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_2 = """
@@ -882,16 +841,6 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
-elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and not requires_grad_:
-    loss = fast_linear_cross_entropy(
-        hidden_states        = hidden_states\\1,
-        lm_head              = self.lm_head,
-        labels               = labels,
-        num_items_in_batch   = n_items,
-        logit_softcapping    = None if (\\4) == () else (\\4),
-        logit_scale_multiply = None if (\\2) == () else (\\2),
-        logit_scale_divide   = None if (\\3) == () else (\\3),
-    )
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -908,34 +857,21 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
     _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
-    loss = unsloth_compiled_fused_ce_loss_function(
+    loss = unsloth_fused_ce_loss(
+        trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        output_labels        = labels,
+        labels               = labels,
+        mask                 = None,
+        n_items              = n_items,
+        scaling              = getattr(self, "accelerator_scaler"),
+        target_gb            = 1,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
-        logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
-        vocab_size           = (\\8),
-        n_items              = n_items,
-        requires_grad_       = requires_grad_,
+        logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
-
-
-    # ========= OLD non fused =========
-    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
-    # torch._dynamo.mark_dynamic(logits, 1)
-    # torch._dynamo.mark_dynamic(labels, 1)
-    # loss = unsloth_compiled_ce_loss_function(
-    #     output_logits        = logits,
-    #     output_labels        = labels,
-    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
-    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
-    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
-    #     vocab_size           = (\\8),
-    #     n_items              = n_items,
-    #     requires_grad_       = requires_grad_,
-    # )
 else:
     logits = self.lm_head(hidden_states\\1)
     if (\\2) != ():
@@ -1008,37 +944,21 @@ else:
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
         torch._dynamo.mark_dynamic(attention_mask, 1)
-    loss = unsloth_compiled_fused_ce_loss_function(
+    loss = unsloth_fused_ce_loss(
+        trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        output_labels        = labels,
+        labels               = labels,
+        mask                 = \\6,
+        n_items              = n_items,
+        scaling              = getattr(self, "accelerator_scaler"),
+        target_gb            = 1,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
-        logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
-        vocab_size           = (\\7),
-        n_items              = n_items,
-        mask                 = \\6,
-        requires_grad_       = requires_grad_,
+        logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
-
-    # ========= OLD non fused =========
-    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
-    # torch._dynamo.mark_dynamic(logits, 1)
-    # torch._dynamo.mark_dynamic(labels, 1)
-    # if attention_mask is not None:
-    #     torch._dynamo.mark_dynamic(attention_mask, 1)
-    # loss = unsloth_compiled_ce_loss_function(
-    #     output_logits        = logits,
-    #     output_labels        = labels,
-    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
-    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
-    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
-    #     vocab_size           = (\\7),
-    #     n_items              = n_items,
-    #     mask                 = \\6,
-    #     requires_grad_       = requires_grad_,
-    # )
 """.replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 ce_finders = [
