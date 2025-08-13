@@ -54,6 +54,8 @@ IMAGE_TOKENS = [
     "<|IMG_PATCH|>",      # Cohere
 ]
 
+from __future__ import annotations
+
 import torch
 from PIL import Image
 import base64
@@ -64,15 +66,15 @@ import sys
 import warnings
 import os
 import logging
+import copy
 from functools import lru_cache
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 import requests
 import torchvision
 from packaging import version
-from typing import Union, Tuple, List, Dict
+from typing import Optional, Union, Tuple, List, Dict
 from torchvision import io, transforms
 from torchvision.transforms import InterpolationMode
 
@@ -83,7 +85,8 @@ MAX_RATIO = 200
 
 VIDEO_MIN_PIXELS = 128 * 28 * 28
 VIDEO_MAX_PIXELS = 768 * 28 * 28
-VIDEO_TOTAL_PIXELS = 24576 * 28 * 28
+VIDEO_TOTAL_PIXELS = int(float(os.environ.get('VIDEO_MAX_PIXELS', 128000 * 28 * 28 * 0.9)))
+logger.info(f"set VIDEO_TOTAL_PIXELS: {VIDEO_TOTAL_PIXELS}")
 FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
@@ -108,7 +111,7 @@ pass
 
 def smart_resize(
     height: int, width: int, factor: int = IMAGE_FACTOR, min_pixels: int = MIN_PIXELS, max_pixels: int = MAX_PIXELS
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     """
     Rescales the image so that the following conditions are met:
 
@@ -137,7 +140,7 @@ pass
 
 
 def fetch_image(
-    ele: Dict,
+    ele: dict,
     size_factor: int = IMAGE_FACTOR,
 ) -> Image.Image:
     if "image" in ele:
@@ -229,7 +232,7 @@ def smart_nframes(
 
 def _read_video_torchvision(
     ele: dict,
-) -> (torch.Tensor, float):
+) -> tuple[torch.Tensor, float]:
     """read video using torchvision.io.read_video
 
     Args:
@@ -330,7 +333,7 @@ def calculate_video_frame_range(
 
 def _read_video_decord(
     ele: dict,
-) -> (torch.Tensor, float):
+) -> tuple[torch.Tensor, float]:
     """read video using decord.VideoReader
 
     Args:
@@ -375,7 +378,7 @@ def is_torchcodec_available() -> bool:
 
 def _read_video_torchcodec(
     ele: dict,
-) -> (torch.Tensor, float):
+) -> tuple[torch.Tensor, float]:
     """read video using torchcodec.decoders.VideoDecoder
 
     Args:
