@@ -520,6 +520,8 @@ class GptOssMLP(nn.Module):
 pass
 
 def patch_gpt_oss_linearized():
+    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
+    if not model_name.endswith("-bnb-4bit"): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
     except Exception as e:
@@ -530,6 +532,36 @@ def patch_gpt_oss_linearized():
     return
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
+
+
+def patch_GptOssRMSNorm():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssRMSNorm
+    except Exception as e:
+        return raise_error("GptOssRMSNorm.forward", e)
+
+    def forward(self, x): # x can be fp32 (from embeddings) or fp16 (from MLP/Attn)
+        # Internals in fp32
+        x_fp32 = x.to(torch.float32)
+        variance = x_fp32.pow(2).mean(-1, keepdim = True)
+        hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + self.variance_epsilon)
+
+        # self.weight is bf16 (from vision.py loading if UNSLOTH_FORCE_FLOAT32="1")
+        # So, cast self.weight to fp32 for the (weight) operation
+        output_fp32 = hidden_states_fp32 * (self.weight.to(torch.float32))
+
+        # Clamp to fp16 range before casting back to fp16
+        fp16_max = torch.finfo(torch.float16).max
+        fp16_min = torch.finfo(torch.float16).min
+        clamped_output_fp32 = torch.clamp(output_fp32, min=fp16_min, max=fp16_max)
+
+        return clamped_output_fp32.to(torch.float16) # Output fp16
+    pass
+    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssRMSNorm, "forward", forward, fullgraph = True)
+pass
+TEMPORARY_PATCHES.append(patch_GptOssRMSNorm)
 
 
 try:
