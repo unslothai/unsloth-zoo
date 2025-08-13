@@ -177,7 +177,6 @@ class WorkerLoRAManager(AbstractWorkerManager):
                              f"is greater than lora_extra_vocab_size "
                              f"{self.lora_config.lora_extra_vocab_size}.")
         return lora
-      
 
     def add_dummy_lora(self, lora_request: LoRARequest, rank: int) -> bool:
         if lora_request.lora_int_id in self.list_adapters():
@@ -295,3 +294,4 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
                 lora_request.lora_int_id) is not None
         self._adapter_manager.activate_adapter(lora_request.lora_int_id)
         return loaded
+      
