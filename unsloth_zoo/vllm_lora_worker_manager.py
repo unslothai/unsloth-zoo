@@ -294,4 +294,3 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
                 lora_request.lora_int_id) is not None
         self._adapter_manager.activate_adapter(lora_request.lora_int_id)
         return loaded
-      
