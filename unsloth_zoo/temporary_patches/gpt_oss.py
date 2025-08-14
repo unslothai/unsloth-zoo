@@ -560,7 +560,7 @@ def patch_gpt_oss_linearized():
 
                     # Force float32 matrix multiply on some down projection modules
                     gated_output = gated_output.to(dtype)
-                    device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+                    device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
                     with torch.autocast(device_type=device_type, enabled=False): # Force float32
                         out = down_proj(gated_output)
                     weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
@@ -580,7 +580,7 @@ def patch_gpt_oss_linearized():
                 # fused = (up_h + 1) * glu
 
                 # Force float32 matrix multiply on down projection only
-                device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+                device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
                 with torch.autocast(device_type=device_type, enabled=False): # Force float32
                     out_list = [
                         down_l(fused[e].to(
