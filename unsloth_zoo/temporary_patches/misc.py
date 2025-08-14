@@ -19,7 +19,7 @@ import torch.nn as nn
 import inspect
 import importlib
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from .common import TEMPORARY_PATCHES, torch_compile_options
+from .common import TEMPORARY_PATCHES, torch_compile
 from .utils import (
     patch_function,
     process_output_options,

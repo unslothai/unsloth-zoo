@@ -19,7 +19,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .common import TEMPORARY_PATCHES, torch_compile_options
+from .common import TEMPORARY_PATCHES, torch_compile
 from .utils import (
     patch_function,
     KWARGS_TYPE,
@@ -28,7 +28,7 @@ from .utils import (
 )
 torch_cuda_device = torch.cuda.device
 
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
+@torch_compile(dynamic = True, fullgraph = True)
 def swiglu_torch_forward(a, alpha, limit, dtype = None):
     a_gelu = a[..., ::2].to(torch.float32)
     if limit is not None:
@@ -42,7 +42,7 @@ def swiglu_torch_forward(a, alpha, limit, dtype = None):
     return out.to(a.dtype if dtype is None else dtype)
 pass
 
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
+@torch_compile(dynamic = True, fullgraph = True)
 def swiglu_torch_backward(pre_act, alpha, limit, g1):
     g, l = pre_act[..., ::2].to(torch.float32), pre_act[..., 1::2].to(torch.float32)
 
@@ -497,7 +497,7 @@ class GptOssTopKRouter(nn.Module):
         self.hidden_dim = config.hidden_size
         self.linear = nn.Linear(self.hidden_dim, self.num_experts, dtype=config.torch_dtype)
 
-    @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)
+    @torch_compile(dynamic = True, fullgraph = True)
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
