@@ -553,9 +553,9 @@ def patch_GptOssRMSNorm():
         output_fp32 = hidden_states_fp32 * (self.weight.to(torch.float32))
 
         # Clamp to fp16 range before casting back to fp16
-        fp16_max = torch.finfo(torch.float16).max
-        fp16_min = torch.finfo(torch.float16).min
-        clamped_output_fp32 = torch.clamp(output_fp32, min=fp16_min, max=fp16_max)
+        # fp16_max = torch.finfo(torch.float16).max
+        # fp16_min = torch.finfo(torch.float16).min
+        # clamped_output_fp32 = torch.clamp(output_fp32, min=fp16_min, max=fp16_max)
 
         return clamped_output_fp32.to(torch.float16) # Output fp16
     pass
