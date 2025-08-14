@@ -631,7 +631,7 @@ def fix_mamba_ssm_float32():
     # Try getting file for mamba_ssm
     try:
         ssd_chunk_scan_file = inspect.getfile(mamba_ssm.ops.triton.ssd_chunk_scan)
-        with open(ssd_chunk_scan_file, "r") as file: file = file.read()
+        with open(ssd_chunk_scan_file, "r", encoding = "utf-8") as file: file = file.read()
     except Exception as e:
         return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
 
@@ -654,7 +654,7 @@ def fix_mamba_ssm_float32():
 
     try:
         # Reload module since we editted it
-        with open(ssd_chunk_scan_file, "w") as f: f.write(file)
+        with open(ssd_chunk_scan_file, "w", encoding = "utf-8") as f: f.write(file)
         importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
     except Exception as e:
         return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
