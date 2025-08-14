@@ -286,30 +286,30 @@ def patch_model_and_tokenizer(
     pass
     # If we force float32, we first use bfloat16, then downcast to float16
     if do_forced_float32:
-      correct_dtype = torch.float16
-      for name, module in model.named_modules():
-          if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
-              module.to(torch.float16)
-          if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
-              module.to(torch.float16)
-          if "lm_head" in name or "embed_tokens" in name:
-              module.to(torch.float16)
-          if "embed_tokens" in name or "patch_embedding" in name:
-              module.to(torch.float16)
-          if "norm" in name:
-              module.to(torch.float16)
-          torch.cuda.empty_cache()
+        correct_dtype = torch.float16
+        for name, module in model.named_modules():
+            if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
+                module.to(torch.float16)
+            if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
+                module.to(torch.float16)
+            if "lm_head" in name or "embed_tokens" in name:
+                module.to(torch.float16)
+            if "embed_tokens" in name or "patch_embedding" in name:
+                module.to(torch.float16)
+            if "norm" in name:
+                module.to(torch.float16)
+            torch.cuda.empty_cache()
 
-      # Convert any remaining bfloat16 parameters
-      for name, param in model.named_parameters():
-          if param.dtype == torch.bfloat16:
-              param.data = param.data.to(torch.float16)
+        # Convert any remaining bfloat16 parameters
+        for name, param in model.named_parameters():
+            if param.dtype == torch.bfloat16:
+                param.data = param.data.to(torch.float16)
 
-      # Also convert buffers (like position embeddings)
-      for name, buffer in model.named_buffers():
-          if buffer.dtype == torch.bfloat16:
-              buffer.data = buffer.data.to(torch.float16)
-      pass
+        # Also convert buffers (like position embeddings)
+        for name, buffer in model.named_buffers():
+            if buffer.dtype == torch.bfloat16:
+                buffer.data = buffer.data.to(torch.float16)
+        pass
     pass
 
     # Correct torch_dtype
@@ -346,16 +346,21 @@ def patch_model_and_tokenizer(
 
             quant_state = weight.quant_state
 
+            if hasattr(module, "_pre_set_compute_dtype"):
+                setted_dtype = module._pre_set_compute_dtype
+            else:
+                setted_dtype = correct_dtype
+
             if type(quant_state) is list:
                 # BnB seems to have float16 as default!
-                module.weight.quant_state[2] = correct_dtype # Cast to correct dtype
+                module.weight.quant_state[2] = setted_dtype # Cast to correct dtype
             else:
                 # https://github.com/TimDettmers/bitsandbytes/pull/763/files
-                quant_state.dtype = correct_dtype
+                quant_state.dtype = setted_dtype
             pass
 
             if hasattr(module, "compute_dtype"):
-                module.compute_dtype = correct_dtype
+                module.compute_dtype = setted_dtype
         pass
         # Downcast RoPE embedding to correct data type
         if downcast_rope and ((name.endswith("rotary_emb") or hasattr(module, "cos_cached"))):
