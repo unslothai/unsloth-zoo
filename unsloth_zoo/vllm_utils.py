@@ -324,6 +324,8 @@ if importlib.util.find_spec("vllm") is not None:
             vllm.v1.worker.lora_model_runner_mixin.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
         except:
             pass
+        if os.getenv("UNSLOTH_DO_NOT_PATCH_V0_LRU_LORA_MANAGER", "0") == "1":
+            return
         try:
             import vllm.worker.model_runner
             vllm.worker.model_runner.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
