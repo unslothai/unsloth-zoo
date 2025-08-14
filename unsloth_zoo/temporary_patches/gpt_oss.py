@@ -527,7 +527,7 @@ def patch_gpt_oss_linearized():
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
 
     # We find down_proj overflows in GPT OSS
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1": 
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
         def forward(
             self,
             hidden_states: torch.Tensor,
