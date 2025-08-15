@@ -354,6 +354,32 @@ def get_mask_functions():
         return []
 pass
 
+# Convert F.softmax(x, ...) to F.softmax(x, ..., dtype = torch.float32).to(x.dtype)
+def higher_precision_softmax(source):
+    """
+    Converts all softmax to float32 for eg:
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+    """
+    softmax_objects = re.finditer(
+        r"(nn\.functional\.softmax|F\.softmax)"\
+        r"\("\
+        r"([^,]{1,}), "\
+        r"(dim[ ]?\=[ ]?[\-0-9]{1,2})"\
+        r"(\,[ ]?dtype[^\)]{1,})?"\
+        r"\)",
+        text,
+    )
+    for item in softmax_objects:
+        full_match, matches = item.group(0), item.groups()
+        softmax, variable, dim, dtype = matches
+        new = f"{softmax}({variable}, {dim}, dtype = torch.float32).to({variable}.dtype)"
+        source = source.replace(full_match, new)
+    return source
+pass
+
+
 def create_new_function(
     name,
     new_source,
@@ -367,6 +393,9 @@ def create_new_function(
     # All Unsloth Zoo code licensed under LGPLv3
     old_new_source = new_source
     do_logging = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+
+    # Fix all softmax low precisions to float32
+    new_source = higher_precision_softmax(new_source)
 
     if new_source[0] == " ":
         spaces = new_source.find("def")
@@ -621,6 +650,10 @@ def create_standalone_class(
         r"self.\1((input_ids \2 \3).clamp_(0))",
         source,
     )
+
+    # Fix all softmax low precisions to float32
+    source = higher_precision_softmax(source)
+
     return source
 pass
 

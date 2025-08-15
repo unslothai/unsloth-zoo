@@ -154,7 +154,7 @@ def patch_gpt_oss():
             swiglu_output = swiglu_torch_forward(
                 pre_activation,
                 self_class.alpha,
-                getattr(self_class.gate_up_proj_precision_config, "limit", None),
+                self_class.limit,
             )
             out = matmul_ogs(
                 swiglu_output,
@@ -187,7 +187,7 @@ def patch_gpt_oss():
             raise NotImplementedError("Backwards pass using MXFP4 is still under construction!")
             (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
             self_class = ctx.self_class
-            limit = getattr(self_class.down_proj, "limit", None)
+            limit = self_class.limit
             alpha = self_class.alpha
 
             # 1) token ➜ expert (reverse of forward scatter)
@@ -243,14 +243,14 @@ def patch_gpt_oss():
                 torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32), requires_grad=False
             )
             self.alpha = 1.702
-
+            self.limit = config.swiglu_limit
             self.gate_up_proj_precision_config = None
             self.down_proj_precision_config = None
 
         def forward(self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx) -> torch.Tensor:
             with torch_cuda_device(hidden_states.device):
                 if not hasattr(self, "act"):
-                    self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, None), 2)
+                    self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
                 if not hidden_states.requires_grad:
                     intermediate_cache1 = matmul_ogs(
                         hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
@@ -426,7 +426,7 @@ class GptOssExperts(nn.Module):
         self.hidden_size = config.hidden_size
         self.expert_dim = config.intermediate_size
         self.alpha = 1.702
-        self.limit = 7.0
+        self.limit = config.swiglu_limit
         self.dtype = config.torch_dtype
 
         self.gate_up_projs = nn.ModuleList([
@@ -448,6 +448,7 @@ class GptOssExperts(nn.Module):
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         num_experts = routing_weights.shape[1]
+        print("limit", self.limit)
         if self.training:
             next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
             with torch.no_grad():
@@ -501,7 +502,7 @@ class GptOssTopKRouter(nn.Module):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(router_logits.dtype)
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(router_top_value.dtype)
         router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
         return router_scores, router_indices
 pass
@@ -538,6 +539,7 @@ def patch_gpt_oss_linearized():
             batch_size = hidden_states.shape[0]
             hidden_states = hidden_states.reshape(-1, self.hidden_size)
             num_experts = routing_weights.shape[1]
+            print("limit", self.limit)
             if self.training:
                 next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
                 with torch.no_grad():
