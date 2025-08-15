@@ -1814,6 +1814,7 @@ def unsloth_compile_transformers(
     supports_sdpa          : list = None,
 ):
     # import transformers logging module and instantiate model_type logging instance.
+    print("supports_sdpa", supports_sdpa)
     from transformers import logging as transformers_logging
     model_logger = transformers_logging.get_logger(f"modeling_{model_type}")
 
