@@ -369,7 +369,7 @@ def higher_precision_softmax(source):
         r"(dim[ ]?\=[ ]?[\-0-9]{1,2})"\
         r"(\,[ ]?dtype[^\)]{1,})?"\
         r"\)",
-        text,
+        source,
     )
     for item in softmax_objects:
         full_match, matches = item.group(0), item.groups()
