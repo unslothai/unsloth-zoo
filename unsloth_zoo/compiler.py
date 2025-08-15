@@ -1957,6 +1957,7 @@ def unsloth_compile_transformers(
         elif ("scaled_dot_product_attention" in source or "ALL_ATTENTION_FUNCTIONS" in source) \
             and ("_supports_sdpa = False" not in source):
             # Must add _supports_sdpa check since now all modules use ALL_ATTENTION_FUNCTIONS
+            print(source)
             scaled_dot_product_attention_modules.append(module)
         elif "nn.functional.softmax" in source or "flash_attn_varlen_func" in source or "_flash_attention_forward" in source:
             full_attention_modules.append(module)
