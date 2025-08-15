@@ -47,8 +47,6 @@ dependencies = [
     "typing_extensions",
 ]
 
-
-
 [tool.setuptools.dynamic]
 version = {attr = "unsloth_zoo.__init__.__version__"}
 
