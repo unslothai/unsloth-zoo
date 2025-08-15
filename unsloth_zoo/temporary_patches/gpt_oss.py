@@ -243,7 +243,7 @@ def patch_gpt_oss():
                 torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32), requires_grad=False
             )
             self.alpha = 1.702
-            self.limit = config.swiglu_limit
+            self.limit = getattr(config, "swiglu_limit", 7.0)
             self.gate_up_proj_precision_config = None
             self.down_proj_precision_config = None
 
@@ -426,7 +426,7 @@ class GptOssExperts(nn.Module):
         self.hidden_size = config.hidden_size
         self.expert_dim = config.intermediate_size
         self.alpha = 1.702
-        self.limit = config.swiglu_limit
+        self.limit = getattr(config, "swiglu_limit", 7.0)
         self.dtype = config.torch_dtype
 
         self.gate_up_projs = nn.ModuleList([
@@ -448,7 +448,6 @@ class GptOssExperts(nn.Module):
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         num_experts = routing_weights.shape[1]
-        print("limit", self.limit)
         if self.training:
             next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
             with torch.no_grad():
@@ -539,7 +538,6 @@ def patch_gpt_oss_linearized():
             batch_size = hidden_states.shape[0]
             hidden_states = hidden_states.reshape(-1, self.hidden_size)
             num_experts = routing_weights.shape[1]
-            print("limit", self.limit)
             if self.training:
                 next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
                 with torch.no_grad():
