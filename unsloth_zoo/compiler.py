@@ -427,7 +427,7 @@ def create_new_function(
     if not overwrite and os.path.isfile(function_location):
 
         # Check if exactly equivalent
-        with open(function_location, "r", encoding="utf-8") as f:
+        with open(function_location, "r", encoding = "utf-8") as f:
             file_source = f.read()
 
         if file_source != write_new_source:
@@ -445,7 +445,7 @@ def create_new_function(
 
     # Check location
     def write_file(function_location, write_new_source):
-        with open(function_location, "wb", buffering = 0) as file:
+        with open(function_location, "wb", buffering = 0, encoding = "utf-8") as file:
             file.write(write_new_source.encode("utf-8"))
             file.flush()
             os.fsync(file.fileno())

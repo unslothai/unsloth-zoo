@@ -1567,7 +1567,7 @@ pass
 
 @functools.cache
 def get_peft_config(save_directory):
-    with open(os.path.join(save_directory, "adapter_config.json")) as f:
+    with open(os.path.join(save_directory, "adapter_config.json"), encoding = "utf-8") as f:
         config = json.load(f)
     return config
 pass
