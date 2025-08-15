@@ -1967,11 +1967,14 @@ def unsloth_compile_transformers(
     torch_modules = [x for x in torch_modules if x not in removal]
 
     # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
+    print("supports_sdpa", supports_sdpa)
     if supports_sdpa is not None:
         assert(type(supports_sdpa) is list and len(supports_sdpa) == 1)
         if len(scaled_dot_product_attention_modules) != 0:
+            print(scaled_dot_product_attention_modules)
             if supports_sdpa[0] != False: supports_sdpa[0] = True
         elif "_supports_sdpa = True" in full_source:
+            print("_supports_sdpa = True")
             if supports_sdpa[0] != False: supports_sdpa[0] = True
         else:
             supports_sdpa[0] = False
