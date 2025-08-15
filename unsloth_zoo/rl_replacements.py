@@ -146,12 +146,12 @@ def grpo_compute_loss(
     if old_logits is not None: 
         log_ratio = torch.exp(new - old)
     else:
-        log_ratio = torch.exp(new - new.detach())
+        log_ratio = torch.ones(new.shape, device = new.device)
 
     if importance_sampling_level == "token":
         log_importance_weights = log_ratio
     elif importance_sampling_level == "sequence":
-        log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+        log_importance_weights = (log_ratio * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
         log_importance_weights = log_importance_weights.unsqueeze(-1)
     else:
         raise ValueError(
