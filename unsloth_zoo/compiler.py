@@ -1955,9 +1955,8 @@ def unsloth_compile_transformers(
         if "_gradient_checkpointing_func" in source:
             gradient_checkpointed_modules.append(module)
         elif ("scaled_dot_product_attention" in source or "ALL_ATTENTION_FUNCTIONS" in source) \
-            and ("_supports_sdpa = False" not in source):
+            and ("_supports_sdpa = False" not in full_source):
             # Must add _supports_sdpa check since now all modules use ALL_ATTENTION_FUNCTIONS
-            print(source)
             scaled_dot_product_attention_modules.append(module)
         elif "nn.functional.softmax" in source or "flash_attn_varlen_func" in source or "_flash_attention_forward" in source:
             full_attention_modules.append(module)
@@ -1970,18 +1969,15 @@ def unsloth_compile_transformers(
     torch_modules = [x for x in torch_modules if x not in removal]
 
     # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
-    print(model_type, supports_sdpa)
     if supports_sdpa is not None:
         assert(type(supports_sdpa) is list and len(supports_sdpa) == 1)
         if ("_supports_sdpa = True" in full_source) and ("_supports_sdpa = False" not in full_source):
             if supports_sdpa[0] != False: supports_sdpa[0] = True
         elif len(scaled_dot_product_attention_modules) != 0:
-            print(scaled_dot_product_attention_modules)
             if supports_sdpa[0] != False: supports_sdpa[0] = True
         else:
             supports_sdpa[0] = False
     pass
-    print(model_type, supports_sdpa)
 
     # Get functions which are called
     called_functions = []
