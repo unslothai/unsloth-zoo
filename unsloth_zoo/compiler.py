@@ -445,7 +445,7 @@ def create_new_function(
 
     # Check location
     def write_file(function_location, write_new_source):
-        with open(function_location, "wb", buffering = 0, encoding = "utf-8") as file:
+        with open(function_location, "wb", buffering = 0) as file:
             file.write(write_new_source.encode("utf-8"))
             file.flush()
             os.fsync(file.fileno())
