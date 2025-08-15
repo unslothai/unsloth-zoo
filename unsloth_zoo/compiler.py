@@ -1970,14 +1970,11 @@ def unsloth_compile_transformers(
     torch_modules = [x for x in torch_modules if x not in removal]
 
     # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
-    print("supports_sdpa", supports_sdpa)
     if supports_sdpa is not None:
         assert(type(supports_sdpa) is list and len(supports_sdpa) == 1)
-        if len(scaled_dot_product_attention_modules) != 0:
-            print(scaled_dot_product_attention_modules)
+        if ("_supports_sdpa = True" in full_source) and ("_supports_sdpa = False" not in full_source):
             if supports_sdpa[0] != False: supports_sdpa[0] = True
-        elif "_supports_sdpa = True" in full_source:
-            print("_supports_sdpa = True")
+        elif len(scaled_dot_product_attention_modules) != 0:
             if supports_sdpa[0] != False: supports_sdpa[0] = True
         else:
             supports_sdpa[0] = False
@@ -1987,7 +1984,7 @@ def unsloth_compile_transformers(
     called_functions = []
     for function in functions:
         # Start of text
-        defined = re.findall(r"\bdef[\s]{1,}" + re.escape(function),full_source, flags = re.DOTALL)
+        defined = re.findall(r"\bdef[\s]{1,}" + re.escape(function), full_source, flags = re.DOTALL)
         # Disable self.
         called = re.findall(r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags = re.DOTALL)
         if len(defined) != 0 and len(called) != 0:
