@@ -269,7 +269,7 @@ def patch_gpt_oss():
                         routing_data,
                         scatter_indx=scatter_idx,
                         precision_config=self.down_proj_precision_config,
-                        gammas=routing_data.gate_scal,
+                        gammas=routing_data.gate_scal if routing_data else None,
                     )
                 else:
                     intermediate_cache3 = Mxfp4GptOssExperts_Training.apply(
