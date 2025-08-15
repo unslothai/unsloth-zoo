@@ -1975,6 +1975,7 @@ def unsloth_compile_transformers(
         if ("_supports_sdpa = True" in full_source) and ("_supports_sdpa = False" not in full_source):
             if supports_sdpa[0] != False: supports_sdpa[0] = True
         elif len(scaled_dot_product_attention_modules) != 0:
+            print(scaled_dot_product_attention_modules)
             if supports_sdpa[0] != False: supports_sdpa[0] = True
         else:
             supports_sdpa[0] = False
