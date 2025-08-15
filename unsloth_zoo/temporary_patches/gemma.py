@@ -18,7 +18,7 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import torch
 import torch.nn as nn
 import os
-from .common import TEMPORARY_PATCHES, torch_compile_options
+from .common import TEMPORARY_PATCHES, torch_compile
 from .utils import (
     patch_function,
     process_output_options,
@@ -376,7 +376,7 @@ def patch_Gemma3Attention():
             attn_mask_for_sdpa,
         )
     pass
-    prepare = torch.compile(prepare, fullgraph = True, dynamic = True, options = torch_compile_options)
+    prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
 
     def forward(
         self,
@@ -562,7 +562,7 @@ def patch_Gemma3Attention_normal():
             attn_mask_for_sdpa,
         )
     pass
-    prepare = torch.compile(prepare, fullgraph = True, dynamic = True, options = torch_compile_options)
+    prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
 
     def forward(
         self,
