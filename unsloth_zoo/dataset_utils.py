@@ -603,18 +603,22 @@ def sft_prepare_dataset(
         pass
     pass
     if packing:
-        print("Unsloth: Hugging Face's packing is currently buggy - we're disabling it for now!")
-        return dataset
+        # Try using new packing which works in TRL
+        try:
+            pack_dataset
+        except:
+            print("Unsloth: Hugging Face's packing is currently buggy - we're disabling it for now!")
+            return dataset
 
         if max_seq_length == 0:
             raise ValueError("When packing is enabled, `max_seq_length` can't be `None`.")
 
         if use_desc: map_kwargs["desc"] = f"Unsloth: Packing {dataset_name} dataset"
-        dataset = dataset.select_columns(used_column_names).map(
-            pack_examples,
-            batched = True,
-            fn_kwargs = {"seq_length": max_seq_length,},
-            **map_kwargs,
+        dataset = pack_dataset(
+            dataset.select_columns(used_column_names),
+            max_seq_length,
+            getattr(args, "packing_strategy", "bfd"),
+            map_kwargs,
         )
     pass
     return dataset
