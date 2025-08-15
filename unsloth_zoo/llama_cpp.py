@@ -396,7 +396,7 @@ def _download_convert_hf_to_gguf(
     )
 
     # Write file
-    with open(f"llama.cpp/{name}.py", "wb", encoding = "utf-8") as file:
+    with open(f"llama.cpp/{name}.py", "wb") as file:
         file.write(converter_latest)
     filename = f"llama.cpp/{name}.py"
 
