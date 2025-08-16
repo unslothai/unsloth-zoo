@@ -318,6 +318,12 @@ def patch_model_and_tokenizer(
         pass
     pass
 
+    # Correct other generic dtypes like norms
+    for name, module in model.named_modules():
+        if hasattr(module, "_pre_set_compute_dtype"):
+            module.to(module._pre_set_compute_dtype)
+    pass
+
     # Correct torch_dtype
     def __fix_dtype(config):
         if not hasattr(config, "to_dict"): return
