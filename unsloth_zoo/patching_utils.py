@@ -288,16 +288,22 @@ def patch_model_and_tokenizer(
     if do_forced_float32:
         correct_dtype = torch.float16
         for name, module in model.named_modules():
+            if hasattr(module, "_pre_set_compute_dtype"):
+                setted_dtype = module._pre_set_compute_dtype
+            else:
+                setted_dtype = torch.float16
             if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
-                module.to(torch.float16)
+                module.to(setted_dtype)
             if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
-                module.to(torch.float16)
+                module.to(setted_dtype)
             if "lm_head" in name or "embed_tokens" in name:
-                module.to(torch.float16)
+                module.to(setted_dtype)
             if "embed_tokens" in name or "patch_embedding" in name:
-                module.to(torch.float16)
-            if "norm" in name:
-                module.to(torch.float16)
+                module.to(setted_dtype)
+            if name.endswith("norm"):
+                module.to(setted_dtype)
+            if "bias" in name:
+                module.to(setted_dtype)
             torch.cuda.empty_cache()
 
         # Convert any remaining bfloat16 parameters
