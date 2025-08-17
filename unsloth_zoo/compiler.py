@@ -413,6 +413,8 @@ def higher_precision_layernorms(modeling_file):
     higher_precision = os.environ.get("UNSLOTH_HIGH_PRECISION_LAYERNORM", "0") == "1"
     if dtype == torch.float32:
         higher_precision = True
+    if higher_precision:
+        print("Unsloth: Upcasting layernorm weights to float32")
     os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "1" if higher_precision else "0"
 pass
 

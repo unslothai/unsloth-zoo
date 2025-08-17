@@ -564,12 +564,12 @@ def patch_Gemma3Attention_normal():
     pass
     prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
 
-    def forward(
+    def forward_function(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
@@ -636,14 +636,14 @@ def patch_Gemma3Attention_normal():
         )
 
         # 5. KV Cache update (using fp32 K, V)
-        if past_key_value is not None:
+        if past_key_values is not None:
             cache_kwargs = {
                 "sin": sin_fp32, "cos": cos_fp32, "cache_position": cache_position
             }
             # Add sliding_window if the attribute exists (common in newer models)
             if hasattr(self, "sliding_window") and self.sliding_window is not None:
                  cache_kwargs["sliding_window"] = self.sliding_window
-            key_states_fp32, value_states_fp32 = past_key_value.update(
+            key_states_fp32, value_states_fp32 = past_key_values.update(
                 key_states_fp32, value_states_fp32, self.layer_idx, cache_kwargs
             )
 
@@ -685,6 +685,29 @@ def patch_Gemma3Attention_normal():
 
         return attn_output_projected, attn_weights # 3-tuple return
     pass
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention)
