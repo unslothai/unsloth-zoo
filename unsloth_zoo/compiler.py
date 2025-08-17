@@ -380,6 +380,43 @@ def higher_precision_softmax(source):
 pass
 
 
+# Use float32 for layernorms if we find evidence for it
+def higher_precision_layernorms(source):
+    norm_modules = list(re.finditer(
+        r"\nclass[^\(\n]{1,}Norm\(nn\.Module\)"\
+        r".+?def __init__"\
+        r".+?self.weight"\
+        r".+?\nclass[^\(\n]{1,}",
+        modeling_file,
+        flags = re.DOTALL | re.MULTILINE,
+    ))
+    if len(norm_modules) == 0: return source
+    norm_module = norm_modules[0]
+    start, end = norm_module.span(0)
+    end = modeling_file.find("\nclass", end)
+    norm_module = modeling_file[start : end]
+    dtype = torch.float16
+    if "self.weight.to(torch.float32)" in norm_module:
+        dtype = torch.float32
+    elif "(self.weight * hidden_states).to(" in norm_module:
+        dtype = torch.float32
+    elif "self.weight * hidden_states.to(" in norm_module:
+        dtype = torch.float16
+    elif "self.weight.float()" in norm_module:
+        dtype = torch.float32
+    elif "return output * self.weight" in norm_module:
+        dtype = torch.float16
+    else:
+        dtype = torch.float16
+
+    # Set environment variable
+    higher_precision = os.environ.get("UNSLOTH_HIGH_PRECISION_LAYERNORM", "0") == "1"
+    if dtype == torch.float32:
+        higher_precision = True
+    os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "1" if higher_precision else "0"
+pass
+
+
 def create_new_function(
     name,
     new_source,
@@ -1934,6 +1971,10 @@ def unsloth_compile_transformers(
     # Order functions by ascending order
     functions = list(np.array(functions)[np.argsort([full_source.find(x) for x in functions])])
     ordered_functions = functions.copy()
+
+    # Check layernorms for float32 / float16
+    # Sets UNSLOTH_HIGH_PRECISION_LAYERNORM
+    higher_precision_layernorms(full_source)
 
     # If mamba type, but no fast causal functions, warn!
     if not has_causal_conv1d and \

@@ -295,9 +295,11 @@ def patch_model_and_tokenizer(
             if "lm_head" in name or "embed_tokens" in name:
                 module.to(torch.float16)
             if "embed_tokens" in name or "patch_embedding" in name:
-                module.to(torch.float16)
-            if "norm" in name:
-                module.to(torch.float16)
+                module.to(setted_dtype)
+            if name.endswith("norm") and hasattr(module, "weight"):
+                module.to(setted_dtype)
+            if "bias" in name:
+                module.to(setted_dtype)
             torch.cuda.empty_cache()
 
         # Convert any remaining bfloat16 parameters
