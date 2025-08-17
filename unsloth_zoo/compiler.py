@@ -381,7 +381,7 @@ pass
 
 
 # Use float32 for layernorms if we find evidence for it
-def higher_precision_layernorms(source):
+def higher_precision_layernorms(modeling_file):
     norm_modules = list(re.finditer(
         r"\nclass[^\(\n]{1,}Norm\(nn\.Module\)"\
         r".+?def __init__"\
@@ -390,7 +390,7 @@ def higher_precision_layernorms(source):
         modeling_file,
         flags = re.DOTALL | re.MULTILINE,
     ))
-    if len(norm_modules) == 0: return source
+    if len(norm_modules) == 0: return modeling_file
     norm_module = norm_modules[0]
     start, end = norm_module.span(0)
     end = modeling_file.find("\nclass", end)
