@@ -184,7 +184,11 @@ def patch_gpt_oss():
 
         @staticmethod
         def backward(ctx, grad_token):
-            raise NotImplementedError("Backwards pass using MXFP4 is still under construction!")
+            raise NotImplementedError(
+                "Backwards pass using MXFP4 is still under construction!\n"\
+                "Instead, use `unsloth/gpt-oss-20b-BF16` for bfloat16 training which will work for LoRA.\n"\
+                "Or, use `load_in_4bit = True` which allows finetuning."
+            )
             (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
             self_class = ctx.self_class
             limit = self_class.limit
