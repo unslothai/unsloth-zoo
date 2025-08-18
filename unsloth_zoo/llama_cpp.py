@@ -340,8 +340,6 @@ def install_llama_cpp(
     return quantizer, converter
 pass
 
-global converter_latest_final
-converter_latest_final = None
 
 @lru_cache(1)
 def _download_convert_hf_to_gguf(
@@ -404,9 +402,6 @@ def _download_convert_hf_to_gguf(
         rb"try:\n    \1\nexcept:\n    pass\n",
         converter_latest,
     )
-    global converter_latest_final
-    converter_latest_final = converter_latest
-    raise
     # from x import (y, z,)
     converter_latest = re.sub(
         rb"(from mistral_common[^\n\(]{1,}[\s]{0,}\(.+?\))",
