@@ -354,6 +354,71 @@ def get_mask_functions():
         return []
 pass
 
+# Convert F.softmax(x, ...) to F.softmax(x, ..., dtype = torch.float32).to(x.dtype)
+def higher_precision_softmax(source):
+    """
+    Converts all softmax to float32 for eg:
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+    """
+    softmax_objects = re.finditer(
+        r"(nn\.functional\.softmax|F\.softmax)"\
+        r"\("\
+        r"([^,]{1,}), "\
+        r"(dim[ ]?\=[ ]?[\-0-9]{1,2})"\
+        r"(\,[ ]?dtype[^\)]{1,})?"\
+        r"\)",
+        source,
+    )
+    for item in softmax_objects:
+        full_match, matches = item.group(0), item.groups()
+        softmax, variable, dim, dtype = matches
+        new = f"{softmax}({variable}, {dim}, dtype = torch.float32).to({variable}.dtype)"
+        source = source.replace(full_match, new)
+    return source
+pass
+
+
+# Use float32 for layernorms if we find evidence for it
+def higher_precision_layernorms(modeling_file):
+    norm_modules = list(re.finditer(
+        r"\nclass[^\(\n]{1,}Norm\(nn\.Module\)"\
+        r".+?def __init__"\
+        r".+?self.weight"\
+        r".+?\nclass[^\(\n]{1,}",
+        modeling_file,
+        flags = re.DOTALL | re.MULTILINE,
+    ))
+    if len(norm_modules) == 0: return modeling_file
+    norm_module = norm_modules[0]
+    start, end = norm_module.span(0)
+    end = modeling_file.find("\nclass", end)
+    norm_module = modeling_file[start : end]
+    dtype = torch.float16
+    if "self.weight.to(torch.float32)" in norm_module:
+        dtype = torch.float32
+    elif "(self.weight * hidden_states).to(" in norm_module:
+        dtype = torch.float32
+    elif "self.weight * hidden_states.to(" in norm_module:
+        dtype = torch.float16
+    elif "self.weight.float()" in norm_module:
+        dtype = torch.float32
+    elif "return output * self.weight" in norm_module:
+        dtype = torch.float16
+    else:
+        dtype = torch.float16
+
+    # Set environment variable
+    higher_precision = os.environ.get("UNSLOTH_HIGH_PRECISION_LAYERNORM", "0") == "1"
+    if dtype == torch.float32:
+        higher_precision = True
+    if higher_precision:
+        print("Unsloth: Upcasting layernorm weights to float32")
+    os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "1" if higher_precision else "0"
+pass
+
+
 def create_new_function(
     name,
     new_source,
@@ -367,6 +432,9 @@ def create_new_function(
     # All Unsloth Zoo code licensed under LGPLv3
     old_new_source = new_source
     do_logging = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+
+    # Fix all softmax low precisions to float32
+    new_source = higher_precision_softmax(new_source)
 
     if new_source[0] == " ":
         spaces = new_source.find("def")
@@ -427,7 +495,7 @@ def create_new_function(
     if not overwrite and os.path.isfile(function_location):
 
         # Check if exactly equivalent
-        with open(function_location, "r", encoding="utf-8") as f:
+        with open(function_location, "r", encoding = "utf-8") as f:
             file_source = f.read()
 
         if file_source != write_new_source:
@@ -621,6 +689,10 @@ def create_standalone_class(
         r"self.\1((input_ids \2 \3).clamp_(0))",
         source,
     )
+
+    # Fix all softmax low precisions to float32
+    source = higher_precision_softmax(source)
+
     return source
 pass
 
@@ -1902,6 +1974,10 @@ def unsloth_compile_transformers(
     functions = list(np.array(functions)[np.argsort([full_source.find(x) for x in functions])])
     ordered_functions = functions.copy()
 
+    # Check layernorms for float32 / float16
+    # Sets UNSLOTH_HIGH_PRECISION_LAYERNORM
+    higher_precision_layernorms(full_source)
+
     # If mamba type, but no fast causal functions, warn!
     if not has_causal_conv1d and \
         ("causal_conv1d_fn" in full_source or "causal_conv1d_update" in full_source):
@@ -1954,7 +2030,9 @@ def unsloth_compile_transformers(
         except: continue
         if "_gradient_checkpointing_func" in source:
             gradient_checkpointed_modules.append(module)
-        elif "scaled_dot_product_attention" in source or "ALL_ATTENTION_FUNCTIONS" in source:
+        elif ("scaled_dot_product_attention" in source or "ALL_ATTENTION_FUNCTIONS" in source) \
+            and ("_supports_sdpa = False" not in full_source):
+            # Must add _supports_sdpa check since now all modules use ALL_ATTENTION_FUNCTIONS
             scaled_dot_product_attention_modules.append(module)
         elif "nn.functional.softmax" in source or "flash_attn_varlen_func" in source or "_flash_attention_forward" in source:
             full_attention_modules.append(module)
@@ -1969,9 +2047,9 @@ def unsloth_compile_transformers(
     # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
     if supports_sdpa is not None:
         assert(type(supports_sdpa) is list and len(supports_sdpa) == 1)
-        if len(scaled_dot_product_attention_modules) != 0:
+        if ("_supports_sdpa = True" in full_source) and ("_supports_sdpa = False" not in full_source):
             if supports_sdpa[0] != False: supports_sdpa[0] = True
-        elif "_supports_sdpa = True" in full_source:
+        elif len(scaled_dot_product_attention_modules) != 0:
             if supports_sdpa[0] != False: supports_sdpa[0] = True
         else:
             supports_sdpa[0] = False
@@ -1981,7 +2059,7 @@ def unsloth_compile_transformers(
     called_functions = []
     for function in functions:
         # Start of text
-        defined = re.findall(r"\bdef[\s]{1,}" + re.escape(function),full_source, flags = re.DOTALL)
+        defined = re.findall(r"\bdef[\s]{1,}" + re.escape(function), full_source, flags = re.DOTALL)
         # Disable self.
         called = re.findall(r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags = re.DOTALL)
         if len(defined) != 0 and len(called) != 0:
