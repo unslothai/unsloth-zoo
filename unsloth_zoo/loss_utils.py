@@ -301,7 +301,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             break
     pass
 
-    print(batch_samples, len(batch_samples))
+    print("len(batch_samples)", len(batch_samples))
 
     # Get num_items_in_batch
     if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
