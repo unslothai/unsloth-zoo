@@ -144,9 +144,9 @@ def grpo_compute_loss(
     # Below is forward KL (normal KL)
     # kl_i = torch.exp(old) * (old - new)
     if old_logits is not None: 
-        log_ratio = torch.exp(new - old)
+        log_ratio = new - old
     else:
-        log_ratio = torch.ones(new.shape, device = new.device)
+        log_ratio = new - new.detach()
 
     if importance_sampling_level == "token":
         log_importance_weights = log_ratio
