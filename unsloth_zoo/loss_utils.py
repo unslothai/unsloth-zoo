@@ -304,7 +304,8 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
     global final_batches
     final_batches = batch_samples
-    raise
+    if "RAISE_ATTENTION_MASK" in os.environ:
+        raise
 
     # Get num_items_in_batch
     if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
