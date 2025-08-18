@@ -332,10 +332,12 @@ def set_additional_modules(new_model, quant_state_dict, config):
 
     # Embeddings
     embed_tokens_key = f"{language_model_prefix}.embed_tokens.weight"
+    pad_token_id = getattr(config, "pad_token_id", None) or getattr(config, "text_config", None) and getattr(config.text_config, "pad_token_id", None)
+    if pad_token_id: assert pad_token_id <= quant_state_dict[embed_tokens_key].shape[0], f"Pad token id {pad_token_id} out of bounds for vocab size {quant_state_dict[embed_tokens_key].shape[0]}"
     language_model.embed_tokens = torch.nn.Embedding.from_pretrained(
         quant_state_dict[embed_tokens_key],
         freeze = True,
-        padding_idx = config.pad_token_id,
+        padding_idx = pad_token_id,
     )
 
     # Norm

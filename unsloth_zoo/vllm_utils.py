@@ -53,8 +53,7 @@ from .temporary_patches.common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
 )
-# from unsloth import DEVICE_TYPE
-DEVICE_TYPE = "cuda"
+from unsloth import DEVICE_TYPE
 global LORA_REQUEST_ID
 
 # Ignore logging messages
@@ -771,8 +770,6 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
         raise RuntimeError(f"Unsloth: Cannot access vLLM internal model. This might be due to a vLLM version incompatibility. Error: {str(e)}")
     pass
 
-    print(f"Unsloth: vllm_internals: \n\n{vllm_internals}\n\n")
-
     assert(config is not None)
 
     # Determine model type from config BEFORE reassigning config
@@ -789,70 +786,67 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     quant_state_dict = OrderedDict()
 
     def get_state_dict(prefix, kk, state_dict, proj, slice_weights=True, slice_index=-1):
-        try:
-            proj = getattr(proj, "base_layer", proj)
-            qweight = proj.weight
+        proj = getattr(proj, "base_layer", proj)
+        qweight = proj.weight
 
-            # Determine slicing offsets
-            output_sizes = getattr(proj, "output_sizes", None)
-            if output_sizes is not None:
-                dim_offsets = np.cumsum([0] + output_sizes)
+        # Determine slicing offsets
+        output_sizes = getattr(proj, "output_sizes", None)
+        if output_sizes is not None:
+            dim_offsets = np.cumsum([0] + output_sizes)
+        else:
+            dim_offsets = [0, qweight.shape[0]]
+
+        # Handle quantized weights
+        quant_states = getattr(qweight, "bnb_quant_state", None)
+        if quant_states is not None:
+            offsets = qweight.bnb_shard_offsets
+            if slice_weights:
+                weight = qweight[offsets[kk] : offsets[kk + 1]]
+                quant_state_dict[prefix + ".weight.quant_state"] = quant_states[kk]
+                quant_state = quant_states[kk].as_dict(packed = True)
+                for k, v in quant_state.items():
+                    state_dict[prefix + ".weight." + k] = v
             else:
-                dim_offsets = [0, qweight.shape[0]]
-
-            # Handle quantized weights
-            quant_states = getattr(qweight, "bnb_quant_state", None)
-            if quant_states is not None:
-                offsets = qweight.bnb_shard_offsets
-                if slice_weights:
-                    weight = qweight[offsets[kk] : offsets[kk + 1]]
-                    quant_state_dict[prefix + ".weight.quant_state"] = quant_states[kk]
-                    quant_state = quant_states[kk].as_dict(packed = True)
-                    for k, v in quant_state.items():
-                        state_dict[prefix + ".weight." + k] = v
-                else:
-                    weight = qweight
-                    quant_state_dict[prefix + ".weight.quant_state"] = quant_states[0]
-                    quant_state = quant_states[0].as_dict(packed = True)
-                    for k, v in quant_state.items():
-                        state_dict[prefix + ".weight." + k] = v
+                weight = qweight
+                quant_state_dict[prefix + ".weight.quant_state"] = quant_states[0]
+                quant_state = quant_states[0].as_dict(packed = True)
+                for k, v in quant_state.items():
+                    state_dict[prefix + ".weight." + k] = v
+        else:
+            # Normal FP16 weights
+            qweight.requires_grad_(False)
+            if slice_weights:
+                weight = qweight[dim_offsets[kk] : dim_offsets[kk + 1]]
             else:
-                # Normal FP16 weights
-                qweight.requires_grad_(False)
-                if slice_weights:
-                    weight = qweight[dim_offsets[kk] : dim_offsets[kk + 1]]
-                else:
-                    weight = qweight
+                weight = qweight
 
-            # Apply vocab_size truncation for embedding and lm_head layers
-            # for mllama, prefer using org_vocab_size which is text_config.vocab_size + 8
-            # https://github.com/huggingface/transformers/blob/1cea763ba422b83778a8db0374ea90f43b09992b/src/transformers/models/mllama/modeling_mllama.py#L1147
-            shrink_size = getattr(proj,"org_vocab_size", vocab_size)
-            if shrink_size and ("embed_tokens" in prefix or "lm_head" in prefix):
-                if weight.shape[0] > shrink_size:
-                    weight = weight[:shrink_size]
+        # Apply vocab_size truncation for embedding and lm_head layers
+        # for mllama, prefer using org_vocab_size which is text_config.vocab_size + 8
+        # https://github.com/huggingface/transformers/blob/1cea763ba422b83778a8db0374ea90f43b09992b/src/transformers/models/mllama/modeling_mllama.py#L1147
+        shrink_size = getattr(proj,"org_vocab_size", vocab_size)
+        if shrink_size and ("embed_tokens" in prefix or "lm_head" in prefix):
+            if weight.shape[0] > shrink_size:
+                weight = weight[:shrink_size]
 
-            state_dict[prefix + ".weight"] = weight
-            quant_state_dict[prefix + ".weight"] = weight
+        state_dict[prefix + ".weight"] = weight
+        quant_state_dict[prefix + ".weight"] = weight
 
-            # Handle bias
-            bias = getattr(proj, "bias", None)
-            if bias is not None:
-                bias.requires_grad_(False)
-                if slice_weights:
-                    bias_tensor = bias[dim_offsets[kk] : dim_offsets[kk + 1]]
-                else:
-                    bias_tensor = bias
+        # Handle bias
+        bias = getattr(proj, "bias", None)
+        if bias is not None:
+            bias.requires_grad_(False)
+            if slice_weights:
+                bias_tensor = bias[dim_offsets[kk] : dim_offsets[kk + 1]]
+            else:
+                bias_tensor = bias
 
-                # Apply vocab_size truncation for bias as well
-                if shrink_size is not None and ("embed_tokens" in prefix or "lm_head" in prefix):
-                    if bias_tensor.shape[0] > shrink_size:
-                        bias_tensor = bias_tensor[:shrink_size]
+            # Apply vocab_size truncation for bias as well
+            if shrink_size is not None and ("embed_tokens" in prefix or "lm_head" in prefix):
+                if bias_tensor.shape[0] > shrink_size:
+                    bias_tensor = bias_tensor[:shrink_size]
 
-                state_dict[prefix + ".bias"] = bias_tensor
-                quant_state_dict[prefix + ".bias"] = bias_tensor
-        except:
-            print(f'failed to extract weights for {prefix}')
+            state_dict[prefix + ".bias"] = bias_tensor
+            quant_state_dict[prefix + ".bias"] = bias_tensor
     pass
 
     # Embedding
@@ -1553,7 +1547,7 @@ def load_vllm(
         # max_seq_len_to_capture fails for V1
         # max_seq_len_to_capture = min(8192, max_seq_length + 256), # Default is 8192 for CUDAGraphs
         compilation_config     = compilation_config, # 0, 1, 2, 3
-        enforce_eager          = True,
+        enforce_eager          = enforce_eager,
         swap_space             = swap_space, # Low memory devices like Colab (13GB) default 4GB
         device                 = device,
         # New vLLM versions need to pass this in!
@@ -2166,7 +2160,7 @@ def _test_get_vllm_state_dict(
     print(f'Loading model with type {model_class}')
     model = model_class.from_pretrained(
         model_name,
-        device_map          = "auto",
+        device_map          = "sequential",
         torch_dtype         = dtype,
         attn_implementation = "sdpa",
         low_cpu_mem_usage   = True,
@@ -2176,7 +2170,7 @@ def _test_get_vllm_state_dict(
     # unpatch_bitsandbytes_compute_dtype()
     for param in model.parameters():
         param.requires_grad_(False)
-    # model, _ = patch_model_and_tokenizer(model, None)
+    model, _ = patch_model_and_tokenizer(model, None)
     model.eval()
 
     # Patch vLLM to disable multiprocessing for state dict extraction
