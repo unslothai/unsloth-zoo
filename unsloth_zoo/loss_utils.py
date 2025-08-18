@@ -248,6 +248,7 @@ TRAINING_ITERATIONS = 0
 mark_static  = torch._dynamo.mark_static
 mark_dynamic = torch._dynamo.mark_dynamic
 
+global final_batches
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
@@ -301,7 +302,9 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             break
     pass
 
-    print("len(batch_samples)", len(batch_samples))
+    global final_batches
+    final_batches = batch_samples
+    raise
 
     # Get num_items_in_batch
     if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
