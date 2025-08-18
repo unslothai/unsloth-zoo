@@ -595,7 +595,7 @@ pass
 
 def _remove_quantization_config(config_path: Path):
     assert config_path.exists(), "Given config does not exist"
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding = "utf-8") as f:
         config = json.load(f)
     if "quantization_config" in config:
         # Remove the quantization_config field
@@ -603,7 +603,7 @@ def _remove_quantization_config(config_path: Path):
     else:
         return
     # Overwrite the config file
-    with open(config_path, "w") as f:
+    with open(config_path, "w", encoding = "utf-8") as f:
         json.dump(config, f, indent = 4)
     pass
 pass
@@ -660,7 +660,7 @@ def merge_and_overwrite_lora(
         index_path = os.path.join(model_name, "model.safetensors.index.json")
         if os.path.exists(index_path):
             try:
-                with open(index_path, 'r') as f:
+                with open(index_path, 'r', encoding = "utf-8") as f:
                     index_data = json.load(f)
                     # Extract file names from the index if available
                     if "weight_map" in index_data:
@@ -1302,7 +1302,7 @@ def get_original_model_id(local_path: str):
 
     config_path = os.path.join(local_path, "config.json")
     if os.path.exists(config_path):
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding = "utf-8") as f:
             config = json.load(f)
 
         # Check for _name_or_path that's not a local path
@@ -1312,7 +1312,7 @@ def get_original_model_id(local_path: str):
 
     config_path = os.path.join(local_path, "adapter_config.json")
     if os.path.exists(config_path):
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding = "utf-8") as f:
             config = json.load(f)
 
         if "base_model_name_or_path" in config:

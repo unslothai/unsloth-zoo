@@ -162,8 +162,12 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         "config.cuda.enable_cuda_lto = True",
         "config.cuda.use_fast_math = True",
         f"config.cuda.compile_opt_level = {'-O2' if O3 else '-O1'}",
-        # Capture torch.arange(...), torch.zeros(...)
-        "config.capture_dynamic_output_shape_ops = True",
+        # See torch.compile, the missing manual
+        # https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8
+        # f"config.emulate_precision_casts = {not debug}", # Force X.to(f32).to(f16) instead of X.to(f16)
+        # when setting to not debug aka True, we get errors on torch2.6 
+        # TypeError: ValueRangeAnalysis.to_dtype() got an unexpected keyword argument 'use_compute_types'
+        # this keyword exists in torch2.7.0 but not in torch2.6.0 so set to False until torch2.6.0 is deprecated.
         "config.emulate_precision_casts = False", # Force X.to(f32).to(f16) instead of X.to(f16)
     ]
     # Torch dynamo arguments
@@ -177,9 +181,14 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # FAILS for Gemma!
         "config.compiled_autograd = False", # New Torch 2.4 feature which can compile backwards passes
         # https://pytorch.org/tutorials/intermediate/compiled_autograd_tutorial.html
-        "config.recompile_limit = 8", # Reduce recompiles to 8 - then will do eager
+        "config.recompile_limit = 32", # Increase recompile amounts to 32 - then will do eager
         "config.allow_unspec_int_on_nn_module = True", # Integers in modules will auto wrap torch.tensor(self.vocab_size)
-        "config.optimize_ddp = True", # Optimizes DDP
+        f"config.optimize_ddp = {not debug}", # Optimizes DDP, but can error out so disable on debug
+        # Captures .item() for eg
+        # n_chunks = int(torch.ceil((torch.tensor(vocab_size) / 262144) * 8))
+        "config.capture_scalar_outputs = True",
+        # Capture torch.arange(...), torch.zeros(...)
+        "config.capture_dynamic_output_shape_ops = True",
     ]
     if not debug and ignore_errors:
         # Have to explicitly set it!
@@ -277,30 +286,42 @@ def patch_model_and_tokenizer(
     pass
     # If we force float32, we first use bfloat16, then downcast to float16
     if do_forced_float32:
-      correct_dtype = torch.float16
-      for name, module in model.named_modules():
-          if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
-              module.to(torch.float16)
-          if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
-              module.to(torch.float16)
-          if "lm_head" in name or "embed_tokens" in name:
-              module.to(torch.float16)
-          if "embed_tokens" in name or "patch_embedding" in name:
-              module.to(torch.float16)
-          if "norm" in name:
-              module.to(torch.float16)
-          torch.cuda.empty_cache()
+        correct_dtype = torch.float16
+        for name, module in model.named_modules():
+            if hasattr(module, "_pre_set_compute_dtype"):
+                setted_dtype = module._pre_set_compute_dtype
+            else:
+                setted_dtype = torch.float16
+            if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
+                module.to(setted_dtype)
+            if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
+                module.to(setted_dtype)
+            if "lm_head" in name or "embed_tokens" in name:
+                module.to(setted_dtype)
+            if "embed_tokens" in name or "patch_embedding" in name:
+                module.to(setted_dtype)
+            if name.endswith("norm") and hasattr(module, "weight"):
+                module.to(setted_dtype)
+            if "bias" in name:
+                module.to(setted_dtype)
+            torch.cuda.empty_cache()
 
-      # Convert any remaining bfloat16 parameters
-      for name, param in model.named_parameters():
-          if param.dtype == torch.bfloat16:
-              param.data = param.data.to(torch.float16)
+        # Convert any remaining bfloat16 parameters
+        for name, param in model.named_parameters():
+            if param.dtype == torch.bfloat16:
+                param.data = param.data.to(torch.float16)
 
-      # Also convert buffers (like position embeddings)
-      for name, buffer in model.named_buffers():
-          if buffer.dtype == torch.bfloat16:
-              buffer.data = buffer.data.to(torch.float16)
-      pass
+        # Also convert buffers (like position embeddings)
+        for name, buffer in model.named_buffers():
+            if buffer.dtype == torch.bfloat16:
+                buffer.data = buffer.data.to(torch.float16)
+        pass
+    pass
+
+    # Upcast ot downcast if explicitly set
+    for name, module in model.named_modules():
+        if hasattr(module, "_pre_set_compute_dtype"):
+            module.to(module._pre_set_compute_dtype)
     pass
 
     # Correct torch_dtype
@@ -337,16 +358,21 @@ def patch_model_and_tokenizer(
 
             quant_state = weight.quant_state
 
+            if hasattr(module, "_pre_set_compute_dtype"):
+                setted_dtype = module._pre_set_compute_dtype
+            else:
+                setted_dtype = correct_dtype
+
             if type(quant_state) is list:
                 # BnB seems to have float16 as default!
-                module.weight.quant_state[2] = correct_dtype # Cast to correct dtype
+                module.weight.quant_state[2] = setted_dtype # Cast to correct dtype
             else:
                 # https://github.com/TimDettmers/bitsandbytes/pull/763/files
-                quant_state.dtype = correct_dtype
+                quant_state.dtype = setted_dtype
             pass
 
             if hasattr(module, "compute_dtype"):
-                module.compute_dtype = correct_dtype
+                module.compute_dtype = setted_dtype
         pass
         # Downcast RoPE embedding to correct data type
         if downcast_rope and ((name.endswith("rotary_emb") or hasattr(module, "cos_cached"))):

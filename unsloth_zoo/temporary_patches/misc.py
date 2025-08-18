@@ -17,8 +17,9 @@
 import torch
 import torch.nn as nn
 import inspect
+import importlib
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from .common import TEMPORARY_PATCHES, torch_compile_options
+from .common import TEMPORARY_PATCHES, torch_compile
 from .utils import (
     patch_function,
     process_output_options,
@@ -32,7 +33,55 @@ from .utils import (
     StaticCache,
     HybridCache,
     Unpack,
+    _get_unique_storage_name,
 )
+from textwrap import dedent
+import re
+
+def patch_merge_quantization_configs():
+    # Fixes some issues with merging quantization configs
+    try:
+        import transformers.quantizers.auto
+    except Exception as e:
+        return raise_error("transformers.quantizers.auto", e)
+    try:
+        f = transformers.quantizers.auto.AutoHfQuantizer.merge_quantization_configs
+    except Exception as e:
+        return raise_error("transformers.quantizers.auto.AutoHfQuantizer.merge_quantization_configs", e)
+
+    # Fast return if already patched
+    unique_name = _get_unique_storage_name(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs")
+    if hasattr(transformers.quantizers.auto.AutoHfQuantizer, unique_name): return
+
+    source = inspect.getsource(f)
+    items = dir(transformers.quantizers.auto)
+
+    # Fix as at 7th August 2025
+    # ValueError: The model is quantized with Mxfp4Config but you are passing a NoneType config.
+    # Please make sure to pass the same quantization config class to `from_pretrained` with different loading attributes.
+    source = source.replace(
+        "if quantization_config.__class__.__name__ != quantization_config_from_args.__class__.__name__:",
+        "if quantization_config_from_args is not None and quantization_config.__class__.__name__ != quantization_config_from_args.__class__.__name__:",
+    )
+
+    exec("from transformers.quantizers.auto import (" + ",".join(x for x in items if x in source) + ")", globals())
+    source = dedent(source)
+    # Remove cls if classmethod
+    is_classmethod = source.startswith("@classmethod")
+    source = source[source.find("def"):]
+    if is_classmethod:
+        matches = re.match(r"(def[\s]{1,}[^(]{1,}\()[\s]{0,}cls[\s]{0,}\,[\s]{0,}", source)
+        if matches is not None:
+            found, replace = matches.group(0), matches.group(1)
+            source = replace + source[len(found):]
+    try:
+        exec(source, globals())
+    except Exception as e:
+        return raise_error("", e)
+
+    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merge_quantization_configs)
+pass
+TEMPORARY_PATCHES.append(patch_merge_quantization_configs)
 
 
 def patch_CsmDepthDecoderForCausalLM_forward():
@@ -569,3 +618,45 @@ def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     patch_function(transformers.models.granitemoehybrid.modeling_granitemoehybrid.GraniteMoeHybridMambaLayer, "cuda_kernels_forward", cuda_kernels_forward)
 pass
 TEMPORARY_PATCHES.append(patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward)
+
+
+def fix_mamba_ssm_float32():
+    try:
+        import mamba_ssm.ops.triton.ssd_chunk_scan
+    except ImportError:
+        return
+    except Exception as e:
+        return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+
+    # Try getting file for mamba_ssm
+    try:
+        ssd_chunk_scan_file = inspect.getfile(mamba_ssm.ops.triton.ssd_chunk_scan)
+        with open(ssd_chunk_scan_file, "r", encoding = "utf-8") as file: file = file.read()
+    except Exception as e:
+        return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+
+    # Find dst +=|= tl.dot(a, b)
+    matches = list(re.finditer(
+        r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)",
+        file)
+    )
+    for match in matches:
+        old = match.group(0)
+        dst, adder, a, b = match.groups()
+        accumulator = '' if adder == "=" else f', acc = {dst}'
+        # Change to float32 if float16 seen otherwise leave as original precision
+        new = f" {dst} = tl.dot("\
+            f"{a}.to(tl.float32), "\
+            f"{b}.to(tl.float32)"\
+            f"{accumulator})"
+        file = file.replace(old, new)
+    pass
+
+    try:
+        # Reload module since we editted it
+        with open(ssd_chunk_scan_file, "w", encoding = "utf-8") as f: f.write(file)
+        importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
+    except Exception as e:
+        return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+pass
+TEMPORARY_PATCHES.append(fix_mamba_ssm_float32)

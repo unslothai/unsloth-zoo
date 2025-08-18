@@ -326,6 +326,8 @@ if importlib.util.find_spec("vllm") is not None:
             vllm.v1.worker.lora_model_runner_mixin.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
         except:
             pass
+        if os.getenv("UNSLOTH_DO_NOT_PATCH_V0_LRU_LORA_MANAGER", "0") == "1":
+            return
         try:
             import vllm.worker.model_runner
             vllm.worker.model_runner.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
@@ -1655,7 +1657,7 @@ pass
 
 @functools.cache
 def get_peft_config(save_directory):
-    with open(os.path.join(save_directory, "adapter_config.json")) as f:
+    with open(os.path.join(save_directory, "adapter_config.json"), encoding = "utf-8") as f:
         config = json.load(f)
     return config
 pass
