@@ -2669,7 +2669,9 @@ def unsloth_compile_transformers(
         pass
     pass
     # Quick exit
-    if combined_module is None or disable: return
+    if combined_module is None or disable:
+        print(f"Unsloth: Exit auto compiler with combined_module = {combined_module}, disable = {disable}")
+        return
 
     # Import and replace with new module
     for module in all_standalone_classes.keys():
