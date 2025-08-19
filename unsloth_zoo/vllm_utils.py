@@ -754,7 +754,6 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     # vllm_state_dict = {}
     try:
         llm_engine = getattr(llm, "llm_engine", getattr(llm, "engine", llm))
-
         # Handle V1 vs V0 engines
         if hasattr(llm_engine, "engine_core"):
             # V1 engine - access through engine_core (multiprocessing is disabled by patch_vllm)
@@ -762,12 +761,19 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
         else:
             # V0 engine - direct access
             vllm_internals = llm_engine.model_executor.driver_worker.model_runner.model
-
-        # for name, p in vllm_internals.named_parameters():
-        #     vllm_state_dict[name] = p
-    except Exception as e:
-        # If we can't access the model directly, raise a more informative error
-        raise RuntimeError(f"Unsloth: Cannot access vLLM internal model. This might be due to a vLLM version incompatibility. Error: {str(e)}")
+    except:
+        # Using a new VLLM version must use collective_rpc
+        try:
+            vllm_state_dict = {}
+            gpu_ids = llm.collective_rpc("report_device_id", args = tuple())
+            weights = llm.collective_rpc("get_weight_ipc_handles", args = tuple())[0]
+            weights = weights[gpu_ids[0]]
+            for weight_name, (to_cuda_fx, cuda_data,) in weights.items():
+                vllm_state_dict[weight_name] = to_cuda_fx(*cuda_data)
+            pass
+            raise NotImplementedError("Unsloth: Currently vLLM RPC is not yet fully enabled!")
+        except Exception as e:
+            raise RuntimeError(f"Unsloth: Cannot get internal vLLM states with error = {str(e)}")
     pass
 
     assert(config is not None)
