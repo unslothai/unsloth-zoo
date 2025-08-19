@@ -379,6 +379,7 @@ def standardize_data_formats(
     aliases_for_system    = ["system",],
     aliases_for_user      = ["user", "human", "input",],
     aliases_for_assistant = ["gpt", "assistant", "output",],
+    batch_size            = 1000
 ):
     """
     Standardizes ShareGPT and other formats to user/assistant Hugging Face format.
@@ -464,23 +465,20 @@ def standardize_data_formats(
         return { "conversations" : all_convos, }
     pass
 
-    if isinstance(dataset, IterableDataset):
-        return dataset.map(
-            _standardize_dataset,
-            batched = True,
-            batch_size = dataset._ex_iterable.batch_size,
-            desc = "Unsloth: Standardizing formats"
-        )
-    else:
-        from multiprocessing import cpu_count
-        num_proc = cpu_count()
+    dataset_map_kwargs = {
+        'batched': True,
+        'desc': "Unsloth: Standardizing formats",
+        'batch_size': batch_size,
+    }
 
-        return dataset.map(
-            _standardize_dataset,
-            batched = True,
-            desc = "Unsloth: Standardizing formats",
-            num_proc = num_proc,
-        )
+    if not isinstance(dataset, IterableDataset):
+        from multiprocessing import cpu_count
+        dataset_map_kwargs['num_proc'] = cpu_count()
+
+    return dataset.map(
+        _standardize_dataset,
+        **dataset_map_kwargs
+    )
 pass
 
 
