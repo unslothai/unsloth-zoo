@@ -420,6 +420,15 @@ def higher_precision_layernorms(modeling_file):
 pass
 
 
+disble_use_cache_logging = """
+import logging
+class HideLoggingMessage(logging.Filter):
+    def __init__(self, text): self.text = text
+    def filter(self, x): return not (self.text in x.getMessage())
+pass
+logger.addFilter(HideLoggingMessage("`use_cache=True`"))
+"""
+
 def create_new_function(
     name,
     new_source,
@@ -467,6 +476,10 @@ def create_new_function(
     imports += f"from {model_location} import (" + ", ".join(x for x in items) + ")" if len(items) != 0 else ""
     new_source = imports + "\n\n" + new_source
     new_source = prepend + new_source + append
+
+    # Check logger and remove use_cache
+    if "logger" in items:
+        new_source = new_source + "\n" + disble_use_cache_logging + "\n"
 
     # Check versioning
     try: unsloth_zoo_version = importlib_version("unsloth_zoo")
@@ -1902,7 +1915,7 @@ def unsloth_compile_transformers(
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"): return
 
     # Use transformers model_type logger to suppress message: Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
-    exec("model_logger.addFilter(HideLoggingMessage('use_cache'))", globals(), locals())
+    exec("model_logger.addFilter(HideLoggingMessage('`use_cache`'))", globals(), locals())
     # Use transformers model_type logger to suppress message: You have set `compile_config`, but we are unable to meet the criteria for compilation.
     exec("model_logger.addFilter(HideLoggingMessage('compile_config'))", globals(), locals())
 
