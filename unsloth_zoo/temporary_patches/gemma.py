@@ -530,6 +530,27 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention)
 
 
+def patch_Gemma3RMSNorm_generic():
+    # Must do this since torch.compile cannot trace through def prepare for q_norm, k_norm
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1": return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm
+    except Exception as e:
+        return raise_error("Gemma3RMSNorm.forward", e)
+
+    def forward(self, x):
+        x_fp32 = x.to(torch.float32)
+        variance = x_fp32.pow(2).mean(-1, keepdim=True)
+        hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + self.eps)
+        output_fp32 = hidden_states_fp32 * (1.0 + self.weight.to(torch.float32))
+        return output_fp32.to(x.dtype)
+    pass
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm_generic)
+
+
 def patch_Gemma3Attention_generic():
     # Non float16 forced also has some benefits
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1": return
@@ -591,7 +612,8 @@ def patch_Gemma3Attention_generic():
             attn_mask_for_sdpa,
         )
     pass
-    # prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
+    # We must patch RMSNorm as well since q_norm, k_norm can't be traced correctly!
+    prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
 
     def forward_function(
         self,
