@@ -2676,8 +2676,6 @@ def unsloth_compile_transformers(
     # Import and replace with new module
     for module in all_standalone_classes.keys():
         exec(f"{model_location}.{module} = combined_module.{module}", globals(), locals())
-        if UNSLOTH_ENABLE_LOGGING:
-           print(f"Unsloth: Imported new {model_location}.{module}")
     pass
 
     # Finally edit dictionary items inside the target file
