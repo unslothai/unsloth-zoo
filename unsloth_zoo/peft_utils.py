@@ -36,6 +36,9 @@ SKIP_QUANTIZATION_MODULES = [
     "multi_modal_projector", # Llama 3.2 Vision, Pixtral, Llava
     "merger",                # Qwen2 VL
     "modality_projection",   # Idefics, SmolVLM
+    "router",                # MoE Router
+    "gate",                  # MoE Router
+    'mamba',
 ]
 
 def get_peft_regex(
@@ -44,11 +47,11 @@ def get_peft_regex(
     finetune_language_layers   : bool = True,
     finetune_attention_modules : bool = True,
     finetune_mlp_modules       : bool = True,
-    target_modules             : list[str] = None,
-    vision_tags                : list[str] = ["vision", "image", "visual", "patch",],
-    language_tags              : list[str] = ["language", "text",],
-    attention_tags             : list[str] = ["self_attn", "attention", "attn",],
-    mlp_tags                   : list[str] = ["mlp", "feed_forward", "ffn", "dense",],
+    target_modules             : List[str] = None,
+    vision_tags                : List[str] = ["vision", "image", "visual", "patch",],
+    language_tags              : List[str] = ["language", "text",],
+    attention_tags             : List[str] = ["self_attn", "attention", "attn",],
+    mlp_tags                   : List[str] = ["mlp", "feed_forward", "ffn", "dense",],
 ) -> str:
     """
     Create a regex pattern to apply LoRA to only select layers of a model.
@@ -192,11 +195,15 @@ def requires_grad_for_gradient_checkpointing(model):
         if type_output is torch.Tensor:
             output.requires_grad_(True)
         else:
-            try:
-                # Output in huggingface generally a dataclass with loss, try to add to that
-                output.loss.requires_grad_(True)
-            except Exception as _:
-                raise RuntimeError("Unsloth: Failed to make output require gradients!")
+            try: # For dataclass from HF, try on loss or logits 
+                if hasattr(output, "loss") and output.loss is not None:
+                    output.loss.requires_grad_(True)
+                elif hasattr(output, "logits") and output.logits is not None: #with RL like GRPO there are no loss as you don't provide labels 
+                    output.logits.requires_grad_(True)
+                else:
+                    raise ValueError("Neither loss nor logits are available for grad post hook.")
+            except Exception as e:
+                raise RuntimeError(f"Unsloth: Failed to make output require gradients: {e}")
     pass
 
     def requires_grad_pre_hook(module, input):
@@ -220,7 +227,7 @@ def requires_grad_for_gradient_checkpointing(model):
         if param.requires_grad: break
     if param is None: return
 
-    name = re.sub("\.([\d]{1,})\.", r"[\1].", name)
+    name = re.sub(r"\.([\d]{1,})\.", r"[\1].", name)
     name_components = name.split(".")
 
     if len(name_components) == 0:

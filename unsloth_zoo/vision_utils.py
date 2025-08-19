@@ -60,7 +60,7 @@ import base64
 from io import BytesIO
 import math
 import requests
-from typing import Union, Tuple
+from typing import Union, Tuple, List, Dict
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
 MAX_PIXELS = 16384 * 28 * 28
@@ -93,7 +93,7 @@ pass
 
 def smart_resize(
     height: int, width: int, factor: int = IMAGE_FACTOR, min_pixels: int = MIN_PIXELS, max_pixels: int = MAX_PIXELS
-) -> tuple[int, int]:
+) -> Tuple[int, int]:
     """
     Rescales the image so that the following conditions are met:
 
@@ -122,7 +122,7 @@ pass
 
 
 def fetch_image(
-    ele: dict[Union[Tuple[str, str], Image.Image]],
+    ele: Dict,
     size_factor: int = IMAGE_FACTOR,
 ) -> Image.Image:
     if "image" in ele:
@@ -173,7 +173,7 @@ def fetch_image(
 pass
 
 
-def extract_vision_info(conversations: Union[list[dict], list[list[dict]]]) -> list[dict]:
+def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> List[Dict]:
     vision_infos = []
     if isinstance(conversations[0], dict):
         conversations = [conversations]
@@ -181,20 +181,15 @@ def extract_vision_info(conversations: Union[list[dict], list[list[dict]]]) -> l
         for message in conversation:
             if isinstance(message["content"], list):
                 for ele in message["content"]:
-                    if (
-                        "image" in ele
-                        or "image_url" in ele
-                        or "video" in ele
-                        or ele["type"] in ("image", "image_url", "video")
-                    ):
+                    if ele["type"] in ("image", "image_url", "video"):
                         vision_infos.append(ele)
     return vision_infos
 pass
 
 
 def process_vision_info(
-    conversations: Union[list[dict], list[list[dict]]],
-) -> tuple[Union[list[Image.Image], None], Union[list[Union[torch.Tensor, list[Image.Image]]], None]]:
+    conversations: Union[List[Dict], List[List[Dict]]],
+) -> Tuple[Union[List[Image.Image], None], Union[List[Union[torch.Tensor, List[Image.Image]]], None]]:
     vision_infos = extract_vision_info(conversations)
     ## Read images or videos
     image_inputs = []

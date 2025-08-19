@@ -340,14 +340,14 @@ def train_on_responses_only(
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
     pass
     
-    if hasattr(trainer, "eval_dataset")  and trainer.eval_dataset  is not None:
+    if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
         # Eval datasets could be a dict!
         if type(trainer.eval_dataset) is dict:
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-                if isinstance(trainer.eval_dataset, IterableDataset):
-                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = trainer.eval_dataset._ex_iterable.batch_size, batched = True)
+                if isinstance(value, IterableDataset):
+                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = value._ex_iterable.batch_size, batched = True)
                 else:
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = num_proc)
         else:
@@ -380,6 +380,7 @@ def standardize_data_formats(
     aliases_for_user      = ["user", "human", "input",],
     aliases_for_assistant = ["gpt", "assistant", "output",],
     batch_size            = 1000
+    num_proc              = None,
 ):
     """
     Standardizes ShareGPT and other formats to user/assistant Hugging Face format.
@@ -473,7 +474,11 @@ def standardize_data_formats(
 
     if not isinstance(dataset, IterableDataset):
         from multiprocessing import cpu_count
-        dataset_map_kwargs['num_proc'] = cpu_count()
+        
+        if num_proc is None or type(num_proc) is not int: 
+          num_proc = cpu_count()
+
+        dataset_map_kwargs['num_proc'] = num_proc
 
     return dataset.map(
         _standardize_dataset,
@@ -483,7 +488,12 @@ pass
 
 
 from datasets import (Dataset, IterableDataset,)
-from trl.trainer.utils import ConstantLengthDataset
+try:
+    from trl.trainer.utils import ConstantLengthDataset
+except:
+    # TRL 0.20.0 removes ConstantLengthDataset
+    ConstantLengthDataset = None
+
 # Faster SFTTrainer prepare_dataset
 def sft_prepare_dataset(
     self,
@@ -495,7 +505,10 @@ def sft_prepare_dataset(
     dataset_name: str,
 ) -> Union[Dataset, IterableDataset]:
     # All Unsloth Zoo code licensed under LGPLv3
-    if isinstance(dataset, ConstantLengthDataset): return dataset
+    try:
+        if isinstance(dataset, ConstantLengthDataset): return dataset
+    except:
+        pass
 
     map_kwargs = {}
     use_desc = isinstance(dataset, Dataset)
@@ -600,18 +613,22 @@ def sft_prepare_dataset(
         pass
     pass
     if packing:
-        print("Unsloth: Hugging Face's packing is currently buggy - we're disabling it for now!")
-        return dataset
+        # Try using new packing which works in TRL
+        try:
+            pack_dataset
+        except:
+            print("Unsloth: Hugging Face's packing is currently buggy - we're disabling it for now!")
+            return dataset
 
         if max_seq_length == 0:
             raise ValueError("When packing is enabled, `max_seq_length` can't be `None`.")
 
         if use_desc: map_kwargs["desc"] = f"Unsloth: Packing {dataset_name} dataset"
-        dataset = dataset.select_columns(used_column_names).map(
-            pack_examples,
-            batched = True,
-            fn_kwargs = {"seq_length": max_seq_length,},
-            **map_kwargs,
+        dataset = pack_dataset(
+            dataset.select_columns(used_column_names),
+            max_seq_length,
+            getattr(args, "packing_strategy", "bfd"),
+            map_kwargs,
         )
     pass
     return dataset

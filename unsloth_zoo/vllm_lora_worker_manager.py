@@ -19,6 +19,16 @@ from vllm.lora.utils import get_adapter_absolute_path
 
 logger = init_logger(__name__)
 
+import inspect
+import functools
+
+@functools.lru_cache(1)
+def dummy_lora_has_scaling_factor(create_dummy_lora):
+    # create_dummy_lora(self, lora_id, rank, scaling_factor, embedding_modules)
+    # create_dummy_lora(self, lora_id, rank, embedding_modules)
+    keys = inspect.signature(create_dummy_lora).parameters.keys()
+    return "scaling_factor" in keys
+pass
 
 class WorkerLoRAManager(AbstractWorkerManager):
     """WorkerLoRAManager that manages LoRA models on the worker side.
@@ -110,7 +120,6 @@ class WorkerLoRAManager(AbstractWorkerManager):
             else:
                 lora_request.lora_config["vllm_max_position_embeddings"] = self.max_position_embeddings
                 peft_helper = PEFTHelper.from_dict(lora_request.config)
-    
             # Validates the LoRA configuration against requirements before
             # loading weights, throwing an exception if validation fails.
             peft_helper.validate_legal(self.lora_config)
@@ -122,12 +131,12 @@ class WorkerLoRAManager(AbstractWorkerManager):
                     and model.hf_to_vllm_mapper is not None):
                 hf_to_vllm_mapper = model.hf_to_vllm_mapper
 
-            if lora_request.lora_tensors is not None:
+            if getattr(lora_request, "lora_tensors", None) is not None:
                 lora = self._lora_model_cls.from_lora_tensors(
                     lora_model_id=lora_request.lora_int_id,
                     tensors=lora_request.lora_tensors,
                     peft_helper=peft_helper,
-                    device="cpu",
+                    device=None, # Keep whatever the original device was
                     dtype=self.lora_config.lora_dtype,
                     embeddings=lora_request.lora_embeddings,
                     target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
@@ -141,7 +150,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
                     expected_lora_modules,
                     peft_helper=peft_helper,
                     lora_model_id=lora_request.lora_int_id,
-                    device="cpu",
+                    device="cpu", # Local checkpoint is CPU
                     dtype=self.lora_config.lora_dtype,
                     target_embedding_padding=self.vocab_size +
                     self.lora_config.lora_extra_vocab_size,
@@ -176,8 +185,21 @@ class WorkerLoRAManager(AbstractWorkerManager):
             dummy_lora = self._cached_dummy_lora.clone(
                 lora_request.lora_int_id)
         else:
-            dummy_lora = self._adapter_manager.create_dummy_lora(
-                lora_request.lora_int_id, rank, 1, self.embedding_modules)
+            f = self._adapter_manager.create_dummy_lora
+            if dummy_lora_has_scaling_factor(f):
+                dummy_lora = f(
+                    lora_id = lora_request.lora_int_id,
+                    rank = rank,
+                    scaling_factor = 1,
+                    embedding_modules = self.embedding_modules,
+                )
+            else:
+                dummy_lora = f(
+                    lora_id = lora_request.lora_int_id,
+                    rank = rank,
+                    # scaling_factor = 1,
+                    embedding_modules = self.embedding_modules,
+                )
             if self._cached_dummy_lora is None:
                 self._cached_dummy_lora = dummy_lora
         return self._adapter_manager.add_adapter(dummy_lora)

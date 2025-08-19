@@ -356,7 +356,7 @@ def _download_convert_hf_to_gguf(
         )
 
     # Get all supported models
-    supported_types = re.findall(rb"@Model\.register\(([^)]{1,})\)", converter_latest)
+    supported_types = re.findall(rb"@(?:Model|ModelBase)\.register\(\s*([^)]+?)\s*\)",converter_latest)
     supported_types = b", ".join(supported_types).decode("utf-8")
     supported_types = re.findall(r"[\'\"]([^\'\"]{1,})[\'\"]", supported_types)
     supported_types = frozenset(supported_types)
@@ -393,6 +393,21 @@ def _download_convert_hf_to_gguf(
         rb"\2if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']\n"\
         rb"\2",
         converter_latest,
+    )
+
+    # Make mistral_common optional for now
+    # from x import y
+    converter_latest = re.sub(
+        rb"(from mistral_common[^\n\(]{1,})[\s]{0,}\n",
+        rb"try:\n    \1\nexcept:\n    pass\n",
+        converter_latest,
+    )
+    # from x import (y, z,)
+    converter_latest = re.sub(
+        rb"(from mistral_common[^\n\(]{1,}[\s]{0,}\(.+?\))",
+        rb"try:\n    \1\nexcept:\n    pass\n",
+        converter_latest,
+        flags = re.MULTILINE | re.DOTALL,
     )
 
     # Write file

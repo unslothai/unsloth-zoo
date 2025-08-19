@@ -17,9 +17,13 @@
 import torch
 from packaging.version import Version
 import os
+import math
+import functools
+from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
-major, minor = torch.cuda.get_device_capability()
+from . import DEVICE_TYPE
+from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 import inspect
 
 global HAS_CUT_CROSS_ENTROPY
@@ -36,16 +40,23 @@ if UNSLOTH_STUDIO_ENABLED:
     )
 pass
 
-if (Version(torch.__version__) >= Version("2.4.0")) and \
-    (not ((major <= 7) and (minor < 5))) and \
-    (not (Version(triton_version) < Version("3.0.0"))):
-    try:
-        from cut_cross_entropy import linear_cross_entropy
-        HAS_CUT_CROSS_ENTROPY = True
-    except:
+if DEVICE_TYPE == "cuda":
+    major, minor = torch.cuda.get_device_capability()
+    if (Version(torch.__version__) >= Version("2.4.0")) and \
+        (not ((major <= 7) and (minor < 5))) and \
+        (not (Version(triton_version) < Version("3.0.0"))):
+        try:
+            from cut_cross_entropy import linear_cross_entropy
+            HAS_CUT_CROSS_ENTROPY = True
+        except:
+            HAS_CUT_CROSS_ENTROPY = False
+    else:
         HAS_CUT_CROSS_ENTROPY = False
-else:
+    pass
+elif DEVICE_TYPE == "xpu":
     HAS_CUT_CROSS_ENTROPY = False
+else:
+    pass
 pass
 
 __all__ = [
@@ -55,8 +66,10 @@ __all__ = [
     "fused_linear_cross_entropy",
     "fast_linear_cross_entropy",
     "_unsloth_get_batch_samples",
+    "unsloth_fused_ce_loss",
 ]
 
+from .fused_losses import unsloth_fused_ce_loss
 
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -104,13 +117,6 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         UnslothForCausalLMLoss = torch._disable_dynamo(UnslothForCausalLMLoss)
     
     elif torch_compile:
-        torch_compile_options = {
-            "epilogue_fusion"   : True,
-            "max_autotune"      : False,
-            "shape_padding"     : True,
-            "trace.enabled"     : os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1",
-            "triton.cudagraphs" : False,
-        }
         UnslothForCausalLMLoss = torch.compile(
             UnslothForCausalLMLoss,
             dynamic = True,
@@ -154,6 +160,7 @@ def post_patch_loss_function(model):
 pass
 
 
+torch_cuda_device = torch.cuda.device
 def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,
@@ -165,18 +172,23 @@ def fused_linear_cross_entropy(
     accuracy_threshold : str = "auto",
 ):
     # All Unsloth Zoo code licensed under LGPLv3
+    if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
+        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
-    loss = linear_cross_entropy(
-        hidden_states.to(lm_weight.dtype),
-        lm_weight,
-        targets      = labels,
-        ignore_index = ignore_index,
-        softcap      = logit_softcapping,
-        reduction    = reduction,
-        shift        = True,
-        filter_eps   = accuracy_threshold,
-    )
+
+    with torch_cuda_device(lm_weight.device):
+        loss = linear_cross_entropy(
+            hidden_states.to(lm_weight.dtype),
+            lm_weight,
+            targets      = labels,
+            ignore_index = ignore_index,
+            softcap      = logit_softcapping,
+            reduction    = reduction,
+            shift        = True,
+            filter_eps   = accuracy_threshold,
+        )
     if num_items_in_batch is not None: loss = loss / num_items_in_batch
     return loss
 pass
@@ -195,6 +207,9 @@ def fast_linear_cross_entropy(
     attention_mask       : torch.Tensor = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
+    if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
+        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
     if logit_scale_multiply != 0:
@@ -223,6 +238,17 @@ pass
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
+global TRAINING_ITERATIONS
+TRAINING_ITERATIONS = 0
+
+# Cannot use sadly
+# import torch._dynamo.eval_frame as torch_dynamo_eval_frame
+# torch_compiler_set_stance = torch.compiler.set_stance
+
+mark_static  = torch._dynamo.mark_static
+mark_dynamic = torch._dynamo.mark_dynamic
+
+# global final_batches
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
@@ -230,6 +256,9 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
     # Check if model allows **kwargs
     m = self.model
+    if hasattr(m, "get_base_model"):
+        # Removes PeftModelForCausalLM and gets internal model
+        m = m.get_base_model()
     model_name = m.__class__.__name__
     global ALLOWED_NUM_ITEMS_IN_BATCH
     if model_name not in ALLOWED_NUM_ITEMS_IN_BATCH:
@@ -273,20 +302,34 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             break
     pass
 
+    # global final_batches
+    # final_batches = batch_samples
+    # if "RAISE_ATTENTION_MASK" in os.environ:
+    #     raise
+
     # Get num_items_in_batch
     if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
         try:
-            if not "attention_mask" in batch_samples[0]: is_vlm = False
-            if not is_vlm:
-                num_items_in_batch = sum(
-                    [(x["labels"][..., 1:] != -100)\
-                    .sum() for x in batch_samples]
-                )
-            else:
-                num_items_in_batch = sum(
-                    [((x["labels"][..., 1:] != -100) & (x["attention_mask"][..., 1:] != 0))\
-                    .sum() for x in batch_samples]
-                )
+            token_counts = []
+            for x in batch_samples:
+                labels = x["labels"]
+                token_count = (labels[..., 1:] != -100)
+                if "input_ids" in x:
+                    input_ids = x["input_ids"]
+                    mark_static (input_ids, 0)
+                    mark_dynamic(input_ids, 1)
+                if "attention_mask" in x:
+                    attention_mask = x["attention_mask"]
+                    mark_static (attention_mask, 0)
+                    mark_dynamic(attention_mask, 1)
+                    token_count &= (attention_mask[..., 1:] != 0)
+                if "token_type_ids" in x:
+                    token_type_ids = x["token_type_ids"]
+                    mark_static (token_type_ids, 0)
+                    mark_dynamic(token_type_ids, 1)
+                token_counts.append(token_count.sum())
+            pass
+            num_items_in_batch = sum(token_counts)
 
             if self.args.average_tokens_across_devices:
                 num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
@@ -295,6 +338,24 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         except Exception as exception:
             raise RuntimeError(exception)
     pass
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
+    
+    # [TODO] Unfortunately skip_guard_eval_unsafe = True fails
+    # Increment counter and set compiler stance
+    # if not hasattr(self.model, "vllm_engine"):
+    #     # Only for non vLLM runs! Otherwise errors out
+    #     global TRAINING_ITERATIONS
+    #     if TRAINING_ITERATIONS == 16:
+    #         # Skip guards after 16 warmup runs
+    #         torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = True)
+    #         if UNSLOTH_ENABLE_LOGGING:
+    #             logger.info(f"Unsloth: Skipping torch.compile guards after 16 steps at TRAINING_ITERATIONS = {TRAINING_ITERATIONS}")
+    #     elif torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe == False and TRAINING_ITERATIONS > 16:
+    #         # Reset TRAINING_ITERATIONS
+    #         torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+    #         TRAINING_ITERATIONS = 0
+    #     TRAINING_ITERATIONS += 1
     return batch_samples, num_items_in_batch
 pass
 
