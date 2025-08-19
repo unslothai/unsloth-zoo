@@ -588,7 +588,7 @@ def patch_Gemma3Attention_generic():
             attn_mask_for_sdpa,
         )
     pass
-    prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
+    # prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
 
     def forward_function(
         self,
