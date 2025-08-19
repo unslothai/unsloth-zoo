@@ -42,6 +42,7 @@ from .utils import (
     is_distributed,
     distributed_function,
 )
+from .log import logger
 import triton
 import regex
 from .peft_utils import get_lora_layer_modules
@@ -317,7 +318,7 @@ def _get_compile_folder(use_tempfile = False):
         UNSLOTH_COMPILE_USE_TEMP = True
         location = os.path.join(tempfile.gettempdir(), UNSLOTH_COMPILE_LOCATION)
         if not os.path.exists(location):
-            print(
+            logger.info(
                 f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
             )
             os.makedirs(location, exist_ok = True)
@@ -332,7 +333,7 @@ def _get_compile_folder(use_tempfile = False):
             UNSLOTH_COMPILE_USE_TEMP = True
             location = os.path.join(tempfile.gettempdir(), location)
             os.makedirs(location, exist_ok = True)
-            print(
+            logger.info(
                 f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
             )
     return location, UNSLOTH_COMPILE_USE_TEMP
@@ -562,13 +563,13 @@ def create_new_function(
             function_location = os.path.join(compile_folder, f"{name}.py")
             distributed_function(1, write_file, function_location, write_new_source)
             if is_main_process():
-                print(f"Standard import failed for {name}: {e}. Using tempfile instead!")
+                logger.info(f"Standard import failed for {name}: {e}. Using tempfile instead!")
             try:
                 new_module, old_path = import_module(compile_folder, name)
             except Exception as e:
                 new_module = None
                 if is_main_process():
-                    print(f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!")
+                    logger.info(f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!")
         pass
         # Fallback to direct module loading
         if new_module is None:
