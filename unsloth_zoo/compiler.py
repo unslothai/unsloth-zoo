@@ -421,12 +421,13 @@ pass
 
 
 disble_use_cache_logging = """
-import logging
-class HideLoggingMessage(logging.Filter):
-    def __init__(self, text): self.text = text
-    def filter(self, x): return not (self.text in x.getMessage())
-pass
-logger.addFilter(HideLoggingMessage("`use_cache=True`"))
+if hasattr(logger, "addFilter"):
+    import logging
+    class HideLoggingMessage(logging.Filter):
+        def __init__(self, text): self.text = text
+        def filter(self, x): return not (self.text in x.getMessage())
+    pass
+    logger.addFilter(HideLoggingMessage("`use_cache=True`"))
 """
 
 def create_new_function(
@@ -475,11 +476,10 @@ def create_new_function(
     imports += "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     imports += f"from {model_location} import (" + ", ".join(x for x in items) + ")" if len(items) != 0 else ""
     new_source = imports + "\n\n" + new_source
-    new_source = prepend + new_source + append
-
     # Check logger and remove use_cache
     if "logger" in items:
         new_source = new_source + "\n" + disble_use_cache_logging + "\n"
+    new_source = prepend + new_source + append
 
     # Check versioning
     try: unsloth_zoo_version = importlib_version("unsloth_zoo")
