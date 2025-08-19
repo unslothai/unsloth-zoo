@@ -331,7 +331,6 @@ def patch_Gemma3Attention():
     torch_jit_is_tracing = torch.jit.is_tracing
 
     def prepare(
-        self,
         hidden_states,
         query_states_fp16,
         key_states_fp16,
@@ -340,6 +339,8 @@ def patch_Gemma3Attention():
         kv_hidden_shape,
         position_embeddings,
         attention_mask,
+        q_norm,
+        k_norm,
     ):
         # 2. Upcast Q, K, V for norm and RoPE, and then transpose for attention
         # (bsz, num_specific_heads, q_len, head_dim)
@@ -348,8 +349,8 @@ def patch_Gemma3Attention():
         value_states_fp32 = value_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2) # V for attention also fp32
 
         # 3. Normalization (q_norm, k_norm are RMSNorms)
-        query_norm_out_fp16 = self.q_norm(query_states_fp32)
-        key_norm_out_fp16   = self.k_norm(key_states_fp32)
+        query_norm_out_fp16 = q_norm(query_states_fp32) # self.q_norm doesn't use auto compiler
+        key_norm_out_fp16   = k_norm(key_states_fp32) # self.q_norm doesn't use auto compiler
 
         query_states_fp32 = query_norm_out_fp16.to(torch.float32)
         key_states_fp32   = key_norm_out_fp16.to(torch.float32)
@@ -438,7 +439,6 @@ def patch_Gemma3Attention():
             sin_fp32,
             attn_mask_for_sdpa,
         ) = prepare(
-            self,
             hidden_states,
             query_states_fp16,
             key_states_fp16,
@@ -447,6 +447,8 @@ def patch_Gemma3Attention():
             kv_hidden_shape,
             position_embeddings,
             attention_mask,
+            self.q_norm,
+            self.k_norm,
         )
 
         # 5. KV Cache update (using fp32 K, V)
@@ -542,7 +544,6 @@ def patch_Gemma3Attention_generic():
     torch_jit_is_tracing = torch.jit.is_tracing
 
     def prepare(
-        self,
         hidden_states,
         query_states_fp16,
         key_states_fp16,
@@ -551,6 +552,8 @@ def patch_Gemma3Attention_generic():
         kv_hidden_shape,
         position_embeddings,
         attention_mask,
+        q_norm,
+        k_norm,
     ):
         # 2. Upcast Q, K, V for norm and RoPE, and then transpose for attention
         # (bsz, num_specific_heads, q_len, head_dim)
@@ -559,8 +562,8 @@ def patch_Gemma3Attention_generic():
         value_states_fp32 = value_states_fp16.view(kv_hidden_shape).transpose(1, 2) # V for attention also fp32
 
         # 3. Normalization (q_norm, k_norm are RMSNorms)
-        query_norm_out_fp16 = self.q_norm(query_states_fp32)
-        key_norm_out_fp16   = self.k_norm(key_states_fp32)
+        query_norm_out_fp16 = q_norm(query_states_fp32) # self.q_norm doesn't use auto compiler
+        key_norm_out_fp16   = k_norm(key_states_fp32) # self.k_norm doesn't use auto compiler
 
         query_states_fp32 = query_norm_out_fp16#.to(torch.float32)
         key_states_fp32   = key_norm_out_fp16#.to(torch.float32)
@@ -588,7 +591,7 @@ def patch_Gemma3Attention_generic():
             attn_mask_for_sdpa,
         )
     pass
-    # prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
+    prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
 
     def forward_function(
         self,
@@ -650,7 +653,6 @@ def patch_Gemma3Attention_generic():
             sin_fp32,
             attn_mask_for_sdpa,
         ) = prepare(
-            self,
             hidden_states,
             query_states_fp16,
             key_states_fp16,
@@ -659,6 +661,8 @@ def patch_Gemma3Attention_generic():
             kv_hidden_shape,
             position_embeddings,
             attention_mask,
+            self.q_norm,
+            self.k_norm,
         )
 
         # 5. KV Cache update (using fp32 K, V)
