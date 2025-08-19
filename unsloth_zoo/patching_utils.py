@@ -30,6 +30,26 @@ __all__ = [
 from .compiler import UNSLOTH_COMPILE_LOCATION
 from .utils import _get_dtype, Version
 
+def patch_tf_protobuf():
+    # TF 2.19.0 throws a non terminating error with later versions of protobuf.
+    # This patch avoids it.
+    import google.protobuf.message_factory
+    if not hasattr(google.protobuf.message_factory, "MessageFactory"):
+        class MessageFactory:
+            def CreatePrototype(self, *args, **kwargs): return
+            def GetMessages(self, *args, **kwargs): return
+            def GetPrototype(self, *args, **kwargs): return
+        google.protobuf.message_factory.MessageFactory = MessageFactory
+    elif hasattr(google.protobuf.message_factory, "MessageFactory") and \
+        not hasattr(google.protobuf.message_factory.MessageFactory, "GetPrototype") and \
+        hasattr(google.protobuf.message_factory, "GetMessageClass"):
+        GetMessageClass = google.protobuf.message_factory.GetMessageClass
+        def GetPrototype(self, descriptor):
+            return GetMessageClass(descriptor)
+        google.protobuf.message_factory.MessageFactory.GetPrototype = GetPrototype
+
+patch_tf_protobuf()
+
 # Also disable compiling on bitsandbytes
 def patch_compiling_bitsandbytes():
     # All Unsloth Zoo code licensed under LGPLv3
@@ -165,7 +185,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # See torch.compile, the missing manual
         # https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8
         # f"config.emulate_precision_casts = {not debug}", # Force X.to(f32).to(f16) instead of X.to(f16)
-        # when setting to not debug aka True, we get errors on torch2.6 
+        # when setting to not debug aka True, we get errors on torch2.6
         # TypeError: ValueRangeAnalysis.to_dtype() got an unexpected keyword argument 'use_compute_types'
         # this keyword exists in torch2.7.0 but not in torch2.6.0 so set to False until torch2.6.0 is deprecated.
         "config.emulate_precision_casts = False", # Force X.to(f32).to(f16) instead of X.to(f16)
