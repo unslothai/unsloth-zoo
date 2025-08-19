@@ -2628,6 +2628,9 @@ def unsloth_compile_transformers(
     except Exception as exception:
         if not disable:
             raise RuntimeError(exception)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(str(exception))
+            logger.info(str(dir(combined_module)))
         combined_module = None
 
     if compile_torch_modules and not disable:
@@ -2671,6 +2674,8 @@ def unsloth_compile_transformers(
     # Import and replace with new module
     for module in all_standalone_classes.keys():
         exec(f"{model_location}.{module} = combined_module.{module}", globals(), locals())
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Patched over {model_location}.{module}")
     pass
 
     # Finally edit dictionary items inside the target file
