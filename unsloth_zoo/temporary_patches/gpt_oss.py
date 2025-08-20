@@ -27,6 +27,7 @@ from .utils import (
     logger,
     Cache,
     TransformersKwargs,
+    Unpack,
 )
 torch_cuda_device = torch.cuda.device
 
