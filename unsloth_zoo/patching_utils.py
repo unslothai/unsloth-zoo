@@ -309,10 +309,13 @@ def patch_model_and_tokenizer(
 
         # Convert any remaining bfloat16 parameters
         for name, param in model.named_parameters():
-            if "sinks" in name:
+            if "self_attn.sinks" in name:
                 print("named_parameters", name, param.dtype)
-
-            if param.dtype == torch.bfloat16:
+                param.data = param.data.to(torch.float32)
+            if "mlp.router" in name:
+                print("named_parameters", name, param.dtype)
+                param.data = param.data.to(torch.float32)
+            elif param.dtype == torch.bfloat16:
                 print("named_parameters", name)
                 param.data = param.data.to(torch.float16)
 
