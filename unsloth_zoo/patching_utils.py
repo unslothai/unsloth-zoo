@@ -315,6 +315,9 @@ def patch_model_and_tokenizer(
             if "mlp.router" in name:
                 print("named_parameters", name, param.dtype)
                 param.data = param.data.to(torch.float32)
+            if "bias" in name:
+                print("named_parameters", name, param.dtype)
+                param.data = param.data.to(torch.float32)
             elif param.dtype == torch.bfloat16:
                 print("named_parameters", name)
                 param.data = param.data.to(torch.float32)
