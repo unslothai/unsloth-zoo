@@ -555,7 +555,7 @@ def patch_gpt_oss_linearized():
                     current_state = hidden_states[token_idx]
                     gate_up = self.gate_up_projs[expert_idx](current_state)
                     down_proj = self.down_projs[expert_idx]
-                    dtype = getattr(down_proj, "compute_dtype", torch.float16)
+                    dtype = getattr(down_proj, "_pre_set_compute_dtype", torch.float16)
                     if dtype == torch.float32: has_float32 = True
                     gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
                     # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
