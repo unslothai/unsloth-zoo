@@ -566,12 +566,12 @@ def patch_gpt_oss_linearized():
                         down_proj = self.down_projs[expert_idx]
                     dtype = getattr(down_proj, "_pre_set_compute_dtype", torch.float32)
                     if dtype == torch.float32: has_float32 = True
-                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
-                    # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                    # gate = gate.clamp(min=None, max=self.limit)
-                    # up = up.clamp(min=-self.limit, max=self.limit)
-                    # glu = gate * torch.sigmoid(gate * self.alpha)
-                    # gated_output = (up + 1) * glu
+                    # gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
+                    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                    gate = gate.clamp(min=None, max=self.limit)
+                    up = up.clamp(min=-self.limit, max=self.limit)
+                    glu = gate * torch.sigmoid(gate * self.alpha)
+                    gated_output = (up + 1) * glu
 
                     # Force float32 matrix multiply on some down projection modules
                     gated_output = gated_output.to(dtype)
