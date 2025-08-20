@@ -284,6 +284,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                 accumulate_chunk,
                 dynamic = True,
                 fullgraph = True,
+                options = torch_compile_options,
             )
 
         for (grad_inputs_j, hidden_states_j, labels_j,) in \
@@ -348,8 +349,6 @@ def unsloth_fused_ce_loss(
     # Get mixed precision scaling if seen
     scaling = scaler.get_scale() if scaler is not None else scaling
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
-    print(scaling)
-    kwargs["n_chunks"] = 1
     return apply_autograd_function(UnslothFusedLoss, dict(
         loss_function = compute_fused_ce_loss,
         hidden_states = hidden_states,

@@ -298,35 +298,24 @@ def patch_model_and_tokenizer(
             if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
                 module.to(setted_dtype)
             if "lm_head" in name or "embed_tokens" in name:
-                module.to(torch.float32)
+                module.to(setted_dtype)
             if "embed_tokens" in name or "patch_embedding" in name:
                 module.to(setted_dtype)
             if name.endswith("norm") and hasattr(module, "weight"):
-                module.to(torch.float32)
+                module.to(setted_dtype)
             if "bias" in name:
-                module.to(torch.float32)
+                module.to(setted_dtype)
             torch.cuda.empty_cache()
 
         # Convert any remaining bfloat16 parameters
         for name, param in model.named_parameters():
-            if "self_attn.sinks" in name:
-                print("named_parameters", name, param.dtype)
-                param.data = param.data.to(torch.float32)
-            if "mlp.router" in name:
-                print("named_parameters", name, param.dtype)
-                param.data = param.data.to(torch.float32)
-            if "bias" in name:
-                print("named_parameters", name, param.dtype)
-                param.data = param.data.to(torch.float32)
-            elif param.dtype == torch.bfloat16:
-                print("named_parameters", name)
-                param.data = param.data.to(torch.float32)
+            if param.dtype == torch.bfloat16:
+                param.data = param.data.to(torch.float16)
 
         # Also convert buffers (like position embeddings)
         for name, buffer in model.named_buffers():
             if buffer.dtype == torch.bfloat16:
-                print("named_buffers", name)
-                buffer.data = buffer.data.to(torch.float32)
+                buffer.data = buffer.data.to(torch.float16)
         pass
     pass
 

@@ -25,9 +25,6 @@ from .utils import (
     KWARGS_TYPE,
     raise_error,
     logger,
-    Cache,
-    TransformersKwargs,
-    Unpack,
 )
 torch_cuda_device = torch.cuda.device
 
@@ -506,11 +503,11 @@ class GptOssTopKRouter(nn.Module):
     @torch_compile(dynamic = True, fullgraph = True)
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        with torch.autocast(device_type="cuda", enabled=False): # Force float32
-            router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
+        router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(torch.float32)
-        router_scores = torch.zeros_like(router_logits, dtype = torch.float32).scatter_(1, router_indices, router_top_value)
+        dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
+        router_scores = torch.zeros_like(router_logits, dtype = dtype).scatter_(1, router_indices, router_top_value)
         return router_scores, router_indices
 pass
 
@@ -521,9 +518,8 @@ class GptOssMLP(nn.Module):
         self.experts = GptOssExperts(config)
 
     def forward(self, hidden_states):
-        with torch.autocast(device_type="cuda", enabled=False): # Force float32
-            router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
-            routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
+        router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
+        routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
         return routed_out, router_scores
 pass
 
@@ -557,30 +553,27 @@ def patch_gpt_oss_linearized():
                 for expert_idx in expert_hitted[:]:
                     with torch.no_grad():
                         _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                    current_state = hidden_states[token_idx].to(torch.float32)
-                    device_type = current_state.device.type if isinstance(current_state.device.type, str) and current_state.device.type != "mps" else "cpu"
-                    
-                    with torch.autocast(device_type=device_type, enabled=False): # Force float32
-                        gate_up = self.gate_up_projs[expert_idx](current_state)
-                    with torch.autocast(device_type=device_type, enabled=False): # Force float32
-                        down_proj = self.down_projs[expert_idx]
-                    dtype = getattr(down_proj, "_pre_set_compute_dtype", torch.float32)
+                    current_state = hidden_states[token_idx]
+                    gate_up = self.gate_up_projs[expert_idx](current_state)
+                    down_proj = self.down_projs[expert_idx]
+                    dtype = getattr(down_proj, "_pre_set_compute_dtype", torch.float16)
                     if dtype == torch.float32: has_float32 = True
-                    # gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
-                    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                    gate = gate.clamp(min=None, max=self.limit)
-                    up = up.clamp(min=-self.limit, max=self.limit)
-                    glu = gate * torch.sigmoid(gate * self.alpha)
-                    gated_output = (up + 1) * glu
+                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
+                    # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                    # gate = gate.clamp(min=None, max=self.limit)
+                    # up = up.clamp(min=-self.limit, max=self.limit)
+                    # glu = gate * torch.sigmoid(gate * self.alpha)
+                    # gated_output = (up + 1) * glu
 
                     # Force float32 matrix multiply on some down projection modules
                     gated_output = gated_output.to(dtype)
+                    device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
                     with torch.autocast(device_type=device_type, enabled=False): # Force float32
                         out = down_proj(gated_output)
                     weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                     next_states.index_add_(0, token_idx, weighted_output)
                 next_states = next_states.view(batch_size, -1, self.hidden_size)
-                return next_states.to(torch.float32 if has_float32 else torch.float32)
+                return next_states.to(torch.float32 if has_float32 else torch.float16)
             else:
                 X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
                 gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
@@ -598,7 +591,7 @@ def patch_gpt_oss_linearized():
                 with torch.autocast(device_type=device_type, enabled=False): # Force float32
                     out_list = [
                         down_l(fused[e].to(
-                            torch.float32,
+                            getattr(down_l, "_pre_set_compute_dtype", torch.float16)
                         ))
                         for e, down_l in enumerate(self.down_projs)
                     ]
@@ -618,62 +611,6 @@ def patch_gpt_oss_linearized():
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
-
-def patch_gpt_oss_attention():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try:
-        import transformers.models.gpt_oss.modeling_gpt_oss
-        transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention
-        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS, eager_attention_forward
-    except Exception as e:
-        return raise_error("GptOssAttention.forward", e)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-        with torch.autocast(device_type="cuda", enabled=False): # Force float32
-            query_states = self.q_proj(hidden_states.to(torch.float32)).view(hidden_shape).to(torch.float32).transpose(1, 2)
-            key_states   = self.k_proj(hidden_states.to(torch.float32)).view(hidden_shape).to(torch.float32).transpose(1, 2)
-            value_states = self.v_proj(hidden_states.to(torch.float32)).view(hidden_shape).to(torch.float32).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(torch.float32), sin.to(torch.float32))
-
-        if past_key_values is not None:
-            cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states.to(torch.float32),
-            key_states.to(torch.float32),
-            value_states.to(torch.float32),
-            attention_mask.to(torch.float32),
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            s_aux=self.sinks.to(torch.float32),  # diff with Llama
-            **kwargs,
-        )
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        with torch.autocast(device_type="cuda", enabled=False): # Force float32
-            attn_output = self.o_proj(attn_output).to(torch.float32)
-        return attn_output, attn_weights
-    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
-pass
-TEMPORARY_PATCHES.append(patch_gpt_oss_attention)
 
 try:
     from openai_harmony import (
