@@ -25,6 +25,8 @@ from .utils import (
     KWARGS_TYPE,
     raise_error,
     logger,
+    Cache,
+    TransformersKwargs,
 )
 torch_cuda_device = torch.cuda.device
 
