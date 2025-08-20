@@ -521,8 +521,9 @@ class GptOssMLP(nn.Module):
         self.experts = GptOssExperts(config)
 
     def forward(self, hidden_states):
-        router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
-        routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
+        with torch.autocast(device_type="cuda", enabled=False): # Force float32
+            router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
+            routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
         return routed_out, router_scores
 pass
 
@@ -638,10 +639,10 @@ def patch_gpt_oss_attention():
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = self.q_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
-        key_states   = self.k_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
+        with torch.autocast(device_type="cuda", enabled=False): # Force float32
+            query_states = self.q_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
+            key_states   = self.k_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(torch.float32), sin.to(torch.float32))
@@ -667,7 +668,8 @@ def patch_gpt_oss_attention():
             **kwargs,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output).to(torch.float16)
+        with torch.autocast(device_type="cuda", enabled=False): # Force float32
+            attn_output = self.o_proj(attn_output).to(torch.float16)
         return attn_output, attn_weights
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
 pass
