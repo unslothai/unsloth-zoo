@@ -18,7 +18,7 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import torch
 import torch.nn as nn
 import os
-from .common import TEMPORARY_PATCHES, torch_compile_options
+from .common import TEMPORARY_PATCHES, torch_compile
 from .utils import (
     patch_function,
     process_output_options,
@@ -331,7 +331,6 @@ def patch_Gemma3Attention():
     torch_jit_is_tracing = torch.jit.is_tracing
 
     def prepare(
-        self,
         hidden_states,
         query_states_fp16,
         key_states_fp16,
@@ -340,6 +339,8 @@ def patch_Gemma3Attention():
         kv_hidden_shape,
         position_embeddings,
         attention_mask,
+        q_norm,
+        k_norm,
     ):
         # 2. Upcast Q, K, V for norm and RoPE, and then transpose for attention
         # (bsz, num_specific_heads, q_len, head_dim)
@@ -348,8 +349,8 @@ def patch_Gemma3Attention():
         value_states_fp32 = value_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2) # V for attention also fp32
 
         # 3. Normalization (q_norm, k_norm are RMSNorms)
-        query_norm_out_fp16 = self.q_norm(query_states_fp32)
-        key_norm_out_fp16   = self.k_norm(key_states_fp32)
+        query_norm_out_fp16 = q_norm(query_states_fp32) # self.q_norm doesn't use auto compiler
+        key_norm_out_fp16   = k_norm(key_states_fp32) # self.q_norm doesn't use auto compiler
 
         query_states_fp32 = query_norm_out_fp16.to(torch.float32)
         key_states_fp32   = key_norm_out_fp16.to(torch.float32)
@@ -376,9 +377,9 @@ def patch_Gemma3Attention():
             attn_mask_for_sdpa,
         )
     pass
-    prepare = torch.compile(prepare, fullgraph = True, dynamic = True, options = torch_compile_options)
+    prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
 
-    def forward(
+    def forward_function(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor,
@@ -438,7 +439,6 @@ def patch_Gemma3Attention():
             sin_fp32,
             attn_mask_for_sdpa,
         ) = prepare(
-            self,
             hidden_states,
             query_states_fp16,
             key_states_fp16,
@@ -447,6 +447,8 @@ def patch_Gemma3Attention():
             kv_hidden_shape,
             position_embeddings,
             attention_mask,
+            self.q_norm,
+            self.k_norm,
         )
 
         # 5. KV Cache update (using fp32 K, V)
@@ -499,12 +501,58 @@ def patch_Gemma3Attention():
 
         return attn_output_projected, attn_weights # 3-tuple return
     pass
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
+
+    # Change past_key_value to past_key_values
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention)
 
 
-def patch_Gemma3Attention_normal():
+def patch_Gemma3RMSNorm_generic():
+    # Must do this since torch.compile cannot trace through def prepare for q_norm, k_norm
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1": return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm
+    except Exception as e:
+        return raise_error("Gemma3RMSNorm.forward", e)
+
+    def forward(self, x):
+        x_fp32 = x.to(torch.float32)
+        variance = x_fp32.pow(2).mean(-1, keepdim=True)
+        hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + self.eps)
+        output_fp32 = hidden_states_fp32 * (1.0 + self.weight.to(torch.float32))
+        return output_fp32.to(x.dtype)
+    pass
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm_generic)
+
+
+def patch_Gemma3Attention_generic():
+    # Non float16 forced also has some benefits
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1": return
     try:
         import transformers.models.gemma3.modeling_gemma3
@@ -517,7 +565,6 @@ def patch_Gemma3Attention_normal():
     torch_jit_is_tracing = torch.jit.is_tracing
 
     def prepare(
-        self,
         hidden_states,
         query_states_fp16,
         key_states_fp16,
@@ -526,33 +573,36 @@ def patch_Gemma3Attention_normal():
         kv_hidden_shape,
         position_embeddings,
         attention_mask,
+        q_norm,
+        k_norm,
     ):
         # 2. Upcast Q, K, V for norm and RoPE, and then transpose for attention
         # (bsz, num_specific_heads, q_len, head_dim)
-        query_states_fp32 = query_states_fp16.view(query_hidden_shape).to(torch.float32).transpose(1, 2)
-        key_states_fp32   = key_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2)
-        value_states_fp32 = value_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2) # V for attention also fp32
+        query_states_fp32 = query_states_fp16.view(query_hidden_shape).transpose(1, 2)
+        key_states_fp32   = key_states_fp16.view(kv_hidden_shape).transpose(1, 2)
+        value_states_fp32 = value_states_fp16.view(kv_hidden_shape).transpose(1, 2) # V for attention also fp32
 
         # 3. Normalization (q_norm, k_norm are RMSNorms)
-        query_norm_out_fp16 = self.q_norm(query_states_fp32)
-        key_norm_out_fp16   = self.k_norm(key_states_fp32)
+        query_norm_out_fp16 = q_norm(query_states_fp32) # self.q_norm doesn't use auto compiler
+        key_norm_out_fp16   = k_norm(key_states_fp32) # self.k_norm doesn't use auto compiler
 
-        query_states_fp32 = query_norm_out_fp16.to(torch.float32)
-        key_states_fp32   = key_norm_out_fp16.to(torch.float32)
+        query_states_fp32 = query_norm_out_fp16#.to(torch.float32)
+        key_states_fp32   = key_norm_out_fp16#.to(torch.float32)
 
         # 4. Rotary Positional Embeddings in fp32
         if not (isinstance(position_embeddings, tuple) and len(position_embeddings) == 2):
             raise ValueError("Position embeddings not provided as (cos, sin) tuple to Gemma3Attention")
 
         cos, sin = position_embeddings
-        cos_fp32 = cos.to(torch.float32)
-        sin_fp32 = sin.to(torch.float32)
+        cos_fp32 = cos#.to(torch.float32)
+        sin_fp32 = sin#.to(torch.float32)
         query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos = cos_fp32, sin = sin_fp32)
 
         # 6. Core Attention mechanism (SDPA) in fp32
         attn_mask_for_sdpa = attention_mask
         if attn_mask_for_sdpa is not None and attn_mask_for_sdpa.dtype != torch.bool:
-            attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
+            attn_mask_for_sdpa = attn_mask_for_sdpa#.to(torch.float32)
+            attn_mask_for_sdpa = attn_mask_for_sdpa.to(query_states_fp32.dtype)
         return (
             query_states_fp32.contiguous(),
             key_states_fp32.contiguous(),
@@ -562,9 +612,10 @@ def patch_Gemma3Attention_normal():
             attn_mask_for_sdpa,
         )
     pass
-    prepare = torch.compile(prepare, fullgraph = True, dynamic = True, options = torch_compile_options)
+    # We must patch RMSNorm as well since q_norm, k_norm can't be traced correctly!
+    prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
 
-    def forward(
+    def forward_function(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor,
@@ -624,7 +675,6 @@ def patch_Gemma3Attention_normal():
             sin_fp32,
             attn_mask_for_sdpa,
         ) = prepare(
-            self,
             hidden_states,
             query_states_fp16,
             key_states_fp16,
@@ -633,6 +683,8 @@ def patch_Gemma3Attention_normal():
             kv_hidden_shape,
             position_embeddings,
             attention_mask,
+            self.q_norm,
+            self.k_norm,
         )
 
         # 5. KV Cache update (using fp32 K, V)
@@ -678,13 +730,36 @@ def patch_Gemma3Attention_normal():
         # Using -1 for the last dimension is robust and aligns with your original example.
         attn_output_fp32 = attn_output_fp32.reshape(bsz, q_len, -1) # REVISED FIX
 
-        attn_output_fp16 = attn_output_fp32.to(torch.float16)
+        attn_output_fp16 = attn_output_fp32#.to(torch.float16)
 
         # 8. Output Projection (o_proj) in fp16
         attn_output_projected = self.o_proj(attn_output_fp16) # fp16 output
 
         return attn_output_projected, attn_weights # 3-tuple return
     pass
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
 pass
-TEMPORARY_PATCHES.append(patch_Gemma3Attention)
+TEMPORARY_PATCHES.append(patch_Gemma3Attention_generic)

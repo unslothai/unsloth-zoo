@@ -395,6 +395,21 @@ def _download_convert_hf_to_gguf(
         converter_latest,
     )
 
+    # Make mistral_common optional for now
+    # from x import y
+    converter_latest = re.sub(
+        rb"(from mistral_common[^\n\(]{1,})[\s]{0,}\n",
+        rb"try:\n    \1\nexcept:\n    pass\n",
+        converter_latest,
+    )
+    # from x import (y, z,)
+    converter_latest = re.sub(
+        rb"(from mistral_common[^\n\(]{1,}[\s]{0,}\(.+?\))",
+        rb"try:\n    \1\nexcept:\n    pass\n",
+        converter_latest,
+        flags = re.MULTILINE | re.DOTALL,
+    )
+
     # Write file
     with open(f"llama.cpp/{name}.py", "wb") as file:
         file.write(converter_latest)
