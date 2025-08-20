@@ -614,6 +614,62 @@ pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
+def patch_gpt_oss_attention():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention
+        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS, eager_attention_forward
+    except Exception as e:
+        return raise_error("GptOssAttention.forward", e)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
+        key_states   = self.k_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(torch.float32), sin.to(torch.float32))
+
+        if past_key_values is not None:
+            cache_kwargs = {"cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states.to(torch.float32),
+            key_states.to(torch.float32),
+            value_states.to(torch.float32),
+            attention_mask.to(torch.float32),
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            s_aux=self.sinks.to(torch.float32),  # diff with Llama
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous().to(torch.float16)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
+pass
+TEMPORARY_PATCHES.append(patch_gpt_oss_attention)
+
 try:
     from openai_harmony import (
         Author,
