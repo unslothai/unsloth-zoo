@@ -665,7 +665,6 @@ def patch_gpt_oss_attention():
             s_aux=self.sinks.to(torch.float32),  # diff with Llama
             **kwargs,
         )
-        print(torch.amax(attn_output))
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output).to(torch.float16)
         return attn_output, attn_weights
