@@ -598,7 +598,7 @@ def patch_gpt_oss_linearized():
                 with torch.autocast(device_type=device_type, enabled=False): # Force float32
                     out_list = [
                         down_l(fused[e].to(
-                            getattr(down_l, "compute_dtype", torch.float16)
+                            torch.float32,
                         ))
                         for e, down_l in enumerate(self.down_projs)
                     ]
@@ -669,7 +669,7 @@ def patch_gpt_oss_attention():
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         with torch.autocast(device_type="cuda", enabled=False): # Force float32
-            attn_output = self.o_proj(attn_output).to(torch.float16)
+            attn_output = self.o_proj(attn_output).to(torch.float32)
         return attn_output, attn_weights
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
 pass
