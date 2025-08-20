@@ -309,6 +309,9 @@ def patch_model_and_tokenizer(
 
         # Convert any remaining bfloat16 parameters
         for name, param in model.named_parameters():
+            if "sinks" in name:
+                print("named_parameters", name, param.dtype)
+
             if param.dtype == torch.bfloat16:
                 print("named_parameters", name)
                 param.data = param.data.to(torch.float16)
