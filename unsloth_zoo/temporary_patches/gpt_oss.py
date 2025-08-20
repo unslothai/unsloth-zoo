@@ -552,10 +552,12 @@ def patch_gpt_oss_linearized():
                 for expert_idx in expert_hitted[:]:
                     with torch.no_grad():
                         _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                    current_state = hidden_states[token_idx]
-                    gate_up = self.gate_up_projs[expert_idx](current_state)
-                    down_proj = self.down_projs[expert_idx]
-                    dtype = getattr(down_proj, "_pre_set_compute_dtype", torch.float16)
+                    current_state = hidden_states[token_idx].to(torch.float32)
+                    with torch.autocast(device_type=device_type, enabled=False): # Force float32
+                        gate_up = self.gate_up_projs[expert_idx](current_state)
+                    with torch.autocast(device_type=device_type, enabled=False): # Force float32
+                        down_proj = self.down_projs[expert_idx]
+                    dtype = getattr(down_proj, "_pre_set_compute_dtype", torch.float32)
                     if dtype == torch.float32: has_float32 = True
                     gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
                     # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
@@ -572,7 +574,7 @@ def patch_gpt_oss_linearized():
                     weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                     next_states.index_add_(0, token_idx, weighted_output)
                 next_states = next_states.view(batch_size, -1, self.hidden_size)
-                return next_states.to(torch.float32 if has_float32 else torch.float16)
+                return next_states.to(torch.float32 if has_float32 else torch.float32)
             else:
                 X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
                 gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
