@@ -80,14 +80,14 @@ def compute_fused_ce_loss(
     vocab_size = lm_head_weight.shape[0]
 
     # Apply softcapping and other functions
-    logit_scale_multiply = kwargs.get("logit_scale_multiply", 0)
-    logit_scale_divide = kwargs.get("logit_scale_divide", 0)
-    logit_softcapping = kwargs.get("logit_softcapping", 0)
-    if logit_scale_multiply != 0:
+    logit_scale_multiply = kwargs.get("logit_scale_multiply", None)
+    logit_scale_divide = kwargs.get("logit_scale_divide", None)
+    logit_softcapping = kwargs.get("logit_softcapping", None)
+    if logit_scale_multiply != 0 and logit_scale_multiply is not None:
         logits = logits * logit_scale_multiply
-    if logit_scale_divide != 0:
+    if logit_scale_divide != 0 and logit_scale_divide is not None:
         logits = logits / logit_scale_divide
-    if logit_softcapping != 0:
+    if logit_softcapping != 0 and logit_softcapping is not None:
         logits = logits / logit_softcapping
         logits = torch.tanh(logits)
         logits = logits * logit_softcapping

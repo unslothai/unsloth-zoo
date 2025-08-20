@@ -182,6 +182,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         "config.compiled_autograd = False", # New Torch 2.4 feature which can compile backwards passes
         # https://pytorch.org/tutorials/intermediate/compiled_autograd_tutorial.html
         "config.recompile_limit = 32", # Increase recompile amounts to 32 - then will do eager
+        # f"config.fail_on_recompile_limit_hit = {not debug and ignore_errors}", # Ignore recompiles CANNOT be used in tandem with suppress_errors
         "config.allow_unspec_int_on_nn_module = True", # Integers in modules will auto wrap torch.tensor(self.vocab_size)
         f"config.optimize_ddp = {not debug}", # Optimizes DDP, but can error out so disable on debug
         # Captures .item() for eg
@@ -308,12 +309,16 @@ def patch_model_and_tokenizer(
 
         # Convert any remaining bfloat16 parameters
         for name, param in model.named_parameters():
-            if param.dtype == torch.bfloat16:
+            if hasattr(param, "_pre_set_compute_dtype"):
+                param.data = param.data.to(param._pre_set_compute_dtype)
+            elif param.dtype == torch.bfloat16:
                 param.data = param.data.to(torch.float16)
 
         # Also convert buffers (like position embeddings)
         for name, buffer in model.named_buffers():
-            if buffer.dtype == torch.bfloat16:
+            if hasattr(buffer, "_pre_set_compute_dtype"):
+                buffer.data = buffer.data.to(buffer._pre_set_compute_dtype)
+            elif buffer.dtype == torch.bfloat16:
                 buffer.data = buffer.data.to(torch.float16)
         pass
     pass
