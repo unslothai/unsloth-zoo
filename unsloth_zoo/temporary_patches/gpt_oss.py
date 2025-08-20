@@ -505,8 +505,9 @@ class GptOssTopKRouter(nn.Module):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(router_top_value.dtype)
-        router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
+        dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
+        router_scores = torch.zeros_like(router_logits, dtype = dtype).scatter_(1, router_indices, router_top_value)
         return router_scores, router_indices
 pass
 
@@ -590,7 +591,7 @@ def patch_gpt_oss_linearized():
                 with torch.autocast(device_type=device_type, enabled=False): # Force float32
                     out_list = [
                         down_l(fused[e].to(
-                            getattr(down_l, "compute_dtype", torch.float16)
+                            getattr(down_l, "_pre_set_compute_dtype", torch.float16)
                         ))
                         for e, down_l in enumerate(self.down_projs)
                     ]
