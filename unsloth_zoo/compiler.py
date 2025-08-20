@@ -876,7 +876,7 @@ else:
         labels               = labels,
         mask                 = None,
         n_items              = n_items,
-        scaling              = getattr(self, "accelerator_scaler"),
+        scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = 1,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
@@ -951,7 +951,7 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         labels               = labels,
         mask                 = None,
         n_items              = n_items,
-        scaling              = getattr(self, "accelerator_scaler"),
+        scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = 1,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
@@ -1038,7 +1038,7 @@ else:
         labels               = labels,
         mask                 = \\6,
         n_items              = n_items,
-        scaling              = getattr(self, "accelerator_scaler"),
+        scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = 1,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
@@ -1608,7 +1608,7 @@ def patch_lora_forwards(torch_compile_options):
     pass
     if success <= 5:
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
-    
+
     if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
         print(could_not_replace_modules)
