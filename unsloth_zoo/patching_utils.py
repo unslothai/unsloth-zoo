@@ -310,11 +310,13 @@ def patch_model_and_tokenizer(
         # Convert any remaining bfloat16 parameters
         for name, param in model.named_parameters():
             if param.dtype == torch.bfloat16:
+                print("named_parameters", name)
                 param.data = param.data.to(torch.float16)
 
         # Also convert buffers (like position embeddings)
         for name, buffer in model.named_buffers():
             if buffer.dtype == torch.bfloat16:
+                print("named_buffers", name)
                 buffer.data = buffer.data.to(torch.float16)
         pass
     pass
