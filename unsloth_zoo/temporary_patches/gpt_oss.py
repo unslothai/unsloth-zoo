@@ -506,8 +506,8 @@ class GptOssTopKRouter(nn.Module):
         dtype = torch.float32 if hidden_states.dtype == torch.float16 else hidden_states.dtype
         router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(router_top_value.dtype)
-        router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
+        router_scores = torch.zeros_like(router_logits, dtype = dtype).scatter_(1, router_indices, router_top_value)
         return router_scores, router_indices
 pass
 
@@ -545,7 +545,6 @@ def single_expert_forward(
 # next_states = next_states.view(batch_size, -1, self.hidden_size)
 # return next_states.to(torch.float32 if has_float32 else torch.float16)
 
-global data
 def patch_gpt_oss_linearized():
     model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
     if not model_name.endswith("-bnb-4bit"): return
@@ -578,11 +577,9 @@ def patch_gpt_oss_linearized():
                     current_state = hidden_states[token_idx]
                     gate_up_proj = self.gate_up_projs[expert_idx]
                     down_proj = self.down_projs[expert_idx]
-                    dtype = getattr(down_proj, "_pre_set_compute_dtype", torch.float16)
-                    if dtype == torch.float32: has_float32 = True
 
                     gate_up = gate_up_proj(current_state)
-                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
+                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
                     # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
                     # gate = gate.clamp(min=None, max=self.limit)
                     # up = up.clamp(min=-self.limit, max=self.limit)
@@ -590,12 +587,11 @@ def patch_gpt_oss_linearized():
                     # gated_output = (up + 1) * glu
 
                     # Force float32 matrix multiply on some down projection modules
-                    gated_output = gated_output.to(dtype)
-                    out = down_proj(gated_output)
-                    weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+                    out = down_proj(gated_output.to(torch.float32))
+                    weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                     next_states.index_add_(0, token_idx, weighted_output)
                 next_states = next_states.view(batch_size, -1, self.hidden_size)
-                return next_states.to(torch.float32 if has_float32 else torch.float16)
+                return next_states.to(torch.float32)
             else:
                 X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
                 gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
