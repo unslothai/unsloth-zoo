@@ -575,18 +575,20 @@ def patch_gpt_oss_linearized():
                     with torch.no_grad():
                         _, token_idx = torch.where(expert_mask[expert_idx[0]])
                     current_state = hidden_states[token_idx]
-                    gate_up = self.gate_up_projs[expert_idx](current_state)
-                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+                    with torch.autocast(device_type = "cuda", dtype = torch.bfloat16):
+                        gate_up = self.gate_up_projs[expert_idx](current_state)
+                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.bfloat16)
                     # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
                     # gate = gate.clamp(min=None, max=self.limit)
                     # up = up.clamp(min=-self.limit, max=self.limit)
                     # glu = gate * torch.sigmoid(gate * self.alpha)
                     # gated_output = (up + 1) * glu
-                    out = self.down_projs[expert_idx](gated_output)
+                    with torch.autocast(device_type = "cuda", dtype = torch.bfloat16):
+                        out = self.down_projs[expert_idx](gated_output)
                     weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                     next_states.index_add_(0, token_idx, weighted_output)
                 next_states = next_states.view(batch_size, -1, self.hidden_size)
-                return next_states
+                return next_states.to(torch,bfloat16)
             else:
                 X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
                 gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
