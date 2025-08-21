@@ -532,15 +532,12 @@ def single_expert_forward(
     down_projs_k,
     routing_weights_k,
 ):
-    gate_up = gate_up_projs_k(hidden_states[token_idx])
-    dtype = getattr(down_projs_k, "_pre_set_compute_dtype", torch.float16)
-    if dtype == torch.float32: has_float32 = True
-    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
-
+    current_state = hidden_states[token_idx]
+    gate_up = gate_up_projs_k(current_state)
+    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
     # Force float32 matrix multiply on some down projection modules
-    gated_output = gated_output.to(dtype)
-    out = down_proj(gated_output)
-    weighted_output = out.to(torch.float32) * routing_weights_k[token_idx, None].to(torch.float32)
+    out = down_proj(gated_output.to(torch.float32))
+    weighted_output = out * routing_weights_k[token_idx, None].to(torch.float32)
     next_states.index_add_(0, token_idx, weighted_output)
 # next_states = next_states.view(batch_size, -1, self.hidden_size)
 # return next_states.to(torch.float32 if has_float32 else torch.float16)
@@ -578,7 +575,7 @@ def patch_gpt_oss_linearized():
                     gate_up_proj = self.gate_up_projs[expert_idx]
                     down_proj = self.down_projs[expert_idx]
 
-                    gate_up = gate_up_proj(current_state)
+                    gate_up = gate_up_proj(current_state.to(torch.float32))
                     gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
                     # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
                     # gate = gate.clamp(min=None, max=self.limit)
