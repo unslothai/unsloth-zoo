@@ -530,7 +530,7 @@ def single_expert_forward(
     token_idx,
     gate_up_projs_k,
     down_projs_k,
-    routing_weights,
+    routing_weights_k,
 ):
     gate_up = gate_up_projs_k(hidden_states[token_idx])
     dtype = getattr(down_projs_k, "_pre_set_compute_dtype", torch.float16)
@@ -539,10 +539,8 @@ def single_expert_forward(
 
     # Force float32 matrix multiply on some down projection modules
     gated_output = gated_output.to(dtype)
-    device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
-    with torch.autocast(device_type=device_type, enabled=False): # Force float32
-        out = down_proj(gated_output)
-    weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+    out = down_proj(gated_output)
+    weighted_output = out.to(torch.float32) * routing_weights_k[token_idx, None].to(torch.float32)
     next_states.index_add_(0, token_idx, weighted_output)
 # next_states = next_states.view(batch_size, -1, self.hidden_size)
 # return next_states.to(torch.float32 if has_float32 else torch.float16)
@@ -575,9 +573,6 @@ def patch_gpt_oss_linearized():
                     expert_mask = expert_mask.permute(2, 1, 0)
                     token_idxes = [torch.where(expert_mask[i])[1] for i in range(num_experts)]
                 has_float32 = False
-                global data
-                data = [routing_weights]
-                raise
                 for expert_idx in range(num_experts):
                     token_idx = token_idxes[expert_idx]
                     current_state = hidden_states[token_idx]
@@ -585,6 +580,8 @@ def patch_gpt_oss_linearized():
                     down_proj = self.down_projs[expert_idx]
                     dtype = getattr(down_proj, "_pre_set_compute_dtype", torch.float16)
                     if dtype == torch.float32: has_float32 = True
+
+                    gate_up = gate_up_proj(current_state)
                     gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
                     # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
                     # gate = gate.clamp(min=None, max=self.limit)
@@ -594,9 +591,7 @@ def patch_gpt_oss_linearized():
 
                     # Force float32 matrix multiply on some down projection modules
                     gated_output = gated_output.to(dtype)
-                    device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
-                    with torch.autocast(device_type=device_type, enabled=False): # Force float32
-                        out = down_proj(gated_output)
+                    out = down_proj(gated_output)
                     weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                     next_states.index_add_(0, token_idx, weighted_output)
                 next_states = next_states.view(batch_size, -1, self.hidden_size)
