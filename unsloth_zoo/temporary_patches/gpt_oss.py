@@ -549,7 +549,8 @@ def patch_gpt_oss_linearized():
                     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
                     expert_mask = expert_mask.permute(2, 1, 0)
                     expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-                    print(expert_hitted)
+                    print(expert_mask, expert_mask.shape, hidden_states.shape, router_indices, num_experts)
+                    raise
                 has_float32 = False
                 for expert_idx in expert_hitted[:]:
                     with torch.no_grad():
