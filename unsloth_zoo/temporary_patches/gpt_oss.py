@@ -503,9 +503,9 @@ class GptOssTopKRouter(nn.Module):
     @torch_compile(dynamic = True, fullgraph = True)
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        dtype = torch.float32 if hidden_states.dtype == torch.float16 else hidden_states.dtype
         router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-        dtype = torch.float16 if router_logits.dtype == torch.float16 else router_logits.dtype
         router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
         router_scores = torch.zeros_like(router_logits, dtype = dtype).scatter_(1, router_indices, router_top_value)
         return router_scores, router_indices
@@ -549,10 +549,12 @@ def patch_gpt_oss_linearized():
                     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
                     expert_mask = expert_mask.permute(2, 1, 0)
                     expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+                    print(expert_hitted)
                 has_float32 = False
                 for expert_idx in expert_hitted[:]:
                     with torch.no_grad():
                         _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                    print(expert_idx, token_idx)
                     current_state = hidden_states[token_idx]
                     gate_up = self.gate_up_projs[expert_idx](current_state)
                     down_proj = self.down_projs[expert_idx]
