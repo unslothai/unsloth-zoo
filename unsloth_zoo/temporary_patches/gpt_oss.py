@@ -638,6 +638,7 @@ def patch_GptOssAttention():
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
+        print(hidden_states.dtype)
         hidden_states = hidden_states.to(torch.float32)
         query_states = self.q_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
@@ -673,7 +674,7 @@ def patch_GptOssAttention():
     pass
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
 pass
-# TEMPORARY_PATCHES.append(patch_GptOssAttention)
+TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 try:
     from openai_harmony import (
