@@ -565,33 +565,29 @@ def patch_gpt_oss_linearized():
             batch_size = hidden_states.shape[0]
             hidden_states = hidden_states.reshape(-1, self.hidden_size)
             num_experts = routing_weights.shape[1]
+            print("#", end = "")
             if self.training:
                 next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
                 with torch.no_grad():
                     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
                     expert_mask = expert_mask.permute(2, 1, 0)
-                    token_idxes = [torch.where(expert_mask[i])[1] for i in range(num_experts)]
-                has_float32 = False
-                for expert_idx in range(num_experts):
-                    token_idx = token_idxes[expert_idx]
+                    expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+                for expert_idx in expert_hitted[:]:
+                    with torch.no_grad():
+                        _, token_idx = torch.where(expert_mask[expert_idx[0]])
                     current_state = hidden_states[token_idx]
-                    gate_up_proj = self.gate_up_projs[expert_idx]
-                    down_proj = self.down_projs[expert_idx]
-
-                    gate_up = gate_up_proj(current_state)
-                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
+                    gate_up = self.gate_up_projs[expert_idx](current_state)
+                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
                     # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
                     # gate = gate.clamp(min=None, max=self.limit)
                     # up = up.clamp(min=-self.limit, max=self.limit)
                     # glu = gate * torch.sigmoid(gate * self.alpha)
                     # gated_output = (up + 1) * glu
-
-                    # Force float32 matrix multiply on some down projection modules
-                    out = down_proj(gated_output.to(torch.float32))
+                    out = self.down_projs[expert_idx](gated_output)
                     weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                     next_states.index_add_(0, token_idx, weighted_output)
                 next_states = next_states.view(batch_size, -1, self.hidden_size)
-                return next_states.to(torch.float32)
+                return next_states
             else:
                 X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
                 gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
@@ -603,21 +599,11 @@ def patch_gpt_oss_linearized():
                 # up_h = up_h.clamp(min=-self.limit, max=self.limit)
                 # glu = gate * torch.sigmoid(gate * self.alpha)
                 # fused = (up_h + 1) * glu
-
-                # Force float32 matrix multiply on down projection only
-                device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
-                with torch.autocast(device_type=device_type, enabled=False): # Force float32
-                    out_list = [
-                        down_l(fused[e].to(
-                            getattr(down_l, "_pre_set_compute_dtype", torch.float16)
-                        ))
-                        for e, down_l in enumerate(self.down_projs)
-                    ]
+                out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
                 outs = torch.stack(out_list, dim=0)
                 rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-                mixed = (outs.to(torch.float32) * rw.to(torch.float32)).sum(dim=0)
-                return mixed.view(batch_size, -1, self.hidden_size).to(outs.dtype)
-            pass
+                mixed = (outs * rw).sum(dim=0)
+                return mixed.view(batch_size, -1, self.hidden_size)
         pass
         GptOssExperts.forward = forward
     pass
@@ -685,7 +671,7 @@ def patch_GptOssAttention():
     pass
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
 pass
-TEMPORARY_PATCHES.append(patch_GptOssAttention)
+# TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 try:
     from openai_harmony import (
