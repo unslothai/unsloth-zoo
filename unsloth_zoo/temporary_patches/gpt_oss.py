@@ -523,6 +523,30 @@ class GptOssMLP(nn.Module):
         return routed_out, router_scores
 pass
 
+
+def single_expert_forward(
+    next_states,
+    hidden_states,
+    token_idx,
+    gate_up_projs_k,
+    down_projs_k,
+    routing_weights,
+):
+    gate_up = gate_up_projs_k(hidden_states[token_idx])
+    dtype = getattr(down_projs_k, "_pre_set_compute_dtype", torch.float16)
+    if dtype == torch.float32: has_float32 = True
+    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
+
+    # Force float32 matrix multiply on some down projection modules
+    gated_output = gated_output.to(dtype)
+    device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
+    with torch.autocast(device_type=device_type, enabled=False): # Force float32
+        out = down_proj(gated_output)
+    weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+    next_states.index_add_(0, token_idx, weighted_output)
+# next_states = next_states.view(batch_size, -1, self.hidden_size)
+# return next_states.to(torch.float32 if has_float32 else torch.float16)
+
 global data
 def patch_gpt_oss_linearized():
     model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
@@ -549,17 +573,15 @@ def patch_gpt_oss_linearized():
                 with torch.no_grad():
                     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
                     expert_mask = expert_mask.permute(2, 1, 0)
-                    expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-                    global data
-                    data = [self, hidden_states, expert_mask, expert_mask.shape, hidden_states.shape, router_indices, num_experts, router_indices]
-                    raise
+                    token_idxes = [torch.where(expert_mask[i])[1] for i in range(num_experts)]
                 has_float32 = False
-                for expert_idx in expert_hitted[:]:
-                    with torch.no_grad():
-                        _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                    print(expert_idx, token_idx)
+                global data
+                data = [routing_weights]
+                raise
+                for expert_idx in range(num_experts):
+                    token_idx = token_idxes[expert_idx]
                     current_state = hidden_states[token_idx]
-                    gate_up = self.gate_up_projs[expert_idx](current_state)
+                    gate_up_proj = self.gate_up_projs[expert_idx]
                     down_proj = self.down_projs[expert_idx]
                     dtype = getattr(down_proj, "_pre_set_compute_dtype", torch.float16)
                     if dtype == torch.float32: has_float32 = True
