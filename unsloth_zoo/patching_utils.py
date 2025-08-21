@@ -313,7 +313,6 @@ def patch_model_and_tokenizer(
                 param.data = param.data.to(param._pre_set_compute_dtype)
             elif param.dtype == torch.bfloat16:
                 param.data = param.data.to(torch.float16)
-
         # Also convert buffers (like position embeddings)
         for name, buffer in model.named_buffers():
             if hasattr(buffer, "_pre_set_compute_dtype"):
@@ -323,12 +322,20 @@ def patch_model_and_tokenizer(
         pass
     pass
 
-    # Upcast ot downcast if explicitly set
+    # Upcast to downcast if explicitly set
     for name, module in model.named_modules():
         if hasattr(module, "_pre_set_compute_dtype"):
             module.to(module._pre_set_compute_dtype)
     pass
-
+    # Convert any remaining bfloat16 parameters
+    for name, param in model.named_parameters():
+        if hasattr(param, "_pre_set_compute_dtype"):
+            param.data = param.data.to(param._pre_set_compute_dtype)
+    # Also convert buffers (like position embeddings)
+    for name, buffer in model.named_buffers():
+        if hasattr(buffer, "_pre_set_compute_dtype"):
+            buffer.data = buffer.data.to(buffer._pre_set_compute_dtype)
+    pass
     # Correct torch_dtype
     def __fix_dtype(config):
         if not hasattr(config, "to_dict"): return
