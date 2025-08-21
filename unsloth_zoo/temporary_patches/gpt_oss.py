@@ -583,7 +583,6 @@ def patch_gpt_oss_linearized():
                     # up = up.clamp(min=-self.limit, max=self.limit)
                     # glu = gate * torch.sigmoid(gate * self.alpha)
                     # gated_output = (up + 1) * glu
-                    print(1)
                     with torch.autocast(device_type = "cuda", dtype = torch.bfloat16):
                         out = self.down_projs[expert_idx](gated_output)
                     weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
