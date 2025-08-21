@@ -565,7 +565,6 @@ def patch_gpt_oss_linearized():
             batch_size = hidden_states.shape[0]
             hidden_states = hidden_states.reshape(-1, self.hidden_size)
             num_experts = routing_weights.shape[1]
-            print("#", end = "")
             if self.training:
                 next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
                 with torch.no_grad():
