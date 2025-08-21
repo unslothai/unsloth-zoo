@@ -638,11 +638,11 @@ def patch_GptOssAttention():
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        print(hidden_states.dtype)
-        hidden_states = hidden_states.to(torch.float32)
-        query_states = self.q_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
+        with torch.autocast(device_type = "cuda", dtype = torch.bfloat16):
+            hidden_states = hidden_states.to(torch.float32)
+            query_states = self.q_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(torch.float32), sin.to(torch.float32))
@@ -667,9 +667,9 @@ def patch_GptOssAttention():
             s_aux=self.sinks.to(torch.float32), # diff with Llama
             **kwargs,
         )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output).to(torch.float32)
+        with torch.autocast(device_type = "cuda", dtype = torch.bfloat16):
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output).to(torch.float32)
         return attn_output, attn_weights
     pass
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
