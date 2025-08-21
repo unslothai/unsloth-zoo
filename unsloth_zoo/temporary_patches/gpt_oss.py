@@ -630,7 +630,7 @@ pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
-def patch_Gemma3Attention():
+def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
@@ -686,6 +686,7 @@ def patch_Gemma3Attention():
     pass
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
 pass
+TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 try:
     from openai_harmony import (
