@@ -651,7 +651,6 @@ def patch_GptOssAttention():
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         hidden_states = hidden_states.to(torch.float16)
-        print("1")
         query_states = self.q_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
