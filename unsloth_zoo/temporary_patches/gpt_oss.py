@@ -507,7 +507,8 @@ class GptOssTopKRouter(nn.Module):
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         dtype = torch.float32 if hidden_states.dtype == torch.float16 else hidden_states.dtype
-        router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
+        with torch.autocast(device_type = "cuda", dtype = torch.bfloat16):
+            router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
         router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
         router_scores = torch.zeros_like(router_logits, dtype = dtype).scatter_(1, router_indices, router_top_value)
@@ -607,7 +608,7 @@ def patch_gpt_oss_linearized():
                 return mixed.view(batch_size, -1, self.hidden_size)
             pass
         pass
-        # GptOssExperts.forward = forward
+        GptOssExperts.forward = forward
     pass
 
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExperts
