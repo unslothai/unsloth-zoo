@@ -617,7 +617,7 @@ def patch_gpt_oss_linearized():
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP = GptOssMLP
     return
 pass
-TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
+# TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
 def patch_GptOssAttention():
@@ -677,7 +677,7 @@ def patch_GptOssAttention():
     pass
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
 pass
-TEMPORARY_PATCHES.append(patch_GptOssAttention)
+# TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 try:
     from openai_harmony import (
