@@ -609,7 +609,7 @@ def patch_gpt_oss_linearized():
                 return mixed.view(batch_size, -1, self.hidden_size)
             pass
         pass
-        GptOssExperts.forward = forward
+        # GptOssExperts.forward = forward
     pass
 
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExperts
@@ -617,7 +617,7 @@ def patch_gpt_oss_linearized():
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP = GptOssMLP
     return
 pass
-# TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
+TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
 def patch_GptOssAttention():
