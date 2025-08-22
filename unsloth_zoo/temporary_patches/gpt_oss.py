@@ -522,8 +522,9 @@ class GptOssMLP(nn.Module):
         self.experts = GptOssExperts(config)
 
     def forward(self, hidden_states):
-        router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
-        routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
+        with torch.autocast(device_type = "cuda", dtype = torch.bfloat16):
+            router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
+            routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
         return routed_out, router_scores
 pass
 
