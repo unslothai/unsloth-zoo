@@ -379,6 +379,7 @@ def standardize_data_formats(
     aliases_for_system    = ["system",],
     aliases_for_user      = ["user", "human", "input",],
     aliases_for_assistant = ["gpt", "assistant", "output",],
+    batch_size            = 1000,
     num_proc              = None,
 ):
     """
@@ -406,10 +407,10 @@ def standardize_data_formats(
     if "conversations" not in column_names:
         return dataset
 
-    convos = dataset[:10]["conversations"]
+    examples = itertools.islice(dataset, 10)
     uniques = collections.defaultdict(list)
-    for convo in convos:
-        for message in convo:
+    for example in examples:
+        for message in example["conversations"]:
             for key, value in message.items():
                 if type(value) is not str:
                     raise RuntimeError("Unsloth: Cannot standardize non text datasets!")
@@ -465,14 +466,23 @@ def standardize_data_formats(
         return { "conversations" : all_convos, }
     pass
 
-    from multiprocessing import cpu_count
-    if num_proc is None or type(num_proc) is not int: num_proc = cpu_count()
+    dataset_map_kwargs = {
+        'batched': True,
+        'batch_size': batch_size,
+    }
+
+    if not isinstance(dataset, IterableDataset):
+        from multiprocessing import cpu_count
+        
+        if num_proc is None or type(num_proc) is not int: 
+          num_proc = cpu_count()
+
+        dataset_map_kwargs['num_proc'] = num_proc
+        dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
     return dataset.map(
         _standardize_dataset,
-        batched = True,
-        desc = "Unsloth: Standardizing formats",
-        num_proc = num_proc,
+        **dataset_map_kwargs
     )
 pass
 

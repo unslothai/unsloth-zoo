@@ -75,8 +75,20 @@ BAD_OUTCOMES = {
 
 def install_package(package, sudo = False, print_output = False, print_outputs = None):
     # All Unsloth Zoo code licensed under LGPLv3
-    x = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+    if sudo:
+        raise RuntimeError(
+            "Unsloth: Using sudo elevated permissions is not allowed!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
+    # x = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+    x = f"{''}apt-get install {package} -y"
     print(f"Unsloth: Installing packages: {package}")
+    acceptance = input(f"We will use executing `{x}` - do you accept? Press ENTER. Type NO if not.")
+    if "no" in str(acceptance).lower():
+        raise RuntimeError(
+            f"Unsloth: Execution of `{x}` was cancelled!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
     with subprocess.Popen(x, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
@@ -126,6 +138,12 @@ def do_we_need_sudo():
         pass
     pass
 
+    if sudo:
+        raise RuntimeError(
+            "Unsloth: Using sudo elevated permissions is not allowed!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
+
     # Update all package lists as well
     x = f"sudo apt-get update -y"
 
@@ -171,6 +189,11 @@ pass
 
 def try_execute(command, sudo = False, print_output = False, print_outputs = None):
     # All Unsloth Zoo code licensed under LGPLv3
+    if sudo:
+        raise RuntimeError(
+            "Unsloth: Using sudo elevated permissions is not allowed!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
     need_to_install = False
     with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
@@ -333,6 +356,7 @@ def install_llama_cpp(
         print(f"=== Main error = {str(error)} ===")
         print("=== Error log below: ===")
         print("".join(print_outputs))
+        print("Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf")
     pass
 
     # Check if it installed correctly
@@ -393,6 +417,21 @@ def _download_convert_hf_to_gguf(
         rb"\2if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']\n"\
         rb"\2",
         converter_latest,
+    )
+
+    # Make mistral_common optional for now
+    # from x import y
+    converter_latest = re.sub(
+        rb"(from mistral_common[^\n\(]{1,})[\s]{0,}\n",
+        rb"try:\n    \1\nexcept:\n    pass\n",
+        converter_latest,
+    )
+    # from x import (y, z,)
+    converter_latest = re.sub(
+        rb"(from mistral_common[^\n\(]{1,}[\s]{0,}\(.+?\))",
+        rb"try:\n    \1\nexcept:\n    pass\n",
+        converter_latest,
+        flags = re.MULTILINE | re.DOTALL,
     )
 
     # Write file

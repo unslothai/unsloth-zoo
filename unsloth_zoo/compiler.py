@@ -42,6 +42,7 @@ from .utils import (
     is_distributed,
     distributed_function,
 )
+from .log import logger
 import triton
 import regex
 from .peft_utils import get_lora_layer_modules
@@ -317,7 +318,7 @@ def _get_compile_folder(use_tempfile = False):
         UNSLOTH_COMPILE_USE_TEMP = True
         location = os.path.join(tempfile.gettempdir(), UNSLOTH_COMPILE_LOCATION)
         if not os.path.exists(location):
-            print(
+            logger.info(
                 f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
             )
             os.makedirs(location, exist_ok = True)
@@ -332,7 +333,7 @@ def _get_compile_folder(use_tempfile = False):
             UNSLOTH_COMPILE_USE_TEMP = True
             location = os.path.join(tempfile.gettempdir(), location)
             os.makedirs(location, exist_ok = True)
-            print(
+            logger.info(
                 f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
             )
     return location, UNSLOTH_COMPILE_USE_TEMP
@@ -413,9 +414,21 @@ def higher_precision_layernorms(modeling_file):
     higher_precision = os.environ.get("UNSLOTH_HIGH_PRECISION_LAYERNORM", "0") == "1"
     if dtype == torch.float32:
         higher_precision = True
+    if higher_precision:
+        print("Unsloth: Upcasting layernorm weights to float32")
     os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "1" if higher_precision else "0"
 pass
 
+
+disble_use_cache_logging = """
+if hasattr(logger, "addFilter"):
+    import logging
+    class HideLoggingMessage(logging.Filter):
+        def __init__(self, text): self.text = text
+        def filter(self, x): return not (self.text in x.getMessage())
+    pass
+    logger.addFilter(HideLoggingMessage("`use_cache=True`"))
+"""
 
 def create_new_function(
     name,
@@ -463,6 +476,9 @@ def create_new_function(
     imports += "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     imports += f"from {model_location} import (" + ", ".join(x for x in items) + ")" if len(items) != 0 else ""
     new_source = imports + "\n\n" + new_source
+    # Check logger and remove use_cache
+    if "logger" in items:
+        new_source = new_source + "\n" + disble_use_cache_logging + "\n"
     new_source = prepend + new_source + append
 
     # Check versioning
@@ -560,13 +576,13 @@ def create_new_function(
             function_location = os.path.join(compile_folder, f"{name}.py")
             distributed_function(1, write_file, function_location, write_new_source)
             if is_main_process():
-                print(f"Standard import failed for {name}: {e}. Using tempfile instead!")
+                logger.info(f"Standard import failed for {name}: {e}. Using tempfile instead!")
             try:
                 new_module, old_path = import_module(compile_folder, name)
             except Exception as e:
                 new_module = None
                 if is_main_process():
-                    print(f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!")
+                    logger.info(f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!")
         pass
         # Fallback to direct module loading
         if new_module is None:
@@ -860,7 +876,7 @@ else:
         labels               = labels,
         mask                 = None,
         n_items              = n_items,
-        scaling              = getattr(self, "accelerator_scaler"),
+        scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = 1,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
@@ -935,7 +951,7 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         labels               = labels,
         mask                 = None,
         n_items              = n_items,
-        scaling              = getattr(self, "accelerator_scaler"),
+        scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = 1,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
@@ -1022,7 +1038,7 @@ else:
         labels               = labels,
         mask                 = \\6,
         n_items              = n_items,
-        scaling              = getattr(self, "accelerator_scaler"),
+        scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = 1,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
@@ -1592,7 +1608,7 @@ def patch_lora_forwards(torch_compile_options):
     pass
     if success <= 5:
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
-    
+
     if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
         print(could_not_replace_modules)
@@ -1899,7 +1915,7 @@ def unsloth_compile_transformers(
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"): return
 
     # Use transformers model_type logger to suppress message: Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
-    exec("model_logger.addFilter(HideLoggingMessage('use_cache'))", globals(), locals())
+    exec("model_logger.addFilter(HideLoggingMessage('`use_cache`'))", globals(), locals())
     # Use transformers model_type logger to suppress message: You have set `compile_config`, but we are unable to meet the criteria for compilation.
     exec("model_logger.addFilter(HideLoggingMessage('compile_config'))", globals(), locals())
 
@@ -2612,6 +2628,9 @@ def unsloth_compile_transformers(
     except Exception as exception:
         if not disable:
             raise RuntimeError(exception)
+        if UNSLOTH_ENABLE_LOGGING:
+            print(str(exception))
+            print(str(dir(combined_module)))
         combined_module = None
 
     if compile_torch_modules and not disable:
@@ -2650,7 +2669,9 @@ def unsloth_compile_transformers(
         pass
     pass
     # Quick exit
-    if combined_module is None or disable: return
+    if combined_module is None or disable:
+        print(f"Unsloth: Exit auto compiler with combined_module = {combined_module}, disable = {disable}")
+        return
 
     # Import and replace with new module
     for module in all_standalone_classes.keys():
