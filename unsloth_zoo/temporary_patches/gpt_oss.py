@@ -27,6 +27,7 @@ from .utils import (
     KWARGS_TYPE,
     raise_error,
     logger,
+    Unpack,
     Cache,
     TransformersKwargs,
 )
