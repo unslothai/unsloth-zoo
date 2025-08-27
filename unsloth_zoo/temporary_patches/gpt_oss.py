@@ -692,6 +692,8 @@ def patch_GptOssAttention():
             )
             attn_weights = None
         else:
+            # Weirdly for inference, flex attention returns gibberish
+            # Most likely due to left padding
             attn_output, attn_weights = eager_attention_forward(
                 self,
                 query_states,
@@ -734,7 +736,7 @@ def patch_GptOssAttention():
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
 pass
-TEMPORARY_PATCHES.append(patch_GptOssAttention)
+# TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 
 try:
