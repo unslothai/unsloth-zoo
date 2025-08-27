@@ -615,6 +615,43 @@ pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
+def patch_GptOssAttention():
+    try:
+        from ..flex_attention import flex_attention_with_sink
+        assert flex_attention_with_sink is not None
+    except Exception as e:
+        return raise_error("flex_attention_with_sink", e)
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention
+        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
+    
+    apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self_attn.head_dim)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        attn_output = flex_attention_with_sink(self, query_states, key_states, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output
+    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
+pass
+TEMPORARY_PATCHES.append(patch_GptOssAttention)
+
 try:
     from openai_harmony import (
         Author,
