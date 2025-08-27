@@ -651,7 +651,13 @@ def patch_GptOssAttention():
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attn_output = flex_attention_with_sink(self, query_states, key_states, value_states)
+        attn_output = flex_attention_with_sink(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            compile = self.training,
+        )
         attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output, None
     pass
