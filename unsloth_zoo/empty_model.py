@@ -9,7 +9,7 @@ __all__ = [
 
 import torch
 import re
-from collections import OrderedDict
+import os
 from copy import deepcopy
 
 def is_comparable(val):
@@ -178,15 +178,16 @@ def copy_attributes(original_model, new_model):
                 skipped_count += 1
                 skipped_attrs.append(attr)
 
-    print(f"✅ Copied {copied_count} attributes (including {dict_copied_count} config-related dicts)")
-    if dict_skipped_count > 0:
-        print(f"📋 Skipped {dict_skipped_count} non-config dictionaries")
-    if skipped_count > 0:
-        print(f"⏭️  Skipped {skipped_count} total attributes (tensors, modules, non-config dicts, etc.)")
-        if skipped_count <= 10:
-            print(f"   Skipped: {skipped_attrs}")
-        else:
-            print(f"   Sample: {skipped_attrs[:5]}... and {skipped_count-5} more")
+    if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+        print(f"✅ Copied {copied_count} attributes (including {dict_copied_count} config-related dicts)")
+        if dict_skipped_count > 0:
+            print(f"📋 Skipped {dict_skipped_count} non-config dictionaries")
+        if skipped_count > 0:
+            print(f"⏭️  Skipped {skipped_count} total attributes (tensors, modules, non-config dicts, etc.)")
+            if skipped_count <= 10:
+                print(f"   Skipped: {skipped_attrs}")
+            else:
+                print(f"   Sample: {skipped_attrs[:5]}... and {skipped_count-5} more")
 
 
 @torch.inference_mode()
@@ -256,7 +257,6 @@ def create_empty_vision_model(config, dtype = torch.float16):
         from accelerate import init_empty_weights
         with init_empty_weights():
             original_meta_model = model_cls(config)
-            print(f'Initialised dummy model for config')
     except Exception as e:
         print(f"Failed to create original_meta_model for {model_cls.__name__}. Error {e}")
         import traceback
