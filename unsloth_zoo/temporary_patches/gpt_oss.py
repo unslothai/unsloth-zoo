@@ -647,9 +647,9 @@ def patch_GptOssAttention():
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_values is not None:
+        if past_key_value is not None:
             cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attn_output = flex_attention_with_sink(self, query_states, key_states, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
