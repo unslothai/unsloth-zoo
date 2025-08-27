@@ -653,7 +653,7 @@ def patch_GptOssAttention():
 
         attn_output = flex_attention_with_sink(self, query_states, key_states, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
-        return attn_output
+        return attn_output, None
     pass
 
     def forward(
