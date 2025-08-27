@@ -625,11 +625,43 @@ def patch_GptOssAttention():
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention
-        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
+        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb, repeat_kv
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
     
+    def eager_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
+        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+
+        sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+
+        # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
+        # when training with bsz>1 we clamp max values.
+        # combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        probs = torch.nn.functional.softmax(combined_logits, dim=-1, dtype=torch.float32).to(combined_logits.dtype)
+        scores = probs[..., :-1]  # we drop the sink here
+        attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output, attn_weights
+    pass
+
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
+    eager_attention_forward = torch_compile(eager_attention_forward)
     def forward_function(
         self,
         hidden_states: torch.Tensor,
@@ -651,16 +683,30 @@ def patch_GptOssAttention():
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attn_output = flex_attention_with_sink(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            compile = self.training, # Only enable torch.compile for training due to padding
-        )
+        if self.training:
+            attn_output = flex_attention_with_sink(
+                self,
+                query_states,
+                key_states,
+                value_states,
+            )
+            attn_weights = None
+        else:
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                s_aux=self.sinks,  # diff with Llama
+                **kwargs,
+            )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, None
+        return attn_output, attn_weights
     pass
 
     def forward(
