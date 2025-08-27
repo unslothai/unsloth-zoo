@@ -22,3 +22,8 @@ from .utils import (
     causal_mask,
     generate_sliding_window,
 )
+
+if HAS_FLEX_ATTENTION:
+    from .attention_sink import flex_attention_with_sink
+else:
+    flex_attention_with_sink = None
