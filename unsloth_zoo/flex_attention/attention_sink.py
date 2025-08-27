@@ -24,6 +24,7 @@ from .utils import (
     create_block_mask_cached,
     flex_attention,
 )
+from torch.nn.attention.flex_attention import flex_attention as uncompiled_flex_attention
 
 def causal_mask_with_sink(batch, head, q_idx, kv_idx):
     """
@@ -72,6 +73,7 @@ def flex_attention_with_sink(
     value,
     scale = None,
     sliding_window = None,
+    compile = True,
 ):
     """
     Allows one sink token to be attended to for full/sliding window attention
@@ -98,7 +100,7 @@ def flex_attention_with_sink(
         causal_mask_with_sink
     score_mod = generate_sink_score_mod(sink_weights)
     block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV+1) # Add 1 since we padded
-    attn_output = flex_attention(
+    attn_output = (flex_attention if compile else uncompiled_flex_attention)(
         query,
         key_padded,
         value_padded,
