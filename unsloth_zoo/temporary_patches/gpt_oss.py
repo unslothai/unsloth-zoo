@@ -656,9 +656,10 @@ def patch_GptOssAttention():
             query_states,
             key_states,
             value_states,
-            compile = self.training,
+            compile = self.training, # Only enable torch.compile for training due to padding
         )
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
         return attn_output, None
     pass
 

@@ -109,5 +109,6 @@ def flex_attention_with_sink(
         enable_gqa = enable_gqa,
         scale = scale,
     )
+    attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output
 pass
