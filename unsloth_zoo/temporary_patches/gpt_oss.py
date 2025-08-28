@@ -24,6 +24,7 @@ import textwrap
 from .common import (
     TEMPORARY_PATCHES,
     UNSLOTH_COMPILE_DISABLE,
+    UNSLOTH_ENABLE_LOGGING,
     torch_compile,
     get_torch_compile_options,
 )
