@@ -108,7 +108,7 @@ def get_torch_compile_options(
         # "cuda.use_fast_math"                : True, # Disable fast math
         # Causes incompatible gradient sizes on 2.6
         # And TypeError: bad operand type for unary -: 'SymbolicCallArg'
-        "combo_kernels"                       : False,
+        "combo_kernels"                       : combo_kernels,
         "benchmark_combo_kernel"              : True,
         "combo_kernel_foreach_dynamic_shapes" : True,
     }
