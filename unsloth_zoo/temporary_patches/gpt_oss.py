@@ -552,14 +552,15 @@ def patch_gpt_oss_linearized():
             num_experts = routing_weights.shape[1]
             if self.training:
                 next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
-                with torch.no_grad():
-                    expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                    expert_mask = expert_mask.permute(2, 1, 0)
-                    expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-                has_float32 = False
-                for expert_idx in expert_hitted[:]:
+                # with torch.no_grad():
+                #     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
+                #     expert_mask = expert_mask.permute(2, 1, 0)
+                #     expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+                # for expert_idx in expert_hitted[:]:
+                for expert_idx in range(num_experts):
                     with torch.no_grad():
-                        _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                        # _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                        token_idx, _ = torch.where(router_indices == expert_idx)
                     current_state = hidden_states[token_idx]
                     gate_up = self.gate_up_projs[expert_idx](current_state)
                     down_proj = self.down_projs[expert_idx]
@@ -577,7 +578,7 @@ def patch_gpt_oss_linearized():
                     weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                     next_states.index_add_(0, token_idx, weighted_output)
                 next_states = next_states.view(batch_size, -1, self.hidden_size)
-                return next_states.to(torch.float32 if has_float32 else torch.float16)
+                return next_states.to(torch.float32)
             else:
                 X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
                 gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
@@ -594,9 +595,7 @@ def patch_gpt_oss_linearized():
                 device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
                 with torch.autocast(device_type=device_type, enabled=False): # Force float32
                     out_list = [
-                        down_l(fused[e].to(
-                            getattr(down_l, "_pre_set_compute_dtype", torch.float16)
-                        ))
+                        down_l(fused[e].to(torch.float32))
                         for e, down_l in enumerate(self.down_projs)
                     ]
                 outs = torch.stack(out_list, dim=0)
