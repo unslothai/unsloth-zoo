@@ -467,7 +467,7 @@ class GptOssExperts(nn.Module):
             for expert_idx in range(num_experts):
                 with torch.no_grad():
                     # _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                    _, token_idx = torch.where(router_indices == expert_idx)
+                    token_idx, _ = torch.where(router_indices == expert_idx)
                 current_state = hidden_states[token_idx]
                 gate_up = self.gate_up_projs[expert_idx](current_state)
                 gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
