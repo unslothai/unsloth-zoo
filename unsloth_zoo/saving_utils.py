@@ -24,12 +24,14 @@ from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype
 from .hf_utils import dtype_from_config
 
+
 try:
     from transformers.integrations.mxfp4 import convert_moe_packed_tensors
 except (ImportError, ModuleNotFoundError):
     # Provide a fallback or a clear error if the function isn't available
     # when not using mxfp4.
     convert_moe_packed_tensors = None
+
 
 MODEL_CARD = \
 """---
