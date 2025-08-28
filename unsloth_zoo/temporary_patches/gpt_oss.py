@@ -532,6 +532,41 @@ class GptOssMLP(nn.Module):
         return routed_out, router_scores
 pass
 
+
+from peft.utils.integrations import (
+    dequantize_module_weight,
+    dequantize_bnb_weight as _dequantize_bnb_weight,
+)
+from bitsandbytes.nn.modules import Params4bit
+import bitsandbytes as bnb
+
+def dequantize_bnb_weight(module):
+    weight = module.weight
+    quant_state = getattr(module, "state", None)
+    device = weight.device
+    if isinstance(weight, Params4bit):
+        return bnb.functional.dequantize_4bit(weight.data, weight.quant_state)
+    else:
+        return _dequantize_bnb_weight(weight, state=quant_state)
+    return weight
+pass
+
+
+@torch.compile(dynamic = True, fullgraph = True)
+def moe(self, X, num_experts : int = 32):
+
+    gate_up_proj = torch.cat([dequantize_bnb_weight(self.gate_up_projs[i]).t().unsqueeze(0) for i in range(num_experts)])
+    b = torch.cat([self.gate_up_projs[i].bias.unsqueeze(0).unsqueeze(0) for i in range(num_experts)])
+    gate_up = torch.bmm(X, gate_up_proj) + b
+
+    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+
+    down_proj = torch.cat([dequantize_bnb_weight(self.down_projs[i]).t().unsqueeze(0) for i in range(num_experts)])
+    b = torch.cat([self.down_projs[i].bias.unsqueeze(0).unsqueeze(0) for i in range(num_experts)])
+    out = torch.bmm(gated_output, down_proj) + b
+    return out
+pass
+
 def patch_gpt_oss_linearized():
     model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
     if not model_name.endswith("-bnb-4bit"): return
@@ -554,30 +589,51 @@ def patch_gpt_oss_linearized():
             num_experts = routing_weights.shape[1]
             if self.training:
                 next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
+                
+                reshaped_hidden_states   = [None]*num_experts
+                reshaped_routing_weights = [None]*num_experts
+                routing_to_where = [None]*num_experts
                 with torch.no_grad():
-                    expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                    expert_mask = expert_mask.permute(2, 1, 0)
-                    expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-                has_float32 = False
-                for expert_idx in expert_hitted[:]:
-                    with torch.no_grad():
-                        _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                    current_state = hidden_states[token_idx]
-                    gate_up = self.gate_up_projs[expert_idx](current_state)
-                    down_proj = self.down_projs[expert_idx]
-                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
-                    # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                    # gate = gate.clamp(min=None, max=self.limit)
-                    # up = up.clamp(min=-self.limit, max=self.limit)
-                    # glu = gate * torch.sigmoid(gate * self.alpha)
-                    # gated_output = (up + 1) * glu
+                    for k in range(num_experts):
+                        where = torch.where(router_indices == k)[0]
+                        routing_to_where[k] = where
+                for k in range(num_experts):
+                    where = routing_to_where[where]
+                    reshaped_hidden_states[k]   = hidden_states[where]
+                    reshaped_routing_weights[k] = routing_weights[where, k].unsqueeze(1)
+                reshaped_hidden_states = torch.nested.nested_tensor(reshaped_hidden_states, layout = torch.jagged)
 
-                    # Force float32 matrix multiply on some down projection modules
-                    device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
-                    with torch.autocast(device_type=device_type, enabled=False): # Force float32
-                        out = down_proj(gated_output.to(torch.float32))
-                    weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
-                    next_states.index_add_(0, token_idx, weighted_output)
+                out = moe(self, reshaped_hidden_states, num_experts = num_experts)
+                for k in range(num_experts):
+                    expert = out.unbind()[k]
+                    expert = expert.mul_(reshaped_routing_weights[k].to(torch.float32))
+                    next_states.index_add_(0, routing_to_where[k], expert.to(torch.float32))
+                pass
+
+                # with torch.no_grad():
+                #     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
+                #     expert_mask = expert_mask.permute(2, 1, 0)
+                #     expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+                # has_float32 = False
+                # for expert_idx in expert_hitted[:]:
+                #     with torch.no_grad():
+                #         _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                #     current_state = hidden_states[token_idx]
+                #     gate_up = self.gate_up_projs[expert_idx](current_state)
+                #     down_proj = self.down_projs[expert_idx]
+                #     gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
+                #     # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                #     # gate = gate.clamp(min=None, max=self.limit)
+                #     # up = up.clamp(min=-self.limit, max=self.limit)
+                #     # glu = gate * torch.sigmoid(gate * self.alpha)
+                #     # gated_output = (up + 1) * glu
+
+                #     # Force float32 matrix multiply on some down projection modules
+                #     device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
+                #     with torch.autocast(device_type=device_type, enabled=False): # Force float32
+                #         out = down_proj(gated_output.to(torch.float32))
+                #     weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+                #     next_states.index_add_(0, token_idx, weighted_output)
                 next_states = next_states.view(batch_size, -1, self.hidden_size)
                 return next_states.to(torch.float32 if has_float32 else torch.float16)
             else:
