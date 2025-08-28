@@ -477,11 +477,11 @@ class GptOssExperts(nn.Module):
             out = moe(self, reshaped_hidden_states, num_experts = num_experts)
             for k in range(num_experts):
                 expert = out.unbind()[k]
-                expert = expert.mul_(reshaped_routing_weights[k].to(torch.float32))
+                expert = expert * reshaped_routing_weights[k].to(torch.float32)
                 next_states.index_add_(0, routing_to_where[k], expert.to(torch.float32))
             pass
             next_states = next_states.view(batch_size, -1, self.hidden_size)
-            return next_states
+            return next_states.to(hidden_states.dtype)
         else:
             X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
@@ -605,7 +605,7 @@ def patch_gpt_oss_linearized():
                 out = moe(self, reshaped_hidden_states, num_experts = num_experts)
                 for k in range(num_experts):
                     expert = out.unbind()[k]
-                    expert = expert.mul_(reshaped_routing_weights[k].to(torch.float32))
+                    expert = expert * reshaped_routing_weights[k].to(torch.float32)
                     next_states.index_add_(0, routing_to_where[k], expert.to(torch.float32))
                 pass
 
