@@ -738,7 +738,7 @@ def patch_GptOssAttention():
     # Set env variable for padding purposes
     os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
 pass
-TEMPORARY_PATCHES.append(patch_GptOssAttention)
+# TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 
 try:
