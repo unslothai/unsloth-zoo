@@ -615,6 +615,7 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
 def patch_GptOssAttention():
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     try:
         from ..flex_attention import flex_attention_with_sink
         assert flex_attention_with_sink is not None
@@ -733,6 +734,9 @@ def patch_GptOssAttention():
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
+
+    # Set env variable for padding purposes
+    os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
 pass
 # TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
