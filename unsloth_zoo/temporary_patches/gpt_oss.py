@@ -29,6 +29,7 @@ from .utils import (
     logger,
     Cache,
 )
+from ..hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
 
 
@@ -435,7 +436,7 @@ class GptOssExperts(nn.Module):
         self.expert_dim = config.intermediate_size
         self.alpha = 1.702
         self.limit = getattr(config, "swiglu_limit", 7.0)
-        self.dtype = config.torch_dtype
+        self.dtype = dtype_from_config(config)
 
         self.gate_up_projs = nn.ModuleList([
             nn.Linear(self.hidden_size, 2 * self.expert_dim, dtype=self.dtype)
@@ -502,7 +503,7 @@ class GptOssTopKRouter(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_local_experts
         self.hidden_dim = config.hidden_size
-        self.linear = nn.Linear(self.hidden_dim, self.num_experts, dtype=config.torch_dtype)
+        self.linear = nn.Linear(self.hidden_dim, self.num_experts, dtype=dtype_from_config(config))
 
     @torch_compile(dynamic = True, fullgraph = True)
     def forward(self, hidden_states):
