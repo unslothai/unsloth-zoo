@@ -469,7 +469,7 @@ class GptOssExperts(nn.Module):
                     where = torch.where(router_indices == k)[0]
                     routing_to_where[k] = where
             for k in range(num_experts):
-                where = routing_to_where[where]
+                where = routing_to_where[k]
                 reshaped_hidden_states[k]   = hidden_states[where]
                 reshaped_routing_weights[k] = routing_weights[where, k].unsqueeze(1)
             reshaped_hidden_states = torch.nested.nested_tensor(reshaped_hidden_states, layout = torch.jagged)
@@ -597,7 +597,7 @@ def patch_gpt_oss_linearized():
                         where = torch.where(router_indices == k)[0]
                         routing_to_where[k] = where
                 for k in range(num_experts):
-                    where = routing_to_where[where]
+                    where = routing_to_where[k]
                     reshaped_hidden_states[k]   = hidden_states[where]
                     reshaped_routing_weights[k] = routing_weights[where, k].unsqueeze(1)
                 reshaped_hidden_states = torch.nested.nested_tensor(reshaped_hidden_states, layout = torch.jagged)
