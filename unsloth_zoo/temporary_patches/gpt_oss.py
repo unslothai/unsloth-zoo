@@ -1070,6 +1070,6 @@ try:
         except Exception as e:
             return raise_error("transformers.models.gpt_oss.configuration_gpt_oss", e)
     pass
-    # TEMPORARY_PATCHES.append(patch_gpt_oss_config)
+    TEMPORARY_PATCHES.append(patch_gpt_oss_config)
 except Exception as e:
     raise_error("transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig", e)
