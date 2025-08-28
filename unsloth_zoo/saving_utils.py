@@ -22,6 +22,7 @@ __all__ = [
 import warnings
 from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype
+from .hf_utils import dtype_from_config
 
 MODEL_CARD = \
 """---
@@ -508,7 +509,7 @@ def prepare_saving(
         pass
     pass
 
-    if output_dtype is None: output_dtype = _get_dtype(model.config.torch_dtype)
+    if output_dtype is None: output_dtype = _get_dtype(dtype_from_config(model.config))
     assert(output_dtype in (torch.float32, torch.float16, torch.float64, torch.bfloat16))
     assert(type(torch.bfloat16) is torch.dtype)
     element_size = torch.tensor([], dtype = output_dtype).element_size()
