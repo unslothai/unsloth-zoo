@@ -458,29 +458,28 @@ class GptOssExperts(nn.Module):
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         num_experts = routing_weights.shape[1]
-        global data
-        data = [hidden_states, router_indices, routing_weights]
-        raise
         if self.training:
             next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
+            
+            reshaped_hidden_states   = [None]*num_experts
+            reshaped_routing_weights = [None]*num_experts
+            routing_to_where = [None]*num_experts
             with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            for expert_idx in expert_hitted[:]:
-                with torch.no_grad():
-                    _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                current_state = hidden_states[token_idx]
-                gate_up = self.gate_up_projs[expert_idx](current_state)
-                gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
-                # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                # gate = gate.clamp(min=None, max=self.limit)
-                # up = up.clamp(min=-self.limit, max=self.limit)
-                # glu = gate * torch.sigmoid(gate * self.alpha)
-                # gated_output = (up + 1) * glu
-                out = self.down_projs[expert_idx](gated_output)
-                weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
-                next_states.index_add_(0, token_idx, weighted_output)
+                for k in range(num_experts):
+                    where = torch.where(router_indices == k)[0]
+                    routing_to_where[k] = where
+            for k in range(num_experts):
+                where = routing_to_where[where]
+                reshaped_hidden_states[k]   = hidden_states[where]
+                reshaped_routing_weights[k] = routing_weights[where, k].unsqueeze(1)
+            reshaped_hidden_states = torch.nested.nested_tensor(reshaped_hidden_states, layout = torch.jagged)
+
+            out = moe(self, reshaped_hidden_states, num_experts = num_experts)
+            for k in range(num_experts):
+                expert = out.unbind()[k]
+                expert = expert.mul_(reshaped_routing_weights[k].to(torch.float32))
+                next_states.index_add_(0, routing_to_where[k], expert.to(torch.float32))
+            pass
             next_states = next_states.view(batch_size, -1, self.hidden_size)
             return next_states
         else:
