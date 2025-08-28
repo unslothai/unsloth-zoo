@@ -599,7 +599,11 @@ def sft_prepare_dataset(
         pass
 
         if not isinstance(dataset, IterableDataset):
-            map_kwargs["num_proc"] = getattr(args, "dataset_num_proc", 2)
+            dataset_num_proc = getattr(args, "dataset_num_proc", None)
+            if dataset_num_proc is None:
+                from multiprocessing import cpu_count
+                dataset_num_proc = max(cpu_count()+4, 2)
+            map_kwargs["num_proc"] = dataset_num_proc
         else:
             map_kwargs["batch_size"] = dataset._ex_iterable.batch_size
             

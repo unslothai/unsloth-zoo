@@ -459,13 +459,15 @@ class GptOssExperts(nn.Module):
         num_experts = routing_weights.shape[1]
         if self.training:
             next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
-            with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            for expert_idx in expert_hitted[:]:
+            # with torch.no_grad():
+                # expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
+                # expert_mask = expert_mask.permute(2, 1, 0)
+                # expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            # for expert_idx in expert_hitted[:]:
+            for expert_idx in range(num_experts):
                 with torch.no_grad():
-                    _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                    # _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                    token_idx, _ = torch.where(router_indices == expert_idx)
                 current_state = hidden_states[token_idx]
                 gate_up = self.gate_up_projs[expert_idx](current_state)
                 gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
@@ -478,7 +480,7 @@ class GptOssExperts(nn.Module):
                 weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                 next_states.index_add_(0, token_idx, weighted_output)
             next_states = next_states.view(batch_size, -1, self.hidden_size)
-            return next_states
+            return next_states.to(hidden_states.dtype)
         else:
             X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
@@ -550,20 +552,19 @@ def patch_gpt_oss_linearized():
             num_experts = routing_weights.shape[1]
             if self.training:
                 next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
-                with torch.no_grad():
-                    expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                    expert_mask = expert_mask.permute(2, 1, 0)
-                    expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-                has_float32 = False
-                for expert_idx in expert_hitted[:]:
+                # with torch.no_grad():
+                #     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
+                #     expert_mask = expert_mask.permute(2, 1, 0)
+                #     expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+                # for expert_idx in expert_hitted[:]:
+                for expert_idx in range(num_experts):
                     with torch.no_grad():
-                        _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                        # _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                        token_idx, _ = torch.where(router_indices == expert_idx)
                     current_state = hidden_states[token_idx]
                     gate_up = self.gate_up_projs[expert_idx](current_state)
                     down_proj = self.down_projs[expert_idx]
-                    dtype = getattr(down_proj, "_pre_set_compute_dtype", torch.float16)
-                    if dtype == torch.float32: has_float32 = True
-                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
+                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
                     # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
                     # gate = gate.clamp(min=None, max=self.limit)
                     # up = up.clamp(min=-self.limit, max=self.limit)
@@ -571,14 +572,14 @@ def patch_gpt_oss_linearized():
                     # gated_output = (up + 1) * glu
 
                     # Force float32 matrix multiply on some down projection modules
-                    gated_output = gated_output.to(dtype)
+                    gated_output = gated_output.to(torch.float32)
                     device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
                     with torch.autocast(device_type=device_type, enabled=False): # Force float32
                         out = down_proj(gated_output)
                     weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                     next_states.index_add_(0, token_idx, weighted_output)
                 next_states = next_states.view(batch_size, -1, self.hidden_size)
-                return next_states.to(torch.float32 if has_float32 else torch.float16)
+                return next_states.to(torch.float32)
             else:
                 X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
                 gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
@@ -595,9 +596,7 @@ def patch_gpt_oss_linearized():
                 device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
                 with torch.autocast(device_type=device_type, enabled=False): # Force float32
                     out_list = [
-                        down_l(fused[e].to(
-                            getattr(down_l, "_pre_set_compute_dtype", torch.float16)
-                        ))
+                        down_l(fused[e].to(torch.float32))
                         for e, down_l in enumerate(self.down_projs)
                     ]
                 outs = torch.stack(out_list, dim=0)
@@ -618,6 +617,7 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
 def patch_GptOssAttention():
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     try:
         from ..flex_attention import flex_attention_with_sink
         assert flex_attention_with_sink is not None
@@ -736,6 +736,9 @@ def patch_GptOssAttention():
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
+
+    # Set env variable for padding purposes
+    os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
 pass
 TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
