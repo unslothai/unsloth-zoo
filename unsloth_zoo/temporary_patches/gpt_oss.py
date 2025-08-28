@@ -427,6 +427,7 @@ pass
 TEMPORARY_PATCHES.append(patch_gpt_oss)
 
 
+global data
 class GptOssExperts(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -457,6 +458,9 @@ class GptOssExperts(nn.Module):
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         num_experts = routing_weights.shape[1]
+        global data
+        data = [hidden_states, router_indices, routing_weights]
+        raise
         if self.training:
             next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
             with torch.no_grad():
