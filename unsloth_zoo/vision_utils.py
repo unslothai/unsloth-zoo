@@ -61,6 +61,7 @@ from io import BytesIO
 import math
 import requests
 from typing import Union, Tuple, List, Dict
+from .hf_utils import dtype_from_config, HAS_TORCH_DTYPE
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
 MAX_PIXELS = 16384 * 28 * 28
@@ -280,8 +281,8 @@ class UnslothVisionDataCollator:
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
         self.dtype = _get_dtype(
-            model.config.torch_dtype \
-            if hasattr(model.config, "torch_dtype") else \
+            dtype_from_config(model.config)
+            if HAS_TORCH_DTYPE else
             model.get_input_embeddings().weight.dtype
         )
         self.ignore_index = ignore_index

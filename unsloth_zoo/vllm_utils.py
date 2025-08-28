@@ -47,6 +47,11 @@ import contextlib
 import inspect
 from functools import partial
 from .utils import _get_dtype
+from .hf_utils import (
+    dtype_from_config,
+    add_dtype_kwargs,
+    set_dtype_in_config,
+)
 from .patching_utils import patch_model_and_tokenizer
 from .temporary_patches.common import (
     get_torch_compile_options,
@@ -940,7 +945,7 @@ pass
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
-    config.update({"torch_dtype" : dtype}) # Do not use config file's dtype!
+    set_dtype_in_config(config, dtype)
     new_model = create_empty_causal_lm(config, dtype)
     quantization_config = getattr(config, "quantization_config", {})
     kwargs = dict()
@@ -1076,20 +1081,43 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
     # Fix up config items with correct items
     config_as_dict = config.to_dict()
+    # dtype is a ready only attribute on hf modules
+    if 'dtype' in config_as_dict:
+        config_as_dict.pop("dtype")
+
+    def _set_attribute(instance, key, value):
+        did_set = False
+        err1, err2 = "", ""
+        try:
+            if hasattr(instance, key): setattr(instance, key, value)
+            did_set = True
+        except Exception as e:
+            err1 = str(e)
+            did_set = False
+        if not did_set:
+            try:
+                if hasattr(instance, key): exec(f"instance.{key} = {value}")
+                did_set = True
+            except Exception as e:
+                err2 = str(e)
+                if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+                    print(f"Unsloth: Failed to set {key} in {type(instance)} with two errors: {err1} and {err2}")
+
     for module in new_model.modules():
         for key, value in config_as_dict.items():
-            if hasattr(module, key): exec(f"module.{key} = {value}")
-        if hasattr(module, "config"): module.config = config
+            _set_attribute(module, key, value)
+        _set_attribute(module, "config", config)
     pass
     for param in new_model.parameters():
         for key, value in config_as_dict.items():
-            if hasattr(param, key): exec(f"param.{key} = {value}")
-        if hasattr(param, "config"): param.config = config
+            _set_attribute(param, key, value)
+        _set_attribute(param, "config", config)
     pass
     module = new_model
     for key, value in config_as_dict.items():
-        if hasattr(module, key): exec(f"module.{key} = {value}")
-    new_model.config = config
+        _set_attribute(module, key, value)
+    pass
+    _set_attribute(new_model, "config", config)
 
     # Fix up rotary_emb by re-initing them
     device = "xpu:0" if DEVICE_TYPE == "xpu" else "cuda:0"
@@ -1692,7 +1720,7 @@ def convert_lora_modules(
     model,
     dtype = None,
 ):
-    dtype = _get_dtype(model.config.torch_dtype if dtype is None else dtype)
+    dtype = _get_dtype(dtype_from_config(model.config) if dtype is None else dtype)
 
     if (hasattr(model, "peft_config") and "default" in model.peft_config) \
         and (model.peft_config["default"].peft_type == PeftType.LORA):
@@ -1721,7 +1749,7 @@ def return_lora_modules(
     dtype = torch.float32,
 ):
     if state_dict == {} or state_dict is None: return
-    dtype = _get_dtype(model.config.torch_dtype if dtype is None else dtype)
+    dtype = _get_dtype(dtype_from_config(model.config) if dtype is None else dtype)
 
     if (hasattr(model, "peft_config") and "default" in model.peft_config) \
         and (model.peft_config["default"].peft_type == PeftType.LORA):
@@ -2021,13 +2049,14 @@ def _test_get_vllm_state_dict(
     pass
     kwargs = dict()
     if load_in_4bit: kwargs["quantization_config"] = bnb_config
+    kwargs = add_dtype_kwargs(dtype, kwargs)
     # Must patch BnB compute_dtype since it's forced to bfloat16!
     patch_bitsandbytes_quant_state()
     # patch_bitsandbytes_compute_dtype(dtype)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map          = "sequential",
-        torch_dtype         = dtype,
+        # torch_dtype         = dtype,  transformers moved torch_dtype to dtype
         attn_implementation = "sdpa",
         **kwargs,
     )

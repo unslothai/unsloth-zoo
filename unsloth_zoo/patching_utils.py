@@ -29,6 +29,7 @@ __all__ = [
 
 from .compiler import UNSLOTH_COMPILE_LOCATION
 from .utils import _get_dtype, Version
+from .hf_utils import dtype_from_config, set_dtype_in_config
 
 # Also disable compiling on bitsandbytes
 def patch_compiling_bitsandbytes():
@@ -250,20 +251,22 @@ def patch_model_and_tokenizer(
     assert(type(downcast_rope) is bool)
     import gc
 
-    # Fix torch_dtype
+    # Fix dtype
     m = model
     while hasattr(m, "model"):
         if hasattr(m, "config"):
-            if   m.config.torch_dtype ==  "float32": m.config.torch_dtype = torch.float32
-            elif m.config.torch_dtype == "bfloat16": m.config.torch_dtype = torch.bfloat16
-            elif m.config.torch_dtype ==  "float16": m.config.torch_dtype = torch.float16
+            config_dtype = dtype_from_config(m.config)
+            if   config_dtype ==  "float32": set_dtype_in_config(m.config, torch.float32)
+            elif config_dtype == "bfloat16": set_dtype_in_config(m.config, torch.bfloat16)
+            elif config_dtype ==  "float16": set_dtype_in_config(m.config, torch.float16)
         pass
         m = m.model
     pass
     if hasattr(m, "config"):
-        if   m.config.torch_dtype ==  "float32": m.config.torch_dtype = torch.float32
-        elif m.config.torch_dtype == "bfloat16": m.config.torch_dtype = torch.bfloat16
-        elif m.config.torch_dtype ==  "float16": m.config.torch_dtype = torch.float16
+        config_dtype = dtype_from_config(m.config)
+        if   config_dtype ==  "float32": set_dtype_in_config(m.config, torch.float32)
+        elif config_dtype == "bfloat16": set_dtype_in_config(m.config, torch.bfloat16)
+        elif config_dtype ==  "float16": set_dtype_in_config(m.config, torch.float16)
     pass
 
     # Also patch all dtypes - BnB seems to not allocate the correct type?
@@ -281,7 +284,7 @@ def patch_model_and_tokenizer(
     # Get most likely the correct data-type of the model
     if correct_dtype is None:
         try:
-            correct_dtype = _get_dtype(model.config.torch_dtype)
+            correct_dtype = _get_dtype(dtype_from_config(model.config))
         except:
             correct_dtype = model.get_input_embeddings().weight.dtype
     pass
@@ -329,13 +332,13 @@ def patch_model_and_tokenizer(
             module.to(module._pre_set_compute_dtype)
     pass
 
-    # Correct torch_dtype
+    # Correct dtype
     def __fix_dtype(config):
         if not hasattr(config, "to_dict"): return
         dicts = config.to_dict()
         for key, value in dicts.items():
-            if key == "torch_dtype":
-                setattr(config, "torch_dtype", correct_dtype)
+            if key == "torch_dtype" or key == "dtype":
+                set_dtype_in_config(config, correct_dtype)
             else:
                 __fix_dtype(getattr(config, key))
     m = model

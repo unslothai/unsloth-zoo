@@ -26,6 +26,7 @@ from packaging.version import Version
 import time
 from typing import Any, Optional, List, Dict, Tuple
 from .utils import _get_dtype
+from .hf_utils import dtype_from_config
 import os
 import re
 
@@ -106,7 +107,7 @@ def prepare_model_for_training(
     assert(type(train_lm_head) is bool)
     assert(type(float32_mixed_precision) is bool)
 
-    dtype = _get_dtype(model.config.torch_dtype)
+    dtype = _get_dtype(dtype_from_config(model.config))
     mixed_precision_dtype = torch.float32
     if dtype == torch.float16:
         # We need to upcast to float32
@@ -341,7 +342,8 @@ def unsloth_train(trainer):
 
     # Mixed precision scaling
     torch_version = torch.__version__
-    if model.config.torch_dtype == torch.float16:
+    config_dtype = dtype_from_config(model.config)
+    if config_dtype == torch.float16:
         mixed_precision = "fp16"
         mixed_dtype = torch.float16
         # torch.cuda.amp.autocast is deprecated >= 2.4
