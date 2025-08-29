@@ -1152,10 +1152,17 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             )
         if hasattr(module, "rotary_emb_local"):
             # gemma3 has a rotary_emb_local
+            # https://github.com/huggingface/transformers/blob/008c0ba8e2a1226a6ef5a61c4915a0a8a340c157/src/transformers/models/gemma3/modeling_gemma3.py#L469-L471
+            # Gemma3 uses different defaults for local and global RoPE. Copy the config for modification.
+            local_rope_config = deepcopy(text_config)
+            local_rope_config.rope_theta = text_config.rope_local_base_freq
+            local_rope_config.rope_scaling = {"rope_type": "default"}
+            # gemma3 has a rotary_emb_local
             module.rotary_emb_local = module.rotary_emb_local.__class__(
-                config = text_config,
+                config = local_rope_config,
                 device = get_target_device(),
             )
+            del local_rope_config
         pass
     pass
 

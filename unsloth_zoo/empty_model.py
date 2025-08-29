@@ -334,11 +334,18 @@ def set_additional_modules(new_model, quant_state_dict, config):
     embed_tokens_key = f"{language_model_prefix}.embed_tokens.weight"
     pad_token_id = getattr(config, "pad_token_id", None) or getattr(config, "text_config", None) and getattr(config.text_config, "pad_token_id", None)
     if pad_token_id: assert pad_token_id <= quant_state_dict[embed_tokens_key].shape[0], f"Pad token id {pad_token_id} out of bounds for vocab size {quant_state_dict[embed_tokens_key].shape[0]}"
-    language_model.embed_tokens = torch.nn.Embedding.from_pretrained(
-        quant_state_dict[embed_tokens_key],
-        freeze = True,
-        padding_idx = pad_token_id,
-    )
+
+    # language_model.embed_tokens = torch.nn.Embedding.from_pretrained(
+    #     quant_state_dict[embed_tokens_key],
+    #     freeze = True,
+    #     padding_idx = pad_token_id,
+    # )
+    # we cannot use the normal embedding init because gemma3 uses Gemma3TextScaledWordEmbedding which wraps around nn.Embedding and has a scaling factor. This new init ensures that we respect the forward from original model.
+    num_embeddings, embedding_dim = quant_state_dict[embed_tokens_key].shape
+    language_model.embed_tokens.weight = quant_state_dict[embed_tokens_key]
+    language_model.embed_tokens.padding_idx = pad_token_id
+    language_model.embed_tokens.num_embeddings = num_embeddings
+    language_model.embed_tokens.embedding_dim = embedding_dim
 
     # Norm
     norm_key = f"{language_model_prefix}.norm.weight"
