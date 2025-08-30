@@ -503,6 +503,7 @@ def get_model_layer_config():
             "model.visual.blocks.{kk}.attn.qkv",
             "model.visual.blocks.{kk}.attn.proj",
 
+            "model.visual.blocks.{kk}.mlp.gate_up_proj",
             "model.visual.blocks.{kk}.mlp.gate_proj",
             "model.visual.blocks.{kk}.mlp.up_proj",
             "model.visual.blocks.{kk}.mlp.down_proj",
@@ -629,7 +630,11 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                          get_state_dict(f"{layer_path.replace('qkv_proj', 'v_proj')}", 2, state_dict, layer_module)
                     elif model_type == "qwen2_5_vl":
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
-
+                elif "gate_up_proj" in layer_path:
+                    # vLLM seems to have merged gate and up proj recently for qwen vl. This is to handle new variant
+                    # https://github.com/jeejeelee/vllm/commit/a71e4765cc0c1534f2a8891aaf628e1751f6df07
+                    get_state_dict(f"{layer_path.replace('gate_up_proj','gate_proj')}", 0, state_dict, layer_module)
+                    get_state_dict(f"{layer_path.replace('gate_up_proj','up_proj')}", 1, state_dict, layer_module)
                 elif "fc" in layer_path or "proj" in layer_path:
                     get_state_dict(layer_path, 0, state_dict, layer_module)
                 else: # Handle other layers, especially layernorms
