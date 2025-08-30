@@ -48,6 +48,11 @@ import inspect
 from functools import partial
 from .utils import _get_dtype
 from .empty_model import *
+from .hf_utils import (
+    dtype_from_config,
+    add_dtype_kwargs,
+    set_dtype_in_config,
+)
 from .patching_utils import patch_model_and_tokenizer
 from .temporary_patches.common import (
     get_torch_compile_options,
@@ -1001,7 +1006,7 @@ pass
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
-    config.update({"torch_dtype" : dtype}) # Do not use config file's dtype!
+    set_dtype_in_config(config, dtype)
     new_model, original_meta_model, layer_names, layer_count = create_empty_model(config, dtype, is_vision_model)
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
     quantization_config = getattr(config, "quantization_config", {})
@@ -1789,7 +1794,7 @@ def convert_lora_modules(
     model,
     dtype = None,
 ):
-    dtype = _get_dtype(model.config.torch_dtype if dtype is None else dtype)
+    dtype = _get_dtype(dtype_from_config(model.config) if dtype is None else dtype)
 
     if (hasattr(model, "peft_config") and "default" in model.peft_config) \
         and (model.peft_config["default"].peft_type == PeftType.LORA):
@@ -1818,7 +1823,7 @@ def return_lora_modules(
     dtype = torch.float32,
 ):
     if state_dict == {} or state_dict is None: return
-    dtype = _get_dtype(model.config.torch_dtype if dtype is None else dtype)
+    dtype = _get_dtype(dtype_from_config(model.config) if dtype is None else dtype)
 
     if (hasattr(model, "peft_config") and "default" in model.peft_config) \
         and (model.peft_config["default"].peft_type == PeftType.LORA):
@@ -2154,6 +2159,7 @@ def _test_get_vllm_state_dict(
     pass
     kwargs = dict()
     if load_in_4bit: kwargs["quantization_config"] = bnb_config
+    kwargs = add_dtype_kwargs(dtype, kwargs)
     # Must patch BnB compute_dtype since it's forced to bfloat16!
     patch_bitsandbytes_quant_state()
     # patch_bitsandbytes_compute_dtype(dtype)
@@ -2174,7 +2180,7 @@ def _test_get_vllm_state_dict(
     model = model_class.from_pretrained(
         model_name,
         device_map          = "sequential",
-        torch_dtype         = dtype,
+        # torch_dtype         = dtype,  transformers moved torch_dtype to dtype
         attn_implementation = "sdpa",
         low_cpu_mem_usage   = True,
         **kwargs,

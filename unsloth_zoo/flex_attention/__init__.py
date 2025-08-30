@@ -14,10 +14,16 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+from .utils import (
+    HAS_FLEX_ATTENTION,
+    FLEX_ATTENTION_BLOCK_SIZE,
+    flex_attention,
+    create_block_mask_cached,
+    causal_mask,
+    generate_sliding_window,
+)
 
-from .common import *
-from .gemma import *
-from .misc import *
-from .gemma3n import *
-from .gpt_oss import *
-from .pixtral import *
+if HAS_FLEX_ATTENTION:
+    from .attention_sink import flex_attention_with_sink
+else:
+    flex_attention_with_sink = None
