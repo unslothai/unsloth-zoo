@@ -610,6 +610,17 @@ def patch_vllm_enable_sleep_mode():
         # print(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
     pass
 
+    def get_patched_generate(original_generate):
+        def new_generate(self, args, kwargs):
+            if os.environ.get('UNSLOTH_VLLM_STANDBY', "0") == "1":
+                self.llm_engine.wake_up()
+            return original_generate(self,args, kwargs)
+        return new_generate
+    pass
+
+    vllm.LLM.generate = get_patched_generate(vllm.LLM.generate)
+    vllm.AsyncLLMEngine.generate = get_patched_generate(vllm.AsyncLLMEngine.generate)
+
     CuMemAllocator.sleep = sleep
     CuMemAllocator.wake_up = wake_up
     CuMemAllocator.print_memory_summary = print_memory_summary
