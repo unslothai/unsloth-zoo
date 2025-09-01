@@ -611,10 +611,18 @@ def patch_vllm_enable_sleep_mode():
     pass
 
     def get_patched_generate(original_generate):
-        def new_generate(self, args, kwargs):
-            if os.environ.get('UNSLOTH_VLLM_STANDBY', "0") == "1":
-                self.llm_engine.wake_up()
-            return original_generate(self,args, kwargs)
+        def check_sleep_mode(self):
+            # LLM object has llm_engine as an attribute
+            engine = getattr(self, "llm_engine", self)
+            return hasattr(engine, "vllm_config") and hasattr(engine.vllm_config, "model_config") and getattr(engine.vllm_config.model_config, "enable_sleep_mode", False)
+
+        import functools
+        @functools.wraps(original_generate)
+        def new_generate(self, *args, **kwargs):
+            # vLLM internally checks if wake_up is necessary before performing memory allocation.
+            if check_sleep_mode(self):
+                self.wake_up()
+            return original_generate(self,*args, **kwargs)
         return new_generate
     pass
 
@@ -718,7 +726,9 @@ def patch_vllm(debug = True):
     patch_vllm_bitsandbytes()
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
-    patch_vllm_enable_sleep_mode()
+    if os.getenv("UNSLOTH_VLLM_STANDBY", "0") == "1":
+        print(f'Unsloth: Patching vLLM to enable standby.')
+        patch_vllm_enable_sleep_mode()
     patch_vllm_graph_capture()
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
