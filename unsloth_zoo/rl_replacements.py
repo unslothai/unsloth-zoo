@@ -351,7 +351,9 @@ def grpo_accumulated_loss(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     bsz, qlen = input_ids.shape
-
+    pixel_values = kwargs.get('pixel_values',None)
+    image_grid_thw = kwargs.get('image_grid_thw',None)
+    
     # Find closest multiple
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
@@ -371,14 +373,22 @@ def grpo_accumulated_loss(
             ref_hidden_states = trainer.model(
                 input_ids = input_ids,
                 attention_mask = attention_mask,
+                pixel_values = pixel_values,
+                image_grid_thw = image_grid_thw,
                 logits_to_keep = logits_to_keep + 1,
             ).logits
         pass
         new_hidden_states = trainer.model(
             input_ids = input_ids,
             attention_mask = attention_mask,
+            pixel_values = pixel_values,
+            image_grid_thw = image_grid_thw,
             logits_to_keep = logits_to_keep + 1,
         ).logits
+
+        if ref_hidden_states.size(1) != logits_to_keep + 1 : # Some models like Qwen VL don't have logits_to_keep parameter so you need to trim the output manually
+            ref_hidden_states = ref_hidden_states[:,-(logits_to_keep + 1):,:]
+            new_hidden_states = new_hidden_states[:,-(logits_to_keep + 1):,:]
 
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
             new_hidden_states,
