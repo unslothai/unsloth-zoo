@@ -1293,6 +1293,8 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
+    unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
+
     if DEVICE_TYPE == "cuda":
         major_version, minor_version = torch.cuda.get_device_capability()
         if major_version < 7: raise NotImplementedError("Unsloth: Your GPU is too old!")
