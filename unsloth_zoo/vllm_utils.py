@@ -525,9 +525,6 @@ def patch_vllm_enable_sleep_mode():
         true_offloads = 0
         total_offloads = 0
 
-        print("####", offload_tags, flush = True)
-        print("####", offload_tags, flush = True)
-        print("####", offload_tags, flush = True)
         for ptr, data in self.pointer_to_data.items():
             total_offloads += 1
             handle = data.handle
