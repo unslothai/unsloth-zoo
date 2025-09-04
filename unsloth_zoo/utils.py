@@ -85,7 +85,10 @@ def is_distributed():
 pass
 
 def distributed_function(n = 1, function = None, *args, **kwargs):
-    # Must call 
+    # Must call
+    print("RANK", os.environ.get("RANK"), flush = True)
+    print("RANK", os.environ.get("RANK"), flush = True)
+    print("RANK", os.environ.get("RANK"), flush = True)
     if is_distributed():
         if torch_distributed_get_rank() == 0:
             object_list = function(*args, **kwargs)
