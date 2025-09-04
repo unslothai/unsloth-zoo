@@ -862,6 +862,15 @@ def merge_and_overwrite_lora(
             save_directory = save_directory,
             state_dict = {},
         )
+        # Remove any weight files that shouldn't have been saved (transformers 4.56.0 bug)
+        import glob
+        weight_files = glob.glob(os.path.join(save_directory, "*.bin")) + \
+                       glob.glob(os.path.join(save_directory, "*.safetensors"))
+
+        for weight_file in weight_files:
+            os.remove(weight_file)
+            print(f"DEBUG: Removed incorrectly saved weight file: {os.path.basename(weight_file)}")
+
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         # Remove the quantization_config in the config.json file if it exists,
     # as we are exporting the model in 16-bit format.
