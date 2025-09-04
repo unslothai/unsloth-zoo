@@ -75,6 +75,7 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
             object_list = function(*args, **kwargs)
+            print(torch.distributed.get_rank(), function, object_list)
             if n == 1: object_list = [object_list]
         else:
             object_list = [None for _ in range(n)]
