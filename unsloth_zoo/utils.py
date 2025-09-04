@@ -25,6 +25,7 @@ __all__ = [
 
 from packaging.version import Version as TrueVersion
 import torch
+import os
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -62,17 +63,23 @@ pass
 
 
 import functools
-torch_distributed_is_initialized = functools.cache(torch.distributed.is_initialized)
-torch_distributed_is_torchelastic_launched = functools.cache(torch.distributed.is_torchelastic_launched)
-torch_distributed_get_rank = functools.cache(torch.distributed.get_rank)
+torch_distributed_is_initialized = torch.distributed.is_initialized
+torch_distributed_is_torchelastic_launched = torch.distributed.is_torchelastic_launched
+torch_distributed_get_rank = torch.distributed.get_rank
 
-@functools.cache
 def is_main_process():
+    if torch_distributed_is_initialized():
+        # torch.distributed.init_process_group was run, so get_rank works
+        return is_initialized and torch_distributed_get_rank() == 0
+    elif torch_distributed_is_torchelastic_launched():
+        # accelerate launch for example calls init_process_group later
+        print("RANK", os.environ.get("RANK"), flush = True)
+        print("RANK", os.environ.get("RANK"), flush = True)
+        print("RANK", os.environ.get("RANK"), flush = True)
     is_initialized = torch_distributed_is_initialized() or torch_distributed_is_torchelastic_launched()
     return (not is_initialized) or (is_initialized and torch_distributed_get_rank() == 0)
 pass
 
-@functools.cache
 def is_distributed():
     return torch_distributed_is_initialized() or torch_distributed_is_torchelastic_launched()
 pass
