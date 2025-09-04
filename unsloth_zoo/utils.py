@@ -20,6 +20,7 @@ __all__ = [
     "is_main_process",
     "is_distributed",
     "distributed_function",
+    "torch_distributed_get_rank",
 ]
 
 from packaging.version import Version as TrueVersion
@@ -60,32 +61,32 @@ def _get_dtype(dtype):
 pass
 
 
+import functools
+torch_distributed_is_initialized = functools.cache(torch.distributed.is_initialized)
+torch_distributed_is_torchelastic_launched = functools.cache(torch.distributed.is_torchelastic_launched)
+torch_distributed_get_rank = functools.cache(torch.distributed.get_rank)
+
+@functools.cache
 def is_main_process():
-    is_initialized = torch.distributed.is_initialized()
-    return (not is_initialized) or (is_initialized and torch.distributed.get_rank() == 0)
+    is_initialized = torch_distributed_is_initialized() or torch_distributed_is_torchelastic_launched()
+    return (not is_initialized) or (is_initialized and torch_distributed_get_rank() == 0)
 pass
 
-
+@functools.cache
 def is_distributed():
-    return torch.distributed.is_initialized()
+    return torch_distributed_is_initialized() or torch_distributed_is_torchelastic_launched()
 pass
-
 
 def distributed_function(n = 1, function = None, *args, **kwargs):
-    print("############", torch.distributed.is_initialized(), torch.distributed.is_torchelastic_launched(), flush = True)
-    print("############", torch.distributed.is_initialized(), torch.distributed.is_torchelastic_launched(), flush = True)
-    print("############", torch.distributed.is_initialized(), torch.distributed.is_torchelastic_launched(), flush = True)
-    print("############", torch.distributed.is_initialized(), flush = True)
-    print("############", torch.distributed.is_initialized(), flush = True)
-    if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
+    # Must call 
+    if is_distributed():
+        if torch_distributed_get_rank() == 0:
             object_list = function(*args, **kwargs)
             if n == 1: object_list = [object_list]
         else:
             object_list = [None for _ in range(n)]
         # broadcast_object_list auto blocks so no need for barrier
         torch.distributed.broadcast_object_list(object_list, src = 0, device = "cpu")
-        torch.distributed.barrier()
         if n == 1: result = object_list[0]
     else:
         result = function(*args, **kwargs)
