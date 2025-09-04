@@ -72,6 +72,11 @@ pass
 
 
 def distributed_function(n = 1, function = None, *args, **kwargs):
+    print("############", torch.distributed.is_initialized(), flush = True)
+    print("############", torch.distributed.is_initialized(), flush = True)
+    print("############", torch.distributed.is_initialized(), flush = True)
+    print("############", torch.distributed.is_initialized(), flush = True)
+    print("############", torch.distributed.is_initialized(), flush = True)
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
             object_list = function(*args, **kwargs)
