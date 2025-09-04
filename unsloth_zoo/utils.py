@@ -72,9 +72,9 @@ pass
 
 
 def distributed_function(n = 1, function = None, *args, **kwargs):
-    print("############", torch.distributed.is_initialized(), flush = True)
-    print("############", torch.distributed.is_initialized(), flush = True)
-    print("############", torch.distributed.is_initialized(), flush = True)
+    print("############", torch.distributed.is_initialized(), torch.distributed.is_torchelastic_launched(), flush = True)
+    print("############", torch.distributed.is_initialized(), torch.distributed.is_torchelastic_launched(), flush = True)
+    print("############", torch.distributed.is_initialized(), torch.distributed.is_torchelastic_launched(), flush = True)
     print("############", torch.distributed.is_initialized(), flush = True)
     print("############", torch.distributed.is_initialized(), flush = True)
     if torch.distributed.is_initialized():
