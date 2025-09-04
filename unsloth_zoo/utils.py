@@ -26,6 +26,8 @@ __all__ = [
 from packaging.version import Version as TrueVersion
 import torch
 import os
+import time
+import contextlib
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -82,7 +84,6 @@ def is_distributed():
 pass
 
 def distributed_function(n = 1, function = None, *args, **kwargs):
-    # Must call
     if is_distributed():
         if is_main_process():
             object_list = function(*args, **kwargs)
@@ -90,8 +91,19 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
         else:
             object_list = [None for _ in range(n)]
         # broadcast_object_list auto blocks so no need for barrier
-        torch.distributed.broadcast_object_list(object_list, src = 0, device = "cpu")
-        if n == 1: result = object_list[0]
+        if not torch_distributed_is_initialized():
+            # But check if the function even works!
+            # This happens when torch_distributed_is_torchelastic_launched()==True but
+            # torch_distributed_is_initialized()==False
+            # Trick is to just add a 1+0.5*RANK second sleep and print with flush
+            time.sleep(1 + 0.5*int(os.environ.get("RANK", "0")))
+            with contextlib.redirect_stdout(None):
+                print("", flush = True)
+            object_list = function(*args, **kwargs)
+            if n == 1: object_list = [object_list]
+        else:
+            torch.distributed.broadcast_object_list(object_list, src = 0, device = "cpu")
+            if n == 1: result = object_list[0]
     else:
         result = function(*args, **kwargs)
     return result
