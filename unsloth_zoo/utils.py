@@ -70,14 +70,11 @@ torch_distributed_get_rank = torch.distributed.get_rank
 def is_main_process():
     if torch_distributed_is_initialized():
         # torch.distributed.init_process_group was run, so get_rank works
-        return is_initialized and torch_distributed_get_rank() == 0
+        return torch_distributed_get_rank() == 0
     elif torch_distributed_is_torchelastic_launched():
         # accelerate launch for example calls init_process_group later
-        print("RANK", os.environ.get("RANK"), flush = True)
-        print("RANK", os.environ.get("RANK"), flush = True)
-        print("RANK", os.environ.get("RANK"), flush = True)
-    is_initialized = torch_distributed_is_initialized() or torch_distributed_is_torchelastic_launched()
-    return (not is_initialized) or (is_initialized and torch_distributed_get_rank() == 0)
+        return os.environ.get("RANK", "0") == "0"
+    return True
 pass
 
 def is_distributed():
@@ -86,11 +83,8 @@ pass
 
 def distributed_function(n = 1, function = None, *args, **kwargs):
     # Must call
-    print("RANK", os.environ.get("RANK"), flush = True)
-    print("RANK", os.environ.get("RANK"), flush = True)
-    print("RANK", os.environ.get("RANK"), flush = True)
     if is_distributed():
-        if torch_distributed_get_rank() == 0:
+        if is_main_process():
             object_list = function(*args, **kwargs)
             if n == 1: object_list = [object_list]
         else:
