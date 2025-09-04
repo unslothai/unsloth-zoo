@@ -116,7 +116,7 @@ def flex_attention_with_sink(
 pass
 
 
-def new_flex_attention_with_sink(
+def flex_attention_with_sink(
     self_attn,
     query,
     key,
