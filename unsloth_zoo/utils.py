@@ -95,8 +95,8 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
             # But check if the function even works!
             # This happens when torch_distributed_is_torchelastic_launched()==True but
             # torch_distributed_is_initialized()==False
-            # Trick is to just add a 0.2+0.1*RANK second sleep and print with flush
-            time.sleep(0.2 + 0.1*int(os.environ.get("RANK", "0")))
+            # Trick is to just add a 0.01+0.01*RANK second sleep and print with flush
+            time.sleep(0.01 + 0.01*int(os.environ.get("RANK", "0")))
             with contextlib.redirect_stdout(None):
                 print("", flush = True)
             object_list = function(*args, **kwargs)
