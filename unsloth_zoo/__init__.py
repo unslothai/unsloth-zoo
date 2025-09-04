@@ -49,6 +49,7 @@ if (os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1") or \
     os.environ["TRITON_DISABLE_LINE_INFO"] = "0" # Enables Triton line info
     os.environ["TRITON_FRONT_END_DEBUGGING"] = "0" # Debugging
     os.environ["TRITON_ALWAYS_COMPILE"] = "1" # Always compile kernels
+    os.environ["NCCL_DEBUG"] = "WARN" # Warn on NCCL issues
 pass
 
 # Triton compile debugging
