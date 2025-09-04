@@ -533,6 +533,7 @@ def patch_vllm_enable_sleep_mode():
                 continue
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
+                print("####", size_in_bytes, flush = True)
                 cpu_backup_tensor = torch.empty(
                     size_in_bytes,
                     dtype=torch.uint8,
