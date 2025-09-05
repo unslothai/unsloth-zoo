@@ -23,6 +23,7 @@ import warnings
 from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype
 from .hf_utils import dtype_from_config
+from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 
 
 try:
@@ -414,10 +415,12 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
 
                         lora_stats = converted_lora_weights.get(base_name, None)
                         if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                            print(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
+                            if UNSLOTH_ENABLE_LOGGING:
+                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
                             count += 1; W = _merge_lora(W, lora_stats, output_key)
                         else:
-                            print(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
+                            if UNSLOTH_ENABLE_LOGGING:
+                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
                         action_logged = True
 
                     elif key.endswith("_scales"):
@@ -859,6 +862,15 @@ def merge_and_overwrite_lora(
             save_directory = save_directory,
             state_dict = {},
         )
+        # Remove any weight files that shouldn't have been saved (transformers 4.56.0 bug)
+        import glob
+        weight_files = glob.glob(os.path.join(save_directory, "*.bin")) + \
+                       glob.glob(os.path.join(save_directory, "*.safetensors"))
+
+        for weight_file in weight_files:
+            os.remove(weight_file)
+            print(f"DEBUG: Removed incorrectly saved weight file: {os.path.basename(weight_file)}")
+
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         # Remove the quantization_config in the config.json file if it exists,
     # as we are exporting the model in 16-bit format.
@@ -966,6 +978,7 @@ def merge_and_overwrite_lora(
 
         if push_to_hub:
             upload_items("model.safetensors.index.json")
+        print("Unsloth: Merge process completed.")
 
     # Step 7: Final upload of all shards if not using low disk space mode and pushing
     if not low_disk_space_usage and push_to_hub:

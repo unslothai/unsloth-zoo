@@ -109,7 +109,11 @@ except ImportError as e:
     e = str(e)
     if "cannot import name '_center' from 'numpy._core.umath'" in e:
         raise RuntimeError(
-            f"You might have used uv to install packages, and they broke numpy. Try restarting your runtime."
+            f"***** You might have used uv to install packages, and they broke numpy. Try restarting your runtime. *****"
+        )
+    elif "torchvision::nms does not exist" in e:
+        raise RuntimeError(
+            f"***** Please update and reinstall torchvision - it broke! `pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
         )
     elif "Unpack" not in e:
         raise Exception(e)
