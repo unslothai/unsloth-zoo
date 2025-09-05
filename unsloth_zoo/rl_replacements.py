@@ -431,9 +431,9 @@ def grpo_accumulated_loss(
     completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
 
     lm_head = trainer.model.get_output_embeddings().weight
-    completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(torch.int32)
+    completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
     attention_mask =  input_ids != trainer.processing_class.pad_token_id
-    attention_mask = attention_mask.to(torch.int32)
+    attention_mask = attention_mask.to(attention_mask.dtype)
     with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
             ref_hidden_states = trainer.model(
