@@ -60,7 +60,66 @@ def chunked_selective_log_softmax(logits, index):
     return all_per_token_logps
 pass
 
+def calculate_pad_tokens_in_prompt(
+        input_ids: torch.Tensor,
+        logits_to_keep: int,
+        pad_token_id: int
+    ) -> torch.Tensor:
+        """
+        Given prompt tensor, it returns all the left padded tokens in that sequence. so [pad, pad, pad, cat] = 3 tokens 
+        """
+        if logits_to_keep >= input_ids.shape[1]:
+            raise ValueError("logits_to_keep must be smaller than the sequence length.")
+
+        prompt_section = input_ids[:, :-logits_to_keep]
+
+        padding_mask = (prompt_section == pad_token_id)
+
+        pad_token_counts = padding_mask.sum(dim=1)
+
+        return pad_token_counts
+
+def create_completion_attention_mask(
+        completion_input_ids: torch.Tensor,
+        left_pad_tokens_per_prompt: torch.Tensor,
+        max_left_pad: int,
+        pad_token_id: int
+    ) -> torch.Tensor:
+        """
+        Given that we have a sequence, [p,p,p,c,c,c,pad,pad,pad]
+
+        Where p are extra prompt tokens we got from slicing the torch tensor, c is completion tokens
+        and pad are pad tokens, this function would make a completion mask that would 0 out the pad
+        and p tokens. so in this example [0,0,0,1,1,1,0,0,0]
+        """
+        batch_size, completion_len = completion_input_ids.shape
+        device = completion_input_ids.device
+
+        num_tokens_to_mask = max_left_pad - left_pad_tokens_per_prompt
+
+        indices = torch.arange(completion_len, device=device).unsqueeze(0)
+        shift_mask = indices >= num_tokens_to_mask.unsqueeze(1)
+
+        non_padding_mask = (completion_input_ids != pad_token_id)
+
+        final_mask = shift_mask & non_padding_mask
+
+        return final_mask
+
+def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
+    """
+    Moves all padding tokens in each sequence of a batch to the right.
+    """
+    mask = (tensor != pad_id)
+    sorted_indices = torch.argsort(mask, dim=1, descending=True)
+    packed_tensor = torch.gather(tensor, 1, sorted_indices)
+
+    return packed_tensor
+
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
+RL_REPLACEMENTS["create_completion_attention_mask"] = create_completion_attention_mask
+RL_REPLACEMENTS["calculate_pad_tokens_in_prompt"] = calculate_pad_tokens_in_prompt
+RL_REPLACEMENTS["left_pack_padding"] = left_pack_padding
 
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
@@ -362,92 +421,19 @@ def grpo_accumulated_loss(
         if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = torch.float16
     pass
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
-    def calculate_pad_tokens_in_prompt(
-        input_ids: torch.Tensor,
-        logits_to_keep: int,
-        pad_token_id: int
-    ) -> torch.Tensor:
-        """
-        Calculates the number of padding tokens in the prompt section of each sequence.
 
-        This function ASSUMES a fixed boundary, where the prompt and its padding are
-        fully contained within the initial part of the sequence.
-
-        Args:
-            input_ids (torch.Tensor): The full input tensor.
-            logits_to_keep (int): The length of the completion part of the sequence.
-            pad_token_id (int): The ID of the padding token.
-
-        Returns:
-            torch.Tensor: A 1D tensor of shape (batch_size,) with the count of padding
-                        tokens for each sequence's prompt section.
-        """
-        if logits_to_keep >= input_ids.shape[1]:
-            raise ValueError("logits_to_keep must be smaller than the sequence length.")
-
-        # 1. Isolate the part of the tensor that is assumed to be the prompt section.
-        prompt_section = input_ids[:, :-logits_to_keep]
-
-        # 2. Create a mask for padding tokens within that section.
-        padding_mask = (prompt_section == pad_token_id)
-
-        # 3. Sum the padding tokens for each sequence to get the count.
-        pad_token_counts = padding_mask.sum(dim=1)
-        #breakpoint()
-        return pad_token_counts
-    def create_completion_attention_mask(
-        completion_input_ids: torch.Tensor,
-        left_pad_tokens_per_prompt: torch.Tensor,
-        max_left_pad: int,
-        pad_token_id: int
-    ) -> torch.Tensor:
-        """
-        Creates a left-aligned completion mask that also accounts for padding tokens.
-
-        For each sequence `i`, the mask is False for the first `N` tokens, where
-        `N = max_left_pad - left_pad_tokens_per_prompt[i]`. It is also False
-        for any token that is a pad_token_id.
-
-        Args:
-            completion_input_ids (torch.Tensor): The sliced tensor of completion IDs.
-            left_pad_tokens_per_prompt (torch.Tensor): 1D tensor with left pad counts.
-            max_left_pad (int): The maximum value from left_pad_tokens_per_prompt.
-            pad_token_id (int): The ID for padding tokens.
-
-        Returns:
-            torch.Tensor: A boolean attention mask of the same shape as
-                        completion_input_ids.
-        """
-        batch_size, completion_len = completion_input_ids.shape
-        device = completion_input_ids.device
-
-        # 1. Calculate the number of initial tokens to mask for each sequence
-        num_tokens_to_mask = max_left_pad - left_pad_tokens_per_prompt
-
-        # 2. Create the base mask for the left-side shift
-        indices = torch.arange(completion_len, device=device).unsqueeze(0)
-        shift_mask = indices >= num_tokens_to_mask.unsqueeze(1)
-
-        # 3. Create a mask to identify non-padding tokens
-        non_padding_mask = (completion_input_ids != pad_token_id)
-
-        # 4. The final mask is True only where both conditions are met
-        final_mask = shift_mask & non_padding_mask
-
-        return final_mask
-    #breakpoint()
     left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
+
     max_left_pad = max(left_pad_tokens_per_prompt).item()
-    #breakpoint()
+
     input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
-    #breakpoint()
+
     completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
-    #breakpoint()
+
     lm_head = trainer.model.get_output_embeddings().weight
     completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(torch.int32)
     attention_mask =  input_ids != trainer.processing_class.pad_token_id
     attention_mask = attention_mask.to(torch.int32)
-    #breakpoint()
     with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
             ref_hidden_states = trainer.model(
@@ -462,14 +448,13 @@ def grpo_accumulated_loss(
             #logits_to_keep = logits_to_keep + 1,
         ).logits
         
-        #breakpoint()
-
+        #keep extra logit as we generated a new token
         new_hidden_states = new_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
         if ref_hidden_states is not None: 
             ref_hidden_states = ref_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
         if old_hidden_states is not None: 
             old_hidden_states = old_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
-        #breakpoint()
+        
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
             new_hidden_states,
             old_hidden_states,
