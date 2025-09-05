@@ -27,7 +27,7 @@ from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 
 
 try:
-    from transformers.integrations.mxfp4 import convert_moe_packed_tensors
+    from transformers.integrations.mxfp4 import convert_moe_packed_tensors, convert_moe_packed_tensors_cpu
 except (ImportError, ModuleNotFoundError):
     # Provide a fallback or a clear error if the function isn't available
     # when not using mxfp4.
@@ -403,14 +403,44 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                     if key.endswith("_blocks"):
                         if convert_moe_packed_tensors is None:
                             raise ImportError("MXFP4 dequantization is required, but `convert_moe_packed_tensors` could not be imported.")
+
                         base_name = key[:-len("_blocks")]
                         scales_key = base_name + "_scales"
                         output_key = base_name # Correct naming without .weight
                         if scales_key not in safetensor_keys:
                             warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
                             continue
+
                         blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
-                        W = convert_moe_packed_tensors(blocks_tensor, scales_tensor).transpose(1, 2).contiguous()
+
+                        # Determine optimal device and chunk size for mxfp4 dequantization
+                        device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
+                            blocks_tensor, scales_tensor
+                        )
+
+                        # Apply dequantization with optimal parameters
+                        if device_type == 'cpu':
+                            # Use CPU-optimized version
+                            try:
+                                from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
+                                W = convert_moe_packed_tensors_cpu(
+                                    blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                                ).transpose(1, 2).contiguous()
+                                if UNSLOTH_ENABLE_LOGGING:
+                                    logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                            except ImportError:
+                                # Fallback to original function
+                                W = convert_moe_packed_tensors(
+                                    blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                                ).transpose(1, 2).contiguous()
+                        else:
+                            # Use GPU version (original or patched)
+                            W = convert_moe_packed_tensors(
+                                blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                            ).transpose(1, 2).contiguous()
+                            if UNSLOTH_ENABLE_LOGGING:
+                                logger.info(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+
                         processed_mxfp4_keys.add(key); processed_mxfp4_keys.add(scales_key)
 
                         lora_stats = converted_lora_weights.get(base_name, None)
@@ -459,7 +489,6 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
             except OSError:
                 # On Windows, the mmap might keep a handle. The OS will clean it up.
                 pass
-
 
             tensors[output_key] = W
 
@@ -1636,6 +1665,167 @@ def determine_base_model_source(model_name, token=None):
         else:
             # B2: Nothing found
             raise ValueError(f"Model {model_name} not found locally or on HuggingFace")
+pass
+
+def get_memory_stats():
+    """Get current memory statistics for CPU and GPU"""
+    stats = {}
+    import psutil
+
+    # CPU Memory
+    cpu_mem = psutil.virtual_memory()
+    stats['cpu'] = {
+        'total': cpu_mem.total,
+        'available': cpu_mem.available,
+        'used': cpu_mem.used,
+        'percent': cpu_mem.percent,
+        'free': cpu_mem.available,  # Available is more accurate than free
+    }
+
+    # GPU Memory (for each GPU)
+    stats['gpus'] = []
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            gpu_mem = torch.cuda.mem_get_info(i)
+            total = gpu_mem[1]
+            free = gpu_mem[0]
+            stats['gpus'].append({
+                'device_id': i,
+                'name': torch.cuda.get_device_name(i),
+                'total': total,
+                'free': free,
+                'used': total - free,
+                'percent': ((total - free) / total) * 100 if total > 0 else 0
+            })
+
+    return stats
+pass
+
+def format_bytes(bytes_value):
+    """Convert bytes to human readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_value < 1024.0:
+            return f"{bytes_value:.2f} {unit}"
+        bytes_value /= 1024.0
+    return f"{bytes_value:.2f} PB"
+pass
+
+
+def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
+    """
+    Choose optimal device and chunk size for mxfp4 dequantization based on available memory.
+    """
+    import math
+
+    # Calculate tensor dimensions
+    *prefix_shape, G, B = blocks_tensor.shape
+    rows_total = math.prod(prefix_shape) * G
+
+    # Estimate memory requirements for different chunk sizes
+    # Memory per chunk ≈ rows_per_chunk × B × 21 bytes (from our earlier calculation)
+    base_memory_per_row = B * 21 if B else 128 * 21  # Default B=128 if unknown
+
+    # Also account for input tensors and final output
+    input_size = blocks_tensor.numel() + scales_tensor.numel() * 4  # scales are int32
+    output_size = rows_total * B * 2 * 2  # bfloat16 output, double width
+    persistent_memory = input_size + output_size
+
+    stats = get_memory_stats()
+    safety_factor = 0.95  # Use up to 95% of available memory
+
+    # Define chunk size options from most to least preferred
+    chunk_options = [
+        (32768 * 1024, "max_gpu"),      # Original GPU default
+        (4 * 1024 * 1024, "large"),    # 4M rows
+        (1024 * 1024, "medium"),       # 1M rows
+        (256 * 1024, "small"),         # 256K rows
+        (64 * 1024, "tiny"),           # 64K rows
+        (8192, "minimal"),             # 8K rows
+    ]
+
+    suitable_strategies = []
+
+    # Check CPU strategies
+    cpu_available = stats['cpu']['available'] * safety_factor
+    for chunk_size, size_name in chunk_options:
+        if chunk_size > rows_total:  # Skip if chunk is larger than total rows
+            continue
+
+        temp_memory = min(chunk_size, rows_total) * base_memory_per_row
+        total_memory_needed = persistent_memory + temp_memory
+
+        if cpu_available >= total_memory_needed:
+            suitable_strategies.append({
+                'device_type': 'cpu',
+                'device_id': None,
+                'rows_per_chunk': chunk_size,
+                'available_memory': cpu_available,
+                'needed_memory': total_memory_needed,
+                'efficiency_score': chunk_size / 1000000,  # Prefer larger chunks for efficiency
+                'speed_score': 1.0,  # CPU baseline
+                'size_name': size_name
+            })
+
+    # Check GPU strategies
+    for gpu in stats['gpus']:
+        gpu_available = gpu['free'] * safety_factor
+        for chunk_size, size_name in chunk_options:
+            if chunk_size > rows_total:  # Skip if chunk is larger than total rows
+                continue
+
+            temp_memory = min(chunk_size, rows_total) * base_memory_per_row
+            total_memory_needed = persistent_memory + temp_memory
+
+            if gpu_available >= total_memory_needed:
+                suitable_strategies.append({
+                    'device_type': 'cuda',
+                    'device_id': gpu['device_id'],
+                    'rows_per_chunk': chunk_size,
+                    'available_memory': gpu_available,
+                    'needed_memory': total_memory_needed,
+                    'efficiency_score': chunk_size / 1000000,
+                    'speed_score': 10.0,  # GPU is much faster
+                    'size_name': size_name
+                })
+
+    if suitable_strategies:
+        # Sort by: speed_score (prefer GPU), then efficiency_score (prefer larger chunks)
+        suitable_strategies.sort(
+            key=lambda x: (x['speed_score'], x['efficiency_score']),
+            reverse=True
+        )
+
+        best = suitable_strategies[0]
+
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(
+                f"[MXFP4] Selected {best['device_type']}:{best['device_id'] or ''} "
+                f"with {best['rows_per_chunk']:,} rows per chunk ({best['size_name']}) "
+                f"- Need: {format_bytes(best['needed_memory'])}, "
+                f"Available: {format_bytes(best['available_memory'])}"
+            )
+
+        return (best['device_type'], best['device_id'], best['rows_per_chunk'])
+
+    # Fallback: use smallest chunk size on device with most memory
+    all_devices = []
+    all_devices.append(('cpu', None, cpu_available))
+    for gpu in stats['gpus']:
+        all_devices.append(('cuda', gpu['device_id'], gpu['free'] * safety_factor))
+
+    all_devices.sort(key=lambda x: x[2], reverse=True)
+    best_device = all_devices[0] if all_devices else ('cpu', None, 0)
+
+    # Use minimal chunk size as last resort
+    fallback_chunk_size = min(8192, max(1024, rows_total // 100))  # At least 1024, at most 8192
+
+    warnings.warn(
+        f"[MXFP4] Insufficient memory for optimal processing. "
+        f"Using {best_device[0]}:{best_device[1] or ''} with small chunks ({fallback_chunk_size:,}). "
+        f"Processing may be slow."
+    )
+
+    return (best_device[0], best_device[1], fallback_chunk_size)
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
