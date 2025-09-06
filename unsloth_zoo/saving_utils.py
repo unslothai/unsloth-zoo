@@ -31,7 +31,8 @@ try:
 except (ImportError, ModuleNotFoundError):
     # Provide a fallback or a clear error if the function isn't available
     # when not using mxfp4.
-    convert_moe_packed_tensors = None
+    convert_moe_packed_tensors     = None
+    convert_moe_packed_tensors_cpu = None
 
 
 MODEL_CARD = \
@@ -391,6 +392,11 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
             if key in processed_mxfp4_keys:
                 continue
 
+            # FORCE memory cleanup before processing each tensor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
             W = None
             output_key = key
             action_logged = False
@@ -412,6 +418,10 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                             continue
 
                         blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
+
+                        if torch.cuda.is_available():
+                          torch.cuda.synchronize()  # Wait for previous operations to complete
+                          torch.cuda.empty_cache()
 
                         # Determine optimal device and chunk size for mxfp4 dequantization
                         device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
@@ -1710,6 +1720,12 @@ def format_bytes(bytes_value):
     return f"{bytes_value:.2f} PB"
 pass
 
+def calculate_combined_score(speed_score, chunk_size):
+    # Normalize chunk size to 0-1 scale (assuming max reasonable chunk is 100M)
+    chunk_factor = min(1.0, chunk_size / (100 * 1024 * 1024))
+    # Weight: 60% device speed, 40% chunk efficiency
+    return speed_score * 0.6 + chunk_factor * 10 * 0.4  # Scale chunk factor to match speed range
+pass
 
 def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     """
@@ -1721,113 +1737,158 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     *prefix_shape, G, B = blocks_tensor.shape
     rows_total = math.prod(prefix_shape) * G
 
-    # Estimate memory requirements for different chunk sizes
-    # Memory per chunk ≈ rows_per_chunk × B × 21 bytes (from our earlier calculation)
-    base_memory_per_row = B * 21 if B else 128 * 21  # Default B=128 if unknown
-
-    # Also account for input tensors and final output
-    input_size = blocks_tensor.numel() + scales_tensor.numel() * 4  # scales are int32
-    output_size = rows_total * B * 2 * 2  # bfloat16 output, double width
+    # Estimate memory requirements
+    #base_memory_per_row = B * 21 if B else 128 * 21
+    base_memory_per_row = B * 35 if B else 128 * 35
+    input_size = blocks_tensor.numel() + scales_tensor.numel() * 4
+    output_size = rows_total * B * 2 * 2
     persistent_memory = input_size + output_size
 
+    # Device-specific safety factors
+    GPU_SAFETY_FACTOR = 0.75  # GPUs can handle higher utilization
+    CPU_SAFETY_FACTOR = 0.75  # CPUs need more headroom for OS and other processes
+
+    def calculate_safe_usable_memory(free_memory, safety_factor):
+        # Option 1: What we can use from reported free memory (accounting for fragmentation)
+        usable_from_free = free_memory * safety_factor
+
+        return usable_from_free
+
+
+    def calculate_optimal_chunk_size(safe_usable_memory):
+        """Calculate the largest chunk size that fits in the safe usable memory"""
+        temp_memory_budget = safe_usable_memory - persistent_memory
+        if temp_memory_budget <= 0:
+            return None
+
+        max_chunk_from_memory = int(temp_memory_budget // base_memory_per_row)
+        optimal_chunk = min(rows_total, max_chunk_from_memory)
+
+        if optimal_chunk < 1024:
+            return None
+
+        return optimal_chunk
+
     stats = get_memory_stats()
-    safety_factor = 0.95  # Use up to 95% of available memory
-
-    # Define chunk size options from most to least preferred
-    chunk_options = [
-        (32768 * 1024, "max_gpu"),      # Original GPU default
-        (4 * 1024 * 1024, "large"),    # 4M rows
-        (1024 * 1024, "medium"),       # 1M rows
-        (256 * 1024, "small"),         # 256K rows
-        (64 * 1024, "tiny"),           # 64K rows
-        (8192, "minimal"),             # 8K rows
-    ]
-
     suitable_strategies = []
 
-    # Check CPU strategies
-    cpu_available = stats['cpu']['available'] * safety_factor
-    for chunk_size, size_name in chunk_options:
-        if chunk_size > rows_total:  # Skip if chunk is larger than total rows
-            continue
-
-        temp_memory = min(chunk_size, rows_total) * base_memory_per_row
-        total_memory_needed = persistent_memory + temp_memory
-
-        if cpu_available >= total_memory_needed:
-            suitable_strategies.append({
-                'device_type': 'cpu',
-                'device_id': None,
-                'rows_per_chunk': chunk_size,
-                'available_memory': cpu_available,
-                'needed_memory': total_memory_needed,
-                'efficiency_score': chunk_size / 1000000,  # Prefer larger chunks for efficiency
-                'speed_score': 1.0,  # CPU baseline
-                'size_name': size_name
-            })
-
-    # Check GPU strategies
+    # Check GPU strategies first (preferred for speed)
     for gpu in stats['gpus']:
-        gpu_available = gpu['free'] * safety_factor
-        for chunk_size, size_name in chunk_options:
-            if chunk_size > rows_total:  # Skip if chunk is larger than total rows
-                continue
+        safe_usable_memory = calculate_safe_usable_memory(
+            free_memory=gpu['free'],
+            safety_factor=GPU_SAFETY_FACTOR,
+        )
+        chunk_size = calculate_optimal_chunk_size(safe_usable_memory)
 
+        if chunk_size:
             temp_memory = min(chunk_size, rows_total) * base_memory_per_row
             total_memory_needed = persistent_memory + temp_memory
 
-            if gpu_available >= total_memory_needed:
-                suitable_strategies.append({
-                    'device_type': 'cuda',
-                    'device_id': gpu['device_id'],
-                    'rows_per_chunk': chunk_size,
-                    'available_memory': gpu_available,
-                    'needed_memory': total_memory_needed,
-                    'efficiency_score': chunk_size / 1000000,
-                    'speed_score': 10.0,  # GPU is much faster
-                    'size_name': size_name
-                })
+            combined_score = calculate_combined_score(3.0, chunk_size)
+
+            suitable_strategies.append({
+                'device_type': 'cuda',
+                'device_id': gpu['device_id'],
+                'rows_per_chunk': chunk_size,
+                'available_memory': gpu['free'] * GPU_SAFETY_FACTOR,
+                'total_memory': gpu['total'],
+                'safe_usable_memory': safe_usable_memory,
+                'needed_memory': total_memory_needed,
+                'speed_score': 3.0,
+                'efficiency_score': chunk_size,
+                'safety_factor': GPU_SAFETY_FACTOR,
+                'memory_utilization': total_memory_needed / safe_usable_memory,
+                'combined_score': combined_score,
+            })
+
+    # Check CPU strategy
+    cpu_safe_usable_memory = calculate_safe_usable_memory(
+        free_memory=stats['cpu']['available'],
+        safety_factor=CPU_SAFETY_FACTOR,
+    )
+    cpu_chunk_size = calculate_optimal_chunk_size(cpu_safe_usable_memory)
+
+    if cpu_chunk_size:
+        temp_memory = min(cpu_chunk_size, rows_total) * base_memory_per_row
+        total_memory_needed = persistent_memory + temp_memory
+        combined_score = calculate_combined_score(1.0, cpu_chunk_size)  # For CPU
+        suitable_strategies.append({
+            'device_type': 'cpu',
+            'device_id': None,
+            'rows_per_chunk': cpu_chunk_size,
+            'available_memory': stats['cpu']['available'] * CPU_SAFETY_FACTOR,
+            'total_memory': stats['cpu']['total'],
+            'safe_usable_memory': cpu_safe_usable_memory,
+            'needed_memory': total_memory_needed,
+            'speed_score': 1.0,
+            'efficiency_score': cpu_chunk_size,
+            'safety_factor': CPU_SAFETY_FACTOR,
+            'fragmentation_factor': 1.0,
+            'memory_utilization': total_memory_needed / cpu_safe_usable_memory,
+            'combined_score': combined_score,
+        })
 
     if suitable_strategies:
-        # Sort by: speed_score (prefer GPU), then efficiency_score (prefer larger chunks)
-        suitable_strategies.sort(
-            key=lambda x: (x['speed_score'], x['efficiency_score']),
-            reverse=True
-        )
+
+        # Sort by combined score
+        suitable_strategies.sort(key=lambda x: x['combined_score'], reverse=True)
 
         best = suitable_strategies[0]
 
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(
                 f"[MXFP4] Selected {best['device_type']}:{best['device_id'] or ''} "
-                f"with {best['rows_per_chunk']:,} rows per chunk ({best['size_name']}) "
+                f"with {best['rows_per_chunk']:,} rows per chunk "
+                f"(safety factor: {best['safety_factor']:.0%}, "
+                f"safe memory utilization: {best['memory_utilization']:.1%}) "
                 f"- Need: {format_bytes(best['needed_memory'])}, "
                 f"Available: {format_bytes(best['available_memory'])}"
             )
 
         return (best['device_type'], best['device_id'], best['rows_per_chunk'])
 
-    # Fallback: use smallest chunk size on device with most memory
-    all_devices = []
-    all_devices.append(('cpu', None, cpu_available))
+    # Fallback: find device with most memory and use minimal chunk
+    fallback_options = []
+
+    # Add CPU fallback
+    fallback_options.append({
+        'device_type': 'cpu',
+        'device_id': None,
+        'available': stats['cpu']['available'] * CPU_SAFETY_FACTOR,
+        'total_available': stats['cpu']['available']
+    })
+
+    # Add GPU fallbacks
     for gpu in stats['gpus']:
-        all_devices.append(('cuda', gpu['device_id'], gpu['free'] * safety_factor))
+        fallback_options.append({
+            'device_type': 'cuda',
+            'device_id': gpu['device_id'],
+            'available': gpu['free'] * GPU_SAFETY_FACTOR,
+            'total_available': gpu['free']
+        })
 
-    all_devices.sort(key=lambda x: x[2], reverse=True)
-    best_device = all_devices[0] if all_devices else ('cpu', None, 0)
+    # Sort by available memory (after safety factor)
+    fallback_options.sort(key=lambda x: x['available'], reverse=True)
+    best_fallback = fallback_options[0]
 
-    # Use minimal chunk size as last resort
-    fallback_chunk_size = min(8192, max(1024, rows_total // 100))  # At least 1024, at most 8192
+    # Calculate minimal safe chunk size for fallback
+    remaining_memory = best_fallback['available'] - persistent_memory
+    if remaining_memory > 0:
+        fallback_chunk_size = max(1024, min(8192, int(remaining_memory // base_memory_per_row), rows_total))
+    else:
+        fallback_chunk_size = min(1024, rows_total)
 
     warnings.warn(
-        f"[MXFP4] Insufficient memory for optimal processing. "
-        f"Using {best_device[0]}:{best_device[1] or ''} with small chunks ({fallback_chunk_size:,}). "
-        f"Processing may be slow."
+        f"[MXFP4] Insufficient memory for optimal processing on any device. "
+        f"Using {best_fallback['device_type']}:{best_fallback['device_id'] or ''} "
+        f"with minimal chunks ({fallback_chunk_size:,}). "
+        f"Available: {format_bytes(best_fallback['total_available'])}, "
+        f"Required: {format_bytes(persistent_memory)}. "
+        f"Processing will be slow."
     )
 
-    return (best_device[0], best_device[1], fallback_chunk_size)
+    return (best_fallback['device_type'], best_fallback['device_id'], fallback_chunk_size)
 pass
-
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
