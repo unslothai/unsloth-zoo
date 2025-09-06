@@ -190,6 +190,7 @@ pass
 
 def process_vision_info(
     conversations: Union[List[Dict], List[List[Dict]]],
+    size_factor: int = IMAGE_FACTOR,
 ) -> Tuple[Union[List[Image.Image], None], Union[List[Union[torch.Tensor, List[Image.Image]]], None]]:
     vision_infos = extract_vision_info(conversations)
     ## Read images or videos
@@ -197,7 +198,7 @@ def process_vision_info(
     video_inputs = []
     for vision_info in vision_infos:
         if "image" in vision_info or "image_url" in vision_info:
-            image_inputs.append(fetch_image(vision_info))
+            image_inputs.append(fetch_image(vision_info, size_factor=size_factor))
         elif "video" in vision_info:
             video_inputs.append(fetch_video(vision_info))
         else:
@@ -254,11 +255,14 @@ from .dataset_utils import train_on_responses_only as _train_on_responses_only
 
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
-    __slots__ = \
-        "padding_token_ids", "dtype", "ignore_index", \
-        "processor", "formatting_func", "image_size", \
-        "max_seq_length", "truncation", "train_on_responses_only", \
-        "num_proc", "assistant_single_content",
+    __slots__ = (
+        "padding_token_ids", "dtype", "ignore_index",
+        "processor", "formatting_func", "image_size",
+        "max_seq_length", "truncation", "train_on_responses_only",
+        "num_proc", "assistant_single_content", "patch_size",
+        "resize_dimension", "snap_to_patch_size",
+        "completion_only_loss", "pad_to_multiple_of", "size_func",
+    )
 
     def __init__(
         self,
@@ -275,6 +279,10 @@ class UnslothVisionDataCollator:
         response_part    = None,
         force_match      = True, # Match newlines as well!
         num_proc         = None,
+        completion_only_loss = False,
+        pad_to_multiple_of = None,
+        resize_dimension = 0, # can be 0, 1, 'max' or 'min' (max resizes based on the max of height width, min the min size, 0 the first dim, etc)
+        snap_to_patch_size = False,
     ):
         if not hasattr(processor, "image_processor"):
             raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
@@ -288,6 +296,20 @@ class UnslothVisionDataCollator:
         self.ignore_index = ignore_index
         self.processor = processor
         self.formatting_func = formatting_func
+        self.completion_only_loss = completion_only_loss
+        self.pad_to_multiple_of = pad_to_multiple_of
+        self.snap_to_patch_size = snap_to_patch_size
+        try:
+            self.patch_size = model.config.vision_config.patch_size
+        except:
+            if hasattr(model.config, 'vision_config') and hasattr(model.config.vision_config, 'model_type'):
+                lower_name = model.config.vision_config.model_type.lower()
+                if 'gemma3n' in lower_name or 'pixtral' in lower_name:
+                    self.patch_size = 16 #  really gemma3n doesn't have a patch size but expects images in 256, 512, or 768
+                else:
+                    self.patch_size = IMAGE_FACTOR // 2
+            else:
+                self.patch_size = IMAGE_FACTOR // 2
 
         # Auto resize images to save VRAM!
         if resize == "min":
@@ -296,11 +318,12 @@ class UnslothVisionDataCollator:
             except:
                 print("Unsloth: Model does not have a default image size - using 512")
                 self.image_size = 512
+
         elif resize == "max":
             self.image_size = None
-        elif type(resize) is tuple or type(resize) is list:
+        elif isinstance(resize, (tuple, list)):
             assert(len(resize) == 2)
-            assert(type(resize[0]) is int and type(resize[1]) is int)
+            assert(isinstance(resize[0], int) and isinstance(resize[1], int))
             self.image_size = tuple(resize)
         elif type(resize) is int:
             self.image_size = resize
@@ -310,6 +333,23 @@ class UnslothVisionDataCollator:
                 "For example (224, 224) or just 224. The default is 'min' which auto resizes images!"
             )
         pass
+        if resize_dimension not in [0, 1, 'max', 'min']:
+            raise TypeError(
+                "Unsloth: resize_dimension accepts 0, 1, 'max' or 'min'\n"\
+                "For example 0 resizes the first dimension, 1 the second, 'max' resizes based on the max of height width, 'min' the min size"
+            )
+        elif resize_dimension in [0, 1]:
+            self.size_func = lambda x: x.size[resize_dimension]
+        elif resize_dimension == 'max':
+            self.size_func = lambda x: max(x.size[0], x.size[1])
+        elif resize_dimension == 'min':
+            self.size_func = lambda x: min(x.size[0], x.size[1])
+        else:
+            raise TypeError(
+                "Unsloth: resize_dimension accepts 0, 1, 'max' or 'min'\n"\
+                "For example 0 resizes the first dimension, 1 the second, 'max' resizes based on the max of height width, 'min' the min size"
+            )
+        self.resize_dimension = resize_dimension
 
         # Sequence lengths
         if max_seq_length is None:
@@ -319,7 +359,7 @@ class UnslothVisionDataCollator:
 
         # Train on reponses if provided
         if train_on_responses_only:
-            assert(type(instruction_part) is str and type(response_part) is str)
+            assert(isinstance(instruction_part, str) and isinstance(response_part, str))
             self.train_on_responses_only = _train_on_responses_only(
                 None,
                 instruction_part = instruction_part,
@@ -367,52 +407,28 @@ class UnslothVisionDataCollator:
     def __call__(self, examples):
         # [TODO] Support non image inputs as well
         # The issue is batch = self.processor( forces tensors to be returned and not None.
-        texts  = []
-        images = []
 
         if self.formatting_func is not None:
             examples = [self.formatting_func(example) for example in examples]
+        
+        if "prompt" in examples[0] and "completion" in examples[0]:
+            return self._collate_prompt_completion(examples)
 
+        texts  = []
+        images = []
         for example in examples:
-            if "messages" in example:
-                messages = example["messages"]
-            elif "conversations" in example:
-                messages = example["conversations"]
-            else:
-                messages = example
+            messages = self._select_messages_or_raw(example)
 
             # Check if data format is correct for VLMs!
             if len(messages) != 0:
-                message = messages[0]
-                assert(type(message) is dict)
-                if "role" not in message and "content" not in message:
-                    raise TypeError(
-                        "Unsloth: Failed to use vision data collator!\n"\
-                        "Maybe use `standardize_data_formats` first!"
-                    )
-                content = message["content"]
-                if type(content) is str:
-                    message["content"] = content = [{"type" : "text", "text" : content}]
-                elif type(content) is list or type(content) is tuple:
-                    part = content[0]
-                    assert("type" in part)
-                else:
-                    raise TypeError(
-                        "Unsloth: Failed to use vision data collator!\n"\
-                        "Your messages must be a like:\n"\
-                        "[{'role':'user', 'content':[{'type':'text', 'text':'Hello!'}]}]"
-                    )
-                pass
+                messages = self._validate_and_normalize_first_message(messages)
 
                 # Also fix the messages if assistant must only be 1 string!
                 # Only affects Mistral V3 I think!
                 if self.assistant_single_content:
-                    for message in messages:
-                        if message["role"] == "assistant":
-                            if type(content := message["content"]) is list:
-                                message["content"] = content[0]["text"]
-                pass
+                    messages = self._collapse_assistant_content(messages)
             pass
+
             message = self.processor.apply_chat_template(
                 messages,
                 tokenize = False,
@@ -420,41 +436,136 @@ class UnslothVisionDataCollator:
             )
             texts.append(message)
             # Dataset with 2 columns messages / images
-            if "images" in example:
-                image = [example["images"][0]]
-            else:
-                image, video = process_vision_info(messages)
-                if image is None: image = []
-            pass
-            # Resize images
-            image_size = self.image_size
-
-            if image_size is not None:
-                for i, img in enumerate(image):
-                    if type(image_size) is tuple:
-                        image[i] = img.resize(image_size, LANCZOS)
-                    elif img.size[0] > image_size:
-                        if hasattr(img, "resize"):
-                            wpercent = image_size / img.size[0]
-                            hsize = int(img.size[1] * wpercent)
-                            image[i] = img.resize((image_size, hsize), LANCZOS)
-            pass
+            image = self._extract_images_for_example(example, messages)
+            image = self._resize_images_inplace(image)
             images.append(image)
         pass
 
         # Tokenize the texts and process the images
-        batch = self.processor(
-            text    = texts,
-            images  = images,
-            padding = True,
-            truncation = self.truncation,
-            max_length = self.max_seq_length,
-            return_tensors = "pt",
-            add_special_tokens = False, # Stop double BOS
+        proc_kwargs = dict(
+            text=texts,
+            images=images,
+            padding=True,
+            truncation=self.truncation,
+            max_length=self.max_seq_length,
+            return_tensors="pt",
+            add_special_tokens=False,
         )
+        if self.pad_to_multiple_of is not None:
+            proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
+        batch = self.processor(**proc_kwargs)
+
         # Cannot remove due to bidirectional attention from Gemma 3!
         # batch.pop("token_type_ids", None)
+        batch = self._cast_pixel_values_dtype_inplace(batch)
 
+        # Mask image tokens and pad tokens
+        labels = batch["input_ids"].clone()
+        labels[torch.isin(labels, self.padding_token_ids)] = self.ignore_index
+        batch["labels"] = labels
+        if self.train_on_responses_only:
+            batch["labels"] = self.train_on_responses_only(batch)["labels"]
+        return batch
+    pass
+
+    def _select_messages_or_raw(self, example):
+        if "messages" in example:
+            return example["messages"]
+        elif "conversations" in example:
+            return example["conversations"]
+        else:
+            # original behavior: allow the example itself to be the messages list
+            return example
+
+    def _validate_and_normalize_first_message(self, messages):
+        if len(messages) == 0:
+            return
+        message = messages[0]
+        assert isinstance(message, dict)
+        if "role" not in message and "content" not in message:
+            raise TypeError(
+                "Unsloth: Failed to use vision data collator!\n"
+                "Maybe use `standardize_data_formats` first!"
+            )
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = [{"type": "text", "text": content}]
+        elif isinstance(content, (list, tuple)):
+            part = content[0]
+            assert "type" in part
+        else:
+            raise TypeError(
+                "Unsloth: Failed to use vision data collator!\n"
+                "Your messages must be like:\n"
+                "[{'role':'user', 'content':[{'type':'text', 'text':'Hello!'}]}]"
+            )
+        return messages
+
+    def _collapse_assistant_content(self, messages):
+        for message in messages:
+            if message["role"] == "assistant":
+                if isinstance(content := message["content"], list):
+                    message["content"] = content[0]["text"]
+        return messages
+
+    def _render_chat(self, messages):
+        return self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+
+    def _extract_images_for_example(self, example, messages):
+        if "images" in example:
+            image = [example["images"][0]]
+        else:
+            image, video = process_vision_info(messages, size_factor=self.patch_size*2)
+            if image is None: image = []
+        return image
+
+    def _extract_images_for_pc(self, example, p_msgs, c_msgs):
+        # PC: prefer embedded across prompt+completion; else top-level first image; else []
+        imgs = None
+        try:
+            msg_list = (p_msgs or []) + (c_msgs or [])
+            if msg_list:
+                imgs, _ = process_vision_info(msg_list, size_factor=self.patch_size*2)
+        except Exception:
+            imgs = None
+        if imgs is None:
+            if "images" in example:
+                return [example["images"][0]]
+            return []
+        return imgs
+
+    def _resize_images_inplace(self, image):
+
+        def quantize_to_factor(x):
+            return max(factor, int(factor * (
+                math.ceil(x/factor) if x >= image_size - 1e-6 else math.floor(x/factor+0.5)
+            )))
+
+        if image is None or self.image_size is None:
+            return image or []
+        # Resize images
+        image_size = self.image_size
+
+        if image_size is not None:
+            for i, img in enumerate(image):
+                if type(image_size) is tuple:
+                    image[i] = img.resize(image_size, LANCZOS)
+                elif self.size_func(img) > image_size and hasattr(img, "resize"):
+                    w, h = img.size
+                    # integer math rounding
+                    new_w = (w * image_size + self.size_func(img) // 2) // self.size_func(img)
+                    new_h = (h * image_size + self.size_func(img) // 2) // self.size_func(img)
+                    if self.snap_to_patch_size:
+                        factor = self.patch_size * 2
+                        new_w, new_h = quantize_to_factor(new_w), quantize_to_factor(new_h)
+
+                    image[i] = img.resize((new_w, new_h), LANCZOS)
+
+        return image
+
+    def _cast_pixel_values_dtype_inplace(self, batch):
         # Pixtral accepts multiple images, so we have to cast it individually
         pixel_values = batch["pixel_values"]
         if type(pixel_values) is list:
@@ -469,13 +580,168 @@ class UnslothVisionDataCollator:
         else:
             batch["pixel_values"] = batch["pixel_values"].to(self.dtype)
         pass
-
-        # Mask image tokens and pad tokens
-        labels = batch["input_ids"].clone()
-        labels[torch.isin(labels, self.padding_token_ids)] = self.ignore_index
-        batch["labels"] = labels
-        if self.train_on_responses_only:
-            batch["labels"] = self.train_on_responses_only(batch)["labels"]
         return batch
-    pass
+
+    def _tokenizer_padding_side(self) -> str:
+        tok = getattr(self.processor, "tokenizer", self.processor)
+        side = getattr(tok, "padding_side", "right")
+        return "left" if side == "left" else "right"
+
+    def _pad_token_id_or_fail(self) -> int:
+        tok = getattr(self.processor, "tokenizer", self.processor)
+        pad_id = getattr(tok, "pad_token_id", None)
+        if pad_id is None:
+            raise ValueError("Tokenizer must define `pad_token_id` for prompt–completion collation.")
+        return pad_id
+
+    def _flush_to_side(self, attention_mask, input_ids, side, pad_token_id, extra_masks: tuple | list | None = None):
+        """Compact non-pad tokens toward `side`. Returns (attn, ids, extras...)."""
+        B, L = input_ids.shape
+        new_ids = torch.full_like(input_ids, pad_token_id)
+        new_attn = torch.zeros_like(attention_mask)
+        new_extras = None
+        if extra_masks is not None:
+            new_extras = [torch.zeros_like(m) for m in extra_masks]
+        keep = attention_mask.bool()
+        for i in range(B):
+            k = int(attention_mask[i].sum().item())
+            if k == 0:
+                continue
+            src = input_ids[i][keep[i]]
+            if side == "left":
+                new_ids[i, L - k:] = src
+                new_attn[i, L - k:] = 1
+                if new_extras is not None:
+                    for idx, m in enumerate(extra_masks):
+                        new_extras[idx][i, L - k:] = m[i][keep[i]]
+            else:
+                new_ids[i, :k] = src
+                new_attn[i, :k] = 1
+                if new_extras is not None:
+                    for idx, m in enumerate(extra_masks):
+                        new_extras[idx][i, :k] = m[i][keep[i]]
+        if new_extras is None:
+            return new_attn, new_ids, ()
+        return new_attn, new_ids, tuple(new_extras)
+
+    def _truncate_by_side(self, input_ids, attention_mask, completion_mask, side, max_len):
+        if side == "left":
+            input_ids = input_ids[:, -max_len:]
+            attention_mask = attention_mask[:, -max_len:]
+            completion_mask = completion_mask[:, -max_len:]
+        else:
+            input_ids = input_ids[:, :max_len]
+            attention_mask = attention_mask[:, :max_len]
+            completion_mask = completion_mask[:, :max_len]
+        return input_ids, attention_mask, completion_mask
+
+    def _pad_to_multiple(self, input_ids, attention_mask, completion_mask, side, pad_id, multiple):
+        B, L = input_ids.shape
+        L2 = ((L + multiple - 1) // multiple) * multiple
+        if L2 == L:
+            return input_ids, attention_mask, completion_mask
+        pad_len = L2 - L
+        pad_ids = torch.full((B, pad_len), pad_id, dtype=input_ids.dtype, device=input_ids.device)
+        zeros = torch.zeros_like(pad_ids)
+        if side == "left":
+            input_ids = torch.cat((pad_ids, input_ids), dim=1)
+            attention_mask = torch.cat((zeros, attention_mask), dim=1)
+            completion_mask = torch.cat((zeros, completion_mask), dim=1)
+        else:
+            input_ids = torch.cat((input_ids, pad_ids), dim=1)
+            attention_mask = torch.cat((attention_mask, zeros), dim=1)
+            completion_mask = torch.cat((completion_mask, zeros), dim=1)
+        return input_ids, attention_mask, completion_mask
+
+    def _collate_prompt_completion(self, examples):
+        prompt_texts, completion_texts, images = [], [], []
+
+        for ex in examples:
+            p, c = ex["prompt"], ex["completion"]
+
+            # Determine chat vs plain for each side
+            is_p_msgs = isinstance(p, list) and (len(p) == 0 or isinstance(p[0], dict))
+            is_c_msgs = isinstance(c, list) and (len(c) == 0 or isinstance(c[0], dict))
+
+            if is_p_msgs:
+                self._validate_and_normalize_first_message(p)
+                if self.assistant_single_content:
+                    self._collapse_assistant_content(p)
+                p_txt = self._render_chat(p)
+            else:
+                p_txt = str(p)
+
+            if is_c_msgs:
+                self._validate_and_normalize_first_message(c)
+                if self.assistant_single_content:
+                    self._collapse_assistant_content(c)
+                c_txt = self._render_chat(c)
+            else:
+                c_txt = str(c)
+
+            # Images: prefer embedded; else first top-level image; else []
+            imgs = self._extract_images_for_pc(ex, p if is_p_msgs else None, c if is_c_msgs else None)
+            imgs = self._resize_images_inplace(imgs)
+
+            prompt_texts.append(p_txt)
+            completion_texts.append(c_txt)
+            images.append(imgs)
+
+        # Encode prompts (LEFT pad) with images
+        proc_prompts = self.processor(
+            images=images,
+            text=prompt_texts,
+            padding=True,
+            padding_side="left",
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        # Encode completions (RIGHT pad) text-only
+        proc_completions = self.processor(
+            text=completion_texts,
+            padding=True,
+            padding_side="right",
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+
+        p_ids, c_ids = proc_prompts["input_ids"], proc_completions["input_ids"]
+        p_m, c_m = proc_prompts["attention_mask"], proc_completions["attention_mask"]
+        input_ids = torch.cat((p_ids, c_ids), dim=1)
+        attention_mask = torch.cat((p_m, c_m), dim=1)
+        completion_mask = torch.cat((torch.zeros_like(p_m), c_m), dim=1)
+
+        # Flush to tokenizer default padding side
+        pad_id = self._pad_token_id_or_fail()
+        flush_side = self._tokenizer_padding_side()
+        attention_mask, input_ids, (completion_mask,) = self._flush_to_side(
+            attention_mask, input_ids, flush_side, pad_id, (completion_mask,)
+        )
+
+        # Truncate with side awareness
+        if self.max_seq_length is not None:
+            input_ids, attention_mask, completion_mask = self._truncate_by_side(
+                input_ids, attention_mask, completion_mask, flush_side, self.max_seq_length
+            )
+
+        # Optional pad-to-multiple-of (manual in PC)
+        if self.pad_to_multiple_of and self.pad_to_multiple_of > 1:
+            input_ids, attention_mask, completion_mask = self._pad_to_multiple(
+                input_ids, attention_mask, completion_mask, flush_side, pad_id, self.pad_to_multiple_of
+            )
+
+        # Labels: mask attention pads + image/pad tokens; completion-only if requested
+        labels = input_ids.clone()
+        labels[attention_mask == 0] = self.ignore_index
+        labels[torch.isin(labels, self.padding_token_ids)] = self.ignore_index
+        if self.completion_only_loss:
+            labels[completion_mask == 0] = self.ignore_index
+
+        # Build output (keep pixel_values from prompt batch) + cast dtype
+        out = dict(proc_prompts)
+        out["input_ids"] = input_ids
+        out["attention_mask"] = attention_mask
+        out["labels"] = labels
+        self._cast_pixel_values_dtype_inplace(out)
+        return out
 pass
