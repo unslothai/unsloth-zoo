@@ -399,22 +399,23 @@ def can_safely_patch(
             # Check removed flags must not have any gaps!
             removed_flags_list = set(removed_flags_list)
             removed_flags_list -= set({"args", "kwargs"})
-            print(removed_flags_list)
             i = 0
             fail = False
             while i < len(old_fp):
                 old_arg = old_fp[i]
                 if old_arg["name"] in removed_flags_list:
                     # Go to the end
-                    print("$$$$$$$$$$$$$$$")
                     i += 1
                     while i < len(old_fp):
                         old_arg = old_fp[i]
                         if old_arg["name"] not in removed_flags_list:
-                            # Hole seen
-                            print("$$$$$$$$$$", old_arg["name"])
-                            fail = True
-                            break
+                            # Hole seen but ignore args, kwargs
+                            if old_arg["name"] in ("args", "kwargs",) and
+                                old_arg["kind"] in (VAR_KEYWORD_ID, VAR_POSITIONAL_ID):
+                                continue
+                            else:
+                                fail = True
+                                break
                         i += 1
                 i += 1
             if not fail:
