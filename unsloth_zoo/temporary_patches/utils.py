@@ -398,7 +398,7 @@ def can_safely_patch(
         ):
             # Check removed flags must not have any gaps!
             removed_flags_list = set(removed_flags_list)
-            print(removed_flags_list)
+            removed_flags_list -= set({"args", "kwargs"})
             i = 0
             fail = False
             while i < len(old_fp):
