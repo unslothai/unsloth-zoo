@@ -240,7 +240,8 @@ try: from transformers.processing_utils import ProcessorMixin
 except: pass
 
 # Normalize common built-in types to their typing equivalents
-VAR_KEYWORD_ID = inspect.Parameter.VAR_KEYWORD.value
+VAR_KEYWORD_ID    = inspect.Parameter.VAR_KEYWORD.value
+VAR_POSITIONAL_ID = inspect.Parameter.VAR_POSITIONAL.value
 TYPE_MAPPINGS = {
     torch.Tensor         : torch.Tensor,
     torch.IntTensor      : torch.Tensor,
@@ -390,8 +391,34 @@ def can_safely_patch(
     if len(old_fp) != len(new_fp):
         # New transformers 4.54.0 removed output_attentions and output_hidden_states
         # We check it and ignore if the old function has both these, and the new removed them
-        if removed_flags(old_fp, new_fp) == ("output_attentions", "output_hidden_states",):
+        removed_flags_list = removed_flags(old_fp, new_fp)
+        if removed_flags_list == ("output_attentions", "output_hidden_states",):
             return False, f"New function removed output_attentions and output_hidden_states"
+        # If relaxed, allow matching with *args, **kwargs
+        if (match_level == "relaxed") and (len(new_fp) >= 2) and (
+            new_fp[-1]["kind"] == VAR_KEYWORD_ID and new_fp[-1]["name"] == "kwargs"
+        ) and (
+            new_fp[-2]["kind"] == VAR_POSITIONAL_ID and new_fp[-2]["name"] == "args"
+        ):
+            # Check removed flags must not have any gaps!
+            removed_flags_list = set(removed_flags_list)
+            i = 0
+            fail = False
+            while i < len(old_fp)
+                old_arg = old_fp[i]
+                if old_arg["name"] in removed_flags_list:
+                    # Go to the end
+                    i += 1
+                    while i < len(old_fp):
+                        old_arg = old_fp[i]
+                        if old_arg["name"] not in removed_flags_list:
+                            # Hole seen
+                            fail = True
+                            break
+                        i += 1
+                i += 1
+            if not fail:
+                return True, f"Replacing with *args, **kwargs"
         return False, f"Parameter count mismatch: {len(old_fp)} vs {len(new_fp)}"
 
     for old_param, new_param in zip(old_fp, new_fp):
