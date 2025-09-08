@@ -107,7 +107,7 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.integrations.mxfp4", e)
 
-    def swizzle_mxfp4(w, w_scale):
+    def swizzle_mxfp4(w, w_scale, *args, **kwargs):
         from triton_kernels import tensor, tensor_details
         FP4, convert_layout, wrap_torch_tensor = (
             tensor.FP4,
@@ -133,7 +133,7 @@ def patch_gpt_oss():
         # w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout, **scale_layout_opts)
         w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
         return w, w_scale
-    patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4)
+    patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level = "relaxed")
 
     class Mxfp4GptOssExperts_Training(torch.autograd.Function):
         @staticmethod
@@ -325,7 +325,7 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
 
-    def load_and_swizzle_mxfp4(module, param_name, param_value, target_device, **kwargs):
+    def load_and_swizzle_mxfp4(module, param_name, param_value, target_device, *args, **kwargs):
         model = kwargs.get("model", None)
         empty_param = kwargs.get("empty_param", None)
         casting_dtype = kwargs.get("casting_dtype", None)
@@ -388,7 +388,7 @@ def patch_gpt_oss():
                     # setattr(module, blocks_attr, torch.nn.Parameter(triton_weight_tensor.storage.data, requires_grad=False))
                     del blocks
     pass
-    patch_function(transformers.integrations.mxfp4, "load_and_swizzle_mxfp4", load_and_swizzle_mxfp4)
+    patch_function(transformers.integrations.mxfp4, "load_and_swizzle_mxfp4", load_and_swizzle_mxfp4, match_level = "relaxed")
 
     try:
         from transformers.integrations.mxfp4 import _replace_with_mxfp4_linear
