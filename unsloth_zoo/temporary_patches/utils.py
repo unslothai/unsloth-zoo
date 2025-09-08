@@ -410,9 +410,9 @@ def can_safely_patch(
                         old_arg = old_fp[i]
                         if old_arg["name"] not in removed_flags_list:
                             # Hole seen but ignore args, kwargs
-                            if old_arg["name"] in ("args", "kwargs",) and
-                                old_arg["kind"] in (VAR_KEYWORD_ID, VAR_POSITIONAL_ID):
-                                continue
+                            if (old_arg["name"] in ("args", "kwargs",)) and
+                                (old_arg["kind"] in (VAR_KEYWORD_ID, VAR_POSITIONAL_ID,)):
+                                pass
                             else:
                                 fail = True
                                 break
