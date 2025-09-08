@@ -22,8 +22,6 @@ import torch.nn.functional as F
 import inspect
 import textwrap
 from .common import TEMPORARY_PATCHES, torch_compile
-from importlib.metadata import version as importlib_version
-from packaging import version as pkg_version
 from .utils import (
     patch_function,
     KWARGS_TYPE,
@@ -210,7 +208,7 @@ def patch_gpt_oss():
             del Wd_T
             # 3) activation derivative
             g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
-            # 4) g1 · Wuᵀ
+            # 4) g1 · Wuᵀ  
             Wu_T = ctx.self_class.gate_up_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, 2*d_ff, d_model)
             dx_exp = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather_idx)
             del Wu_T
@@ -631,7 +629,7 @@ def patch_GptOssAttention():
         from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb, repeat_kv
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
-
+    
     def eager_attention_forward(
         module: nn.Module,
         query: torch.Tensor,
@@ -714,7 +712,7 @@ def patch_GptOssAttention():
         return attn_output, attn_weights
     pass
 
-    def forward_backward_compat(
+    def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -722,8 +720,9 @@ def patch_GptOssAttention():
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
 
     # Change past_key_value to past_key_values
     def forward(
@@ -734,13 +733,9 @@ def patch_GptOssAttention():
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
-
-    if pkg_version.parse(importlib_version("transformers")) <= pkg_version.parse("4.55.4"):
-        patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward_backward_compat)
-    else:
-        patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
+    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
 
     # Set env variable for padding purposes
     os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
