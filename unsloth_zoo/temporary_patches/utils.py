@@ -391,7 +391,9 @@ def can_safely_patch(
     if len(old_fp) != len(new_fp):
         # New transformers 4.54.0 removed output_attentions and output_hidden_states
         # We check it and ignore if the old function has both these, and the new removed them
+        print("##################")
         removed_flags_list = removed_flags(old_fp, new_fp)
+        print(removed_flags_list)
         if removed_flags_list == ("output_attentions", "output_hidden_states",):
             return False, f"New function removed output_attentions and output_hidden_states"
         # If relaxed, allow matching with *args, **kwargs
@@ -400,6 +402,7 @@ def can_safely_patch(
         ) and (
             new_fp[-2]["kind"] == VAR_POSITIONAL_ID and new_fp[-2]["name"] == "args"
         ):
+            print("$$$$$$$$$$$$$$")
             # Check removed flags must not have any gaps!
             removed_flags_list = set(removed_flags_list)
             i = 0
