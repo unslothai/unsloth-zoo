@@ -54,7 +54,11 @@ if DEVICE_TYPE == "cuda":
         HAS_CUT_CROSS_ENTROPY = False
     pass
 elif DEVICE_TYPE == "xpu":
-    HAS_CUT_CROSS_ENTROPY = False
+    try:
+        from cut_cross_entropy import linear_cross_entropy
+        HAS_CUT_CROSS_ENTROPY = True
+    except:
+        HAS_CUT_CROSS_ENTROPY = False
 else:
     pass
 pass
@@ -160,7 +164,7 @@ def post_patch_loss_function(model):
 pass
 
 
-torch_cuda_device = torch.cuda.device
+current_device = torch.xpu.device if DEVICE_TYPE == "xpu" else torch.cuda.device
 def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,
@@ -178,7 +182,7 @@ def fused_linear_cross_entropy(
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
 
-    with torch_cuda_device(lm_weight.device):
+    with current_device(lm_weight.device):
         loss = linear_cross_entropy(
             hidden_states.to(lm_weight.dtype),
             lm_weight,
