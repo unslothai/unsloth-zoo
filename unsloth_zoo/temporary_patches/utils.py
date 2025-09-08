@@ -396,15 +396,16 @@ def can_safely_patch(
         ) and (
             new_fp[-2]["kind"] == VAR_POSITIONAL_ID and new_fp[-2]["name"] == "args"
         ):
-            print(old_fp, new_fp)
             # Check removed flags must not have any gaps!
             removed_flags_list = set(removed_flags_list)
+            print(removed_flags_list)
             i = 0
             fail = False
             while i < len(old_fp):
                 old_arg = old_fp[i]
                 if old_arg["name"] in removed_flags_list:
                     # Go to the end
+                    print("$$$$$$$$$$$$$$$")
                     i += 1
                     while i < len(old_fp):
                         old_arg = old_fp[i]
