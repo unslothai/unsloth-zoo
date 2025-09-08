@@ -391,11 +391,12 @@ def can_safely_patch(
 
     # If relaxed, allow matching with *args, **kwargs
     def check_args_kwargs(old_fp, new_fp, removed_flags_list):
-        if (match_level == "relaxed") and (len(new_fp) >= 2) and (
+        if (len(new_fp) >= 2) and (
             new_fp[-1]["kind"] == VAR_KEYWORD_ID and new_fp[-1]["name"] == "kwargs"
         ) and (
             new_fp[-2]["kind"] == VAR_POSITIONAL_ID and new_fp[-2]["name"] == "args"
         ):
+            print(old_fp, new_fp)
             # Check removed flags must not have any gaps!
             removed_flags_list = set(removed_flags_list)
             i = 0
