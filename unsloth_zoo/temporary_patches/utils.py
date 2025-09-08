@@ -388,21 +388,14 @@ def can_safely_patch(
     except ValueError as e:
         return False, f"Signature inspection failed: {e}"
 
-    if len(old_fp) != len(new_fp):
-        # New transformers 4.54.0 removed output_attentions and output_hidden_states
-        # We check it and ignore if the old function has both these, and the new removed them
-        print("##################")
-        removed_flags_list = removed_flags(old_fp, new_fp)
-        print(removed_flags_list)
-        if removed_flags_list == ("output_attentions", "output_hidden_states",):
-            return False, f"New function removed output_attentions and output_hidden_states"
-        # If relaxed, allow matching with *args, **kwargs
+
+    # If relaxed, allow matching with *args, **kwargs
+    def check_args_kwargs(old_fp, new_fp, removed_flags_list):
         if (match_level == "relaxed") and (len(new_fp) >= 2) and (
             new_fp[-1]["kind"] == VAR_KEYWORD_ID and new_fp[-1]["name"] == "kwargs"
         ) and (
             new_fp[-2]["kind"] == VAR_POSITIONAL_ID and new_fp[-2]["name"] == "args"
         ):
-            print("$$$$$$$$$$$$$$")
             # Check removed flags must not have any gaps!
             removed_flags_list = set(removed_flags_list)
             i = 0
@@ -422,10 +415,31 @@ def can_safely_patch(
                 i += 1
             if not fail:
                 return True, f"Replacing with *args, **kwargs"
-        return False, f"Parameter count mismatch: {len(old_fp)} vs {len(new_fp)}"
+        return False, ""
+    pass
 
+
+    if len(old_fp) != len(new_fp):
+        # New transformers 4.54.0 removed output_attentions and output_hidden_states
+        # We check it and ignore if the old function has both these, and the new removed them
+        removed_flags_list = removed_flags(old_fp, new_fp)
+        if removed_flags_list == ("output_attentions", "output_hidden_states",):
+            return False, f"New function removed output_attentions and output_hidden_states"
+        result, error = check_args_kwargs(old_fp, new_fp, removed_flags_list)
+        if result == True:
+            return True, error
+        return False, f"Parameter count mismatch: {len(old_fp)} vs {len(new_fp)}"
+    pass
+
+    # Go through function one by one
     for old_param, new_param in zip(old_fp, new_fp):
         if (old_param['name'], old_param['kind']) != (new_param['name'], new_param['kind']):
+            if match_level == "relaxed":
+                # Check one last time for *args, **kwargs replacement
+                removed_flags_list = removed_flags(old_fp, new_fp)
+                result, error = check_args_kwargs(old_fp, new_fp, removed_flags_list)
+                if result == True:
+                    return True, error
             return False, f"Parameter '{old_param['name']}' signature changed"
 
         if new_param['is_required'] and not old_param['is_required']:
