@@ -27,11 +27,12 @@ from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 
 
 try:
-    from transformers.integrations.mxfp4 import convert_moe_packed_tensors
+    from transformers.integrations.mxfp4 import convert_moe_packed_tensors, convert_moe_packed_tensors_cpu
 except (ImportError, ModuleNotFoundError):
     # Provide a fallback or a clear error if the function isn't available
     # when not using mxfp4.
-    convert_moe_packed_tensors = None
+    convert_moe_packed_tensors     = None
+    convert_moe_packed_tensors_cpu = None
 
 
 MODEL_CARD = \
@@ -391,6 +392,11 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
             if key in processed_mxfp4_keys:
                 continue
 
+            # FORCE memory cleanup before processing each tensor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
             W = None
             output_key = key
             action_logged = False
@@ -403,14 +409,48 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                     if key.endswith("_blocks"):
                         if convert_moe_packed_tensors is None:
                             raise ImportError("MXFP4 dequantization is required, but `convert_moe_packed_tensors` could not be imported.")
+
                         base_name = key[:-len("_blocks")]
                         scales_key = base_name + "_scales"
                         output_key = base_name # Correct naming without .weight
                         if scales_key not in safetensor_keys:
                             warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
                             continue
+
                         blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
-                        W = convert_moe_packed_tensors(blocks_tensor, scales_tensor).transpose(1, 2).contiguous()
+
+                        if torch.cuda.is_available():
+                          torch.cuda.synchronize()  # Wait for previous operations to complete
+                          torch.cuda.empty_cache()
+
+                        # Determine optimal device and chunk size for mxfp4 dequantization
+                        device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
+                            blocks_tensor, scales_tensor
+                        )
+
+                        # Apply dequantization with optimal parameters
+                        if device_type == 'cpu':
+                            # Use CPU-optimized version
+                            try:
+                                from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
+                                W = convert_moe_packed_tensors_cpu(
+                                    blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                                ).transpose(1, 2).contiguous()
+                                if UNSLOTH_ENABLE_LOGGING:
+                                    logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                            except ImportError:
+                                # Fallback to original function
+                                W = convert_moe_packed_tensors(
+                                    blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                                ).transpose(1, 2).contiguous()
+                        else:
+                            # Use GPU version (original or patched)
+                            W = convert_moe_packed_tensors(
+                                blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                            ).transpose(1, 2).contiguous()
+                            if UNSLOTH_ENABLE_LOGGING:
+                                logger.info(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+
                         processed_mxfp4_keys.add(key); processed_mxfp4_keys.add(scales_key)
 
                         lora_stats = converted_lora_weights.get(base_name, None)
@@ -459,7 +499,6 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
             except OSError:
                 # On Windows, the mmap might keep a handle. The OS will clean it up.
                 pass
-
 
             tensors[output_key] = W
 
@@ -862,6 +901,15 @@ def merge_and_overwrite_lora(
             save_directory = save_directory,
             state_dict = {},
         )
+        # Remove any weight files that shouldn't have been saved (transformers 4.56.0 bug)
+        import glob
+        weight_files = glob.glob(os.path.join(save_directory, "*.bin")) + \
+                       glob.glob(os.path.join(save_directory, "*.safetensors"))
+
+        for weight_file in weight_files:
+            os.remove(weight_file)
+            print(f"DEBUG: Removed incorrectly saved weight file: {os.path.basename(weight_file)}")
+
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         # Remove the quantization_config in the config.json file if it exists,
     # as we are exporting the model in 16-bit format.
@@ -1629,6 +1677,218 @@ def determine_base_model_source(model_name, token=None):
             raise ValueError(f"Model {model_name} not found locally or on HuggingFace")
 pass
 
+def get_memory_stats():
+    """Get current memory statistics for CPU and GPU"""
+    stats = {}
+    import psutil
+
+    # CPU Memory
+    cpu_mem = psutil.virtual_memory()
+    stats['cpu'] = {
+        'total': cpu_mem.total,
+        'available': cpu_mem.available,
+        'used': cpu_mem.used,
+        'percent': cpu_mem.percent,
+        'free': cpu_mem.available,  # Available is more accurate than free
+    }
+
+    # GPU Memory (for each GPU)
+    stats['gpus'] = []
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            gpu_mem = torch.cuda.mem_get_info(i)
+            total = gpu_mem[1]
+            free = gpu_mem[0]
+            stats['gpus'].append({
+                'device_id': i,
+                'name': torch.cuda.get_device_name(i),
+                'total': total,
+                'free': free,
+                'used': total - free,
+                'percent': ((total - free) / total) * 100 if total > 0 else 0
+            })
+
+    return stats
+pass
+
+def format_bytes(bytes_value):
+    """Convert bytes to human readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_value < 1024.0:
+            return f"{bytes_value:.2f} {unit}"
+        bytes_value /= 1024.0
+    return f"{bytes_value:.2f} PB"
+pass
+
+def calculate_combined_score(speed_score, chunk_size):
+    # Normalize chunk size to 0-1 scale (assuming max reasonable chunk is 100M)
+    chunk_factor = min(1.0, chunk_size / (100 * 1024 * 1024))
+    # Weight: 60% device speed, 40% chunk efficiency
+    return speed_score * 0.6 + chunk_factor * 10 * 0.4  # Scale chunk factor to match speed range
+pass
+
+def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
+    """
+    Choose optimal device and chunk size for mxfp4 dequantization based on available memory.
+    """
+    import math
+
+    # Calculate tensor dimensions
+    *prefix_shape, G, B = blocks_tensor.shape
+    rows_total = math.prod(prefix_shape) * G
+
+    # Estimate memory requirements
+    #base_memory_per_row = B * 21 if B else 128 * 21
+    base_memory_per_row = B * 35 if B else 128 * 35
+    input_size = blocks_tensor.numel() + scales_tensor.numel() * 4
+    output_size = rows_total * B * 2 * 2
+    persistent_memory = input_size + output_size
+
+    # Device-specific safety factors
+    GPU_SAFETY_FACTOR = 0.75  # GPUs can handle higher utilization
+    CPU_SAFETY_FACTOR = 0.75  # CPUs need more headroom for OS and other processes
+
+    def calculate_safe_usable_memory(free_memory, safety_factor):
+        # Option 1: What we can use from reported free memory (accounting for fragmentation)
+        usable_from_free = free_memory * safety_factor
+
+        return usable_from_free
+
+
+    def calculate_optimal_chunk_size(safe_usable_memory):
+        """Calculate the largest chunk size that fits in the safe usable memory"""
+        temp_memory_budget = safe_usable_memory - persistent_memory
+        if temp_memory_budget <= 0:
+            return None
+
+        max_chunk_from_memory = int(temp_memory_budget // base_memory_per_row)
+        optimal_chunk = min(rows_total, max_chunk_from_memory)
+
+        if optimal_chunk < 1024:
+            return None
+
+        return optimal_chunk
+
+    stats = get_memory_stats()
+    suitable_strategies = []
+
+    # Check GPU strategies first (preferred for speed)
+    for gpu in stats['gpus']:
+        safe_usable_memory = calculate_safe_usable_memory(
+            free_memory=gpu['free'],
+            safety_factor=GPU_SAFETY_FACTOR,
+        )
+        chunk_size = calculate_optimal_chunk_size(safe_usable_memory)
+
+        if chunk_size:
+            temp_memory = min(chunk_size, rows_total) * base_memory_per_row
+            total_memory_needed = persistent_memory + temp_memory
+
+            combined_score = calculate_combined_score(3.0, chunk_size)
+
+            suitable_strategies.append({
+                'device_type': 'cuda',
+                'device_id': gpu['device_id'],
+                'rows_per_chunk': chunk_size,
+                'available_memory': gpu['free'] * GPU_SAFETY_FACTOR,
+                'total_memory': gpu['total'],
+                'safe_usable_memory': safe_usable_memory,
+                'needed_memory': total_memory_needed,
+                'speed_score': 3.0,
+                'efficiency_score': chunk_size,
+                'safety_factor': GPU_SAFETY_FACTOR,
+                'memory_utilization': total_memory_needed / safe_usable_memory,
+                'combined_score': combined_score,
+            })
+
+    # Check CPU strategy
+    cpu_safe_usable_memory = calculate_safe_usable_memory(
+        free_memory=stats['cpu']['available'],
+        safety_factor=CPU_SAFETY_FACTOR,
+    )
+    cpu_chunk_size = calculate_optimal_chunk_size(cpu_safe_usable_memory)
+
+    if cpu_chunk_size:
+        temp_memory = min(cpu_chunk_size, rows_total) * base_memory_per_row
+        total_memory_needed = persistent_memory + temp_memory
+        combined_score = calculate_combined_score(1.0, cpu_chunk_size)  # For CPU
+        suitable_strategies.append({
+            'device_type': 'cpu',
+            'device_id': None,
+            'rows_per_chunk': cpu_chunk_size,
+            'available_memory': stats['cpu']['available'] * CPU_SAFETY_FACTOR,
+            'total_memory': stats['cpu']['total'],
+            'safe_usable_memory': cpu_safe_usable_memory,
+            'needed_memory': total_memory_needed,
+            'speed_score': 1.0,
+            'efficiency_score': cpu_chunk_size,
+            'safety_factor': CPU_SAFETY_FACTOR,
+            'fragmentation_factor': 1.0,
+            'memory_utilization': total_memory_needed / cpu_safe_usable_memory,
+            'combined_score': combined_score,
+        })
+
+    if suitable_strategies:
+
+        # Sort by combined score
+        suitable_strategies.sort(key=lambda x: x['combined_score'], reverse=True)
+
+        best = suitable_strategies[0]
+
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(
+                f"[MXFP4] Selected {best['device_type']}:{best['device_id'] or ''} "
+                f"with {best['rows_per_chunk']:,} rows per chunk "
+                f"(safety factor: {best['safety_factor']:.0%}, "
+                f"safe memory utilization: {best['memory_utilization']:.1%}) "
+                f"- Need: {format_bytes(best['needed_memory'])}, "
+                f"Available: {format_bytes(best['available_memory'])}"
+            )
+
+        return (best['device_type'], best['device_id'], best['rows_per_chunk'])
+
+    # Fallback: find device with most memory and use minimal chunk
+    fallback_options = []
+
+    # Add CPU fallback
+    fallback_options.append({
+        'device_type': 'cpu',
+        'device_id': None,
+        'available': stats['cpu']['available'] * CPU_SAFETY_FACTOR,
+        'total_available': stats['cpu']['available']
+    })
+
+    # Add GPU fallbacks
+    for gpu in stats['gpus']:
+        fallback_options.append({
+            'device_type': 'cuda',
+            'device_id': gpu['device_id'],
+            'available': gpu['free'] * GPU_SAFETY_FACTOR,
+            'total_available': gpu['free']
+        })
+
+    # Sort by available memory (after safety factor)
+    fallback_options.sort(key=lambda x: x['available'], reverse=True)
+    best_fallback = fallback_options[0]
+
+    # Calculate minimal safe chunk size for fallback
+    remaining_memory = best_fallback['available'] - persistent_memory
+    if remaining_memory > 0:
+        fallback_chunk_size = max(1024, min(8192, int(remaining_memory // base_memory_per_row), rows_total))
+    else:
+        fallback_chunk_size = min(1024, rows_total)
+
+    warnings.warn(
+        f"[MXFP4] Insufficient memory for optimal processing on any device. "
+        f"Using {best_fallback['device_type']}:{best_fallback['device_id'] or ''} "
+        f"with minimal chunks ({fallback_chunk_size:,}). "
+        f"Available: {format_bytes(best_fallback['total_available'])}, "
+        f"Required: {format_bytes(persistent_memory)}. "
+        f"Processing will be slow."
+    )
+
+    return (best_fallback['device_type'], best_fallback['device_id'], fallback_chunk_size)
+pass
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
