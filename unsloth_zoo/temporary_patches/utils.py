@@ -404,7 +404,7 @@ def can_safely_patch(
             removed_flags_list = set(removed_flags_list)
             i = 0
             fail = False
-            while i < len(old_fp)
+            while i < len(old_fp):
                 old_arg = old_fp[i]
                 if old_arg["name"] in removed_flags_list:
                     # Go to the end
