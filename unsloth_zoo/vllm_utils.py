@@ -490,11 +490,30 @@ else:
 pass
 
 def patch_vllm_enable_sleep_mode():
-    from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map
+    from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map, AllocationData
     from vllm.utils import is_pin_memory_available
-    from typing import Optional, Union, Tuple
+    from typing import Optional, Union, Tuple, Any
 
     logger.info(f"Unsloth: Enabling vLLM standby mode")
+
+    def __init__(self):
+        # This is a replica of the original CuMemAllocator.__init__()
+        # with no changes except modification to error message for better readability
+        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        print(f'PYTORCH_CUDA_ALLOC_CONF = {conf}')
+        assert "expandable_segments:True" not in conf, \
+            ("Standby mode is not supported with expandable segments.\n"
+            "Please set environment variable PYTORCH_CUDA_ALLOC_CONF without `expandable_segments:True`.\n"
+            )
+
+        self.pointer_to_data: dict[int, AllocationData] = {}
+        self.current_tag: str = CuMemAllocator.default_tag
+        self.allocator_and_pools: dict[str, Any] = {}
+        # Creating strong references to the two callbacks here to prevent
+        # these ephemeral bound-method objects being garbage collected.
+        # See discussions in https://github.com/vllm-project/vllm/pull/22724
+        self.python_malloc_callback = self._python_malloc_callback
+        self.python_free_callback = self._python_free_callback
 
     def sleep(
             self,
@@ -630,6 +649,7 @@ def patch_vllm_enable_sleep_mode():
     vllm.LLM.generate = get_patched_generate(vllm.LLM.generate)
     vllm.AsyncLLMEngine.generate = get_patched_generate(vllm.AsyncLLMEngine.generate)
 
+    CuMemAllocator.__init__ = __init__
     CuMemAllocator.sleep = sleep
     CuMemAllocator.wake_up = wake_up
     CuMemAllocator.print_memory_summary = print_memory_summary
@@ -1601,9 +1621,6 @@ def load_vllm(
         # To reduce memory usage, we limit the number of images/videos per prompt
         # TODO: Make it configurable by user
         engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
-
-    if unsloth_vllm_standby and "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
-        del os.environ['PYTORCH_CUDA_ALLOC_CONF'] # Disable expandable segments cuz https://github.com/pytorch/pytorch/issues/147851
 
     good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
     old_keys = list(engine_args.keys())
