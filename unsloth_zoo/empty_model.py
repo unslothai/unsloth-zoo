@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 __all__ = [
     "create_empty_model",
     "set_additional_modules",
@@ -342,7 +358,12 @@ def set_additional_modules(new_model, quant_state_dict, config):
     # )
     # we cannot use the normal embedding init because gemma3 uses Gemma3TextScaledWordEmbedding which wraps around nn.Embedding and has a scaling factor. This new init ensures that we respect the forward from original model.
     num_embeddings, embedding_dim = quant_state_dict[embed_tokens_key].shape
-    language_model.embed_tokens.weight = quant_state_dict[embed_tokens_key]
+    embeddings = quant_state_dict[embed_tokens_key]
+    if isinstance(embeddings, torch.Tensor):
+        # in the newer vLLM versions, this seems to return a tensor which can't be assigned to embedding weight
+        # we need to convert that to nn.Paramter and then pass it on
+        embeddings = torch.nn.Parameter(embeddings, requires_grad = False)
+    language_model.embed_tokens.weight = embeddings
     language_model.embed_tokens.padding_idx = pad_token_id
     language_model.embed_tokens.num_embeddings = num_embeddings
     language_model.embed_tokens.embedding_dim = embedding_dim

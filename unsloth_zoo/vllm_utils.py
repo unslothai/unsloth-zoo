@@ -58,6 +58,7 @@ from .temporary_patches.common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
 )
+from .log import logger
 from unsloth import DEVICE_TYPE
 global LORA_REQUEST_ID
 
@@ -490,12 +491,10 @@ pass
 
 def patch_vllm_enable_sleep_mode():
     from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map
-    from vllm.logger import init_logger
     from vllm.utils import is_pin_memory_available
     from typing import Optional, Union, Tuple
 
-    logger = init_logger(__name__)
-    print(f"Unsloth: Enabling vLLM standby mode")
+    logger.info(f"Unsloth: Enabling vLLM standby mode")
 
     def sleep(
             self,
@@ -719,7 +718,7 @@ pass
 def patch_vllm(debug = True):
     # Temporary patch to disable multiprocessing for vLLM
     # Allows accessing model_executor
-    print(f'Unsloth: Patching vLLM')
+    logger.info(f'Unsloth: Patching vLLM')
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     if debug:
         os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
@@ -730,7 +729,7 @@ def patch_vllm(debug = True):
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
     if os.getenv("UNSLOTH_VLLM_STANDBY", "0") == "1":
-        print(f'Unsloth: Patching vLLM to enable standby.')
+        logger.info(f'Unsloth: Patching vLLM to enable standby.')
         patch_vllm_enable_sleep_mode()
     patch_vllm_graph_capture()
     global LORA_REQUEST_ID
