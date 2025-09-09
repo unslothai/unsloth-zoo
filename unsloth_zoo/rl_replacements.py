@@ -398,7 +398,7 @@ def grpo_accumulated_loss(
             image_grid_thw = image_grid_thw,
             pixel_attention_mask = pixel_attention_mask,
             image_sizes = image_sizes,
-            logits_to_keep = logits_to_keep + 1,
+            #logits_to_keep = logits_to_keep + 1,
         ).logits
 
         
@@ -416,7 +416,7 @@ def grpo_accumulated_loss(
             kwargs # pass kwargs as a dict
         )
     pass
-    #breakpoint()
+    
     # Some models like Qwen VL 2 don't have logits_to_keep parameter so you need to trim the output manually. Qwen VL 2.5 however does have it.
     if new_hidden_states.size(1) != logits_to_keep + 1 : 
         if ref_hidden_states is not None:
