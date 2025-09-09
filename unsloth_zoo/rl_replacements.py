@@ -481,7 +481,6 @@ def grpo_accumulated_loss(
             if old_hidden_states is not None: 
                 old_hidden_states = old_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
         
-        breakpoint()
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
             new_hidden_states,
             old_hidden_states,
