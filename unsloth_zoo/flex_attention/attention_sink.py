@@ -23,6 +23,8 @@ import functools
 from .utils import (
     create_block_mask_cached,
     flex_attention,
+    generate_sliding_window,
+    causal_mask,
 )
 from torch.nn.attention.flex_attention import flex_attention as uncompiled_flex_attention
 
@@ -109,6 +111,70 @@ def flex_attention_with_sink(
         enable_gqa = enable_gqa,
         scale = scale,
     )
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output
+pass
+
+
+def new_flex_attention_with_sink(
+    self_attn,
+    query,
+    key,
+    value,
+    scale = None,
+    sliding_window = None,
+    compile = True,
+):
+    """
+    Allows one sink token to be attended to for full/sliding window attention
+    Similar to Efficient Streaming Language Models with Attention Sinks
+    Primarily for GPT-OSS 2025
+
+    [WARNING] has higher error than old_flex_attention_with_sink
+    """
+    assert getattr(self_attn, "sinks", None) is not None, "Unsloth: self_attn must have sinks"
+    sink_weights = self_attn.sinks
+    enable_gqa = getattr(self_attn, "num_key_value_groups", 1) != 1
+    scale = getattr(self_attn, "scaling", None) or getattr(self_attn, "scale", None) or scale
+
+    bsz, heads_Q, qlen_Q, dim = query.shape
+    _, heads_KV, qlen_KV, _ = key.shape
+
+    # Check for sliding window
+    sliding_window = sliding_window or getattr(self_attn, "sliding_window", None)
+    mask_mod = \
+        generate_sliding_window(sliding_window) \
+        if type(sliding_window) is int and sliding_window != 0 else \
+        causal_mask
+    block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV)
+    attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
+        query,
+        key,
+        value,
+        block_mask = block_mask,
+        score_mod = None, # None needed
+        enable_gqa = enable_gqa,
+        scale = scale,
+        return_lse = True, # log(sum(exp(xi)))
+    )
+
+    #### 3 versions to add sink tokens ####
+    #### Version 1: Basic reciprocal denominator removal
+    # softmax_sum = torch.exp(logsumexp)
+    # new_denominator = softmax_sum / (softmax_sum + torch.exp(self_attn.sinks.unsqueeze(1)))
+    # scale = new_denominator
+    
+    ### Version 2: logaddexp does log(exp(x1) + exp(x2))
+    # logsumexp_new = torch.logaddexp(logsumexp, self_attn.sinks.unsqueeze(1))
+    # scale = torch.exp(logsumexp - logsumexp_new)
+
+    ### Version 3: Most simple uses sigmoid and scale
+    scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
+
+    # All 3 versions scale the original attn_output!
+    attn_output = attn_output * scale.unsqueeze(-1).to(attn_output.dtype)
+    # To reduce error, one should do attn_output.to(torch.float32)
+
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output
 pass

@@ -660,3 +660,75 @@ def fix_mamba_ssm_float32():
         return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
 pass
 TEMPORARY_PATCHES.append(fix_mamba_ssm_float32)
+
+
+# Mllama Patches
+
+def patch_MllamaVisionEncoderLayer():
+    try:
+        import math
+        import inspect
+        import transformers.models.mllama.modeling_mllama
+        from transformers.models.mllama.modeling_mllama import (
+            MllamaVisionConfig,
+            MllamaVisionAttention,
+            MllamaVisionMLP,
+            MllamaVisionEncoder,
+        )
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception as e:
+        return raise_error("transformers.models.mllama.modeling_mllama", e)
+
+
+    # ref: https://github.com/huggingface/transformers/blob/main/src/transformers/models/mllama/modeling_mllama.py#L275C1-L315C28
+    class MllamaVisionEncoderLayer(GradientCheckpointingLayer):
+        def __init__(self, config: MllamaVisionConfig, is_gated: bool = False):
+            super().__init__()
+
+            self.hidden_size = config.hidden_size
+            self.num_attention_heads = config.attention_heads
+            self.is_gated = is_gated
+            self.intermediate_size = config.intermediate_size
+
+            self.self_attn = MllamaVisionAttention(config)
+            self.mlp = MllamaVisionMLP(config)
+
+            self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=config.norm_eps)
+            self.post_attention_layernorm = nn.LayerNorm(self.hidden_size, eps=config.norm_eps)
+
+            if is_gated:
+                self.gate_attn = nn.Parameter(torch.ones(1) * math.pi / 4)
+                self.gate_ffn = nn.Parameter(torch.ones(1) * math.pi / 4)
+
+        def forward(
+            self,
+            hidden_state: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+        ):
+            # Self Attention
+            residual = hidden_state
+            hidden_state = self.input_layernorm(hidden_state)
+            hidden_state, attn_weights = self.self_attn(hidden_state, attention_mask=attention_mask)
+            if self.is_gated:
+                hidden_state = self.gate_attn.tanh() * hidden_state
+            hidden_state = residual + hidden_state
+
+            # Feed forward
+            residual = hidden_state
+            hidden_state = self.post_attention_layernorm(hidden_state)
+            hidden_state = self.mlp(hidden_state)
+            if self.is_gated:
+                hidden_state = self.gate_ffn.tanh() * hidden_state
+            hidden_state = residual + hidden_state
+
+            return hidden_state
+
+    try:
+        vision_encoder_forward_source = inspect.getsource(MllamaVisionEncoder.forward)
+        if "gradient_checkpointing" not in vision_encoder_forward_source:
+            transformers.models.mllama.modeling_mllama.MllamaVisionEncoderLayer = MllamaVisionEncoderLayer
+    except Exception as e:
+        return raise_error("transformers.models.mllama.modeling_mllama.MllamaVisionEncoderLayer", e)
+
+pass
+TEMPORARY_PATCHES.append(patch_MllamaVisionEncoderLayer)

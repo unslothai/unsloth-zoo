@@ -34,12 +34,14 @@ def dtype_from_config(config):
 
 def set_dtype_in_config(config, dtype):
     try:
+        # if dtype is not a string, convert it to a string
+        string_dtype = str(dtype).split(".")[-1] if isinstance(dtype, torch.dtype) else dtype
         if HAS_TORCH_DTYPE:
-            setattr(config, "torch_dtype", dtype)
+            setattr(config, "torch_dtype", string_dtype)
         else:
-            setattr(config, "dtype", dtype)
+            setattr(config, "dtype", string_dtype)
     except:
-        set_dtype_in_config_fallback(config, dtype)
+        set_dtype_in_config_fallback(config, string_dtype)
 
 def set_dtype_in_config_fallback(config, dtype):
     try:

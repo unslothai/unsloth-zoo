@@ -23,6 +23,17 @@ import warnings
 from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype
 from .hf_utils import dtype_from_config
+from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
+
+
+try:
+    from transformers.integrations.mxfp4 import convert_moe_packed_tensors, convert_moe_packed_tensors_cpu
+except (ImportError, ModuleNotFoundError):
+    # Provide a fallback or a clear error if the function isn't available
+    # when not using mxfp4.
+    convert_moe_packed_tensors     = None
+    convert_moe_packed_tensors_cpu = None
+
 
 MODEL_CARD = \
 """---
@@ -353,7 +364,7 @@ import gc
 import time
 
 @torch.inference_mode
-def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype, model_class_name):
+def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
     filename_original = os.path.join(save_directory, filename)  # Original file path
@@ -374,35 +385,125 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
             lora_weights, safetensor_keys, model_class_name=model_class_name)
 
+        # Set to track mxfp4 keys that have already been processed
+        processed_mxfp4_keys = set()
+
         for key in safetensor_keys:
-            W = file.get_tensor(key)
+            if key in processed_mxfp4_keys:
+                continue
+
+            # FORCE memory cleanup before processing each tensor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+            W = None
+            output_key = key
+            action_logged = False
+            # --- START OF MODIFIED LOGIC ---
+
+            # Case 1: Base model is MXFP4 quantized
+            if base_model_is_quantized:
+                if quant_type == "mxfp4":
+                    # This block handles ALL keys from a hybrid MXFP4 file.
+                    if key.endswith("_blocks"):
+                        if convert_moe_packed_tensors is None:
+                            raise ImportError("MXFP4 dequantization is required, but `convert_moe_packed_tensors` could not be imported.")
+
+                        base_name = key[:-len("_blocks")]
+                        scales_key = base_name + "_scales"
+                        output_key = base_name # Correct naming without .weight
+                        if scales_key not in safetensor_keys:
+                            warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
+                            continue
+
+                        blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
+
+                        if torch.cuda.is_available():
+                          torch.cuda.synchronize()  # Wait for previous operations to complete
+                          torch.cuda.empty_cache()
+
+                        # Determine optimal device and chunk size for mxfp4 dequantization
+                        device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
+                            blocks_tensor, scales_tensor
+                        )
+
+                        # Apply dequantization with optimal parameters
+                        if device_type == 'cpu':
+                            # Use CPU-optimized version
+                            try:
+                                from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
+                                W = convert_moe_packed_tensors_cpu(
+                                    blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                                ).transpose(1, 2).contiguous()
+                                if UNSLOTH_ENABLE_LOGGING:
+                                    logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                            except ImportError:
+                                # Fallback to original function
+                                W = convert_moe_packed_tensors(
+                                    blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                                ).transpose(1, 2).contiguous()
+                        else:
+                            # Use GPU version (original or patched)
+                            W = convert_moe_packed_tensors(
+                                blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                            ).transpose(1, 2).contiguous()
+                            if UNSLOTH_ENABLE_LOGGING:
+                                logger.info(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+
+                        processed_mxfp4_keys.add(key); processed_mxfp4_keys.add(scales_key)
+
+                        lora_stats = converted_lora_weights.get(base_name, None)
+                        if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                            if UNSLOTH_ENABLE_LOGGING:
+                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
+                            count += 1; W = _merge_lora(W, lora_stats, output_key)
+                        else:
+                            if UNSLOTH_ENABLE_LOGGING:
+                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
+                        action_logged = True
+
+                    elif key.endswith("_scales"):
+                        continue
+
+                    else:
+                        # Handle the 16-bit tensors (like attention layers)
+                        # that are present in the same file as the MXFP4 tensors.
+                        W = file.get_tensor(key)
+
+            else: # This is the general case for a purely 16-bit base model.
+                W = file.get_tensor(key)
             # Remove .weight suffix to match LoRA key format
-            lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
+            lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
             lora_stats = converted_lora_weights.get(lora_key, None)
 
-            if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                count += 1
-                W = _merge_lora(W, lora_stats, key)  # Assume _merge_lora is defined elsewhere
-                if psutil.virtual_memory().available <= limit:
-                    temp_file = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)  # Create temporary file
-                    temp_filename = temp_file.name  # Get temporary file name
-                    torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
-                    W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
-                    temp_file.close()  # Close temporary file
-                    # Clean up the temporary pickle file
-                    try:
-                        os.remove(temp_filename)
-                    except:
-                        pass
-                else:
-                    # To enable fast async copy from CUDA to CPU, allocate a pinned (page-locked) buffer
-                    pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
-                    W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
-            else:
-                if lora_key in converted_lora_weights:
-                    lora_stats_info = converted_lora_weights[lora_key]
+            if W is not None and lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                if not action_logged:
+                    count += 1
+                    W = _merge_lora(W, lora_stats, output_key)  # Assume _merge_lora is defined elsewhere
+                    action_logged=True
 
-            tensors[key] = W
+            if W is None:
+                continue
+
+            with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
+                temp_filename = temp_file.name
+                # Save the merged tensor to a unique temp file
+                torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+                # Load it back as a memory-mapped object. The OS will manage paging this from disk.
+                W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
+
+                # Clean up the temporary pickle file immediately after mmaping
+            try:
+                os.remove(temp_filename)
+            except OSError:
+                # On Windows, the mmap might keep a handle. The OS will clean it up.
+                pass
+
+            tensors[output_key] = W
+
+            # Free up VRAM after each merge
+            torch.cuda.empty_cache()
 
     # CRITICAL: Force cleanup to release file handles on Windows
     if os.name == 'nt':
@@ -637,6 +738,10 @@ def merge_and_overwrite_lora(
     except:
         model_name = model.config._name_or_path
 
+    final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
+    if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method== "merged_16bit":
+        raise TypeError("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
+    model_name = final_model_name
     safetensors_list = []
     max_size_in_bytes = 0
     total_size_in_bytes = 0
@@ -745,7 +850,7 @@ def merge_and_overwrite_lora(
     if save_method == "merged_4bit" or save_method == "forced_merged_4bit":
         base_model = model.base_model if isinstance(model, PeftModel) else model
         print(f"Unsloth: Merging LoRA weights into 4bit model...")
-        if not isinstance(model, PeftModelForCausalLM) or not isinstance(model, PeftModel):
+        if not isinstance(model, PeftModelForCausalLM) and not isinstance(model, PeftModel):
              raise TypeError("Model must be a PeftModelForCausalLM or PeftModel for 'merged_4bit' save.")
         if not getattr(model.config, "quantization_config", None):
              raise ValueError("Model does not appear to be quantized. Cannot use 'merged_4bit'.")
@@ -796,6 +901,15 @@ def merge_and_overwrite_lora(
             save_directory = save_directory,
             state_dict = {},
         )
+        # Remove any weight files that shouldn't have been saved (transformers 4.56.0 bug)
+        import glob
+        weight_files = glob.glob(os.path.join(save_directory, "*.bin")) + \
+                       glob.glob(os.path.join(save_directory, "*.safetensors"))
+
+        for weight_file in weight_files:
+            os.remove(weight_file)
+            print(f"DEBUG: Removed incorrectly saved weight file: {os.path.basename(weight_file)}")
+
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         # Remove the quantization_config in the config.json file if it exists,
     # as we are exporting the model in 16-bit format.
@@ -805,26 +919,31 @@ def merge_and_overwrite_lora(
         upload_items()
 
 
-    # Step 3: Handle original 16-bit shard retrieval (cache/download)
+    # Step 3: Conditional index handling
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
     safe_tensor_index_files = ["model.safetensors.index.json"] if len(safetensors_list) > 1 else []
 
-    # For local models, we'll copy from the local directory instead of cache/download
-    if is_local_path:
-        print(f"Copying safetensors from local directory: {model_name}")
-        os.makedirs(save_directory, exist_ok=True)
+    # ONLY download/copy the original index if we are NOT dequantizing an MXFP4 model
+    if not (base_model_is_quantized and quant_type == "mxfp4"):
+        if is_local_path:
+            os.makedirs(save_directory, exist_ok=True)
+            # Copy from local
+            if safe_tensor_index_files:
+                local_index_path = os.path.join(model_name, "model.safetensors.index.json")
+                if os.path.exists(local_index_path):
+                    shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
+        else:
+            # Download from HF
+            if "model.safetensors.index.json" in [f for f in safe_tensor_index_files]:
+                snapshot_download(repo_id=model_name, local_dir=save_directory, allow_patterns=["model.safetensors.index.json"])
 
-        # Copy index file if it exists
-        local_index_path = os.path.join(model_name, "model.safetensors.index.json")
-        if os.path.exists(local_index_path):
-            shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
-            print(f"Copied safetensors index file from local model")
+        if push_to_hub and safe_tensor_index_files:
+            upload_items("model.safetensors.index.json")
+        pass
 
-        # We'll handle the actual files in the later loop
-        copied_all_from_cache = True  # Mark as handled to skip download
-
-    elif _hf_cache_dir is not None:
+    # Step 4 : Handle retrieval of original 16-bit shards
+    if not is_local_path and _hf_cache_dir is not None:
         copied_all_from_cache = _try_copy_all_from_cache(
             repo_id=model_name,
             filenames_to_check=safetensors_list,
@@ -832,6 +951,7 @@ def merge_and_overwrite_lora(
             hf_cache_dir=_hf_cache_dir,
             token=token,
         )
+
     if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
         print(f"Downloading safetensors for {model_name}...")
         snapshot_download(
@@ -839,17 +959,7 @@ def merge_and_overwrite_lora(
             local_dir = save_directory,
             allow_patterns = safe_tensor_index_files + safetensors_list,
         )
-    elif safe_tensor_index_files and not is_local_path:
-        print(f"Downloading safetensors index for {model_name}...")
-        snapshot_download(
-            repo_id = model_name,
-            local_dir = save_directory,
-            allow_patterns = ["model.safetensors.index.json"],
-        )
 
-    # Step 4: Ensure the index file is uploaded for sharded models, regardless of low_disk_space_usage
-    if push_to_hub and len(safetensors_list) > 1 and os.path.exists(os.path.join(save_directory, "model.safetensors.index.json")):
-        upload_items("model.safetensors.index.json")
 
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
     for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
@@ -877,6 +987,8 @@ def merge_and_overwrite_lora(
             lora_weights = lora_weights,
             output_dtype = output_dtype,
             model_class_name = find_lora_base_model(model).__class__.__name__,
+            base_model_is_quantized = base_model_is_quantized,
+            quant_type=quant_type,
         )
         torch.cuda.empty_cache()
         if low_disk_space_usage and push_to_hub:
@@ -885,7 +997,29 @@ def merge_and_overwrite_lora(
         pass
     pass
 
-    # Step 6: Final upload of all shards if not using low disk space mode and pushing
+    # Step 6: Regenerate index ONLY for MXFP4 dequantization
+    if base_model_is_quantized and quant_type == "mxfp4" and len(safetensors_list) > 1:
+        print("Unsloth: Regenerating safetensors index for dequantized MXFP4 model...")
+        weight_map = {}
+
+        for filename in safetensors_list:
+            file_path = os.path.join(save_directory, filename)
+            # Important check for low_disk_space mode where files might be deleted
+            if not os.path.exists(file_path): continue
+            with safe_open(file_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    weight_map[key] = filename
+
+        index_data = {"metadata": {}, "weight_map": weight_map}
+        index_path = os.path.join(save_directory, "model.safetensors.index.json")
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(index_data, f, indent=4)
+
+        if push_to_hub:
+            upload_items("model.safetensors.index.json")
+        print("Unsloth: Merge process completed.")
+
+    # Step 7: Final upload of all shards if not using low disk space mode and pushing
     if not low_disk_space_usage and push_to_hub:
 
         # Explicitly upload all safetensors files if not already handled
@@ -1440,6 +1574,321 @@ def find_lora_base_model(model_to_inspect):
     return current
 pass
 
+def check_hf_model_exists(model_name, token=None):
+    """Check if model exists on HuggingFace"""
+    try:
+        file_list = HfFileSystem(token=token).ls(model_name, detail=True)
+        return any(x["name"].endswith(".safetensors") for x in file_list)
+    except:
+        return False
+pass
+
+def check_local_model_exists(model_path):
+    """Check if model exists locally"""
+    return os.path.exists(model_path) and os.path.isdir(model_path)
+pass
+
+def check_model_quantization_status(model_name_or_path, token=None):
+    """Check if a model is quantized (works for both HF and local)"""
+    config = None
+    # Local path
+    if os.path.exists(model_name_or_path) and os.path.isdir(model_name_or_path):
+        config_path = os.path.join(model_name_or_path, "config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding="utf-8") as f:
+                    config = json.load(f)
+            except:
+                pass
+    # HF repo
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+            config_path = hf_hub_download(
+                repo_id=model_name_or_path,
+                filename="config.json",
+                cache_dir=None,
+                token=token
+            )
+            with open(config_path, 'r', encoding="utf-8") as f:
+                config = json.load(f)
+        except:
+            pass
+
+    if config and "quantization_config" in config:
+        quant_config = config["quantization_config"]
+
+        # Case 2: Check for MXFP4 format first (more specific)
+        # We assume the Mxfp4Config serializes with a "quant_method": "mxfp4" key.
+        if isinstance(quant_config, dict) and quant_config.get("quant_method") == "mxfp4":
+            return (True, "mxfp4")
+
+        # Case 1: Fallback to existing logic for bitsandbytes
+        elif isinstance(quant_config, dict):
+            is_quantized = quant_config.get("load_in_4bit", False)
+            quant_type = quant_config.get("bnb_4bit_quant_type", None)
+            if is_quantized:
+                # Return the specific type if available, otherwise a generic "bitsandbytes"
+                return (True, quant_type if quant_type else "bitsandbytes")
+
+    return (False, None)
+pass
+
+def determine_base_model_source(model_name, token=None):
+    """
+    Determine the best source for base model using branched logic
+    Returns: (final_model_name, is_local_path, source_info, is_quantized, quant_type)
+    """
+
+    # Check availability
+    hf_exists = check_hf_model_exists(model_name, token)
+    local_exists = check_local_model_exists(model_name)
+
+    # Branch A: HF model exists
+    if hf_exists:
+        hf_is_quantized, hf_quant_type = check_model_quantization_status(model_name, token)
+
+        if not hf_is_quantized:
+            # A1: HF unquantized exists → use HF
+            return (model_name, False, "HF_unquantized", False, None)
+        else:
+            # A2: HF is quantized, check if local unquantized exists
+            if local_exists:
+                local_is_quantized, local_quant_type = check_model_quantization_status(model_name)
+                if not local_is_quantized:
+                    # A2a: Local unquantized exists → use local
+                    return (model_name, True, "local_unquantized_preferred_over_HF_quantized", False, None)
+                else:
+                    # A2b: Both quantized → use HF (more reliable)
+                    return (model_name, False, "HF_quantized", True, hf_quant_type)
+            else:
+                # A3: Only HF quantized exists
+                return (model_name, False, "HF_quantized_only", True, hf_quant_type)
+
+    # Branch B: HF model doesn't exist
+    else:
+        if local_exists:
+            # B1: Any local exists → use local
+            local_is_quantized, local_quant_type = check_model_quantization_status(model_name)
+            status = "quantized" if local_is_quantized else "unquantized"
+            return (model_name, True, f"local_{status}_only", local_is_quantized, local_quant_type)
+        else:
+            # B2: Nothing found
+            raise ValueError(f"Model {model_name} not found locally or on HuggingFace")
+pass
+
+def get_memory_stats():
+    """Get current memory statistics for CPU and GPU"""
+    stats = {}
+    import psutil
+
+    # CPU Memory
+    cpu_mem = psutil.virtual_memory()
+    stats['cpu'] = {
+        'total': cpu_mem.total,
+        'available': cpu_mem.available,
+        'used': cpu_mem.used,
+        'percent': cpu_mem.percent,
+        'free': cpu_mem.available,  # Available is more accurate than free
+    }
+
+    # GPU Memory (for each GPU)
+    stats['gpus'] = []
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            gpu_mem = torch.cuda.mem_get_info(i)
+            total = gpu_mem[1]
+            free = gpu_mem[0]
+            stats['gpus'].append({
+                'device_id': i,
+                'name': torch.cuda.get_device_name(i),
+                'total': total,
+                'free': free,
+                'used': total - free,
+                'percent': ((total - free) / total) * 100 if total > 0 else 0
+            })
+
+    return stats
+pass
+
+def format_bytes(bytes_value):
+    """Convert bytes to human readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_value < 1024.0:
+            return f"{bytes_value:.2f} {unit}"
+        bytes_value /= 1024.0
+    return f"{bytes_value:.2f} PB"
+pass
+
+def calculate_combined_score(speed_score, chunk_size):
+    # Normalize chunk size to 0-1 scale (assuming max reasonable chunk is 100M)
+    chunk_factor = min(1.0, chunk_size / (100 * 1024 * 1024))
+    # Weight: 60% device speed, 40% chunk efficiency
+    return speed_score * 0.6 + chunk_factor * 10 * 0.4  # Scale chunk factor to match speed range
+pass
+
+def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
+    """
+    Choose optimal device and chunk size for mxfp4 dequantization based on available memory.
+    """
+    import math
+
+    # Calculate tensor dimensions
+    *prefix_shape, G, B = blocks_tensor.shape
+    rows_total = math.prod(prefix_shape) * G
+
+    # Estimate memory requirements
+    #base_memory_per_row = B * 21 if B else 128 * 21
+    base_memory_per_row = B * 35 if B else 128 * 35
+    input_size = blocks_tensor.numel() + scales_tensor.numel() * 4
+    output_size = rows_total * B * 2 * 2
+    persistent_memory = input_size + output_size
+
+    # Device-specific safety factors
+    GPU_SAFETY_FACTOR = 0.75  # GPUs can handle higher utilization
+    CPU_SAFETY_FACTOR = 0.75  # CPUs need more headroom for OS and other processes
+
+    def calculate_safe_usable_memory(free_memory, safety_factor):
+        # Option 1: What we can use from reported free memory (accounting for fragmentation)
+        usable_from_free = free_memory * safety_factor
+
+        return usable_from_free
+
+
+    def calculate_optimal_chunk_size(safe_usable_memory):
+        """Calculate the largest chunk size that fits in the safe usable memory"""
+        temp_memory_budget = safe_usable_memory - persistent_memory
+        if temp_memory_budget <= 0:
+            return None
+
+        max_chunk_from_memory = int(temp_memory_budget // base_memory_per_row)
+        optimal_chunk = min(rows_total, max_chunk_from_memory)
+
+        if optimal_chunk < 1024:
+            return None
+
+        return optimal_chunk
+
+    stats = get_memory_stats()
+    suitable_strategies = []
+
+    # Check GPU strategies first (preferred for speed)
+    for gpu in stats['gpus']:
+        safe_usable_memory = calculate_safe_usable_memory(
+            free_memory=gpu['free'],
+            safety_factor=GPU_SAFETY_FACTOR,
+        )
+        chunk_size = calculate_optimal_chunk_size(safe_usable_memory)
+
+        if chunk_size:
+            temp_memory = min(chunk_size, rows_total) * base_memory_per_row
+            total_memory_needed = persistent_memory + temp_memory
+
+            combined_score = calculate_combined_score(3.0, chunk_size)
+
+            suitable_strategies.append({
+                'device_type': 'cuda',
+                'device_id': gpu['device_id'],
+                'rows_per_chunk': chunk_size,
+                'available_memory': gpu['free'] * GPU_SAFETY_FACTOR,
+                'total_memory': gpu['total'],
+                'safe_usable_memory': safe_usable_memory,
+                'needed_memory': total_memory_needed,
+                'speed_score': 3.0,
+                'efficiency_score': chunk_size,
+                'safety_factor': GPU_SAFETY_FACTOR,
+                'memory_utilization': total_memory_needed / safe_usable_memory,
+                'combined_score': combined_score,
+            })
+
+    # Check CPU strategy
+    cpu_safe_usable_memory = calculate_safe_usable_memory(
+        free_memory=stats['cpu']['available'],
+        safety_factor=CPU_SAFETY_FACTOR,
+    )
+    cpu_chunk_size = calculate_optimal_chunk_size(cpu_safe_usable_memory)
+
+    if cpu_chunk_size:
+        temp_memory = min(cpu_chunk_size, rows_total) * base_memory_per_row
+        total_memory_needed = persistent_memory + temp_memory
+        combined_score = calculate_combined_score(1.0, cpu_chunk_size)  # For CPU
+        suitable_strategies.append({
+            'device_type': 'cpu',
+            'device_id': None,
+            'rows_per_chunk': cpu_chunk_size,
+            'available_memory': stats['cpu']['available'] * CPU_SAFETY_FACTOR,
+            'total_memory': stats['cpu']['total'],
+            'safe_usable_memory': cpu_safe_usable_memory,
+            'needed_memory': total_memory_needed,
+            'speed_score': 1.0,
+            'efficiency_score': cpu_chunk_size,
+            'safety_factor': CPU_SAFETY_FACTOR,
+            'fragmentation_factor': 1.0,
+            'memory_utilization': total_memory_needed / cpu_safe_usable_memory,
+            'combined_score': combined_score,
+        })
+
+    if suitable_strategies:
+
+        # Sort by combined score
+        suitable_strategies.sort(key=lambda x: x['combined_score'], reverse=True)
+
+        best = suitable_strategies[0]
+
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(
+                f"[MXFP4] Selected {best['device_type']}:{best['device_id'] or ''} "
+                f"with {best['rows_per_chunk']:,} rows per chunk "
+                f"(safety factor: {best['safety_factor']:.0%}, "
+                f"safe memory utilization: {best['memory_utilization']:.1%}) "
+                f"- Need: {format_bytes(best['needed_memory'])}, "
+                f"Available: {format_bytes(best['available_memory'])}"
+            )
+
+        return (best['device_type'], best['device_id'], best['rows_per_chunk'])
+
+    # Fallback: find device with most memory and use minimal chunk
+    fallback_options = []
+
+    # Add CPU fallback
+    fallback_options.append({
+        'device_type': 'cpu',
+        'device_id': None,
+        'available': stats['cpu']['available'] * CPU_SAFETY_FACTOR,
+        'total_available': stats['cpu']['available']
+    })
+
+    # Add GPU fallbacks
+    for gpu in stats['gpus']:
+        fallback_options.append({
+            'device_type': 'cuda',
+            'device_id': gpu['device_id'],
+            'available': gpu['free'] * GPU_SAFETY_FACTOR,
+            'total_available': gpu['free']
+        })
+
+    # Sort by available memory (after safety factor)
+    fallback_options.sort(key=lambda x: x['available'], reverse=True)
+    best_fallback = fallback_options[0]
+
+    # Calculate minimal safe chunk size for fallback
+    remaining_memory = best_fallback['available'] - persistent_memory
+    if remaining_memory > 0:
+        fallback_chunk_size = max(1024, min(8192, int(remaining_memory // base_memory_per_row), rows_total))
+    else:
+        fallback_chunk_size = min(1024, rows_total)
+
+    warnings.warn(
+        f"[MXFP4] Insufficient memory for optimal processing on any device. "
+        f"Using {best_fallback['device_type']}:{best_fallback['device_id'] or ''} "
+        f"with minimal chunks ({fallback_chunk_size:,}). "
+        f"Available: {format_bytes(best_fallback['total_available'])}, "
+        f"Required: {format_bytes(persistent_memory)}. "
+        f"Processing will be slow."
+    )
+
+    return (best_fallback['device_type'], best_fallback['device_id'], fallback_chunk_size)
+pass
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #

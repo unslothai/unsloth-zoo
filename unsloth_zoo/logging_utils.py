@@ -28,7 +28,8 @@ METRICS_MOVE_TO_END = [
 REMOVED_METRICS = [
     "num_tokens", # All extras - not necessary
     "mean_token_accuracy", # SFT extras
-
+    "entropy",
+    
     # GRPO extras
     "clip_ratio",
     'clip_ratio/low_mean',
