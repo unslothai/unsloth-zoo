@@ -61,50 +61,50 @@ def chunked_selective_log_softmax(logits, index):
 pass
 
 def calculate_pad_tokens_in_prompt(
-        input_ids: torch.Tensor,
-        logits_to_keep: int,
-        pad_token_id: int
-    ) -> torch.Tensor:
-        """
-        Given prompt tensor, it returns all the left padded tokens in that sequence. so [pad, pad, pad, cat] = 3 tokens 
-        """
-        if logits_to_keep >= input_ids.shape[1]:
-            raise ValueError("logits_to_keep must be smaller than the sequence length.")
+    input_ids: torch.Tensor,
+    logits_to_keep: int,
+    pad_token_id: int
+) -> torch.Tensor:
+    """
+    Given prompt tensor, it returns all the left padded tokens in that sequence. so [pad, pad, pad, cat] = 3 tokens 
+    """
+    if logits_to_keep >= input_ids.shape[1]:
+        raise ValueError("logits_to_keep must be smaller than the sequence length.")
 
-        prompt_section = input_ids[:, :-logits_to_keep]
+    prompt_section = input_ids[:, :-logits_to_keep]
 
-        padding_mask = (prompt_section == pad_token_id)
+    padding_mask = (prompt_section == pad_token_id)
 
-        pad_token_counts = padding_mask.sum(dim=1)
+    pad_token_counts = padding_mask.sum(dim=1)
 
-        return pad_token_counts
+    return pad_token_counts
 
 def create_completion_attention_mask(
-        completion_input_ids: torch.Tensor,
-        left_pad_tokens_per_prompt: torch.Tensor,
-        max_left_pad: int,
-        pad_token_id: int
-    ) -> torch.Tensor:
-        """
-        Given that we have a sequence, [p,p,p,c,c,c,pad,pad,pad]
+    completion_input_ids: torch.Tensor,
+    left_pad_tokens_per_prompt: torch.Tensor,
+    max_left_pad: int,
+    pad_token_id: int
+) -> torch.Tensor:
+    """
+    Given that we have a sequence, [p,p,p,c,c,c,pad,pad,pad]
 
-        Where p are extra prompt tokens we got from slicing the torch tensor, c is completion tokens
-        and pad are pad tokens, this function would make a completion mask that would 0 out the pad
-        and p tokens. so in this example [0,0,0,1,1,1,0,0,0]
-        """
-        batch_size, completion_len = completion_input_ids.shape
-        device = completion_input_ids.device
+    Where p are extra prompt tokens we got from slicing the torch tensor, c is completion tokens
+    and pad are pad tokens, this function would make a completion mask that would 0 out the pad
+    and p tokens. so in this example [0,0,0,1,1,1,0,0,0]
+    """
+    batch_size, completion_len = completion_input_ids.shape
+    device = completion_input_ids.device
 
-        num_tokens_to_mask = max_left_pad - left_pad_tokens_per_prompt
+    num_tokens_to_mask = max_left_pad - left_pad_tokens_per_prompt
 
-        indices = torch.arange(completion_len, device=device).unsqueeze(0)
-        shift_mask = indices >= num_tokens_to_mask.unsqueeze(1)
+    indices = torch.arange(completion_len, device=device).unsqueeze(0)
+    shift_mask = indices >= num_tokens_to_mask.unsqueeze(1)
 
-        non_padding_mask = (completion_input_ids != pad_token_id)
+    non_padding_mask = (completion_input_ids != pad_token_id)
 
-        final_mask = shift_mask & non_padding_mask
+    final_mask = shift_mask & non_padding_mask
 
-        return final_mask
+    return final_mask
 
 def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
     """
