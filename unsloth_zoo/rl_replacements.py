@@ -144,6 +144,7 @@ def grpo_compute_loss(
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
     logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
+    importance_sampling_level = kwargs.get("importance_sampling_level", "token")
 
     input_ids = input_ids.unsqueeze(-1)
 
@@ -202,9 +203,23 @@ def grpo_compute_loss(
     # Below is forward KL (normal KL)
     # kl_i = torch.exp(old) * (old - new)
     if old_logits is not None: 
-        coef_1 = torch.exp(new - old)
+        log_ratio = new - old
     else:
-        coef_1 = torch.exp(new - new.detach())
+        log_ratio = new - new.detach()
+
+    if importance_sampling_level == "token":
+        log_importance_weights = log_ratio
+    elif importance_sampling_level == "sequence":
+        log_importance_weights = (log_ratio * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+        log_importance_weights = log_importance_weights.unsqueeze(-1)
+    else:
+        raise ValueError(
+            f"Unknown importance sampling level: {importance_sampling_level}. Possible values are 'token' "
+            "and 'sequence'."
+        )
+
+    coef_1 =  torch.exp(log_importance_weights)
+
     coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
 
     if delta is not None:
@@ -341,7 +356,10 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             old_hidden_states  = torch.chunk(_old_hidden_states, chunks = n_chunks, dim = 0)
         else: 
             old_hidden_states = [None] * n_chunks
-        ref_hidden_states  = torch.chunk(_ref_hidden_states, chunks = n_chunks, dim = 0)
+        if _ref_hidden_states is not None: 
+            ref_hidden_states  = torch.chunk(_ref_hidden_states, chunks = n_chunks, dim = 0)
+        else: 
+            ref_hidden_states = [None] * n_chunks
         input_ids          = torch.chunk(_input_ids,         chunks = n_chunks, dim = 0)
         mask               = torch.chunk(_mask,              chunks = n_chunks, dim = 0)
         advantages         = torch.chunk(_advantages,        chunks = n_chunks, dim = 0)
@@ -405,12 +423,17 @@ def grpo_accumulated_loss(
     completion_mask,
     advantages,
     old_hidden_states,
+    ref_hidden_states, 
     n_chunks = -1,
     **kwargs,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     bsz, qlen = input_ids.shape
 
+    pixel_values = kwargs.get('pixel_values',None)
+    image_grid_thw = kwargs.get('image_grid_thw',None)
+    pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
+    image_sizes = kwargs.get('image_sizes',None)
     # Find closest multiple
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
@@ -434,18 +457,16 @@ def grpo_accumulated_loss(
     completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
     attention_mask =  input_ids != trainer.processing_class.pad_token_id
     attention_mask = attention_mask.to(attention_mask.dtype)
-    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):
-        with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
-            ref_hidden_states = trainer.model(
-                input_ids = input_ids,
-                attention_mask = attention_mask,
-                #logits_to_keep = logits_to_keep + 1,
-            ).logits
-        pass
+    
+    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):  
         new_hidden_states = trainer.model(
             input_ids = input_ids,
             attention_mask = attention_mask,
-            #logits_to_keep = logits_to_keep + 1,
+            pixel_values = pixel_values,
+            image_grid_thw = image_grid_thw,
+            pixel_attention_mask = pixel_attention_mask,
+            image_sizes = image_sizes,
+            logits_to_keep = logits_to_keep + 1,
         ).logits
         
         #keep extra logit as we generated a new token
@@ -469,8 +490,10 @@ def grpo_accumulated_loss(
             kwargs # pass kwargs as a dict
         )
     pass
+
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
+
     return loss, completion_length, mean_kl
     # Old non efficient code path
     new_logits = torch.matmul(new_hidden_states, lm_head.t())
