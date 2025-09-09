@@ -509,11 +509,14 @@ def patch_vllm_enable_sleep_mode():
         self.pointer_to_data: dict[int, AllocationData] = {}
         self.current_tag: str = CuMemAllocator.default_tag
         self.allocator_and_pools: dict[str, Any] = {}
-        # Creating strong references to the two callbacks here to prevent
-        # these ephemeral bound-method objects being garbage collected.
-        # See discussions in https://github.com/vllm-project/vllm/pull/22724
-        self.python_malloc_callback = self._python_malloc_callback
-        self.python_free_callback = self._python_free_callback
+        if hasattr(self, '_python_malloc_callback'):
+            # vllm changed something recently wrt cumem init
+            # new versions have function _python_malloc/free and set it to self.python_malloc/free
+            # old versions just have the function self.python_malloc/free so they need no such assignment
+            # this check is to make sure it works for both new versions and old alike
+            # https://github.com/vllm-project/vllm/commit/9dc30b7068ae07ceca89663e9f8403d00217256d
+            self.python_malloc_callback = self._python_malloc_callback
+            self.python_free_callback = self._python_free_callback
 
     def sleep(
             self,
