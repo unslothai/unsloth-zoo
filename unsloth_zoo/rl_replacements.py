@@ -111,7 +111,7 @@ def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
     Moves all padding tokens in each sequence of a batch to the right.
     """
     mask = (tensor != pad_id)
-    sorted_indices = torch.argsort(mask, dim=1, descending=True, stable=True)
+    sorted_indices = torch.argsort(mask, dim=1, descending=True)
     packed_tensor = torch.gather(tensor, 1, sorted_indices)
 
     return packed_tensor
@@ -444,19 +444,23 @@ def grpo_accumulated_loss(
         if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = torch.float16
     pass
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
-
-    left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
-
-    max_left_pad = max(left_pad_tokens_per_prompt).item()
-
-    input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
-
-    completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
-
+    
     lm_head = trainer.model.get_output_embeddings().weight
-    completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
-    attention_mask =  input_ids != trainer.processing_class.pad_token_id
-    attention_mask = attention_mask.to(attention_mask.dtype)
+
+    if pixel_values is None: 
+        left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
+
+        max_left_pad = max(left_pad_tokens_per_prompt).item()
+
+        input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
+
+        completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
+
+        completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
+        attention_mask =  input_ids != trainer.processing_class.pad_token_id
+        attention_mask = attention_mask.to(attention_mask.dtype)
+    else: 
+        completion_input_ids = input_ids[:, -logits_to_keep:]
     
     with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):  
         new_hidden_states = trainer.model(
@@ -468,14 +472,16 @@ def grpo_accumulated_loss(
             image_sizes = image_sizes,
             logits_to_keep = logits_to_keep + 1,
         ).logits
+
+        if pixel_values is None:
+            #keep extra logit as we generated a new token
+            new_hidden_states = new_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
+            if ref_hidden_states is not None: 
+                ref_hidden_states = ref_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
+            if old_hidden_states is not None: 
+                old_hidden_states = old_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
         
-        #keep extra logit as we generated a new token
-        new_hidden_states = new_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
-        if ref_hidden_states is not None: 
-            ref_hidden_states = ref_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
-        if old_hidden_states is not None: 
-            old_hidden_states = old_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
-        
+        breakpoint()
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
             new_hidden_states,
             old_hidden_states,
