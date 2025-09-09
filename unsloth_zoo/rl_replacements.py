@@ -209,21 +209,15 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             new_logits = torch.matmul(new_hidden_states, lm_head.t())
             new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
 
-            # Slice to match completion length - only keep logits for completion tokens
-            completion_length = input_ids.shape[1]
-            new_logits = new_logits[:, -completion_length:, :]
-
             with torch.no_grad():
                 if beta != 0.0:
                     ref_logits = torch.matmul(ref_hidden_states, lm_head.t())
                     ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-                    ref_logits = ref_logits[:, -completion_length:, :]  # Slice to match completion length
                 else:
                     ref_logits = None
                 if old_hidden_states is not None:
                     old_logits = torch.matmul(old_hidden_states, lm_head.t())
                     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-                    old_logits = old_logits[:, -completion_length:, :]  # Slice to match completion length
                 else:
                     old_logits = None
             # if old_hidden_states is not None:
