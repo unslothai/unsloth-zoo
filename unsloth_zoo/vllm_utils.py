@@ -1191,6 +1191,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     #         param.config = config
 
     text_config = getattr(config, "text_config", config) #try using text config for VLMs
+    vision_config = getattr(config, "vision_config", None)
     # Fix up rotary_emb by re-initing them
     for module in new_model.modules():
         if hasattr(module, "rotary_emb"):
@@ -1198,6 +1199,12 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 config = text_config,
                 device = get_target_device(),
             )
+        if hasattr(module, "rotary_pos_emb"):
+            # Qwen 2.5 VL has a rotary_pos_emb in vision submodel
+            # https://github.com/huggingface/transformers/blob/a871f6f58d49f3a05ae9dae519caa8aa9d919a07/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py#L337
+            assert vision_config is not None, "Unsloth: vision_config is required for models with vision rotary_pos_emb"
+            head_dim = vision_config.hidden_size // vision_config.num_heads
+            module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(get_target_device())
         if hasattr(module, "rotary_emb_local"):
             # gemma3 has a rotary_emb_local
             # https://github.com/huggingface/transformers/blob/008c0ba8e2a1226a6ef5a61c4915a0a8a340c157/src/transformers/models/gemma3/modeling_gemma3.py#L469-L471
