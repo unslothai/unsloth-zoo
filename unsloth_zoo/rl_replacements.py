@@ -111,7 +111,7 @@ def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
     Moves all padding tokens in each sequence of a batch to the right.
     """
     mask = (tensor != pad_id)
-    sorted_indices = torch.argsort(mask, dim=1, descending=True)
+    sorted_indices = sorted_indices = torch.argsort(mask, dim=1, descending=True, stable=True)
     packed_tensor = torch.gather(tensor, 1, sorted_indices)
 
     return packed_tensor
