@@ -1238,6 +1238,7 @@ pass
 
 def approximate_vllm_memory_usage(
     config,
+    load_in_4bit = False,
     max_seq_length = 2048,
     gpu_memory_utilization = 0.8,
     enable_lora = True,
@@ -1248,7 +1249,7 @@ def approximate_vllm_memory_usage(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
-    load_in_4bit = "quantization_config" in config
+
     free_memory, total_memory = get_mem_info()
 
     free_memory = gpu_memory_utilization * free_memory
@@ -1382,10 +1383,14 @@ def load_vllm(
     else:
         mem_config = config
 
+    use_bitsandbytes = use_bitsandbytes or \
+        model_name.lower().endswith("-bnb-4bit") or "quantization_config" in config
+
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
     approximate_vllm_memory_usage(
         mem_config,
+        load_in_4bit = use_bitsandbytes,
         max_seq_length = max_seq_length,
         gpu_memory_utilization = gpu_memory_utilization,
         enable_lora = enable_lora,
@@ -1437,8 +1442,6 @@ def load_vllm(
     free_memory, total_memory = get_mem_info()
 
     total_memory_gb = round(total_memory / 1024 / 1024 / 1024, 2)
-    use_bitsandbytes = use_bitsandbytes or \
-        model_name.lower().endswith("-bnb-4bit")
 
     # Fix up vLLM compute_dtype for bitsandbytes
     BitsAndBytesConfig = patch_vllm_compute_dtype(dtype)
