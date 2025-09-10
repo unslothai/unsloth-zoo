@@ -23,7 +23,8 @@ import inspect
 import textwrap
 from .common import TEMPORARY_PATCHES, torch_compile
 from importlib.metadata import version as importlib_version
-from packaging import version as pkg_version
+transformers_version = Version(importlib_version("transformers"))
+from ..utils import Version
 from .utils import (
     patch_function,
     KWARGS_TYPE,
@@ -737,7 +738,7 @@ def patch_GptOssAttention():
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
 
-    if pkg_version.parse(importlib_version("transformers")) <= pkg_version.parse("4.55.4"):
+    if transformers_version <= Version("4.55.4"):
         patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward_backward_compat)
     else:
         patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
