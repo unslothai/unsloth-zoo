@@ -23,8 +23,8 @@ import inspect
 import textwrap
 from .common import TEMPORARY_PATCHES, torch_compile
 from importlib.metadata import version as importlib_version
-transformers_version = Version(importlib_version("transformers"))
 from ..utils import Version
+transformers_version = Version(importlib_version("transformers"))
 from .utils import (
     patch_function,
     KWARGS_TYPE,
