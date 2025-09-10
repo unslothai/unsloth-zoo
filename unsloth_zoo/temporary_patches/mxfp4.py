@@ -28,6 +28,85 @@ from .common import TEMPORARY_PATCHES, torch_compile_options, UNSLOTH_ENABLE_LOG
 logger = logging.getLogger(__name__)
 
 
+def patch_convert_moe_packed_tensors():
+    """
+    Pin the original GPU-optimized version of convert_moe_packed_tensors with smaller default chunk size.
+    """
+    try:
+        import transformers.integrations.mxfp4
+        from transformers.integrations.mxfp4 import FP4_VALUES
+    except:
+        return
+
+    def convert_moe_packed_tensors(
+        blocks,
+        scales,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        rows_per_chunk: int = 32768 * 1024,
+    ) -> torch.Tensor:
+        """
+        Convert the mxfp4 weights again, dequantizing and makes them compatible with the forward
+        pass of GPT_OSS.
+
+        Args:
+            blocks: Packed quantized weights
+            scales: Quantization scales
+            dtype: Output data type
+            rows_per_chunk: Number of rows to process per chunk. .
+        """
+        # Check if blocks and scales are on CPU, and move to GPU if so
+        if not blocks.is_cuda and torch.cuda.is_available():
+            blocks = blocks.cuda()
+            scales = scales.cuda()
+
+        scales = scales.to(torch.int32) - 127
+
+        assert blocks.shape[:-1] == scales.shape, f"{blocks.shape=} does not match {scales.shape=}"
+
+        lut = torch.tensor(FP4_VALUES, dtype=dtype, device=blocks.device)
+
+        *prefix_shape, G, B = blocks.shape
+        rows_total = math.prod(prefix_shape) * G
+
+        blocks = blocks.reshape(rows_total, B)
+        scales = scales.reshape(rows_total, 1)
+
+        out = torch.empty(rows_total, B * 2, dtype=dtype, device=blocks.device)
+
+        for r0 in range(0, rows_total, rows_per_chunk):
+            r1 = min(r0 + rows_per_chunk, rows_total)
+
+            blk = blocks[r0:r1]
+            exp = scales[r0:r1]
+
+            # nibble indices -> int64
+            idx_lo = (blk & 0x0F).to(torch.long)
+            idx_hi = (blk >> 4).to(torch.long)
+
+            sub = out[r0:r1]
+            sub[:, 0::2] = lut[idx_lo]
+            sub[:, 1::2] = lut[idx_hi]
+
+            torch.ldexp(sub, exp, out=sub)
+            del idx_lo, idx_hi, blk, exp, sub
+
+        out = out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
+        del blocks, scales, lut
+        return out
+
+    # Add the new CPU function to the mxfp4 module
+    if hasattr(transformers.integrations.mxfp4, 'convert_moe_packed_tensors'):
+        transformers.integrations.mxfp4.convert_moe_packed_tensors = convert_moe_packed_tensors
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Successfully added convert_moe_packed_tensors_cpu function.")
+    else:
+        if UNSLOTH_ENABLE_LOGGING:
+            print("Unsloth: Failed to add convert_moe_packed_tensors_cpu - original function not found.")
+    return
+pass
+TEMPORARY_PATCHES.append(patch_convert_moe_packed_tensors)
+
 
 def patch_convert_moe_packed_tensors_cpu():
     """
@@ -101,7 +180,7 @@ def patch_convert_moe_packed_tensors_cpu():
 
         out = out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
         del blocks, scales, lut
-        return out.transpose(1, 2).contiguous()
+        return out
 
     # Add the new CPU function to the mxfp4 module
     if hasattr(transformers.integrations.mxfp4, 'convert_moe_packed_tensors'):
