@@ -490,35 +490,7 @@ def grpo_accumulated_loss(
                 image_sizes = image_sizes,
                 logits_to_keep = logits_to_keep + 1,
             ).logits
-    # breakpoint()
-    # lm_head = lm_head
-    # new_logits = torch.matmul(new_hidden_states, lm_head.t())
-    # new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-   
-    # with torch.no_grad():
-    #     if trainer.args.beta != 0.0:
-    #         ref_logits = torch.matmul(ref_hidden_states, lm_head.t())
-    #         ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-    #     else:
-    #         ref_logits = None
-    #     if old_hidden_states is not None:
-    #         old_logits = torch.matmul(old_hidden_states, lm_head.t())
-    #         old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-            
-    #     else: 
-    #         old_logits = None
-    # breakpoint()
-    # completion_input_ids = completion_input_ids.unsqueeze(-1)
-    # new_x = torch.gather(new_logits, dim = -1, index = completion_input_ids).squeeze(-1)
-    # new = new_x - torch.logsumexp(new_logits, dim = -1)
 
-    # old_x = torch.gather(old_logits, dim = -1, index = completion_input_ids).squeeze(-1)
-    # old = old_x - torch.logsumexp(old_logits, dim = -1)
-
-    # ref_x = torch.gather(ref_logits, dim = -1, index = completion_input_ids).squeeze(-1)
-    # ref = ref_x - torch.logsumexp(ref_logits, dim = -1)
-
-    # breakpoint()
     loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
         new_hidden_states,
         old_hidden_states,
