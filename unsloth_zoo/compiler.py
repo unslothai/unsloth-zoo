@@ -1910,8 +1910,10 @@ def unsloth_compile_transformers(
 ):
     # import transformers logging module and instantiate model_type logging instance.
     from transformers import logging as transformers_logging
-    model_logger = transformers_logging.get_logger(f"modeling_{model_type}")
-
+    try:
+        model_logger = transformers_logging.get_logger(f"modeling_{model_type}")
+    except:
+        return
     # All Unsloth Zoo code licensed under LGPLv3
     disable = disable or (os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1")
     if fast_residual_stream:
@@ -1919,7 +1921,10 @@ def unsloth_compile_transformers(
     pass
 
     model_location = f"transformers.models.{model_type}.modeling_{model_type}"
-    exec(f"import {model_location}", globals())
+    try:
+        exec(f"import {model_location}", globals())
+    except ModuleNotFoundError:
+        return
     modeling_file = eval(model_location)
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"): return
 
