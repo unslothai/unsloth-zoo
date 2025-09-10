@@ -77,6 +77,8 @@ minor = None
 if DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
     OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+elif DEVICE_TYPE == "hip":
+    OLD_CUDA_ARCH_VERSION = False
 elif DEVICE_TYPE == "xpu":
     OLD_CUDA_ARCH_VERSION = False
 pass

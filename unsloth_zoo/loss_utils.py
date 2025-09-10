@@ -53,6 +53,12 @@ if DEVICE_TYPE == "cuda":
     else:
         HAS_CUT_CROSS_ENTROPY = False
     pass
+elif DEVICE_TYPE == "hip":
+    try:
+        from cut_cross_entropy import linear_cross_entropy
+        HAS_CUT_CROSS_ENTROPY = True
+    except:
+        HAS_CUT_CROSS_ENTROPY = False
 elif DEVICE_TYPE == "xpu":
     try:
         from cut_cross_entropy import linear_cross_entropy
