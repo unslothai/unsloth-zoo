@@ -1394,7 +1394,6 @@ def patch_gradient_checkpointing(module, source):
     try: forward = inspect.getsource(source.forward)
     except: return None
     if "_gradient_checkpointing_func" in forward: return None
-    if 'gpt-oss' in os.environ.get("UNSLOTH_MODEL_NAME", ""): return None
 
     # Fix Qwen2 missing None for gradient checkpointing
     for custom_find, custom_replace in custom_gradient_checkpointing_replacements:
@@ -1432,6 +1431,9 @@ def patch_gradient_checkpointing(module, source):
     # Also fix init
     spaces = init.find("def")
     init = init + "\n" + (spaces + 4) * " " + "self.gradient_checkpointing = False\n\n"
+
+    # Confirm no equal signs seen - might be "attention_mask=causal_mask_mapping" vs "attention_mask=attention_mask"
+    if "=" in init: return None
     return init, forward
 pass
 
@@ -2402,6 +2404,9 @@ def unsloth_compile_transformers(
     if gradient_checkpointing:
         for module in other_classes:
             source = eval(f"{model_location}.{module}")
+            # if "(GradientCheckpointingLayer)" in full_source:
+            #     # Uses GC layers which is in new transformers - no need to patch
+            #     continue
             output = patch_gradient_checkpointing(module, source)
             if output is None: continue
 
