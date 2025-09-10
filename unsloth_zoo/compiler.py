@@ -215,48 +215,55 @@ _patch_functions = [
 ]
 
 
-def get_transformers_model_type(
-    model_name,
-    token = None,
-    revision = None,
-    trust_remote_code = False,
-):
-    # All Unsloth Zoo code licensed under LGPLv3
-    from transformers import AutoConfig
-    from huggingface_hub.utils import disable_progress_bars, enable_progress_bars, are_progress_bars_disabled
-    was_disabled = are_progress_bars_disabled()
-    disable_progress_bars()
-
-    config = AutoConfig.from_pretrained(
-        model_name,
-        token = token,
-        revision = revision,
-        trust_remote_code = trust_remote_code,
-    )
-    if not was_disabled: enable_progress_bars()
-
-    model_types = []
-    config = str(config.to_dict())
-    model_types = re.findall(r"'model_type': '([^\s\']{1,})'", config)
-    model_types = [x.replace("-", "_").lower() for x in model_types]
-    # Add splitted modules for eg gemma3_text -> gemma3
-    model_types += [x.split("_")[0] for x in model_types]
-    if 'gpt-oss' in os.environ.get("UNSLOTH_MODEL_NAME", ""):
-        model_types = [x for x in model_types if x != "gpt"]
-    model_types = list(dict().fromkeys(model_types))
-
-    from transformers import models
-    models = dir(models)
-    all_model_types = set()
-    for name in models:
-        for model_type in model_types:
-            if model_type in name.lower():
-                all_model_types.add(model_type)
-                break
+def get_transformers_model_type(config):
+    """ Gets model_type from config file - can be PEFT or normal HF """
+    if config is None:
+        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
+    model_types = None
+    from peft import PeftConfig
+    if issubclass(type(config), PeftConfig):
+        model_type_list = re.finditer(r"transformers\.models\.([^\.]{2,})\.modeling_\1", str(config))
+        model_type_list = list(model_type_list)
+        # Use transformers.models.gpt_oss.modeling_gpt_oss
+        if len(model_type_list) != 0:
+            model_type = model_type_list[0].group(1)
+            model_types = [model_type]
+        elif hasattr(config, "auto_mapping"):
+            # Use GptOssForCausalLM
+            model_type = config.auto_mapping.get("base_model_class", None)
+            if model_type is None:
+                # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
+                model_type = config.base_model_name_or_path
+                model_type = os.path.split(model_type)[-1]
+            model_types = [model_type]
+    else:
+        from collections.abc import Mapping, Sequence
+        def find_values(data, target_key):
+            stack = [data]
+            while stack:
+                obj = stack.pop()
+                if isinstance(obj, Mapping):
+                    # Emit values for matches
+                    if target_key in obj:
+                        yield obj[target_key]
+                    # Keep walking into nested values
+                    stack.extend(obj.values())
+                elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
+                    # Walk sequences (lists/tuples/sets), but not strings/bytes
+                    stack.extend(obj)
+        model_types = list(find_values(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
     pass
-
-    all_model_types = list(all_model_types)
-    return all_model_types
+    if model_types is None:
+        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
+    # Standardize model_type
+    final_model_types = []
+    for model_type in model_types:
+        model_type = model_type.lower()
+        model_type = model_type.replace("-", "_")
+        model_type = model_type.replace("/", "_")
+        model_type = model_type.replace(".", "_")
+        final_model_types.append(model_type)
+    return sorted(final_model_types)
 pass
 
 
@@ -1387,7 +1394,6 @@ def patch_gradient_checkpointing(module, source):
     try: forward = inspect.getsource(source.forward)
     except: return None
     if "_gradient_checkpointing_func" in forward: return None
-    if 'gpt-oss' in os.environ.get("UNSLOTH_MODEL_NAME", ""): return None
 
     # Fix Qwen2 missing None for gradient checkpointing
     for custom_find, custom_replace in custom_gradient_checkpointing_replacements:
@@ -1424,6 +1430,9 @@ def patch_gradient_checkpointing(module, source):
     # Also fix init
     spaces = init.find("def")
     init = init + "\n" + (spaces + 4) * " " + "self.gradient_checkpointing = False\n\n"
+
+    # Confirm no equal signs seen - might be "attention_mask=causal_mask_mapping" vs "attention_mask=attention_mask"
+    if "=" in init: return None
     return init, forward
 pass
 
@@ -2394,6 +2403,9 @@ def unsloth_compile_transformers(
     if gradient_checkpointing:
         for module in other_classes:
             source = eval(f"{model_location}.{module}")
+            if "(GradientCheckpointingLayer)" in full_source:
+                # Uses GC layers which is in new transformers - no need to patch
+                continue
             output = patch_gradient_checkpointing(module, source)
             if output is None: continue
 
