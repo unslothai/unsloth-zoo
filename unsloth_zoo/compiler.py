@@ -1404,7 +1404,6 @@ def patch_gradient_checkpointing(module, source):
     modulelist_items = re.findall(r"(self\.[^\s]{1,}) = .*?nn\.ModuleList\(", init)
     if len(modulelist_items) != 1: return None
     modulelist_item = modulelist_items[0]
-    print(modulelist_items)
 
     # Check in forward source
     finder = \
@@ -2404,9 +2403,9 @@ def unsloth_compile_transformers(
     if gradient_checkpointing:
         for module in other_classes:
             source = eval(f"{model_location}.{module}")
-            # if "(GradientCheckpointingLayer)" in full_source:
-            #     # Uses GC layers which is in new transformers - no need to patch
-            #     continue
+            if "(GradientCheckpointingLayer)" in full_source:
+                # Uses GC layers which is in new transformers - no need to patch
+                continue
             output = patch_gradient_checkpointing(module, source)
             if output is None: continue
 
