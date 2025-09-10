@@ -23,4 +23,5 @@ import os
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
 logger = logging.getLogger(__name__)
 if UNSLOTH_ENABLE_LOGGING:
+    logging.basicConfig(level=logging.DEBUG, format='%(name)s - %(levelname)s - %(message)s')
     logger.setLevel(logging.DEBUG)
