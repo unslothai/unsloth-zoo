@@ -259,10 +259,9 @@ def get_transformers_model_type(config):
     final_model_types = []
     for model_type in model_types:
         model_type = model_type.lower()
-        model_type = model_type.replace("_", "")
-        model_type = model_type.replace("-", "")
-        model_type = model_type.replace("/", "")
-        model_type = model_type.replace(".", "")
+        model_type = model_type.replace("-", "_")
+        model_type = model_type.replace("/", "_")
+        model_type = model_type.replace(".", "_")
         final_model_types.append(model_type)
     return sorted(final_model_types)
 pass
