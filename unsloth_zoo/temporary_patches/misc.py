@@ -178,7 +178,11 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: KWARGS_TYPE,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        return old_forward(**locals())
+        new_kwargs = locals().copy()
+        new_kwargs.pop('old_forward', None)
+        kwargs = new_kwargs.pop('kwargs', dict())
+        new_kwargs.update(kwargs)
+        return old_forward(**new_kwargs)
     patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
@@ -329,7 +333,11 @@ def patch_CsmForConditionalGeneration_forward():
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: KWARGS_TYPE,
     ) -> Union[Tuple, CsmOutputWithPast]:
-        return old_forward(**locals())
+        new_kwargs = locals().copy()
+        new_kwargs.pop('old_forward', None)
+        kwargs = new_kwargs.pop('kwargs', dict())
+        new_kwargs.update(kwargs)
+        return old_forward(**new_kwargs)
     patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
