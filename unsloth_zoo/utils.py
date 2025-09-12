@@ -28,11 +28,20 @@ import torch
 import os
 import time
 import contextlib
+import re
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        return TrueVersion(version)
+        version = str(version)
+        try:
+            return TrueVersion(version)
+        except Exception as e:
+            version = re.match(r"[0-9\.]{1,}", version)
+            if version is None:
+                raise Exception(str(e))
+            version = version.group(0).rstrip(".")
+            return TrueVersion(version)
     except:
         from inspect import getframeinfo, stack
         caller = getframeinfo(stack()[1][0])
