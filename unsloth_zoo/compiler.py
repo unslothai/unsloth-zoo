@@ -220,7 +220,10 @@ _patch_functions = [
 def get_transformers_model_type(config):
     """ Gets model_type from config file - can be PEFT or normal HF """
     if config is None:
-        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
+        raise RuntimeError(
+            f"Unsloth: No config file found - are you sure the `model_name` is correct?\n"\
+            f"If you're passing a model on your local device, confirm if the folder location exists."
+        )
     model_types = None
     from peft import PeftConfig
     if issubclass(type(config), PeftConfig):
