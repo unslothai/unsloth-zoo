@@ -34,6 +34,7 @@ from .utils import (
     patch_function_past_key_values,
     dedent,
 )
+import inspect
 
 
 def patch_Gemma3Processor():
