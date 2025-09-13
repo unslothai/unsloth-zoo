@@ -586,7 +586,7 @@ def patch_function_past_key_values(
                     success = patch_function(
                         target_obj = target_obj,
                         attr_name = attr_name,
-                        func = func, 
+                        new_func = func, 
                         force = force,
                         store_original = store_original,
                         match_level = match_level,
