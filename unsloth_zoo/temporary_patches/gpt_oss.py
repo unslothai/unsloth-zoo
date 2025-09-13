@@ -20,7 +20,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import inspect
-import textwrap
 from .common import TEMPORARY_PATCHES, torch_compile
 from importlib.metadata import version as importlib_version
 from ..utils import Version
@@ -718,20 +717,19 @@ def patch_GptOssAttention():
     pass
 
     functions = []
-    forward = """
     def forward(
         self,
-        hidden_states:       torch.Tensor,
+        hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask:      Optional[torch.Tensor],
-        past_key_values:     Optional[Cache] = None,
-        cache_position:      Optional[torch.LongTensor] = None,
-        **kwargs:            KWARGS_TYPE,
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
-    """
-    functions.append(exec(dedent(forward.replace("past_key_values", "past_key_values")), locals(), globals()))
-    functions.append(exec(dedent(forward.replace("past_key_values", "past_key_value" )), locals(), globals()))
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+    functions.append(forward)
+    exec(dedent(inspect.getsource(forward).replace("past_key_value", "past_key_values")), locals(), globals())
+    functions.append(forward)
     patch_function_past_key_values(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", functions)
     # Set env variable for padding purposes
     os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
@@ -1057,8 +1055,8 @@ try:
             return raise_error("transformers.models.gpt_oss.configuration_gpt_oss", e)
 
         try:
-            current_class = textwrap.dedent(inspect.getsource(transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig))
-            new_class = textwrap.dedent(inspect.getsource(Old_GptOssConfig))
+            current_class = dedent(inspect.getsource(transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig))
+            new_class = dedent(inspect.getsource(Old_GptOssConfig))
             new_class = new_class.replace("Old_GptOssConfig", "GptOssConfig")
             if new_class == current_class:
                 logger.info("Unsloth: Updating GPT OSS Config to fix missing `max_position_embeddings`")
