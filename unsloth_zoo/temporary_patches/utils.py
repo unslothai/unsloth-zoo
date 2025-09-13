@@ -572,7 +572,7 @@ def patch_function_past_key_values(
         logger.error(f"Unsloth: Cannot inspect {target_obj.__name__}")
         return False
     success = False
-    error
+    error = ""
     for func in new_functions:
         try:
             new_keys = inspect.signature(func).parameters.keys()
