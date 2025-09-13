@@ -27,6 +27,8 @@ from ..utils import Version
 transformers_version = Version(importlib_version("transformers"))
 from .utils import (
     patch_function,
+    patch_function_past_key_values,
+    dedent,
     KWARGS_TYPE,
     raise_error,
     logger,
@@ -715,34 +717,22 @@ def patch_GptOssAttention():
         return attn_output, attn_weights
     pass
 
-    def forward_backward_compat(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
-
-    # Change past_key_value to past_key_values
+    functions = []
+    forward = """
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states:       torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
+        attention_mask:      Optional[torch.Tensor],
+        past_key_values:     Optional[Cache] = None,
+        cache_position:      Optional[torch.LongTensor] = None,
+        **kwargs:            KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
-
-    if transformers_version <= Version("4.55.4"):
-        patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward_backward_compat)
-    else:
-        patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
-
+    """
+    functions.append(exec(dedent(forward.replace("past_key_values", "past_key_values")), locals(), globals()))
+    functions.append(exec(dedent(forward.replace("past_key_values", "past_key_value" )), locals(), globals()))
+    patch_function_past_key_values(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", functions)
     # Set env variable for padding purposes
     os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
 pass
