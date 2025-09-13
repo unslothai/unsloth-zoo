@@ -77,6 +77,8 @@ minor = None
 if DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
     OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+elif DEVICE_TYPE == "hip":
+    OLD_CUDA_ARCH_VERSION = False
 elif DEVICE_TYPE == "xpu":
     OLD_CUDA_ARCH_VERSION = False
 pass
@@ -218,27 +220,46 @@ _patch_functions = [
 def get_transformers_model_type(config):
     """ Gets model_type from config file - can be PEFT or normal HF """
     if config is None:
-        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
+        raise RuntimeError(
+            f"Unsloth: No config file found - are you sure the `model_name` is correct?\n"\
+            f"If you're using a model on your local device, confirm if the folder location exists.\n"\
+            f"If you're using a HuggingFace online model, check if it exists."
+        )
     model_types = None
+
     from peft import PeftConfig
     if issubclass(type(config), PeftConfig):
         model_type_list = re.finditer(r"transformers\.models\.([^\.]{2,})\.modeling_\1", str(config))
         model_type_list = list(model_type_list)
-        # Use transformers.models.gpt_oss.modeling_gpt_oss
         if len(model_type_list) != 0:
+            # Use transformers.models.gpt_oss.modeling_gpt_oss
             model_type = model_type_list[0].group(1)
             model_types = [model_type]
-        elif hasattr(config, "auto_mapping"):
+        elif getattr(config, "auto_mapping", None) is not None:
             # Use GptOssForCausalLM
             model_type = config.auto_mapping.get("base_model_class", None)
+            if model_type is not None:
+                model_type = str(model_type)
+                model_type = model_type.rsplit("For", 1)[0].lower()
+                # Find exact name of modeling path
+                import transformers.models
+                supported_model_types = dir(transformers.models)
+                for modeling_file in supported_model_types:
+                    if model_type == modeling_file.lower().replace("_", "").replace(".", "_").replace("-", "_"):
+                        model_types = [modeling_file]
+                        break
+            pass
+        if model_types is None:
+            # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
+            model_type = getattr(config, "base_model_name_or_path", None)
             if model_type is None:
-                # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
-                model_type = config.base_model_name_or_path
-                model_type = os.path.split(model_type)[-1]
+                raise TypeError("Unsloth: adapter_config.json's `base_model_name_or_path` is None?")
+            model_type = str(model_type)
+            model_type = os.path.split(model_type)[-1]
             model_types = [model_type]
     else:
         from collections.abc import Mapping, Sequence
-        def find_values(data, target_key):
+        def find(data, target_key):
             stack = [data]
             while stack:
                 obj = stack.pop()
@@ -251,7 +272,7 @@ def get_transformers_model_type(config):
                 elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
                     # Walk sequences (lists/tuples/sets), but not strings/bytes
                     stack.extend(obj)
-        model_types = list(find_values(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
+        model_types = list(find(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
     pass
     if model_types is None:
         raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
