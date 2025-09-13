@@ -257,7 +257,7 @@ def get_transformers_model_type(config):
             raise TypeError("Unsloth: adapter_config.json's `base_model_name_or_path` is None?")
         base_model_name_or_path = str(base_model_name_or_path)
         # Set model name for patching purposes
-        os.environ["UNSLOTH_MODEL_NAME"] = base_model_name_or_path
+        os.environ["UNSLOTH_MODEL_NAME"] = base_model_name_or_path.lower()
 
         # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
         if model_types is None:
