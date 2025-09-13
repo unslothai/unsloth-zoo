@@ -231,13 +231,13 @@ def get_transformers_model_type(config):
     if issubclass(type(config), PeftConfig):
         model_type_list = re.finditer(r"transformers\.models\.([^\.]{2,})\.modeling_\1", str(config))
         model_type_list = list(model_type_list)
-        # Use transformers.models.gpt_oss.modeling_gpt_oss
-        if hasattr(config, "auto_mapping"):
-            auto_mapping = config.auto_mapping
-            if auto_mapping is None:
-                raise TypeError("Unsloth: adapter_config.json's `auto_mapping` is None?")
+        if len(model_type_list) != 0:
+            # Use transformers.models.gpt_oss.modeling_gpt_oss
+            model_type = model_type_list[0].group(1)
+            model_types = [model_type]
+        elif getattr(config, "auto_mapping", None) is not None:
             # Use GptOssForCausalLM
-            model_type = auto_mapping.get("base_model_class", None)
+            model_type = config.auto_mapping.get("base_model_class", None)
             if model_type is not None:
                 model_type = str(model_type)
                 model_type = model_type.rsplit("For", 1)[0].lower()
@@ -259,7 +259,7 @@ def get_transformers_model_type(config):
             model_types = [model_type]
     else:
         from collections.abc import Mapping, Sequence
-        def find_values(data, target_key):
+        def find(data, target_key):
             stack = [data]
             while stack:
                 obj = stack.pop()
@@ -272,7 +272,7 @@ def get_transformers_model_type(config):
                 elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
                     # Walk sequences (lists/tuples/sets), but not strings/bytes
                     stack.extend(obj)
-        model_types = list(find_values(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
+        model_types = list(find(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
     pass
     if model_types is None:
         raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
