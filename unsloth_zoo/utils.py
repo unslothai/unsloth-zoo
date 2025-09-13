@@ -67,9 +67,9 @@ def _get_dtype(dtype):
     except:
         if type(dtype) is str:
             dtype = dtype.lower()
-            if hasattr(torch, dtype):
-                return getattr(torch, dtype)
-        if isinstance(dtype, torch.dtype): return dtype
+            return getattr(torch, dtype, None)
+        elif isinstance(dtype, torch.dtype):
+            return dtype
     return None
 pass
 
