@@ -18,6 +18,9 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import torch
 import torch.nn as nn
 import os
+from importlib.metadata import version as importlib_version
+from ..utils import Version
+transformers_version = Version(importlib_version("transformers"))
 from .common import TEMPORARY_PATCHES, torch_compile
 from .utils import (
     patch_function,
@@ -502,7 +505,7 @@ def patch_Gemma3Attention():
         return attn_output_projected, attn_weights # 3-tuple return
     pass
 
-    def forward(
+    def forward_backward_compat(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor,
@@ -512,7 +515,6 @@ def patch_Gemma3Attention():
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
 
     # Change past_key_value to past_key_values
     def forward(
@@ -525,7 +527,12 @@ def patch_Gemma3Attention():
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
+
+    if transformers_version <= Version("4.55.4"):
+        patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward_backward_compat)
+    else:
+        patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
+
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention)
 
@@ -738,7 +745,7 @@ def patch_Gemma3Attention_generic():
         return attn_output_projected, attn_weights # 3-tuple return
     pass
 
-    def forward(
+    def forward_backward_compat(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor,
@@ -748,7 +755,6 @@ def patch_Gemma3Attention_generic():
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
 
     def forward(
         self,
@@ -760,6 +766,10 @@ def patch_Gemma3Attention_generic():
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", forward)
+
+        if transformers_version <= Version("4.55.4"):
+            patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward_backward_compat)
+        else:
+            patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention_generic)
