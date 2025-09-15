@@ -583,7 +583,7 @@ def _merge_and_overwrite_lora(
                 except Exception as e:
                     logger.info(f"Failed overwriting safetensor file at `{output_key}` with error = {str(e)}. Switching to slower version.")
                     if numpy_view.nbytes != (index_R - index_L):
-                        logger.info(f"Fast saving got incorrect elements with `numpy_view={len(numpy_view)}, mmap={index_R-index_L}`")
+                        logger.info(f"Fast saving got incorrect elements with `numpy_view={numpy_view.nbytes}, mmap={index_R-index_L}`")
                     # Disable overwrite
                     overwrite = False
                     mm.flush(); mm.close(); mm = None;
