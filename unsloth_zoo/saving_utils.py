@@ -572,10 +572,12 @@ def _merge_and_overwrite_lora(
                 index_R += 8 + length_of_header # Indexing via [] uses seek(0)
                 # array = mm[index_L : index_R]
                 # Transform tensor to numpy bytes format
-                numpy_view = W.ravel().to(output_dtype).contiguous().view(torch.uint8)
+                numpy_view = W.to(output_dtype).view(torch.uint8).contiguous().ravel()
                 numpy_view = numpy_view.to("cpu", non_blocking = True).numpy()
                 try:
-                    mm[index_L : index_R] = memoryview(numpy_view)
+                    # mm[index_L : index_R] = memoryview(numpy_view)
+                    mm.seek(index_L)
+                    mm.write(numpy_view.tobytes())
                     success = True
                     del W
                     del numpy_view
