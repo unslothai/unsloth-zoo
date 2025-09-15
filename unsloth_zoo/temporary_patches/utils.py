@@ -16,6 +16,7 @@
 
 __all__ = [
     "patch_function",
+    "patch_function_past_key_values",
     "process_return",
     "process_output_options",
     "KWARGS_TYPE",
@@ -33,11 +34,13 @@ __all__ = [
     "ProcessingKwargs",
     "ProcessorMixin",
     "_get_unique_storage_name",
+    "dedent",
 ]
 import inspect
 import typing as t
 import torch
-from typing import Any, Callable, Dict, List, Tuple
+from textwrap import dedent
+from typing import Any, Callable, Dict, List, Tuple, Union
 try:
     t_TypedDictMeta = t._TypedDictMeta
 except:
@@ -388,7 +391,6 @@ def can_safely_patch(
     except ValueError as e:
         return False, f"Signature inspection failed: {e}"
 
-
     # If relaxed, allow matching with *args, **kwargs
     def check_args_kwargs(old_fp, new_fp, removed_flags_list):
         if (len(new_fp) >= 2) and (
@@ -544,6 +546,60 @@ def patch_function(
             logger.error(f"Unsloth: Failed to patch {target_obj.__name__}.{attr_name}: {e}")
         return False
     pass
+pass
+
+
+def patch_function_past_key_values(
+    target_obj: Any,
+    attr_name: str,
+    new_functions: Union[Callable, List[Callable]], 
+    force: bool = False,
+    store_original: bool = True, 
+    match_level: str = "strict",
+    fullgraph = None,
+    dynamic = True,
+) -> bool:
+    """ Patch either past_key_value or past_key_values """
+    if not hasattr(target_obj, attr_name):
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.error(f"Unsloth: Attribute '{attr_name}' not found on {target_obj.__name__}")
+        return False
+
+    original_func = getattr(target_obj, attr_name)
+    try:
+        old_keys = inspect.signature(original_func).parameters.keys()
+    except:
+        logger.error(f"Unsloth: Cannot inspect {target_obj.__name__}")
+        return False
+    success = False
+    error = ""
+    for func in new_functions:
+        try:
+            new_keys = inspect.signature(func).parameters.keys()
+        except Exception as e:
+            error = str(e)
+            continue
+        # Check if either is provided
+        for key in ("past_key_value", "past_key_values",):
+            if key in new_keys and key in old_keys:
+                try:
+                    success = patch_function(
+                        target_obj = target_obj,
+                        attr_name = attr_name,
+                        new_func = func, 
+                        force = force,
+                        store_original = store_original,
+                        match_level = match_level,
+                        fullgraph = fullgraph,
+                        dynamic = dynamic,
+                    )
+                    if success: break
+                except Exception as e:
+                    error = str(e)
+                    continue
+    if not success and UNSLOTH_ENABLE_LOGGING:
+        logger.error(f"Unsloth: Failed to patch {target_obj.__name__}.{attr_name}: {error}")
+    return success
 pass
 
 

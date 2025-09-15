@@ -249,13 +249,19 @@ def get_transformers_model_type(config):
                         model_types = [modeling_file]
                         break
             pass
+        pass
+
+        # Get original base model
+        base_model_name_or_path = getattr(config, "base_model_name_or_path", None)
+        if base_model_name_or_path is None:
+            raise TypeError("Unsloth: adapter_config.json's `base_model_name_or_path` is None?")
+        base_model_name_or_path = str(base_model_name_or_path)
+        # Set model name for patching purposes
+        os.environ["UNSLOTH_MODEL_NAME"] = base_model_name_or_path.lower()
+
+        # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
         if model_types is None:
-            # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
-            model_type = getattr(config, "base_model_name_or_path", None)
-            if model_type is None:
-                raise TypeError("Unsloth: adapter_config.json's `base_model_name_or_path` is None?")
-            model_type = str(model_type)
-            model_type = os.path.split(model_type)[-1]
+            model_type = os.path.split(base_model_name_or_path)[-1]
             model_types = [model_type]
     else:
         from collections.abc import Mapping, Sequence
