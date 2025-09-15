@@ -1097,11 +1097,17 @@ def merge_and_overwrite_lora(
                 print(f"Copied {filename} from local model directory")
 
         elif not copied_all_from_cache and low_disk_space_usage and not os.path.exists(file_path) and not is_local_path:
-            hf_hub_download(
+            # hf_hub_download(
+            #     repo_id = model_name,
+            #     filename = filename,
+            #     repo_type = "model",
+            #     local_dir = save_directory,
+            # )
+            snapshot_download(
                 repo_id = model_name,
-                filename = filename,
-                repo_type = "model",
                 local_dir = save_directory,
+                allow_patterns = [filename],
+                local_dir_use_symlinks = False,
             )
         pass
         n_saved_modules += _merge_and_overwrite_lora(
@@ -1201,7 +1207,7 @@ def _try_copy_all_from_cache(
     all_found = True
     for filename in filenames_to_check:
         try:
-            cached_path_str = hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True)
+            cached_path_str = hf_hub_download(repo_id = repo_id, filename = filename, local_files_only = True)
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
             print(f"Cache check failed: {filename} not found in local cache.") # Verbose
@@ -1727,12 +1733,11 @@ def check_model_quantization_status(model_name_or_path, token=None):
     # HF repo
     else:
         try:
-            from huggingface_hub import hf_hub_download
             config_path = hf_hub_download(
-                repo_id=model_name_or_path,
-                filename="config.json",
-                cache_dir=None,
-                token=token
+                repo_id = model_name_or_path,
+                filename = "config.json",
+                cache_dir = None,
+                token = token
             )
             with open(config_path, 'r', encoding="utf-8") as f:
                 config = json.load(f)
