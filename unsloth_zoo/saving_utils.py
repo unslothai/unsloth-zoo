@@ -464,12 +464,12 @@ def _merge_and_overwrite_lora(
         # Set to track mxfp4 keys that have already been processed
         processed_mxfp4_keys = set()
 
-        for key in safetensor_keys:
+        for iteration, key in enumerate(safetensor_keys):
             if key in processed_mxfp4_keys:
                 continue
 
             # FORCE memory cleanup before processing each tensor
-            if torch.cuda.is_available():
+            if not overwrite:
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
@@ -495,9 +495,8 @@ def _merge_and_overwrite_lora(
 
                         blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
 
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()  # Wait for previous operations to complete
-                            torch.cuda.empty_cache()
+                        torch.cuda.synchronize() # Wait for previous operations to complete
+                        torch.cuda.empty_cache()
 
                         # Determine optimal device and chunk size for mxfp4 dequantization
                         device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
@@ -606,9 +605,9 @@ def _merge_and_overwrite_lora(
                     pass
                 # Save to tensors output for saving in the future
                 tensors[output_key] = W
+                # Free up VRAM after each merge
+                torch.cuda.empty_cache()
             pass
-            # Free up VRAM after each merge
-            torch.cuda.empty_cache()
         pass
     pass
 
@@ -622,6 +621,7 @@ def _merge_and_overwrite_lora(
         overwrite = False
         mm.flush(); mm.close(); mm = None;
         raw_pointer.flush(); raw_pointer.close(); raw_pointer = None
+        gc.collect()
         # FAST return if overwriting
         return count
     pass
@@ -631,7 +631,7 @@ def _merge_and_overwrite_lora(
         temp_filename_safetensors = tmpfile.name
 
     save_file(tensors, temp_filename_safetensors, metadata = {"format": "pt"})  # Save to the temporary safetensors file
-
+    del tensors
     # Replace the temporary file with the original file
     try:
         os.replace(temp_filename_safetensors, filename_original)  # Attempt atomic rename
