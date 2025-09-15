@@ -398,7 +398,7 @@ def _merge_and_overwrite_lora(
     model_class_name,
     base_model_is_quantized = False,
     quant_type = None,
-    overwrite = True, # Overwrites current safetensor file
+    overwrite = False, # Overwrites current safetensor file
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -1114,7 +1114,7 @@ def merge_and_overwrite_lora(
             model_class_name = find_lora_base_model(model).__class__.__name__,
             base_model_is_quantized = base_model_is_quantized,
             quant_type = quant_type,
-            overwrite = True, # Faster overwriting logic
+            overwrite = False, # Faster overwriting logic
         )
         torch.cuda.empty_cache()
         if low_disk_space_usage and push_to_hub:
