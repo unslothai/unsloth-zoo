@@ -251,14 +251,19 @@ def grpo_compute_loss(
 
     # loss = (loss_i * mask).sum() / mask.sum()
     
-    # Get metrics as well which are folded
-    with torch.inference_mode():
-        completion_length = n_mask_per_reward.mean()
-        mean_kl_per_reward = (kl_i * mask).sum(1) / n_mask_per_reward
-        mean_kl = mean_kl_per_reward.mean()
-    pass
+    completion_length = n_mask_per_reward.mean()
 
-    return loss, completion_length, mean_kl
+    # loss = (loss_i * mask).sum() / mask.sum()
+    def masked_batch_mean(x):
+        with torch.inference_mode():
+            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
+                return x.mean()
+            else:
+                mean_kl_per_reward = (kl_i * mask).sum(1) / n_mask_per_reward
+                mean_kl = mean_kl_per_reward.mean()
+                return mean_kl
+
+    return loss, completion_length,  masked_batch_mean(kl_i)
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
