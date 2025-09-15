@@ -622,7 +622,7 @@ def _merge_and_overwrite_lora(
     if overwrite:
         overwrite = False
         mm.flush(); os.fsync(raw_pointer.fileno()); mm.close(); mm = None
-        raw_pointer.flush(); aw_pointer.close(); raw_pointer = None
+        raw_pointer.flush(); raw_pointer.close(); raw_pointer = None
         gc.collect()
         # FAST return if overwriting
         return count
