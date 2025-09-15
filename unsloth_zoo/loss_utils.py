@@ -346,8 +346,8 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             if torch.is_tensor(num_items_in_batch):
                 if device is not None:
                     num_items_in_batch = num_items_in_batch.to(device)
-                if getattr(self.args, "n_gpu", 1) > 1 and len(num_items_in_batch.size()) == 0:
-                    num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
+                # if getattr(self.args, "n_gpu", 1) > 1 and len(num_items_in_batch.size()) == 0:
+                #     num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
         except Exception as exception:
             raise RuntimeError(exception)
     pass
