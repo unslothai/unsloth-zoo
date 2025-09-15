@@ -296,6 +296,7 @@ def canonicalize_annotation(annotation: Any) -> Any:
         # Union[str, List[str], list[str]] gets reduced to Union[str, list[str]]
         # due to duplicates. We also sort Unions
         if annotation[0] == t.Union:
+            print(annotation[1])
             annotation = (annotation[0], tuple(set(annotation[1])),)
         # Fix up kwargs
         # (typing.Unpack, (<class 'transformers.models.csm.modeling_csm.KwargsForCausalLM'>,)) to
