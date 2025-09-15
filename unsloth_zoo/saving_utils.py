@@ -450,7 +450,7 @@ def _merge_and_overwrite_lora(
                 logger.info("Unsloth: Disabling disk space efficient overwriting and switching to less efficient temporary file approach.")
                 # Disable overwrite
                 overwrite = False
-                mm.flush(); mm.close(); mm = None;
+                mm.flush(); os.fsync(raw_pointer.fileno()); mm.close(); mm = None
                 raw_pointer.flush(); raw_pointer.close(); raw_pointer = None
         pass
 
@@ -587,7 +587,7 @@ def _merge_and_overwrite_lora(
                         logger.info(f"Fast saving got incorrect elements with `numpy_view={numpy_view.nbytes}, mmap={index_R-index_L}`")
                     # Disable overwrite
                     overwrite = False
-                    mm.flush(); mm.close(); mm = None;
+                    mm.flush(); os.fsync(raw_pointer.fileno()); mm.close(); mm = None
                     raw_pointer.flush(); raw_pointer.close(); raw_pointer = None
             pass
             if not success:
@@ -621,8 +621,8 @@ def _merge_and_overwrite_lora(
     # Final cleanup for overwrite
     if overwrite:
         overwrite = False
-        mm.flush(); mm.close(); mm = None;
-        raw_pointer.flush(); raw_pointer.close(); raw_pointer = None
+        mm.flush(); os.fsync(raw_pointer.fileno()); mm.close(); mm = None
+        raw_pointer.flush(); aw_pointer.close(); raw_pointer = None
         gc.collect()
         # FAST return if overwriting
         return count
