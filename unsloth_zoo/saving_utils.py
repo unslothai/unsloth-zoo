@@ -450,7 +450,7 @@ def _merge_and_overwrite_lora(
                 logger.info("Unsloth: Disabling disk space efficient overwriting and switching to less efficient temporary file approach.")
                 # Disable overwrite
                 overwrite = False
-                mm.flush(); mm.close(); mm = None;
+                mm.flush(); os.fsync(raw_pointer.fileno()); mm.close(); mm = None
                 raw_pointer.flush(); raw_pointer.close(); raw_pointer = None
         pass
 
@@ -572,10 +572,12 @@ def _merge_and_overwrite_lora(
                 index_R += 8 + length_of_header # Indexing via [] uses seek(0)
                 # array = mm[index_L : index_R]
                 # Transform tensor to numpy bytes format
-                numpy_view = W.ravel().to(output_dtype).contiguous().view(torch.uint8)
+                numpy_view = W.to(output_dtype).view(torch.uint8).contiguous().ravel()
                 numpy_view = numpy_view.to("cpu", non_blocking = True).numpy()
                 try:
-                    mm[index_L : index_R] = memoryview(numpy_view)
+                    # mm[index_L : index_R] = memoryview(numpy_view)
+                    mm.seek(index_L)
+                    mm.write(numpy_view.tobytes())
                     success = True
                     del W
                     del numpy_view
@@ -585,7 +587,7 @@ def _merge_and_overwrite_lora(
                         logger.info(f"Fast saving got incorrect elements with `numpy_view={numpy_view.nbytes}, mmap={index_R-index_L}`")
                     # Disable overwrite
                     overwrite = False
-                    mm.flush(); mm.close(); mm = None;
+                    mm.flush(); os.fsync(raw_pointer.fileno()); mm.close(); mm = None
                     raw_pointer.flush(); raw_pointer.close(); raw_pointer = None
             pass
             if not success:
@@ -619,7 +621,7 @@ def _merge_and_overwrite_lora(
     # Final cleanup for overwrite
     if overwrite:
         overwrite = False
-        mm.flush(); mm.close(); mm = None;
+        mm.flush(); os.fsync(raw_pointer.fileno()); mm.close(); mm = None
         raw_pointer.flush(); raw_pointer.close(); raw_pointer = None
         gc.collect()
         # FAST return if overwriting
@@ -1201,7 +1203,7 @@ def _try_copy_all_from_cache(
     all_found = True
     for filename in filenames_to_check:
         try:
-            cached_path_str = hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True)
+            cached_path_str = hf_hub_download(repo_id = repo_id, filename = filename, local_files_only = True)
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
             print(f"Cache check failed: {filename} not found in local cache.") # Verbose
@@ -1727,12 +1729,11 @@ def check_model_quantization_status(model_name_or_path, token=None):
     # HF repo
     else:
         try:
-            from huggingface_hub import hf_hub_download
             config_path = hf_hub_download(
-                repo_id=model_name_or_path,
-                filename="config.json",
-                cache_dir=None,
-                token=token
+                repo_id = model_name_or_path,
+                filename = "config.json",
+                cache_dir = None,
+                token = token
             )
             with open(config_path, 'r', encoding="utf-8") as f:
                 config = json.load(f)
