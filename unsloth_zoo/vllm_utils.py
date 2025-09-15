@@ -60,6 +60,7 @@ from .temporary_patches.common import (
 )
 from .log import logger
 from unsloth import DEVICE_TYPE
+from unsloth.models.vision import VLLM_SUPPORTED_VLM
 global LORA_REQUEST_ID
 
 # Ignore logging messages
@@ -1304,6 +1305,7 @@ def approximate_vllm_memory_usage(
     if total_memory - free_memory < maximum_activation:
         free_memory = total_memory - maximum_activation
     actual_gpu_memory_utilization = free_memory / total_memory
+    print(f'Unsloth: {load_in_4bit=} {actual_gpu_memory_utilization=} \t {free_memory=} \t {total_memory=} \t {maximum_activation=}')
 
     # 2 bytes = float16
     total_quantizable_elements = (qkvo + mlp)*n_layers * 2
@@ -1317,6 +1319,7 @@ def approximate_vllm_memory_usage(
     kv_elements = (kv_size * 2 * n_layers) * float_bytes
     memory_left_for_kv_cache = free_memory - bytes_for_model
     if memory_left_for_kv_cache <= 0: memory_left_for_kv_cache = 0
+    print(f'Unsloth: {total_quantizable_elements=} \t {total_float16_elements=} \t {lora_elements=} \t {bytes_for_model=} \t {kv_elements=} \t {memory_left_for_kv_cache=}')
 
     # Approx maximum # of KV cache elements
     max_num_batched_tokens = int(0.95*(memory_left_for_kv_cache / kv_elements))
@@ -2203,7 +2206,7 @@ def _test_get_vllm_state_dict(
 
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     bnb_config = None
-    load_in_4bit = model_name.lower().endswith("-bnb-4bit")
+    load_in_4bit = model_name.lower().endswith("-bnb-4bit") or load_in_4bit
     if load_in_4bit:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit              = True,
@@ -2225,7 +2228,7 @@ def _test_get_vllm_state_dict(
     if not is_vision_model:
         model_class = AutoModelForCausalLM
     else:
-        if model_type in ["qwen2_5_vl", "gemma3", "mllama"]:
+        if model_type in VLLM_SUPPORTED_VLM:
             import transformers
             model_class = getattr(transformers, config.architectures[0])
         else:

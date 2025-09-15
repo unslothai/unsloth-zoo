@@ -476,6 +476,10 @@ def get_model_layer_config():
             "model.vision_tower.vision_model.encoder.layers.{kk}.post_layernorm",
             "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm1",
             "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm2",
+
+            # Mistral3 vision norms
+            "model.vision_tower.transformer.layers.{kk}.attention_norm",
+            "model.vision_tower.transformer.layers.{kk}.ffn_norm",
         },
         'vision_layers': {
 
@@ -529,6 +533,14 @@ def get_model_layer_config():
             "model.visual.blocks.{kk}.mlp.up_proj",
             "model.visual.blocks.{kk}.mlp.down_proj",
 
+
+            # Mistral 3
+            "model.vision_tower.transformer.layers.{kk}.attention.qkv_proj",
+            "model.vision_tower.transformer.layers.{kk}.attention.o_proj",
+
+            "model.vision_tower.transformer.layers.{kk}.feed_forward.gate_up_proj",
+            "model.vision_tower.transformer.layers.{kk}.feed_forward.down_proj",
+
         },
         'additional_layers': {
             "model.visual.merger.mlp.{kk}",
@@ -557,7 +569,13 @@ def get_model_layer_config():
             "model.vision_model.pre_tile_positional_embedding.embedding",
             "model.vision_model.gated_positional_embedding",
             "model.vision_model.post_tile_positional_embedding.embedding",
-            "model.vision_model.pre_tile_positional_embedding.gate"
+            "model.vision_model.pre_tile_positional_embedding.gate",
+            # Mistral3
+            "model.vision_tower.patch_positional_embedding",
+            "model.vision_tower.patch_conv",
+            "model.vision_tower.ln_pre",
+            "model.multi_modal_projector.patch_merger.merging_layer"
+
         }
     }
     # Convert sets to sorted lists for deterministic order
@@ -642,15 +660,14 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 # vLLM uses vllm_internals.language_model.model.layers while HF uses model.language_model.layers
                 layer_path = layer_path.replace('language_model.model', 'language_model')
 
-
             if layer_module is not None:
                 if "qkv_proj" in layer_path:
-                    if model_type in ["mllama", "gemma3"]:
-                         get_state_dict(f"{layer_path.replace('qkv_proj', 'q_proj')}", 0, state_dict, layer_module)
-                         get_state_dict(f"{layer_path.replace('qkv_proj', 'k_proj')}", 1, state_dict, layer_module)
-                         get_state_dict(f"{layer_path.replace('qkv_proj', 'v_proj')}", 2, state_dict, layer_module)
-                    elif model_type == "qwen2_5_vl":
+                    if model_type == "qwen2_5_vl":
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
+                    else:
+                        get_state_dict(f"{layer_path.replace('qkv_proj', 'q_proj')}", 0, state_dict, layer_module)
+                        get_state_dict(f"{layer_path.replace('qkv_proj', 'k_proj')}", 1, state_dict, layer_module)
+                        get_state_dict(f"{layer_path.replace('qkv_proj', 'v_proj')}", 2, state_dict, layer_module)
                 elif "gate_up_proj" in layer_path:
                     # vLLM seems to have merged gate and up proj recently for qwen vl. This is to handle new variant
                     # https://github.com/jeejeelee/vllm/commit/a71e4765cc0c1534f2a8891aaf628e1751f6df07
@@ -676,13 +693,44 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
     non_layered_components = layer_config.get('non_layered_components', [])
     for component_path in non_layered_components:
         component = _get_nested_attr(vllm_internals, component_path)
+        print(f'Unsloth NLC component: {component_path=} {component=} {type(component)=}')
+
+        def check_keys(state_dict, msg=''):
+            for key in state_dict.keys():
+                if '..' in key:
+                    print(f'{msg} found a key that has .. {key}')
 
         if component is not None:
-            if isinstance(component, torch.nn.Module):
+            if hasattr(component, 'weight'):
+                get_state_dict(component_path, 0, state_dict, component)
+            elif isinstance(component, torch.nn.Module):
+                # breakpoint()
+                # for param_name, param in component.named_modules():
+                #     full_param_path = f"{component_path}.{param_name}"
+                #     print(f'Unsloth NLC module: {full_param_path=} {type(param)=} {component_path=} {param_name=}')
+                #     if hasattr(param, 'weight'):
+                #         print(f'\t processing {component_path, param_name} {param} with attr weight')
+                #         breakpoint()
+                #         get_state_dict(full_param_path, 0, state_dict, param,)
+                #         print(f'has been added? {full_param_path+".weight" in state_dict}')
+
+                print(f'Finished doing modules for {component_path}')
+                print('='*50)
                 for param_name, param in component.named_parameters():
-                    full_param_path = f"{component_path}.{param_name}"
-                    state_dict[full_param_path] = param.data
-                    quant_state_dict[full_param_path] = param.data
+                    full_param_path = f"{component_path}.{param_name}" if len(param_name) > 0 else component_path
+                    print(f'Unsloth NLC param: {full_param_path=} {type(param)=} {component_path=} {param_name=}')
+                    if '.weight' in full_param_path:
+                        correct_path = full_param_path[:-len('.weight')]
+                        p = _get_nested_attr(vllm_internals, correct_path)
+                        print(f'\t\t Fetched submodule {component_path}+{param_name} from {p=}')
+                        get_state_dict(correct_path, 0, state_dict, p)
+                        breakpoint()
+                    elif hasattr(param, 'data'):
+                        state_dict[full_param_path] = param.data
+                        quant_state_dict[full_param_path] = param.data
+                    check_keys(state_dict, param_name)
+                print(f'Finished doing parameters for {component_path}')
+                print('='*50)
             elif isinstance(component, torch.nn.Parameter):
                 state_dict[component_path] = component.data
                 quant_state_dict[component_path] = component.data
