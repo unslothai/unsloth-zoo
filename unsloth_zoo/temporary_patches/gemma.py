@@ -521,8 +521,8 @@ def patch_Gemma3Attention():
         self,
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor,
-        attention_masks: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
