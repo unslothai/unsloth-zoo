@@ -1097,17 +1097,11 @@ def merge_and_overwrite_lora(
                 print(f"Copied {filename} from local model directory")
 
         elif not copied_all_from_cache and low_disk_space_usage and not os.path.exists(file_path) and not is_local_path:
-            # hf_hub_download(
-            #     repo_id = model_name,
-            #     filename = filename,
-            #     repo_type = "model",
-            #     local_dir = save_directory,
-            # )
-            snapshot_download(
+            hf_hub_download(
                 repo_id = model_name,
+                filename = filename,
+                repo_type = "model",
                 local_dir = save_directory,
-                allow_patterns = [filename],
-                local_dir_use_symlinks = False,
             )
         pass
         n_saved_modules += _merge_and_overwrite_lora(
