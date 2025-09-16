@@ -646,9 +646,6 @@ def patch_Gemma3Attention_generic():
         query_states_fp16 = self.q_proj(hidden_states) # output fp16
         key_states_fp16   = self.k_proj(hidden_states) # output fp16
         value_states_fp16 = self.v_proj(hidden_states) # output fp16
-        print(query_states_fp16.dtype, key_states_fp16.dtype, value_states_fp16.dtype, flush = True)
-        print(query_states_fp16.dtype, key_states_fp16.dtype, value_states_fp16.dtype, flush = True)
-        print(query_states_fp16.dtype, key_states_fp16.dtype, value_states_fp16.dtype, flush = True)
 
         # 2. Upcast Q, K, V for norm and RoPE, and then transpose for attention
         # (bsz, num_specific_heads, q_len, head_dim)
