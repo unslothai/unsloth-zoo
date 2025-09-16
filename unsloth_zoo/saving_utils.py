@@ -487,7 +487,7 @@ def _merge_and_overwrite_lora(
         mm.close()
         raw_pointer.close()
         if torch.cuda.is_available():
-          torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
         return count
 
     except Exception as e:
@@ -1054,7 +1054,7 @@ def merge_and_overwrite_lora(
 
     # Step 3: Conditional index handling
     import subprocess
-    is_t4 = "Tesla T4" in str(subprocess.check_output(["nvidia-smi"]))
+    is_t4 = "Tesla T4" in str(torch.cuda.get_device_name(0))
     needs_splitting = should_split_shards(is_t4, config, safetensors_list)
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
