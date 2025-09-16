@@ -288,13 +288,13 @@ class UnslothFusedLoss(torch.autograd.Function):
             accumulated_loss.add_(unscaled_loss)
             grad_inputs_j[:] = chunk_grad_input
         pass
-        # if torch_compile:
-        #     accumulate_chunk = torch.compile(
-        #         accumulate_chunk,
-        #         dynamic = True,
-        #         fullgraph = True,
-        #         options = torch_compile_options,
-        #     )
+        if torch_compile:
+            accumulate_chunk = torch.compile(
+                accumulate_chunk,
+                dynamic = True,
+                fullgraph = True,
+                options = torch_compile_options,
+            )
 
         for (grad_inputs_j, hidden_states_j, labels_j,) in \
             zip(__grad_inputs, __shift_states, __shift_labels,):
