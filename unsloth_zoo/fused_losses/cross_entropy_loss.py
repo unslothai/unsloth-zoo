@@ -177,6 +177,8 @@ class UnslothFusedLoss(torch.autograd.Function):
 
         # N items divisor
         divisor = n_items if n_items is not None else (labels != -100).sum()
+        # Counteract DataParallel having multiple items
+        if divisor.numel() != 1: divisor = divisor.ravel()[0]
         divisor = divisor.to(dtype = torch.float32, device = device)
         # Check what needs gradients
         lm_head_requires_grad = lm_head_weight is not None and lm_head_weight.requires_grad
