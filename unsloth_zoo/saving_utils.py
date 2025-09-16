@@ -457,7 +457,6 @@ def _merge_and_overwrite_lora(
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
-                #W = None
                 output_key = key
                 action_logged = False
                 # Standard 16-bit model
