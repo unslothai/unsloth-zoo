@@ -473,6 +473,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         pass
         if ctx._requires_gradient: ctx.save_for_backward(*tensor_inputs)
 
+        print(args)
         with torch.no_grad():
             outputs = run_function(*args)
 
