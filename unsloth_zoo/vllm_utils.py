@@ -989,8 +989,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     quant_state_dict[norm_prefix] = state_dict[norm_prefix]
 
     # LM Head - Use get_state_dict for consistency
-
-    if not getattr(text_config, "tie_word_embeddings", False):
+    if not (getattr(text_config, "tie_word_embeddings", False) or getattr(config, "tie_word_embeddings", False)):
         lm_layer = [mod for name,mod in vllm_internals.named_modules() if "lm_head" in name]
         # Use get_state_dict for consistent extraction and automatic truncation
         get_state_dict("lm_head", 0, state_dict, lm_layer[0], slice_weights=False)
@@ -1002,7 +1001,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             state_dict["lm_head.weight"] = lm_weight
             quant_state_dict["lm_head.weight"] = lm_weight
 
-
+    breakpoint()
     if not return_state_dict: state_dict = None
     return state_dict, quant_state_dict
 pass
@@ -2348,6 +2347,7 @@ def _test_get_vllm_state_dict(
             bnb_4bit_use_double_quant = True,
             bnb_4bit_quant_type       = "nf4",
             bnb_4bit_compute_dtype    = dtype,
+            llm_int8_skip_modules     = ["model.multi_modal_projector.patch_merger.merging_layer", "embed_tokens", "lm_head"],
         )
     pass
     kwargs = dict()
@@ -2409,6 +2409,7 @@ def _test_get_vllm_state_dict(
         config = config,
         is_vision_model = is_vision_model,
     )
+    breakpoint()
     assert_same_state_dict(model.state_dict(), state_dict)
 
     new_model = convert_vllm_to_huggingface(quant_state_dict, config, dtype, is_vision_model = is_vision_model)
