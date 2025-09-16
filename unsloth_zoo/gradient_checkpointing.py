@@ -393,6 +393,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         tensor_inputs = []
         ctx._requires_gradient = False
         use_gpu_buffer = False
+        print(args)
 
         for i, arg in enumerate(args):
             if torch.is_tensor(arg):
@@ -500,9 +501,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         tensors = ctx.saved_tensors
 
         new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM = ctx._saved_metadata
-        print("backward", shape, device_index)
-        print("backward", shape, device_index)
-        print("backward", shape, device_index)
         if CPU_INDEX is not None:
             global GPU_BUFFER
             buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
