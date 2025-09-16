@@ -402,9 +402,14 @@ def patch_model_and_tokenizer(
 
     if not fix_embeddings: return model, tokenizer
 
-    # Torch.compile fails on embedding matrix??
-    try: old_input_embedding = model.get_input_embeddings ().weight
-    except: return model, tokenizer
+    # Check if torch.nn.Embedding seen
+    is_torch_embedding = False
+    try:
+        old_input_embedding = model.get_input_embeddings()
+        is_torch_embedding  = type(old_input_embedding) is torch.nn.Embedding
+        old_input_embedding = old_input_embedding.weight
+    except:
+        return model, tokenizer
 
     # Maybe not all models have a lm_head?
     try: old_output_embedding = model.get_output_embeddings().weight
@@ -415,7 +420,7 @@ def patch_model_and_tokenizer(
         or (model.config.tie_word_embeddings)
 
     # Check pad token's id -> we need to expand the embedding
-    if tokenizer is not None and len(tokenizer) > old_input_embedding.shape[0]:
+    if is_torch_embedding and (tokenizer is not None) and (len(tokenizer) > old_input_embedding.shape[0]):
         # Workaround randomnly fixes it for torch versions < 2.
         requires_grad = old_input_embedding.requires_grad
         old_input_embedding.requires_grad_(False)
@@ -436,12 +441,14 @@ def patch_model_and_tokenizer(
         pass
     pass
 
-    model.set_input_embeddings(
-        torch.nn.Embedding.from_pretrained(
-            old_input_embedding,
-            padding_idx = getattr(model.config, "pad_token_id", None),
+    if is_torch_embedding:
+        model.set_input_embeddings(
+            torch.nn.Embedding.from_pretrained(
+                old_input_embedding,
+                padding_idx = getattr(model.config, "pad_token_id", None),
+            )
         )
-    )
+    pass
 
     # We also do this for the lm_head
     if old_output_embedding.numel() != 0:
