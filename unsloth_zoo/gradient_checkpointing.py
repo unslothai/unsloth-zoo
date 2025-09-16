@@ -500,7 +500,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         tensors = ctx.saved_tensors
 
         new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM = ctx._saved_metadata
-        print("backward", shape, device_index, flush = True)
         if CPU_INDEX is not None:
             global GPU_BUFFER
             buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
