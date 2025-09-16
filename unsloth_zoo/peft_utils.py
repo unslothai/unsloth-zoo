@@ -33,11 +33,12 @@ import re
 # Skip some modules sensitive to quantization
 SKIP_QUANTIZATION_MODULES = [
     "lm_head",
-    "multi_modal_projector", # Llama 3.2 Vision, Pixtral, Llava
-    "merger",                # Qwen2 VL
-    "modality_projection",   # Idefics, SmolVLM
-    "router",                # MoE Router
-    "gate",                  # MoE Router
+    "multi_modal_projector",    # Llama 3.2 Vision, Pixtral, Llava
+    "merger",                   # Qwen2 VL
+    "modality_projection",      # Idefics, SmolVLM
+    "router",                   # MoE Router
+    "mlp.gate",                 # MoE Router
+    "block_sparse_moe.gate",    # MoE Router
     'mamba',
 ]
 

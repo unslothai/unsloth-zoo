@@ -239,7 +239,7 @@ def grpo_compute_loss(
     mask = mask.to(torch.float32)
     n_mask_per_reward = mask.sum(1)
 
-    # https://github.com/huggingface/trl/blob/main/trl/trainer/grpo_trainer.py#L1363-L1370
+    # https://github.com/huggingface/trl/blob/e8b8499f1f8d76838155b515e414ee98f757d6d5/trl/trainer/grpo_trainer.py#L1624
     if loss_type == "grpo":
         loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
     elif loss_type == "bnpo":
@@ -253,7 +253,7 @@ def grpo_compute_loss(
     
     completion_length = n_mask_per_reward.mean()
 
-    # loss = (loss_i * mask).sum() / mask.sum()
+    # Get metrics as well which are folded
     def masked_batch_mean(x):
         with torch.inference_mode():
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence"

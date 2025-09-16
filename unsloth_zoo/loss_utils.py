@@ -53,6 +53,12 @@ if DEVICE_TYPE == "cuda":
     else:
         HAS_CUT_CROSS_ENTROPY = False
     pass
+elif DEVICE_TYPE == "hip":
+    try:
+        from cut_cross_entropy import linear_cross_entropy
+        HAS_CUT_CROSS_ENTROPY = True
+    except:
+        HAS_CUT_CROSS_ENTROPY = False
 elif DEVICE_TYPE == "xpu":
     try:
         from cut_cross_entropy import linear_cross_entropy
@@ -337,8 +343,11 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
             if self.args.average_tokens_across_devices:
                 num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
-            if device is not None and torch.is_tensor(num_items_in_batch):
-                num_items_in_batch = num_items_in_batch.to(device)
+            if torch.is_tensor(num_items_in_batch):
+                if device is not None:
+                    num_items_in_batch = num_items_in_batch.to(device)
+                # if getattr(self.args, "n_gpu", 1) > 1 and len(num_items_in_batch.size()) == 0:
+                #     num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
         except Exception as exception:
             raise RuntimeError(exception)
     pass

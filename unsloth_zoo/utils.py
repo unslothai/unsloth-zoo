@@ -28,11 +28,20 @@ import torch
 import os
 import time
 import contextlib
+import re
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        return TrueVersion(version)
+        version = str(version)
+        try:
+            return TrueVersion(version)
+        except Exception as e:
+            version = re.match(r"[0-9\.]{1,}", version)
+            if version is None:
+                raise Exception(str(e))
+            version = version.group(0).rstrip(".")
+            return TrueVersion(version)
     except:
         from inspect import getframeinfo, stack
         caller = getframeinfo(stack()[1][0])
@@ -57,9 +66,10 @@ def _get_dtype(dtype):
         return __DTYPE_MAP[dtype]
     except:
         if type(dtype) is str:
-            try: dtype = eval(f"torch.{dtype.lower()}")
-            except: pass
-        if type(dtype) is torch.dtype: return dtype
+            dtype = dtype.lower()
+            return getattr(torch, dtype, None)
+        elif isinstance(dtype, torch.dtype):
+            return dtype
     return None
 pass
 
