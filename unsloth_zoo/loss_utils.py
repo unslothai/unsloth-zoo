@@ -251,6 +251,19 @@ ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
 
+# Check for DataParallel
+#
+# DataParallel uses scatter and gather
+# cpu->0 scatter 0 --> 0 gather 0
+# cpu->0 scatter 1 --> 1 gather 0
+# cpu->0 scatter 2 --> 2 gather 0
+#
+# DistributedDataParallel is faster and launches multiple processes
+# cpu->0 ------------> 0 gather 0
+# cpu->1 ------------> 1 gather 0
+# cpu->2 ------------> 2 gather 0
+from transformers.training_args import ParallelMode
+
 # Cannot use sadly
 # import torch._dynamo.eval_frame as torch_dynamo_eval_frame
 # torch_compiler_set_stance = torch.compiler.set_stance
@@ -341,8 +354,10 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             if torch.is_tensor(num_items_in_batch):
                 if device is not None:
                     num_items_in_batch = num_items_in_batch.to(device)
-                # if getattr(self.args, "n_gpu", 1) > 1 and len(num_items_in_batch.size()) == 0:
-                #     num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
+                if getattr(self.args, "n_gpu", 1) > 1 and self.args.parallel_mode == ParallelMode.NOT_DISTRIBUTED:
+                    # Uses DataParallel scatter gather
+                    # So we have to scatter num_items_in_batch to each GPU
+                    num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
         except Exception as exception:
             raise RuntimeError(exception)
     pass
