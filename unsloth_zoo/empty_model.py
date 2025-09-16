@@ -30,7 +30,7 @@ from copy import deepcopy
 
 def is_comparable(val):
     # Don't treat tensors as comparable, only basic types
-    return isinstance(val, (int, float, bool, str, list, type(None)))
+    return isinstance(val, (int, float, bool, str, list, tuple, type(None), torch.dtype))
 
 def compare_dicts(orig_dict, new_dict, prefix=""):
     all_keys = set(orig_dict.keys()) | set(new_dict.keys())
@@ -59,6 +59,9 @@ def compare_attributes(original_model, new_model):
     ):
         orig_attrs = {attr for attr in dir(original_module) if not attr.startswith('_')}
         new_attrs = {attr for attr in dir(module) if not attr.startswith('_')}
+        buffer_names = {name for name,_ in original_module.named_buffers(recurse=False)}
+
+        assert type(module) == type(original_module), f"Type mismatch for {name}: {type(module)} != {type(original_module)}"
 
         # Find missing attributes (in original but not in new)
         missing_in_new = orig_attrs - new_attrs
@@ -73,8 +76,9 @@ def compare_attributes(original_model, new_model):
             for attr in sorted(extra_in_new):
                 print(f"EXTRA ATTRIBUTE: {name}.{attr} (exists in new model but not original)")
 
-        # Compare common attributes
+        # Compare common attributes and buffer names
         common_attrs = orig_attrs & new_attrs
+        common_buffers = orig_attrs | buffer_names
         for attr in sorted(common_attrs):
             try:
                 original_val = getattr(original_module, attr)
@@ -161,6 +165,7 @@ def copy_attributes(original_model, new_model):
     dict_skipped_count = 0
 
     for (name, module), (_, original_module) in zip(new_model.named_modules(), original_model.named_modules()):
+        buffer_names = [name for name,_ in original_module.named_buffers(recurse=False)]
         for attr in dir(original_module):
             if attr.startswith('_'):
                 continue
@@ -168,12 +173,11 @@ def copy_attributes(original_model, new_model):
             try:
                 original_val = getattr(original_module, attr)
 
-                if original_model.config.model_type == 'gemma3' and attr == 'embed_scale':
-                    # Gemma3 has this value as tensor. We generally skip copying tensors.
-                    # We might want to force copy this attribute
-                    setattr(module, attr, original_val)
-
-                if is_comparable(original_val):
+                if attr in buffer_names:
+                    # Some models like gemma3 have embed_scale and position_ids as buffers
+                    # Lets copy them over to avoid inconsistencies
+                    setattr(module, attr, original_val.to(new_model.device))
+                elif is_comparable(original_val):
                     setattr(module, attr, original_val)
                     copied_count += 1
                 elif isinstance(original_val, dict):
@@ -533,11 +537,9 @@ def get_model_layer_config():
             "model.visual.blocks.{kk}.mlp.up_proj",
             "model.visual.blocks.{kk}.mlp.down_proj",
 
-
             # Mistral 3
             "model.vision_tower.transformer.layers.{kk}.attention.qkv_proj",
             "model.vision_tower.transformer.layers.{kk}.attention.o_proj",
-
             "model.vision_tower.transformer.layers.{kk}.feed_forward.gate_up_proj",
             "model.vision_tower.transformer.layers.{kk}.feed_forward.down_proj",
 
@@ -570,12 +572,12 @@ def get_model_layer_config():
             "model.vision_model.gated_positional_embedding",
             "model.vision_model.post_tile_positional_embedding.embedding",
             "model.vision_model.pre_tile_positional_embedding.gate",
+
             # Mistral3
             "model.vision_tower.patch_positional_embedding",
             "model.vision_tower.patch_conv",
             "model.vision_tower.ln_pre",
             "model.multi_modal_projector.patch_merger.merging_layer"
-
         }
     }
     # Convert sets to sorted lists for deterministic order
@@ -660,14 +662,15 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 # vLLM uses vllm_internals.language_model.model.layers while HF uses model.language_model.layers
                 layer_path = layer_path.replace('language_model.model', 'language_model')
 
+
             if layer_module is not None:
                 if "qkv" in layer_path:
                     if model_type == "qwen2_5_vl":
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
                     else:
-                        get_state_dict(f"{layer_path.replace('qkv_proj', 'q_proj')}", 0, state_dict, layer_module)
-                        get_state_dict(f"{layer_path.replace('qkv_proj', 'k_proj')}", 1, state_dict, layer_module)
-                        get_state_dict(f"{layer_path.replace('qkv_proj', 'v_proj')}", 2, state_dict, layer_module)
+                         get_state_dict(f"{layer_path.replace('qkv_proj', 'q_proj')}", 0, state_dict, layer_module)
+                         get_state_dict(f"{layer_path.replace('qkv_proj', 'k_proj')}", 1, state_dict, layer_module)
+                         get_state_dict(f"{layer_path.replace('qkv_proj', 'v_proj')}", 2, state_dict, layer_module)
                 elif "gate_up_proj" in layer_path:
                     # vLLM seems to have merged gate and up proj recently for qwen vl. This is to handle new variant
                     # https://github.com/jeejeelee/vllm/commit/a71e4765cc0c1534f2a8891aaf628e1751f6df07
@@ -678,7 +681,11 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 else: # Handle other layers, especially layernorms
                     if isinstance(layer_module, torch.nn.Module):
                         if hasattr(layer_module, 'weight'):
-                            get_state_dict(layer_path, 0, state_dict, layer_module)
+                            state_dict[f"{layer_path}.weight"] = layer_module.weight.data
+                            quant_state_dict[f"{layer_path}.weight"] = state_dict[f"{layer_path}.weight"]
+                            if hasattr(layer_module, 'bias') and layer_module.bias is not None:
+                                state_dict[f"{layer_path}.bias"] = layer_module.bias.data
+                                quant_state_dict[f"{layer_path}.bias"] = state_dict[f"{layer_path}.bias"]
                     elif isinstance(layer_module, torch.nn.Parameter):
                         state_dict[f"{layer_path}"] = layer_module.data
                         quant_state_dict[f"{layer_path}"] = state_dict[f"{layer_path}"]
@@ -692,16 +699,17 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
         if component is not None:
             if hasattr(component, 'weight'):
-                get_state_dict(component_path, 0, state_dict, component, slice_weights=False)
+                # Prefer using get_state_dict when possible
+                get_state_dict(component_path, 0, state_dict, component)
             elif isinstance(component, torch.nn.Parameter):
                 state_dict[component_path] = component.data
                 quant_state_dict[component_path] = component.data
             elif isinstance(component, torch.nn.Module):
                 for param_name, param in component.named_modules():
-                    if param_name=='': continue # Skip self module (if it had weight we'd have dealt with it above already)
+                    if param_name == '': continue # Skip self among named modules
                     full_param_path = f"{component_path}.{param_name}"
                     if hasattr(param, 'weight'):
-                        get_state_dict(full_param_path, 0, state_dict, param, slice_weights=False)
+                        get_state_dict(full_param_path, 0, state_dict, param)
                     elif hasattr(param, 'data'):
                         state_dict[full_param_path] = param.data
                         quant_state_dict[full_param_path] = param.data

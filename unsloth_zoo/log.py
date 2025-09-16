@@ -18,9 +18,14 @@ __all__ = [
 	"UNSLOTH_ENABLE_LOGGING",
 	"logger",
 ]
+
 import logging
 import os
-UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
+
+UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") in ("1", "True", "true",)
+
 logger = logging.getLogger(__name__)
 if UNSLOTH_ENABLE_LOGGING:
-    logger.setLevel(logging.DEBUG)
+    logging.basicConfig(level = logging.INFO, format = '[%(name)s|%(levelname)s]%(message)s')
+    logger.setLevel(logging.INFO)
+pass

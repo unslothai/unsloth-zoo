@@ -75,6 +75,8 @@ def _return_self(self, *args, **kwargs): return self
 def _return_self_tokenizer(self, *args, **kwargs): return self.tokenizer
 
 def get_target_device(index = 0):
+    if DEVICE_TYPE == "hip":
+        return torch.device("cuda", index)
     return torch.device(DEVICE_TYPE, index)
 
 def get_mem_info():
@@ -517,6 +519,7 @@ def patch_vllm_enable_sleep_mode():
             # this check is to make sure it works for both new versions and old alike
             # https://github.com/vllm-project/vllm/commit/9dc30b7068ae07ceca89663e9f8403d00217256d
             self.python_malloc_callback = self._python_malloc_callback
+        if hasattr(self, '_python_free_callback'):
             self.python_free_callback = self._python_free_callback
 
     def sleep(
@@ -1428,6 +1431,8 @@ def load_vllm(
 
     # Get correct dtype
     if DEVICE_TYPE == "cuda" and major_version >= 8: _dtype = torch.bfloat16
+    elif DEVICE_TYPE == "hip":
+        _dtype = torch.bfloat16
     elif DEVICE_TYPE == "xpu":
         _dtype = torch.bfloat16
     else:
@@ -1474,6 +1479,8 @@ def load_vllm(
         if (major_version < 7) or (major_version == 7 and minor_version < 5):
             print("Unsloth: Your GPU does not support prefix caching - will disable!")
             enable_prefix_caching = False
+    elif DEVICE_TYPE == "hip":
+        enable_prefix_caching = True
     elif DEVICE_TYPE == "xpu":
         enable_prefix_caching = True
 
