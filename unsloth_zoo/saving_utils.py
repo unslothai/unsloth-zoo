@@ -562,8 +562,8 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
 
                 if torch.cuda.is_available():
-                  torch.cuda.synchronize()  # Wait for previous operations to complete
-                  torch.cuda.empty_cache()
+                    torch.cuda.synchronize()  # Wait for previous operations to complete
+                    torch.cuda.empty_cache()
 
                 # Determine optimal device and chunk size for mxfp4 dequantization
                 device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
