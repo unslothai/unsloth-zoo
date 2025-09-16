@@ -518,6 +518,7 @@ def patch_vllm_enable_sleep_mode():
             # this check is to make sure it works for both new versions and old alike
             # https://github.com/vllm-project/vllm/commit/9dc30b7068ae07ceca89663e9f8403d00217256d
             self.python_malloc_callback = self._python_malloc_callback
+        if hasattr(self, '_python_free_callback'):
             self.python_free_callback = self._python_free_callback
 
     def sleep(
