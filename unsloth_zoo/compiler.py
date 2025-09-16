@@ -77,6 +77,8 @@ minor = None
 if DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
     OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+elif DEVICE_TYPE == "hip":
+    OLD_CUDA_ARCH_VERSION = False
 elif DEVICE_TYPE == "xpu":
     OLD_CUDA_ARCH_VERSION = False
 pass
@@ -215,48 +217,80 @@ _patch_functions = [
 ]
 
 
-def get_transformers_model_type(
-    model_name,
-    token = None,
-    revision = None,
-    trust_remote_code = False,
-):
-    # All Unsloth Zoo code licensed under LGPLv3
-    from transformers import AutoConfig
-    from huggingface_hub.utils import disable_progress_bars, enable_progress_bars, are_progress_bars_disabled
-    was_disabled = are_progress_bars_disabled()
-    disable_progress_bars()
+def get_transformers_model_type(config):
+    """ Gets model_type from config file - can be PEFT or normal HF """
+    if config is None:
+        raise RuntimeError(
+            f"Unsloth: No config file found - are you sure the `model_name` is correct?\n"\
+            f"If you're using a model on your local device, confirm if the folder location exists.\n"\
+            f"If you're using a HuggingFace online model, check if it exists."
+        )
+    model_types = None
 
-    config = AutoConfig.from_pretrained(
-        model_name,
-        token = token,
-        revision = revision,
-        trust_remote_code = trust_remote_code,
-    )
-    if not was_disabled: enable_progress_bars()
+    from peft import PeftConfig
+    if issubclass(type(config), PeftConfig):
+        model_type_list = re.finditer(r"transformers\.models\.([^\.]{2,})\.modeling_\1", str(config))
+        model_type_list = list(model_type_list)
+        if len(model_type_list) != 0:
+            # Use transformers.models.gpt_oss.modeling_gpt_oss
+            model_type = model_type_list[0].group(1)
+            model_types = [model_type]
+        elif getattr(config, "auto_mapping", None) is not None:
+            # Use GptOssForCausalLM
+            model_type = config.auto_mapping.get("base_model_class", None)
+            if model_type is not None:
+                model_type = str(model_type)
+                model_type = model_type.rsplit("For", 1)[0].lower()
+                # Find exact name of modeling path
+                import transformers.models
+                supported_model_types = dir(transformers.models)
+                for modeling_file in supported_model_types:
+                    if model_type == modeling_file.lower().replace("_", "").replace(".", "_").replace("-", "_"):
+                        model_types = [modeling_file]
+                        break
+            pass
+        pass
 
-    model_types = []
-    config = str(config.to_dict())
-    model_types = re.findall(r"'model_type': '([^\s\']{1,})'", config)
-    model_types = [x.replace("-", "_").lower() for x in model_types]
-    # Add splitted modules for eg gemma3_text -> gemma3
-    model_types += [x.split("_")[0] for x in model_types]
-    if 'gpt-oss' in os.environ.get("UNSLOTH_MODEL_NAME", ""):
-        model_types = [x for x in model_types if x != "gpt"]
-    model_types = list(dict().fromkeys(model_types))
+        # Get original base model
+        base_model_name_or_path = getattr(config, "base_model_name_or_path", None)
+        if base_model_name_or_path is None:
+            raise TypeError("Unsloth: adapter_config.json's `base_model_name_or_path` is None?")
+        base_model_name_or_path = str(base_model_name_or_path)
+        # Set model name for patching purposes
+        os.environ["UNSLOTH_MODEL_NAME"] = base_model_name_or_path.lower()
 
-    from transformers import models
-    models = dir(models)
-    all_model_types = set()
-    for name in models:
-        for model_type in model_types:
-            if model_type in name.lower():
-                all_model_types.add(model_type)
-                break
+        # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
+        if model_types is None:
+            model_type = os.path.split(base_model_name_or_path)[-1]
+            model_types = [model_type]
+    else:
+        from collections.abc import Mapping, Sequence
+        def find(data, target_key):
+            stack = [data]
+            while stack:
+                obj = stack.pop()
+                if isinstance(obj, Mapping):
+                    # Emit values for matches
+                    if target_key in obj:
+                        yield obj[target_key]
+                    # Keep walking into nested values
+                    stack.extend(obj.values())
+                elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
+                    # Walk sequences (lists/tuples/sets), but not strings/bytes
+                    stack.extend(obj)
+        model_types = list(find(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
     pass
-
-    all_model_types = list(all_model_types)
-    return all_model_types
+    if model_types is None:
+        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
+    # Standardize model_type
+    final_model_types = []
+    for model_type in model_types:
+        model_type = model_type.lower()
+        model_type = model_type.replace("-", "_")
+        model_type = model_type.replace("/", "_")
+        model_type = model_type.replace(".", "_")
+        final_model_types.append(model_type)
+    return sorted(final_model_types)
 pass
 
 
@@ -831,16 +865,19 @@ all_locals = locals()
 if 'loss_kwargs' in all_locals:
     __kwargs = all_locals['loss_kwargs']
     if type(__kwargs) is dict:
-        n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+        n_items = __kwargs.get("num_items_in_batch", None)
+        if n_items is None: n_items = __kwargs.get("n_items", None)
 if n_items is None and 'kwargs' in all_locals:
     __kwargs = all_locals['kwargs']
     if type(__kwargs) is dict:
-        n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+        n_items = __kwargs.get("num_items_in_batch", None)
+        if n_items is None: n_items = __kwargs.get("n_items", None)
 if n_items is None:
     all_locals = all_locals.values()
     for __kwargs in all_locals:
         if type(__kwargs) is dict:
-            n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+            n_items = __kwargs.get("num_items_in_batch", None)
+            if n_items is None: n_items = __kwargs.get("n_items", None)
             break
 pass
 
@@ -906,16 +943,19 @@ if n_items is None:
     if 'loss_kwargs' in all_locals:
         __kwargs = all_locals['loss_kwargs']
         if type(__kwargs) is dict:
-            n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+            n_items = __kwargs.get("num_items_in_batch", None)
+            if n_items is None: n_items = __kwargs.get("n_items", None)
     if n_items is None and 'kwargs' in all_locals:
         __kwargs = all_locals['kwargs']
         if type(__kwargs) is dict:
-            n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+            n_items = __kwargs.get("num_items_in_batch", None)
+            if n_items is None: n_items = __kwargs.get("n_items", None)
     if n_items is None:
         all_locals = all_locals.values()
         for __kwargs in all_locals:
             if type(__kwargs) is dict:
-                n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+                n_items = __kwargs.get("num_items_in_batch", None)
+                if n_items is None: n_items = __kwargs.get("n_items", None)
                 break
 pass
 
@@ -999,16 +1039,19 @@ n_items = None
 if 'loss_kwargs' in all_locals:
     __kwargs = all_locals['loss_kwargs']
     if type(__kwargs) is dict:
-        n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+        n_items = __kwargs.get("num_items_in_batch", None)
+        if n_items is None: n_items = __kwargs.get("n_items", None)
 if n_items is None and 'kwargs' in all_locals:
     __kwargs = all_locals['kwargs']
     if type(__kwargs) is dict:
-        n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+        n_items = __kwargs.get("num_items_in_batch", None)
+        if n_items is None: n_items = __kwargs.get("n_items", None)
 if n_items is None:
     all_locals = all_locals.values()
     for __kwargs in all_locals:
         if type(__kwargs) is dict:
-            n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
+            n_items = __kwargs.get("num_items_in_batch", None)
+            if n_items is None: n_items = __kwargs.get("n_items", None)
             break
 pass
 
@@ -1387,7 +1430,6 @@ def patch_gradient_checkpointing(module, source):
     try: forward = inspect.getsource(source.forward)
     except: return None
     if "_gradient_checkpointing_func" in forward: return None
-    if 'gpt-oss' in os.environ.get("UNSLOTH_MODEL_NAME", ""): return None
 
     # Fix Qwen2 missing None for gradient checkpointing
     for custom_find, custom_replace in custom_gradient_checkpointing_replacements:
@@ -1424,6 +1466,9 @@ def patch_gradient_checkpointing(module, source):
     # Also fix init
     spaces = init.find("def")
     init = init + "\n" + (spaces + 4) * " " + "self.gradient_checkpointing = False\n\n"
+
+    # Confirm no equal signs seen - might be "attention_mask=causal_mask_mapping" vs "attention_mask=attention_mask"
+    if "=" in init: return None
     return init, forward
 pass
 
@@ -1901,8 +1946,10 @@ def unsloth_compile_transformers(
 ):
     # import transformers logging module and instantiate model_type logging instance.
     from transformers import logging as transformers_logging
-    model_logger = transformers_logging.get_logger(f"modeling_{model_type}")
-
+    try:
+        model_logger = transformers_logging.get_logger(f"modeling_{model_type}")
+    except:
+        return
     # All Unsloth Zoo code licensed under LGPLv3
     disable = disable or (os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1")
     if fast_residual_stream:
@@ -1910,7 +1957,10 @@ def unsloth_compile_transformers(
     pass
 
     model_location = f"transformers.models.{model_type}.modeling_{model_type}"
-    exec(f"import {model_location}", globals())
+    try:
+        exec(f"import {model_location}", globals())
+    except ModuleNotFoundError:
+        return
     modeling_file = eval(model_location)
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"): return
 
@@ -2394,6 +2444,9 @@ def unsloth_compile_transformers(
     if gradient_checkpointing:
         for module in other_classes:
             source = eval(f"{model_location}.{module}")
+            if "(GradientCheckpointingLayer)" in full_source:
+                # Uses GC layers which is in new transformers - no need to patch
+                continue
             output = patch_gradient_checkpointing(module, source)
             if output is None: continue
 
