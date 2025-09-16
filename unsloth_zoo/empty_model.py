@@ -30,7 +30,7 @@ from copy import deepcopy
 
 def is_comparable(val):
     # Don't treat tensors as comparable, only basic types
-    return isinstance(val, (int, float, bool, str, list, tuple, type(None)))
+    return isinstance(val, (int, float, bool, str, list, tuple, type(None), torch.dtype))
 
 def compare_dicts(orig_dict, new_dict, prefix=""):
     all_keys = set(orig_dict.keys()) | set(new_dict.keys())
@@ -59,6 +59,8 @@ def compare_attributes(original_model, new_model):
     ):
         orig_attrs = {attr for attr in dir(original_module) if not attr.startswith('_')}
         new_attrs = {attr for attr in dir(module) if not attr.startswith('_')}
+
+        assert type(module) == type(original_module), f"Type mismatch for {name}: {type(module)} != {type(original_module)}"
 
         # Find missing attributes (in original but not in new)
         missing_in_new = orig_attrs - new_attrs
