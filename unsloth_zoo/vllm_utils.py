@@ -74,6 +74,8 @@ def _return_self(self, *args, **kwargs): return self
 def _return_self_tokenizer(self, *args, **kwargs): return self.tokenizer
 
 def get_target_device(index = 0):
+    if DEVICE_TYPE == "hip":
+        return torch.device("cuda", index)
     return torch.device(DEVICE_TYPE, index)
 
 def get_mem_info():
@@ -1427,6 +1429,8 @@ def load_vllm(
 
     # Get correct dtype
     if DEVICE_TYPE == "cuda" and major_version >= 8: _dtype = torch.bfloat16
+    elif DEVICE_TYPE == "hip":
+        _dtype = torch.bfloat16
     elif DEVICE_TYPE == "xpu":
         _dtype = torch.bfloat16
     else:
@@ -1473,6 +1477,8 @@ def load_vllm(
         if (major_version < 7) or (major_version == 7 and minor_version < 5):
             print("Unsloth: Your GPU does not support prefix caching - will disable!")
             enable_prefix_caching = False
+    elif DEVICE_TYPE == "hip":
+        enable_prefix_caching = True
     elif DEVICE_TYPE == "xpu":
         enable_prefix_caching = True
 
