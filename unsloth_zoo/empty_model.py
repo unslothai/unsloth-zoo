@@ -61,7 +61,7 @@ def compare_attributes(original_model, new_model):
         new_attrs = {attr for attr in dir(module) if not attr.startswith('_')}
         buffer_names = {name for name,_ in original_module.named_buffers(recurse=False)}
 
-        assert type(module) == type(original_module), f"Type mismatch for {name}: {type(module)} != {type(original_module)}"
+        assert type(module) == type(original_module) or isinstance(module, type(original_module)), f"Type mismatch for {name}: {type(module)} != {type(original_module)}"
 
         # Find missing attributes (in original but not in new)
         missing_in_new = orig_attrs - new_attrs
@@ -681,11 +681,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 else: # Handle other layers, especially layernorms
                     if isinstance(layer_module, torch.nn.Module):
                         if hasattr(layer_module, 'weight'):
-                            state_dict[f"{layer_path}.weight"] = layer_module.weight.data
-                            quant_state_dict[f"{layer_path}.weight"] = state_dict[f"{layer_path}.weight"]
-                            if hasattr(layer_module, 'bias') and layer_module.bias is not None:
-                                state_dict[f"{layer_path}.bias"] = layer_module.bias.data
-                                quant_state_dict[f"{layer_path}.bias"] = state_dict[f"{layer_path}.bias"]
+                            get_state_dict(layer_path, 0, state_dict, layer_module)
                     elif isinstance(layer_module, torch.nn.Parameter):
                         state_dict[f"{layer_path}"] = layer_module.data
                         quant_state_dict[f"{layer_path}"] = state_dict[f"{layer_path}"]
