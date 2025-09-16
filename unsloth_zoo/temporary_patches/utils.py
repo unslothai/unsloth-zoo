@@ -275,7 +275,6 @@ if LossKwargs           != t_TypedDictMeta: TYPE_MAPPINGS[LossKwargs]           
 
 try:
     import types
-    types.UnionType
     TYPE_MAPPINGS[types.UnionType] = t.Union
 except:
     pass
@@ -304,7 +303,9 @@ def canonicalize_annotation(annotation: Any) -> Any:
         # due to duplicates. We also sort Unions
         if annotation[0] == t.Union:
             args = list(set(annotation[1]))
+            # We must sort by str(x) since set is NOT ordered
             args.sort(key = lambda x: str(x))
+            args = tuple(args)
             annotation = (annotation[0], args,)
         # Fix up kwargs
         # (typing.Unpack, (<class 'transformers.models.csm.modeling_csm.KwargsForCausalLM'>,)) to
