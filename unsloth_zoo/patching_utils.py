@@ -166,7 +166,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # See torch.compile, the missing manual
         # https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8
         # f"config.emulate_precision_casts = {not debug}", # Force X.to(f32).to(f16) instead of X.to(f16)
-        # when setting to not debug aka True, we get errors on torch2.6 
+        # when setting to not debug aka True, we get errors on torch2.6
         # TypeError: ValueRangeAnalysis.to_dtype() got an unexpected keyword argument 'use_compute_types'
         # this keyword exists in torch2.7.0 but not in torch2.6.0 so set to False until torch2.6.0 is deprecated.
         "config.emulate_precision_casts = False", # Force X.to(f32).to(f16) instead of X.to(f16)
@@ -217,7 +217,9 @@ def get_model(model):
             break
         elif hasattr(x, "model"):
             x = x.model
-        elif hasattr(x, "base_model"):
+        elif hasattr(x, "base_model") and x.base_model !=x:
+            # for VLMs x.base_model = x causing this to be stuck in endless loop
+            # the check x.base_model != x is to prevent this
             x = x.base_model
         elif hasattr(x, "language_model"):
             x = x.language_model
@@ -402,9 +404,14 @@ def patch_model_and_tokenizer(
 
     if not fix_embeddings: return model, tokenizer
 
-    # Torch.compile fails on embedding matrix??
-    try: old_input_embedding = model.get_input_embeddings ().weight
-    except: return model, tokenizer
+    # Check if torch.nn.Embedding seen
+    is_torch_embedding = False
+    try:
+        old_input_embedding = model.get_input_embeddings()
+        is_torch_embedding  = type(old_input_embedding) is torch.nn.Embedding
+        old_input_embedding = old_input_embedding.weight
+    except:
+        return model, tokenizer
 
     # Maybe not all models have a lm_head?
     try: old_output_embedding = model.get_output_embeddings().weight
@@ -415,7 +422,7 @@ def patch_model_and_tokenizer(
         or (model.config.tie_word_embeddings)
 
     # Check pad token's id -> we need to expand the embedding
-    if tokenizer is not None and len(tokenizer) > old_input_embedding.shape[0]:
+    if is_torch_embedding and (tokenizer is not None) and (len(tokenizer) > old_input_embedding.shape[0]):
         # Workaround randomnly fixes it for torch versions < 2.
         requires_grad = old_input_embedding.requires_grad
         old_input_embedding.requires_grad_(False)
@@ -436,12 +443,14 @@ def patch_model_and_tokenizer(
         pass
     pass
 
-    model.set_input_embeddings(
-        torch.nn.Embedding.from_pretrained(
-            old_input_embedding,
-            padding_idx = getattr(model.config, "pad_token_id", None),
+    if is_torch_embedding:
+        model.set_input_embeddings(
+            torch.nn.Embedding.from_pretrained(
+                old_input_embedding,
+                padding_idx = getattr(model.config, "pad_token_id", None),
+            )
         )
-    )
+    pass
 
     # We also do this for the lm_head
     if old_output_embedding.numel() != 0:

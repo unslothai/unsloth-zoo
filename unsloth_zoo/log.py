@@ -26,6 +26,6 @@ UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") in ("1",
 
 logger = logging.getLogger(__name__)
 if UNSLOTH_ENABLE_LOGGING:
-    logging.basicConfig(level = logging.INFO, format = '%(name)s - %(levelname)s - %(message)s')
+    logging.basicConfig(level = logging.INFO, format = '[%(name)s|%(levelname)s]%(message)s')
     logger.setLevel(logging.INFO)
 pass

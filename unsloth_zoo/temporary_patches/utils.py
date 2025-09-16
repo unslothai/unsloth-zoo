@@ -273,6 +273,12 @@ if TransformersKwargs   != t_TypedDictMeta: TYPE_MAPPINGS[TransformersKwargs]   
 if FlashAttentionKwargs != t_TypedDictMeta: TYPE_MAPPINGS[FlashAttentionKwargs] = t_TypedDictMeta
 if LossKwargs           != t_TypedDictMeta: TYPE_MAPPINGS[LossKwargs]           = t_TypedDictMeta
 
+try:
+    import types
+    TYPE_MAPPINGS[types.UnionType] = t.Union
+except:
+    pass
+
 def _canonicalize_annotation(annotation: Any) -> Any:
     """
     Canonicalize type annotations for consistent comparison.
@@ -296,7 +302,11 @@ def canonicalize_annotation(annotation: Any) -> Any:
         # Union[str, List[str], list[str]] gets reduced to Union[str, list[str]]
         # due to duplicates. We also sort Unions
         if annotation[0] == t.Union:
-            annotation = (annotation[0], tuple(set(annotation[1])),)
+            args = list(set(annotation[1]))
+            # We must sort by str(x) since set is NOT ordered
+            args.sort(key = lambda x: str(x))
+            args = tuple(args)
+            annotation = (annotation[0], args,)
         # Fix up kwargs
         # (typing.Unpack, (<class 'transformers.models.csm.modeling_csm.KwargsForCausalLM'>,)) to
         # (typing.Unpack, (<class 'typing._TypedDictMeta'>,))
