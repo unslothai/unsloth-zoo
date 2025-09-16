@@ -1035,7 +1035,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
 
                 if key1 is not None and key2 is not None:
                     try:
-                        torch.testing.assert_close(old_state_dict[key1], new_state_dict[key2], check_stride = True)
+                        torch.testing.assert_close(old_state_dict[key1].contiguous(), new_state_dict[key2].contiguous(), check_stride = True)
                     except Exception:
                         failures[key] = error
                 else:

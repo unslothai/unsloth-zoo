@@ -539,9 +539,14 @@ def get_model_layer_config():
             "model.visual.blocks.{kk}.mlp.down_proj",
 
             # Mistral 3
+            "model.vision_tower.transformer.layers.{kk}.attention.q_proj",
+            "model.vision_tower.transformer.layers.{kk}.attention.k_proj",
+            "model.vision_tower.transformer.layers.{kk}.attention.v_proj",
             "model.vision_tower.transformer.layers.{kk}.attention.qkv_proj",
             "model.vision_tower.transformer.layers.{kk}.attention.o_proj",
             "model.vision_tower.transformer.layers.{kk}.feed_forward.gate_up_proj",
+            "model.vision_tower.transformer.layers.{kk}.feed_forward.gate_proj",
+            "model.vision_tower.transformer.layers.{kk}.feed_forward.up_proj",
             "model.vision_tower.transformer.layers.{kk}.feed_forward.down_proj",
 
         },
