@@ -501,8 +501,6 @@ def patch_vllm_enable_sleep_mode():
     def __init__(self):
         # This is a replica of the original CuMemAllocator.__init__()
         # with no changes except modification to error message for better readability
-        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        print(f'PYTORCH_CUDA_ALLOC_CONF = {conf}')
         assert "expandable_segments:True" not in conf, \
             ("Standby mode is not supported with expandable segments.\n"
             "Please set environment variable PYTORCH_CUDA_ALLOC_CONF without `expandable_segments:True`.\n"
