@@ -63,6 +63,8 @@ def compare_attributes(original_model, new_model):
 
         assert type(module) == type(original_module) or isinstance(module, type(original_module)), f"Type mismatch for {name}: {type(module)} != {type(original_module)}"
 
+        assert type(module) == type(original_module), f"Type mismatch for {name}: {type(module)} != {type(original_module)}"
+
         # Find missing attributes (in original but not in new)
         missing_in_new = orig_attrs - new_attrs
         missing_in_new = missing_in_new - {'hf_device_map'}
