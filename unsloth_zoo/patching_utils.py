@@ -166,7 +166,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # See torch.compile, the missing manual
         # https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8
         # f"config.emulate_precision_casts = {not debug}", # Force X.to(f32).to(f16) instead of X.to(f16)
-        # when setting to not debug aka True, we get errors on torch2.6 
+        # when setting to not debug aka True, we get errors on torch2.6
         # TypeError: ValueRangeAnalysis.to_dtype() got an unexpected keyword argument 'use_compute_types'
         # this keyword exists in torch2.7.0 but not in torch2.6.0 so set to False until torch2.6.0 is deprecated.
         "config.emulate_precision_casts = False", # Force X.to(f32).to(f16) instead of X.to(f16)
@@ -217,7 +217,9 @@ def get_model(model):
             break
         elif hasattr(x, "model"):
             x = x.model
-        elif hasattr(x, "base_model"):
+        elif hasattr(x, "base_model") and x.base_model !=x:
+            # for VLMs x.base_model = x causing this to be stuck in endless loop
+            # the check x.base_model != x is to prevent this
             x = x.base_model
         elif hasattr(x, "language_model"):
             x = x.language_model
