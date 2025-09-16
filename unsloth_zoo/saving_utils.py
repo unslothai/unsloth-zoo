@@ -429,6 +429,7 @@ def _merge_and_overwrite_lora(
     length_of_header = 0
     # Only if overwriting
     try:
+
         # Memory map the file for direct access
         raw_pointer = open(filename_original, "r+b")
         mm = mmap.mmap(raw_pointer.fileno(), length=0, access=mmap.ACCESS_WRITE)
@@ -458,7 +459,7 @@ def _merge_and_overwrite_lora(
 
                 #W = None
                 output_key = key
-                action_logged=False
+                action_logged = False
                 # Standard 16-bit model
                 W = file.get_tensor(key)
 
@@ -622,7 +623,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 if not action_logged:
                     count += 1
                     W = _merge_lora(W, lora_stats, output_key)  # Assume _merge_lora is defined elsewhere
-                    action_logged=True
+                    action_logged = True
 
             if W is None:
                 continue
