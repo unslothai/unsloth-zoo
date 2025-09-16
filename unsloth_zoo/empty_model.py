@@ -661,7 +661,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 layer_path = layer_path.replace('language_model.model', 'language_model')
 
             if layer_module is not None:
-                if "qkv_proj" in layer_path:
+                if "qkv" in layer_path:
                     if model_type == "qwen2_5_vl":
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
                     else:
@@ -678,11 +678,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 else: # Handle other layers, especially layernorms
                     if isinstance(layer_module, torch.nn.Module):
                         if hasattr(layer_module, 'weight'):
-                            state_dict[f"{layer_path}.weight"] = layer_module.weight.data
-                            quant_state_dict[f"{layer_path}.weight"] = state_dict[f"{layer_path}.weight"]
-                            if hasattr(layer_module, 'bias') and layer_module.bias is not None:
-                                state_dict[f"{layer_path}.bias"] = layer_module.bias.data
-                                quant_state_dict[f"{layer_path}.bias"] = state_dict[f"{layer_path}.bias"]
+                            get_state_dict(layer_path, 0, state_dict, layer_module)
                     elif isinstance(layer_module, torch.nn.Parameter):
                         state_dict[f"{layer_path}"] = layer_module.data
                         quant_state_dict[f"{layer_path}"] = state_dict[f"{layer_path}"]
@@ -693,47 +689,22 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
     non_layered_components = layer_config.get('non_layered_components', [])
     for component_path in non_layered_components:
         component = _get_nested_attr(vllm_internals, component_path)
-        print(f'Unsloth NLC component: {component_path=} {component=} {type(component)=}')
-
-        def check_keys(state_dict, msg=''):
-            for key in state_dict.keys():
-                if '..' in key:
-                    print(f'{msg} found a key that has .. {key}')
 
         if component is not None:
             if hasattr(component, 'weight'):
-                get_state_dict(component_path, 0, state_dict, component)
-            elif isinstance(component, torch.nn.Module):
-                # breakpoint()
-                # for param_name, param in component.named_modules():
-                #     full_param_path = f"{component_path}.{param_name}"
-                #     print(f'Unsloth NLC module: {full_param_path=} {type(param)=} {component_path=} {param_name=}')
-                #     if hasattr(param, 'weight'):
-                #         print(f'\t processing {component_path, param_name} {param} with attr weight')
-                #         breakpoint()
-                #         get_state_dict(full_param_path, 0, state_dict, param,)
-                #         print(f'has been added? {full_param_path+".weight" in state_dict}')
-
-                print(f'Finished doing modules for {component_path}')
-                print('='*50)
-                for param_name, param in component.named_parameters():
-                    full_param_path = f"{component_path}.{param_name}" if len(param_name) > 0 else component_path
-                    print(f'Unsloth NLC param: {full_param_path=} {type(param)=} {component_path=} {param_name=}')
-                    if '.weight' in full_param_path:
-                        correct_path = full_param_path[:-len('.weight')]
-                        p = _get_nested_attr(vllm_internals, correct_path)
-                        print(f'\t\t Fetched submodule {component_path}+{param_name} from {p=}')
-                        get_state_dict(correct_path, 0, state_dict, p)
-                        breakpoint()
-                    elif hasattr(param, 'data'):
-                        state_dict[full_param_path] = param.data
-                        quant_state_dict[full_param_path] = param.data
-                    check_keys(state_dict, param_name)
-                print(f'Finished doing parameters for {component_path}')
-                print('='*50)
+                get_state_dict(component_path, 0, state_dict, component, slice_weights=False)
             elif isinstance(component, torch.nn.Parameter):
                 state_dict[component_path] = component.data
                 quant_state_dict[component_path] = component.data
+            elif isinstance(component, torch.nn.Module):
+                for param_name, param in component.named_modules():
+                    if param_name=='': continue # Skip self module (if it had weight we'd have dealt with it above already)
+                    full_param_path = f"{component_path}.{param_name}"
+                    if hasattr(param, 'weight'):
+                        get_state_dict(full_param_path, 0, state_dict, param, slice_weights=False)
+                    elif hasattr(param, 'data'):
+                        state_dict[full_param_path] = param.data
+                        quant_state_dict[full_param_path] = param.data
             else:
                 print(f"Unsloth: Skipping non-layered component '{component_path}' of unexpected type: {type(component)}")
 
