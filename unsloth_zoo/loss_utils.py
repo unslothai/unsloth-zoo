@@ -323,7 +323,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         except StopIteration:
             break
     pass
-    print([x["input_ids"].shape for x in batch_samples])
 
     # Get num_items_in_batch
     if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
