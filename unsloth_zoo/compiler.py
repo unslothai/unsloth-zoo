@@ -874,6 +874,8 @@ if n_items is None:
     all_locals = all_locals.values()
     for __kwargs in all_locals:
         if type(__kwargs) is dict:
+            print(__kwargs.get("num_items_in_batch", None))
+            print(__kwargs.get("n_items", None))
             n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
             break
 pass
@@ -949,6 +951,8 @@ if n_items is None:
         all_locals = all_locals.values()
         for __kwargs in all_locals:
             if type(__kwargs) is dict:
+                print(__kwargs.get("num_items_in_batch", None))
+                print(__kwargs.get("n_items", None))
                 n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
                 break
 pass
@@ -1042,6 +1046,8 @@ if n_items is None:
     all_locals = all_locals.values()
     for __kwargs in all_locals:
         if type(__kwargs) is dict:
+            print(__kwargs.get("num_items_in_batch", None))
+            print(__kwargs.get("n_items", None))
             n_items = __kwargs.get("num_items_in_batch", None) or __kwargs.get("n_items", None)
             break
 pass
