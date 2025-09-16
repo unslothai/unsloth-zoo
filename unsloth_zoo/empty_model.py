@@ -59,6 +59,7 @@ def compare_attributes(original_model, new_model):
     ):
         orig_attrs = {attr for attr in dir(original_module) if not attr.startswith('_')}
         new_attrs = {attr for attr in dir(module) if not attr.startswith('_')}
+        buffer_names = {name for name,_ in original_module.named_buffers(recurse=False)}
 
         assert type(module) == type(original_module), f"Type mismatch for {name}: {type(module)} != {type(original_module)}"
 
@@ -75,8 +76,9 @@ def compare_attributes(original_model, new_model):
             for attr in sorted(extra_in_new):
                 print(f"EXTRA ATTRIBUTE: {name}.{attr} (exists in new model but not original)")
 
-        # Compare common attributes
+        # Compare common attributes and buffer names
         common_attrs = orig_attrs & new_attrs
+        common_buffers = orig_attrs | buffer_names
         for attr in sorted(common_attrs):
             try:
                 original_val = getattr(original_module, attr)
@@ -163,6 +165,7 @@ def copy_attributes(original_model, new_model):
     dict_skipped_count = 0
 
     for (name, module), (_, original_module) in zip(new_model.named_modules(), original_model.named_modules()):
+        buffer_names = [name for name,_ in original_module.named_buffers(recurse=False)]
         for attr in dir(original_module):
             if attr.startswith('_'):
                 continue
@@ -170,12 +173,11 @@ def copy_attributes(original_model, new_model):
             try:
                 original_val = getattr(original_module, attr)
 
-                if original_model.config.model_type == 'gemma3' and attr == 'embed_scale':
-                    # Gemma3 has this value as tensor. We generally skip copying tensors.
-                    # We might want to force copy this attribute
-                    setattr(module, attr, original_val)
-
-                if is_comparable(original_val):
+                if attr in buffer_names:
+                    # Some models like gemma3 have embed_scale and position_ids as buffers
+                    # Lets copy them over to avoid inconsistencies
+                    setattr(module, attr, original_val.to(new_model.device))
+                elif is_comparable(original_val):
                     setattr(module, attr, original_val)
                     copied_count += 1
                 elif isinstance(original_val, dict):
