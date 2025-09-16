@@ -30,7 +30,7 @@ from copy import deepcopy
 
 def is_comparable(val):
     # Don't treat tensors as comparable, only basic types
-    return isinstance(val, (int, float, bool, str, list, type(None)))
+    return isinstance(val, (int, float, bool, str, list, tuple, type(None)))
 
 def compare_dicts(orig_dict, new_dict, prefix=""):
     all_keys = set(orig_dict.keys()) | set(new_dict.keys())
