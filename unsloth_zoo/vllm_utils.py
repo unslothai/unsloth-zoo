@@ -685,7 +685,7 @@ def patch_vllm_graph_capture():
     # Patch vLLM v1
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
-        print('Unsloth: Patching vLLM v1 graph capture')
+        logger.info('Unsloth: Patching vLLM v1 graph capture')
         original_capture_model_v1 = GPUModelRunner.capture_model
 
         @wraps(original_capture_model_v1)
@@ -713,7 +713,7 @@ def patch_vllm_graph_capture():
     # Also patch vLLM v0
     try:
         from vllm.worker.model_runner import GPUModelRunnerBase, logger
-        print('Unsloth: Patching vLLM v0 graph capture')
+        logger.info('Unsloth: Patching vLLM v0 graph capture')
         original_capture_model_v0 = GPUModelRunnerBase.capture_model
 
         @wraps(original_capture_model_v0)
