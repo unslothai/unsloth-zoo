@@ -1074,7 +1074,7 @@ def merge_and_overwrite_lora(
     # Step 3: Conditional index handling
     import subprocess
     is_t4 = "Tesla T4" in str(torch.cuda.get_device_name(0))
-    needs_splitting = should_split_shards(is_t4, config, safetensors_list)
+    needs_splitting = should_split_shards(is_t4, config, safetensors_list) if save_method == "merged_16bit" else False
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
     safe_tensor_index_files = ["model.safetensors.index.json"] if len(safetensors_list) > 1 else []
@@ -1124,7 +1124,7 @@ def merge_and_overwrite_lora(
     final_safetensors_list = []
 
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
-    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
+    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
         file_path = os.path.join(save_directory, filename)
         # Only download if we didn't get everything from cache AND this specific file doesn't exist
         # AND we're in low disk space mode
