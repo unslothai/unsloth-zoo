@@ -745,8 +745,8 @@ def patch_vllm(debug = True):
     # Allows accessing model_executor
     logger.info(f'Unsloth: Patching vLLM')
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    if debug:
-        os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
+    if debug or os.getenv("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+        os.environ["VLLM_LOGGING_LEVEL"] = "INFO"
     # os.environ["VLLM_TRACE_FUNCTION"] = "1"
     patch_vllm_set_inductor_config()
     patch_bitsandbytes_quant_state()
