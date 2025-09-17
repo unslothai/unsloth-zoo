@@ -1582,7 +1582,7 @@ def load_vllm(
                 # cudagraph_capture_sizes = [1, 2, 4, 8, 16],
                 # max_capture_size = 16,
                 cudagraph_num_of_warmups = 1,
-                full_cuda_graph = False,
+                full_cuda_graph = True,
                 use_cudagraph = True,
                 use_inductor = True,
                 inductor_compile_config = get_torch_compile_options(
