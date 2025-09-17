@@ -685,7 +685,7 @@ def patch_vllm_graph_capture():
     # Patch vLLM v1
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
-        print('Unsloth: Patching vLLM v1 graph capture')
+        logger.info('Unsloth: Patching vLLM v1 graph capture')
         original_capture_model_v1 = GPUModelRunner.capture_model
 
         @wraps(original_capture_model_v1)
@@ -713,7 +713,7 @@ def patch_vllm_graph_capture():
     # Also patch vLLM v0
     try:
         from vllm.worker.model_runner import GPUModelRunnerBase, logger
-        print('Unsloth: Patching vLLM v0 graph capture')
+        logger.info('Unsloth: Patching vLLM v0 graph capture')
         original_capture_model_v0 = GPUModelRunnerBase.capture_model
 
         @wraps(original_capture_model_v0)
@@ -745,8 +745,8 @@ def patch_vllm(debug = True):
     # Allows accessing model_executor
     logger.info(f'Unsloth: Patching vLLM')
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    if debug:
-        os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
+    if debug or os.getenv("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+        os.environ["VLLM_LOGGING_LEVEL"] = "INFO"
     # os.environ["VLLM_TRACE_FUNCTION"] = "1"
     patch_vllm_set_inductor_config()
     patch_bitsandbytes_quant_state()
@@ -1582,7 +1582,7 @@ def load_vllm(
                 # cudagraph_capture_sizes = [1, 2, 4, 8, 16],
                 # max_capture_size = 16,
                 cudagraph_num_of_warmups = 1,
-                full_cuda_graph = False,
+                full_cuda_graph = True,
                 use_cudagraph = True,
                 use_inductor = True,
                 inductor_compile_config = get_torch_compile_options(
