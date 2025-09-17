@@ -827,8 +827,6 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             raise RuntimeError(f"Unsloth: Cannot get internal vLLM states with error = {str(e)}")
     pass
 
-    print(f'{vllm_internals=}')
-
     assert(config is not None)
 
     # Determine model type from config BEFORE reassigning config
@@ -856,6 +854,8 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
         # Handle quantized weights
         quant_states = getattr(qweight, "bnb_quant_state", None)
         if quant_states is not None:
+            if 'vision_tower.transformers.layers.0.' in prefix:
+                print(f'Unsloth: Quantized weights for vision model {prefix}\t{proj}!')
             offsets = qweight.bnb_shard_offsets
             if slice_weights:
                 weight = qweight[offsets[kk] : offsets[kk + 1]]
@@ -999,7 +999,6 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             state_dict["lm_head.weight"] = lm_weight
             quant_state_dict["lm_head.weight"] = lm_weight
 
-    breakpoint()
     if not return_state_dict: state_dict = None
     return state_dict, quant_state_dict
 pass
@@ -1304,7 +1303,6 @@ def approximate_vllm_memory_usage(
     if total_memory - free_memory < maximum_activation:
         free_memory = total_memory - maximum_activation
     actual_gpu_memory_utilization = free_memory / total_memory
-    print(f'Unsloth: {load_in_4bit=} {actual_gpu_memory_utilization=} \t {free_memory=} \t {total_memory=} \t {maximum_activation=}')
 
     # 2 bytes = float16
     total_quantizable_elements = (qkvo + mlp)*n_layers * 2
@@ -1318,7 +1316,6 @@ def approximate_vllm_memory_usage(
     kv_elements = (kv_size * 2 * n_layers) * float_bytes
     memory_left_for_kv_cache = free_memory - bytes_for_model
     if memory_left_for_kv_cache <= 0: memory_left_for_kv_cache = 0
-    print(f'Unsloth: {total_quantizable_elements=} \t {total_float16_elements=} \t {lora_elements=} \t {bytes_for_model=} \t {kv_elements=} \t {memory_left_for_kv_cache=}')
 
     # Approx maximum # of KV cache elements
     max_num_batched_tokens = int(0.95*(memory_left_for_kv_cache / kv_elements))
@@ -2177,46 +2174,6 @@ def test_model_conversion(original_model, new_model):
     print("✅ Model conversion test completed!")
     return True
 
-from collections import defaultdict
-import torch
-from functools import partial
-
-# Pre-forward hook: Track max input tensor value
-@torch.inference_mode
-def pre_hook_function(module, args, statistics_dict):
-    name = module._module_name
-    if len(args) > 0 and isinstance(args[0], torch.Tensor):
-        x = args[0]
-        statistics_dict['pre'][name].append(torch.amax(x).item())
-
-# Post-forward hook: Track max output tensor value
-@torch.inference_mode
-def post_hook_function(module, args, output, statistics_dict):
-    name = module._module_name
-    x = output if isinstance(output, torch.Tensor) else output[0]
-    if isinstance(x, torch.Tensor):
-        statistics_dict['post'][name].append(torch.amax(x).item())
-
-# Backward hook: Track max gradient value
-def backward_hook_function(module, grad_input, grad_output, statistics_dict):
-    name = module._module_name
-    if grad_output is not None and len(grad_output) > 0:
-        x = grad_output[0]
-        if isinstance(x, torch.Tensor):
-            statistics_dict['backward'][name].append(torch.amax(x).item())
-
-# Utility function to attach hooks to a model
-def register_hooks(model, statistics_dict):
-    for name, module in model.named_modules():
-        module._module_name = name
-        module.register_forward_pre_hook(
-            partial(pre_hook_function, statistics_dict=statistics_dict), prepend=True)
-        module.register_forward_hook(
-            partial(post_hook_function, statistics_dict=statistics_dict), prepend=True)
-        module.register_full_backward_hook(
-            partial(backward_hook_function, statistics_dict=statistics_dict), prepend=True)
-
-
 def _test_is_same_vlm(model, new_model, processor, test_backward=False):
     # All Unsloth Zoo code licensed under LGPLv3
     assert model.device == new_model.device
@@ -2343,7 +2300,6 @@ def _test_get_vllm_state_dict(
             bnb_4bit_use_double_quant = True,
             bnb_4bit_quant_type       = "nf4",
             bnb_4bit_compute_dtype    = dtype,
-            llm_int8_skip_modules     = ["model.multi_modal_projector.patch_merger.merging_layer", "embed_tokens", "lm_head"],
         )
     pass
     kwargs = dict()
@@ -2375,8 +2331,6 @@ def _test_get_vllm_state_dict(
         **kwargs,
     )
 
-    print(f'HF Model {model=}')
-
     # unpatch_bitsandbytes_compute_dtype()
     for param in model.parameters():
         param.requires_grad_(False)
@@ -2405,7 +2359,7 @@ def _test_get_vllm_state_dict(
         config = config,
         is_vision_model = is_vision_model,
     )
-    breakpoint()
+
     assert_same_state_dict(model.state_dict(), state_dict)
 
     new_model = convert_vllm_to_huggingface(quant_state_dict, config, dtype, is_vision_model = is_vision_model)
