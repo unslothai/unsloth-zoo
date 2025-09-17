@@ -27,10 +27,14 @@ __all__ = [
 ]
 
 def dtype_from_config(config):
-    return (
-        getattr(config, "dtype", None)
-        or getattr(config, "torch_dtype", None)
-    )
+    check_order = ['dtype', 'torch_dtype']
+    if HAS_TORCH_DTYPE:
+        check_order = ['torch_dtype', 'dtype']
+    dtype = None
+    for dtype_name in check_order:
+        if dtype is None:
+            dtype = getattr(config, dtype_name, None)
+    return dtype
 
 def set_dtype_in_config(config, dtype):
     try:
@@ -62,3 +66,29 @@ def add_dtype_kwargs(dtype, kwargs_dict=None):
     else:
         kwargs_dict["dtype"] = dtype
     return kwargs_dict
+
+def _dtype_stringify(x):
+    # Convert *values* (not the config) into JSON-safe strings when they are dtypes
+    try:
+        if isinstance(x, torch.dtype):
+            # str(torch.float16) -> "torch.float16" -> "float16"
+            return str(x).split(".", 1)[-1]
+        if isinstance(x, str) and x.startswith("torch."):
+            tail = x.split(".", 1)[-1]
+            # Only strip "torch." if the tail is actually a dtype on torch
+            if hasattr(torch, tail) and isinstance(getattr(torch, tail), torch.dtype):
+                return tail
+    except Exception:
+        pass
+
+    return x
+
+def _normalize_dict_dtypes(obj):
+    if isinstance(obj, dict):
+        return {k: _normalize_dict_dtypes(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_dict_dtypes(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_normalize_dict_dtypes(v) for v in obj)
+    return _dtype_stringify(obj)
+    

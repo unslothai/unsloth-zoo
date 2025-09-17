@@ -29,7 +29,7 @@ __all__ = [
 
 from .compiler import UNSLOTH_COMPILE_LOCATION
 from .utils import _get_dtype, Version
-from .hf_utils import dtype_from_config, set_dtype_in_config
+from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
 # Also disable compiling on bitsandbytes
 def patch_compiling_bitsandbytes():
@@ -241,6 +241,33 @@ def verify_and_set_device(module,):
     module._per_layer_device_index = device.index
 pass
 
+def patch_to_dict():
+    from functools import wraps
+    from transformers.configuration_utils import PretrainedConfig
+    from .hf_utils import _normalize_dict_dtypes
+    original_to_dict = PretrainedConfig.to_dict
+    original_to_diff_dict = PretrainedConfig.to_diff_dict
+
+    @wraps(original_to_dict)
+    def wrapped_to_dict(self, *args, **kwargs):
+        result = original_to_dict(self, *args, **kwargs)
+        return _normalize_dict_dtypes(result)
+    
+    @wraps(original_to_diff_dict)
+    def wrapped_to_diff_dict(self, *args, **kwargs):
+        result = original_to_diff_dict(self, *args, **kwargs)
+        return _normalize_dict_dtypes(result)
+    
+    wrapped_to_diff_dict._unsloth_patched = True
+    if not getattr(PretrainedConfig, "_unsloth_patched", False):
+        setattr(PretrainedConfig, "to_diff_dict", wrapped_to_diff_dict)
+    pass
+
+    wrapped_to_dict._unsloth_patched = True
+    if not getattr(PretrainedConfig, "_unsloth_patched", False):
+        setattr(PretrainedConfig, "to_dict", wrapped_to_dict)
+pass
+
 def patch_model_and_tokenizer(
     model,
     tokenizer,
@@ -340,7 +367,7 @@ def patch_model_and_tokenizer(
         dicts = config.to_dict()
         for key, value in dicts.items():
             if key == "torch_dtype" or key == "dtype":
-                set_dtype_in_config(config, correct_dtype)
+                setattr(config, key, correct_dtype)
             else:
                 __fix_dtype(getattr(config, key))
     m = model
@@ -356,6 +383,13 @@ def patch_model_and_tokenizer(
         try: setattr(m, "dtype", correct_dtype)
         except: pass
     pass
+
+    # since we are now setting actual dtypes in config
+    # and there is a transition from torch.dtype to dtype
+    # support for auto dtype conversion is not stable
+    # patch to dict makes sure that any torch.dtype is converted to
+    # string when trying to save the config or serialize it
+    patch_to_dict()
 
     # Check all params and patch!
     for name, module in model.named_modules():
