@@ -835,9 +835,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     model_type = getattr(config, "model_type", "causal_lm")
 
     # Keep the original config for model_type but use text_config for vocab_size etc
-    text_config = config
-    if hasattr(config, "text_config"):
-        text_config = config.text_config
+    text_config = getattr(config, "text_config", config)
 
     vocab_size = text_config.vocab_size
 
@@ -989,7 +987,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     quant_state_dict[norm_prefix] = state_dict[norm_prefix]
 
     # LM Head - Use get_state_dict for consistency
-    if not (getattr(text_config, "tie_word_embeddings", False) or getattr(config, "tie_word_embeddings", False)):
+    if not getattr(text_config, "tie_word_embeddings", False):
         lm_layer = [mod for name,mod in vllm_internals.named_modules() if "lm_head" in name]
         # Use get_state_dict for consistent extraction and automatic truncation
         get_state_dict("lm_head", 0, state_dict, lm_layer[0], slice_weights=False)
@@ -1054,7 +1052,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
     set_dtype_in_config(config, dtype)
-    new_model, original_meta_model, layer_names, layer_count = create_empty_model(config, dtype, is_vision_model)
+    new_model, original_meta_model, layer_count, layer_names = create_empty_model(config, dtype, is_vision_model)
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
     quantization_config = getattr(config, "quantization_config", {})
     kwargs = dict()
@@ -1103,8 +1101,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     skipped_layernorms = []
     for kk in range(layer_count):
         for layer_name in layer_names:
-            if "kk" not in layer_name: # skip those that are not per layer
-                continue
             layer_name = layer_name.format(kk = kk)
 
             if 'language_model.model' in layer_name:

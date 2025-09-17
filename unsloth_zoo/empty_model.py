@@ -61,8 +61,6 @@ def compare_attributes(original_model, new_model):
         new_attrs = {attr for attr in dir(module) if not attr.startswith('_')}
         buffer_names = {name for name,_ in original_module.named_buffers(recurse=False)}
 
-        if not (type(module) == type(original_module) or (isinstance(module, type(original_module)) and 'unsloth' in str(type(module)))):
-            print(f'type mismatch: {name}')
 
         # Find missing attributes (in original but not in new)
         missing_in_new = orig_attrs - new_attrs
@@ -241,11 +239,7 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         attn_implementation = "eager",
     )
 
-    # Get layer names from config
-    layer_config = get_model_layer_config()
-    layer_names = sum(layer_config.values(), [])
-
-    return new_model, original_meta_model, layer_names, config.num_hidden_layers
+    return new_model, original_meta_model, config.num_hidden_layers
 
 def _set_config_attrs(config_obj, attrs_to_set):
     """Helper to set multiple attributes on a config object if they exist."""
@@ -327,20 +321,23 @@ def create_empty_vision_model(config, dtype = torch.float16):
     num_layers = max(text_layers, vision_layers)
     new_model = model_cls(new_config)
 
-    # Get layer names from config
-    layer_config = get_model_layer_config()
-    layer_names = sum(layer_config.values(), [])
-
-    return new_model, original_meta_model, layer_names, num_layers
+    return new_model, original_meta_model, num_layers
 
 
 @torch.inference_mode()
 def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     if is_vision_model:
-        return create_empty_vision_model(config, dtype)
+        new_model, original_meta_model, num_layers = create_empty_vision_model(config, dtype)
     else:
-        return create_empty_causal_lm(config, dtype)
+        new_model, original_meta_model, num_layers = create_empty_causal_lm(config, dtype)
+
+    # Get layer names from config
+    layer_templates = get_model_layer_config(return_non_layered=False)
+    layer_names = sum(layer_templates.values(), [])
+
+    return new_model, original_meta_model, num_layers, layer_names
+
 
 @torch.inference_mode()
 def set_additional_modules(new_model, quant_state_dict, config):
@@ -379,8 +376,11 @@ def set_additional_modules(new_model, quant_state_dict, config):
     norm = torch.nn.Parameter(norm, requires_grad = False)
     language_model.norm.weight = norm
 
-    # LM Head
-    if getattr(config, "tie_word_embeddings", False):
+    # LM Head. Do note that for some models, like Mistral3ForConditionalGeneration,
+    # there can be mismatch in the value of tie_word_embeddings between config and text_config
+    # we prefer picking the one in text_config. If you notice any issue later, please report it!
+    text_config = getattr(config, "text_config", config)
+    if getattr(text_config, "tie_word_embeddings", False):
         lmhead_key = f"{language_model_prefix}.embed_tokens.weight"
     else:
         lmhead_key = "lm_head.weight"
@@ -423,19 +423,20 @@ def set_additional_modules(new_model, quant_state_dict, config):
     )
 
     for key in additional_keys:
-        try:
-            replaced_key = re.sub(r"\.(\d+)\.", r"[\1].", key)
-            exec(f"new_{replaced_key}.data = quant_state_dict[key]")
-        except:
-            try:
-                # sometimes it can be in new_model.model. instead of new_model.
-                exec(f"new_model.{replaced_key}.data = quant_state_dict[key]")
-            except:
-                continue
+        replaced_key = re.sub(r"\.(\d+)\.", r"[\1].", key)
+        # sometimes it can be in new_model.model. instead of new_model.
+        for prefix in ['new_', 'new_model.']:
+            for suffix in ['', '.data']:
+                try:
+                    exec(f"{prefix}{replaced_key}{suffix} = quant_state_dict[key]")
+                    break
+                except:
+                    continue
+
     pass
 pass
 
-def get_model_layer_config():
+def get_model_layer_config(return_non_layered=True):
     """
     Returns a unified layer configuration containing the union of layer names
     from all supported vision models. Serves as a fallback.
@@ -556,8 +557,15 @@ def get_model_layer_config():
             'model.language_model.model.layers.{kk}.cross_attn_mlp_gate',
             'model.language_model.model.layers.{kk}.cross_attn_attn_gate',
             'model.vision_model.global_transformer.layers.{kk}.gate_ffn',
+
+            # Mistral3
+            "model.multi_modal_projector.patch_merger.merging_layer",
+            "model.multi_modal_projector.linear_1",
+            "model.multi_modal_projector.linear_2",
         },
         "non_layered_components":{
+            # we do not handle quantization for these layers yet
+            # the set_additional_modules would process these layers
             "model.multi_modal_projector",
             "model.language_model.norm",
             'model.vision_model.layernorm_pre',
@@ -583,11 +591,11 @@ def get_model_layer_config():
             "model.vision_tower.patch_positional_embedding",
             "model.vision_tower.patch_conv",
             "model.vision_tower.ln_pre",
-            "model.multi_modal_projector.patch_merger.merging_layer"
         }
     }
+
     # Convert sets to sorted lists for deterministic order
-    return {key: sorted(list(value)) for key, value in layer_templates.items()}
+    return {key: sorted(list(value)) for key, value in layer_templates.items() if key!='non_layered_components' or return_non_layered}
 
 
 def get_model_layer_counts(config):
@@ -707,8 +715,9 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 state_dict[component_path] = component.data
                 quant_state_dict[component_path] = component.data
             elif isinstance(component, torch.nn.Module):
-                for param_name, param in component.named_modules():
-                    if param_name == '': continue # Skip self among named modules
+                for param_name, param in component.named_parameters():
+                    # if the parameter is to be extracted separately, skip it
+                    if param_name.replace('.weight', '') in non_layered_components: continue
                     full_param_path = f"{component_path}.{param_name}"
                     if hasattr(param, 'weight'):
                         get_state_dict(full_param_path, 0, state_dict, param)
