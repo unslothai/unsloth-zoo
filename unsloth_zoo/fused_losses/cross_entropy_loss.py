@@ -26,6 +26,7 @@ import inspect
 import functools
 import math
 from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth import DEVICE_TYPE
 
 @functools.cache
 def _get_mapping(autograd):
@@ -112,7 +113,7 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
     """ Gets chunk size that fits the target max memory usage (1GB) """
     if target_gb is None:
         # Find current VRAM left in the GPU, and use 50% or less of it
-        free, total = torch.cuda.mem_get_info(0)
+        free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu"  else torch.cuda.mem_get_info(0)
         free_gb = free / 1024 / 1024 / 1024
         free_gb = free_gb * 0.5
         target_gb = free_gb
