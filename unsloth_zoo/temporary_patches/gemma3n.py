@@ -88,11 +88,46 @@ def patch_Gemma3nMultimodalEmbedder_forward():
     patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nMultimodalEmbedder, "forward", Gemma3nMultimodalEmbedder_forward, fullgraph = True)
 pass
 
+def patch_Gemma3nTextAltUp_predict():
+    try:
+        import transformers.models.gemma3n.modeling_gemma3n
+        from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
+    except Exception as e:
+        return raise_error("Gemma3nTextAltUp.predict", e)
+    
+    def predict(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        new_dtype = self.router_input_scale.dtype
+        hidden_states = hidden_states.to(new_dtype)
+        x = hidden_states[self.config.altup_active_idx]
+        router_inputs = Gemma3nRMSNorm_forward(self.router_norm, x) * self.router_input_scale
+        routed = self.modality_router(router_inputs)
+        modalities = torch.tanh(routed.float()).type_as(x)
+
+        if self.training and self.config.altup_coef_clip is not None:
+            self.prediction_coefs.weight.data.clamp_(-self.config.altup_coef_clip, self.config.altup_coef_clip)
+
+        # Project and then transpose all 2D matrices contained so that mulmat gives the correct result
+        all_coefs: torch.Tensor = (
+            self.prediction_coefs(modalities)
+            .reshape(*modalities.shape[:-1], self.config.altup_num_inputs, self.config.altup_num_inputs)
+            .permute(0, 1, 3, 2)
+        )
+
+        # permute hidden_states to [batch_size, num_tokens, hidden_size, altup_num_inputs]
+        predictions = torch.matmul(hidden_states.permute(1, 2, 3, 0), all_coefs)
+        predictions = predictions.permute(3, 0, 1, 2)  # undo the permute
+        predictions += hidden_states  # add the original input
+        return predictions.contiguous().type_as(hidden_states)
+    pass
+    patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "predict", predict, fullgraph = True)
+pass
+
 def patch_Gemma3nConv_Embed_forwards():
     # helper function to patch both forwards
     try:
         patch_Gemma3nConvNormAct_forward()
         patch_Gemma3nMultimodalEmbedder_forward()
+        patch_Gemma3nTextAltUp_predict()
     except Exception as e:
         return raise_error("patch_Gemma3nConv_Embed_forwards", e)
 pass

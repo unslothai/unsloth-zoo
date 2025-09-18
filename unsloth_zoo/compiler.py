@@ -473,7 +473,7 @@ def higher_precision_sqrt_mean(source):
             f"{new_variable} = {mean}(({variable}).to(torch.float32)**{power}{rest})"\
             f"{spaces}"\
             f"{new_variable} = {sqrt}({inner}({new_variable}).to(torch.float32)"\
-            f"{ending}.to(({variable}).dtype))"
+            f"{ending}.to(({variable}).dtype))\n"
         source = source.replace(full_match, new)
     return source
 pass
@@ -773,7 +773,6 @@ def create_standalone_class(
     pass
 
     source = f"{compile}\n{source}\n"
-
     left = re.match(r"[\s\n]{4,}", leftover).span()[1]
     new_forward = definition + leftover[:left] + \
         f"return {module}_forward({parameters})\n"
@@ -1980,6 +1979,7 @@ DISABLE_COMPILE_MODULES = [
     "GraniteMoeHybridMambaLayer",
     "GptOssMLP",
     "GptOssExperts",
+    "Gemma3nTextModel",
 ]
 
 
@@ -2141,6 +2141,9 @@ def unsloth_compile_transformers(
     torch_modules = list(dict.fromkeys(torch_modules + inherited_modules))
     # Get all functions as well
     functions = [x for x in functions if x not in torch_modules or not compile_torch_modules or not compile_custom_modules]
+
+    # Get all PretrainedModel classes
+    pretrained_modules = re.findall(r"class ([^\s]{1,})\(.+?PreTrainedModel\)", full_source)
 
     # Remove if no forward function
     final_torch_modules = []
@@ -2368,6 +2371,13 @@ def unsloth_compile_transformers(
     pass
     # Add back to functions since failed compiling
     functions += list(bad_torch_modules)
+
+    if len(pretrained_modules) > 0:
+        for module in pretrained_modules:
+            if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+                print(f"Unsloth: Disabling compile for {module} since it's marked for disabling.")
+                disable_modules.add(module)
+            pass
 
     if len(disable_modules) > 0:
         for module in disable_modules:
