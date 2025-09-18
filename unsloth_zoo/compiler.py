@@ -415,6 +415,70 @@ def higher_precision_softmax(source):
 pass
 
 
+# Convert  torch.mean(X ** 2, dim=-1, keepdim=True) ** 0.5
+# to      (torch.mean(X.to(torch.float32) ** 2, dim=-1, keepdim=True) ** 0.5).to(X.dtype)
+def higher_precision_sqrt_mean(source):
+    """
+    Converts all sqrt(mean(X**2)) to float32
+    torch.mean(hidden_states[0] ** 2, dim=-1, keepdim=True) ** 0.5
+    target_magnitude = torch.mean(hidden_states_0**2, dim=-1, keepdim=True) ** 0.5
+    """
+    sqrt_mean_objects = re.finditer(
+        r"(torch\.mean|torch\.sum)"\
+        r"\("\
+        r"([a-zA-Z0-9\_\[\]]{1,})[ ]{0,}"\
+        r"(\*\*)[ ]{0,}"\
+        r"([\d]{1,})"\
+        r"([^\)]{0,})"\
+        r"\)"\
+        r"[ ]{0,}"\
+        r"(\*\*)[ ]{0,}"\
+        r"([\d\.]{1,})",
+        source,
+    )
+    for item in sqrt_mean_objects:
+        full_match, matches = item.group(0), item.groups()
+        mean, variable, _, power, rest, _, divisor = matches
+        new = f"({mean}((({variable}).to(torch.float32)**{(power)}){rest})**({divisor})).to(({variable}).dtype)"
+        source = source.replace(full_match, new)
+    pass
+
+    """
+    Converts all sqrt(mean(X**2)) on 2 lines to float32
+    new_magnitude = torch.mean(current_hidden_state**2, dim=-1, keepdim=True)
+    new_magnitude = torch.sqrt(torch.maximum(new_magnitude, epsilon_tensor.to(target_magnitude.device)))
+    """
+    sqrt_mean_objects = re.finditer(
+        r"([a-zA-Z0-9\_]{1,})[ ]{0,}\=[ ]{0,}"\
+        r"(torch\.mean|torch\.sum)"\
+        r"\("\
+        r"([a-zA-Z0-9\_\[\]]{1,})[ ]{0,}"\
+        r"(\*\*)[ ]{0,}"\
+        r"([\d]{1,})"\
+        r"([^\)]{0,})"\
+        r"\)"\
+        r"([\n ]{1,})"\
+        r"\1[ ]{0,}\=[ ]{0,}"\
+        r"(torch.sqrt)"\
+        r"\("\
+        r"(.*?)\1"\
+        r"(.*?)\)\n",
+        source,
+    )
+    for item in sqrt_mean_objects:
+        full_match, matches = item.group(0), item.groups()
+        new_variable, mean, variable, _, power, rest, spaces, sqrt, inner, ending = matches
+        if "\n" in ending: continue
+        new = \
+            f"{new_variable} = {mean}(({variable}).to(torch.float32)**{power}{rest})"\
+            f"{spaces}"\
+            f"{new_variable} = {sqrt}({inner}({new_variable}).to(torch.float32)"\
+            f"{ending}.to(({variable}).dtype))"
+        source = source.replace(full_match, new)
+    return source
+pass
+
+
 # Use float32 for layernorms if we find evidence for it
 def higher_precision_layernorms(modeling_file):
     norm_modules = list(re.finditer(
@@ -740,6 +804,9 @@ def create_standalone_class(
 
     # Fix all softmax low precisions to float32
     source = higher_precision_softmax(source)
+
+    # Fix all sqrt(mean(X**2)) lower precisions to float32
+    source = higher_precision_sqrt_mean(source)
 
     return source
 pass
