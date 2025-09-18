@@ -48,6 +48,55 @@ pass
 # We only execute this for float16 so it's not always executed
 # TEMPORARY_PATCHES.append(patch_Gemma3nConvNormAct_forward)
 
+@torch_compile
+def Gemma3nRMSNorm_forward(self, x: torch.Tensor) -> torch.Tensor:
+    # Llama does x.to(float16) * w whilst Gemma2 is (x * w).to(float16)
+    # See https://github.com/huggingface/transformers/pull/29402
+    output = self._norm(x.float()) * self.weight.float()
+    return output.type_as(x)
+
+def patch_Gemma3nMultimodalEmbedder_forward():
+    try:
+        import transformers.models.gemma3n.modeling_gemma3n
+        from transformers.models.gemma3n.modeling_gemma3n import Gemma3nMultimodalEmbedder
+    except Exception as e:
+        return raise_error("timm.layers.multimodal_embedder.MultimodalEmbedder", e)
+
+    def Gemma3nMultimodalEmbedder_forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is not None:
+            emb_norm = Gemma3nRMSNorm_forward(self.soft_embedding_norm, inputs_embeds)
+        else:
+            hard_emb = self.embedding(input_ids - self.vocab_offset)
+            emb_norm = Gemma3nRMSNorm_forward(self.hard_embedding_norm, hard_emb)
+
+        old_dtype = emb_norm.dtype
+        emb_norm = emb_norm.to(torch.float32)
+        with torch.autocast(device_type = "cuda", dtype = torch.float32, enabled = True):
+            emb_norm_proj = self.embedding_projection(emb_norm)
+        emb_norm_proj = emb_norm_proj.to(old_dtype)
+
+        return Gemma3nRMSNorm_forward(self.embedding_post_projection_norm, emb_norm_proj)
+    pass
+
+    patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nMultimodalEmbedder, "forward", Gemma3nMultimodalEmbedder_forward, fullgraph = True)
+pass
+
+def patch_Gemma3nConv_Embed_forwards():
+    # helper function to patch both forwards
+    try:
+        patch_Gemma3nConvNormAct_forward()
+        patch_Gemma3nMultimodalEmbedder_forward()
+    except Exception as e:
+        return raise_error("patch_Gemma3nConv_Embed_forwards", e)
+pass
+
 
 def patch_Gemma3nTextAltUp_functions():
     try:
