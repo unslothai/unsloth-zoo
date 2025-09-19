@@ -561,16 +561,27 @@ def create_new_function(
 
     # Check location
     def write_file(function_location, write_new_source):
-        with open(function_location, "wb", buffering = 0) as file:
-            file.write(write_new_source.encode("utf-8"))
-            file.flush()
-            os.fsync(file.fileno())
+        if is_main_process():
+            # Main process writes the file
+            with open(function_location, "wb", buffering = 0) as file:
+                file.write(write_new_source.encode("utf-8"))
+                file.flush()
+                os.fsync(file.fileno())
+        else:
+            # Other processes wait for the file to exist
+            max_wait_time = 30  # seconds
+            start_time = time.time()
+            
+            while not os.path.exists(function_location):
+                time.sleep(0.1)
+                if time.time() - start_time > max_wait_time:
+                    raise TimeoutError(f"Waited too long for {function_location} to be created by main process")
         return None
     pass
 
     if overwrite or not os.path.isfile(function_location):
         try:
-            distributed_function(1, write_file, function_location, write_new_source)
+            write_file(function_location, write_new_source)
         except Exception as error:
             if UNSLOTH_COMPILE_USE_TEMP:
                 raise RuntimeError(error)
@@ -578,7 +589,7 @@ def create_new_function(
                 # Failed so instead use a temporary directory
                 compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = True)
                 function_location = os.path.join(compile_folder, f"{name}.py")
-                distributed_function(1, write_file, function_location, write_new_source)
+                write_file(function_location, write_new_source)
             pass
         pass
     pass
@@ -608,7 +619,7 @@ def create_new_function(
         if not UNSLOTH_COMPILE_USE_TEMP:
             compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = True)
             function_location = os.path.join(compile_folder, f"{name}.py")
-            distributed_function(1, write_file, function_location, write_new_source)
+            write_file(function_location, write_new_source)
             if is_main_process():
                 logger.info(f"Standard import failed for {name}: {e}. Using tempfile instead!")
             try:
