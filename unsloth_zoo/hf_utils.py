@@ -19,6 +19,7 @@ import tempfile
 import shutil
 import torch
 import json
+import re
 from transformers import PretrainedConfig
 HAS_TORCH_DTYPE = "torch_dtype" in PretrainedConfig.__doc__
 
