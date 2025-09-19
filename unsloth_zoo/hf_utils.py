@@ -114,6 +114,7 @@ def fix_lora_auto_mapping(model):
         auto_mapping_dict = {
             "base_model_class": base_model_class.__name__,
             "parent_library": parent_library,
+            "unsloth_fixed" : True,
         }
         if getattr(config, "auto_mapping", None) is None:
             config.auto_mapping = auto_mapping_dict
