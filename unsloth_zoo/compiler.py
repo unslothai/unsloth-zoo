@@ -53,6 +53,11 @@ from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
 from .temporary_patches.common import get_torch_compile_options
 
+try:
+    ScriptFunction = torch.jit.torch.jit.ScriptFunction
+except:
+    ScriptFunction = None
+
 # Compiled cache location
 global COMBINED_UNSLOTH_NAME
 COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
@@ -2698,7 +2703,19 @@ def unsloth_compile_transformers(
         for module in called_functions:
             function = eval(f"{model_location}.{module}")
 
-            parameters = inspect.signature(function)
+            # This does not always succeed, so need to check:
+            if type(function) is ScriptFunction:
+                # Can't get inspect.signature and most likely scripting will work
+                print(f"Unsloth: Cannot patch {module} since it's a torch.jit.script function.")
+                continue
+            else:
+                try:
+                    parameters = inspect.signature(function)
+                except Exception as e:
+                    print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
+                    continue
+            pass
+
             params = list(parameters.parameters.keys())
             source = inspect.getsource(function)
 
