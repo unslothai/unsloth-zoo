@@ -318,10 +318,13 @@ def get_transformers_model_type(config):
     for j, model_type in enumerate(final_model_types):
         if model_type not in all_model_types:
             # Try splitting on _ gemma3_text -> gemma3
-            model_type = model_type.split("_")[0]
-            if model_type in all_model_types:
-                final_model_types[j] = model_type
-                found_type = True
+            model_types = list(model_type)
+            model_types = ["".join(model_types[:i]) for i in range(len(model_types), 0, -1)]
+            for current_model_type in model_types:
+                if current_model_type in all_model_types:
+                    final_model_types[j] = current_model_type
+                    found_type = True
+                    break
         else:
             found_type = True
     pass
