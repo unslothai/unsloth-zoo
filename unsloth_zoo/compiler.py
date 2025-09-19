@@ -306,7 +306,27 @@ def get_transformers_model_type(config):
         model_type = model_type.replace("/", "_")
         model_type = model_type.replace(".", "_")
         final_model_types.append(model_type)
-    return sorted(final_model_types)
+    final_model_types = sorted(final_model_types)
+
+    # Check if model type is correct
+    # Gemma-3 270M has `gemma3_text` which is wrong
+    import transformers.models
+    all_model_types = dir(transformers.models)
+    found_type = False
+    for j, model_type in enumerate(final_model_types):
+        if model_type not in all_model_types:
+            # Try splitting on _ gemma3_text -> gemma3
+            model_type = model_type.split("_")[0]
+            if model_type in all_model_types:
+                final_model_types[j] = model_type
+                found_type = True
+        else:
+            found_type = True
+    pass
+    if not found_type:
+        logger.info(f"*** Could not find model_type for config = {str(config)} ***")
+    final_model_types = sorted(final_model_types)
+    return final_model_types
 pass
 
 
