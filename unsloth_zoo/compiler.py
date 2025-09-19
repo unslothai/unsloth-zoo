@@ -2751,7 +2751,19 @@ def unsloth_compile_transformers(
         for module in called_functions:
             if module in all_standalone_classes: continue
             function = eval(f"{model_location}.{module}")
-            source = inspect.getsource(function)
+
+            # This does not always succeed, so need to check:
+            if type(function) is ScriptFunction:
+                # Can't get inspect.signature and most likely scripting will work
+                print(f"Unsloth: Cannot patch {module} since it's a torch.jit.script function.")
+                continue
+            else:
+                try:
+                    source = inspect.getsource(function)
+                except Exception as e:
+                    print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
+                    continue
+            pass
 
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
