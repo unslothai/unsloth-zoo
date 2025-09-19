@@ -237,6 +237,8 @@ def get_transformers_model_type(config):
     if issubclass(type(config), PeftConfig):
         model_type_list = re.finditer(r"transformers\.models\.([^\.]{2,})\.modeling_\1", str(config))
         model_type_list = list(model_type_list)
+        if len(model_type_list) == 0:
+            logger.info("*** `model_type_list` in `get_transformers_model_type` is None!")
         if len(model_type_list) != 0:
             # Use transformers.models.gpt_oss.modeling_gpt_oss
             model_type = model_type_list[0].group(1)
