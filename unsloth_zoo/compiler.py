@@ -132,6 +132,7 @@ _license_header = """
 import os
 import torch
 import importlib.util
+import math
 if importlib.util.find_spec("unsloth_studio") is None:
     UNSLOTH_STUDIO_ENABLED = False
 else:
@@ -228,6 +229,11 @@ def get_transformers_model_type(config):
     model_types = None
 
     from peft import PeftConfig
+    # Handle model.peft_config["default"]
+    if type(config) is dict and "default" in config:
+        config = config["default"]
+    
+    retry_config = False
     if issubclass(type(config), PeftConfig):
         model_type_list = re.finditer(r"transformers\.models\.([^\.]{2,})\.modeling_\1", str(config))
         model_type_list = list(model_type_list)
@@ -261,9 +267,19 @@ def get_transformers_model_type(config):
 
         # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
         if model_types is None:
-            model_type = os.path.split(base_model_name_or_path)[-1]
-            model_types = [model_type]
+            from transformers import AutoConfig
+            try:
+                config = AutoConfig.from_pretrained(base_model_name_or_path)
+                retry_config = True
+            except:
+                config = None
+        pass
     else:
+        retry_config = True
+    pass
+
+    # Check since we might have tried AutoConfig fallback last resort for LoRA
+    if retry_config:
         from collections.abc import Mapping, Sequence
         def find(data, target_key):
             stack = [data]
