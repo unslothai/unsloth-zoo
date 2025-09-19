@@ -52,6 +52,7 @@ import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
 from .temporary_patches.common import get_torch_compile_options
+from .hf_utils import get_transformers_model_type
 
 try:
     ScriptFunction = torch.jit.torch.jit.ScriptFunction
@@ -221,123 +222,6 @@ _patch_functions = [
     "GroupNorm", "RMSNorm", "LayerNorm",
     # "CrossEntropyLoss",
 ]
-
-
-def get_transformers_model_type(config):
-    """ Gets model_type from config file - can be PEFT or normal HF """
-    if config is None:
-        raise RuntimeError(
-            f"Unsloth: No config file found - are you sure the `model_name` is correct?\n"\
-            f"If you're using a model on your local device, confirm if the folder location exists.\n"\
-            f"If you're using a HuggingFace online model, check if it exists."
-        )
-    model_types = None
-
-    from peft import PeftConfig
-    # Handle model.peft_config["default"]
-    if type(config) is dict and "default" in config:
-        config = config["default"]
-    
-    retry_config = False
-    if issubclass(type(config), PeftConfig):
-        model_type_list = re.finditer(r"transformers\.models\.([^\.]{2,})\.modeling_\1", str(config))
-        model_type_list = list(model_type_list)
-        if len(model_type_list) == 0:
-            logger.info("*** `model_type_list` in `get_transformers_model_type` is None!")
-        if len(model_type_list) != 0:
-            # Use transformers.models.gpt_oss.modeling_gpt_oss
-            model_type = model_type_list[0].group(1)
-            model_types = [model_type]
-        elif getattr(config, "auto_mapping", None) is not None:
-            # Use GptOssForCausalLM
-            model_type = config.auto_mapping.get("base_model_class", None)
-            if model_type is not None:
-                model_type = str(model_type)
-                model_type = model_type.rsplit("For", 1)[0].lower()
-                # Find exact name of modeling path
-                import transformers.models
-                supported_model_types = dir(transformers.models)
-                for modeling_file in supported_model_types:
-                    if model_type == modeling_file.lower().replace("_", "").replace(".", "_").replace("-", "_"):
-                        model_types = [modeling_file]
-                        break
-            pass
-        pass
-
-        # Get original base model
-        base_model_name_or_path = getattr(config, "base_model_name_or_path", None)
-        if base_model_name_or_path is None:
-            raise TypeError("Unsloth: adapter_config.json's `base_model_name_or_path` is None?")
-        base_model_name_or_path = str(base_model_name_or_path)
-        # Set model name for patching purposes
-        os.environ["UNSLOTH_MODEL_NAME"] = base_model_name_or_path.lower()
-
-        # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
-        if model_types is None:
-            from transformers import AutoConfig
-            try:
-                config = AutoConfig.from_pretrained(base_model_name_or_path)
-                retry_config = True
-            except:
-                config = None
-        pass
-    else:
-        retry_config = True
-    pass
-
-    # Check since we might have tried AutoConfig fallback last resort for LoRA
-    if retry_config:
-        from collections.abc import Mapping, Sequence
-        def find(data, target_key):
-            stack = [data]
-            while stack:
-                obj = stack.pop()
-                if isinstance(obj, Mapping):
-                    # Emit values for matches
-                    if target_key in obj:
-                        yield obj[target_key]
-                    # Keep walking into nested values
-                    stack.extend(obj.values())
-                elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
-                    # Walk sequences (lists/tuples/sets), but not strings/bytes
-                    stack.extend(obj)
-        model_types = list(find(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
-    pass
-    if model_types is None:
-        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
-    # Standardize model_type
-    final_model_types = []
-    for model_type in model_types:
-        model_type = model_type.lower()
-        model_type = model_type.replace("-", "_")
-        model_type = model_type.replace("/", "_")
-        model_type = model_type.replace(".", "_")
-        final_model_types.append(model_type)
-    final_model_types = sorted(final_model_types)
-
-    # Check if model type is correct
-    # Gemma-3 270M has `gemma3_text` which is wrong
-    import transformers.models
-    all_model_types = dir(transformers.models)
-    found_type = False
-    for j, model_type in enumerate(final_model_types):
-        if model_type not in all_model_types:
-            # Try splitting on _ gemma3_text -> gemma3
-            model_types = list(model_type)
-            model_types = ["".join(model_types[:i]) for i in range(len(model_types), 0, -1)]
-            for current_model_type in model_types:
-                if current_model_type in all_model_types:
-                    final_model_types[j] = current_model_type
-                    found_type = True
-                    break
-        else:
-            found_type = True
-    pass
-    if not found_type:
-        logger.info(f"*** Could not find model_type for config = {str(config)} ***")
-    final_model_types = sorted(final_model_types)
-    return final_model_types
-pass
 
 
 # Empty causal mask
