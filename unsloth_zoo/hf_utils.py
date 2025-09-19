@@ -20,6 +20,7 @@ import shutil
 import torch
 import json
 import re
+from .log import logger
 from transformers import PretrainedConfig
 HAS_TORCH_DTYPE = "torch_dtype" in PretrainedConfig.__doc__
 
