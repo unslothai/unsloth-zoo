@@ -132,6 +132,7 @@ _license_header = """
 import os
 import torch
 import importlib.util
+import math
 if importlib.util.find_spec("unsloth_studio") is None:
     UNSLOTH_STUDIO_ENABLED = False
 else:
@@ -228,6 +229,11 @@ def get_transformers_model_type(config):
     model_types = None
 
     from peft import PeftConfig
+    # Handle model.peft_config["default"]
+    if type(config) is dict and "default" in config:
+        config = config["default"]
+    
+    retry_config = False
     if issubclass(type(config), PeftConfig):
         model_type_list = re.finditer(r"transformers\.models\.([^\.]{2,})\.modeling_\1", str(config))
         model_type_list = list(model_type_list)
@@ -261,9 +267,19 @@ def get_transformers_model_type(config):
 
         # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
         if model_types is None:
-            model_type = os.path.split(base_model_name_or_path)[-1]
-            model_types = [model_type]
+            from transformers import AutoConfig
+            try:
+                config = AutoConfig.from_pretrained(base_model_name_or_path)
+                retry_config = True
+            except:
+                config = None
+        pass
     else:
+        retry_config = True
+    pass
+
+    # Check since we might have tried AutoConfig fallback last resort for LoRA
+    if retry_config:
         from collections.abc import Mapping, Sequence
         def find(data, target_key):
             stack = [data]
@@ -410,6 +426,70 @@ def higher_precision_softmax(source):
         full_match, matches = item.group(0), item.groups()
         softmax, variable, dim, dtype = matches
         new = f"{softmax}({variable}, {dim}, dtype = torch.float32).to({variable}.dtype)"
+        source = source.replace(full_match, new)
+    return source
+pass
+
+
+# Convert  torch.mean(X ** 2, dim=-1, keepdim=True) ** 0.5
+# to      (torch.mean(X.to(torch.float32) ** 2, dim=-1, keepdim=True) ** 0.5).to(X.dtype)
+def higher_precision_sqrt_mean(source):
+    """
+    Converts all sqrt(mean(X**2)) to float32
+    torch.mean(hidden_states[0] ** 2, dim=-1, keepdim=True) ** 0.5
+    target_magnitude = torch.mean(hidden_states_0**2, dim=-1, keepdim=True) ** 0.5
+    """
+    sqrt_mean_objects = re.finditer(
+        r"(torch\.mean|torch\.sum)"\
+        r"\("\
+        r"([a-zA-Z0-9\_\[\]]{1,})[ ]{0,}"\
+        r"(\*\*)[ ]{0,}"\
+        r"([\d]{1,})"\
+        r"([^\)]{0,})"\
+        r"\)"\
+        r"[ ]{0,}"\
+        r"(\*\*)[ ]{0,}"\
+        r"([\d\.]{1,})",
+        source,
+    )
+    for item in sqrt_mean_objects:
+        full_match, matches = item.group(0), item.groups()
+        mean, variable, _, power, rest, _, divisor = matches
+        new = f"({mean}((({variable}).to(torch.float32)**{(power)}){rest})**({divisor})).to(({variable}).dtype)"
+        source = source.replace(full_match, new)
+    pass
+
+    """
+    Converts all sqrt(mean(X**2)) on 2 lines to float32
+    new_magnitude = torch.mean(current_hidden_state**2, dim=-1, keepdim=True)
+    new_magnitude = torch.sqrt(torch.maximum(new_magnitude, epsilon_tensor.to(target_magnitude.device)))
+    """
+    sqrt_mean_objects = re.finditer(
+        r"([a-zA-Z0-9\_]{1,})[ ]{0,}\=[ ]{0,}"\
+        r"(torch\.mean|torch\.sum)"\
+        r"\("\
+        r"([a-zA-Z0-9\_\[\]]{1,})[ ]{0,}"\
+        r"(\*\*)[ ]{0,}"\
+        r"([\d]{1,})"\
+        r"([^\)]{0,})"\
+        r"\)"\
+        r"([\n ]{1,})"\
+        r"\1[ ]{0,}\=[ ]{0,}"\
+        r"(torch.sqrt)"\
+        r"\("\
+        r"(.*?)\1"\
+        r"(.*?)\)\n",
+        source,
+    )
+    for item in sqrt_mean_objects:
+        full_match, matches = item.group(0), item.groups()
+        new_variable, mean, variable, _, power, rest, spaces, sqrt, inner, ending = matches
+        if "\n" in ending: continue
+        new = \
+            f"{new_variable} = {mean}(({variable}).to(torch.float32)**{power}{rest})"\
+            f"{spaces}"\
+            f"{new_variable} = {sqrt}({inner}({new_variable}).to(torch.float32)"\
+            f"{ending}.to(({variable}).dtype))\n"
         source = source.replace(full_match, new)
     return source
 pass
@@ -709,7 +789,6 @@ def create_standalone_class(
     pass
 
     source = f"{compile}\n{source}\n"
-
     left = re.match(r"[\s\n]{4,}", leftover).span()[1]
     new_forward = definition + leftover[:left] + \
         f"return {module}_forward({parameters})\n"
@@ -740,6 +819,9 @@ def create_standalone_class(
 
     # Fix all softmax low precisions to float32
     source = higher_precision_softmax(source)
+
+    # Fix all sqrt(mean(X**2)) lower precisions to float32
+    source = higher_precision_sqrt_mean(source)
 
     return source
 pass
@@ -1913,6 +1995,7 @@ DISABLE_COMPILE_MODULES = [
     "GraniteMoeHybridMambaLayer",
     "GptOssMLP",
     "GptOssExperts",
+    "Gemma3nTextModel",
 ]
 
 
@@ -2074,6 +2157,9 @@ def unsloth_compile_transformers(
     torch_modules = list(dict.fromkeys(torch_modules + inherited_modules))
     # Get all functions as well
     functions = [x for x in functions if x not in torch_modules or not compile_torch_modules or not compile_custom_modules]
+
+    # Get all PretrainedModel classes
+    pretrained_modules = re.findall(r"class ([^\s]{1,})\(.+?PreTrainedModel\)", full_source)
 
     # Remove if no forward function
     final_torch_modules = []
@@ -2301,6 +2387,13 @@ def unsloth_compile_transformers(
     pass
     # Add back to functions since failed compiling
     functions += list(bad_torch_modules)
+
+    if len(pretrained_modules) > 0:
+        for module in pretrained_modules:
+            if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+                print(f"Unsloth: Disabling compile for {module} since it's marked for disabling.")
+                disable_modules.add(module)
+            pass
 
     if len(disable_modules) > 0:
         for module in disable_modules:

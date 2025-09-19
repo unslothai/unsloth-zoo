@@ -24,6 +24,7 @@ __all__ = [
     "dtype_from_config",
     "add_dtype_kwargs",
     "set_dtype_in_config",
+    "fix_lora_auto_mapping",
 ]
 
 def dtype_from_config(config):
@@ -91,4 +92,30 @@ def _normalize_dict_dtypes(obj):
     if isinstance(obj, tuple):
         return tuple(_normalize_dict_dtypes(v) for v in obj)
     return _dtype_stringify(obj)
-    
+
+# Fix LoraConfig's auto_mapping_dict
+def fix_lora_auto_mapping(model):
+    if getattr(model, "peft_config", None) is None: return
+
+    peft_config = model.peft_config
+    values = peft_config.values() if type(peft_config) is dict else [peft_config]
+    for config in values:
+        # See https://github.com/huggingface/peft/blob/20a9829f76419149f5e447b856bc0abe865c28a7/src/peft/peft_model.py#L347
+        if getattr(model, "_get_base_model_class", None) is not None:
+            base_model_class = model._get_base_model_class(
+                is_prompt_tuning = getattr(config, "is_prompt_learning", False),
+            )
+        elif getattr(model, "base_model", None) is not None:
+            base_model_class = model.base_model.__class__
+        else:
+            base_model_class = model.__class__
+        pass
+        parent_library = base_model_class.__module__
+        auto_mapping_dict = {
+            "base_model_class": base_model_class.__name__,
+            "parent_library": parent_library,
+        }
+        if getattr(config, "auto_mapping", None) is None:
+            config.auto_mapping = auto_mapping_dict
+    pass
+pass
