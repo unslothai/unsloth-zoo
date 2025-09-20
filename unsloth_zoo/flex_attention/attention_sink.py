@@ -16,7 +16,7 @@
 
 __all__ = [
     "flex_attention_with_sink",
-    "new_flex_attention_with_sink",
+    "old_flex_attention_with_sink",
 ]
 
 import torch
@@ -69,7 +69,7 @@ def generate_sink_score_mod(sink_weights : torch.Tensor):
 pass
 
 
-def flex_attention_with_sink(
+def old_flex_attention_with_sink(
     self_attn,
     query,
     key,
@@ -122,7 +122,7 @@ def flex_attention_with_sink(
 pass
 
 
-def new_flex_attention_with_sink(
+def flex_attention_with_sink(
     self_attn,
     query,
     key,

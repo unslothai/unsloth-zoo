@@ -24,7 +24,7 @@ from .utils import (
 )
 
 if HAS_FLEX_ATTENTION:
-    from .attention_sink import flex_attention_with_sink, new_flex_attention_with_sink
+    from .attention_sink import old_flex_attention_with_sink, flex_attention_with_sink
 else:
+    old_flex_attention_with_sink = None
     flex_attention_with_sink = None
-    new_flex_attention_with_sink = None
