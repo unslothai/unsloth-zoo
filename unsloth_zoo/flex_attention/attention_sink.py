@@ -171,11 +171,11 @@ def flex_attention_with_sink(
     # scale = new_denominator
     
     ### Version 2: logaddexp does log(exp(x1) + exp(x2))
-    # logsumexp_new = torch.logaddexp(logsumexp, self_attn.sinks.unsqueeze(1))
-    # scale = torch.exp(logsumexp - logsumexp_new)
+    logsumexp_new = torch.logaddexp(logsumexp, self_attn.sinks.unsqueeze(1))
+    scale = torch.exp(logsumexp - logsumexp_new)
 
     ### Version 3: Most simple uses sigmoid and scale
-    scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
+    # scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
 
     # All 3 versions scale the original attn_output!
     attn_output = attn_output.to(torch.float32) * scale.unsqueeze(-1)
