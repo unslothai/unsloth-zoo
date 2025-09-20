@@ -118,7 +118,8 @@ DISABLED_KEYWORDS = [
     "pad_tensor_by_size", # falcon h1
 ]
 
-_license_header = """
+
+_full_license_header = """
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
@@ -134,7 +135,9 @@ _license_header = """
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
 
+_license_header = _full_license_header + """
 import os
 import torch
 import importlib.util
@@ -525,7 +528,10 @@ def create_new_function(
         f'{transformers_version}\n'\
         f'{trl_version}\n__UNSLOTH_VERSIONING__\n' + '"""\n'
 
-    write_new_source = versioning + new_source
+    if _full_license_header not in new_source:
+        write_new_source = versioning + _full_license_header + new_source
+    else:
+        write_new_source = versioning + new_source
 
     # Write function
     global UNSLOTH_COMPILE_USE_TEMP
