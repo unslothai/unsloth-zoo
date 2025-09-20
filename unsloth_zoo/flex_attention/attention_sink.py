@@ -178,9 +178,9 @@ def flex_attention_with_sink(
     scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
 
     # All 3 versions scale the original attn_output!
-    attn_output = attn_output * scale.unsqueeze(-1).to(attn_output.dtype)
+    attn_output = attn_output.to(torch.float32) * scale.unsqueeze(-1)
     # To reduce error, one should do attn_output.to(torch.float32)
 
-    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.to(query.dtype).transpose(1, 2).contiguous()
     return attn_output
 pass
