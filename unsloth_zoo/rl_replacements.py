@@ -200,7 +200,11 @@ def grpo_compute_loss(
         kl_i = torch.exp(ref - new) - (ref - new) - 1.0
 
     else:
-        kl_i = 0.0 # set it to 0 to not effect the downstream computation
+        # set kl_i to a tensor of zeros with the correct shape
+        if importance_sampling_level == "sequence":
+            kl_i = new.new_zeros(new.size(0), 1)
+        else:
+            kl_i = torch.zeros_like(new)
     # Full correct reverse KL divergence?? Missing term maybe?
     # kl_i = torch.exp(new) * kl_i
 
@@ -263,7 +267,7 @@ def grpo_compute_loss(
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
                 return completion_length, x.mean()
             else:
-                mean_kl_per_reward = (kl_i * mask).sum(1) / n_mask_per_reward
+                mean_kl_per_reward = (x * mask).sum(1) / n_mask_per_reward
                 mean_kl = mean_kl_per_reward.mean()
                 return completion_length, mean_kl
     completion_length, mean_kl = masked_batch_mean(kl_i)
