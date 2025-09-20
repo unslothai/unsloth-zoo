@@ -686,7 +686,8 @@ def patch_GptOssAttention():
 
         if past_key_value is not None:
             cache_kwargs = {"cache_position": cache_position}
-            print(type(past_key_value))
+            print(past_key_value.layers)
+            raise
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         # flex_attention_with_sink only works for training since KV cache is wrong
