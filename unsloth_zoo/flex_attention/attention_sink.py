@@ -16,6 +16,7 @@
 
 __all__ = [
     "flex_attention_with_sink",
+    "new_flex_attention_with_sink",
 ]
 
 import torch
@@ -81,7 +82,12 @@ def flex_attention_with_sink(
     Allows one sink token to be attended to for full/sliding window attention
     Similar to Efficient Streaming Language Models with Attention Sinks
     Primarily for GPT-OSS 2025
+
+    [WARNING] This only works for training. Inference fails since KV cache's
+    absolute positioning will fail.
     """
+    if not self_attn.training:
+        raise NotImplementedError("Unsloth: This version of flex attention only works for training")
     assert getattr(self_attn, "sinks", None) is not None, "Unsloth: self_attn must have sinks"
     sink_weights = self_attn.sinks
     enable_gqa = getattr(self_attn, "num_key_value_groups", 1) != 1
@@ -130,7 +136,7 @@ def new_flex_attention_with_sink(
     Similar to Efficient Streaming Language Models with Attention Sinks
     Primarily for GPT-OSS 2025
 
-    [WARNING] has higher error than old_flex_attention_with_sink
+    [WARNING] has higher error than old_flex_attention_with_sink, but works for inference
     """
     assert getattr(self_attn, "sinks", None) is not None, "Unsloth: self_attn must have sinks"
     sink_weights = self_attn.sinks
