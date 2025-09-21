@@ -155,7 +155,6 @@ def flex_attention_with_sink(
         causal_mask
 
     # Handle inference and training
-    print(qlen_Q, qlen_KV, self_attn.training, flush = True)
     if self_attn.training or qlen_Q != 1:
         block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV)
         if hasattr(self_attn, "_flex_attention_cache"):
