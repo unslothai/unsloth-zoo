@@ -2373,6 +2373,7 @@ def unsloth_compile_transformers(
                 continue
         pass
     pass
+    print(f"Unsloth: Disabled modules = {str(disable_modules)}")
 
     # Now patch modules ie LlamaRMSNorm
     if compile_custom_modules:
