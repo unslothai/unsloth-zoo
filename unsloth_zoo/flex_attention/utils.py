@@ -85,7 +85,7 @@ try:
 
     # Used for every attention layer
     class FlexAttentionCache:
-        __slots__ = "offset", "offset_tensor", "block_mask", "mask_mod", "max_length"
+        __slots__ = "offset", "offset_tensor", "block_mask", "mask_mod", "max_length", "block_size",
 
         def __init__(self, key, mask_mod):
             bsz, heads_KV, qlen_KV, dim = key.shape
@@ -97,13 +97,14 @@ try:
             self.block_mask = create_block_mask_cached(mask_mod, n, n)
             self.mask_mod = mask_mod
             self.max_length = n
+            self.block_size = self.block_mask.BLOCK_SIZE[0]
 
         def __call__(self, key):
             # We increment beforehand to get the correct index since offset_tensor is used
             self.offset += 1
             self.offset_tensor.add_(1)
             bsz, heads_KV, qlen_KV, dim = key.shape
-            block_offset = self.offset // self.block_mask.BLOCK_SIZE[0]
+            block_offset = self.offset // self.block_size
             block_mask_slice = self.block_mask[:, :, block_offset]
             block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
             block_mask_slice.seq_lengths = (1, qlen_KV)
@@ -111,6 +112,7 @@ try:
                 n = self.max_length + FLEX_ATTENTION_KV_INCREMENT
                 self.block_mask = create_block_mask_cached(self.mask_mod, n, n)
                 self.max_length = n
+                self.block_size = self.block_mask.BLOCK_SIZE[0]
             return block_mask_slice
     pass
 
