@@ -778,7 +778,10 @@ def create_standalone_class(
     source = higher_precision_sqrt_mean(source)
 
     # Fix RotaryEmbeddings being in the wrong precision
-    source = fix_rotary_embedding_dtype(source)
+    try:
+        source = fix_rotary_embedding_dtype(source)
+    except Exception as e:
+        print(str(e))
 
     return source
 pass
