@@ -2151,6 +2151,7 @@ def unsloth_compile_transformers(
         gradient_checkpointed_modules
     )
     torch_modules = [x for x in torch_modules if x not in removal]
+    print(f"Unsloth: Removing these modules = {removal}")
 
     # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
     if supports_sdpa is not None:
@@ -2345,6 +2346,7 @@ def unsloth_compile_transformers(
     pass
     # Add back to functions since failed compiling
     functions += list(bad_torch_modules)
+    print(f"Unsloth: Bad torch modules = {str(bad_torch_modules)}")
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
