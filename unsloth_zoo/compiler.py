@@ -2331,7 +2331,7 @@ def unsloth_compile_transformers(
                         model_location,
                         functions,
                         fullgraph = False,
-                        disable = None,
+                        disable = disable,
                         forward_source = new_source,
                     )
                     print(f"Unsloth: Faster residual stream for {module}")
@@ -2378,6 +2378,7 @@ def unsloth_compile_transformers(
                     model_location,
                     functions,
                     fullgraph = fullgraph,
+                    disable = disable,
                 )
                 print(f"Unsloth: Compiled module {module}.")
                 all_standalone_classes[module] = new_module
@@ -2401,7 +2402,7 @@ def unsloth_compile_transformers(
                     model_location,
                     functions,
                     fullgraph = fullgraph,
-                    disable = sdpa_dynamic_compile,
+                    disable = True if disable else sdpa_dynamic_compile,
                     forward_source = forward_source,
                 )
                 print(f"Unsloth: Fast Attention patch for {module}.")
