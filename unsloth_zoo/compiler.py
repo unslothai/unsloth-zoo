@@ -2798,13 +2798,16 @@ def unsloth_compile_transformers(
         pass
     pass
     # Quick exit
-    if combined_module is None or disable:
+    if combined_module is None:
         print(f"Unsloth: Exit auto compiler with combined_module = {combined_module}, disable = {disable}")
         return
 
     # Import and replace with new module
     for module in all_standalone_classes.keys():
-        exec(f"{model_location}.{module} = combined_module.{module}", globals(), locals())
+        try:
+            exec(f"{model_location}.{module} = combined_module.{module}", globals(), locals())
+        except:
+            pass
     pass
 
     # Finally edit dictionary items inside the target file
@@ -2819,9 +2822,12 @@ def unsloth_compile_transformers(
             found = False
             for replaced_class in replaced_classes:
                 if replaced_class in value:
-                    exec(f"{model_location}.{check}['{key}'] = combined_module.{replaced_class}", globals(), locals())
-                    # print(f"Unsloth: Replacing {check} with {replaced_class}")
-                    break
+                    try:
+                        exec(f"{model_location}.{check}['{key}'] = combined_module.{replaced_class}", globals(), locals())
+                        # print(f"Unsloth: Replacing {check} with {replaced_class}")
+                        break
+                    except:
+                        pass
                 pass
             pass
         pass
