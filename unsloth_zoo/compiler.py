@@ -2108,6 +2108,7 @@ def unsloth_compile_transformers(
 
     # Get class LlamaAttention(nn.Module)
     torch_modules = re.findall(r"class ([^\s]{1,})\(.+?\.Module\)", full_source)
+    print(torch_modules)
     # Also get class LlamaSdpaAttention(LlamaAttention)
     inherited_class = "(?:" + "|".join(re.findall(r"class ([^\s]{1,})\(.+?\.Module\)", full_source)) + ")"
     inherited_modules = re.findall(r"class ([^\s]{1,})\(" + inherited_class + r"\)", full_source)
