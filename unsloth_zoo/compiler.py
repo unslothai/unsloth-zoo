@@ -440,6 +440,7 @@ def fix_rotary_embedding_dtype(source):
                             "sin.to(dtype=x.dtype)",
                             "sin.to(dtype=torch.float16 if x.dtype == torch.float32 else x.dtype)"
                         )
+                        print(source)
                         return source
     return source
 pass
