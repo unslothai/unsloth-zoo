@@ -413,6 +413,31 @@ def higher_precision_sqrt_mean(source):
 pass
 
 
+def fix_rotary_embedding_dtype(source):
+    # Rotary Embeddings might be left in float32 since we upcast it
+    # We downcast it to float16 if we see float32 for X's dtype
+    if "return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)" in source:
+        source = source.replace(
+            "return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)",
+
+            "return cos.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype), "\
+                   "sin.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype)",
+           1,
+        )
+    if "inv_freq_expanded" in source and "cos.to(dtype=x.dtype)" in source:
+        source = source.replace(
+            "cos.to(dtype=x.dtype)",
+            "cos.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype)"
+        )
+    if "inv_freq_expanded" in source and "sin.to(dtype=x.dtype)" in source:
+        source = source.replace(
+            "sin.to(dtype=x.dtype)",
+            "sin.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype)"
+        )
+    return source
+pass
+
+
 # Use float32 for layernorms if we find evidence for it
 def higher_precision_layernorms(modeling_file):
     norm_modules = list(re.finditer(
@@ -743,6 +768,9 @@ def create_standalone_class(
 
     # Fix all sqrt(mean(X**2)) lower precisions to float32
     source = higher_precision_sqrt_mean(source)
+
+    # Fix RotaryEmbeddings being in the wrong precision
+    source = fix_rotary_embedding_dtype(source)
 
     return source
 pass
