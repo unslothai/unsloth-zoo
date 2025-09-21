@@ -2108,7 +2108,6 @@ def unsloth_compile_transformers(
 
     # Get class LlamaAttention(nn.Module)
     torch_modules = re.findall(r"class ([^\s]{1,})\(.+?\.Module\)", full_source)
-    print(torch_modules)
     # Also get class LlamaSdpaAttention(LlamaAttention)
     inherited_class = "(?:" + "|".join(re.findall(r"class ([^\s]{1,})\(.+?\.Module\)", full_source)) + ")"
     inherited_modules = re.findall(r"class ([^\s]{1,})\(" + inherited_class + r"\)", full_source)
@@ -2116,7 +2115,7 @@ def unsloth_compile_transformers(
     torch_modules = list(dict.fromkeys(torch_modules + inherited_modules))
     # Get all functions as well
     functions = [x for x in functions if x not in torch_modules or not compile_torch_modules or not compile_custom_modules]
-
+    print(functions)
     # Get all PretrainedModel classes
     pretrained_modules = re.findall(r"class ([^\s]{1,})\(.+?PreTrainedModel\)", full_source)
 
@@ -2127,7 +2126,7 @@ def unsloth_compile_transformers(
         if hasattr(source, "forward"): final_torch_modules.append(module)
     pass
     torch_modules = final_torch_modules
-
+    print(torch_modules)
     # Remove functions which have gradient checkpointing in them
     # Also check if it's an attention module
     gradient_checkpointed_modules = []
