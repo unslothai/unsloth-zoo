@@ -101,6 +101,7 @@ try:
             block_offset = self.offset // self.block_mask.BLOCK_SIZE[0]
             block_mask_slice = self.block_mask[:, :, block_offset]
             block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
+            block_mask_slice.seq_lengths = (1, self.max_length)
             self.offset += 1
             self.offset_tensor.add_(1)
             if self.offset >= self.max_length:
