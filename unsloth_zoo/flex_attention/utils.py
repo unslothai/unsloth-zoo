@@ -103,16 +103,16 @@ try:
             # We increment beforehand to get the correct index since offset_tensor is used
             self.offset += 1
             self.offset_tensor.add_(1)
-            bsz, heads_KV, qlen_KV, dim = key.shape
-            block_offset = self.offset // self.block_size
-            block_mask_slice = self.block_mask[:, :, block_offset]
-            block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
-            block_mask_slice.seq_lengths = (1, qlen_KV)
             if self.offset >= self.max_length:
                 n = self.max_length + FLEX_ATTENTION_KV_INCREMENT
                 self.block_mask = create_block_mask_cached(self.mask_mod, n, n)
                 self.max_length = n
                 self.block_size = self.block_mask.BLOCK_SIZE[0]
+            bsz, heads_KV, qlen_KV, dim = key.shape
+            block_offset = self.offset // self.block_size
+            block_mask_slice = self.block_mask[:, :, block_offset]
+            block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
+            block_mask_slice.seq_lengths = (1, qlen_KV)
             return block_mask_slice
     pass
 
