@@ -153,7 +153,7 @@ import math
 
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_CCE = os.environ.get("UNSLOTH_ENABLE_CCE", "1") == "1"
-UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
+UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial",)
 
 import logging
 logger_compiler = logging.getLogger(__name__)
@@ -1990,7 +1990,9 @@ def unsloth_compile_transformers(
     except:
         return
     # All Unsloth Zoo code licensed under LGPLv3
-    disable = disable or (os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1")
+    full_disable = disable or (os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1")
+    disable = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "partial"
+    if full_disable: disable = True
     if fast_residual_stream:
         raise NotImplementedError("Unsloth: Fast residual stream optimization makes things slower!")
     pass
@@ -2798,7 +2800,7 @@ def unsloth_compile_transformers(
         pass
     pass
     # Quick exit
-    if combined_module is None:
+    if combined_module is None or full_disable:
         print(f"Unsloth: Exit auto compiler with combined_module = {combined_module}, disable = {disable}")
         return
 
