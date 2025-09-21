@@ -363,6 +363,7 @@ def patch_Gemma3Attention():
             raise ValueError("Position embeddings not provided as (cos, sin) tuple to Gemma3Attention")
 
         cos, sin = position_embeddings
+        print(cos.dtype, sin.dtype)
         cos_fp32 = cos.to(torch.float32)
         sin_fp32 = sin.to(torch.float32)
         query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos = cos_fp32, sin = sin_fp32)
@@ -380,7 +381,7 @@ def patch_Gemma3Attention():
             attn_mask_for_sdpa,
         )
     pass
-    prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
+    # prepare = torch_compile(prepare, fullgraph = True, dynamic = True)
 
     def forward_function(
         self,
