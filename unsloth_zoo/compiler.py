@@ -416,24 +416,31 @@ pass
 def fix_rotary_embedding_dtype(source):
     # Rotary Embeddings might be left in float32 since we upcast it
     # We downcast it to float16 if we see float32 for X's dtype
-    if "return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)" in source:
-        source = source.replace(
-            "return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)",
-
-            "return cos.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype), "\
-                   "sin.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype)",
-           1,
-        )
-    if "inv_freq_expanded" in source and "cos.to(dtype=x.dtype)" in source:
-        source = source.replace(
-            "cos.to(dtype=x.dtype)",
-            "cos.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype)"
-        )
-    if "inv_freq_expanded" in source and "sin.to(dtype=x.dtype)" in source:
-        source = source.replace(
-            "sin.to(dtype=x.dtype)",
-            "sin.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype)"
-        )
+    if "cos.to" in source or "sin.to" in source:
+        if os.environ.get("UNSLOTH_FORCE_CUSTOM_DTYPE", "") != "":
+            custom_datatype = os.environ["UNSLOTH_FORCE_CUSTOM_DTYPE"]
+            assert custom_datatype.count(";") >= 4
+            checker, _dtype, _bnb_compute_dtype, _custom_datatype, execute_code = custom_datatype.split(";", 4)
+            # Allow custom dtypes on all runs
+            allow_all_runs = (checker == "all")
+            # Allow only on float16 datatypes
+            allow_float16_runs = (
+                (checker == "float16" or checker == "torch.float16") and \
+                (dtype == torch.float16 or os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1")
+            )
+            if allow_all_runs or allow_float16_runs:
+                if eval(_dtype) is not None:
+                    dtype = eval(_dtype)
+                    if dtype == torch.float32:
+                        source = source.replace(
+                            "cos.to(dtype=x.dtype)",
+                            "cos.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype)"
+                        )
+                        source = source.replace(
+                            "sin.to(dtype=x.dtype)",
+                            "sin.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype)"
+                        )
+                        return source
     return source
 pass
 
