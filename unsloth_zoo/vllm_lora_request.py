@@ -5,7 +5,11 @@ from typing import Optional, Dict
 import msgspec
 import torch
 
-from vllm.adapter_commons.request import AdapterRequest
+try:
+    # vLLM removed this as part of https://github.com/vllm-project/vllm/pull/25045
+    from vllm.adapter_commons.request import AdapterRequest as adapter_request
+except ImportError:
+    adapter_request = None
 
 
 class LoRARequest(
@@ -23,7 +27,8 @@ class LoRARequest(
     lora_int_id must be globally unique for a given adapter.
     This is currently not enforced in vLLM.
     """
-    __metaclass__ = AdapterRequest
+    if adapter_request is not None:
+        __metaclass__ = adapter_request
 
     lora_name: str
     lora_int_id: int
