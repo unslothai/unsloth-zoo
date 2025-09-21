@@ -26,6 +26,7 @@ from .utils import (
     flex_attention,
     generate_sliding_window,
     causal_mask,
+    FlexAttentionCache,
 )
 from torch.nn.attention.flex_attention import flex_attention as uncompiled_flex_attention
 
@@ -152,7 +153,18 @@ def flex_attention_with_sink(
         generate_sliding_window(sliding_window) \
         if type(sliding_window) is int and sliding_window != 0 else \
         causal_mask
-    block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV)
+
+    # Handle inference and training
+    if self.training:
+        block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV)
+        if hasattr(self_attn, "_flex_attention_cache"):
+            del self_attn._flex_attention_cache
+    else:
+        if not hasattr(self_attn, "_flex_attention_cache"):
+            self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod)
+        block_mask = self_attn._flex_attention_cache.get_block_mask()
+    pass
+
     attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
         query,
         key,
