@@ -426,7 +426,7 @@ def fix_rotary_embedding_dtype(source):
             # Allow only on float16 datatypes
             allow_float16_runs = (
                 (checker == "float16" or checker == "torch.float16") and \
-                (dtype == torch.float16 or os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1")
+                (os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1")
             )
             if allow_all_runs or allow_float16_runs:
                 if eval(_dtype) is not None:
@@ -440,7 +440,6 @@ def fix_rotary_embedding_dtype(source):
                             "sin.to(dtype=x.dtype)",
                             "sin.to(dtype=torch.float16 if x.dtype == torch.float32 else x.dtype)"
                         )
-                        print(source)
                         return source
     return source
 pass
@@ -778,10 +777,7 @@ def create_standalone_class(
     source = higher_precision_sqrt_mean(source)
 
     # Fix RotaryEmbeddings being in the wrong precision
-    try:
-        source = fix_rotary_embedding_dtype(source)
-    except Exception as e:
-        print(str(e))
+    source = fix_rotary_embedding_dtype(source)
 
     return source
 pass
@@ -2119,7 +2115,7 @@ def unsloth_compile_transformers(
     torch_modules = list(dict.fromkeys(torch_modules + inherited_modules))
     # Get all functions as well
     functions = [x for x in functions if x not in torch_modules or not compile_torch_modules or not compile_custom_modules]
-    print(functions)
+
     # Get all PretrainedModel classes
     pretrained_modules = re.findall(r"class ([^\s]{1,})\(.+?PreTrainedModel\)", full_source)
 
@@ -2130,7 +2126,7 @@ def unsloth_compile_transformers(
         if hasattr(source, "forward"): final_torch_modules.append(module)
     pass
     torch_modules = final_torch_modules
-    print(torch_modules)
+
     # Remove functions which have gradient checkpointing in them
     # Also check if it's an attention module
     gradient_checkpointed_modules = []
@@ -2155,8 +2151,6 @@ def unsloth_compile_transformers(
         gradient_checkpointed_modules
     )
     torch_modules = [x for x in torch_modules if x not in removal]
-    print(f"Unsloth: Removing these modules = {removal}")
-    print(torch_modules)
 
     # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
     if supports_sdpa is not None:
@@ -2203,7 +2197,6 @@ def unsloth_compile_transformers(
         pass
         torch_modules[module] = fullgraph if UNSLOTH_FULLGRAPH else False
     pass
-    print(torch_modules.keys())
 
     # Get other classes
     other_classes = re.findall(r"class ([^\s]{1,})\(.+?\)", full_source)
@@ -2290,9 +2283,7 @@ def unsloth_compile_transformers(
         try:
             init   = inspect.getsource(source.__init__)
             source = inspect.getsource(source.forward)
-        except Exception as e:
-            print(f"Skipping {module} with error = {str(e)}")
-            continue
+        except: continue
 
         if "attn_weights" in source or "self.self_attn" in source or "_ATTENTION_CLASSES" in init:
 
@@ -2347,14 +2338,14 @@ def unsloth_compile_transformers(
                     )
                     print(f"Unsloth: Faster residual stream for {module}")
                     all_standalone_classes[module] = new_module
-                except:
+                except Exception as e:
+                    print(f"Unsloth: Failed faster residual stream {module} with error = {str(e).replace('\n', ' ')}")
                     continue
             pass
         pass
     pass
     # Add back to functions since failed compiling
     functions += list(bad_torch_modules)
-    print(f"Unsloth: Bad torch modules = {str(bad_torch_modules)}")
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
@@ -2374,12 +2365,11 @@ def unsloth_compile_transformers(
                     disable = True,
                 )
                 all_standalone_classes[module] = new_module
-            except:
-                print(f"Unsloth: Failed to disable {module}.")
+            except Exception as e:
+                print(f"Unsloth: Failed disabling modules for {module} with error = {str(e).replace('\n', ' ')}")
                 continue
         pass
     pass
-    print(f"Unsloth: Disabled modules = {str(disable_modules)}")
 
     # Now patch modules ie LlamaRMSNorm
     if compile_custom_modules:
@@ -2395,7 +2385,8 @@ def unsloth_compile_transformers(
                 )
                 print(f"Unsloth: Compiled module {module}.")
                 all_standalone_classes[module] = new_module
-            except:
+            except Exception as e:
+                print(f"Unsloth: Failed compiling {module} with error = {str(e).replace('\n', ' ')}")
                 continue
         pass
     pass
@@ -2420,7 +2411,8 @@ def unsloth_compile_transformers(
                 )
                 print(f"Unsloth: Fast Attention patch for {module}.")
                 all_standalone_classes[module] = new_module
-            except:
+            except Exception as e:
+                print(f"Unsloth: Failed Fast Attention patch for {module} with error = {str(e).replace('\n', ' ')}")
                 continue
         pass
 
@@ -2436,7 +2428,8 @@ def unsloth_compile_transformers(
                 )
                 print(f"Unsloth: Slow Attention patch for {module}.")
                 all_standalone_classes[module] = new_module
-            except:
+            except Exception as e:
+                print(f"Unsloth: Failed Slow Attention patch {module} with error = {str(e).replace('\n', ' ')}")
                 continue
         pass
     pass
@@ -2487,17 +2480,21 @@ def unsloth_compile_transformers(
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:
-                    new_module = create_standalone_class(
-                        module,
-                        model_location,
-                        functions,
-                        fullgraph = False,
-                        disable = True,
-                        forward_source = new_source,
-                        add_loss_kwargs = True,
-                    )
-                    print(f"Unsloth: Fast fused linear cross entropy patch for {module}.")
-                    all_standalone_classes[module] = new_module
+                    try:
+                        new_module = create_standalone_class(
+                            module,
+                            model_location,
+                            functions,
+                            fullgraph = False,
+                            disable = True,
+                            forward_source = new_source,
+                            add_loss_kwargs = True,
+                        )
+                        print(f"Unsloth: Fast fused linear cross entropy patch for {module}.")
+                        all_standalone_classes[module] = new_module
+                    except Exception as e:
+                        print(f"Unsloth: Failed Fast fused linear cross entropy patch {module} with error = {str(e).replace('\n', ' ')}")
+                        continue
                 pass
             pass
         pass
@@ -2514,18 +2511,22 @@ def unsloth_compile_transformers(
             if output is None: continue
 
             init, forward = output
-            new_module = create_standalone_class(
-                module,
-                model_location,
-                functions,
-                fullgraph = False,
-                disable = True,
-                forward_source = forward,
-                add_loss_kwargs = False,
-                new_init = init,
-            )
-            all_standalone_classes[module] = new_module
-            print(f"Unsloth: Patched {module} by adding gradient checkpointing")
+            try:
+                new_module = create_standalone_class(
+                    module,
+                    model_location,
+                    functions,
+                    fullgraph = False,
+                    disable = True,
+                    forward_source = forward,
+                    add_loss_kwargs = False,
+                    new_init = init,
+                )
+                all_standalone_classes[module] = new_module
+                print(f"Unsloth: Patched {module} by adding gradient checkpointing")
+            except Exception as e:
+                print(f"Unsloth: Failed gradient checkpointing patch {module} with error = {str(e).replace('\n', ' ')}")
+                continue
         pass
     pass
 
@@ -2541,16 +2542,20 @@ def unsloth_compile_transformers(
                 continue
             new_source = patch_finfo_attention_mask_dtype_mismatch(module, source)
             if new_source != source:
-                new_module = create_standalone_class(
-                    module,
-                    model_location,
-                    functions,
-                    fullgraph = False,
-                    disable = True,
-                    forward_source = new_source,
-                )
-                all_standalone_classes[module] = new_module
-                print(f"Unsloth: Patched {module} by fixing finfo dtype mismatch in attention mask")
+                try:
+                    new_module = create_standalone_class(
+                        module,
+                        model_location,
+                        functions,
+                        fullgraph = False,
+                        disable = True,
+                        forward_source = new_source,
+                    )
+                    all_standalone_classes[module] = new_module
+                    print(f"Unsloth: Patched {module} by fixing finfo dtype mismatch in attention mask")
+                except Exception as e:
+                    print(f"Unsloth: Failed fixing finfo dtype mismatch in attention in {module} with error = {str(e).replace('\n', ' ')}")
+                    continue
             pass
         pass
     pass
