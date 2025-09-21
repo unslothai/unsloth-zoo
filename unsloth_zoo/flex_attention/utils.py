@@ -89,6 +89,7 @@ try:
 
         def __init__(self, key, mask_mod):
             bsz, heads_KV, qlen_KV, dim = key.shape
+            qlen_KV -= 1 # Minue one since we need the block mask to use the saved offset_tensor
             self.offset = qlen_KV
             self.offset_tensor = torch.tensor(qlen_KV, device = key.device, dtype = int)
             div, mod = divmod(qlen_KV, FLEX_ATTENTION_KV_INCREMENT)
@@ -98,13 +99,14 @@ try:
             self.max_length = n
 
         def __call__(self, key):
+            # We increment beforehand to get the correct index since offset_tensor is used
+            self.offset += 1
+            self.offset_tensor.add_(1)
             bsz, heads_KV, qlen_KV, dim = key.shape
             block_offset = self.offset // self.block_mask.BLOCK_SIZE[0]
             block_mask_slice = self.block_mask[:, :, block_offset]
             block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
             block_mask_slice.seq_lengths = (1, qlen_KV)
-            self.offset += 1
-            self.offset_tensor.add_(1)
             if self.offset >= self.max_length:
                 n = self.max_length + FLEX_ATTENTION_KV_INCREMENT
                 self.block_mask = create_block_mask_cached(self.mask_mod, n, n)
