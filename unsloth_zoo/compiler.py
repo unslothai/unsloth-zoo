@@ -2152,6 +2152,7 @@ def unsloth_compile_transformers(
     )
     torch_modules = [x for x in torch_modules if x not in removal]
     print(f"Unsloth: Removing these modules = {removal}")
+    print(torch_modules)
 
     # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
     if supports_sdpa is not None:
@@ -2198,6 +2199,7 @@ def unsloth_compile_transformers(
         pass
         torch_modules[module] = fullgraph if UNSLOTH_FULLGRAPH else False
     pass
+    print(torch_modules.keys())
 
     # Get other classes
     other_classes = re.findall(r"class ([^\s]{1,})\(.+?\)", full_source)
