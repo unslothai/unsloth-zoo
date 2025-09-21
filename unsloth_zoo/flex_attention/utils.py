@@ -98,7 +98,7 @@ try:
                 n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
                 self.offset = qlen_KV - 1 # Minue one since we need the block mask to use the saved offset_tensor
                 self.sliding_window = None
-            self.offset_tensor = torch.tensor(self.offset, device = key.device, dtype = int)
+            self.offset_tensor = torch.tensor(self.offset, device = key.device, dtype = torch.int32)
             self.block_mask = create_block_mask_cached(mask_mod, n, n)
             self.mask_mod = mask_mod
             self.max_length = n
@@ -115,6 +115,7 @@ try:
                 self.max_length = n
                 self.block_size = self.block_mask.BLOCK_SIZE[0]
             bsz, heads_KV, qlen_KV, dim = key.shape
+            print(self.sliding_window, self.offset, self.max_length, qlen_KV, flush = True)
             block_offset = self.offset // self.block_size
             block_mask_slice = self.block_mask[:, :, block_offset]
             block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
