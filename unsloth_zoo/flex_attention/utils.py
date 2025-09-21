@@ -94,7 +94,7 @@ try:
                 self.offset = min(sliding_window, qlen_KV) - 1 # Minus 1 since block mask is indexing
                 self.sliding_window = sliding_window - 1 # Minus 1 since 128 means index 127
             else:
-                div, mod = divmod(self.offset, FLEX_ATTENTION_KV_INCREMENT)
+                div, mod = divmod(qlen_KV, FLEX_ATTENTION_KV_INCREMENT)
                 n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
                 self.offset = qlen_KV - 1 # Minue one since we need the block mask to use the saved offset_tensor
                 self.sliding_window = None
