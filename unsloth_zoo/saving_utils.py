@@ -472,6 +472,7 @@ def _merge_and_overwrite_lora(
                 action_logged = False
                 # Standard 16-bit model
                 W = file.get_tensor(key)
+                W_original_dtype = W.dtype
 
                 if W is None:
                     continue
@@ -485,7 +486,7 @@ def _merge_and_overwrite_lora(
                     count += 1
 
                 # FIXED: Direct tensor writing using torch
-                success = _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, W, output_dtype)
+                success = _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, W, W_original_dtype)
 
                 if not success:
                     raise RuntimeError(f"Failed to write tensor to model file.")
