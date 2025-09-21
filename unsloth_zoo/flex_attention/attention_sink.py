@@ -163,8 +163,7 @@ def flex_attention_with_sink(
     else:
         if not hasattr(self_attn, "_flex_attention_cache"):
             self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod)
-        block_mask = self_attn._flex_attention_cache()
-        print(block_mask, flush = True)
+        block_mask = self_attn._flex_attention_cache(key)
     pass
 
     attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
