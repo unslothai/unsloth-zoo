@@ -434,11 +434,11 @@ def fix_rotary_embedding_dtype(source):
                     if dtype == torch.float32:
                         source = source.replace(
                             "cos.to(dtype=x.dtype)",
-                            "cos.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype)"
+                            "cos.to(dtype=torch.float16 if x.dtype == torch.float32 else x.dtype)"
                         )
                         source = source.replace(
                             "sin.to(dtype=x.dtype)",
-                            "sin.to(dtype=torch.float16 if x.dtype is torch.float32 else x.dtype)"
+                            "sin.to(dtype=torch.float16 if x.dtype == torch.float32 else x.dtype)"
                         )
                         return source
     return source
