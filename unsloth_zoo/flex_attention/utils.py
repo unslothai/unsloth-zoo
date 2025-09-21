@@ -99,8 +99,7 @@ try:
 
         def __call__(self):
             block_offset = self.offset // self.block_mask.BLOCK_SIZE[0]
-            # block_mask_slice = self.block_mask[:, :, block_offset]
-            block_mask_slice = self.block_mask.select(2, block_offset)
+            block_mask_slice = self.block_mask[:, :, block_offset]
             block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
             self.offset += 1
             self.offset_tensor.add_(1)
