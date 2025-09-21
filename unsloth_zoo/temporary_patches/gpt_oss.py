@@ -689,6 +689,7 @@ def patch_GptOssAttention():
 
         # flex_attention_with_sink only works for training since KV cache is wrong
         # switch to flex_attention_with_sink which allows all to work
+        print(query_states.shape, key_states.shape, value_states.shape, flush = True)
         attn_output = flex_attention_with_sink(
             self,
             query_states,
