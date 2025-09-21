@@ -2286,7 +2286,9 @@ def unsloth_compile_transformers(
         try:
             init   = inspect.getsource(source.__init__)
             source = inspect.getsource(source.forward)
-        except: continue
+        except Exception as e:
+            print(f"Skipping {module} with error = {str(e)}")
+            continue
 
         if "attn_weights" in source or "self.self_attn" in source or "_ATTENTION_CLASSES" in init:
 
