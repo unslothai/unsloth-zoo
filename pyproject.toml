@@ -46,6 +46,7 @@ dependencies = [
     "regex",
     "msgspec",
     "typing_extensions",
+    "mistral_common",
 ]
 
 [tool.setuptools.dynamic]
