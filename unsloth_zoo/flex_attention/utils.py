@@ -91,24 +91,87 @@ try:
             bsz, heads_KV, qlen_KV, dim = key.shape
             if sliding_window is None:
                 """
+                Normal causal mask:
                     k0 k1 k2 k3 k4
                 q0   X
                 q1   X  X
                 q2   X  X  X
                 q3   X  X  X  X
                 q4   X  X  X  X  X
+                During decoding:
+                    k0 k1 k2 k3 k4
+                q0   
+                q1   
+                q2   
+                q3   
+                q4   X  X  X  X  X
+                But q_index = 0, so we need an offset = 4
+                If no offset, we get:
+                   k0 k1 k2 k3 k4
+                q0   
+                q1   
+                q2   
+                q3   
+                q4   X
+                Which is wrong.
+                Note it's offset==index since it's indexed from 0 as seen in
+                https://pytorch.org/blog/flexattention-for-inference/
+                https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L91
                 """
+                # Get next multiple of FLEX_ATTENTION_KV_INCREMENT
                 div, mod = divmod(qlen_KV, FLEX_ATTENTION_KV_INCREMENT)
                 n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
-                self.offset = qlen_KV - 1 # Minue one since we need the block mask to use the saved offset_tensor
+                self.offset = qlen_KV - 2 # Minus two since we need the block mask to use the saved offset_tensor
+                if self.offset <= -2:
+                    # Minimum is -1
+                    self.offset = -1
+                    # During decoding we do self.offset += 1, so self.offset = 0
                 self.sliding_window = None
             else:
                 """
-                Sliding window mechanics is different
+                Sliding window of 2 + causal mask:
+                    k0 k1 k2 k3 k4
+                q0   X
+                q1   X  X
+                q2      X  X
+                q3         X  X
+                q4            X  X
+                During decoding:
+                    k0 k1 k2 k3 k4
+                q0   
+                q1   
+                q2   
+                q3   
+                q4            X  X
+                If we set cache_implementation = "static" which we assume, we  don't use an offset
+                since the K is a rolling matrix of the past window size.
+                Ie if sliding_window = 2, K is shape (2, dim). So in actuality, we get:
+                    -- -- -- k3 k4
+                q0   
+                q1   
+                q2   
+                q3   
+                q4            X  X
+                So offset = sliding_window-1 always ie 2-1 = 1
+                    -- -- -- k0 k1
+                q0   
+                q1   
+                q2   
+                q3(0)   
+                q4(1)         X  X
+                Note it's offset==index since it's indexed from 0 as seen in
+                https://pytorch.org/blog/flexattention-for-inference/
+                https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L91
+                For sliding window, it's always sliding_window - 1
+                since 128 means index 127
                 """
                 n = sliding_window
-                self.offset = min(sliding_window, qlen_KV) # Minus 1 since block mask is indexing
-                self.sliding_window = sliding_window # Minus 1 since 128 means index 127
+                self.offset = min(sliding_window, qlen_KV) - 2 # Minus 2 since block mask is indexing
+                if self.offset <= -2:
+                    # Minimum is -1
+                    self.offset = -1
+                    # During decoding we do self.offset += 1, so self.offset = 0
+                self.sliding_window = sliding_window - 1 # Minus 1 since token 128 means index 127
             self.offset_tensor = torch.tensor(self.offset, device = key.device, dtype = torch.int32)
             self.block_mask = create_block_mask_cached(mask_mod, n, n)
             self.mask_mod = mask_mod
@@ -117,18 +180,23 @@ try:
 
         def __call__(self, key):
             # We increment beforehand to get the correct index since offset_tensor is used
+            #                                    Assume sliding_window=128-1 = 127
+            #                                    offset=126, so offset+1 = 127
             if (self.sliding_window is None) or (self.offset < self.sliding_window):
                 self.offset += 1
                 self.offset_tensor.add_(1)
             if self.offset >= self.max_length:
-                n = self.max_length + FLEX_ATTENTION_KV_INCREMENT
-                self.block_mask = create_block_mask_cached(self.mask_mod, n, n)
-                self.max_length = n
+                # Must be >= since offset=127, max_length=128 means size=127+1=128
+                # since we do zero indexing
+                self.max_length += FLEX_ATTENTION_KV_INCREMENT
+                self.block_mask = create_block_mask_cached(self.mask_mod, self.max_length, self.max_length)
                 self.block_size = self.block_mask.BLOCK_SIZE[0]
             bsz, heads_KV, qlen_KV, dim = key.shape
             block_offset = self.offset // self.block_size
             block_mask_slice = self.block_mask[:, :, block_offset]
             block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
+            # Must set seq_lengths as seen in
+            # https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L80
             block_mask_slice.seq_lengths = (1, qlen_KV)
             return block_mask_slice
     pass
