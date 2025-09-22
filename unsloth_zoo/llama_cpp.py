@@ -88,6 +88,13 @@ BAD_OUTCOMES = {
     "is deprecated"              : "Command is deprecated!",
 }
 
+# Check environments
+keynames = "\n" + "\n".join(os.environ.keys())
+IS_COLAB_ENVIRONMENT  = "\nCOLAB_"  in keynames
+IS_KAGGLE_ENVIRONMENT = "\nKAGGLE_" in keynames
+KAGGLE_TMP = "/tmp"
+del keynames
+
 
 @contextlib.contextmanager
 def use_local_gguf():
@@ -127,15 +134,9 @@ pass
 
 def install_package(package, sudo = False, print_output = False, print_outputs = None):
     # All Unsloth Zoo code licensed under LGPLv3
-    if sudo:
-        raise RuntimeError(
-            "Unsloth: Using sudo elevated permissions is not allowed!\n"\
-            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
-        )
-    # x = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
-    x = f"{''}apt-get install {package} -y"
+    x = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
     print(f"Unsloth: Installing packages: {package}")
-    acceptance = input(f"We will use executing `{x}` - do you accept? Press ENTER. Type NO if not.")
+    acceptance = input(f"Missing system packages. We need to execute `{x}` - do you accept? Press ENTER. Type NO if not.")
     if "no" in str(acceptance).lower():
         raise RuntimeError(
             f"Unsloth: Execution of `{x}` was cancelled!\n"\
@@ -147,7 +148,9 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
 
             if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
                 sp.terminate()
-                raise RuntimeError(f"[FAIL] Unsloth: Permission denied when installing package {package}")
+                raise RuntimeError(f"[FAIL] Unsloth: Permission denied when installing package {package}\n"\
+                                   "This operation requires elevated sudo/root permissions. Please manually install missing packages and retry again"
+                    )
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
                 raise RuntimeError(f"[FAIL] Unsloth: apt-get does not exist when installing {package}? Is this NOT a Linux / Mac based computer?")
@@ -190,12 +193,6 @@ def do_we_need_sudo():
         pass
     pass
 
-    if sudo:
-        raise RuntimeError(
-            "Unsloth: Using sudo elevated permissions is not allowed!\n"\
-            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
-        )
-
     # Update all package lists as well
     x = f"sudo apt-get update -y"
 
@@ -216,7 +213,7 @@ def do_we_need_sudo():
         pass
     pass
 
-    if sudo: print("Unsloth: All commands will now use admin permissions (sudo)")
+    #if sudo: print("Unsloth: All commands will now use admin permissions (sudo)")
     return sudo
 pass
 
@@ -241,14 +238,11 @@ pass
 
 def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None):
     # All Unsloth Zoo code licensed under LGPLv3
-    if sudo:
-        raise RuntimeError(
-            "Unsloth: Using sudo elevated permissions is not allowed!\n"\
-            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
-        )
-    need_to_install = False
+
     with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, text=True) as sp:
         stdout, stderr = sp.communicate()
+        stdout = stdout or ""
+        stderr = stderr or ""
         all_output = stdout + stderr
 
         # Check exit code
@@ -370,8 +364,21 @@ def install_llama_cpp(
 
     print_outputs = []
     sudo = do_we_need_sudo()
-    sudo = False
     kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs,}
+
+    missing_packages = check_build_requirements()
+
+    if not missing_packages:
+        print("Unsloth: All required system packages already installed!")
+    else:
+        packages_to_install = " ".join(missing_packages)
+        print(f"Unsloth: Missing packages: {packages_to_install}")
+        print(f"Unsloth: Will attempt to install missing system packages.")
+        install_package(packages_to_install, sudo)
+
+    print("Unsloth: Install llama.cpp and building - please wait 1 to 3 minutes")
+    if gpu_support == "ON":
+        print("Unsloth: Building llama.cpp with GPU support")
 
     # Clone repo if it doesn't exist
     if not os.path.exists(llama_cpp_folder):
@@ -382,17 +389,10 @@ def install_llama_cpp(
         )
 
     pip = check_pip()
-    kwargs["sudo"] = False
 
     print("Unsloth: Install GGUF and other packages")
     try_execute(f"{pip} install gguf protobuf sentencepiece", **kwargs)
     if just_clone_repo: return llama_cpp_folder
-
-    install_package("build-essential cmake curl libcurl4-openssl-dev", sudo)
-
-    print("Unsloth: Install llama.cpp and building - please wait 1 to 3 minutes")
-    if gpu_support == "ON":
-        print("Unsloth: Building llama.cpp with GPU support")
 
     build_success = False
     build_errors = []
@@ -1129,6 +1129,43 @@ def assert_correct_gguf(model_name, model, tokenizer):
     for name in model_name:
         _assert_correct_gguf(name, model, tokenizer)
     pass
+pass
+
+
+def check_build_requirements():
+    """Check if build requirements are available (tool-based approach)"""
+    required_tools = {
+        'gcc': 'build-essential',
+        'cmake': 'cmake',
+        'curl': 'curl',
+        'git': 'git',
+    }
+
+    missing_packages = []
+
+    for tool, package in required_tools.items():
+        try:
+            result = subprocess.run(['which', tool], capture_output=True, text=True)
+            if result.returncode != 0:
+                missing_packages.append(package)
+        except Exception:
+            missing_packages.append(package)
+
+    # Check for libcurl development headers
+    try:
+        result = subprocess.run(['pkg-config', '--exists', 'libcurl'], capture_output=True, text=True)
+        if result.returncode != 0:
+            missing_packages.append('libcurl4-openssl-dev')
+    except Exception:
+        # If pkg-config doesn't exist, check for curl-config
+        try:
+            result = subprocess.run(['curl-config', '--version'], capture_output=True, text=True)
+            if result.returncode != 0:
+                missing_packages.append('libcurl4-openssl-dev')
+        except Exception:
+            missing_packages.append('libcurl4-openssl-dev')
+
+    return list(set(missing_packages))  # Remove duplicates
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
