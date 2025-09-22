@@ -182,6 +182,7 @@ def flex_attention_with_sink(
 
             # Decoding we can ignore mask on q_idx since q_idx is always length 1
             # Normally we have to do:
+            #  q_idx >= padding_start_idx[batch_idx]
             # kv_idx >= padding_start_idx[batch_idx]
             # but we only need the 2nd one
             decoding_mask_mod = \
