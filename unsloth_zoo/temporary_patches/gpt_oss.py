@@ -831,6 +831,7 @@ def patch_GptOssModel():
         })
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward)
 pass
+TEMPORARY_PATCHES.append(patch_GptOssModel)
 
 try:
     from openai_harmony import (
