@@ -20,7 +20,9 @@ __all__ = [
     "flex_attention",
     "create_block_mask_cached",
     "causal_mask",
+    "generate_causal_mask_with_padding",
     "generate_sliding_window",
+    "generate_sliding_window_mask_with_padding",
     "FlexAttentionCache",
 ]
 
@@ -45,9 +47,35 @@ try:
         """Causal mask for Flex Attention"""
         return q_idx >= kv_idx
 
-    def generate_causal_mask(batch_idx, head_idx, q_idx, kv_idx):
-        """Causal mask for Flex Attention with left padding support."""
-        return q_idx >= kv_idx
+    def generate_causal_mask_with_padding(padding_start_idx = None):
+        """
+        Causal mask for Flex Attention with left padding support.
+        Normal causal mask:
+            k0 k1 k2 k3 k4
+        q0   X
+        q1   X  X
+        q2   X  X  X
+        q3   X  X  X  X
+        q4   X  X  X  X  X
+        If we add 2 tokens as padded tokens, we get:
+            #0 #1 k2 k3 k4
+        #0    
+        #1       
+        q2         X
+        q3         X  X
+        q4         X  X  X
+        Assume padding_start_idx == [2]
+        """
+        assert padding_start_idx is not None and type(padding_start_idx) is torch.Tensor
+        assert padding_start_idx.dim() == 1
+        assert padding_start_idx.shape[0] >= 1
+        def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
+            """Causal mask for Flex Attention"""
+            q_padded =  q_idx >= padding_start_idx[batch_idx]
+            k_padded = kv_idx >= padding_start_idx[batch_idx]
+            return q_padded & k_padded & (q_idx >= kv_idx)
+        causal_mask.__name__ = causal_mask.__doc__ = f"causal_mask_with_left_padding_{padding_start_idx.tolist()}"
+        return causal_mask
 
     @functools.lru_cache
     def generate_sliding_window(window_size: int):
@@ -74,6 +102,19 @@ try:
             # windowed_mask = q_idx - kv_idx <= window_size
             return causal_mask & windowed_mask
         sliding_window.__name__ = sliding_window.__doc__ = f"sliding_window_{window_size}"
+        return sliding_window
+
+    def generate_sliding_window_mask_with_padding(window_size: int, padding_start_idx = None):
+        assert padding_start_idx is not None and type(padding_start_idx) is torch.Tensor
+        assert padding_start_idx.dim() == 1
+        assert padding_start_idx.shape[0] >= 1
+        def sliding_window(batch_idx, head_idx, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            windowed_mask = q_idx - kv_idx < window_size
+            q_padded =  q_idx >= padding_start_idx[batch_idx]
+            k_padded = kv_idx >= padding_start_idx[batch_idx]
+            return q_padded & k_padded & causal_mask & windowed_mask
+        sliding_window.__name__ = sliding_window.__doc__ = f"sliding_window_with_left_padding_{window_size}_{padding_start_idx.tolist()}"
         return sliding_window
 
     # For inference see https://pytorch.org/blog/flexattention-for-inference

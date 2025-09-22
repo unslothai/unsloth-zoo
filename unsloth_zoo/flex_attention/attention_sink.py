@@ -24,8 +24,10 @@ import functools
 from .utils import (
     create_block_mask_cached,
     flex_attention,
-    generate_sliding_window,
     causal_mask,
+    generate_causal_mask_with_padding,
+    generate_sliding_window,
+    generate_sliding_window_mask_with_padding,
     FlexAttentionCache,
 )
 from torch.nn.attention.flex_attention import flex_attention as uncompiled_flex_attention
@@ -75,6 +77,7 @@ def old_flex_attention_with_sink(
     query,
     key,
     value,
+    attention_mask = None,
     scale = None,
     sliding_window = None,
     compile = True,
@@ -128,6 +131,7 @@ def flex_attention_with_sink(
     query,
     key,
     value,
+    attention_mask = None,
     scale = None,
     sliding_window = None,
     compile = True,
@@ -149,19 +153,29 @@ def flex_attention_with_sink(
 
     # Check for sliding window
     sliding_window = sliding_window or getattr(self_attn, "sliding_window", None)
-    mask_mod = \
-        generate_sliding_window(sliding_window) \
-        if type(sliding_window) is int and sliding_window != 0 else \
-        causal_mask
+    is_training = self_attn.training
+    if is_training:
+        mask_mod = \
+            generate_sliding_window(sliding_window) \
+            if type(sliding_window) is int and sliding_window != 0 else \
+            causal_mask
+    else:
+        # Consider left padding as well
+        assert attention_mask is not None and attention_mask.dim() == 2
+        padding_start_idx = inputs["attention_mask"].argmax(1)
+        mask_mod = \
+            generate_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
+            if type(sliding_window) is int and sliding_window != 0 else \
+            generate_causal_mask_with_padding(padding_start_idx)
 
     # Handle inference and training
-    if self_attn.training or (
-        not self_attn.training and (not hasattr(self_attn, "_flex_attention_cache") or qlen_Q != 1)
+    if is_training or (
+        not is_training and (not hasattr(self_attn, "_flex_attention_cache") or qlen_Q != 1)
     ):
         block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV, device = key.device)
-        if self_attn.training and hasattr(self_attn, "_flex_attention_cache"):
+        if is_training and hasattr(self_attn, "_flex_attention_cache"):
             del self_attn._flex_attention_cache
-        elif not self_attn.training:
+        elif not is_training:
             self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
     else:
         if not hasattr(self_attn, "_flex_attention_cache"):

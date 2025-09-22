@@ -695,6 +695,7 @@ def patch_GptOssAttention():
             query_states,
             key_states,
             value_states,
+            attention_mask,
         )
         attn_weights = None
         # if self.training:
