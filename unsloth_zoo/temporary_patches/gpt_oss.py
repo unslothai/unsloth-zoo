@@ -32,6 +32,7 @@ from .utils import (
     raise_error,
     logger,
     Cache,
+    DynamicCache,
     process_return,
 )
 from ..hf_utils import dtype_from_config
@@ -765,11 +766,6 @@ def patch_GptOssModel():
         from transformers.models.gpt_oss.modeling_gpt_oss import MoeModelOutputWithPast
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
-    try:
-        from transformers.models.gpt_oss.modeling_gpt_oss import DynamicCache
-    except Exception as e:
-        raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
-        DynamicCache = lambda *args, **kwargs: None
 
     def forward(
         self,
