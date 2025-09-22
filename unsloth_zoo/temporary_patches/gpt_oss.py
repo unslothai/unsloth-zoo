@@ -39,9 +39,9 @@ torch_cuda_device = torch.cuda.device
 
 torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
-    max_autotune = True,
+    max_autotune = False,
     shape_padding = True,
-    debug = False,
+    debug = True,
     cudagraphs = False,
     coordinate_descent_tuning = False,
     logging = UNSLOTH_ENABLE_LOGGING,
