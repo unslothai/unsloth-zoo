@@ -184,17 +184,17 @@ def flex_attention_with_sink(
     #### Version 1: Basic reciprocal denominator removal
     # softmax_sum = torch.exp(logsumexp)
     # new_denominator = softmax_sum / (softmax_sum + torch.exp(self_attn.sinks.unsqueeze(1)))
-    # scale = new_denominator
+    # sink_scale = new_denominator
     
     ### Version 2: logaddexp does log(exp(x1) + exp(x2))
     # logsumexp_new = torch.logaddexp(logsumexp, self_attn.sinks.unsqueeze(1))
-    # scale = torch.exp(logsumexp - logsumexp_new)
+    # sink_scale = torch.exp(logsumexp - logsumexp_new)
 
     ### Version 3: Most simple uses sigmoid and scale
-    scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
+    sink_scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
 
     # All 3 versions scale the original attn_output!
-    attn_output = attn_output * scale.unsqueeze(-1).to(attn_output.dtype)
+    attn_output = attn_output * sink_scale.unsqueeze(-1).to(attn_output.dtype)
     # To reduce error, one should do attn_output.to(torch.float32)
 
     attn_output = attn_output.transpose(1, 2).contiguous()
