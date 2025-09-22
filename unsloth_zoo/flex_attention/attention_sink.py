@@ -155,13 +155,14 @@ def flex_attention_with_sink(
     sliding_window = sliding_window or getattr(self_attn, "sliding_window", None)
     is_training = self_attn.training
     mask_mod = None
+    has_flex_cache = hasattr(self_attn, "_flex_attention_cache")
 
     # Handle inference and training
     if is_training or (
-        not is_training and (not hasattr(self_attn, "_flex_attention_cache") or qlen_Q != 1)
+        not is_training and (not has_flex_cache or qlen_Q != 1)
     ):
         if is_training:
-            if hasattr(self_attn, "_flex_attention_cache"):
+            if has_flex_cache:
                 del self_attn._flex_attention_cache
             block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV, device = key.device)
         else:
@@ -176,7 +177,7 @@ def flex_attention_with_sink(
                 generate_causal_mask_with_padding(padding_start_idx)
             self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
     else:
-        if not hasattr(self_attn, "_flex_attention_cache"):
+        if not has_flex_cache:
             self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
         block_mask = self_attn._flex_attention_cache(key)
     pass
