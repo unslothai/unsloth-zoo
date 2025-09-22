@@ -91,7 +91,7 @@ try:
     class FlexAttentionCache:
         __slots__ = \
             "offset", "offset_tensor", "mask_mod_with_offset", "block_mask", "mask_mod", \
-            "max_length", "block_size", "sliding_window", "block_mask_slice"
+            "max_length", "block_size", "sliding_window", "block_mask_slice",
 
         def __init__(self, key, mask_mod, sliding_window):
             bsz, heads_KV, qlen_KV, dim = key.shape
@@ -194,7 +194,6 @@ try:
                 self.offset += 1
                 self.offset_tensor.add_(1)
             elif (self.sliding_window is not None):
-                print(self.offset)
                 return self.block_mask_slice
             if self.offset >= self.max_length:
                 # Must be >= since offset=127, max_length=128 means size=127+1=128
