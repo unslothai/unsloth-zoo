@@ -169,7 +169,7 @@ def flex_attention_with_sink(
             # Consider left padding as well for prefill
             assert attention_mask is not None
             assert attention_mask.dim() == 2, f"Unsloth: Attention_mask has dim = {attention_mask.dim()}"
-            padding_start_idx = inputs["attention_mask"].argmax(1)
+            padding_start_idx = attention_mask.argmax(1)
             # Use special padded mask creators
             mask_mod = \
                 generate_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
