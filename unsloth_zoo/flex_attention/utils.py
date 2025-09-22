@@ -41,14 +41,18 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return create_block_mask(mask_mod, None, None, M, N, device = device)
 
-    def causal_mask(batch, head, q_idx, kv_idx):
+    def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
         """Causal mask for Flex Attention"""
+        return q_idx >= kv_idx
+
+    def generate_causal_mask(batch_idx, head_idx, q_idx, kv_idx):
+        """Causal mask for Flex Attention with left padding support."""
         return q_idx >= kv_idx
 
     @functools.lru_cache
     def generate_sliding_window(window_size: int):
         """Sliding window mask for Flex Attention"""
-        def sliding_window(batch, head, q_idx, kv_idx):
+        def sliding_window(batch_idx, head_idx, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
             """
             [NOTE] Official PyTorch uses <= window_size which is (window_size+1) tokens
@@ -73,11 +77,13 @@ try:
         return sliding_window
 
     # For inference see https://pytorch.org/blog/flexattention-for-inference
+    @functools.lru_cache(1)
     def get_score_mod_w_offset(score_mod: _score_mod_signature, _offset: torch.tensor):
         def _score_mod(score, b, h, q, kv):
             return score_mod(score, b, h, q + _offset, kv)
         return _score_mod
 
+    @functools.lru_cache(1)
     def get_mask_mod_w_offset(mask_mod: _mask_mod_signature, _offset: torch.tensor):
         def _mask_mod(b, h, q, kv):
             return mask_mod(b, h, q + _offset, kv)
@@ -195,6 +201,7 @@ try:
             block_offset = self.offset // self.block_size
             block_mask_slice = self.block_mask[:, :, block_offset]
             block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
+            print(id(block_mask_slice.mask_mod))
             # Must set seq_lengths as seen in
             # https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L80
             block_mask_slice.seq_lengths = (1, qlen_KV)
