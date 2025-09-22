@@ -777,6 +777,8 @@ def patch_GptOssModel():
         return locals().get("attention_mask", None)
     transformers.masking_utils.create_causal_mask = return_attention_mask
     transformers.masking_utils.create_sliding_window_causal_mask = return_attention_mask
+    transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = return_attention_mask
+    transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = return_attention_mask
 
     def forward(
         self,
