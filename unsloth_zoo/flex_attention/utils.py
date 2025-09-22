@@ -163,7 +163,7 @@ try:
             causal_mask = q_idx >= kv_idx
             windowed_mask = q_idx - kv_idx < window_size
             k_padded = kv_idx >= padding_start_idx[batch_idx]
-            return k_padded & causal_mask & windowed_mask
+            return causal_mask & windowed_mask
         sliding_window.__name__ = sliding_window.__doc__ = f"decoding_sliding_window_with_left_padding_{window_size}_{padding_start_idx.tolist()}"
         return sliding_window
 
