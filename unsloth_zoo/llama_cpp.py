@@ -893,7 +893,7 @@ def convert_to_gguf(
                 mmproj_dtype = model_dtype if model_dtype else ("bf16" if torch.cuda.is_bf16_supported() else "f16")
                 mmproj_output = f"{base_name}.{mmproj_dtype.upper()}-mmproj.gguf"
             else:
-                text_output = f"{model_name}.gguf"
+                text_output = f"{model_name}.{quantization_type.upper()}.gguf"
                 mmproj_dtype = model_dtype if model_dtype else ("bf16" if torch.cuda.is_bf16_supported() else "f16")
                 mmproj_output = f"{model_name}.{mmproj_dtype.upper()}-mmproj.gguf"
 
