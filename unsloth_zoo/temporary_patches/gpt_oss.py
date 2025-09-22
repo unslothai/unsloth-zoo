@@ -43,12 +43,12 @@ torch_compile_options = get_torch_compile_options(
     shape_padding = True,
     debug = True,
     cudagraphs = False,
-    coordinate_descent_tuning = False,
+    coordinate_descent_tuning = True,
     logging = UNSLOTH_ENABLE_LOGGING,
     combo_kernels = True,
     group_fusion = True,
-    memory_planning = True,
-    multi_kernel = True,
+    memory_planning = False,
+    multi_kernel = False,
     use_block_ptr = True,
 )
 
