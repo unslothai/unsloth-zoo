@@ -826,7 +826,7 @@ def patch_GptOssModel():
             )
         hidden_states = self.norm(hidden_states)
         return process_return(MoeModelOutputWithPast, {
-            "last_hidden_state" : last_hidden_state,
+            "last_hidden_state" : hidden_states,
             "past_key_values" : past_key_values,
         })
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward)
