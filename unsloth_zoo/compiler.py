@@ -2339,8 +2339,8 @@ def unsloth_compile_transformers(
                     print(f"Unsloth: Faster residual stream for {module}")
                     all_standalone_classes[module] = new_module
                 except Exception as e:
-                    newline = "\n"
-                    print(f"Unsloth: Failed faster residual stream {module} with error = {str(e).replace(newline, ' ')}")
+                    print(f"Unsloth: Failed faster residual stream {module} with error = {str(e)}")
+                    continue
             pass
         pass
     pass
@@ -2366,8 +2366,7 @@ def unsloth_compile_transformers(
                 )
                 all_standalone_classes[module] = new_module
             except Exception as e:
-                print(f"Unsloth: Failed disabling modules for {module} with error = {str(e).replace('\n', ' ')}")
-                continue
+                print(f"Unsloth: Failed disabling modules for {module} with error = {str(e)}")
         pass
     pass
 
@@ -2386,8 +2385,7 @@ def unsloth_compile_transformers(
                 print(f"Unsloth: Compiled module {module}.")
                 all_standalone_classes[module] = new_module
             except Exception as e:
-                print(f"Unsloth: Failed compiling {module} with error = {str(e).replace('\n', ' ')}")
-                continue
+                print(f"Unsloth: Failed compiling {module} with error = {str(e)}")
         pass
     pass
 
@@ -2412,7 +2410,7 @@ def unsloth_compile_transformers(
                 print(f"Unsloth: Fast Attention patch for {module}.")
                 all_standalone_classes[module] = new_module
             except Exception as e:
-                print(f"Unsloth: Failed Fast Attention patch for {module} with error = {str(e).replace('\n', ' ')}")
+                print(f"Unsloth: Failed Fast Attention patch for {module} with error = {str(e)}")
                 continue
         pass
 
@@ -2429,8 +2427,7 @@ def unsloth_compile_transformers(
                 print(f"Unsloth: Slow Attention patch for {module}.")
                 all_standalone_classes[module] = new_module
             except Exception as e:
-                print(f"Unsloth: Failed Slow Attention patch {module} with error = {str(e).replace('\n', ' ')}")
-                continue
+                print(f"Unsloth: Failed Slow Attention patch {module} with error = {str(e)}")
         pass
     pass
 
@@ -2493,8 +2490,7 @@ def unsloth_compile_transformers(
                         print(f"Unsloth: Fast fused linear cross entropy patch for {module}.")
                         all_standalone_classes[module] = new_module
                     except Exception as e:
-                        print(f"Unsloth: Failed Fast fused linear cross entropy patch {module} with error = {str(e).replace('\n', ' ')}")
-                        continue
+                        print(f"Unsloth: Failed Fast fused linear cross entropy patch {module} with error = {str(e)}")
                 pass
             pass
         pass
@@ -2525,8 +2521,7 @@ def unsloth_compile_transformers(
                 all_standalone_classes[module] = new_module
                 print(f"Unsloth: Patched {module} by adding gradient checkpointing")
             except Exception as e:
-                print(f"Unsloth: Failed gradient checkpointing patch {module} with error = {str(e).replace('\n', ' ')}")
-                continue
+                print(f"Unsloth: Failed gradient checkpointing patch {module} with error = {str(e)}")
         pass
     pass
 
@@ -2554,8 +2549,7 @@ def unsloth_compile_transformers(
                     all_standalone_classes[module] = new_module
                     print(f"Unsloth: Patched {module} by fixing finfo dtype mismatch in attention mask")
                 except Exception as e:
-                    print(f"Unsloth: Failed fixing finfo dtype mismatch in attention in {module} with error = {str(e).replace('\n', ' ')}")
-                    continue
+                    print(f"Unsloth: Failed fixing finfo dtype mismatch in attention in {module} with error = {str(e)}")
             pass
         pass
     pass
