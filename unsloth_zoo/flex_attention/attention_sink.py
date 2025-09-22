@@ -182,7 +182,7 @@ def flex_attention_with_sink(
                 generate_sliding_window(sliding_window) \
                 if type(sliding_window) is int and sliding_window != 0 else \
                 causal_mask
-            self_attn._flex_attention_cache = FlexAttentionCache(key, decoding_mask_mod, sliding_window)
+            self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
     else:
         block_mask = self_attn._flex_attention_cache(key)
     pass

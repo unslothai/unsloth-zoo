@@ -71,10 +71,31 @@ try:
         assert padding_start_idx.shape[0] >= 1
         def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
             """Causal mask for Flex Attention"""
-            q_padded =  q_idx >= padding_start_idx[batch_idx]
-            k_padded = kv_idx >= padding_start_idx[batch_idx]
-            return q_padded & k_padded & (q_idx >= kv_idx)
+            q_start =  q_idx >= padding_start_idx[batch_idx]
+            k_start = kv_idx >= padding_start_idx[batch_idx]
+            return q_start & k_start & (q_idx >= kv_idx)
         causal_mask.__name__ = causal_mask.__doc__ = f"causal_mask_with_left_padding_{padding_start_idx.tolist()}"
+        return causal_mask
+
+    def generate_decoding_causal_mask_with_padding(padding_start_idx = None):
+        """
+        For decoding purposes only. We remove q_padded since decoding attends to 1 q
+        Assume padded tokens = 2
+            #0 #1 k2 k3 k4
+        #0    
+        #1       
+        q2          
+        q3             
+        q4         X  X  X
+        """
+        assert padding_start_idx is not None and type(padding_start_idx) is torch.Tensor
+        assert padding_start_idx.dim() == 1
+        assert padding_start_idx.shape[0] >= 1
+        def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
+            """Causal mask for Flex Attention"""
+            k_start = kv_idx >= padding_start_idx[batch_idx]
+            return k_start & (q_idx >= kv_idx)
+        causal_mask.__name__ = causal_mask.__doc__ = f"decoding_causal_mask_with_left_padding_{padding_start_idx.tolist()}"
         return causal_mask
 
     @functools.lru_cache
@@ -105,6 +126,30 @@ try:
         return sliding_window
 
     def generate_sliding_window_mask_with_padding(window_size: int, padding_start_idx = None):
+        assert padding_start_idx is not None and type(padding_start_idx) is torch.Tensor
+        assert padding_start_idx.dim() == 1
+        assert padding_start_idx.shape[0] >= 1
+        def sliding_window(batch_idx, head_idx, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            windowed_mask = q_idx - kv_idx < window_size
+            q_padded =  q_idx >= padding_start_idx[batch_idx]
+            k_padded = kv_idx >= padding_start_idx[batch_idx]
+            return q_padded & k_padded & causal_mask & windowed_mask
+        sliding_window.__name__ = sliding_window.__doc__ = f"sliding_window_with_left_padding_{window_size}_{padding_start_idx.tolist()}"
+        return sliding_window
+
+    def generate_decoding_sliding_window_mask_with_padding(window_size: int, padding_start_idx = None):
+        """
+        For decoding purposes only. We remove q_padded since decoding attends to 1 q
+        Assume padded tokens = 2 and SWA = 4
+            #0 #1 k2 k3 k4 k5
+        #0   #
+        #1   #  #     
+        q2   #  #  0       
+        q3   #  #  0  0    
+        q4      #  0  0  0
+        q5         X  X  X  X
+        """
         assert padding_start_idx is not None and type(padding_start_idx) is torch.Tensor
         assert padding_start_idx.dim() == 1
         assert padding_start_idx.shape[0] >= 1
