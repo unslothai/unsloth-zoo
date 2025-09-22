@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import inspect
-from .common import TEMPORARY_PATCHES, torch_compile, get_torch_compile_options, UNSLOTH_ENABLE_LOGGING
+from .common import TEMPORARY_PATCHES, torch_compile
 from importlib.metadata import version as importlib_version
 from ..utils import Version
 transformers_version = Version(importlib_version("transformers"))
@@ -37,20 +37,6 @@ from .utils import (
 from ..hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
 
-torch_compile_options = get_torch_compile_options(
-    epilogue_fusion = True,
-    max_autotune = False,
-    shape_padding = True,
-    debug = True,
-    cudagraphs = False,
-    coordinate_descent_tuning = True,
-    logging = UNSLOTH_ENABLE_LOGGING,
-    combo_kernels = True,
-    group_fusion = True,
-    memory_planning = False,
-    multi_kernel = False,
-    use_block_ptr = True,
-)
 
 @torch_compile(dynamic = True, fullgraph = True)
 def swiglu_torch_forward(a, alpha, limit, dtype = None):
@@ -445,25 +431,6 @@ def patch_gpt_oss():
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss)
 
-@torch.compile(dynamic = None, fullgraph = True, options = torch_compile_options)
-def forward_inference(
-    self,
-    hidden_states: torch.Tensor,
-    router_indices = None,
-    routing_weights = None
-) -> torch.Tensor:
-    batch_size = hidden_states.shape[0]
-    hidden_states = hidden_states.reshape(-1, self.hidden_size)
-    num_experts = routing_weights.shape[1]
-    X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
-    gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
-    gate_up = torch.stack(gate_up_list, dim=0)
-    fused = swiglu_torch_forward(gate_up, self.alpha, self.limit)
-    out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
-    outs = torch.stack(out_list, dim=0)
-    rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-    mixed = (outs * rw).sum(dim=0)
-    return mixed.view(batch_size, -1, self.hidden_size)
 
 class GptOssExperts(nn.Module):
     def __init__(self, config):
@@ -520,7 +487,6 @@ class GptOssExperts(nn.Module):
             next_states = next_states.view(batch_size, -1, self.hidden_size)
             return next_states.to(hidden_states.dtype)
         else:
-            return forward_inference(self, hidden_states, router_indices, routing_weights)
             X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
             gate_up = torch.stack(gate_up_list, dim=0)
