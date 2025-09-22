@@ -2340,7 +2340,6 @@ def unsloth_compile_transformers(
                     all_standalone_classes[module] = new_module
                 except Exception as e:
                     print(f"Unsloth: Failed faster residual stream {module} with error = {str(e).replace('\n', ' ')}")
-                    continue
             pass
         pass
     pass
