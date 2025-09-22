@@ -557,6 +557,8 @@ def _download_convert_hf_to_gguf(
         # --- End Architecture Extraction ---
 
         # Convert final set to frozenset for immutability (good practice for cache keys/return values)
+        text_archs = frozenset(text_archs)
+        vision_archs = frozenset(vision_archs)
         supported_types = frozenset(supported_types)
 
         if not supported_types:
@@ -651,7 +653,7 @@ def _download_convert_hf_to_gguf(
              if flag not in all_flags and flag not in rest_flags: logger.warning(f"Essential flag '{flag}' potentially missing."); all_flags[flag] = None
         logger.info("Unsloth: Successfully processed convert_hf_to_gguf.py.")
         # Return path to PATCHED file and combined architectures set
-        return patched_filename, supported_types
+        return patched_filename, text_archs, vision_archs
 
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Unsloth: Network error downloading `{LLAMA_CPP_CONVERT_FILE}`: {e}") from e
@@ -840,7 +842,8 @@ def convert_to_gguf(
     model_dtype = "bf16",
     quantization_type = "bf16", # dequantizing from q8_0 disallow, setting default to bf16
     converter_location = "llama.cpp/unsloth_convert_hf_to_gguf.py",
-    supported_types = None,  # Pass supported architectures
+    supported_text_archs = None,
+    supported_vision_archs = None,
     is_vlm = False,
     is_gpt_oss = False,
     max_shard_size = "50GB",
@@ -867,6 +870,7 @@ def convert_to_gguf(
     pass
 
     # Check if arch is supported
+    supported_types = supported_vision_archs | supported_text_archs
     if supported_types is not None:
         assert("architectures" in config_file)
         arch = config_file["architectures"][0]
@@ -876,6 +880,12 @@ def convert_to_gguf(
                 f"converting model types of `{arch}`."
             )
     pass
+
+    if is_vlm and supported_vision_archs is not None:
+        arch = config_file["architectures"][0]
+        if arch not in supported_vision_archs:
+                is_vlm = False
+                print(f"Unsloth: {arch} is not supported for MMPROJ conversion. Converting as text-only model.")
 
     all_output_files = []
     runs_to_do = []
@@ -980,7 +990,7 @@ def convert_to_gguf(
                 size_str = f"{file_size_bytes / 1024:.1f}K"
             print(f"Unsloth: Successfully saved {description} GGUF to: {output_file} (size: {size_str})")
 
-    return all_output_files
+    return all_output_files, is_vlm
 pass
 
 
