@@ -115,7 +115,6 @@ try:
                 self.max_length = n
                 self.block_size = self.block_mask.BLOCK_SIZE[0]
             bsz, heads_KV, qlen_KV, dim = key.shape
-            print(self.sliding_window, self.offset, self.max_length, qlen_KV, flush = True)
             block_offset = self.offset // self.block_size
             block_mask_slice = self.block_mask[:, :, block_offset]
             block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
