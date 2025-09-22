@@ -165,9 +165,10 @@ def flex_attention_with_sink(
                 del self_attn._flex_attention_cache
             block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV, device = key.device)
         else:
-            # Consider left padding as well
+            # Consider left padding as well for prefill
             assert attention_mask is not None and attention_mask.dim() == 2
             padding_start_idx = inputs["attention_mask"].argmax(1)
+            # Use special padded mask creators
             mask_mod = \
                 generate_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
                 if type(sliding_window) is int and sliding_window != 0 else \
@@ -178,6 +179,7 @@ def flex_attention_with_sink(
             self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
         block_mask = self_attn._flex_attention_cache(key)
     pass
+    # Create mask_mod on training and decoding steps
     if mask_mod is None:
         mask_mod = \
             generate_sliding_window(sliding_window) \
