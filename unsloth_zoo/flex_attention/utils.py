@@ -194,6 +194,9 @@ try:
                 self.offset += 1
                 self.offset_tensor.add_(1)
             elif (self.sliding_window is not None):
+                # Quick return since sliding window mask has the same block mask always
+                # Can only enter here if (self.offset < self.sliding_window) fails
+                # ie the maximum sliding window has been reached already
                 return self.block_mask_slice
             if self.offset >= self.max_length:
                 # Must be >= since offset=127, max_length=128 means size=127+1=128
