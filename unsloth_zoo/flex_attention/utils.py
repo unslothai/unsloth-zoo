@@ -173,7 +173,7 @@ try:
                     # During decoding we do self.offset += 1, so self.offset = 0
                 self.sliding_window = sliding_window - 1 # Minus 1 since token 128 means index 127
             self.offset_tensor = torch.tensor(self.offset, device = key.device, dtype = torch.int32)
-            self.block_mask = create_block_mask_cached(mask_mod, n, n)
+            self.block_mask = create_block_mask_cached(mask_mod, n, n, device = key.device)
             self.mask_mod = mask_mod
             self.max_length = n
             self.block_size = self.block_mask.BLOCK_SIZE[0]
@@ -189,7 +189,7 @@ try:
                 # Must be >= since offset=127, max_length=128 means size=127+1=128
                 # since we do zero indexing
                 self.max_length += FLEX_ATTENTION_KV_INCREMENT
-                self.block_mask = create_block_mask_cached(self.mask_mod, self.max_length, self.max_length)
+                self.block_mask = create_block_mask_cached(self.mask_mod, self.max_length, self.max_length, device = key.device)
                 self.block_size = self.block_mask.BLOCK_SIZE[0]
             bsz, heads_KV, qlen_KV, dim = key.shape
             block_offset = self.offset // self.block_size

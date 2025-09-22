@@ -108,7 +108,7 @@ def old_flex_attention_with_sink(
         if type(sliding_window) is int and sliding_window != 0 else \
         causal_mask_with_sink
     score_mod = generate_sink_score_mod(sink_weights)
-    block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV+1) # Add 1 since we padded
+    block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV+1, device = key.device) # Add 1 since we padded
     attn_output = (flex_attention if compile else uncompiled_flex_attention)(
         query,
         key_padded,
@@ -158,7 +158,7 @@ def flex_attention_with_sink(
     if self_attn.training or (
         not self_attn.training and (not hasattr(self_attn, "_flex_attention_cache") or qlen_Q != 1)
     ):
-        block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV)
+        block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV, device = key.device)
         if self_attn.training and hasattr(self_attn, "_flex_attention_cache"):
             del self_attn._flex_attention_cache
         elif not self_attn.training:
