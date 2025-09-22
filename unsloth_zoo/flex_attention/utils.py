@@ -89,15 +89,22 @@ try:
 
         def __init__(self, key, mask_mod, sliding_window):
             bsz, heads_KV, qlen_KV, dim = key.shape
-            if sliding_window is not None:
-                n = sliding_window
-                self.offset = min(sliding_window, qlen_KV) - 1 # Minus 1 since block mask is indexing
-                self.sliding_window = sliding_window - 1 # Minus 1 since 128 means index 127
-            else:
+            if sliding_window is None:
+                """
+                Sliding window mechanics is different
+                """
                 div, mod = divmod(qlen_KV, FLEX_ATTENTION_KV_INCREMENT)
                 n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
                 self.offset = qlen_KV - 1 # Minue one since we need the block mask to use the saved offset_tensor
                 self.sliding_window = None
+                
+            else:
+                """
+                Sliding window mechanics is different
+                """
+                n = sliding_window
+                self.offset = min(sliding_window, qlen_KV) - 1 # Minus 1 since block mask is indexing
+                self.sliding_window = sliding_window - 1 # Minus 1 since 128 means index 127
             self.offset_tensor = torch.tensor(self.offset, device = key.device, dtype = torch.int32)
             self.block_mask = create_block_mask_cached(mask_mod, n, n)
             self.mask_mod = mask_mod
