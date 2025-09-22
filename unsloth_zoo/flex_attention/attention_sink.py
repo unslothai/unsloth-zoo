@@ -130,7 +130,7 @@ def flex_attention_with_sink(
     value,
     scale = None,
     sliding_window = None,
-    compile = False,
+    compile = True,
 ):
     """
     Allows one sink token to be attended to for full/sliding window attention
