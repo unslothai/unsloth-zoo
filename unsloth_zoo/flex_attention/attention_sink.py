@@ -216,15 +216,30 @@ def flex_attention_with_sink(
     if block_mask is None:
         block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV, device = key.device)
 
-    attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
-        query,
-        key,
-        value,
-        block_mask = block_mask,
-        score_mod = None, # None needed
-        enable_gqa = enable_gqa,
+    # attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
+    #     query,
+    #     key,
+    #     value,
+    #     block_mask = block_mask,
+    #     score_mod = None, # None needed
+    #     enable_gqa = enable_gqa,
+    #     scale = scale,
+    #     return_lse = True, # log(sum(exp(xi)))
+    # )
+    attn_output, logsumexp, _, _, _ = torch.ops.aten._flash_attention_forward(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        cum_seq_q = qlens,
+        cum_seq_k = qlens,
+        max_q = max_qlen,
+        max_k = max_qlen,
+        dropout_p = 0,
+        is_causal = True,
+        return_debug_mask = False,
         scale = scale,
-        return_lse = True, # log(sum(exp(xi)))
+        window_size_left = sliding_window,
+        window_size_right = None,
     )
 
     #### 3 versions to add sink tokens ####
