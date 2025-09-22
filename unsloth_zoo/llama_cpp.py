@@ -136,12 +136,13 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
     # All Unsloth Zoo code licensed under LGPLv3
     x = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
     print(f"Unsloth: Installing packages: {package}")
-    acceptance = input(f"Missing system packages. We need to execute `{x}` - do you accept? Press ENTER. Type NO if not.")
-    if "no" in str(acceptance).lower():
-        raise RuntimeError(
-            f"Unsloth: Execution of `{x}` was cancelled!\n"\
-            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
-        )
+    if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
+        acceptance = input(f"Missing system packages. We need to execute `{x}` - do you accept? Press ENTER. Type NO if not.")
+        if "no" in str(acceptance).lower():
+            raise RuntimeError(
+                f"Unsloth: Execution of `{x}` was cancelled!\n"\
+                "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+            )
     with subprocess.Popen(x, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
