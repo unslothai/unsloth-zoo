@@ -757,6 +757,7 @@ pass
 TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 
+global global_attention_mask
 def patch_GptOssModel():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     try:
@@ -824,6 +825,8 @@ def patch_GptOssModel():
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        global_attention_mask = attention_mask
+        raise
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(
                 hidden_states,
