@@ -166,7 +166,8 @@ def flex_attention_with_sink(
             block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV, device = key.device)
         else:
             # Consider left padding as well for prefill
-            assert attention_mask is not None and attention_mask.dim() == 2
+            assert attention_mask is not None
+            assert attention_mask.dim() == 2, f"Unsloth: Attention_mask has dim = {attention_mask.dim()}"
             padding_start_idx = inputs["attention_mask"].argmax(1)
             # Use special padded mask creators
             mask_mod = \
