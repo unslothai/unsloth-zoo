@@ -763,9 +763,13 @@ def patch_GptOssModel():
         import transformers.models.gpt_oss.modeling_gpt_oss
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel
         from transformers.models.gpt_oss.modeling_gpt_oss import MoeModelOutputWithPast
-        from transformers.models.gpt_oss.modeling_gpt_oss import DynamicCache
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
+    try:
+        from transformers.models.gpt_oss.modeling_gpt_oss import DynamicCache
+    except Exception as e:
+        raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
+        DynamicCache = lambda *args, **kwargs: None
 
     def forward(
         self,
