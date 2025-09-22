@@ -937,11 +937,11 @@ def convert_to_gguf(
         # Non-VLM: single conversion
         elif quantization_type == "None":
             if is_gpt_oss:
-                final_output = f"{model_name}.gguf"
+                final_output = f"{model_name}.MXFP4.gguf"
             else:
                 final_output = f"{model_name}.{model_dtype.upper()}.gguf"
         else:
-            final_output = model_name if model_name.endswith(".gguf") else f"{model_name}.gguf"
+            final_output = model_name if model_name.endswith(".gguf") else f"{model_name}.{quantization_type.upper()}.gguf"
 
         if quantization_type == "None":
             args = {
