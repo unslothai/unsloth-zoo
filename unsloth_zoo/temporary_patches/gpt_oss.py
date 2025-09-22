@@ -32,6 +32,7 @@ from .utils import (
     raise_error,
     logger,
     Cache,
+    process_return,
 )
 from ..hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
@@ -755,6 +756,81 @@ def patch_GptOssAttention():
 pass
 TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
+
+def patch_GptOssModel():
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel
+        from transformers.models.gpt_oss.modeling_gpt_oss import MoeModelOutputWithPast
+        from transformers.models.gpt_oss.modeling_gpt_oss import DynamicCache
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> MoeModelOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        # It may already have been prepared by e.g. `generate`
+        # if not isinstance(causal_mask_mapping := attention_mask, dict):
+        #     mask_kwargs = {
+        #         "config": self.config,
+        #         "input_embeds": inputs_embeds,
+        #         "attention_mask": attention_mask,
+        #         "cache_position": cache_position,
+        #         "past_key_values": past_key_values,
+        #     }
+        #     causal_mask_mapping = {
+        #         "full_attention": create_causal_mask(**mask_kwargs),
+        #         "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+        #     }
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer(
+                hidden_states,
+                # attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+        hidden_states = self.norm(hidden_states)
+        return process_return(MoeModelOutputWithPast, {
+            "last_hidden_state" : last_hidden_state,
+            "past_key_values" : past_key_values,
+        })
+    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward)
+pass
 
 try:
     from openai_harmony import (
