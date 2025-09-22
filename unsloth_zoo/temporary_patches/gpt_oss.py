@@ -691,37 +691,37 @@ def patch_GptOssAttention():
         # flex_attention_with_sink only works for training since KV cache is wrong
         # switch to flex_attention_with_sink which allows all to work
         # print(query_states.shape, key_states.shape, value_states.shape, flush = True)
-        # attn_output = flex_attention_with_sink(
-        #     self,
-        #     query_states,
-        #     key_states,
-        #     value_states,
-        #     attention_mask,
-        # )
-        # attn_weights = None
-        if self.training:
-            attn_output = flex_attention_with_sink(
-                self,
-                query_states,
-                key_states,
-                value_states,
-            )
-            attn_weights = None
-        else:
-            # Weirdly for inference, flex attention returns gibberish
-            # Most likely due to left padding
-            attn_output, attn_weights = eager_attention_forward(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window,
-                s_aux=self.sinks,  # diff with Llama
-                **kwargs,
-            )
+        attn_output = flex_attention_with_sink(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+        )
+        attn_weights = None
+        # if self.training:
+        #     attn_output = old_flex_attention_with_sink(
+        #         self,
+        #         query_states,
+        #         key_states,
+        #         value_states,
+        #     )
+        #     attn_weights = None
+        # else:
+        #     # Weirdly for inference, flex attention returns gibberish
+        #     # Most likely due to left padding
+        #     attn_output, attn_weights = eager_attention_forward(
+        #         self,
+        #         query_states,
+        #         key_states,
+        #         value_states,
+        #         attention_mask,
+        #         dropout=0.0 if not self.training else self.attention_dropout,
+        #         scaling=self.scaling,
+        #         sliding_window=self.sliding_window,
+        #         s_aux=self.sinks,  # diff with Llama
+        #         **kwargs,
+        #     )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
@@ -852,7 +852,7 @@ def patch_GptOssModel():
         })
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
 pass
-# TEMPORARY_PATCHES.append(patch_GptOssModel)
+TEMPORARY_PATCHES.append(patch_GptOssModel)
 
 try:
     from openai_harmony import (

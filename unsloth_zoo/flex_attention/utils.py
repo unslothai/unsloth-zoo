@@ -78,7 +78,7 @@ try:
             q_start =  q_idx >= padding_start_idx[batch_idx]
             k_start = kv_idx >= padding_start_idx[batch_idx]
             return q_start & k_start & (q_idx >= kv_idx)
-        causal_mask.__name__ = causal_mask.__doc__ = f"causal_mask_with_left_padding_{padding_start_idx.tolist()}"
+        causal_mask.__name__ = causal_mask.__doc__ = f"causal_mask_with_left_padding"
         return causal_mask
 
     def generate_decoding_causal_mask_with_padding(padding_start_idx = None):
@@ -101,7 +101,7 @@ try:
             """Causal mask for Flex Attention"""
             k_start = kv_idx >= padding_start_idx[batch_idx]
             return k_start & (q_idx >= kv_idx)
-        causal_mask.__name__ = causal_mask.__doc__ = f"decoding_causal_mask_with_left_padding_{padding_start_idx.tolist()}"
+        causal_mask.__name__ = causal_mask.__doc__ = f"decoding_causal_mask_with_left_padding"
         return causal_mask
 
     @functools.lru_cache
@@ -141,7 +141,7 @@ try:
             q_padded =  q_idx >= padding_start_idx[batch_idx]
             k_padded = kv_idx >= padding_start_idx[batch_idx]
             return q_padded & k_padded & causal_mask & windowed_mask
-        sliding_window.__name__ = sliding_window.__doc__ = f"sliding_window_with_left_padding_{window_size}_{padding_start_idx.tolist()}"
+        sliding_window.__name__ = sliding_window.__doc__ = f"sliding_window_with_left_padding_{window_size}"
         return sliding_window
 
     def generate_decoding_sliding_window_mask_with_padding(window_size: int, padding_start_idx = None):
