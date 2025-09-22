@@ -112,8 +112,8 @@ try:
                 q1   
                 q2   
                 q3   
-                q4   X
-                Which is wrong.
+                q4  X
+                Which is wrong. We need q_idx=0 + offset=4 = 0+4 = 4
                 Note it's offset==index since it's indexed from 0 as seen in
                 https://pytorch.org/blog/flexattention-for-inference/
                 https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L91
