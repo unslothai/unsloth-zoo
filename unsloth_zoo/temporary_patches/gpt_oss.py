@@ -431,7 +431,8 @@ def patch_gpt_oss():
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss)
 
-
+global data_output
+data_output = None
 class GptOssExperts(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -501,7 +502,10 @@ class GptOssExperts(nn.Module):
             outs = torch.stack(out_list, dim=0)
             rw = routing_weights.transpose(0, 1).unsqueeze(-1)
             mixed = (outs * rw).sum(dim=0)
-            return mixed.view(batch_size, -1, self.hidden_size)
+            out = mixed.view(batch_size, -1, self.hidden_size)
+            global data_output
+            data_output = [hidden_states, out]
+            raise
 pass
 
 class GptOssTopKRouter(nn.Module):
