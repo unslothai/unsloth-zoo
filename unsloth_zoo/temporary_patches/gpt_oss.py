@@ -757,9 +757,6 @@ pass
 TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 
-global global_attention_mask
-global_attention_mask = None
-
 def patch_GptOssModel():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     try:
@@ -778,8 +775,13 @@ def patch_GptOssModel():
     import transformers.masking_utils
     import transformers.generation.utils
     def return_attention_mask(*args, **kwargs):
-        print(args, kwargs)
-        return locals().get("attention_mask", None)
+        if "attention_mask" in kwargs:
+            return kwargs["attention_mask"]
+        for arg in args:
+            if type(arg) is torch.Tensor and arg.dtype == torch.int32:
+                return arg
+        pass
+    pass
     transformers.masking_utils.create_causal_mask = return_attention_mask
     transformers.masking_utils.create_sliding_window_causal_mask = return_attention_mask
     transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = return_attention_mask
@@ -831,9 +833,6 @@ def patch_GptOssModel():
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        global global_attention_mask
-        global_attention_mask = attention_mask
-        raise
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(
                 hidden_states,
