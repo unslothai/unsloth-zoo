@@ -219,6 +219,8 @@ try:
                 div, mod = divmod(qlen_KV, FLEX_ATTENTION_KV_INCREMENT)
                 n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
                 self.offset = qlen_KV - 2 # Minus two since we need the block mask to use the saved offset_tensor
+                # Minus 2 and not -1 since we do pre-incrementing and not post-incrementing
+                # See self.offset += 1
                 if self.offset <= -2:
                     # Minimum is -1
                     self.offset = -1
