@@ -812,7 +812,7 @@ def patch_GptOssModel():
         #         "full_attention": create_causal_mask(**mask_kwargs),
         #         "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
         #     }
-
+        print(attention_mask)
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
