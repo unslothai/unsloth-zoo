@@ -143,7 +143,7 @@ try:
                 q2   
                 q3   
                 q4            X  X
-                If we set cache_implementation = "static" which we assume, we  don't use an offset
+                If we set cache_implementation = "static" which we assume, we don't use an offset
                 since the K is a rolling matrix of the past window size.
                 Ie if sliding_window = 2, K is shape (2, dim). So in actuality, we get:
                     -- -- -- k3 k4
@@ -152,7 +152,7 @@ try:
                 q2   
                 q3   
                 q4            X  X
-                So offset = sliding_window-1 always ie 2-1 = 1
+                But since we use a rolling matrix, offset = sliding_window-1 always ie 2-1 = 1
                     -- -- -- k0 k1
                 q0   
                 q1   
