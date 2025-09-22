@@ -200,8 +200,9 @@ try:
             bsz, heads_KV, qlen_KV, dim = key.shape
             block_offset = self.offset // self.block_size
             block_mask_slice = self.block_mask[:, :, block_offset]
-            block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
-            print(id(block_mask_slice.mask_mod))
+            mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
+            print(id(mask_mod))
+            block_mask_slice.mask_mod = mask_mod
             # Must set seq_lengths as seen in
             # https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L80
             block_mask_slice.seq_lengths = (1, qlen_KV)
