@@ -37,6 +37,20 @@ from .utils import (
 from ..hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
 
+torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = True,
+    shape_padding = True,
+    debug = False,
+    cudagraphs = False,
+    coordinate_descent_tuning = False,
+    logging = UNSLOTH_ENABLE_LOGGING,
+    combo_kernels = True,
+    group_fusion = True,
+    memory_planning = True,
+    multi_kernel = True,
+    use_block_ptr = True,
+)
 
 @torch_compile(dynamic = True, fullgraph = True)
 def swiglu_torch_forward(a, alpha, limit, dtype = None):
@@ -452,6 +466,26 @@ class GptOssExperts(nn.Module):
             for _ in range(self.num_experts)
         ])
 
+    @torch.compile(dynamic = None, fullgraph = True, options = torch_compile_options)
+    def forward_inference(
+        self,
+        hidden_states: torch.Tensor,
+        router_indices = None,
+        routing_weights = None
+    ) -> torch.Tensor:
+        batch_size = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        num_experts = routing_weights.shape[1]
+        X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+        gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
+        gate_up = torch.stack(gate_up_list, dim=0)
+        fused = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+        out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
+        outs = torch.stack(out_list, dim=0)
+        rw = routing_weights.transpose(0, 1).unsqueeze(-1)
+        mixed = (outs * rw).sum(dim=0)
+        return mixed.view(batch_size, -1, self.hidden_size)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -487,6 +521,7 @@ class GptOssExperts(nn.Module):
             next_states = next_states.view(batch_size, -1, self.hidden_size)
             return next_states.to(hidden_states.dtype)
         else:
+            return forward_inference(self, hidden_states, router_indices, routing_weights)
             X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
             gate_up = torch.stack(gate_up_list, dim=0)
