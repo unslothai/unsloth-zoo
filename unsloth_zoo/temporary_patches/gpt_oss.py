@@ -771,6 +771,13 @@ def patch_GptOssModel():
         raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
         DynamicCache = lambda *args, **kwargs: None
 
+    # Disable mask creations since we don't need them for GPT-OSS
+    import transformers.masking_utils
+    def return_attention_mask(*args, **kwargs):
+        return locals().get("attention_mask", None)
+    transformers.masking_utils.create_causal_mask = return_attention_mask
+    transformers.masking_utils.create_sliding_window_causal_mask = return_attention_mask
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -812,7 +819,6 @@ def patch_GptOssModel():
         #         "full_attention": create_causal_mask(**mask_kwargs),
         #         "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
         #     }
-        print(attention_mask)
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
