@@ -156,11 +156,6 @@ def flex_attention_with_sink(
 
     bsz, heads_Q, qlen_Q, dim = query.shape
     _, heads_KV, qlen_KV, _ = key.shape
-    global first_self_attn
-    if first_self_attn is None:
-        first_self_attn = self_attn
-    if self_attn == first_self_attn:
-        print(query.shape, key.shape)
 
     # Check for sliding window
     sliding_window = sliding_window or getattr(self_attn, "sliding_window", None)
@@ -168,6 +163,11 @@ def flex_attention_with_sink(
     mask_mod = None
     block_mask = None
     has_flex_cache = hasattr(self_attn, "_flex_attention_cache")
+    global first_self_attn
+    if first_self_attn is None and sliding_window is None:
+        first_self_attn = self_attn
+    if self_attn == first_self_attn:
+        print(query.shape, key.shape)
 
     # Handle inference and training
     if is_training or (
