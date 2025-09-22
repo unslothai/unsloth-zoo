@@ -173,6 +173,7 @@ def flex_attention_with_sink(
             # Consider left padding as well for prefill
             assert attention_mask is not None
             assert attention_mask.dim() == 2, f"Unsloth: Attention_mask has dim = {attention_mask.dim()}"
+
             padding_start_idx = attention_mask.argmax(1)
             print(padding_start_idx)
             # Use special padded mask creators
@@ -190,7 +191,12 @@ def flex_attention_with_sink(
                 generate_decoding_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
                 if type(sliding_window) is int and sliding_window != 0 else \
                 generate_decoding_causal_mask_with_padding(padding_start_idx)
-            self_attn._flex_attention_cache = FlexAttentionCache(key, decoding_mask_mod, sliding_window)
+
+            mask_mod = \
+                generate_sliding_window_mask(sliding_window) \
+                if type(sliding_window) is int and sliding_window != 0 else \
+                causal_mask
+            self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
     else:
         block_mask = self_attn._flex_attention_cache(key)
     pass
