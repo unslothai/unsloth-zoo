@@ -154,34 +154,35 @@ def flex_attention_with_sink(
     # Check for sliding window
     sliding_window = sliding_window or getattr(self_attn, "sliding_window", None)
     is_training = self_attn.training
-    if is_training:
-        mask_mod = \
-            generate_sliding_window(sliding_window) \
-            if type(sliding_window) is int and sliding_window != 0 else \
-            causal_mask
-    else:
-        # Consider left padding as well
-        assert attention_mask is not None and attention_mask.dim() == 2
-        padding_start_idx = inputs["attention_mask"].argmax(1)
-        mask_mod = \
-            generate_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
-            if type(sliding_window) is int and sliding_window != 0 else \
-            generate_causal_mask_with_padding(padding_start_idx)
+    mask_mod = None
 
     # Handle inference and training
     if is_training or (
         not is_training and (not hasattr(self_attn, "_flex_attention_cache") or qlen_Q != 1)
     ):
-        block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV, device = key.device)
-        if is_training and hasattr(self_attn, "_flex_attention_cache"):
-            del self_attn._flex_attention_cache
-        elif not is_training:
+        if is_training:
+            if hasattr(self_attn, "_flex_attention_cache"):
+                del self_attn._flex_attention_cache
+            block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV, device = key.device)
+        else:
+            # Consider left padding as well
+            assert attention_mask is not None and attention_mask.dim() == 2
+            padding_start_idx = inputs["attention_mask"].argmax(1)
+            mask_mod = \
+                generate_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
+                if type(sliding_window) is int and sliding_window != 0 else \
+                generate_causal_mask_with_padding(padding_start_idx)
             self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
     else:
         if not hasattr(self_attn, "_flex_attention_cache"):
             self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
         block_mask = self_attn._flex_attention_cache(key)
     pass
+    if mask_mod is None:
+        mask_mod = \
+            generate_sliding_window(sliding_window) \
+            if type(sliding_window) is int and sliding_window != 0 else \
+            causal_mask
 
     attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
         query,
