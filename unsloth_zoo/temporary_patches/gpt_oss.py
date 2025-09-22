@@ -445,6 +445,25 @@ def patch_gpt_oss():
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss)
 
+@torch.compile(dynamic = None, fullgraph = True, options = torch_compile_options)
+def forward_inference(
+    self,
+    hidden_states: torch.Tensor,
+    router_indices = None,
+    routing_weights = None
+) -> torch.Tensor:
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, self.hidden_size)
+    num_experts = routing_weights.shape[1]
+    X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+    gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
+    gate_up = torch.stack(gate_up_list, dim=0)
+    fused = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+    out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
+    outs = torch.stack(out_list, dim=0)
+    rw = routing_weights.transpose(0, 1).unsqueeze(-1)
+    mixed = (outs * rw).sum(dim=0)
+    return mixed.view(batch_size, -1, self.hidden_size)
 
 class GptOssExperts(nn.Module):
     def __init__(self, config):
@@ -465,26 +484,6 @@ class GptOssExperts(nn.Module):
             nn.Linear(self.expert_dim, self.hidden_size, dtype=self.dtype)
             for _ in range(self.num_experts)
         ])
-
-    @torch.compile(dynamic = None, fullgraph = True, options = torch_compile_options)
-    def forward_inference(
-        self,
-        hidden_states: torch.Tensor,
-        router_indices = None,
-        routing_weights = None
-    ) -> torch.Tensor:
-        batch_size = hidden_states.shape[0]
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
-        num_experts = routing_weights.shape[1]
-        X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
-        gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
-        gate_up = torch.stack(gate_up_list, dim=0)
-        fused = swiglu_torch_forward(gate_up, self.alpha, self.limit)
-        out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
-        outs = torch.stack(out_list, dim=0)
-        rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-        mixed = (outs * rw).sum(dim=0)
-        return mixed.view(batch_size, -1, self.hidden_size)
 
     def forward(
         self,
