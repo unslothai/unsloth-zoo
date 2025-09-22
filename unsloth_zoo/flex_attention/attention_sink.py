@@ -264,6 +264,6 @@ def flex_attention_with_sink(
         sink_scale = torch.sigmoid(logsumexp, out = logsumexp)
         attn_output *= sink_scale.unsqueeze(-1).to(attn_output.dtype)
 
-    attn_output = attn_output.transpose(1, 2).contiguous()
+    # attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output
 pass
