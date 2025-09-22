@@ -19,11 +19,15 @@ __all__ = [
     "FLEX_ATTENTION_BLOCK_SIZE",
     "flex_attention",
     "create_block_mask_cached",
+    "FlexAttentionCache",
+
     "causal_mask",
     "generate_causal_mask_with_padding",
-    "generate_sliding_window",
+    "generate_decoding_causal_mask_with_padding",
+
+    "generate_sliding_window_mask",
     "generate_sliding_window_mask_with_padding",
-    "FlexAttentionCache",
+    "generate_decoding_sliding_window_mask_with_padding",
 ]
 
 import torch
@@ -59,8 +63,8 @@ try:
         q4   X  X  X  X  X
         If we add 2 tokens as padded tokens, we get:
             #0 #1 k2 k3 k4
-        #0    
-        #1       
+        #0
+        #1
         q2         X
         q3         X  X
         q4         X  X  X
@@ -80,13 +84,15 @@ try:
     def generate_decoding_causal_mask_with_padding(padding_start_idx = None):
         """
         For decoding purposes only. We remove q_padded since decoding attends to 1 q
-        Assume padded tokens = 2
-            #0 #1 k2 k3 k4
-        #0    
-        #1       
-        q2          
-        q3             
-        q4         X  X  X
+        Assume padded tokens = 5
+            #0 #1 #2 #3 #4 k5 k6
+        #0   #
+        #1   #  #
+        #2   #  #  #
+        #3   #  #  #  #
+        #4   #  #  #  #  #
+        q5   #  #  #  #  #  X
+        q6   #  #  #  #  #  X  X
         """
         assert padding_start_idx is not None and type(padding_start_idx) is torch.Tensor
         assert padding_start_idx.dim() == 1
@@ -99,7 +105,7 @@ try:
         return causal_mask
 
     @functools.lru_cache
-    def generate_sliding_window(window_size: int):
+    def generate_sliding_window_mask(window_size: int):
         """Sliding window mask for Flex Attention"""
         def sliding_window(batch_idx, head_idx, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
@@ -144,9 +150,9 @@ try:
         Assume padded tokens = 2 and SWA = 4
             #0 #1 k2 k3 k4 k5
         #0   #
-        #1   #  #     
-        q2   #  #  0       
-        q3   #  #  0  0    
+        #1   #  #
+        q2   #  #  0
+        q3   #  #  0  0
         q4      #  0  0  0
         q5         X  X  X  X
         """
@@ -156,10 +162,9 @@ try:
         def sliding_window(batch_idx, head_idx, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
             windowed_mask = q_idx - kv_idx < window_size
-            q_padded =  q_idx >= padding_start_idx[batch_idx]
             k_padded = kv_idx >= padding_start_idx[batch_idx]
-            return q_padded & k_padded & causal_mask & windowed_mask
-        sliding_window.__name__ = sliding_window.__doc__ = f"sliding_window_with_left_padding_{window_size}_{padding_start_idx.tolist()}"
+            return k_padded & causal_mask & windowed_mask
+        sliding_window.__name__ = sliding_window.__doc__ = f"decoding_sliding_window_with_left_padding_{window_size}_{padding_start_idx.tolist()}"
         return sliding_window
 
     # For inference see https://pytorch.org/blog/flexattention-for-inference
@@ -192,18 +197,18 @@ try:
                 q4   X  X  X  X  X
                 During decoding:
                     k0 k1 k2 k3 k4
-                q0   
-                q1   
-                q2   
-                q3   
+                q0
+                q1
+                q2
+                q3
                 q4   X  X  X  X  X
                 But q_index = 0, so we need an offset = 4
                 If no offset, we get:
                    k0 k1 k2 k3 k4
-                q0   
-                q1   
-                q2   
-                q3   
+                q0
+                q1
+                q2
+                q3
                 q4  X
                 Which is wrong. We need q_idx=0 + offset=4 = 0+4 = 4
                 Note it's offset==index since it's indexed from 0 as seen in
@@ -230,26 +235,26 @@ try:
                 q4            X  X
                 During decoding:
                     k0 k1 k2 k3 k4
-                q0   
-                q1   
-                q2   
-                q3   
+                q0
+                q1
+                q2
+                q3
                 q4            X  X
                 If we set cache_implementation = "static" which we assume, we don't use an offset
                 since the K is a rolling matrix of the past window size.
                 Ie if sliding_window = 2, K is shape (2, dim). So in actuality, we get:
                     -- -- -- k3 k4
-                q0   
-                q1   
-                q2   
-                q3   
+                q0
+                q1
+                q2
+                q3
                 q4            X  X
                 But since we use a rolling matrix, offset = sliding_window-1 always ie 2-1 = 1
                     -- -- -- k0 k1
-                q0   
-                q1   
-                q2   
-                q3(0)   
+                q0
+                q1
+                q2
+                q3(0)
                 q4(1)         X  X
                 Note it's offset==index since it's indexed from 0 as seen in
                 https://pytorch.org/blog/flexattention-for-inference/
@@ -307,6 +312,6 @@ except:
     flex_attention = None
     create_block_mask_cached = None
     causal_mask = None
-    generate_sliding_window = None
+    generate_sliding_window_mask = None
     FlexAttentionCache = None
 pass

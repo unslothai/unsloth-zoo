@@ -20,7 +20,7 @@ from .utils import (
     flex_attention,
     create_block_mask_cached,
     causal_mask,
-    generate_sliding_window,
+    generate_sliding_window_mask,
 )
 
 if HAS_FLEX_ATTENTION:

@@ -24,11 +24,15 @@ import functools
 from .utils import (
     create_block_mask_cached,
     flex_attention,
+    FlexAttentionCache,
+
     causal_mask,
     generate_causal_mask_with_padding,
-    generate_sliding_window,
+    generate_decoding_causal_mask_with_padding,
+
+    generate_sliding_window_mask,
     generate_sliding_window_mask_with_padding,
-    FlexAttentionCache,
+    generate_decoding_sliding_window_mask_with_padding,
 )
 from torch.nn.attention.flex_attention import flex_attention as uncompiled_flex_attention
 
@@ -176,20 +180,22 @@ def flex_attention_with_sink(
                 if type(sliding_window) is int and sliding_window != 0 else \
                 generate_causal_mask_with_padding(padding_start_idx)
 
-            # Decoding can ignore padded since we always leave KV padded tokens as 0 anyways
-            # so even if we attend to them, they're 0.
+            # Decoding we can ignore mask on q_idx since q_idx is always length 1
+            # Normally we have to do:
+            # kv_idx >= padding_start_idx[batch_idx]
+            # but we only need the 2nd one
             decoding_mask_mod = \
-                generate_sliding_window(sliding_window) \
+                generate_decoding_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
                 if type(sliding_window) is int and sliding_window != 0 else \
-                causal_mask
-            self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
+                generate_decoding_causal_mask_with_padding(padding_start_idx)
+            self_attn._flex_attention_cache = FlexAttentionCache(key, decoding_mask_mod, sliding_window)
     else:
         block_mask = self_attn._flex_attention_cache(key)
     pass
     # Create mask_mod on training and decoding steps
     if mask_mod is None:
         mask_mod = \
-            generate_sliding_window(sliding_window) \
+            generate_sliding_window_mask(sliding_window) \
             if type(sliding_window) is int and sliding_window != 0 else \
             causal_mask
     if block_mask is None:
