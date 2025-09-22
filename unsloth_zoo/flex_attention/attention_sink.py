@@ -158,11 +158,11 @@ def flex_attention_with_sink(
     if self_attn.training or (
         not self_attn.training and (not hasattr(self_attn, "_flex_attention_cache") or qlen_Q != 1)
     ):
+        print(1)
         block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV)
         if hasattr(self_attn, "_flex_attention_cache"):
             del self_attn._flex_attention_cache
     else:
-        print(1)
         if not hasattr(self_attn, "_flex_attention_cache"):
             self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
         block_mask = self_attn._flex_attention_cache(key)
