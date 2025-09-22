@@ -77,13 +77,11 @@ try:
         return sliding_window
 
     # For inference see https://pytorch.org/blog/flexattention-for-inference
-    @functools.lru_cache(1)
     def get_score_mod_w_offset(score_mod: _score_mod_signature, _offset: torch.tensor):
         def _score_mod(score, b, h, q, kv):
             return score_mod(score, b, h, q + _offset, kv)
         return _score_mod
 
-    @functools.lru_cache(1)
     def get_mask_mod_w_offset(mask_mod: _mask_mod_signature, _offset: torch.tensor):
         def _mask_mod(b, h, q, kv):
             return mask_mod(b, h, q + _offset, kv)
