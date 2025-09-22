@@ -776,6 +776,7 @@ def patch_GptOssModel():
 
     # Disable mask creations since we don't need them for GPT-OSS
     import transformers.masking_utils
+    import transformers.generation.utils
     def return_attention_mask(*args, **kwargs):
         return locals().get("attention_mask", None)
     transformers.masking_utils.create_causal_mask = return_attention_mask
@@ -783,6 +784,7 @@ def patch_GptOssModel():
     transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = return_attention_mask
     transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = return_attention_mask
     transformers.masking_utils.create_masks_for_generate = return_attention_mask
+    transformers.generation.utils.create_masks_for_generate = return_attention_mask
 
     def forward(
         self,
