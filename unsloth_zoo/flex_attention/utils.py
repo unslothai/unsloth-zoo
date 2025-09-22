@@ -146,26 +146,13 @@ try:
 
     def generate_decoding_sliding_window_mask_with_padding(window_size: int, padding_start_idx = None):
         """
-        For decoding purposes only. We remove q_padded since decoding attends to 1 q
-        Assume padded tokens = 2 and SWA = 4
-            #0 #1 k2 k3 k4 k5
-        #0   #
-        #1   #  #
-        q2   #  #  0
-        q3   #  #  0  0
-        q4      #  0  0  0
-        q5         X  X  X  X
+        We cannot use padding_start_idx[batch_idx] for SWA decoding since
+        assume padding_start_idx=[3406, 4000, 0] and SW=128 then it'll always
+        be masked since the KV size=128.
+
+        Since we set padded tokens = 0 always, we simply return the generic SWA.
         """
-        assert padding_start_idx is not None and type(padding_start_idx) is torch.Tensor
-        assert padding_start_idx.dim() == 1
-        assert padding_start_idx.shape[0] >= 1
-        def sliding_window(batch_idx, head_idx, q_idx, kv_idx):
-            causal_mask = q_idx >= kv_idx
-            windowed_mask = q_idx - kv_idx < window_size
-            k_padded = kv_idx >= padding_start_idx[batch_idx]
-            return causal_mask & windowed_mask
-        sliding_window.__name__ = sliding_window.__doc__ = f"decoding_sliding_window_with_left_padding_{window_size}_{padding_start_idx.tolist()}"
-        return sliding_window
+        return generate_sliding_window_mask(window_size)
 
     # For inference see https://pytorch.org/blog/flexattention-for-inference
     def get_score_mod_w_offset(score_mod: _score_mod_signature, _offset: torch.tensor):
