@@ -93,7 +93,7 @@ try:
     class FlexAttentionCache:
         __slots__ = \
             "offset", "offset_tensor", "mask_mod_with_offset", "block_mask", "mask_mod", \
-            "max_length", "block_size", "sliding_window"
+            "max_length", "block_size", "sliding_window", "block_mask_slice"
 
         def __init__(self, key, mask_mod, sliding_window):
             bsz, heads_KV, qlen_KV, dim = key.shape
@@ -186,6 +186,7 @@ try:
             self.max_length = n
             self.block_size = self.block_mask.BLOCK_SIZE[0]
             self.mask_mod_with_offset = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
+            self.block_mask_slice = None
 
         def __call__(self, key):
             # We increment beforehand to get the correct index since offset_tensor is used
@@ -194,6 +195,9 @@ try:
             if (self.sliding_window is None) or (self.offset < self.sliding_window):
                 self.offset += 1
                 self.offset_tensor.add_(1)
+            elif (self.sliding_window is not None):
+                print(self.offset)
+                return self.block_mask_slice
             if self.offset >= self.max_length:
                 # Must be >= since offset=127, max_length=128 means size=127+1=128
                 # since we do zero indexing
@@ -207,6 +211,7 @@ try:
             # Must set seq_lengths as seen in
             # https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L80
             block_mask_slice.seq_lengths = (1, qlen_KV)
+            self.block_mask_slice = block_mask_slice
             return block_mask_slice
     pass
 
