@@ -743,7 +743,7 @@ def patch_GptOssAttention():
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         if past_key_value is not None:
             cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_value.update(key_stfates, value_states, self.layer_idx, cache_kwargs)
 
         # flex_attention_with_sink only works for training since KV cache is wrong
         # switch to flex_attention_with_sink which allows all to work
@@ -924,6 +924,7 @@ def patch_GptOssModel():
         multi_kernel = False, # Fails on torch 2.10 nightly
         use_block_ptr = True,
     )
+    # Re-compiling for each new sequence length which is NOT ideal
     # @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
     def pre_forward(
         self,
@@ -1036,6 +1037,7 @@ def patch_GptOssModel():
                     **kwargs,
                 )
             pass
+            hidden_states = self.norm(hidden_states)
         else:
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
@@ -1070,8 +1072,8 @@ def patch_GptOssModel():
                 hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
                 hidden_states += residual
             pass
+            hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         pass
-        hidden_states = self.norm(hidden_states)
         return process_return(MoeModelOutputWithPast, {
             "last_hidden_state" : hidden_states,
             "past_key_values" : past_key_values,
