@@ -942,7 +942,7 @@ def patch_GptOssModel():
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = moe_forward_inference(self, hidden_states)
+        hidden_states = moe_forward_inference(self.mlp, hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
     pass
