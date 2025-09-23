@@ -183,17 +183,12 @@ def flex_attention_with_sink(
             assert attention_mask.dim() == 2, f"Unsloth: Attention_mask has dim = {attention_mask.dim()}"
 
             padding_start_idx = attention_mask.argmax(1)
+            print(query, key)
             # Use special padded mask creators
             mask_mod = prefill_mask_mod = \
                 generate_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
                 if type(sliding_window) is int and sliding_window != 0 else \
                 generate_causal_mask_with_padding(padding_start_idx)
-
-            # Decoding we can ignore mask on q_idx since q_idx is always length 1
-            # Normally we have to do:
-            #  q_idx >= padding_start_idx[batch_idx]
-            # kv_idx >= padding_start_idx[batch_idx]
-            # but we only need the 2nd one
             decoding_mask_mod = \
                 generate_decoding_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
                 if type(sliding_window) is int and sliding_window != 0 else \
