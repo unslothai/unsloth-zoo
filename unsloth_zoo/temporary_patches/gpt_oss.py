@@ -1033,7 +1033,6 @@ def patch_GptOssModel():
                 )
             pass
         else:
-            torch.compiler.cudagraph_mark_step_begin()
             for decoder_layer in self.layers:
                 residual = hidden_states.clone()
                 query_states, key_states, value_states, input_shape = pre_forward(
