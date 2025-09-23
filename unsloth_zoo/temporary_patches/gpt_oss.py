@@ -557,7 +557,7 @@ def moe_forward_inference(self, hidden_states):
     gate_up = torch.stack(gate_up_list, dim = 0)
     fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit)
 
-    # Down projection must be done in float32 if not bfloat16
+    # Down projection must be done in float32 if not bfloat16 otherwise infinites
     dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
     fused = fused.to(dtype)
     device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
@@ -901,7 +901,7 @@ def patch_GptOssModel():
         return attn_output
     pass
 
-    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    # @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def pre_forward(
         self,
         hidden_states: torch.Tensor,
@@ -930,7 +930,7 @@ def patch_GptOssModel():
         return residual, query_states, key_states, value_states, input_shape
     pass
 
-    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    # @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def post_forward(
         self,
         residual: torch.Tensor,
