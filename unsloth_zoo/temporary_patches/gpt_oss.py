@@ -553,6 +553,8 @@ def moe_forward_inference(self, hidden_states):
     X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
 
     # Gate up projection
+    print(X_rep.dtype)
+    print([up_l.dtype for e, up_l in enumerate(moe.gate_up_projs)])
     gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(moe.gate_up_projs)]
     gate_up = torch.stack(gate_up_list, dim = 0)
     dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
