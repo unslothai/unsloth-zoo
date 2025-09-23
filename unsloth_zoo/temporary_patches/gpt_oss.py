@@ -867,6 +867,9 @@ def patch_GptOssModel():
     flex_attention_with_sink_decoding = torch.compiler.disable(flex_attention_with_sink_decoding, recursive = True)
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
 
+    # Enable larger recompiling cache
+    torch._dynamo.config.recompile_limit = 256
+
     def pre_attention_decoding(
         self,
         hidden_states: torch.Tensor,
