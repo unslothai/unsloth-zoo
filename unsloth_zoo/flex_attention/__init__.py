@@ -27,8 +27,9 @@ if HAS_FLEX_ATTENTION:
     from .attention_sink import (
         flex_attention_with_sink,
         old_flex_attention_with_sink,
-        flex_attention_with_sink_decoding,
         is_flex_attention_decoding,
+        flex_attention_with_sink_partial_decoding,
+        flex_attention_add_sinks,
     )
 else:
     old_flex_attention_with_sink = None

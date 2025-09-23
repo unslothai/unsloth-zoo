@@ -743,11 +743,16 @@ def patch_GptOssAttention():
         # switch to flex_attention_with_sink which allows all to work
         # print(query_states.shape, key_states.shape, value_states.shape, flush = True)
         if is_flex_attention_decoding(self, query_states):
-            attn_output = flex_attention_with_sink_decoding(
+            attn_output, logsumexp = flex_attention_with_sink_partial_decoding(
                 self,
                 query_states,
                 key_states,
                 value_states,
+            )
+            attn_output = flex_attention_add_sinks(
+                self_attn,
+                attn_output,
+                logsumexp,
             )
         else:
             attn_output = flex_attention_with_sink(

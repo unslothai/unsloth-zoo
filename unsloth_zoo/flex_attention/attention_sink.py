@@ -17,8 +17,9 @@
 __all__ = [
     "flex_attention_with_sink",
     "old_flex_attention_with_sink",
-    "flex_attention_with_sink_decoding",
     "is_flex_attention_decoding",
+    "flex_attention_with_sink_partial_decoding",
+    "flex_attention_add_sinks",
 ]
 
 import torch
@@ -240,8 +241,7 @@ def flex_attention_with_sink(
     return attn_output
 pass
 
-
-def flex_attention_with_sink_decoding(
+def flex_attention_with_sink_partial_decoding(
     self_attn,
     query,
     key,
@@ -263,6 +263,15 @@ def flex_attention_with_sink_decoding(
         scale = scale,
         return_lse = True, # log(sum(exp(xi)))
     )
+    return attn_output, logsumexp
+    # Call _flex_attention_add_sinks later
+pass
+
+def flex_attention_add_sinks(
+    self_attn,
+    attn_output,
+    logsumexp,
+):
     ### Version 3: Most simple uses sigmoid and scale
     sink_scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
 
@@ -273,7 +282,6 @@ def flex_attention_with_sink_decoding(
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output
 pass
-
 
 def is_flex_attention_decoding(self_attn, query):
     bsz, heads_Q, qlen_Q, dim = query.shape
