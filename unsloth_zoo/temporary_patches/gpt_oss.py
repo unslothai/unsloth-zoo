@@ -673,8 +673,10 @@ def patch_GptOssAttention():
     try:
         from ..flex_attention import (
             flex_attention_with_sink,
-            flex_attention_with_sink_decoding,
+            old_flex_attention_with_sink,
             is_flex_attention_decoding,
+            flex_attention_with_sink_partial_decoding,
+            flex_attention_add_sinks,
         )
         assert flex_attention_with_sink is not None
     except Exception as e:
