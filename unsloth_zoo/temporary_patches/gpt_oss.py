@@ -925,6 +925,7 @@ def patch_GptOssModel():
     def pre_forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -932,7 +933,6 @@ def patch_GptOssModel():
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
     ):
-        residual = hidden_states.clone()
         hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
         # Self Attention
         query_states, key_states, value_states, input_shape = pre_attention_decoding(
@@ -945,7 +945,7 @@ def patch_GptOssModel():
             cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
-        return residual, query_states, key_states, value_states, input_shape
+        return query_states, key_states, value_states, input_shape
     pass
 
     @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
@@ -960,10 +960,10 @@ def patch_GptOssModel():
         hidden_states = residual + hidden_states
 
         # Fully Connected
-        residual = hidden_states.clone()
+        new_residual = hidden_states.clone()
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         hidden_states = moe_forward_inference(self.mlp, hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = new_residual + hidden_states
         return hidden_states
     pass
 
@@ -1028,7 +1028,8 @@ def patch_GptOssModel():
             pass
         else:
             for decoder_layer in self.layers:
-                residual, query_states, key_states, value_states, input_shape = pre_forward(
+                residual = hidden_states.clone()
+                query_states, key_states, value_states, input_shape = pre_forward(
                     decoder_layer,
                     hidden_states,
                     attention_mask=attention_mask,
