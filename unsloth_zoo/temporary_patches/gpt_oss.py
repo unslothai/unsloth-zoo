@@ -865,6 +865,7 @@ def patch_GptOssModel():
         flex_attention_add_sinks,
     )
     flex_attention_with_sink_decoding = torch.compiler.disable(flex_attention_with_sink_decoding, recursive = True)
+    apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
 
     def pre_attention_decoding(
         self,
@@ -905,9 +906,11 @@ def patch_GptOssModel():
     def rms_layernorm_forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight * hidden_states).to(input_dtype)
+        variance = hidden_states.square().mean(-1, keepdim=True)
+        variance += self.variance_epsilon
+        hidden_states *= torch.rsqrt_(variance)
+        hidden_states *= self.weight
+        return (hidden_states).to(input_dtype)
     pass
 
     no_combo_fused_torch_compile_options = get_torch_compile_options(
