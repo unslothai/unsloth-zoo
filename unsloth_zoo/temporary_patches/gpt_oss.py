@@ -960,7 +960,7 @@ def patch_GptOssModel():
         return hidden_states
     pass
 
-    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    # @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def post_forward_2(
         self,
         residual: torch.Tensor,
@@ -1035,6 +1035,7 @@ def patch_GptOssModel():
         else:
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
+            # torch.compiler.cudagraph_mark_step_begin()
 
             for decoder_layer in self.layers:
                 residual = hidden_states.clone()
