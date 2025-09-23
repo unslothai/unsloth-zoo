@@ -921,7 +921,7 @@ def patch_GptOssModel():
         multi_kernel = False, # Fails on torch 2.10 nightly
         use_block_ptr = True,
     )
-    @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
+    # @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
     def pre_forward(
         self,
         hidden_states: torch.Tensor,
