@@ -24,7 +24,12 @@ from .utils import (
 )
 
 if HAS_FLEX_ATTENTION:
-    from .attention_sink import *
+    from .attention_sink import (
+        flex_attention_with_sink,
+        old_flex_attention_with_sink,
+        flex_attention_with_sink_decoding,
+        is_flex_attention_decoding,
+    )
 else:
     old_flex_attention_with_sink = None
     flex_attention_with_sink = None
