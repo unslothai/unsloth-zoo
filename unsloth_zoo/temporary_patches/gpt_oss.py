@@ -956,7 +956,6 @@ def patch_GptOssModel():
         memory_planning = True,
         multi_kernel = False, # Fails on torch 2.10 nightly
         use_block_ptr = True,
-        debug = True,
     )
     @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def post_forward(
@@ -1019,7 +1018,7 @@ def patch_GptOssModel():
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        is_decoding = is_flex_attention_decoding(self.layers[-1].self_attn, hidden_states)
+        is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         if not is_decoding:
             for decoder_layer in self.layers:
                 hidden_states = decoder_layer(
