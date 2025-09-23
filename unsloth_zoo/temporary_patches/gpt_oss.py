@@ -629,7 +629,8 @@ def patch_gpt_oss_router():
     # if the model ends with -bnb-4bit, we need to patch
     # linearized but we still need to patch the router
     # otherwise
-    if model_name.endswith("-bnb-4bit"):return
+    print('patching gpt oss router', model_name)
+    if model_name.endswith("-bnb-4bit"): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
     except Exception as e:
@@ -638,12 +639,14 @@ def patch_gpt_oss_router():
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
     if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
         print("Unsloth: Patched GptOssTopKRouter")
+    return
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_router)
 
 def patch_gpt_oss_linearized():
     model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
-    if not model_name.endswith("-bnb-4bit"):return
+    if not model_name.endswith("-bnb-4bit"): return
+    print('patching gpt oss linearized', model_name)
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
     except Exception as e:
