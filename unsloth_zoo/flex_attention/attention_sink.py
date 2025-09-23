@@ -17,9 +17,6 @@
 __all__ = [
     "flex_attention_with_sink",
     "old_flex_attention_with_sink",
-    "is_flex_attention_decoding",
-    "flex_attention_with_sink_partial_decoding",
-    "flex_attention_add_sinks",
 ]
 
 import torch
@@ -239,57 +236,4 @@ def flex_attention_with_sink(
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output
-pass
-
-def flex_attention_with_sink_partial_decoding(
-    self_attn,
-    query,
-    key,
-    value,
-    scale = None,
-):
-    assert getattr(self_attn, "sinks", None) is not None, "Unsloth: self_attn must have sinks"
-    enable_gqa = getattr(self_attn, "num_key_value_groups", 1) != 1
-    scale = getattr(self_attn, "scaling", None) or getattr(self_attn, "scale", None) or scale
-
-    block_mask = self_attn._flex_attention_cache.get_decoding_block_mask(key)
-    attn_output, logsumexp = flex_attention(
-        query,
-        key,
-        value,
-        block_mask = block_mask,
-        score_mod = None, # None needed
-        enable_gqa = enable_gqa,
-        scale = scale,
-        return_lse = True, # log(sum(exp(xi)))
-    )
-    return attn_output, logsumexp
-    # Call _flex_attention_add_sinks later
-pass
-
-def flex_attention_add_sinks(
-    self_attn,
-    attn_output,
-    logsumexp,
-):
-    ### Version 3: Most simple uses sigmoid and scale
-    sink_scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
-
-    # All 3 versions scale the original attn_output!
-    attn_output = attn_output * sink_scale.unsqueeze(-1).to(attn_output.dtype)
-    # To reduce error, one should do attn_output.to(torch.float32)
-
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output
-pass
-
-def is_flex_attention_decoding(self_attn, query):
-    bsz, heads_Q, qlen_Q, dim = query.shape
-    is_training = self_attn.training
-    has_flex_cache = hasattr(self_attn, "_flex_attention_cache")
-    if is_training or (
-        not is_training and (not has_flex_cache or qlen_Q != 1)
-    ):
-        return False
-    return True
 pass

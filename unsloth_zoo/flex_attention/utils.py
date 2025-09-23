@@ -186,11 +186,10 @@ try:
     class FlexAttentionCache:
         __slots__ = \
             "offset", "offset_tensor", "mask_mod_with_offset", "block_mask", "mask_mod", \
-            "max_length", "block_size", "sliding_window", "block_mask_slice", "static_max_KV_length",
+            "max_length", "block_size", "sliding_window", "block_mask_slice",
 
         def __init__(self, key, mask_mod, sliding_window):
             bsz, heads_KV, qlen_KV, dim = key.shape
-            self.static_max_KV_length = qlen_KV
             if sliding_window is None:
                 """
                 Normal causal mask:
@@ -309,28 +308,6 @@ try:
             # Must set seq_lengths as seen in
             # https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L80
             block_mask_slice.seq_lengths = (1, qlen_KV)
-            self.block_mask_slice = block_mask_slice
-            return block_mask_slice
-
-        def get_decoding_block_mask(self, key):
-            bsz, heads_KV, qlen_KV, dim = key.shape
-            # We increment beforehand to get the correct index since offset_tensor is used
-            #                                    Assume sliding_window=128-1 = 127
-            #                                    offset=126, so offset+1 = 127
-            if (self.sliding_window is None) or (self.offset < self.sliding_window):
-                self.offset_tensor.add_(1)
-            elif (self.sliding_window is not None):
-                # Quick return since sliding window mask has the same block mask always
-                # Can only enter here if (self.offset < self.sliding_window) fails
-                # ie the maximum sliding window has been reached already
-                return self.block_mask_slice
-            assert self.offset_tensor.dim() == 0
-            block_offset = self.offset_tensor // self.block_mask.BLOCK_SIZE[0]
-            block_mask_slice = self.block_mask[:, :, block_offset]
-            block_mask_slice.mask_mod = self.mask_mod_with_offset
-            # Must set seq_lengths as seen in
-            # https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L80
-            block_mask_slice.seq_lengths = (1, self.static_max_KV_length)
             self.block_mask_slice = block_mask_slice
             return block_mask_slice
     pass
