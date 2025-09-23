@@ -911,7 +911,6 @@ def patch_GptOssModel():
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **kwargs: KWARGS_TYPE,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -925,7 +924,6 @@ def patch_GptOssModel():
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            **kwargs,
         )
         return residual, query_states, key_states, value_states, input_shape
     pass
@@ -1019,7 +1017,6 @@ def patch_GptOssModel():
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    **kwargs,
                 )
                 attn_output, logsumexp = flex_attention_with_sink_decoding(
                     decoder_layer.self_attn,
