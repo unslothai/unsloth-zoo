@@ -2143,7 +2143,11 @@ def unsloth_compile_transformers(
             # Must add _supports_sdpa check since now all modules use ALL_ATTENTION_FUNCTIONS
             scaled_dot_product_attention_modules.append(module)
         elif "nn.functional.softmax" in source or "flash_attn_varlen_func" in source or "_flash_attention_forward" in source:
-            full_attention_modules.append(module)
+            # Check if TopK is used so Router actually
+            if "torch.topk" in source:
+                pass
+            else:
+                full_attention_modules.append(module)
     pass
     removal = set(
         scaled_dot_product_attention_modules + \
