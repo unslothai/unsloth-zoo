@@ -925,7 +925,6 @@ def patch_GptOssModel():
     def pre_forward(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -960,10 +959,10 @@ def patch_GptOssModel():
         hidden_states = residual + hidden_states
 
         # Fully Connected
-        new_residual = hidden_states.clone()
+        residual = hidden_states.clone()
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         hidden_states = moe_forward_inference(self.mlp, hidden_states)
-        hidden_states = new_residual + hidden_states
+        hidden_states = residual + hidden_states
         return hidden_states
     pass
 
@@ -1027,12 +1026,12 @@ def patch_GptOssModel():
                 )
             pass
         else:
+            torch.compiler.cudagraph_mark_step_begin()
             for decoder_layer in self.layers:
                 residual = hidden_states.clone()
                 query_states, key_states, value_states, input_shape = pre_forward(
                     decoder_layer,
                     hidden_states,
-                    residual,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_values=past_key_values,
