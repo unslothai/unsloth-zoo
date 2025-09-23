@@ -491,7 +491,6 @@ class GptOssExperts(nn.Module):
             return next_states.to(hidden_states.dtype)
         else:
             X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
-            print(494, X_rep.dtype)
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
             gate_up = torch.stack(gate_up_list, dim=0)
             fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = X_rep.dtype)
@@ -540,7 +539,7 @@ fused_torch_compile_options = get_torch_compile_options(
     use_block_ptr = True,
 )
 
-# @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+@torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
 def moe_forward_inference(self, hidden_states):
     """Torch compile for forward inference path only with CUDAGraphs"""
     # Router
@@ -639,7 +638,6 @@ def patch_gpt_oss_linearized():
                 return next_states.to(torch.float32)
             else:
                 X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
-                print(642, X_rep.dtype)
                 gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
                 gate_up = torch.stack(gate_up_list, dim=0)
                 dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
@@ -749,7 +747,6 @@ def patch_GptOssAttention():
 
         # flex_attention_with_sink only works for training since KV cache is wrong
         # switch to flex_attention_with_sink which allows all to work
-        # print(query_states.shape, key_states.shape, value_states.shape, flush = True)
         if is_flex_attention_decoding(self, query_states):
             attn_output, logsumexp = flex_attention_with_sink_decoding(
                 self,
@@ -904,7 +901,7 @@ def patch_GptOssModel():
         return attn_output
     pass
 
-    # @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def pre_forward(
         self,
         hidden_states: torch.Tensor,
@@ -931,7 +928,7 @@ def patch_GptOssModel():
         return residual, query_states, key_states, value_states, input_shape
     pass
 
-    # @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def post_forward(
         self,
         residual: torch.Tensor,
