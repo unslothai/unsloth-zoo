@@ -535,11 +535,11 @@ fused_torch_compile_options = get_torch_compile_options(
     coordinate_descent_tuning = True,
     combo_kernels = True,
     memory_planning = True,
-    multi_kernel = True,
+    multi_kernel = False, # Fails on torch 2.10 nightly
     use_block_ptr = True,
 )
 
-# @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+@torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
 def moe_forward_inference(self, hidden_states):
     """Torch compile for forward inference path only with CUDAGraphs"""
     # Router
