@@ -686,11 +686,6 @@ def patch_GptOssAttention():
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
 
-    flex_attention_with_sink_decoding = torch.compile(
-        flex_attention_with_sink_decoding,
-        dynamic = None, fullgraph = True, options = fused_torch_compile_options,
-    )
-
     def eager_attention_forward(
         module: nn.Module,
         query: torch.Tensor,
