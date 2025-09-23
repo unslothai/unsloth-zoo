@@ -751,7 +751,7 @@ def patch_GptOssAttention():
                 value_states,
             )
             attn_output = flex_attention_add_sinks(
-                self_attn,
+                self,
                 attn_output,
                 logsumexp,
             )
