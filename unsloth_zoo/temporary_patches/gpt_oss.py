@@ -828,6 +828,7 @@ def patch_GptOssModel():
         import transformers.models.gpt_oss.modeling_gpt_oss
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel
         from transformers.models.gpt_oss.modeling_gpt_oss import MoeModelOutputWithPast
+        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
     try:
@@ -853,6 +854,96 @@ def patch_GptOssModel():
     transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = return_attention_mask
     transformers.masking_utils.create_masks_for_generate = return_attention_mask
     transformers.generation.utils.create_masks_for_generate = return_attention_mask
+
+    from ..flex_attention import (
+        is_flex_attention_decoding,
+        flex_attention_with_sink_decoding,
+        flex_attention_add_sinks,
+    )
+    flex_attention_with_sink_decoding = torch.compiler.disable(flex_attention_with_sink_decoding, recursive = True)
+
+    def pre_attention_decoding(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_values is not None:
+            cache_kwargs = {"cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        return query_states, key_states, value_states, input_shape
+    pass
+    # Do flex_attention_with_sink_decoding with cannot be compiled
+    # attn_output, logsumexp = flex_attention_with_sink_decoding(
+    #     self,
+    #     query_states,
+    #     key_states,
+    #     value_states,
+    # )
+    def post_attention_decoding(self_attn, attn_output, logsumexp, input_shape):
+        attn_output = flex_attention_add_sinks(self_attn, attn_output, logsumexp)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self_attn.o_proj(attn_output)
+        return attn_output
+    pass
+
+    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    def pre_decoder_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        **kwargs: KWARGS_TYPE,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        # Self Attention
+        query_states, key_states, value_states, input_shape = pre_attention_decoding(
+            self=self.self_attn,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        return residual, query_states, key_states, value_states, input_shape
+    pass
+
+    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    def post_forward(
+        self,
+        residual: torch.Tensor,
+        attn_output: torch.Tensor,
+        logsumexp: torch.Tensor,
+        input_shape,
+    ):
+        hidden_states = post_attention_decoding(self.self_attn, attn_output, logsumexp, input_shape)
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, _ = self.mlp(hidden_states)  # diff with llama: router scores
+        hidden_states = residual + hidden_states
+        return hidden_states
+    pass
 
     def forward(
         self,
@@ -898,18 +989,49 @@ def patch_GptOssModel():
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for decoder_layer in self.layers:
-            hidden_states = decoder_layer(
-                hidden_states,
-                # attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
+        is_decoding = is_flex_attention_decoding(self.layers[-1].self_attn)
+        if not is_decoding:
+            for decoder_layer in self.layers:
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    # attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+            pass
+        else:
+            for decoder_layer in self.layers:
+                residual, query_states, key_states, value_states, input_shape = pre_decoder_forward(
+                    decoder_layer,
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+                attn_output, logsumexp = flex_attention_with_sink_decoding(
+                    self.self_attn,
+                    query_states,
+                    key_states,
+                    value_states,
+                )
+                hidden_states = post_forward(
+                    decoder_layer,
+                    residual,
+                    attn_output,
+                    logsumexp,
+                    input_shape,
+                )
+            pass
+        pass
         hidden_states = self.norm(hidden_states)
         return process_return(MoeModelOutputWithPast, {
             "last_hidden_state" : hidden_states,
