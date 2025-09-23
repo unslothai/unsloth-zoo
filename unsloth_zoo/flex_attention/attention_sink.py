@@ -17,6 +17,9 @@
 __all__ = [
     "flex_attention_with_sink",
     "old_flex_attention_with_sink",
+    "is_flex_attention_decoding",
+    "flex_attention_with_sink_decoding",
+    "flex_attention_add_sinks",
 ]
 
 import torch
@@ -132,6 +135,21 @@ def old_flex_attention_with_sink(
 pass
 
 
+def is_flex_attention_decoding(self_attn, query):
+    if query.dim() == 4:
+        bsz, heads_Q, qlen_Q, dim = query.shape
+    else:
+        bsz, qlen_Q, dim = query.shape
+    is_training = self_attn.training
+    has_flex_cache = hasattr(self_attn, "_flex_attention_cache")
+    if is_training or (
+        not is_training and (not has_flex_cache or qlen_Q != 1)
+    ):
+        return False
+    return True
+pass
+
+
 def flex_attention_with_sink(
     self_attn,
     query,
@@ -234,6 +252,41 @@ def flex_attention_with_sink(
     attn_output = attn_output * sink_scale.unsqueeze(-1).to(attn_output.dtype)
     # To reduce error, one should do attn_output.to(torch.float32)
 
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output
+pass
+
+def flex_attention_with_sink_decoding(
+    self_attn,
+    query,
+    key,
+    value,
+    scale = None,
+):
+    assert getattr(self_attn, "sinks", None) is not None, "Unsloth: self_attn must have sinks"
+    enable_gqa = getattr(self_attn, "num_key_value_groups", 1) != 1
+    scale = getattr(self_attn, "scaling", None) or getattr(self_attn, "scale", None) or scale
+    block_mask = self_attn._flex_attention_cache(key)
+    attn_output, logsumexp = flex_attention(
+        query,
+        key,
+        value,
+        block_mask = block_mask,
+        score_mod = None, # None needed
+        enable_gqa = enable_gqa,
+        scale = scale,
+        return_lse = True, # log(sum(exp(xi)))
+    )
+    return attn_output, logsumexp
+pass
+
+def flex_attention_add_sinks(
+    self_attn,
+    attn_output,
+    logsumexp,
+):
+    sink_scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
+    attn_output = attn_output * sink_scale.unsqueeze(-1).to(attn_output.dtype)
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output
 pass

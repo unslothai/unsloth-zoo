@@ -671,7 +671,12 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     try:
-        from ..flex_attention import flex_attention_with_sink
+        from ..flex_attention import (
+            flex_attention_with_sink,
+            is_flex_attention_decoding,
+            flex_attention_with_sink_decoding,
+            flex_attention_add_sinks,
+        )
         assert flex_attention_with_sink is not None
     except Exception as e:
         return raise_error("flex_attention_with_sink", e)
@@ -738,13 +743,26 @@ def patch_GptOssAttention():
         # flex_attention_with_sink only works for training since KV cache is wrong
         # switch to flex_attention_with_sink which allows all to work
         # print(query_states.shape, key_states.shape, value_states.shape, flush = True)
-        attn_output = flex_attention_with_sink(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-        )
+        if is_flex_attention_decoding(self, query_states):
+            attn_output, logsumexp = flex_attention_with_sink_decoding(
+                self,
+                query_states,
+                key_states,
+                value_states,
+            )
+            attn_output = flex_attention_add_sinks(
+                self_attn,
+                attn_output,
+                logsumexp,
+            )
+        else:
+            attn_output = flex_attention_with_sink(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+            )
         attn_weights = None
         # if self.training:
         #     attn_output = old_flex_attention_with_sink(
