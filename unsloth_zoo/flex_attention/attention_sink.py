@@ -24,6 +24,7 @@ import functools
 from .utils import (
     create_block_mask_cached,
     create_block_mask,
+    compiled_create_block_mask,
     flex_attention,
     FlexAttentionCache,
 
@@ -207,7 +208,7 @@ def flex_attention_with_sink(
             if type(sliding_window) is int and sliding_window != 0 else \
             causal_mask
     if block_mask is None:
-        block_mask = create_block_mask(mask_mod, bsz, heads_Q, qlen_Q, qlen_KV, device = key.device)
+        block_mask = compiled_create_block_mask(mask_mod, bsz, heads_Q, qlen_Q, qlen_KV, device = key.device)
 
     attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
         query,

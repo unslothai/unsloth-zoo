@@ -20,6 +20,7 @@ __all__ = [
     "flex_attention",
     "create_block_mask_cached",
     "create_block_mask",
+    "compiled_create_block_mask",
     "FlexAttentionCache",
 
     "causal_mask",
@@ -57,6 +58,11 @@ try:
     def compiled_create_block_mask_cached(mask_mod, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _create_block_mask(mask_mod, None, None, M, N, device = device)
+
+    @torch.compile
+    def compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
+        """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
+        return _create_block_mask(mask_mod, bsz, head, M, N, device = device)
 
     def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
         """Causal mask for Flex Attention"""
@@ -270,7 +276,7 @@ try:
                     # During decoding we do self.offset += 1, so self.offset = 0
                 self.sliding_window = sliding_window - 1 # Minus 1 since token 128 means index 127
             self.offset_tensor = torch.tensor(self.offset, device = key.device, dtype = torch.int32)
-            self.block_mask = create_block_mask(mask_mod, bsz, heads_KV, n, n, device = key.device)
+            self.block_mask = compiled_create_block_mask(mask_mod, bsz, heads_KV, n, n, device = key.device)
             self.mask_mod = mask_mod
             self.max_length = n
             self.block_size = self.block_mask.BLOCK_SIZE[0]
@@ -294,7 +300,7 @@ try:
                 # Must be >= since offset=127, max_length=128 means size=127+1=128
                 # since we do zero indexing
                 self.max_length += FLEX_ATTENTION_KV_INCREMENT
-                self.block_mask = create_block_mask(self.mask_mod, bsz, heads_KV, self.max_length, self.max_length, device = key.device)
+                self.block_mask = compiled_create_block_mask(self.mask_mod, bsz, heads_KV, self.max_length, self.max_length, device = key.device)
                 self.block_size = self.block_mask.BLOCK_SIZE[0]
             block_offset = self.offset // self.block_size
             block_mask_slice = self.block_mask[:, :, block_offset]
