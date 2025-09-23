@@ -324,7 +324,8 @@ try:
                 # Can only enter here if (self.offset < self.sliding_window) fails
                 # ie the maximum sliding window has been reached already
                 return self.block_mask_slice
-            block_offset = self.offset_tensor // self.block_size
+            assert self.offset_tensor.dim() == 0
+            block_offset = self.offset_tensor // self.block_mask.BLOCK_SIZE[0]
             block_mask_slice = self.block_mask[:, :, block_offset]
             block_mask_slice.mask_mod = self.mask_mod_with_offset
             # Must set seq_lengths as seen in
