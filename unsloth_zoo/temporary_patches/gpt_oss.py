@@ -91,8 +91,8 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
 
-    if hasattr(transformers.quantizers.quantizer_mxfp4, "_lazy_import_kernels"):
-        transformers.quantizers.quantizer_mxfp4._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
+    if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
 
     try:
         transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
