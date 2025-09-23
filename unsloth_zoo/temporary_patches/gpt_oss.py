@@ -901,7 +901,18 @@ def patch_GptOssModel():
         return attn_output
     pass
 
-    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    no_combo_fused_torch_compile_options = get_torch_compile_options(
+        epilogue_fusion = True,
+        max_autotune = False, # Too slow
+        shape_padding = True,
+        cudagraphs = True,
+        coordinate_descent_tuning = True,
+        combo_kernels = False, # Breaks on attention
+        memory_planning = True,
+        multi_kernel = False, # Fails on torch 2.10 nightly
+        use_block_ptr = True,
+    )
+    @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
     def pre_forward(
         self,
         hidden_states: torch.Tensor,
