@@ -557,13 +557,17 @@ def moe_forward_inference(self, hidden_states):
     gate_up = torch.stack(gate_up_list, dim = 0)
     fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit)
 
-    # Down projection
-    out_list = [down_l(fused[e]) for e, down_l in enumerate(moe.down_projs)]
+    # Down projection must be done in float32 if not bfloat16
+    dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+    fused = fused.to(dtype)
+    device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
+    with torch.autocast(device_type=device_type, enabled=False): # Force float32
+        out_list = [down_l(fused[e].to(dtype)) for e, down_l in enumerate(moe.down_projs)]
     outs = torch.stack(out_list, dim=0)
 
-    rw = routing_weights.transpose(0, 1).unsqueeze(-1)
+    rw = routing_weights.to(dtype).transpose(0, 1).unsqueeze(-1)
     mixed = (outs * rw).sum(dim=0)
-    return mixed.view(batch_size, -1, moe.hidden_size)
+    return mixed.view(batch_size, -1, moe.hidden_size).to(hidden_states.dtype)
 pass
 
 
@@ -989,7 +993,7 @@ def patch_GptOssModel():
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        is_decoding = is_flex_attention_decoding(self.layers[-1].self_attn)
+        is_decoding = is_flex_attention_decoding(self.layers[-1].self_attn, hidden_states)
         if not is_decoding:
             for decoder_layer in self.layers:
                 hidden_states = decoder_layer(
