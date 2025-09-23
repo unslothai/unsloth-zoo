@@ -1022,7 +1022,7 @@ def patch_GptOssModel():
                     **kwargs,
                 )
                 attn_output, logsumexp = flex_attention_with_sink_decoding(
-                    self.self_attn,
+                    decoder_layer.self_attn,
                     query_states,
                     key_states,
                     value_states,
