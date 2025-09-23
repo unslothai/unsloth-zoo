@@ -555,10 +555,10 @@ def moe_forward_inference(self, hidden_states):
     # Gate up projection
     gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(moe.gate_up_projs)]
     gate_up = torch.stack(gate_up_list, dim = 0)
-    fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit)
+    dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+    fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit, dtype = dtype)
 
     # Down projection must be done in float32 if not bfloat16 otherwise infinites
-    dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
     fused = fused.to(dtype)
     device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
     with torch.autocast(device_type=device_type, enabled=False): # Force float32
