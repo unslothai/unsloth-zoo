@@ -624,9 +624,26 @@ class GptOssMLP(nn.Module):
         return routed_out, router_scores
 pass
 
+def patch_gpt_oss_router():
+    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
+    # if the model ends with -bnb-4bit, we need to patch
+    # linearized but we still need to patch the router
+    # otherwise
+    if model_name.endswith("-bnb-4bit"):return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
+
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
+    if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+        print("Unsloth: Patched GptOssTopKRouter")
+pass
+TEMPORARY_PATCHES.append(patch_gpt_oss_router)
+
 def patch_gpt_oss_linearized():
     model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
-    if not model_name.endswith("-bnb-4bit"): return
+    if not model_name.endswith("-bnb-4bit"):return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
     except Exception as e:
