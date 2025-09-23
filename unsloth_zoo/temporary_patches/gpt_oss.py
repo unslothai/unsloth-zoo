@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import inspect
-from .common import TEMPORARY_PATCHES, torch_compile
+from .common import TEMPORARY_PATCHES, torch_compile, torch_compile_options, UNSLOTH_ENABLE_LOGGING
 from importlib.metadata import version as importlib_version
 from ..utils import Version
 transformers_version = Version(importlib_version("transformers"))
@@ -526,6 +526,47 @@ class GptOssTopKRouter(nn.Module):
         return router_scores, router_indices
 pass
 
+
+fused_torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False, # Too slow
+    shape_padding = True,
+    cudagraphs = True,
+    coordinate_descent_tuning = True,
+    combo_kernels = True,
+    memory_planning = True,
+    multi_kernel = True,
+    use_block_ptr = True,
+)
+
+@torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+def moe_forward_inference(self, hidden_states):
+    """Torch compile for forward inference path only with CUDAGraphs"""
+    # Router
+    router_scores, router_indices = self.router(hidden_states)
+    routing_weights = router_scores
+    moe = self.experts
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, moe.hidden_size)
+
+    num_experts = routing_weights.shape[1]
+    X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+
+    # Gate up projection
+    gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(moe.gate_up_projs)]
+    gate_up = torch.stack(gate_up_list, dim = 0)
+    fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit)
+
+    # Down projection
+    out_list = [down_l(fused[e]) for e, down_l in enumerate(moe.down_projs)]
+    outs = torch.stack(out_list, dim=0)
+
+    rw = routing_weights.transpose(0, 1).unsqueeze(-1)
+    mixed = (outs * rw).sum(dim=0)
+    return mixed.view(batch_size, -1, moe.hidden_size)
+pass
+
+
 class GptOssMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -533,6 +574,9 @@ class GptOssMLP(nn.Module):
         self.experts = GptOssExperts(config)
 
     def forward(self, hidden_states):
+        bsz, qlen, hd = hidden_states.shape
+        if qlen == 1 and not self.training:
+            return moe_forward_inference(hidden_states), None
         router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
         routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
         return routed_out, router_scores

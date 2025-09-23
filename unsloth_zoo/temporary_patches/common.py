@@ -128,7 +128,6 @@ torch_compile_options = get_torch_compile_options(
     coordinate_descent_tuning = False,
     logging = UNSLOTH_ENABLE_LOGGING,
     combo_kernels = False,
-    group_fusion = False,
     memory_planning = False,
     multi_kernel = False,
     use_block_ptr = False,
