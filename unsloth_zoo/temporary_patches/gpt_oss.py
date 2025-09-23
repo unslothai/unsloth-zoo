@@ -932,7 +932,7 @@ def patch_GptOssModel():
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
     ):
-        residual = hidden_states
+        residual = hidden_states.clone()
         hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
         # Self Attention
         query_states, key_states, value_states, input_shape = pre_attention_decoding(
@@ -960,7 +960,7 @@ def patch_GptOssModel():
         hidden_states = residual + hidden_states
 
         # Fully Connected
-        residual = hidden_states
+        residual = hidden_states.clone()
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         hidden_states = moe_forward_inference(self.mlp, hidden_states)
         hidden_states = residual + hidden_states
