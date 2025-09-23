@@ -901,6 +901,15 @@ def patch_GptOssModel():
         return attn_output
     pass
 
+    # RMSNorm forward
+    def rms_layernorm_forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight * hidden_states).to(input_dtype)
+    pass
+
     no_combo_fused_torch_compile_options = get_torch_compile_options(
         epilogue_fusion = True,
         max_autotune = False, # Too slow
@@ -924,7 +933,7 @@ def patch_GptOssModel():
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
     ):
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
         # Self Attention
         query_states, key_states, value_states, input_shape = pre_attention_decoding(
             self=self.self_attn,
@@ -952,7 +961,7 @@ def patch_GptOssModel():
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         hidden_states = moe_forward_inference(self.mlp, hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
