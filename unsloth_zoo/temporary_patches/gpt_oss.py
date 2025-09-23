@@ -915,7 +915,7 @@ def patch_GptOssModel():
         max_autotune = False, # Too slow
         shape_padding = True,
         cudagraphs = True,
-        coordinate_descent_tuning = True,
+        coordinate_descent_tuning = False,
         combo_kernels = False, # Breaks on attention
         memory_planning = True,
         multi_kernel = False, # Fails on torch 2.10 nightly
@@ -947,8 +947,8 @@ def patch_GptOssModel():
         return query_states, key_states, value_states, input_shape
     pass
 
-    # @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
-    def post_forward_1(
+    @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
+    def post_forward(
         self,
         residual: torch.Tensor,
         attn_output: torch.Tensor,
@@ -957,16 +957,9 @@ def patch_GptOssModel():
     ):
         hidden_states = post_attention_decoding(self.self_attn, attn_output, logsumexp, input_shape)
         hidden_states = residual + hidden_states
-        return hidden_states
-    pass
 
-    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
-    def post_forward_2(
-        self,
-        residual: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ):
         # Fully Connected
+        residual = hidden_states.clone()
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         hidden_states = moe_forward_inference(self.mlp, hidden_states)
         hidden_states = residual + hidden_states
@@ -1056,18 +1049,12 @@ def patch_GptOssModel():
                     key_states,
                     value_states,
                 )
-                hidden_states = post_forward_1(
+                hidden_states = post_forward(
                     decoder_layer,
                     residual,
                     attn_output,
                     logsumexp,
                     input_shape,
-                )
-                residual = hidden_states.clone()
-                hidden_states = post_forward_2(
-                    decoder_layer,
-                    residual,
-                    hidden_states,
                 )
             pass
         pass
