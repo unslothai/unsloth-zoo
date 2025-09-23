@@ -491,9 +491,10 @@ class GptOssExperts(nn.Module):
             return next_states.to(hidden_states.dtype)
         else:
             X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+            print(X_rep.dtype)
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
             gate_up = torch.stack(gate_up_list, dim=0)
-            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = X_rep.dtype)
             # gate = gate_up[..., ::2]
             # up_h = gate_up[..., 1::2]
             # gate = gate.clamp(max=self.limit)
@@ -539,7 +540,7 @@ fused_torch_compile_options = get_torch_compile_options(
     use_block_ptr = True,
 )
 
-@torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+# @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
 def moe_forward_inference(self, hidden_states):
     """Torch compile for forward inference path only with CUDAGraphs"""
     # Router
@@ -638,6 +639,7 @@ def patch_gpt_oss_linearized():
                 return next_states.to(torch.float32)
             else:
                 X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+                print(X_rep.dtype)
                 gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
                 gate_up = torch.stack(gate_up_list, dim=0)
                 dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
@@ -659,7 +661,7 @@ def patch_gpt_oss_linearized():
                 outs = torch.stack(out_list, dim=0)
                 rw = routing_weights.transpose(0, 1).unsqueeze(-1)
                 mixed = (outs.to(dtype) * rw.to(dtype)).sum(dim=0)
-                return mixed.view(batch_size, -1, self.hidden_size).to(dtype)
+                return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
             pass
         pass
         GptOssExperts.forward = forward
