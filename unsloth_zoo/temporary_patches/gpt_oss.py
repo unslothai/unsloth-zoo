@@ -540,6 +540,17 @@ fused_torch_compile_options = get_torch_compile_options(
     multi_kernel = False, # Fails on torch 2.10 nightly
     use_block_ptr = True,
 )
+no_combo_fused_torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False, # Too slow
+    shape_padding = True,
+    cudagraphs = True,
+    coordinate_descent_tuning = False, # Very slow!
+    combo_kernels = False, # Breaks on attention
+    memory_planning = True,
+    multi_kernel = False, # Fails on torch 2.10 nightly
+    use_block_ptr = True,
+)
 
 @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
 def moe_forward_inference(self, hidden_states):
@@ -572,7 +583,8 @@ def moe_forward_inference(self, hidden_states):
     return mixed.view(batch_size, -1, moe.hidden_size).to(hidden_states.dtype)
 pass
 
-@torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+# Combo Kernels errors with InductorError: AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
+@torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
 def moe_forward_inference_bf16(self, hidden_states):
     router_scores, router_indices = self.router(hidden_states)
     routing_weights = router_scores
@@ -942,17 +954,6 @@ def patch_GptOssModel():
         return (hidden_states).to(input_dtype)
     pass
 
-    no_combo_fused_torch_compile_options = get_torch_compile_options(
-        epilogue_fusion = True,
-        max_autotune = False, # Too slow
-        shape_padding = True,
-        cudagraphs = True,
-        coordinate_descent_tuning = False, # Very slow!
-        combo_kernels = False, # Breaks on attention
-        memory_planning = True,
-        multi_kernel = False, # Fails on torch 2.10 nightly
-        use_block_ptr = True,
-    )
     # Re-compiling for each new sequence length which is NOT ideal
     # @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
     def pre_forward(
