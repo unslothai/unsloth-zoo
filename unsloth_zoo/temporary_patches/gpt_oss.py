@@ -1035,7 +1035,7 @@ def patch_GptOssModel():
         else:
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
-            # torch.compiler.cudagraph_mark_step_begin()
+            torch.compiler.cudagraph_mark_step_begin()
 
             for decoder_layer in self.layers:
                 residual = hidden_states.clone()
