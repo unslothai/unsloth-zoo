@@ -527,13 +527,15 @@ class GptOssTopKRouter(nn.Module):
 pass
 
 
+# Combo kernels uses too much VRAM for low memory GPUs
+use_combo_kernels = False if torch.cuda.memory.mem_get_info(0)[-1]/1024/1024/1024 <= 40 else True
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False, # Too slow
     shape_padding = True,
     cudagraphs = True,
     coordinate_descent_tuning = True,
-    combo_kernels = False,
+    combo_kernels = use_combo_kernels,
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
     use_block_ptr = True,
