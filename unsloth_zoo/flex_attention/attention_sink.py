@@ -183,7 +183,10 @@ def flex_attention_with_sink(
             assert attention_mask.dim() == 2, f"Unsloth: Attention_mask has dim = {attention_mask.dim()}"
 
             padding_start_idx = attention_mask.argmax(1)
-            print(query.shape, key.shape, padding_start_idx)
+            do_padding = torch.arange(max(qlen_Q, qlen_KV), device = "cuda").repeat((bsz, 1)) < padding_start_idx.unsqueeze(0).T
+            query.transpose(2, 1)[do_padding[:, :qlen_Q ]] = 1
+            key  .transpose(2, 1)[do_padding[:, :qlen_KV]] = -torch.inf
+            value.transpose(2, 1)[do_padding[:, :qlen_KV]] = 0
             # Use special padded mask creators
             mask_mod = prefill_mask_mod = \
                 generate_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
