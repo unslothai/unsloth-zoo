@@ -270,7 +270,7 @@ try:
                 since 128 means index 127
                 """
                 n = sliding_window
-                self.offset = min(sliding_window, max_length) - 2 # Minus 2 since block mask is indexing
+                self.offset = min(sliding_window, qlen_KV) - 2 # Minus 2 since block mask is indexing
                 if self.offset <= -2:
                     # Minimum is -1
                     self.offset = -1
