@@ -946,7 +946,18 @@ def patch_GptOssModel():
         )
         return query_states, key_states, value_states, input_shape
     pass
-
+    fused_torch_compile_options = get_torch_compile_options(
+        epilogue_fusion = True,
+        max_autotune = False, # Too slow
+        shape_padding = True,
+        cudagraphs = True,
+        coordinate_descent_tuning = True,
+        combo_kernels = True,
+        memory_planning = True,
+        multi_kernel = False, # Fails on torch 2.10 nightly
+        use_block_ptr = True,
+        debug = True,
+    )
     @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def post_forward(
         self,
