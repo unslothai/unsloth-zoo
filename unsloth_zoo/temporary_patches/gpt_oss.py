@@ -898,7 +898,7 @@ def patch_GptOssModel():
     pass
 
     @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
-    def pre_decoder_forward(
+    def pre_forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -1006,7 +1006,7 @@ def patch_GptOssModel():
             pass
         else:
             for decoder_layer in self.layers:
-                residual, query_states, key_states, value_states, input_shape = pre_decoder_forward(
+                residual, query_states, key_states, value_states, input_shape = pre_forward(
                     decoder_layer,
                     hidden_states,
                     attention_mask=attention_mask,
