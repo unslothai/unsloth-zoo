@@ -142,7 +142,7 @@ def flex_attention_with_sink(
     attention_mask = None,
     scale = None,
     sliding_window = None,
-    compile = False,
+    compile = True,
 ):
     """
     Allows one sink token to be attended to for full/sliding window attention
@@ -182,9 +182,12 @@ def flex_attention_with_sink(
             # Consider left padding as well for prefill
             assert attention_mask is not None
             assert attention_mask.dim() == 2, f"Unsloth: Attention_mask has dim = {attention_mask.dim()}"
-
+            # We must account for left padding
             padding_start_idx = attention_mask.argmax(1)
             do_padding = torch.arange(max(qlen_Q, qlen_KV), device = "cuda").repeat((bsz, 1)) < padding_start_idx.unsqueeze(0).T
+            # We also make all padded tokens Q=1, K=-inf
+            # Note if Q=0, K=0, Q*K = 0, but exp(0) = 1, so that's wrong
+            # Only exp(-inf) = 0. So Q=1, K=-inf, Q*K = -inf
             query.transpose(2, 1)[do_padding[:, :qlen_Q ]] = 1
             key  .transpose(2, 1)[do_padding[:, :qlen_KV]] = -torch.inf
             value.transpose(2, 1)[do_padding[:, :qlen_KV]] = 0
