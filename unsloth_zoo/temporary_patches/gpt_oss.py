@@ -671,7 +671,11 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     try:
-        from ..flex_attention import flex_attention_with_sink
+        from ..flex_attention import (
+            flex_attention_with_sink,
+            flex_attention_with_sink_decoding,
+            is_flex_attention_decoding,
+        )
         assert flex_attention_with_sink is not None
     except Exception as e:
         return raise_error("flex_attention_with_sink", e)
@@ -681,6 +685,11 @@ def patch_GptOssAttention():
         from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb, repeat_kv
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
+
+    flex_attention_with_sink_decoding = torch.compile(
+        flex_attention_with_sink_decoding,
+        dynamic = None, fullgraph = True, options = fused_torch_compile_options,
+    )
 
     def eager_attention_forward(
         module: nn.Module,
@@ -738,13 +747,21 @@ def patch_GptOssAttention():
         # flex_attention_with_sink only works for training since KV cache is wrong
         # switch to flex_attention_with_sink which allows all to work
         # print(query_states.shape, key_states.shape, value_states.shape, flush = True)
-        attn_output = flex_attention_with_sink(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-        )
+        if is_flex_attention_decoding(self, query_states):
+            attn_output = flex_attention_with_sink_decoding(
+                self,
+                query_states,
+                key_states,
+                value_states,
+            )
+        else:
+            attn_output = flex_attention_with_sink(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+            )
         attn_weights = None
         # if self.training:
         #     attn_output = old_flex_attention_with_sink(
