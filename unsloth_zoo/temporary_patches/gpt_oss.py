@@ -583,10 +583,19 @@ def moe_forward_inference(self, hidden_states):
     return mixed.view(batch_size, -1, moe.hidden_size).to(hidden_states.dtype)
 pass
 
+@torch_compile(dynamic = True, fullgraph = True)
+def moe_router_forward(self, hidden_states):
+    hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+    router_logits = F.linear(hidden_states, self.weight, self.bias)  # (seq_len, num_experts)
+    router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+    router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
+    router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
+    return router_scores, router_indices
+
 # Combo Kernels errors with InductorError: AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
 @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
 def moe_forward_inference_bf16(self, hidden_states):
-    router_scores, router_indices = self.router(hidden_states)
+    router_scores, router_indices = moe_router_forward(self, hidden_states)
     routing_weights = router_scores
 
     moe = self.experts
@@ -624,29 +633,9 @@ class GptOssMLP(nn.Module):
         return routed_out, router_scores
 pass
 
-def patch_gpt_oss_router():
-    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
-    # if the model ends with -bnb-4bit, we need to patch
-    # linearized but we still need to patch the router
-    # otherwise
-    print('patching gpt oss router', model_name)
-    if model_name and model_name.endswith("-bnb-4bit"): return
-    try:
-        import transformers.models.gpt_oss.modeling_gpt_oss
-    except Exception as e:
-        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
-
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
-    if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
-        print("Unsloth: Patched GptOssTopKRouter")
-    return
-pass
-TEMPORARY_PATCHES.append(patch_gpt_oss_router)
-
 def patch_gpt_oss_linearized():
     model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
     if not model_name.endswith("-bnb-4bit"): return
-    print('patching gpt oss linearized', model_name)
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
     except Exception as e:
