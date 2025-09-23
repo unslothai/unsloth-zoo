@@ -630,7 +630,7 @@ def patch_gpt_oss_router():
     # linearized but we still need to patch the router
     # otherwise
     print('patching gpt oss router', model_name)
-    if model_name.endswith("-bnb-4bit"): return
+    if model_name and model_name.endswith("-bnb-4bit"): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
     except Exception as e:
