@@ -593,7 +593,7 @@ def moe_forward_inference_bf16(self, hidden_states):
     next_states = next_states.view(num_experts, batch_size, -1, moe.hidden_size)
     next_states = next_states * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
     next_states = next_states.sum(dim=0)
-    return next_stats
+    return next_states
 pass
 
 
