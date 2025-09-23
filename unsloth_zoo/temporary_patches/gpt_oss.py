@@ -1032,6 +1032,7 @@ def patch_GptOssModel():
                 query_states, key_states, value_states, input_shape = pre_forward(
                     decoder_layer,
                     hidden_states,
+                    residual,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_values=past_key_values,
