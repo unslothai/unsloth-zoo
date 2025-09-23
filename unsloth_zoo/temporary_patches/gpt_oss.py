@@ -583,7 +583,8 @@ def moe_forward_inference(self, hidden_states):
     return mixed.view(batch_size, -1, moe.hidden_size).to(hidden_states.dtype)
 pass
 
-@torch_compile(dynamic = True, fullgraph = True)
+# @torch_compile(dynamic = True, fullgraph = True)
+# @torch.compiler.disable(recursive=False)
 def moe_router_forward(self, hidden_states):
     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
     router_logits = F.linear(hidden_states, self.weight, self.bias)  # (seq_len, num_experts)
@@ -593,9 +594,9 @@ def moe_router_forward(self, hidden_states):
     return router_scores, router_indices
 
 # Combo Kernels errors with InductorError: AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
-@torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
+# @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
 def moe_forward_inference_bf16(self, hidden_states):
-    router_scores, router_indices = moe_router_forward(self, hidden_states)
+    router_scores, router_indices = moe_router_forward(self.router, hidden_states)
     routing_weights = router_scores
 
     moe = self.experts
