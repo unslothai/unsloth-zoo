@@ -947,7 +947,7 @@ def patch_GptOssModel():
         return query_states, key_states, value_states, input_shape
     pass
 
-    @torch.compile(dynamic = None, fullgraph = True, options = combo_fused_torch_compile_options)
+    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def post_forward_1(
         self,
         residual: torch.Tensor,
@@ -960,7 +960,7 @@ def patch_GptOssModel():
         return hidden_states
     pass
 
-    @torch.compile(dynamic = None, fullgraph = True, options = combo_fused_torch_compile_options)
+    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def post_forward_2(
         self,
         residual: torch.Tensor,
