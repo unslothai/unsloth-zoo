@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import inspect
-from .common import TEMPORARY_PATCHES, torch_compile, torch_compile_options, UNSLOTH_ENABLE_LOGGING
+from .common import TEMPORARY_PATCHES, torch_compile, get_torch_compile_options, UNSLOTH_ENABLE_LOGGING
 from importlib.metadata import version as importlib_version
 from ..utils import Version
 transformers_version = Version(importlib_version("transformers"))
