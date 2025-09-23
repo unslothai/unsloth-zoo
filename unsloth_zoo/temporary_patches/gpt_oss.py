@@ -1099,7 +1099,7 @@ def patch_GptOssModel():
                     logsumexp,
                     input_shape,
                 )
-                if hasattr(decoder_layer.mlp, "gate_up_projs"):
+                if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
                     hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
                 else:
                     hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
