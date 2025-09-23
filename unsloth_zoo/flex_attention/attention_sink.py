@@ -253,7 +253,7 @@ def flex_attention_with_sink_decoding(
     scale = getattr(self_attn, "scaling", None) or getattr(self_attn, "scale", None) or scale
 
     block_mask = self_attn._flex_attention_cache.get_decoding_block_mask(key)
-    attn_output, logsumexp = uncompiled_flex_attention(
+    attn_output, logsumexp = flex_attention(
         query,
         key,
         value,
