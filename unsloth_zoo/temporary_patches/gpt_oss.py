@@ -972,9 +972,7 @@ def patch_GptOssModel():
         # Fully Connected
         residual = hidden_states.clone()
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
-        hidden_states = moe_forward_inference(self.mlp, hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual
     pass
 
     def forward(
@@ -1060,13 +1058,15 @@ def patch_GptOssModel():
                     key_states,
                     value_states,
                 )
-                hidden_states = post_forward(
+                hidden_states, residual = post_forward(
                     decoder_layer,
                     residual,
                     attn_output,
                     logsumexp,
                     input_shape,
                 )
+                hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
+                hidden_states += residual
             pass
         pass
         hidden_states = self.norm(hidden_states)
