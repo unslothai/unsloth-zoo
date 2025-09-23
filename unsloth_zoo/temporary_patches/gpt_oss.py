@@ -539,7 +539,7 @@ fused_torch_compile_options = get_torch_compile_options(
     use_block_ptr = True,
 )
 
-@torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+# @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
 def moe_forward_inference(self, hidden_states):
     """Torch compile for forward inference path only with CUDAGraphs"""
     # Router
@@ -901,7 +901,7 @@ def patch_GptOssModel():
         return attn_output
     pass
 
-    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    # @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def pre_forward(
         self,
         hidden_states: torch.Tensor,
@@ -928,7 +928,7 @@ def patch_GptOssModel():
         return residual, query_states, key_states, value_states, input_shape
     pass
 
-    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    # @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def post_forward(
         self,
         residual: torch.Tensor,
