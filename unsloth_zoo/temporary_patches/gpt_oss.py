@@ -576,7 +576,7 @@ class GptOssMLP(nn.Module):
     def forward(self, hidden_states):
         bsz, qlen, hd = hidden_states.shape
         if qlen == 1 and not self.training:
-            return moe_forward_inference(hidden_states), None
+            return moe_forward_inference(self, hidden_states), None
         router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
         routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
         return routed_out, router_scores
