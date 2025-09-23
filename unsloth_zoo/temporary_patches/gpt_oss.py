@@ -901,7 +901,7 @@ def patch_GptOssModel():
         return attn_output
     pass
 
-    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    # @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def pre_forward(
         self,
         hidden_states: torch.Tensor,
@@ -928,7 +928,7 @@ def patch_GptOssModel():
         return residual, query_states, key_states, value_states, input_shape
     pass
 
-    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    # @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def post_forward(
         self,
         residual: torch.Tensor,
@@ -942,7 +942,7 @@ def patch_GptOssModel():
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, _ = self.mlp(hidden_states)  # diff with llama: router scores
+        hidden_states = moe_forward_inference(self, hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
     pass
