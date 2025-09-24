@@ -453,7 +453,7 @@ def grpo_accumulated_loss(
 
     if not hasattr(trainer, '_autocast_dtype'):
         trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
-        if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = torch.float32
+        if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = None
     pass
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
@@ -475,7 +475,11 @@ def grpo_accumulated_loss(
         completion_input_ids = input_ids[:, -logits_to_keep:]
     
     unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
-    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):  
+    if trainer._autocast_dtype is None:
+        autocaster = nullcontext()
+    else:
+        autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
+    with autocaster:
         if pixel_values is None:
             new_hidden_states = unwrapped_model(
                 input_ids = input_ids,
