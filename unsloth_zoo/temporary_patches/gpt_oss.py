@@ -1065,7 +1065,7 @@ def patch_GptOssModel():
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         try:
-            torch._dynamo.mark_dynamic(hidden_states, 0)
+            torch._dynamo.mark_static (hidden_states, 0)
             torch._dynamo.mark_dynamic(hidden_states, 1)
             torch._dynamo.mark_static (hidden_states, 2)
         except:
