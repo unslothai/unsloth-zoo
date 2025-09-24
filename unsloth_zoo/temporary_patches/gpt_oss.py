@@ -586,11 +586,13 @@ pass
 @torch_compile(dynamic = True, fullgraph = True)
 def moe_router_forward(self, hidden_states):
     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-    router_logits = F.linear(hidden_states, self.weight, self.bias)  # (seq_len, num_experts)
+    router_logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)  # (seq_len, num_experts)
     router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-    router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
+    dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
+    router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
     router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
     return router_scores, router_indices
+pass
 
 # Combo Kernels errors with InductorError: AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
 @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
