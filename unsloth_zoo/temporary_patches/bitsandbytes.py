@@ -68,7 +68,9 @@ def patch_bitsandbytes_linear4bit_forward():
         bias = None if self.bias is None else self.bias.to(self.compute_dtype)
         # ** Errors out in torch.compile
         # weight = self.weight.t() if self.weight.dim() == 2 else self.weight
-        weight = self.weight.t()
+
+        # Cannot do .t() on Params4bit, instead do it on torch.Tensor
+        weight = self.weight.data.t()
 
         return bitsandbytes.matmul_4bit(x, weight, bias=bias, quant_state=self.weight.quant_state).to(inp_dtype)
 
