@@ -937,7 +937,14 @@ def patch_GptOssModel():
         if past_key_values is not None:
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        return query_states, key_states, value_states, input_shape
+        #return query_states, key_states, value_states, input_shape
+        attn_output, logsumexp = flex_attention_with_sink_decoding(
+            self.self_attn,
+            query_states,
+            key_states,
+            value_states,
+        )
+        return attn_output, logsumexp
     pass
     # Do flex_attention_with_sink_decoding with cannot be compiled
     # attn_output, logsumexp = flex_attention_with_sink_decoding(
@@ -978,7 +985,7 @@ def patch_GptOssModel():
     ):
         hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
         # Self Attention
-        query_states, key_states, value_states, input_shape = pre_attention_decoding(
+        attn_output, logsumexp = pre_attention_decoding(
             self=self.self_attn,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -988,7 +995,7 @@ def patch_GptOssModel():
             cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
-        return query_states, key_states, value_states, input_shape
+        return attn_output, logsumexp
     pass
     fused_torch_compile_options = get_torch_compile_options(
         epilogue_fusion = True,
@@ -1094,7 +1101,7 @@ def patch_GptOssModel():
 
             for decoder_layer in self.layers:
                 residual = hidden_states.clone()
-                query_states, key_states, value_states, input_shape = pre_forward(
+                attn_output, logsumexp = pre_forward(
                     decoder_layer,
                     hidden_states,
                     attention_mask=attention_mask,
@@ -1105,12 +1112,12 @@ def patch_GptOssModel():
                     position_embeddings=position_embeddings,
                 )
                 # Graph Break here - need to investigate how we can fix this
-                attn_output, logsumexp = flex_attention_with_sink_decoding(
-                    decoder_layer.self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                )
+                # attn_output, logsumexp = flex_attention_with_sink_decoding(
+                #     decoder_layer.self_attn,
+                #     query_states,
+                #     key_states,
+                #     value_states,
+                # )
                 hidden_states, residual = post_forward(
                     decoder_layer,
                     residual,
