@@ -22,7 +22,7 @@ import torch.nn as nn
 import os
 import math
 
-from .common import TEMPORARY_PATCHES, torch_compile_options
+from .common import TEMPORARY_PATCHES, torch_compile_options, UNSLOTH_ENABLE_LOGGING
 from .utils import patch_function
 
 def patch_convert_moe_packed_tensors():
