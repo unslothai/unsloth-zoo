@@ -918,7 +918,7 @@ def patch_GptOssModel():
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
 
     # Enable larger recompiling cache
-    torch._dynamo.config.recompile_limit = 256
+    torch._dynamo.config.recompile_limit = 64
 
     def pre_attention_decoding(
         self,
