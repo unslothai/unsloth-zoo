@@ -944,7 +944,7 @@ def patch_GptOssModel():
             key_states,
             value_states,
         )
-        return attn_output, logsumexp
+        return attn_output, logsumexp, input_shape
     pass
     # Do flex_attention_with_sink_decoding with cannot be compiled
     # attn_output, logsumexp = flex_attention_with_sink_decoding(
@@ -985,7 +985,7 @@ def patch_GptOssModel():
     ):
         hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
         # Self Attention
-        attn_output, logsumexp = pre_attention_decoding(
+        attn_output, logsumexp, input_shape = pre_attention_decoding(
             self=self.self_attn,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -995,7 +995,7 @@ def patch_GptOssModel():
             cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
-        return attn_output, logsumexp
+        return attn_output, logsumexp, input_shape
     pass
     fused_torch_compile_options = get_torch_compile_options(
         epilogue_fusion = True,
@@ -1101,7 +1101,7 @@ def patch_GptOssModel():
 
             for decoder_layer in self.layers:
                 residual = hidden_states.clone()
-                attn_output, logsumexp = pre_forward(
+                attn_output, logsumexp, input_shape = pre_forward(
                     decoder_layer,
                     hidden_states,
                     attention_mask=attention_mask,
