@@ -224,7 +224,7 @@ def flex_attention_with_sink(
     if block_mask is None:
         block_mask = compiled_create_block_mask(mask_mod, bsz, heads_Q, qlen_Q, qlen_KV, device = key.device)
 
-    attn_output, logsumexp = uncompiled_flex_attention(
+    attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
         query,
         key,
         value,
@@ -267,7 +267,7 @@ def flex_attention_with_sink_decoding(
     enable_gqa = getattr(self_attn, "num_key_value_groups", 1) != 1
     scale = getattr(self_attn, "scaling", None) or getattr(self_attn, "scale", None) or scale
     block_mask = self_attn._flex_attention_cache(key)
-    attn_output, logsumexp = uncompiled_flex_attention(
+    attn_output, logsumexp = flex_attention(
         query,
         key,
         value,
