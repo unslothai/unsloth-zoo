@@ -28,6 +28,7 @@ from .utils import (
     create_block_mask_cached,
     create_block_mask,
     compiled_create_block_mask,
+    _flex_attention as uncompiled_flex_attention,
     flex_attention,
     FlexAttentionCache,
 
@@ -39,7 +40,6 @@ from .utils import (
     generate_sliding_window_mask_with_padding,
     generate_decoding_sliding_window_mask_with_padding,
 )
-from torch.nn.attention.flex_attention import flex_attention as uncompiled_flex_attention
 
 def causal_mask_with_sink(batch, head, q_idx, kv_idx):
     """

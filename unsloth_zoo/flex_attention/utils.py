@@ -17,6 +17,7 @@
 __all__ = [
     "HAS_FLEX_ATTENTION",
     "FLEX_ATTENTION_BLOCK_SIZE",
+    "_flex_attention",
     "flex_attention",
     "create_block_mask_cached",
     "create_block_mask",
@@ -39,10 +40,41 @@ FLEX_ATTENTION_KV_INCREMENT = 512
 
 try:
     from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE as FLEX_ATTENTION_BLOCK_SIZE
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask as _create_block_mask
+    from torch.nn.attention.flex_attention import (
+        flex_attention as _flex_attention,
+        create_block_mask as _create_block_mask,
+    )
     HAS_FLEX_ATTENTION = True
     from torch.nn.attention.flex_attention import _score_mod_signature, _mask_mod_signature
-    flex_attention = torch_compile(flex_attention)
+
+    # Determine kernel_options since low memory GPUs will go out of memory
+    # InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton_tem_fused_0 Required: 65536 Hardware limit:65536 Reducing block sizes or `num_stages` may help.
+    # See https://github.com/pytorch/pytorch/issues/133254#issuecomment-2408710459
+    # https://github.com/pytorch/pytorch/issues/133254#issuecomment-2539969593
+    vram_of_gpu = min(torch.cuda.memory.mem_get_info(i)[-1]/1024/1024/1024 for i in range(torch.cuda.device_count()))
+    kernel_options = None
+    if vram_of_gpu <= 16:
+        kernel_options = {
+            "BLOCK_M": 32,
+            "BLOCK_N": 32,
+            "BLOCK_M1": 32,
+            "BLOCK_N1": 32,
+            "BLOCK_M2": 32,
+            "BLOCK_N2": 32,
+        }
+        _flex_attention = functools.partial(_flex_attention, kernel_options = kernel_options)
+    elif vram_of_gpu <= 24:
+        kernel_options = {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_M1": 32,
+            "BLOCK_N1": 64,
+            "BLOCK_M2": 64,
+            "BLOCK_N2": 32,
+        }
+        _flex_attention = functools.partial(_flex_attention, kernel_options = kernel_options)
+    pass
+    flex_attention = torch_compile(_flex_attention)
 
     @functools.lru_cache
     def create_block_mask_cached(mask_mod, M, N, device = "cuda"):
