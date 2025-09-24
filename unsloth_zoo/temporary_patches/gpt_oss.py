@@ -965,7 +965,7 @@ def patch_GptOssModel():
     pass
 
     # Re-compiling for each new sequence length which is NOT ideal
-    # @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
+    @torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
     def pre_forward(
         self,
         hidden_states: torch.Tensor,
