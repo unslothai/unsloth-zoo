@@ -535,7 +535,7 @@ fused_torch_compile_options = get_torch_compile_options(
     max_autotune = False, # Too slow
     shape_padding = True,
     cudagraphs = True,
-    coordinate_descent_tuning = False, # Very slow!
+    coordinate_descent_tuning = use_combo_kernels, # Very slow!
     combo_kernels = use_combo_kernels,
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
@@ -546,7 +546,7 @@ no_combo_fused_torch_compile_options = get_torch_compile_options(
     max_autotune = False, # Too slow
     shape_padding = True,
     cudagraphs = True,
-    coordinate_descent_tuning = False, # Very slow!
+    coordinate_descent_tuning = use_combo_kernels, # Very slow!
     combo_kernels = False, # Breaks on attention
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
@@ -917,9 +917,6 @@ def patch_GptOssModel():
     )
     flex_attention_with_sink_decoding = torch.compiler.disable(flex_attention_with_sink_decoding, recursive = True)
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
-
-    # Enable larger recompiling cache
-    torch._dynamo.config.recompile_limit = 64
 
     def pre_attention_decoding(
         self,
