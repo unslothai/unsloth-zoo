@@ -24,6 +24,7 @@ from .common import TEMPORARY_PATCHES, torch_compile, get_torch_compile_options,
 from importlib.metadata import version as importlib_version
 from ..utils import Version
 transformers_version = Version(importlib_version("transformers"))
+has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
     patch_function,
     patch_function_past_key_values,
@@ -796,7 +797,7 @@ def patch_GptOssAttention():
 
         # flex_attention_with_sink only works for training since KV cache is wrong
         # switch to flex_attention_with_sink which allows all to work
-        if is_flex_attention_decoding(self, query_states):
+        if is_flex_attention_decoding(self, query_states) and has_static_cache:
             attn_output, logsumexp = flex_attention_with_sink_decoding(
                 self,
                 query_states,
@@ -1002,7 +1003,7 @@ def patch_GptOssModel():
         multi_kernel = False, # Fails on torch 2.10 nightly
         use_block_ptr = True,
     )
-    # @torch.compile(dynamic = True, fullgraph = True, options = fused_torch_compile_options)
+    @torch.compile(dynamic = True, fullgraph = True, options = fused_torch_compile_options)
     def post_forward(
         self,
         residual: torch.Tensor,
@@ -1073,7 +1074,7 @@ def patch_GptOssModel():
             pass
 
         is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
-        if not is_decoding:
+        if not is_decoding or not has_static_cache:
             for decoder_layer in self.layers:
                 hidden_states = decoder_layer(
                     hidden_states,
