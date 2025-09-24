@@ -962,7 +962,7 @@ def patch_GptOssModel():
         variance += self.variance_epsilon
         hidden_states *= torch.rsqrt_(variance)
         hidden_states *= self.weight
-        return (hidden_states).to(input_dtype)
+        return hidden_states.to(input_dtype)
     pass
 
     # Re-compiling for each new sequence length which is NOT ideal
@@ -1011,7 +1011,7 @@ def patch_GptOssModel():
         input_shape,
     ):
         hidden_states = post_attention_decoding(self.self_attn, attn_output, logsumexp, input_shape)
-        hidden_states = residual + hidden_states
+        hidden_states += residual
 
         # Fully Connected
         residual = hidden_states.clone()
