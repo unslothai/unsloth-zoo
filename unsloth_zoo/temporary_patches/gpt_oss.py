@@ -939,7 +939,7 @@ def patch_GptOssModel():
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
         #return query_states, key_states, value_states, input_shape
         attn_output, logsumexp = flex_attention_with_sink_decoding(
-            self.self_attn,
+            self,
             query_states,
             key_states,
             value_states,
