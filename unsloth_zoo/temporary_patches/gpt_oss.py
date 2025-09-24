@@ -591,7 +591,7 @@ def moe_router_forward(self, hidden_states):
     router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
     dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
     router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
-    router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
+    router_scores = torch.zeros_like(router_logits, dtype = dtype).scatter_(1, router_indices, router_top_value)
     return router_scores, router_indices
 pass
 
