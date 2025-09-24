@@ -100,10 +100,10 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
             inductor = logging.WARN,
             graph_breaks = True,
             recompiles = True,
-            recompiles_verbose = True,
+            recompiles_verbose = False, # Produces too much code
             compiled_autograd_verbose = False, # Produces too much code
             aot_joint_graph = False, # Produces too much code
-            aot_graphs = False,  # Produces too much code
+            aot_graphs = False, # Produces too much code
             perf_hints = True, # Performance improvement hints
         )
         torch._dynamo.config.verbose = True
