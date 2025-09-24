@@ -552,7 +552,7 @@ no_combo_fused_torch_compile_options = get_torch_compile_options(
     use_block_ptr = True,
 )
 
-@torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+@torch.compile(dynamic = True, fullgraph = True, options = fused_torch_compile_options)
 def moe_forward_inference(self, hidden_states):
     """Torch compile for forward inference path only with CUDAGraphs"""
     # Router
@@ -595,7 +595,7 @@ def moe_router_forward(self, hidden_states):
 pass
 
 # Combo Kernels errors with InductorError: AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
-@torch.compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
+@torch.compile(dynamic = True, fullgraph = True, options = no_combo_fused_torch_compile_options)
 def moe_forward_inference_bf16(self, hidden_states):
     router_scores, router_indices = moe_router_forward(self.router, hidden_states)
     routing_weights = router_scores
@@ -1002,7 +1002,7 @@ def patch_GptOssModel():
         multi_kernel = False, # Fails on torch 2.10 nightly
         use_block_ptr = True,
     )
-    @torch.compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    @torch.compile(dynamic = True, fullgraph = True, options = fused_torch_compile_options)
     def post_forward(
         self,
         residual: torch.Tensor,
@@ -1062,6 +1062,13 @@ def patch_GptOssModel():
         #     }
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        try:
+            torch._dynamo.mark_dynamic(hidden_states, 0)
+            torch._dynamo.mark_dynamic(hidden_states, 1)
+            torch._dynamo.mark_static (hidden_states, 2)
+        except:
+            pass
 
         is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         if not is_decoding:
