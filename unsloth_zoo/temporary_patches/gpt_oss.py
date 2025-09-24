@@ -538,7 +538,7 @@ fused_torch_compile_options = get_torch_compile_options(
     combo_kernels = use_combo_kernels,
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
-    use_block_ptr = False,
+    use_block_ptr = True,
 )
 no_combo_fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
@@ -549,7 +549,7 @@ no_combo_fused_torch_compile_options = get_torch_compile_options(
     combo_kernels = False, # Breaks on attention
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
-    use_block_ptr = False,
+    use_block_ptr = True,
 )
 
 @torch.compile(dynamic = True, fullgraph = True, options = fused_torch_compile_options)
