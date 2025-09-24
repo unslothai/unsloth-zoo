@@ -291,16 +291,16 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         if extra_kwargs is None:
             extra_kwargs = {}
         def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states, input_ids, mask, advantages, scaling):
-            new_logits = torch.matmul(new_hidden_states, lm_head.t())
+            new_logits = torch.matmul(new_hidden_states.to(lm_head.dtype), lm_head.t())
             new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             with torch.no_grad():
                 if beta != 0.0:
-                    ref_logits = torch.matmul(ref_hidden_states, lm_head.t())
+                    ref_logits = torch.matmul(ref_hidden_states.to(lm_head.dtype), lm_head.t())
                     ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
                 else:
                     ref_logits = None
                 if old_hidden_states is not None:
-                    old_logits = torch.matmul(old_hidden_states, lm_head.t())
+                    old_logits = torch.matmul(old_hidden_states.to(lm_head.dtype), lm_head.t())
                     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
                 else: 
                     old_logits = None
