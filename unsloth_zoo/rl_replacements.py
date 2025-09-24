@@ -453,7 +453,7 @@ def grpo_accumulated_loss(
 
     if not hasattr(trainer, '_autocast_dtype'):
         trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
-        if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = torch.float16
+        if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = torch.float32
     pass
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
@@ -478,14 +478,14 @@ def grpo_accumulated_loss(
     with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):  
         if pixel_values is None:
             new_hidden_states = unwrapped_model(
-                    input_ids = input_ids,
-                    attention_mask = attention_mask,
-                    pixel_values = pixel_values,
-                    image_grid_thw = image_grid_thw,
-                    pixel_attention_mask = pixel_attention_mask,
-                    image_sizes = image_sizes,
-                    #logits_to_keep = logits_to_keep + 1,
-                ).logits
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                pixel_values = pixel_values,
+                image_grid_thw = image_grid_thw,
+                pixel_attention_mask = pixel_attention_mask,
+                image_sizes = image_sizes,
+                # logits_to_keep = logits_to_keep + 1,
+            ).logits
 
             #keep extra logit as we generated a new token
             new_hidden_states = new_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
