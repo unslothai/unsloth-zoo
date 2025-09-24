@@ -399,10 +399,11 @@ def _merge_and_overwrite_lora(
     model_class_name,
     base_model_is_quantized = False,
     quant_type = None,
+    save_method = "merged_16bit"
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
-    if base_model_is_quantized and quant_type == "mxfp4":
+    if base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4":
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("mxfp4 quantized model detected. Using safe rewrite strategy (requires temporary disk space).")
         # Here, we fall back to the complete rewrite logic.
@@ -457,10 +458,21 @@ def _merge_and_overwrite_lora(
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
+                is_save_mxfp4 = base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4"
+                if is_save_mxfp4 and (key.endswith("_blocks") or key.endswith("_scales")):
+                    # In this mode, we don't dequantize or modify MXFP4 tensors.
+                    # Since we're doing an in-place overwrite on the file,
+                    # skipping these keys leaves them untouched in the final model file.
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.info(f"[DEBUG] Preserving MXFP4 tensor: {key}")
+                    continue
+
+
                 output_key = key
                 action_logged = False
                 # Standard 16-bit model
                 W = file.get_tensor(key)
+                W_original_dtype = W.dtype
 
                 if W is None:
                     continue
@@ -474,7 +486,7 @@ def _merge_and_overwrite_lora(
                     count += 1
 
                 # FIXED: Direct tensor writing using torch
-                success = _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, W, output_dtype)
+                success = _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, W, W_original_dtype)
 
                 if not success:
                     raise RuntimeError(f"Failed to write tensor to model file.")
@@ -1045,6 +1057,14 @@ def merge_and_overwrite_lora(
     if save_method == "merged_16bit":
         config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
+    elif save_method == "mxfp4":
+        from transformers import AutoConfig
+        model_config = AutoConfig.from_pretrained(
+                model_name,
+                token = None,
+                trust_remote_code = False,
+            )
+        model_config.save_pretrained(save_directory)
         # Remove the quantization_config in the config.json file if it exists,
     # as we are exporting the model in 16-bit format.
 
@@ -1055,13 +1075,13 @@ def merge_and_overwrite_lora(
     # Step 3: Conditional index handling
     import subprocess
     is_t4 = "Tesla T4" in str(torch.cuda.get_device_name(0))
-    needs_splitting = should_split_shards(is_t4, config, safetensors_list)
+    needs_splitting = should_split_shards(is_t4, config, safetensors_list) if save_method == "merged_16bit" else False
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
     safe_tensor_index_files = ["model.safetensors.index.json"] if len(safetensors_list) > 1 else []
 
     # ONLY download/copy the original index if we are NOT dequantizing an MXFP4 model
-    if not (base_model_is_quantized and quant_type == "mxfp4") and not needs_splitting:
+    if (not (base_model_is_quantized and quant_type == "mxfp4") or (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")) and not needs_splitting:
         if is_local_path:
             os.makedirs(save_directory, exist_ok=True)
             # Copy from local
@@ -1105,7 +1125,7 @@ def merge_and_overwrite_lora(
     final_safetensors_list = []
 
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
-    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
+    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
         file_path = os.path.join(save_directory, filename)
         # Only download if we didn't get everything from cache AND this specific file doesn't exist
         # AND we're in low disk space mode
@@ -1137,7 +1157,7 @@ def merge_and_overwrite_lora(
     if needs_splitting:
         final_safetensors_list = renumber_safetensor_files(final_safetensors_list, save_directory)
 
-    regenerate_index = ((base_model_is_quantized and quant_type == "mxfp4") or needs_splitting) and len(final_safetensors_list) > 1
+    regenerate_index = ((base_model_is_quantized and quant_type == "mxfp4") or needs_splitting) and len(final_safetensors_list) > 1 and save_method != "mxfp4"
     weight_map = {}
 
     for filename in ProgressBar(final_safetensors_list, desc="Unsloth: Merging weights into 16bit"):
@@ -1149,6 +1169,7 @@ def merge_and_overwrite_lora(
             model_class_name = find_lora_base_model(model).__class__.__name__,
             base_model_is_quantized = base_model_is_quantized,
             quant_type = quant_type,
+            save_method = save_method,
         )
         torch.cuda.empty_cache()
 

@@ -52,6 +52,12 @@ import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
 from .temporary_patches.common import get_torch_compile_options
+from .hf_utils import get_transformers_model_type
+
+try:
+    ScriptFunction = torch.jit.torch.jit.ScriptFunction
+except:
+    ScriptFunction = None
 
 # Compiled cache location
 global COMBINED_UNSLOTH_NAME
@@ -132,6 +138,7 @@ _license_header = """
 import os
 import torch
 import importlib.util
+import math
 if importlib.util.find_spec("unsloth_studio") is None:
     UNSLOTH_STUDIO_ENABLED = False
 else:
@@ -215,83 +222,6 @@ _patch_functions = [
     "GroupNorm", "RMSNorm", "LayerNorm",
     # "CrossEntropyLoss",
 ]
-
-
-def get_transformers_model_type(config):
-    """ Gets model_type from config file - can be PEFT or normal HF """
-    if config is None:
-        raise RuntimeError(
-            f"Unsloth: No config file found - are you sure the `model_name` is correct?\n"\
-            f"If you're using a model on your local device, confirm if the folder location exists.\n"\
-            f"If you're using a HuggingFace online model, check if it exists."
-        )
-    model_types = None
-
-    from peft import PeftConfig
-    if issubclass(type(config), PeftConfig):
-        model_type_list = re.finditer(r"transformers\.models\.([^\.]{2,})\.modeling_\1", str(config))
-        model_type_list = list(model_type_list)
-        if len(model_type_list) != 0:
-            # Use transformers.models.gpt_oss.modeling_gpt_oss
-            model_type = model_type_list[0].group(1)
-            model_types = [model_type]
-        elif getattr(config, "auto_mapping", None) is not None:
-            # Use GptOssForCausalLM
-            model_type = config.auto_mapping.get("base_model_class", None)
-            if model_type is not None:
-                model_type = str(model_type)
-                model_type = model_type.rsplit("For", 1)[0].lower()
-                # Find exact name of modeling path
-                import transformers.models
-                supported_model_types = dir(transformers.models)
-                for modeling_file in supported_model_types:
-                    if model_type == modeling_file.lower().replace("_", "").replace(".", "_").replace("-", "_"):
-                        model_types = [modeling_file]
-                        break
-            pass
-        pass
-
-        # Get original base model
-        base_model_name_or_path = getattr(config, "base_model_name_or_path", None)
-        if base_model_name_or_path is None:
-            raise TypeError("Unsloth: adapter_config.json's `base_model_name_or_path` is None?")
-        base_model_name_or_path = str(base_model_name_or_path)
-        # Set model name for patching purposes
-        os.environ["UNSLOTH_MODEL_NAME"] = base_model_name_or_path.lower()
-
-        # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
-        if model_types is None:
-            model_type = os.path.split(base_model_name_or_path)[-1]
-            model_types = [model_type]
-    else:
-        from collections.abc import Mapping, Sequence
-        def find(data, target_key):
-            stack = [data]
-            while stack:
-                obj = stack.pop()
-                if isinstance(obj, Mapping):
-                    # Emit values for matches
-                    if target_key in obj:
-                        yield obj[target_key]
-                    # Keep walking into nested values
-                    stack.extend(obj.values())
-                elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
-                    # Walk sequences (lists/tuples/sets), but not strings/bytes
-                    stack.extend(obj)
-        model_types = list(find(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
-    pass
-    if model_types is None:
-        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
-    # Standardize model_type
-    final_model_types = []
-    for model_type in model_types:
-        model_type = model_type.lower()
-        model_type = model_type.replace("-", "_")
-        model_type = model_type.replace("/", "_")
-        model_type = model_type.replace(".", "_")
-        final_model_types.append(model_type)
-    return sorted(final_model_types)
-pass
 
 
 # Empty causal mask
@@ -410,6 +340,70 @@ def higher_precision_softmax(source):
         full_match, matches = item.group(0), item.groups()
         softmax, variable, dim, dtype = matches
         new = f"{softmax}({variable}, {dim}, dtype = torch.float32).to({variable}.dtype)"
+        source = source.replace(full_match, new)
+    return source
+pass
+
+
+# Convert  torch.mean(X ** 2, dim=-1, keepdim=True) ** 0.5
+# to      (torch.mean(X.to(torch.float32) ** 2, dim=-1, keepdim=True) ** 0.5).to(X.dtype)
+def higher_precision_sqrt_mean(source):
+    """
+    Converts all sqrt(mean(X**2)) to float32
+    torch.mean(hidden_states[0] ** 2, dim=-1, keepdim=True) ** 0.5
+    target_magnitude = torch.mean(hidden_states_0**2, dim=-1, keepdim=True) ** 0.5
+    """
+    sqrt_mean_objects = re.finditer(
+        r"(torch\.mean|torch\.sum)"\
+        r"\("\
+        r"([a-zA-Z0-9\_\[\]]{1,})[ ]{0,}"\
+        r"(\*\*)[ ]{0,}"\
+        r"([\d]{1,})"\
+        r"([^\)]{0,})"\
+        r"\)"\
+        r"[ ]{0,}"\
+        r"(\*\*)[ ]{0,}"\
+        r"([\d\.]{1,})",
+        source,
+    )
+    for item in sqrt_mean_objects:
+        full_match, matches = item.group(0), item.groups()
+        mean, variable, _, power, rest, _, divisor = matches
+        new = f"({mean}((({variable}).to(torch.float32)**{(power)}){rest})**({divisor})).to(({variable}).dtype)"
+        source = source.replace(full_match, new)
+    pass
+
+    """
+    Converts all sqrt(mean(X**2)) on 2 lines to float32
+    new_magnitude = torch.mean(current_hidden_state**2, dim=-1, keepdim=True)
+    new_magnitude = torch.sqrt(torch.maximum(new_magnitude, epsilon_tensor.to(target_magnitude.device)))
+    """
+    sqrt_mean_objects = re.finditer(
+        r"([a-zA-Z0-9\_]{1,})[ ]{0,}\=[ ]{0,}"\
+        r"(torch\.mean|torch\.sum)"\
+        r"\("\
+        r"([a-zA-Z0-9\_\[\]]{1,})[ ]{0,}"\
+        r"(\*\*)[ ]{0,}"\
+        r"([\d]{1,})"\
+        r"([^\)]{0,})"\
+        r"\)"\
+        r"([\n ]{1,})"\
+        r"\1[ ]{0,}\=[ ]{0,}"\
+        r"(torch.sqrt)"\
+        r"\("\
+        r"(.*?)\1"\
+        r"(.*?)\)\n",
+        source,
+    )
+    for item in sqrt_mean_objects:
+        full_match, matches = item.group(0), item.groups()
+        new_variable, mean, variable, _, power, rest, spaces, sqrt, inner, ending = matches
+        if "\n" in ending: continue
+        new = \
+            f"{new_variable} = {mean}(({variable}).to(torch.float32)**{power}{rest})"\
+            f"{spaces}"\
+            f"{new_variable} = {sqrt}({inner}({new_variable}).to(torch.float32)"\
+            f"{ending}.to(({variable}).dtype))\n"
         source = source.replace(full_match, new)
     return source
 pass
@@ -720,7 +714,6 @@ def create_standalone_class(
     pass
 
     source = f"{compile}\n{source}\n"
-
     left = re.match(r"[\s\n]{4,}", leftover).span()[1]
     new_forward = definition + leftover[:left] + \
         f"return {module}_forward({parameters})\n"
@@ -751,6 +744,9 @@ def create_standalone_class(
 
     # Fix all softmax low precisions to float32
     source = higher_precision_softmax(source)
+
+    # Fix all sqrt(mean(X**2)) lower precisions to float32
+    source = higher_precision_sqrt_mean(source)
 
     return source
 pass
@@ -1924,6 +1920,7 @@ DISABLE_COMPILE_MODULES = [
     "GraniteMoeHybridMambaLayer",
     "GptOssMLP",
     "GptOssExperts",
+    "Gemma3nTextModel",
 ]
 
 
@@ -2085,6 +2082,9 @@ def unsloth_compile_transformers(
     torch_modules = list(dict.fromkeys(torch_modules + inherited_modules))
     # Get all functions as well
     functions = [x for x in functions if x not in torch_modules or not compile_torch_modules or not compile_custom_modules]
+
+    # Get all PretrainedModel classes
+    pretrained_modules = re.findall(r"class ([^\s]{1,})\(.+?PreTrainedModel\)", full_source)
 
     # Remove if no forward function
     final_torch_modules = []
@@ -2312,6 +2312,13 @@ def unsloth_compile_transformers(
     pass
     # Add back to functions since failed compiling
     functions += list(bad_torch_modules)
+
+    if len(pretrained_modules) > 0:
+        for module in pretrained_modules:
+            if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+                print(f"Unsloth: Disabling compile for {module} since it's marked for disabling.")
+                disable_modules.add(module)
+            pass
 
     if len(disable_modules) > 0:
         for module in disable_modules:
@@ -2591,7 +2598,19 @@ def unsloth_compile_transformers(
         for module in called_functions:
             function = eval(f"{model_location}.{module}")
 
-            parameters = inspect.signature(function)
+            # This does not always succeed, so need to check:
+            if type(function) is ScriptFunction:
+                # Can't get inspect.signature and most likely scripting will work
+                print(f"Unsloth: Cannot patch {module} since it's a torch.jit.script function.")
+                continue
+            else:
+                try:
+                    parameters = inspect.signature(function)
+                except Exception as e:
+                    print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
+                    continue
+            pass
+
             params = list(parameters.parameters.keys())
             source = inspect.getsource(function)
 
@@ -2627,7 +2646,19 @@ def unsloth_compile_transformers(
         for module in called_functions:
             if module in all_standalone_classes: continue
             function = eval(f"{model_location}.{module}")
-            source = inspect.getsource(function)
+
+            # This does not always succeed, so need to check:
+            if type(function) is ScriptFunction:
+                # Can't get inspect.signature and most likely scripting will work
+                print(f"Unsloth: Cannot patch {module} since it's a torch.jit.script function.")
+                continue
+            else:
+                try:
+                    source = inspect.getsource(function)
+                except Exception as e:
+                    print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
+                    continue
+            pass
 
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
