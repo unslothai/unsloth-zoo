@@ -259,6 +259,8 @@ def flex_attention_with_sink(
     return attn_output
 pass
 
+# Fails sometimes
+# @torch.compile(dynamic = True, fullgraph = False, mode = "reduce-overhead")
 def flex_attention_with_sink_decoding(
     self_attn,
     query,
