@@ -105,7 +105,7 @@ def patch_convert_moe_packed_tensors():
             print("Unsloth: Failed to add convert_moe_packed_tensors_cpu - original function not found.")
     return
 pass
-# TEMPORARY_PATCHES.append(patch_convert_moe_packed_tensors)
+TEMPORARY_PATCHES.append(patch_convert_moe_packed_tensors)
 
 
 def patch_convert_moe_packed_tensors_cpu():
