@@ -267,7 +267,7 @@ def flex_attention_with_sink_decoding(
     enable_gqa = getattr(self_attn, "num_key_value_groups", 1) != 1
     scale = getattr(self_attn, "scaling", None) or getattr(self_attn, "scale", None) or scale
     block_mask = self_attn._flex_attention_cache(key)
-    attn_output, logsumexp = flex_attention(
+    attn_output, logsumexp = uncompiled_flex_attention(
         query,
         key,
         value,
