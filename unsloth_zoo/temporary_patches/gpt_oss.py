@@ -1038,6 +1038,8 @@ def patch_GptOssModel():
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        if not self.training:
+            inputs_embeds.requires_grad_(False)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
