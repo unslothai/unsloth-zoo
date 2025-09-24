@@ -50,6 +50,8 @@ from . import DEVICE_TYPE
 from .temporary_patches.common import get_torch_compile_options
 from .hf_utils import get_transformers_model_type
 from filelock import FileLock
+import atexit
+import glob
 
 try:
     ScriptFunction = torch.jit.torch.jit.ScriptFunction
@@ -2779,6 +2781,21 @@ def unsloth_compile_transformers(
     pass
     return
 pass
+
+
+# Remove lock files on exit to prevent potential cross-platform deadlocks
+def cleanup_lock_files():
+    folder, _ = get_compile_folder()
+    files = glob.glob(os.path.join(folder, "*.lock"))
+    for file in files:
+        try: os.remove(file)
+        except: pass
+    pass
+pass
+
+
+atexit.register(cleanup_lock_files)
+
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
