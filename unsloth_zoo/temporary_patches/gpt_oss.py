@@ -915,7 +915,7 @@ def patch_GptOssModel():
         flex_attention_with_sink_decoding,
         flex_attention_add_sinks,
     )
-    flex_attention_with_sink_decoding = torch.compiler.disable(flex_attention_with_sink_decoding, recursive = True)
+    # flex_attention_with_sink_decoding = torch.compiler.disable(flex_attention_with_sink_decoding, recursive = True)
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
 
     def pre_attention_decoding(
