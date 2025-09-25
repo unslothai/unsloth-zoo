@@ -1037,7 +1037,7 @@ def patch_GptOssModel():
     def inference_forward(
         self,
         hidden_states,
-        _attention_mask,
+        attention_mask,
         position_ids,
         past_key_values,
         use_cache,
@@ -1045,34 +1045,29 @@ def patch_GptOssModel():
         position_embeddings,
         **kwargs,
     ):
-        for decoder_layer in self.layers:
-            attention_mask = _attention_mask[decoder_layer.attention_type]
+        residual = hidden_states.clone()
+        hidden_states = rms_layernorm_forward(decoder_layer.input_layernorm, hidden_states)
+        # Self Attention
+        hidden_states, _ = decoder_layer.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states += residual
 
-            residual = hidden_states.clone()
-            hidden_states = rms_layernorm_forward(decoder_layer.input_layernorm, hidden_states)
-            # Self Attention
-            hidden_states, _ = decoder_layer.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-            hidden_states += residual
-
-            # Fully Connected
-            residual = hidden_states.clone()
-            hidden_states = rms_layernorm_forward(decoder_layer.post_attention_layernorm, hidden_states)
-            if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
-                hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
-            else:
-                hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
-            hidden_states += residual
-        pass
-        hidden_states = rms_layernorm_forward(self.norm, hidden_states)
+        # Fully Connected
+        residual = hidden_states.clone()
+        hidden_states = rms_layernorm_forward(decoder_layer.post_attention_layernorm, hidden_states)
+        if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
+            hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
+        else:
+            hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
+        hidden_states += residual
         return hidden_states
     pass
 
@@ -1133,17 +1128,20 @@ def patch_GptOssModel():
         if True:# not is_decoding or not has_static_cache:
             bsz, qlen, hd = hidden_states.shape
             if not self.training and qlen == 1 and isinstance(attention_mask, dict):
-                hidden_states = inference_forward(
-                    self,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                    **kwargs,
-                )
+                for decoder_layer in self.layers:
+                    hidden_states = inference_forward(
+                        decoder_layer,
+                        hidden_states,
+                        attention_mask[decoder_layer.attention_type],
+                        position_ids,
+                        past_key_values,
+                        use_cache,
+                        cache_position,
+                        position_embeddings,
+                        **kwargs,
+                    )
+                pass
+                hidden_states = rms_layernorm_forward(self.norm, hidden_states)
             else:
                 for decoder_layer in self.layers:
                     mask = attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask
