@@ -1214,6 +1214,8 @@ def patch_GptOssModel():
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         pass
+        # Fix float16 / float32 mismatching
+        hidden_states = hidden_states.to(inputs_embeds.dtype)
         return process_return(MoeModelOutputWithPast, {
             "last_hidden_state" : hidden_states,
             "past_key_values" : past_key_values,
