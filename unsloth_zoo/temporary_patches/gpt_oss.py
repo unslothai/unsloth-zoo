@@ -1123,6 +1123,9 @@ def patch_GptOssModel():
         if True:# not is_decoding or not has_static_cache:
             bsz, qlen, hd = hidden_states.shape
             if not self.training and qlen == 1 and isinstance(attention_mask, dict):
+                # Add hack since residuals need to clone outside of the torch.compile region??
+                # This forces it to free past residuals
+                torch.compiler.cudagraph_mark_step_begin()
                 for decoder_layer in self.layers:
                     hidden_states, residual = inference_forward(
                         decoder_layer,
