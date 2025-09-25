@@ -249,13 +249,13 @@ def flex_attention_with_sink(
     # sink_scale = torch.exp(logsumexp - logsumexp_new)
 
     ### Version 3: Most simple uses sigmoid and scale
-    sink_scale = torch.sigmoid(logsumexp.to(torch.float32) - self_attn.sinks.to(torch.float32).unsqueeze(1))
+    sink_scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
 
     # All 3 versions scale the original attn_output!
-    attn_output = attn_output.to(torch.float32) * sink_scale.unsqueeze(-1)
+    attn_output = attn_output * sink_scale.unsqueeze(-1).to(attn_output.dtype)
     # To reduce error, one should do attn_output.to(torch.float32)
 
-    attn_output = attn_output.to(query.dtype).transpose(1, 2).contiguous()
+    attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output
 pass
 
@@ -290,12 +290,9 @@ def flex_attention_add_sinks(
     attn_output,
     logsumexp,
 ):
-    old_dtype = attn_output.dtype
-    logsumexp = logsumexp.to(torch.float32)
-    logsumexp -= self_attn.sinks.to(torch.float32).unsqueeze(1)
+    logsumexp -= self_attn.sinks.unsqueeze(1)
     sink_scale = torch.sigmoid(logsumexp, out = logsumexp)
-    attn_output = attn_output.to(torch.float32)
-    attn_output *= sink_scale.unsqueeze(-1)
+    attn_output *= sink_scale.unsqueeze(-1).to(attn_output.dtype)
     attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output.to(old_dtype)
+    return attn_output
 pass
