@@ -196,8 +196,8 @@ def flex_attention_with_sink(
                 assert attention_mask is not None
                 assert attention_mask.dim() == 2, f"Unsloth: Attention_mask has dim = {attention_mask.dim()}"
                 # We must account for left padding
-                padding_start_idx = attention_mask.argmax(1)
-                do_padding = torch.arange(max(qlen_Q, qlen_KV), device = "cuda").repeat((bsz, 1)) < padding_start_idx.unsqueeze(0).T
+                padding_start_idx = attention_mask.argmax(1).to(query.device)
+                do_padding = torch.arange(max(qlen_Q, qlen_KV), device = query.device).repeat((bsz, 1)) < padding_start_idx.unsqueeze(0).T
                 # We also make all padded tokens Q=1, K=-inf
                 # Note if Q=0, K=0, Q*K = 0, but exp(0) = 1, so that's wrong
                 # Only exp(-inf) = 0. So Q=1, K=-inf, Q*K = -inf
