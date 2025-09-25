@@ -901,7 +901,7 @@ def patch_GptOssModel():
     # Disable mask creations since we don't need them for GPT-OSS
     import transformers.masking_utils
     import transformers.generation.utils
-    def wrap(f)
+    def wrap(f):
         def return_attention_mask(*args, **kwargs):
             if kwargs["input_embeds"].requires_grad:
                 if "attention_mask" in kwargs:
