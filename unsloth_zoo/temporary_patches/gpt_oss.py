@@ -902,7 +902,8 @@ def patch_GptOssModel():
     import transformers.masking_utils
     import transformers.generation.utils
     def return_attention_mask(*args, **kwargs):
-        print(args, kwargs)
+        if "input_embeds" in kwargs:
+            print(kwargs["input_embeds"].shape, kwargs["input_embeds"].requires_grad)
         if "attention_mask" in kwargs:
             return kwargs["attention_mask"]
         for arg in args:
