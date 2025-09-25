@@ -83,7 +83,10 @@ def is_main_process():
     if torch_distributed_is_initialized():
         # torch.distributed.init_process_group was run, so get_rank works
         return torch_distributed_get_rank() == 0
-    return os.environ.get("RANK", "0") == "0"
+    elif torch_distributed_is_torchelastic_launched():
+        # accelerate launch for example calls init_process_group later
+        return os.environ.get("RANK", "0") == "0"
+    return True
 pass
 
 def is_distributed():
