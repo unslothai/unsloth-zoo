@@ -1088,10 +1088,10 @@ def patch_GptOssModel():
         is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         if True:# not is_decoding or not has_static_cache:
             for decoder_layer in self.layers:
+                mask = attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask
                 hidden_states = decoder_layer(
                     hidden_states,
-                    # attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                    attention_mask=attention_mask,
+                    attention_mask=mask,
                     position_ids=position_ids,
                     past_key_values=past_key_values,
                     use_cache=use_cache,
