@@ -22,6 +22,7 @@ __all__ = [
     "get_torch_compile_options",
     "logger",
     "torch_compile",
+    "_torch_compile",
 ]
 
 import os
@@ -136,6 +137,11 @@ torch_compile_options = get_torch_compile_options(
 torch_compile = functools.partial(
     torch.compile,
     options = torch_compile_options,
+    disable = UNSLOTH_COMPILE_DISABLE,
+)
+
+_torch_compile = functools.partial(
+    torch.compile,
     disable = UNSLOTH_COMPILE_DISABLE,
 )
 

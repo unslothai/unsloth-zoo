@@ -35,7 +35,7 @@ __all__ = [
 
 import torch
 import functools
-from ..temporary_patches.common import torch_compile
+from ..temporary_patches.common import torch_compile, _torch_compile
 FLEX_ATTENTION_KV_INCREMENT = 512
 
 try:
@@ -74,7 +74,7 @@ try:
         }
         _flex_attention = functools.partial(_flex_attention, kernel_options = kernel_options)
     pass
-    flex_attention = torch_compile(_flex_attention)
+    flex_attention = _torch_compile(_flex_attention)
 
     @functools.lru_cache
     def create_block_mask_cached(mask_mod, M, N, device = "cuda"):
@@ -86,12 +86,12 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _create_block_mask(mask_mod, bsz, head, M, N, device = device)
 
-    @torch.compile
+    @_torch_compile(dynamic = True)
     def compiled_create_block_mask_cached(mask_mod, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _create_block_mask(mask_mod, None, None, M, N, device = device)
 
-    @torch.compile
+    @_torch_compile(dynamic = True)
     def compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _create_block_mask(mask_mod, bsz, head, M, N, device = device)
