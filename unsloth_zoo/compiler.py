@@ -14,7 +14,6 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# All Unsloth Zoo code licensed under LGPLv3
 __all__ = [
     "UNSLOTH_COMPILE_LOCATION",
     "get_transformers_model_type",
@@ -30,6 +29,9 @@ import importlib.util
 import numpy as np
 import os
 import torch
+import subprocess
+import types
+import time
 import logging
 import tempfile
 import sys
@@ -50,8 +52,6 @@ from . import DEVICE_TYPE
 from .temporary_patches.common import get_torch_compile_options
 from .hf_utils import get_transformers_model_type
 from filelock import FileLock
-import atexit
-import glob
 
 try:
     ScriptFunction = torch.jit.torch.jit.ScriptFunction
@@ -287,8 +287,7 @@ def _get_compile_folder(use_tempfile = False):
             os.makedirs(location, exist_ok = True)
     else:
         location = UNSLOTH_COMPILE_LOCATION
-        if os.path.exists(location): 
-            return location, UNSLOTH_COMPILE_USE_TEMP
+        if os.path.exists(location): return location, UNSLOTH_COMPILE_USE_TEMP
         try:
             # Try creating the directory
             os.makedirs(location, exist_ok = True)
@@ -305,6 +304,7 @@ pass
 
 def get_compile_folder(use_tempfile = False):
     lock_file = os.path.join(tempfile.gettempdir(), f"{UNSLOTH_COMPILE_LOCATION}.lock")
+    # Ensure atomic dir creation for multi-GPU
     with FileLock(lock_file):
         location, UNSLOTH_COMPILE_USE_TEMP = _get_compile_folder(use_tempfile)
     return location, UNSLOTH_COMPILE_USE_TEMP
@@ -470,6 +470,7 @@ def create_new_function(
     overwrite = True,
     add_torch_compile = False,
 ):
+    # All Unsloth Zoo code licensed under LGPLv3
     # Fix all softmax low precisions to float32
     new_source = higher_precision_softmax(new_source)
 
@@ -517,58 +518,54 @@ def create_new_function(
     try: trl_version = importlib_version("trl")
     except: trl_version = "0"
 
-    versions = '"""\n' + \
+    versioning = '"""\n' + \
         f'{unsloth_zoo_version}\n'\
         f'{unsloth_version}\n'\
         f'{transformers_version}\n'\
         f'{trl_version}\n__UNSLOTH_VERSIONING__\n' + '"""\n'
 
-    new_source = versions + new_source
+    write_new_source = versioning + new_source
 
     # Write function
     global UNSLOTH_COMPILE_USE_TEMP
     file_source = None
-    compile_dir, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = False)
-    function_file = os.path.join(compile_dir, f"{name}.py")
+    compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = False)
+    function_location = os.path.join(compile_folder, f"{name}.py")
 
-    # Check if file was already created!
-    lock_file = function_file + ".lock"
-
-    with FileLock(lock_file):
-        if not overwrite and os.path.isfile(function_file):
+    # Ensure atomic writes for multi-GPU
+    with FileLock(f"{function_location}.lock"):
+        # Check if file was already created!
+        if not overwrite and os.path.isfile(function_location):
             # Check if exactly equivalent
-            with open(function_file, "r", encoding = "utf-8") as f:
+            with open(function_location, "r", encoding = "utf-8") as f:
                 file_source = f.read()
-
-            if file_source != new_source:
-                overwrite = True
+            if file_source != write_new_source:
+                    overwrite = True
             elif not overwrite:
                 if "__UNSLOTH_VERSIONING__" not in file_source:
                     overwrite = True
                 else:
-                    existing_versions = file_source[:file_source.find('__UNSLOTH_VERSIONING__')]
-                    if versions[:versions.find('__UNSLOTH_VERSIONING__')] != existing_versions:
+                    versions = file_source[:file_source.find('__UNSLOTH_VERSIONING__')]
+                    if versioning[:versioning.find('__UNSLOTH_VERSIONING__')] != versions:
                         overwrite = True
         pass
         if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
             overwrite = False
 
         # Check location
-        if overwrite or not os.path.isfile(function_file):
+        if overwrite or not os.path.isfile(function_location):
             try:
-                # Replace dist_write_file with normal file write
-                with open(function_file, "w", encoding="utf-8") as f:
-                    f.write(new_source)
+                with open(function_location, "w", encoding="utf-8") as f:
+                    f.write(write_new_source)
             except Exception as error:
                 if UNSLOTH_COMPILE_USE_TEMP:
                     raise RuntimeError(error)
                 else:
                     # Failed so instead use a temporary directory
-                    compile_dir, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = True)
-                    function_file = os.path.join(compile_dir, f"{name}.py")
-                    # Use normal file write here too
-                    with open(function_file, "w", encoding="utf-8") as f:
-                        f.write(new_source)
+                    compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = True)
+                    function_location = os.path.join(compile_folder, f"{name}.py")
+                    with open(function_location, "w", encoding="utf-8") as f:
+                        f.write(write_new_source)
                 pass
             pass
         pass
@@ -577,34 +574,33 @@ def create_new_function(
         old_path = None
         new_module = None
 
-        def import_module(compile_dir, name):
+        def import_module(compile_folder, name):
             # Add directory to sys.path temporarily if it's not already there
-            if compile_dir not in sys.path:
+            if compile_folder not in sys.path:
                 old_path = list(sys.path)
                 # Fail if name already exists!
                 if name in old_path:
                     raise OSError(f"Unsloth: File {name} already exists")
-                sys.path.insert(0, compile_dir)
+                sys.path.insert(0, compile_folder)
             # Try standard import
             new_module = importlib.import_module(name)
             return new_module, old_path
         pass
 
         try:
-            new_module, old_path = import_module(compile_dir, name)
+            new_module, old_path = import_module(compile_folder, name)
         except Exception as e:
             new_module = None
             # Try using temp directory instead!
             if not UNSLOTH_COMPILE_USE_TEMP:
-                compile_dir, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = True)
-                function_file = os.path.join(compile_dir, f"{name}.py")
-                # dist_write_file(function_location, new_source)
-                with open(function_file, "w", encoding="utf-8") as f:
-                    f.write(new_source)
+                compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = True)
+                function_location = os.path.join(compile_folder, f"{name}.py")
+                with open(function_location, "w", encoding="utf-8") as f:
+                    f.write(write_new_source)
                 if is_main_process():
                     logger.info(f"Standard import failed for {name}: {e}. Using tempfile instead!")
                 try:
-                    new_module, old_path = import_module(compile_dir, name)
+                    new_module, old_path = import_module(compile_folder, name)
                 except Exception as e:
                     new_module = None
                     if is_main_process():
@@ -614,7 +610,7 @@ def create_new_function(
             if new_module is None:
                 try:
                     module_name = f"unsloth_cache_{name}"
-                    file_location = os.path.join(compile_dir, name) + ".py"
+                    file_location = os.path.join(compile_folder, name) + ".py"
                     spec = importlib.util.spec_from_file_location(module_name, file_location)
                     new_module = importlib.util.module_from_spec(spec)
                     sys.modules[module_name] = new_module
@@ -2781,21 +2777,6 @@ def unsloth_compile_transformers(
     pass
     return
 pass
-
-
-# Remove lock files on exit to prevent potential cross-platform deadlocks
-def cleanup_lock_files():
-    folder, _ = get_compile_folder()
-    files = glob.glob(os.path.join(folder, "*.lock"))
-    for file in files:
-        try: os.remove(file)
-        except: pass
-    pass
-pass
-
-
-atexit.register(cleanup_lock_files)
-
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
