@@ -1009,8 +1009,8 @@ def patch_GptOssModel():
         max_autotune = False, # Too slow
         shape_padding = True,
         cudagraphs = True,
-        coordinate_descent_tuning = True,
-        combo_kernels = False,
+        coordinate_descent_tuning = False,
+        combo_kernels = True,
         memory_planning = True,
         multi_kernel = False, # Fails on torch 2.10 nightly
         use_block_ptr = True,
