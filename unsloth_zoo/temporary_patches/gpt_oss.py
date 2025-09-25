@@ -1059,7 +1059,7 @@ def patch_GptOssModel():
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states += residual
+        hidden_states += residual.to(hidden_states.device)
 
         # Fully Connected
         residual = hidden_states.clone()
