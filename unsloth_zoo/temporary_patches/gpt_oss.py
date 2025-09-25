@@ -1121,7 +1121,7 @@ def patch_GptOssModel():
             pass
 
         # It may already have been prepared by e.g. `generate`
-        if not self.training and not isinstance(causal_mask_mapping := attention_mask, dict):
+        if not self.training and not isinstance(attention_mask, dict):
             mask_kwargs = {
                 "config": self.config,
                 "input_embeds": inputs_embeds,
@@ -1129,7 +1129,7 @@ def patch_GptOssModel():
                 "cache_position": cache_position,
                 "past_key_values": past_key_values,
             }
-            causal_mask_mapping = {
+            attention_mask = {
                 "full_attention": create_causal_mask(**mask_kwargs),
                 "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
             }
