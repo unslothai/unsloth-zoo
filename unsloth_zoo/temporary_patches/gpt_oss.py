@@ -1014,6 +1014,7 @@ def patch_GptOssModel():
         memory_planning = True,
         multi_kernel = False, # Fails on torch 2.10 nightly
         use_block_ptr = True,
+        logging = UNSLOTH_ENABLE_LOGGING,
     )
     @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def post_forward(
@@ -1032,7 +1033,7 @@ def patch_GptOssModel():
         return hidden_states, residual
     pass
 
-    @torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def inference_forward(
         self,
         hidden_states,
