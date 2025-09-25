@@ -971,11 +971,9 @@ def patch_GptOssModel():
     def rms_layernorm_forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.square().mean(-1, keepdim=True)
-        variance += self.variance_epsilon
-        hidden_states *= torch.rsqrt_(variance)
-        hidden_states *= self.weight
-        return hidden_states.to(input_dtype)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight * hidden_states).to(input_dtype)  # main diff with Llama
     pass
 
     # Re-compiling for each new sequence length which is NOT ideal
@@ -1048,7 +1046,7 @@ def patch_GptOssModel():
         for decoder_layer in self.layers:
             attention_mask = _attention_mask[decoder_layer.attention_type]
 
-            residual = hidden_states
+            residual = hidden_states.clone()
             hidden_states = rms_layernorm_forward(decoder_layer.input_layernorm, hidden_states)
             # Self Attention
             hidden_states, _ = decoder_layer.self_attn(
@@ -1061,16 +1059,16 @@ def patch_GptOssModel():
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-            hidden_states = residual + hidden_states
+            hidden_states += residual
 
             # Fully Connected
-            residual = hidden_states
+            residual = hidden_states.clone()
             hidden_states = rms_layernorm_forward(decoder_layer.post_attention_layernorm, hidden_states)
             if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
                 hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
             else:
                 hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
-            hidden_states = residual + hidden_states
+            hidden_states += residual
         pass
         hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         return hidden_states
