@@ -1222,6 +1222,7 @@ def patch_GptOssModel():
         })
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
 pass
+# Otherwise gibberish
 if Version(torch.__version__) >= Version("2.9.0"):
     TEMPORARY_PATCHES.append(patch_GptOssModel)
 
