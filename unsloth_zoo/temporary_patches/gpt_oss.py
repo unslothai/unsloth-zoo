@@ -1049,7 +1049,7 @@ def patch_GptOssModel():
             attention_mask = _attention_mask[decoder_layer.attention_type]
 
             residual = hidden_states
-            hidden_states = rms_layernorm_forward(decoder_layer.input_layernorm, hidden_states)
+            hidden_states = decoder_layer.input_layernorm(hidden_states)
             # Self Attention
             hidden_states, _ = decoder_layer.self_attn(
                 hidden_states=hidden_states,
@@ -1065,14 +1065,14 @@ def patch_GptOssModel():
 
             # Fully Connected
             residual = hidden_states
-            hidden_states = rms_layernorm_forward(decoder_layer.post_attention_layernorm, hidden_states)
+            hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
             if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
                 hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
             else:
                 hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
             hidden_states = residual + hidden_states
         pass
-        hidden_states = rms_layernorm_forward(self.norm, hidden_states)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
     pass
 
