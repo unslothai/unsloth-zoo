@@ -134,16 +134,22 @@ torch_compile_options = get_torch_compile_options(
     use_block_ptr = False,
 )
 
-torch_compile = functools.partial(
-    torch.compile,
-    options = torch_compile_options,
-    disable = UNSLOTH_COMPILE_DISABLE,
-)
+if UNSLOTH_COMPILE_DISABLE:
+    _torch_compile = torch.compiler.disable
+else:
+    torch_compile = functools.partial(
+        torch.compile,
+        options = torch_compile_options,
+        disable = UNSLOTH_COMPILE_DISABLE,
+    )
 
-_torch_compile = functools.partial(
-    torch.compile,
-    disable = UNSLOTH_COMPILE_DISABLE,
-)
+if UNSLOTH_COMPILE_DISABLE:
+    _torch_compile = torch.compiler.disable
+else:
+    _torch_compile = functools.partial(
+        torch.compile,
+        disable = UNSLOTH_COMPILE_DISABLE,
+    )
 
 global TEMPORARY_PATCHES
 TEMPORARY_PATCHES = []
