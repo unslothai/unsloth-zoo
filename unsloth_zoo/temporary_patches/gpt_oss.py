@@ -1063,12 +1063,7 @@ def patch_GptOssModel():
         # Fully Connected
         residual = hidden_states.clone()
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
-        if hasattr(self.mlp.experts, "gate_up_projs"):
-            hidden_states = moe_forward_inference(self.mlp, hidden_states)
-        else:
-            hidden_states = moe_forward_inference_bf16(self.mlp, hidden_states)
-        hidden_states += residual
-        return hidden_states
+        return hidden_states, residual
     pass
 
     def forward(
@@ -1129,7 +1124,7 @@ def patch_GptOssModel():
             bsz, qlen, hd = hidden_states.shape
             if not self.training and qlen == 1 and isinstance(attention_mask, dict):
                 for decoder_layer in self.layers:
-                    hidden_states = inference_forward(
+                    hidden_states, residual = inference_forward(
                         decoder_layer,
                         hidden_states,
                         attention_mask[decoder_layer.attention_type],
@@ -1140,6 +1135,11 @@ def patch_GptOssModel():
                         position_embeddings,
                         **kwargs,
                     )
+                    if hasattr(self.mlp.experts, "gate_up_projs"):
+                        hidden_states = moe_forward_inference(self.mlp, hidden_states)
+                    else:
+                        hidden_states = moe_forward_inference_bf16(self.mlp, hidden_states)
+                    hidden_states += residual
                 pass
                 hidden_states = rms_layernorm_forward(self.norm, hidden_states)
             else:
