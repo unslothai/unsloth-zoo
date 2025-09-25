@@ -1151,6 +1151,7 @@ def patch_GptOssModel():
             else:
                 for decoder_layer in self.layers:
                     mask = attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask
+                    print(mask)
                     hidden_states = decoder_layer(
                         hidden_states,
                         attention_mask=mask,
