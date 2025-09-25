@@ -1035,7 +1035,6 @@ def patch_GptOssModel():
         return hidden_states, residual
     pass
 
-    @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def inference_forward(
         self,
         hidden_states,
@@ -1067,6 +1066,8 @@ def patch_GptOssModel():
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         return hidden_states, residual
     pass
+    if has_static_cache and Version(torch.__version__) >= Version("2.8.0"):
+        inference_forward = _torch_compile(inference_forward, dynamic = None, fullgraph = True, options = fused_torch_compile_options)
 
     def forward(
         self,
