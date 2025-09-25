@@ -1118,7 +1118,7 @@ def patch_GptOssModel():
         if True:# not is_decoding or not has_static_cache:
             bsz, qlen, hd = hidden_states.shape
             if not self.training and qlen == 1 and isinstance(attention_mask, dict):
-                return inference_forward(
+                hidden_states = inference_forward(
                     self,
                     hidden_states,
                     attention_mask,
