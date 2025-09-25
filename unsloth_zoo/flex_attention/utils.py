@@ -86,12 +86,14 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _create_block_mask(mask_mod, bsz, head, M, N, device = device)
 
+    @functools.lru_cache
     def compiled_create_block_mask_cached(mask_mod, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         # See https://github.com/meta-pytorch/attention-gym/issues/15#issuecomment-2284148665
         # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
         return _create_block_mask(mask_mod, None, None, M, N, device = device, _compile = True)
 
+    @functools.lru_cache
     def compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
@@ -181,6 +183,7 @@ try:
         sliding_window.__name__ = sliding_window.__doc__ = f"sliding_window_{window_size}"
         return sliding_window
 
+    @functools.lru_cache(16)
     def generate_sliding_window_mask_with_padding(window_size: int, padding_start_idx = None):
         assert padding_start_idx is not None and type(padding_start_idx) is torch.Tensor
         assert padding_start_idx.dim() == 1
@@ -194,6 +197,7 @@ try:
         sliding_window.__name__ = sliding_window.__doc__ = f"sliding_window_with_left_padding_{window_size}"
         return sliding_window
 
+    @functools.lru_cache(16)
     def generate_decoding_sliding_window_mask_with_padding(window_size: int, padding_start_idx = None):
         """
         We cannot use padding_start_idx[batch_idx] for SWA decoding since

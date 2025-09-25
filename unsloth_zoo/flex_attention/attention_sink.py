@@ -150,6 +150,8 @@ def is_flex_attention_decoding(self_attn, query):
 pass
 
 
+global padding_start_idx_globals
+padding_start_idx_globals = [None for _ in range(torch.cuda.device_count())]
 def flex_attention_with_sink(
     self_attn,
     query,
@@ -182,7 +184,8 @@ def flex_attention_with_sink(
     mask_mod = None
     block_mask = None
     has_flex_cache = hasattr(self_attn, "_flex_attention_cache")
-
+    has_flex_cache = False
+    is_training = True
     # Handle inference and training
     if has_static_cache:
         if is_training or (
@@ -197,23 +200,34 @@ def flex_attention_with_sink(
                 assert attention_mask.dim() == 2, f"Unsloth: Attention_mask has dim = {attention_mask.dim()}"
                 # We must account for left padding
                 padding_start_idx = attention_mask.argmax(1).to(query.device)
-                do_padding = torch.arange(max(qlen_Q, qlen_KV), device = query.device).repeat((bsz, 1)) < padding_start_idx.unsqueeze(0).T
+                device_index = query.device.index
+                global padding_start_idx_globals
+                cached_padding_start_idx = padding_start_idx_globals[device_index]
+                if cached_padding_start_idx is not None:
+                    if cached_padding_start_idx.shape != padding_start_idx.shape:
+                        padding_start_idx_globals[device_index] = padding_start_idx
+                        cached_padding_start_idx = padding_start_idx
+                else:
+                    padding_start_idx_globals[device_index] = padding_start_idx
+                    cached_padding_start_idx = padding_start_idx
+                cached_padding_start_idx.copy_(padding_start_idx)
+                # do_padding = torch.arange(max(qlen_Q, qlen_KV), device = query.device).repeat((bsz, 1)) < padding_start_idx.unsqueeze(0).T
                 # We also make all padded tokens Q=1, K=-inf
                 # Note if Q=0, K=0, Q*K = 0, but exp(0) = 1, so that's wrong
                 # Only exp(-inf) = 0. So Q=1, K=-inf, Q*K = -inf
-                query.transpose(2, 1)[do_padding[:, :qlen_Q ]] = 1
-                key  .transpose(2, 1)[do_padding[:, :qlen_KV]] = -torch.inf
-                value.transpose(2, 1)[do_padding[:, :qlen_KV]] = 0
+                # query.transpose(2, 1)[do_padding[:, :qlen_Q ]] = 1
+                # key  .transpose(2, 1)[do_padding[:, :qlen_KV]] = -torch.inf
+                # value.transpose(2, 1)[do_padding[:, :qlen_KV]] = 0
                 # Use special padded mask creators
                 mask_mod = prefill_mask_mod = \
-                    generate_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
+                    generate_sliding_window_mask_with_padding(sliding_window, cached_padding_start_idx) \
                     if type(sliding_window) is int and sliding_window != 0 else \
-                    generate_causal_mask_with_padding(padding_start_idx)
-                decoding_mask_mod = \
-                    generate_decoding_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
-                    if type(sliding_window) is int and sliding_window != 0 else \
-                    generate_decoding_causal_mask_with_padding(padding_start_idx)
-                self_attn._flex_attention_cache = FlexAttentionCache(key, decoding_mask_mod, sliding_window)
+                    generate_causal_mask_with_padding(cached_padding_start_idx)
+                # decoding_mask_mod = \
+                #     generate_decoding_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
+                #     if type(sliding_window) is int and sliding_window != 0 else \
+                #     generate_decoding_causal_mask_with_padding(padding_start_idx)
+                # self_attn._flex_attention_cache = FlexAttentionCache(key, decoding_mask_mod, sliding_window)
         else:
             block_mask = self_attn._flex_attention_cache(key)
         pass
