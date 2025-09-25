@@ -1205,7 +1205,7 @@ def patch_GptOssModel():
                     hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
                 else:
                     hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
-                hidden_states += residual
+                hidden_states += residual.to(hidden_states.device)
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         pass
