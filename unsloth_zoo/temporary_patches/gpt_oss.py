@@ -559,7 +559,7 @@ no_combo_fused_torch_compile_options = get_torch_compile_options(
     use_block_ptr = True,
 )
 
-# @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+@_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
 def moe_forward_inference(self, hidden_states):
     """Torch compile for forward inference path only with CUDAGraphs"""
     # Router
@@ -602,7 +602,7 @@ def moe_router_forward(self, hidden_states):
 pass
 
 # Combo Kernels errors with InductorError: AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
-# @_torch_compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
+@_torch_compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
 def moe_forward_inference_bf16(self, hidden_states):
     router_scores, router_indices = moe_router_forward(self.router, hidden_states)
     routing_weights = router_scores
