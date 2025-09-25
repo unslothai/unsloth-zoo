@@ -1082,7 +1082,7 @@ def patch_GptOssModel():
                 hidden_states = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                    attention_mask=attention_mask,
+                    # attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_values=past_key_values,
                     use_cache=use_cache,
