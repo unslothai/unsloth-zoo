@@ -898,7 +898,7 @@ def patch_GptOssModel():
         raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
         DynamicCache = lambda *args, **kwargs: None
 
-    torch._dynamo.config.cache_size_limit = 128
+    torch._dynamo.config.cache_size_limit = 256
 
     # Disable mask creations since we don't need them for GPT-OSS
     import transformers.masking_utils
@@ -1222,7 +1222,8 @@ def patch_GptOssModel():
         })
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
 pass
-TEMPORARY_PATCHES.append(patch_GptOssModel)
+if Version(torch.__version__) >= Version("2.9.0"):
+    TEMPORARY_PATCHES.append(patch_GptOssModel)
 
 try:
     from openai_harmony import (
