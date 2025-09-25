@@ -1033,7 +1033,7 @@ def patch_GptOssModel():
         return hidden_states, residual
     pass
 
-    @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    # @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
     def inference_forward(
         self,
         hidden_states,
