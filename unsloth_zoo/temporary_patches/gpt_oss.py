@@ -780,7 +780,7 @@ def patch_GptOssAttention():
     pass
 
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
-    # eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
+    eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
     def forward_function(
         self,
         hidden_states: torch.Tensor,
@@ -1078,7 +1078,7 @@ def patch_GptOssModel():
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         return hidden_states, residual
     pass
-    if has_static_cache and Version(torch.__version__) >= Version("2.8.0"):
+    if has_static_cache and Version(torch.__version__) >= Version("2.9.0"):
         inference_forward = _torch_compile(inference_forward, dynamic = None, fullgraph = True, options = fused_torch_compile_options)
 
     def forward(
