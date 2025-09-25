@@ -976,7 +976,7 @@ def patch_GptOssModel():
         variance = hidden_states.square().mean(-1, keepdim=True)
         variance += self.variance_epsilon
         hidden_states *= torch.rsqrt_(variance)
-        hidden_states *= self.weight.to(torch.float32)
+        hidden_states *= self.weight.to(hidden_states.device).to(torch.float32)
         return hidden_states.to(input_dtype)  # main diff with Llama
     pass
 
