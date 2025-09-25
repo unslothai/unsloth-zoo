@@ -917,9 +917,21 @@ def patch_GptOssModel():
             pass
         return return_attention_mask
     pass
+    create_causal_mask = getattr(
+        transformers.masking_utils,
+        "_old_create_causal_mask",
+        "create_causal_mask",
+    )
+    create_sliding_window_causal_mask = getattr(
+        transformers.masking_utils,
+        "_old_create_sliding_window_causal_mask",
+        "create_sliding_window_causal_mask",
+    )
     if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
-        transformers.masking_utils.create_causal_mask = wrap(transformers.masking_utils.create_causal_mask)
-        transformers.masking_utils.create_sliding_window_causal_mask = wrap(transformers.masking_utils.create_sliding_window_causal_mask)
+        transformers.masking_utils._old_create_causal_mask = transformers.masking_utils.create_causal_mask
+        transformers.masking_utils._old_create_sliding_window_causal_mask = transformers.masking_utils.create_sliding_window_causal_mask
+        transformers.masking_utils.create_causal_mask = wrap(create_causal_mask)
+        transformers.masking_utils.create_sliding_window_causal_mask = wrap(create_sliding_window_causal_mask)
         transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask
         transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = transformers.masking_utils.create_sliding_window_causal_mask
         transformers.masking_utils.create_masks_for_generate = wrap(transformers.masking_utils.create_masks_for_generate)
@@ -1098,20 +1110,6 @@ def patch_GptOssModel():
             )
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-
-        # It may already have been prepared by e.g. `generate`
-        # if not isinstance(causal_mask_mapping := attention_mask, dict):
-        #     mask_kwargs = {
-        #         "config": self.config,
-        #         "input_embeds": inputs_embeds,
-        #         "attention_mask": attention_mask,
-        #         "cache_position": cache_position,
-        #         "past_key_values": past_key_values,
-        #     }
-        #     causal_mask_mapping = {
-        #         "full_attention": create_causal_mask(**mask_kwargs),
-        #         "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-        #     }
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
@@ -1128,11 +1126,20 @@ def patch_GptOssModel():
             if not self.training and qlen == 1 and isinstance(attention_mask, dict):
                 # Add hack since residuals need to clone outside of the torch.compile region??
                 # This forces it to free past residuals
-                print(attention_mask)
-                print(attention_mask)
-                print(attention_mask)
-                print(attention_mask)
                 torch.compiler.cudagraph_mark_step_begin()
+                # It may already have been prepared by e.g. `generate`
+                if not isinstance(causal_mask_mapping := attention_mask, dict):
+                    mask_kwargs = {
+                        "config": self.config,
+                        "input_embeds": inputs_embeds,
+                        "attention_mask": attention_mask,
+                        "cache_position": cache_position,
+                        "past_key_values": past_key_values,
+                    }
+                    causal_mask_mapping = {
+                        "full_attention": create_causal_mask(**mask_kwargs),
+                        "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+                    }
                 for decoder_layer in self.layers:
                     hidden_states, residual = inference_forward(
                         decoder_layer,
