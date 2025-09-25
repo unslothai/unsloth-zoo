@@ -902,6 +902,7 @@ def patch_GptOssModel():
     import transformers.masking_utils
     import transformers.generation.utils
     def return_attention_mask(*args, **kwargs):
+        print(args, kwargs)
         if "attention_mask" in kwargs:
             return kwargs["attention_mask"]
         for arg in args:
