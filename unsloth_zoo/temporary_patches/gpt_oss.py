@@ -1120,6 +1120,20 @@ def patch_GptOssModel():
         except:
             pass
 
+        # It may already have been prepared by e.g. `generate`
+        if not self.training and not isinstance(causal_mask_mapping := attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
+
         is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         if True:# not is_decoding or not has_static_cache:
             bsz, qlen, hd = hidden_states.shape
@@ -1127,19 +1141,6 @@ def patch_GptOssModel():
                 # Add hack since residuals need to clone outside of the torch.compile region??
                 # This forces it to free past residuals
                 torch.compiler.cudagraph_mark_step_begin()
-                # It may already have been prepared by e.g. `generate`
-                if not isinstance(causal_mask_mapping := attention_mask, dict):
-                    mask_kwargs = {
-                        "config": self.config,
-                        "input_embeds": inputs_embeds,
-                        "attention_mask": attention_mask,
-                        "cache_position": cache_position,
-                        "past_key_values": past_key_values,
-                    }
-                    causal_mask_mapping = {
-                        "full_attention": create_causal_mask(**mask_kwargs),
-                        "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-                    }
                 for decoder_layer in self.layers:
                     hidden_states, residual = inference_forward(
                         decoder_layer,
@@ -1162,9 +1163,6 @@ def patch_GptOssModel():
             else:
                 for decoder_layer in self.layers:
                     mask = attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask
-                    print(mask)
-                    print(mask)
-                    print(mask)
                     hidden_states = decoder_layer(
                         hidden_states,
                         attention_mask=mask,
