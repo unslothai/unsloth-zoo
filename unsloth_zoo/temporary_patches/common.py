@@ -134,8 +134,32 @@ torch_compile_options = get_torch_compile_options(
     use_block_ptr = False,
 )
 
+from typing import Any, Callable, TypeVar
+F = TypeVar("F", bound=Callable[..., Any])
+def noop(*args: Any, **kwargs: Any):
+    """
+    A do-nothing decorator/adapter.
+
+    Works as:
+      - @noop
+      - @noop(...)
+      - noop(func, ...)
+    
+    Returns the original function unchanged in every case.
+    """
+    # If used like noop(func, **kwargs) or as @noop on a function,
+    # the first positional arg will be the function. Return it directly.
+    if args and callable(args[0]):
+        return torch.compiler.disable(args[0]) # type: ignore[return-value]
+
+    # Otherwise, used as @noop(...): return a decorator that returns the function unchanged.
+    def _decorator(func: F) -> F:
+        return torch.compiler.disable(func)
+    return _decorator
+pass
+
 if UNSLOTH_COMPILE_DISABLE:
-    _torch_compile = torch.compiler.disable
+    torch_compile = noop
 else:
     torch_compile = functools.partial(
         torch.compile,
@@ -144,7 +168,7 @@ else:
     )
 
 if UNSLOTH_COMPILE_DISABLE:
-    _torch_compile = torch.compiler.disable
+    _torch_compile = noop
 else:
     _torch_compile = functools.partial(
         torch.compile,
