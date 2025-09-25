@@ -780,7 +780,7 @@ def patch_GptOssAttention():
     pass
 
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
-    eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
+    # eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
     def forward_function(
         self,
         hidden_states: torch.Tensor,
