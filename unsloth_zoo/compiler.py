@@ -303,9 +303,10 @@ def _get_compile_folder(use_tempfile = False):
 pass
 
 def get_compile_folder(use_tempfile = False):
-    lock_file = os.path.join(tempfile.gettempdir(), f"{UNSLOTH_COMPILE_LOCATION}.lock")
     # Ensure atomic dir creation for multi-GPU
-    with FileLock(lock_file):
+    lock_file = os.path.join(tempfile.gettempdir(), f"{UNSLOTH_COMPILE_LOCATION}.lock")
+    lock = FileLock(lock_file)
+    with lock:
         location, UNSLOTH_COMPILE_USE_TEMP = _get_compile_folder(use_tempfile)
     return location, UNSLOTH_COMPILE_USE_TEMP
 pass
@@ -533,7 +534,8 @@ def create_new_function(
     function_location = os.path.join(compile_folder, f"{name}.py")
 
     # Ensure atomic writes for multi-GPU
-    with FileLock(f"{function_location}.lock"):
+    lock = FileLock(f"{function_location}.lock")
+    with lock:
         # Check if file was already created!
         if not overwrite and os.path.isfile(function_location):
             # Check if exactly equivalent
