@@ -780,7 +780,7 @@ def patch_GptOssAttention():
     pass
 
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
-    eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
+    # eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
     def forward_function(
         self,
         hidden_states: torch.Tensor,
@@ -1032,6 +1032,35 @@ def patch_GptOssModel():
         return hidden_states, residual
     pass
 
+    @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    def inference_forward(
+        self,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        use_cache,
+        cache_position,
+        position_embeddings,
+        **kwargs,
+    ):
+        for decoder_layer in self.layers:
+            mask = attention_mask[decoder_layer.attention_type]
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+        pass
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+    pass
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1087,20 +1116,34 @@ def patch_GptOssModel():
 
         is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         if True:# not is_decoding or not has_static_cache:
-            for decoder_layer in self.layers:
-                mask = attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask
-                hidden_states = decoder_layer(
+            bsz, qlen, hd = hidden_states.shape
+            if not self.training and qlen == 1 and isinstance(attention_mask, dict):
+                return inference_forward(
+                    self,
                     hidden_states,
-                    attention_mask=mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
                     **kwargs,
                 )
-            pass
-            hidden_states = self.norm(hidden_states)
+            else:
+                for decoder_layer in self.layers:
+                    mask = attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask
+                    hidden_states = decoder_layer(
+                        hidden_states,
+                        attention_mask=mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        **kwargs,
+                    )
+                pass
+                hidden_states = self.norm(hidden_states)
         else:
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
