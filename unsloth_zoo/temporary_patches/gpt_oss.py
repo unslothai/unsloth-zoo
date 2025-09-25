@@ -780,7 +780,7 @@ def patch_GptOssAttention():
     pass
 
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
-    eager_attention_forward = torch_compile(eager_attention_forward)
+    eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
     def forward_function(
         self,
         hidden_states: torch.Tensor,
@@ -803,51 +803,51 @@ def patch_GptOssAttention():
 
         # flex_attention_with_sink only works for training since KV cache is wrong
         # switch to flex_attention_with_sink which allows all to work
-        if is_flex_attention_decoding(self, query_states) and has_static_cache:
-            attn_output, logsumexp = flex_attention_with_sink_decoding(
-                self,
-                query_states,
-                key_states,
-                value_states,
-            )
-            attn_output = flex_attention_add_sinks(
-                self,
-                attn_output,
-                logsumexp,
-            )
-        else:
-            attn_output = flex_attention_with_sink(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                has_static_cache = has_static_cache,
-            )
-        attn_weights = None
-        # if self.training:
-        #     attn_output = old_flex_attention_with_sink(
+        # if is_flex_attention_decoding(self, query_states) and has_static_cache:
+        #     attn_output, logsumexp = flex_attention_with_sink_decoding(
         #         self,
         #         query_states,
         #         key_states,
         #         value_states,
         #     )
-        #     attn_weights = None
+        #     attn_output = flex_attention_add_sinks(
+        #         self,
+        #         attn_output,
+        #         logsumexp,
+        #     )
         # else:
-        #     # Weirdly for inference, flex attention returns gibberish
-        #     # Most likely due to left padding
-        #     attn_output, attn_weights = eager_attention_forward(
+        #     attn_output = flex_attention_with_sink(
         #         self,
         #         query_states,
         #         key_states,
         #         value_states,
         #         attention_mask,
-        #         dropout=0.0 if not self.training else self.attention_dropout,
-        #         scaling=self.scaling,
-        #         sliding_window=self.sliding_window,
-        #         s_aux=self.sinks,  # diff with Llama
-        #         **kwargs,
+        #         has_static_cache = has_static_cache,
         #     )
+        # attn_weights = None
+        if self.training:
+            attn_output = flex_attention_with_sink(
+                self,
+                query_states,
+                key_states,
+                value_states,
+            )
+            attn_weights = None
+        else:
+            # Weirdly for inference, flex attention returns gibberish
+            # Most likely due to left padding
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                s_aux=self.sinks,  # diff with Llama
+                **kwargs,
+            )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
@@ -901,22 +901,29 @@ def patch_GptOssModel():
     # Disable mask creations since we don't need them for GPT-OSS
     import transformers.masking_utils
     import transformers.generation.utils
-    def return_attention_mask(*args, **kwargs):
-        if "input_embeds" in kwargs:
-            print(kwargs["input_embeds"].shape, kwargs["input_embeds"].requires_grad)
-        if "attention_mask" in kwargs:
-            return kwargs["attention_mask"]
-        for arg in args:
-            if type(arg) is torch.Tensor and arg.dtype == torch.int32:
-                return arg
-        pass
+    def wrap(f)
+        def return_attention_mask(*args, **kwargs):
+            if kwargs["input_embeds"].requires_grad:
+                if "attention_mask" in kwargs:
+                    return kwargs["attention_mask"]
+                for arg in args:
+                    if type(arg) is torch.Tensor and arg.dtype == torch.int32:
+                        return arg
+            else:
+                # Eager
+                return f(*args, **kwargs)
+            pass
+        return return_attention_mask
     pass
-    transformers.masking_utils.create_causal_mask = return_attention_mask
-    transformers.masking_utils.create_sliding_window_causal_mask = return_attention_mask
-    transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = return_attention_mask
-    transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = return_attention_mask
-    transformers.masking_utils.create_masks_for_generate = return_attention_mask
-    transformers.generation.utils.create_masks_for_generate = return_attention_mask
+    if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
+        transformers.masking_utils.create_causal_mask = wrap(transformers.masking_utils.create_causal_mask)
+        transformers.masking_utils.create_sliding_window_causal_mask = wrap(transformers.masking_utils.create_sliding_window_causal_mask)
+        transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask
+        transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = transformers.masking_utils.create_sliding_window_causal_mask
+        transformers.masking_utils.create_masks_for_generate = wrap(transformers.masking_utils.create_masks_for_generate)
+        transformers.generation.utils.create_masks_for_generate = wrap(transformers.generation.utils.create_masks_for_generate)
+        transformers.masking_utils.__patched_causal_mask__ = True
+    pass
 
     from ..flex_attention import (
         is_flex_attention_decoding,

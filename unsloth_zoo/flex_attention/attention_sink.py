@@ -183,7 +183,7 @@ def flex_attention_with_sink(
     block_mask = None
     has_flex_cache = hasattr(self_attn, "_flex_attention_cache")
     # Handle inference and training
-    if has_static_cache:
+    if attention_mask is not None and has_static_cache:
         if is_training or (
             not is_training and (not has_flex_cache or qlen_Q != 1)
         ):
