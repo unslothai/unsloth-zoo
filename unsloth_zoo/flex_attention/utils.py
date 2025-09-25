@@ -86,15 +86,16 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _create_block_mask(mask_mod, bsz, head, M, N, device = device)
 
-    @_torch_compile(dynamic = True)
     def compiled_create_block_mask_cached(mask_mod, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
-        return _create_block_mask(mask_mod, None, None, M, N, device = device)
+        # See https://github.com/meta-pytorch/attention-gym/issues/15#issuecomment-2284148665
+        # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
+        return _create_block_mask(mask_mod, None, None, M, N, device = device, _compile = True)
 
-    @_torch_compile(dynamic = True)
     def compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
-        return _create_block_mask(mask_mod, bsz, head, M, N, device = device)
+        # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
+        return _create_block_mask(mask_mod, bsz, head, M, N, device = device, _compile = True)
 
     def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
         """Causal mask for Flex Attention"""

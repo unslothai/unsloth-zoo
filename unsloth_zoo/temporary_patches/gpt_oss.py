@@ -439,7 +439,7 @@ def patch_gpt_oss():
         return model
     patch_function(transformers.integrations.mxfp4, "replace_with_mxfp4_linear", replace_with_mxfp4_linear)
 pass
-# TEMPORARY_PATCHES.append(patch_gpt_oss)
+TEMPORARY_PATCHES.append(patch_gpt_oss)
 
 
 class GptOssExperts(nn.Module):
@@ -726,7 +726,7 @@ def patch_gpt_oss_linearized():
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP = GptOssMLP
     return
 pass
-# TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
+TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
 def patch_GptOssAttention():
@@ -880,7 +880,7 @@ def patch_GptOssAttention():
     # Set env variable for padding purposes
     os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
 pass
-# TEMPORARY_PATCHES.append(patch_GptOssAttention)
+TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 
 def patch_GptOssModel():
@@ -1137,7 +1137,7 @@ def patch_GptOssModel():
         })
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
 pass
-# TEMPORARY_PATCHES.append(patch_GptOssModel)
+TEMPORARY_PATCHES.append(patch_GptOssModel)
 
 try:
     from openai_harmony import (
