@@ -803,7 +803,7 @@ def patch_GptOssAttention():
 
         # flex_attention_with_sink only works for training since KV cache is wrong
         # switch to flex_attention_with_sink which allows all to work
-        if False:#is_flex_attention_decoding(self, query_states) and has_static_cache:
+        if is_flex_attention_decoding(self, query_states) and has_static_cache:
             attn_output, logsumexp = flex_attention_with_sink_decoding(
                 self,
                 query_states,
