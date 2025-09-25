@@ -803,7 +803,7 @@ def patch_GptOssAttention():
 
         # flex_attention_with_sink only works for training since KV cache is wrong
         # switch to flex_attention_with_sink which allows all to work
-        if is_flex_attention_decoding(self, query_states) and has_static_cache:
+        if False:#is_flex_attention_decoding(self, query_states) and has_static_cache:
             attn_output, logsumexp = flex_attention_with_sink_decoding(
                 self,
                 query_states,
@@ -909,12 +909,12 @@ def patch_GptOssModel():
                 return arg
         pass
     pass
-    # transformers.masking_utils.create_causal_mask = return_attention_mask
-    # transformers.masking_utils.create_sliding_window_causal_mask = return_attention_mask
-    # transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = return_attention_mask
-    # transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = return_attention_mask
-    # transformers.masking_utils.create_masks_for_generate = return_attention_mask
-    # transformers.generation.utils.create_masks_for_generate = return_attention_mask
+    transformers.masking_utils.create_causal_mask = return_attention_mask
+    transformers.masking_utils.create_sliding_window_causal_mask = return_attention_mask
+    transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = return_attention_mask
+    transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = return_attention_mask
+    transformers.masking_utils.create_masks_for_generate = return_attention_mask
+    transformers.generation.utils.create_masks_for_generate = return_attention_mask
 
     from ..flex_attention import (
         is_flex_attention_decoding,
@@ -1054,18 +1054,18 @@ def patch_GptOssModel():
             position_ids = cache_position.unsqueeze(0)
 
         # It may already have been prepared by e.g. `generate`
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-            }
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
+        # if not isinstance(causal_mask_mapping := attention_mask, dict):
+        #     mask_kwargs = {
+        #         "config": self.config,
+        #         "input_embeds": inputs_embeds,
+        #         "attention_mask": attention_mask,
+        #         "cache_position": cache_position,
+        #         "past_key_values": past_key_values,
+        #     }
+        #     causal_mask_mapping = {
+        #         "full_attention": create_causal_mask(**mask_kwargs),
+        #         "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+        #     }
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
@@ -1081,8 +1081,8 @@ def patch_GptOssModel():
             for decoder_layer in self.layers:
                 hidden_states = decoder_layer(
                     hidden_states,
-                    attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                    # attention_mask=attention_mask,
+                    # attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                    attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_values=past_key_values,
                     use_cache=use_cache,
