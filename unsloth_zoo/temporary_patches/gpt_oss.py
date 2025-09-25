@@ -559,7 +559,7 @@ no_combo_fused_torch_compile_options = get_torch_compile_options(
     use_block_ptr = True,
 )
 
-@_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+# @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
 def moe_forward_inference(self, hidden_states):
     """Torch compile for forward inference path only with CUDAGraphs"""
     # Router
@@ -602,7 +602,7 @@ def moe_router_forward(self, hidden_states):
 pass
 
 # Combo Kernels errors with InductorError: AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
-@_torch_compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
+# @_torch_compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
 def moe_forward_inference_bf16(self, hidden_states):
     router_scores, router_indices = moe_router_forward(self.router, hidden_states)
     routing_weights = router_scores
@@ -1036,7 +1036,7 @@ def patch_GptOssModel():
     def inference_forward(
         self,
         hidden_states,
-        attention_mask,
+        _attention_mask,
         position_ids,
         past_key_values,
         use_cache,
@@ -1045,10 +1045,14 @@ def patch_GptOssModel():
         **kwargs,
     ):
         for decoder_layer in self.layers:
-            mask = attention_mask[decoder_layer.attention_type]
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=mask,
+            attention_mask = _attention_mask[decoder_layer.attention_type]
+
+            residual = hidden_states
+            hidden_states = rms_layernorm_forward(decoder_layer.input_layernorm, hidden_states)
+            # Self Attention
+            hidden_states, _ = decoder_layer.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -1056,8 +1060,18 @@ def patch_GptOssModel():
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+            hidden_states = residual + hidden_states
+
+            # Fully Connected
+            residual = hidden_states
+            hidden_states = rms_layernorm_forward(decoder_layer.post_attention_layernorm, hidden_states)
+            if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
+                hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
+            else:
+                hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
+            hidden_states = residual + hidden_states
         pass
-        hidden_states = self.norm(hidden_states)
+        hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         return hidden_states
     pass
 
