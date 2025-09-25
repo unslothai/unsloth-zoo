@@ -1010,7 +1010,7 @@ def patch_GptOssModel():
         shape_padding = True,
         cudagraphs = True,
         coordinate_descent_tuning = False,
-        combo_kernels = True,
+        combo_kernels = False,
         memory_planning = True,
         multi_kernel = False, # Fails on torch 2.10 nightly
         use_block_ptr = True,
