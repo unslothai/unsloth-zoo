@@ -898,7 +898,7 @@ def patch_GptOssModel():
         raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
         DynamicCache = lambda *args, **kwargs: None
 
-    torch._dynamo.config.cache_size_limit = 64
+    torch._dynamo.config.cache_size_limit = 128
 
     # Disable mask creations since we don't need them for GPT-OSS
     import transformers.masking_utils
