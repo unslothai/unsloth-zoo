@@ -164,7 +164,6 @@ else:
     torch_compile = functools.partial(
         torch.compile,
         options = torch_compile_options,
-        disable = UNSLOTH_COMPILE_DISABLE,
     )
 
 if UNSLOTH_COMPILE_DISABLE:
@@ -172,7 +171,6 @@ if UNSLOTH_COMPILE_DISABLE:
 else:
     _torch_compile = functools.partial(
         torch.compile,
-        disable = UNSLOTH_COMPILE_DISABLE,
     )
 
 global TEMPORARY_PATCHES
