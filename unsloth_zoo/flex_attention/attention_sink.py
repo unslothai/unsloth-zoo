@@ -20,10 +20,13 @@ __all__ = [
     "is_flex_attention_decoding",
     "flex_attention_with_sink_decoding",
     "flex_attention_add_sinks",
+    "flash_attention_left_padded",
 ]
 
 import torch
 import functools
+import math
+import torch.nn.functional as F
 from .utils import (
     create_block_mask_cached,
     create_block_mask,
@@ -150,7 +153,7 @@ def is_flex_attention_decoding(self_attn, query):
 pass
 
 
-def flex_attention_with_sink(
+def _flex_attention_with_sink(
     self_attn,
     query,
     key,
@@ -293,5 +296,88 @@ def flex_attention_add_sinks(
     sink_scale = torch.sigmoid(logsumexp, out = logsumexp)
     attn_output *= sink_scale.unsqueeze(-1).to(attn_output.dtype)
     attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output
+pass
+
+def flash_attention_left_padded(
+    self_attn,
+    query_states,
+    key_states,
+    value_states,
+    attention_mask,
+    is_causal = True,
+    window_size_left = None,
+    dropout_p = 0.0,
+    scale = None,
+):
+    assert attention_mask.dtype in (torch.int32, torch.int64, torch.bool)
+    device = hidden_states.device
+
+    bsz, qlen = attention_mask.shape
+    n_heads = self_attn.config.num_attention_heads
+    n_kv_heads = getattr(self_attn.config, "num_key_value_heads", n_heads)
+    head_dim = self_attn.head_dim
+
+    Q = query_states.transpose(1, 2)
+    K = key_states.transpose(1, 2)
+    V = value_states.transpose(1, 2)
+
+    Q = Q.view(bsz, qlen, n_heads, head_dim)
+    K = K.view(bsz, qlen, n_kv_heads, head_dim)
+    V = V.view(bsz, qlen, n_kv_heads, head_dim)
+
+    # ---- lengths & cumulative starts (int32 on CUDA) ----
+    seqlens = attention_mask.to(dtype=torch.int32, device=device).sum(dim=1)
+    cu_seqlens = F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0))
+    max_seqlen = int(seqlens.max().item())
+
+    # ---- unpad/pack ----
+    flat_mask = attention_mask.reshape(-1).to(device=device)
+    keep = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+
+    flat_qlen = bsz * qlen
+    Q_flat = Q.reshape(flat_qlen, n_heads, head_dim)
+    K_flat = K.reshape(flat_qlen, n_kv_heads, head_dim)
+    V_flat = V.reshape(flat_qlen, n_kv_heads, head_dim)
+
+    Q_unpad = Q_flat.index_select(0, keep).contiguous()
+    K_unpad = K_flat.index_select(0, keep).contiguous()
+    V_unpad = V_flat.index_select(0, keep).contiguous()
+
+    # ---- call flash attention ----
+    if scale is None:
+        scale = 1.0 / math.sqrt(head_dim)
+
+    kwargs = dict( scale = scale,)
+    # Only pass window sizes if you actually want sliding window
+    if window_size_left is not None:
+        kwargs["window_size_left"] = int(window_size_left)
+        kwargs["window_size_right"] = 0  # causal right window
+
+    """
+    aten::_flash_attention_forward(Tensor query, Tensor key, Tensor value, Tensor? cum_seq_q, Tensor? cum_seq_k, SymInt max_q, SymInt max_k, float dropout_p, bool is_causal, bool return_debug_mask, *, float? scale=None, SymInt? window_size_left=None, SymInt? window_size_right=None, Tensor? seqused_k=None, Tensor? alibi_slopes=None) -> (Tensor output, Tensor softmax_logsumexp, Tensor rng_state, Tensor unused, Tensor debug_attn_mask)
+    """
+    attn_output, logsumexp, rng_state, _, _ = torch.ops.aten._flash_attention_forward(
+        query = Q_unpad,
+        key = K_unpad,
+        value = V_unpad,
+        cum_seq_q = cu_seqlens,
+        cum_seq_k = cu_seqlens, 
+        max_q = max_seqlen,
+        max_k = max_seqlen,
+        dropout_p = float(dropout_p),
+        is_causal = bool(is_causal),
+        return_debug_mask = False,
+        **kwargs
+    )
+    # All 3 versions scale the original attn_output!
+    sink_scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
+    attn_output = attn_output * sink_scale.unsqueeze(-1).transpose(0, 1).to(attn_output.dtype)
+
+    out_flat = Q_flat.new_zeros((flat_qlen, n_heads, head_dim))
+    out_flat[keep] = attn_output
+    attn_output = out_flat.view(bsz, qlen, n_heads, head_dim)
+
+    attn_output = attn_output.contiguous()
     return attn_output
 pass

@@ -737,6 +737,7 @@ def patch_GptOssAttention():
             is_flex_attention_decoding,
             flex_attention_with_sink_decoding,
             flex_attention_add_sinks,
+            flash_attention_left_padded,
         )
         assert flex_attention_with_sink is not None
     except Exception as e:
@@ -782,6 +783,8 @@ def patch_GptOssAttention():
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
     if Version(torch.__version__) >= Version("2.9.0"):
         eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
+
+    has_flash_attention_forward = hasattr(torch.ops.aten, "_flash_attention_forward")
     def forward_function(
         self,
         hidden_states: torch.Tensor,
@@ -835,20 +838,38 @@ def patch_GptOssAttention():
             )
             attn_weights = None
         else:
-            # Weirdly for inference, flex attention returns gibberish
-            # Most likely due to left padding
-            attn_output, attn_weights = eager_attention_forward(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window,
-                s_aux=self.sinks,  # diff with Llama
-                **kwargs,
-            )
+            if has_flash_attention_forward:
+                sliding_window = getattr(self_attn, "sliding_window", None)
+                if sliding_window is not None:
+                    # GPT-OSS includes attending to current token so minus 1
+                    sliding_window = sliding_window - 1
+                attn_output = flash_attention_left_padded(
+                    self,
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    is_causal = True,
+                    window_size_left = sliding_window,
+                    dropout = 0.0 if not self.training else self.attention_dropout,
+                    scale = self.scaling,
+                )
+                attn_weights = None
+            else:
+                # Weirdly for inference, flex attention returns gibberish
+                # Most likely due to left padding
+                attn_output, attn_weights = eager_attention_forward(
+                    self,
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    dropout=0.0 if not self.training else self.attention_dropout,
+                    scaling=self.scaling,
+                    sliding_window=self.sliding_window,
+                    s_aux=self.sinks,  # diff with Llama
+                    **kwargs,
+                )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
