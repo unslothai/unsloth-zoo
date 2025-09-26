@@ -279,10 +279,6 @@ def patch_model_and_tokenizer(
     assert(type(downcast_rope) is bool)
     import gc
 
-    # Must synchronize all devices to remove CUDA errors
-    for device_id in range(torch.cuda.device_count()):
-        torch.cuda.synchronize(device_id)
-
     # Fix dtype
     m = model
     while hasattr(m, "model"):
@@ -346,8 +342,8 @@ def patch_model_and_tokenizer(
         for name, param in model.named_parameters():
             if hasattr(param, "_pre_set_compute_dtype"):
                 param.data = param.data.to(param._pre_set_compute_dtype)
-            # elif param.dtype == torch.bfloat16:
-            #     param.data = param.data.to(torch.float16)
+            elif param.dtype == torch.bfloat16:
+                param.data = param.data.to(torch.float16)
 
         # Also convert buffers (like position embeddings)
         for name, buffer in model.named_buffers():
@@ -359,9 +355,9 @@ def patch_model_and_tokenizer(
     pass
 
     # Upcast ot downcast if explicitly set
-    # for name, module in model.named_modules():
-    #     if hasattr(module, "_pre_set_compute_dtype"):
-    #         module.to(module._pre_set_compute_dtype)
+    for name, module in model.named_modules():
+        if hasattr(module, "_pre_set_compute_dtype"):
+            module.to(module._pre_set_compute_dtype)
     pass
 
     # Correct dtype
@@ -438,10 +434,6 @@ def patch_model_and_tokenizer(
             pass
         pass
     pass
-
-    # Must synchronize all devices to remove CUDA errors
-    for device_id in range(torch.cuda.device_count()):
-        torch.cuda.synchronize(device_id)
 
     if not fix_embeddings: return model, tokenizer
 
@@ -524,10 +516,6 @@ def patch_model_and_tokenizer(
     for _ in range(3):
         gc.collect()
         torch.cuda.empty_cache()
-
-    # Must synchronize all devices to remove CUDA errors
-    for device_id in range(torch.cuda.device_count()):
-        torch.cuda.synchronize(device_id)
     return model, tokenizer
 pass
 
