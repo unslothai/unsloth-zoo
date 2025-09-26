@@ -794,6 +794,7 @@ def patch_GptOssAttention():
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz, qlen, hd = hidden_states.shape
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -838,8 +839,7 @@ def patch_GptOssAttention():
             )
             attn_weights = None
         else:
-            if has_flash_attention_forward:
-                print(attention_mask, attention_mask.dtype, attention_mask.shape)
+            if has_flash_attention_forward and qlen != 1:
                 sliding_window = getattr(self, "sliding_window", None)
                 if sliding_window is not None:
                     # GPT-OSS includes attending to current token so minus 1
@@ -1150,7 +1150,7 @@ def patch_GptOssModel():
         # It may already have been prepared by e.g. `generate`
         bsz, qlen, hd = hidden_states.shape
         if not self.training and not isinstance(attention_mask, dict):
-            if qlen != 1 or not has_flash_attention_forward:
+            if qlen == 1 or not has_flash_attention_forward:
                 mask_kwargs = {
                     "config": self.config,
                     "input_embeds": inputs_embeds,
