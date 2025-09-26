@@ -777,12 +777,16 @@ def patch_GptOssAttention():
     ):
         key_states = repeat_kv(key, module.num_key_value_groups)
         value_states = repeat_kv(value, module.num_key_value_groups)
+        print(query.shape, key_states.shape)
         attn_weights = matmul(query, key_states.transpose(2, 3))
         attn_weights *= scaling
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights += causal_mask
 
+        bsz, n_heads, qlen, kv_len = attn_weights.shape
+        combined_logits = attn_weights.new_empty((bsz, n_heads, qlen, kv_len+1))
+        combined_logits[:,:,:,:kv_len] = attn_weights
         sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
         print(attn_weights.shape, module.sinks.shape, sinks.shape)
         combined_logits = torch.cat([attn_weights, sinks], dim=-1)
