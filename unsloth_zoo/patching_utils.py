@@ -279,6 +279,10 @@ def patch_model_and_tokenizer(
     assert(type(downcast_rope) is bool)
     import gc
 
+    # Must synchronize all devices to remove CUDA errors
+    for device_id in range(torch.cuda.device_count()):
+        torch.cuda.synchronize(device_id)
+
     # Fix dtype
     m = model
     while hasattr(m, "model"):
@@ -435,6 +439,10 @@ def patch_model_and_tokenizer(
         pass
     pass
 
+    # Must synchronize all devices to remove CUDA errors
+    for device_id in range(torch.cuda.device_count()):
+        torch.cuda.synchronize(device_id)
+
     if not fix_embeddings: return model, tokenizer
 
     # Check if torch.nn.Embedding seen
@@ -516,6 +524,10 @@ def patch_model_and_tokenizer(
     for _ in range(3):
         gc.collect()
         torch.cuda.empty_cache()
+
+    # Must synchronize all devices to remove CUDA errors
+    for device_id in range(torch.cuda.device_count()):
+        torch.cuda.synchronize(device_id)
     return model, tokenizer
 pass
 
