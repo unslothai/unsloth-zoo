@@ -103,7 +103,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
             recompiles_verbose = True,
             compiled_autograd_verbose = False, # Produces too much code
             aot_joint_graph = False, # Produces too much code
-            aot_graphs = False,  # Produces too much code
+            aot_graphs = False, # Produces too much code
             perf_hints = True, # Performance improvement hints
         )
         torch._dynamo.config.verbose = True
@@ -169,7 +169,6 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # when setting to not debug aka True, we get errors on torch2.6
         # TypeError: ValueRangeAnalysis.to_dtype() got an unexpected keyword argument 'use_compute_types'
         # this keyword exists in torch2.7.0 but not in torch2.6.0 so set to False until torch2.6.0 is deprecated.
-        "config.emulate_precision_casts = False", # Force X.to(f32).to(f16) instead of X.to(f16)
     ]
     # Torch dynamo arguments
     torch_dynamo_arguments = [

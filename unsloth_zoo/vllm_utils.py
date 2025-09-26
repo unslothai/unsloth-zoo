@@ -60,6 +60,7 @@ from .temporary_patches.common import (
 )
 from .log import logger
 from unsloth import DEVICE_TYPE
+from unsloth.models.vision import VLLM_SUPPORTED_VLM
 global LORA_REQUEST_ID
 
 # Ignore logging messages
@@ -757,6 +758,13 @@ def patch_vllm(debug = True):
         logger.info(f'Unsloth: Patching vLLM to enable standby.')
         patch_vllm_enable_sleep_mode()
     patch_vllm_graph_capture()
+    # GuidedDecodingParmas is renamed to StructuredOutputsParams in vLLM
+    # https://github.com/vllm-project/vllm/pull/22772/files
+    # trl still wants to use GuidedDecodingParams. This is a temporary patch till trl updates
+    try:
+        from vllm.sampling_params import GuidedDecodingParams
+    except ImportError:
+        vllm.sampling_params.GuidedDecodingParams = vllm.sampling_params.StructuredOutputsParams
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
 pass
@@ -832,9 +840,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     model_type = getattr(config, "model_type", "causal_lm")
 
     # Keep the original config for model_type but use text_config for vocab_size etc
-    text_config = config
-    if hasattr(config, "text_config"):
-        text_config = config.text_config
+    text_config = getattr(config, "text_config", config)
 
     vocab_size = text_config.vocab_size
 
@@ -855,6 +861,8 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
         # Handle quantized weights
         quant_states = getattr(qweight, "bnb_quant_state", None)
         if quant_states is not None:
+            if 'vision_tower.transformers.layers.0.' in prefix:
+                print(f'Unsloth: Quantized weights for vision model {prefix}\t{proj}!')
             offsets = qweight.bnb_shard_offsets
             if slice_weights:
                 weight = qweight[offsets[kk] : offsets[kk + 1]]
@@ -986,7 +994,6 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     quant_state_dict[norm_prefix] = state_dict[norm_prefix]
 
     # LM Head - Use get_state_dict for consistency
-
     if not getattr(text_config, "tie_word_embeddings", False):
         lm_layer = [mod for name,mod in vllm_internals.named_modules() if "lm_head" in name]
         # Use get_state_dict for consistent extraction and automatic truncation
@@ -998,7 +1005,6 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             lm_weight = state_dict[embed_key]
             state_dict["lm_head.weight"] = lm_weight
             quant_state_dict["lm_head.weight"] = lm_weight
-
 
     if not return_state_dict: state_dict = None
     return state_dict, quant_state_dict
@@ -1033,7 +1039,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
 
                 if key1 is not None and key2 is not None:
                     try:
-                        torch.testing.assert_close(old_state_dict[key1], new_state_dict[key2], check_stride = True)
+                        torch.testing.assert_close(old_state_dict[key1].contiguous(), new_state_dict[key2].contiguous(), check_stride = True)
                     except Exception:
                         failures[key] = error
                 else:
@@ -1052,7 +1058,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
     set_dtype_in_config(config, dtype)
-    new_model, original_meta_model, layer_names, layer_count = create_empty_model(config, dtype, is_vision_model)
+    new_model, original_meta_model, layer_count, layer_names = create_empty_model(config, dtype, is_vision_model)
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
     quantization_config = getattr(config, "quantization_config", {})
     kwargs = dict()
@@ -1101,8 +1107,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     skipped_layernorms = []
     for kk in range(layer_count):
         for layer_name in layer_names:
-            if "kk" not in layer_name: # skip those that are not per layer
-                continue
             layer_name = layer_name.format(kk = kk)
 
             if 'language_model.model' in layer_name:
@@ -2177,6 +2181,93 @@ def test_model_conversion(original_model, new_model):
     print("✅ Model conversion test completed!")
     return True
 
+def _test_is_same_vlm(model, new_model, processor, test_backward=False):
+    # All Unsloth Zoo code licensed under LGPLv3
+    assert model.device == new_model.device
+    assert model.dtype == new_model.dtype
+
+    messages = [{
+        "role" : "user",
+        "content": [
+            { "type": "image", "image": "https://files.worldwildlife.org/wwfcmsprod/images/Sloth_Sitting_iStock_3_12_2014/story_full_width/8l7pbjmj29_iStock_000011145477Large_mini__1_.jpg"},
+            { "type": "text",  "text" : "Which films does this animal feature in?" }
+        ]
+    }]
+
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+        return_dict=True, return_tensors="pt"
+    ).to(model.device, dtype=model.dtype)
+
+    with torch.no_grad():
+        original_outputs = model(**inputs)
+        new_outputs = new_model(**inputs)
+        torch.testing.assert_close(original_outputs.logits, new_outputs.logits)
+        print(f'Forward pass logits match!')
+
+    inputs['labels'] = inputs['input_ids']
+    original_outputs = model(**inputs)
+    new_outputs = new_model(**inputs)
+    torch.testing.assert_close(original_outputs.loss, new_outputs.loss)
+    print('Losses match !')
+
+    if test_backward:
+        # Initialize per-model statistics dictionaries
+        original_model_stats = {
+            'pre': defaultdict(list),
+            'post': defaultdict(list),
+            'backward': defaultdict(list)
+        }
+
+        new_model_stats = {
+            'pre': defaultdict(list),
+            'post': defaultdict(list),
+            'backward': defaultdict(list)
+        }
+
+        # Register hooks for both models
+        register_hooks(model, original_model_stats)
+        register_hooks(new_model, new_model_stats)
+
+        # Prepare inputs
+        from copy import deepcopy
+        inputs['labels'] = deepcopy(inputs['input_ids'])
+        inputs['input_ids'].requires_grad = True
+
+        # Forward passes
+        original_outputs = model(**inputs)
+        new_outputs = new_model(**inputs)
+
+        # Check loss matches
+        torch.testing.assert_close(original_outputs.loss, new_outputs.loss)
+        print('Losses match!')
+
+        # Backward passes
+        original_outputs.loss.backward()
+        new_outputs.loss.backward()
+
+        # Compare backward gradient statistics
+        matches = []
+        mismatches = []
+        for layer_name in original_model_stats['backward'].keys():
+            original_grads = torch.tensor(original_model_stats['backward'][layer_name])
+            new_grads = torch.tensor(new_model_stats['backward'][layer_name])
+            try:
+                torch.testing.assert_close(original_grads, new_grads, atol=1e-6)
+                matches.append(layer_name)
+            except Exception as e:
+                print(f"Gradient mismatch in layer '{layer_name}': {e}")
+                mismatches.append(layer_name)
+        print(f"Backward gradient statistics match for {len(matches)} layers: {matches}")
+        print(f"Backward gradient statistics mismatch for {len(mismatches)} layers: {mismatches}")
+
+
+    pass
+
 @torch.inference_mode
 def _test_get_vllm_state_dict(
     model_name = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
@@ -2209,7 +2300,7 @@ def _test_get_vllm_state_dict(
 
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     bnb_config = None
-    load_in_4bit = model_name.lower().endswith("-bnb-4bit")
+    load_in_4bit = model_name.lower().endswith("-bnb-4bit") or load_in_4bit
     if load_in_4bit:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit              = True,
@@ -2231,7 +2322,7 @@ def _test_get_vllm_state_dict(
     if not is_vision_model:
         model_class = AutoModelForCausalLM
     else:
-        if model_type in ["qwen2_5_vl", "gemma3", "mllama"]:
+        if model_type in VLLM_SUPPORTED_VLM:
             import transformers
             model_class = getattr(transformers, config.architectures[0])
         else:
@@ -2275,13 +2366,14 @@ def _test_get_vllm_state_dict(
         config = config,
         is_vision_model = is_vision_model,
     )
+
     assert_same_state_dict(model.state_dict(), state_dict)
 
     new_model = convert_vllm_to_huggingface(quant_state_dict, config, dtype, is_vision_model = is_vision_model)
     test_model_conversion(model, new_model)
 
     # Run the model as well
-    if not skip_generation:
+    if not is_vision_model:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         messages = [
@@ -2312,19 +2404,26 @@ def _test_get_vllm_state_dict(
             max_tokens = 256,
         )
 
-        # Cannot just use llm.generate or OOM - split into batches
-        batches = create_batches(inputs, llm.approx_max_num_seqs)
-        completion_ids = []
-        for batch in batches:
-            outputs = llm.generate(batch, sampling_params)
-            completion_ids.extend(out.token_ids for completions in outputs for out in completions.outputs)
-        pass
-        del completion_ids
+        if not skip_generation:
+            # Cannot just use llm.generate or OOM - split into batches
+            batches = create_batches(inputs, llm.approx_max_num_seqs)
+            completion_ids = []
+            for batch in batches:
+                outputs = llm.generate(batch, sampling_params)
+                completion_ids.extend(out.token_ids for completions in outputs for out in completions.outputs)
+            pass
+            del completion_ids
 
         # Check all hidden states manually
         input_ids = tokenizer(inputs[0], add_special_tokens = False, return_tensors = "pt")
         input_ids = input_ids["input_ids"].to("cuda", non_blocking = True)
         _test_same_model(model, new_model, input_ids)
+    else:
+        # VLMs dont have a standardised forward pass mechanism. So we just test whole model forward pass and not layer wise
+        # TODO: Maybe add layer wise checks
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained(model_name)
+        _test_is_same_vlm(model, new_model, processor, False)
 
     delete_vllm(llm)
 

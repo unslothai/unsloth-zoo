@@ -118,8 +118,9 @@ DISABLED_KEYWORDS = [
     "pad_tensor_by_size", # falcon h1
 ]
 
-_license_header = """
-# Unsloth Zoo - Utilities for Unsloth
+
+_full_license_header = """
+# Unsloth auto generated code
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
@@ -135,6 +136,9 @@ _license_header = """
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+"""
+
+_license_header = _full_license_header + """
 import os
 import torch
 import importlib.util
@@ -149,7 +153,7 @@ import math
 
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_CCE = os.environ.get("UNSLOTH_ENABLE_CCE", "1") == "1"
-UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
+UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial",)
 
 import logging
 logger_compiler = logging.getLogger(__name__)
@@ -409,6 +413,38 @@ def higher_precision_sqrt_mean(source):
 pass
 
 
+def fix_rotary_embedding_dtype(source):
+    # Rotary Embeddings might be left in float32 since we upcast it
+    # We downcast it to float16 if we see float32 for X's dtype
+    if "cos.to" in source or "sin.to" in source:
+        if os.environ.get("UNSLOTH_FORCE_CUSTOM_DTYPE", "") != "":
+            custom_datatype = os.environ["UNSLOTH_FORCE_CUSTOM_DTYPE"]
+            assert custom_datatype.count(";") >= 4
+            checker, _dtype, _bnb_compute_dtype, _custom_datatype, execute_code = custom_datatype.split(";", 4)
+            # Allow custom dtypes on all runs
+            allow_all_runs = (checker == "all")
+            # Allow only on float16 datatypes
+            allow_float16_runs = (
+                (checker == "float16" or checker == "torch.float16") and \
+                (os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1")
+            )
+            if allow_all_runs or allow_float16_runs:
+                if eval(_dtype) is not None:
+                    dtype = eval(_dtype)
+                    if dtype == torch.float32:
+                        source = source.replace(
+                            "cos.to(dtype=x.dtype)",
+                            "cos.to(dtype=torch.float16 if x.dtype == torch.float32 else x.dtype)"
+                        )
+                        source = source.replace(
+                            "sin.to(dtype=x.dtype)",
+                            "sin.to(dtype=torch.float16 if x.dtype == torch.float32 else x.dtype)"
+                        )
+                        return source
+    return source
+pass
+
+
 # Use float32 for layernorms if we find evidence for it
 def higher_precision_layernorms(modeling_file):
     norm_modules = list(re.finditer(
@@ -525,7 +561,10 @@ def create_new_function(
         f'{transformers_version}\n'\
         f'{trl_version}\n__UNSLOTH_VERSIONING__\n' + '"""\n'
 
-    write_new_source = versioning + new_source
+    if _full_license_header not in new_source:
+        write_new_source = versioning + _full_license_header + new_source
+    else:
+        write_new_source = versioning + new_source
 
     # Write function
     global UNSLOTH_COMPILE_USE_TEMP
@@ -736,6 +775,9 @@ def create_standalone_class(
 
     # Fix all sqrt(mean(X**2)) lower precisions to float32
     source = higher_precision_sqrt_mean(source)
+
+    # Fix RotaryEmbeddings being in the wrong precision
+    source = fix_rotary_embedding_dtype(source)
 
     return source
 pass
@@ -1948,7 +1990,9 @@ def unsloth_compile_transformers(
     except:
         return
     # All Unsloth Zoo code licensed under LGPLv3
-    disable = disable or (os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1")
+    full_disable = disable or (os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1")
+    disable = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "partial"
+    if full_disable: disable = True
     if fast_residual_stream:
         raise NotImplementedError("Unsloth: Fast residual stream optimization makes things slower!")
     pass
@@ -2099,7 +2143,11 @@ def unsloth_compile_transformers(
             # Must add _supports_sdpa check since now all modules use ALL_ATTENTION_FUNCTIONS
             scaled_dot_product_attention_modules.append(module)
         elif "nn.functional.softmax" in source or "flash_attn_varlen_func" in source or "_flash_attention_forward" in source:
-            full_attention_modules.append(module)
+            # Check if TopK is used so Router actually
+            if "torch.topk" in source:
+                pass
+            else:
+                full_attention_modules.append(module)
     pass
     removal = set(
         scaled_dot_product_attention_modules + \
@@ -2289,12 +2337,13 @@ def unsloth_compile_transformers(
                         model_location,
                         functions,
                         fullgraph = False,
-                        disable = None,
+                        disable = disable,
                         forward_source = new_source,
                     )
                     print(f"Unsloth: Faster residual stream for {module}")
                     all_standalone_classes[module] = new_module
-                except:
+                except Exception as e:
+                    print(f"Unsloth: Failed faster residual stream {module} with error = {str(e)}")
                     continue
             pass
         pass
@@ -2320,9 +2369,8 @@ def unsloth_compile_transformers(
                     disable = True,
                 )
                 all_standalone_classes[module] = new_module
-            except:
-                print(f"Unsloth: Failed to disable {module}.")
-                continue
+            except Exception as e:
+                print(f"Unsloth: Failed disabling modules for {module} with error = {str(e)}")
         pass
     pass
 
@@ -2336,11 +2384,12 @@ def unsloth_compile_transformers(
                     model_location,
                     functions,
                     fullgraph = fullgraph,
+                    disable = disable,
                 )
                 print(f"Unsloth: Compiled module {module}.")
                 all_standalone_classes[module] = new_module
-            except:
-                continue
+            except Exception as e:
+                print(f"Unsloth: Failed compiling {module} with error = {str(e)}")
         pass
     pass
 
@@ -2359,12 +2408,13 @@ def unsloth_compile_transformers(
                     model_location,
                     functions,
                     fullgraph = fullgraph,
-                    disable = sdpa_dynamic_compile,
+                    disable = True if disable else sdpa_dynamic_compile,
                     forward_source = forward_source,
                 )
                 print(f"Unsloth: Fast Attention patch for {module}.")
                 all_standalone_classes[module] = new_module
-            except:
+            except Exception as e:
+                print(f"Unsloth: Failed Fast Attention patch for {module} with error = {str(e)}")
                 continue
         pass
 
@@ -2380,8 +2430,8 @@ def unsloth_compile_transformers(
                 )
                 print(f"Unsloth: Slow Attention patch for {module}.")
                 all_standalone_classes[module] = new_module
-            except:
-                continue
+            except Exception as e:
+                print(f"Unsloth: Failed Slow Attention patch {module} with error = {str(e)}")
         pass
     pass
 
@@ -2431,17 +2481,20 @@ def unsloth_compile_transformers(
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:
-                    new_module = create_standalone_class(
-                        module,
-                        model_location,
-                        functions,
-                        fullgraph = False,
-                        disable = True,
-                        forward_source = new_source,
-                        add_loss_kwargs = True,
-                    )
-                    print(f"Unsloth: Fast fused linear cross entropy patch for {module}.")
-                    all_standalone_classes[module] = new_module
+                    try:
+                        new_module = create_standalone_class(
+                            module,
+                            model_location,
+                            functions,
+                            fullgraph = False,
+                            disable = True,
+                            forward_source = new_source,
+                            add_loss_kwargs = True,
+                        )
+                        print(f"Unsloth: Fast fused linear cross entropy patch for {module}.")
+                        all_standalone_classes[module] = new_module
+                    except Exception as e:
+                        print(f"Unsloth: Failed Fast fused linear cross entropy patch {module} with error = {str(e)}")
                 pass
             pass
         pass
@@ -2458,18 +2511,21 @@ def unsloth_compile_transformers(
             if output is None: continue
 
             init, forward = output
-            new_module = create_standalone_class(
-                module,
-                model_location,
-                functions,
-                fullgraph = False,
-                disable = True,
-                forward_source = forward,
-                add_loss_kwargs = False,
-                new_init = init,
-            )
-            all_standalone_classes[module] = new_module
-            print(f"Unsloth: Patched {module} by adding gradient checkpointing")
+            try:
+                new_module = create_standalone_class(
+                    module,
+                    model_location,
+                    functions,
+                    fullgraph = False,
+                    disable = True,
+                    forward_source = forward,
+                    add_loss_kwargs = False,
+                    new_init = init,
+                )
+                all_standalone_classes[module] = new_module
+                print(f"Unsloth: Patched {module} by adding gradient checkpointing")
+            except Exception as e:
+                print(f"Unsloth: Failed gradient checkpointing patch {module} with error = {str(e)}")
         pass
     pass
 
@@ -2485,16 +2541,19 @@ def unsloth_compile_transformers(
                 continue
             new_source = patch_finfo_attention_mask_dtype_mismatch(module, source)
             if new_source != source:
-                new_module = create_standalone_class(
-                    module,
-                    model_location,
-                    functions,
-                    fullgraph = False,
-                    disable = True,
-                    forward_source = new_source,
-                )
-                all_standalone_classes[module] = new_module
-                print(f"Unsloth: Patched {module} by fixing finfo dtype mismatch in attention mask")
+                try:
+                    new_module = create_standalone_class(
+                        module,
+                        model_location,
+                        functions,
+                        fullgraph = False,
+                        disable = True,
+                        forward_source = new_source,
+                    )
+                    all_standalone_classes[module] = new_module
+                    print(f"Unsloth: Patched {module} by fixing finfo dtype mismatch in attention mask")
+                except Exception as e:
+                    print(f"Unsloth: Failed fixing finfo dtype mismatch in attention in {module} with error = {str(e)}")
             pass
         pass
     pass
@@ -2627,8 +2686,9 @@ def unsloth_compile_transformers(
             parameters = f"def {module}" + parameters + code_section
             print(f"Unsloth: Fixed up function {module}.")
 
-            parameters = \
-                f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
+            if not disable:
+                parameters = \
+                    f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
 
@@ -2660,7 +2720,8 @@ def unsloth_compile_transformers(
                     break
             pass
             if not bad:
-                source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
+                if not disable:
+                    source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(f"Unsloth: Cannot compile function {module} since disabled keyword is in it.")
@@ -2753,13 +2814,16 @@ def unsloth_compile_transformers(
         pass
     pass
     # Quick exit
-    if combined_module is None or disable:
+    if combined_module is None or full_disable:
         print(f"Unsloth: Exit auto compiler with combined_module = {combined_module}, disable = {disable}")
         return
 
     # Import and replace with new module
     for module in all_standalone_classes.keys():
-        exec(f"{model_location}.{module} = combined_module.{module}", globals(), locals())
+        try:
+            exec(f"{model_location}.{module} = combined_module.{module}", globals(), locals())
+        except:
+            pass
     pass
 
     # Finally edit dictionary items inside the target file
@@ -2774,9 +2838,12 @@ def unsloth_compile_transformers(
             found = False
             for replaced_class in replaced_classes:
                 if replaced_class in value:
-                    exec(f"{model_location}.{check}['{key}'] = combined_module.{replaced_class}", globals(), locals())
-                    # print(f"Unsloth: Replacing {check} with {replaced_class}")
-                    break
+                    try:
+                        exec(f"{model_location}.{check}['{key}'] = combined_module.{replaced_class}", globals(), locals())
+                        # print(f"Unsloth: Replacing {check} with {replaced_class}")
+                        break
+                    except:
+                        pass
                 pass
             pass
         pass

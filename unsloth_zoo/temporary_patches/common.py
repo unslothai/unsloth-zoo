@@ -22,6 +22,7 @@ __all__ = [
     "get_torch_compile_options",
     "logger",
     "torch_compile",
+    "_torch_compile",
 ]
 
 import os
@@ -128,17 +129,49 @@ torch_compile_options = get_torch_compile_options(
     coordinate_descent_tuning = False,
     logging = UNSLOTH_ENABLE_LOGGING,
     combo_kernels = False,
-    group_fusion = False,
     memory_planning = False,
     multi_kernel = False,
     use_block_ptr = False,
 )
 
-torch_compile = functools.partial(
-    torch.compile,
-    options = torch_compile_options,
-    disable = UNSLOTH_COMPILE_DISABLE,
-)
+from typing import Any, Callable, TypeVar
+F = TypeVar("F", bound=Callable[..., Any])
+def noop(*args: Any, **kwargs: Any):
+    """
+    A do-nothing decorator/adapter.
+
+    Works as:
+      - @noop
+      - @noop(...)
+      - noop(func, ...)
+    
+    Returns the original function unchanged in every case.
+    """
+    # If used like noop(func, **kwargs) or as @noop on a function,
+    # the first positional arg will be the function. Return it directly.
+    if args and callable(args[0]):
+        return torch.compiler.disable(args[0]) # type: ignore[return-value]
+
+    # Otherwise, used as @noop(...): return a decorator that returns the function unchanged.
+    def _decorator(func: F) -> F:
+        return torch.compiler.disable(func)
+    return _decorator
+pass
+
+if UNSLOTH_COMPILE_DISABLE:
+    torch_compile = noop
+else:
+    torch_compile = functools.partial(
+        torch.compile,
+        options = torch_compile_options,
+    )
+
+if UNSLOTH_COMPILE_DISABLE:
+    _torch_compile = noop
+else:
+    _torch_compile = functools.partial(
+        torch.compile,
+    )
 
 global TEMPORARY_PATCHES
 TEMPORARY_PATCHES = []

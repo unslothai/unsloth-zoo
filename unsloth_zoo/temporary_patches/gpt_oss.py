@@ -20,10 +20,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import inspect
-from .common import TEMPORARY_PATCHES, torch_compile
+from .common import (
+    TEMPORARY_PATCHES,
+    torch_compile,
+    _torch_compile,
+    get_torch_compile_options,
+    UNSLOTH_ENABLE_LOGGING,
+)
 from importlib.metadata import version as importlib_version
 from ..utils import Version
 transformers_version = Version(importlib_version("transformers"))
+has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
     patch_function,
     patch_function_past_key_values,
@@ -32,6 +39,7 @@ from .utils import (
     raise_error,
     logger,
     Cache,
+    process_return,
 )
 from ..hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
@@ -89,6 +97,9 @@ def patch_gpt_oss():
         transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
+
+    if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
 
     try:
         transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
@@ -489,7 +500,7 @@ class GptOssExperts(nn.Module):
             X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
             gate_up = torch.stack(gate_up_list, dim=0)
-            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = X_rep.dtype)
             # gate = gate_up[..., ::2]
             # up_h = gate_up[..., 1::2]
             # gate = gate.clamp(max=self.limit)
@@ -499,8 +510,8 @@ class GptOssExperts(nn.Module):
             out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
             outs = torch.stack(out_list, dim=0)
             rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-            mixed = (outs * rw).sum(dim=0)
-            return mixed.view(batch_size, -1, self.hidden_size)
+            mixed = (outs.to(torch.float32) * rw.to(torch.float32)).sum(dim=0)
+            return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
 pass
 
 class GptOssTopKRouter(nn.Module):
@@ -522,6 +533,102 @@ class GptOssTopKRouter(nn.Module):
         return router_scores, router_indices
 pass
 
+
+# Combo kernels uses too much VRAM for low memory GPUs
+use_combo_kernels = False if torch.cuda.memory.mem_get_info(0)[-1]/1024/1024/1024 <= 40 else True
+fused_torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False, # Too slow
+    shape_padding = True,
+    cudagraphs = True,
+    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    combo_kernels = use_combo_kernels,
+    memory_planning = True,
+    multi_kernel = False, # Fails on torch 2.10 nightly
+    use_block_ptr = True,
+    logging = UNSLOTH_ENABLE_LOGGING,
+)
+no_combo_fused_torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False, # Too slow
+    shape_padding = True,
+    cudagraphs = True,
+    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    combo_kernels = False, # Breaks on attention
+    memory_planning = True,
+    multi_kernel = False, # Fails on torch 2.10 nightly
+    use_block_ptr = True,
+    logging = UNSLOTH_ENABLE_LOGGING,
+)
+
+@_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+def moe_forward_inference(self, hidden_states):
+    """Torch compile for forward inference path only with CUDAGraphs"""
+    # Router
+    router_scores, router_indices = self.router(hidden_states)
+    routing_weights = router_scores
+    moe = self.experts
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, moe.hidden_size)
+
+    num_experts = routing_weights.shape[1]
+    X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+
+    # Gate up projection
+    gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(moe.gate_up_projs)]
+    gate_up = torch.stack(gate_up_list, dim = 0)
+    dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+    fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit, dtype = dtype)
+
+    # Down projection must be done in float32 if not bfloat16 otherwise infinites
+    fused = fused.to(dtype)
+    device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
+    with torch.autocast(device_type=device_type, enabled=False): # Force float32
+        out_list = [down_l(fused[e].to(dtype)) for e, down_l in enumerate(moe.down_projs)]
+    outs = torch.stack(out_list, dim=0)
+
+    rw = routing_weights.to(dtype).transpose(0, 1).unsqueeze(-1)
+    mixed = (outs * rw).sum(dim=0)
+    return mixed.view(batch_size, -1, moe.hidden_size).to(hidden_states.dtype)
+pass
+
+@torch_compile(dynamic = True, fullgraph = True)
+def moe_router_forward(self, hidden_states):
+    hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+    router_logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)  # (seq_len, num_experts)
+    router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+    dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
+    router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
+    router_scores = torch.zeros_like(router_logits, dtype = dtype).scatter_(1, router_indices, router_top_value)
+    return router_scores, router_indices
+pass
+
+# Combo Kernels errors with InductorError: AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
+@_torch_compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
+def moe_forward_inference_bf16(self, hidden_states):
+    router_scores, router_indices = moe_router_forward(self.router, hidden_states)
+    routing_weights = router_scores
+
+    moe = self.experts
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, moe.hidden_size)
+    num_experts = routing_weights.shape[1]
+    hidden_states = hidden_states.repeat(num_experts, 1)
+    hidden_states = hidden_states.view(num_experts, -1, moe.hidden_size)
+    gate_up = torch.bmm(hidden_states, moe.gate_up_proj) + moe.gate_up_proj_bias[..., None, :]
+    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+    gate = gate.clamp(min=None, max=moe.limit)
+    up = up.clamp(min=-moe.limit, max=moe.limit)
+    glu = gate * torch.sigmoid(gate.to(torch.float32) * moe.alpha).to(gate.dtype)
+    next_states = torch.bmm(((up + 1) * glu), moe.down_proj)
+    next_states = next_states + moe.down_proj_bias[..., None, :]
+    next_states = next_states.view(num_experts, batch_size, -1, moe.hidden_size)
+    next_states = next_states * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
+    next_states = next_states.sum(dim=0)
+    return next_states
+pass
+
+
 class GptOssMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -529,6 +636,9 @@ class GptOssMLP(nn.Module):
         self.experts = GptOssExperts(config)
 
     def forward(self, hidden_states):
+        bsz, qlen, hd = hidden_states.shape
+        if qlen == 1 and not self.training:
+            return moe_forward_inference(self, hidden_states), None
         router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
         routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
         return routed_out, router_scores
@@ -588,7 +698,8 @@ def patch_gpt_oss_linearized():
                 X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
                 gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
                 gate_up = torch.stack(gate_up_list, dim=0)
-                fused = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+                dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+                fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
                 # gate = gate_up[..., ::2]
                 # up_h = gate_up[..., 1::2]
                 # gate = gate.clamp(max=self.limit)
@@ -600,13 +711,13 @@ def patch_gpt_oss_linearized():
                 device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
                 with torch.autocast(device_type=device_type, enabled=False): # Force float32
                     out_list = [
-                        down_l(fused[e].to(torch.float32))
+                        down_l(fused[e].to(dtype))
                         for e, down_l in enumerate(self.down_projs)
                     ]
                 outs = torch.stack(out_list, dim=0)
                 rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-                mixed = (outs.to(torch.float32) * rw.to(torch.float32)).sum(dim=0)
-                return mixed.view(batch_size, -1, self.hidden_size).to(outs.dtype)
+                mixed = (outs.to(dtype) * rw.to(dtype)).sum(dim=0)
+                return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
             pass
         pass
         GptOssExperts.forward = forward
@@ -623,16 +734,75 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     try:
-        from ..flex_attention import flex_attention_with_sink
+        from ..flex_attention import (
+            flex_attention_with_sink,
+            is_flex_attention_decoding,
+            flex_attention_with_sink_decoding,
+            flex_attention_add_sinks,
+        )
         assert flex_attention_with_sink is not None
     except Exception as e:
         return raise_error("flex_attention_with_sink", e)
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention
-        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb, repeat_kv
+        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
+
+    torch._dynamo.config.cache_size_limit = 256
+    def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+        num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+        """
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+    F_softmax = torch.nn.functional.softmax
+    F_dropout = nn.functional.dropout
+    matmul = torch.matmul
+    def inplace_eager_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
+
+        bsz, n_heads, qlen, _  = query.shape
+        bsz, n_heads, kvlen, _ = key_states.shape
+        combined_logits = key_states.new_empty((bsz, n_heads, qlen, kvlen+1))
+
+        attn_weights = matmul(query, key_states.transpose(2, 3), out = combined_logits[:,:,:,:kvlen])
+        attn_weights *= scaling
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights += causal_mask
+
+        # sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        # combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+        combined_logits[:, :, :, -1] = module.sinks.reshape(1, -1, 1)
+
+        # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
+        # when training with bsz>1 we clamp max values.
+        # combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        combined_logits[:] = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
+        probs = combined_logits
+        scores = probs[..., :-1]  # we drop the sink here
+        attn_weights = F_dropout(scores, p=dropout, training=module.training, inplace=True)
+        attn_output = matmul(attn_weights, value_states, out = query)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output, None
+    pass
 
     def eager_attention_forward(
         module: nn.Module,
@@ -646,10 +816,11 @@ def patch_GptOssAttention():
     ):
         key_states = repeat_kv(key, module.num_key_value_groups)
         value_states = repeat_kv(value, module.num_key_value_groups)
-        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+        attn_weights = matmul(query, key_states.transpose(2, 3))
+        attn_weights *= scaling
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
+            attn_weights += causal_mask
 
         sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
         combined_logits = torch.cat([attn_weights, sinks], dim=-1)
@@ -657,16 +828,22 @@ def patch_GptOssAttention():
         # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
         # when training with bsz>1 we clamp max values.
         # combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
-        probs = torch.nn.functional.softmax(combined_logits, dim=-1, dtype=torch.float32).to(combined_logits.dtype)
+        combined_logits[:] = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
+        probs = combined_logits
         scores = probs[..., :-1]  # we drop the sink here
-        attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_weights = F_dropout(scores, p=dropout, training=module.training, inplace=True)
+        attn_output = matmul(attn_weights, value_states, out = query)
         attn_output = attn_output.transpose(1, 2).contiguous()
-        return attn_output, attn_weights
+        return attn_output, None
     pass
 
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
-    eager_attention_forward = torch_compile(eager_attention_forward)
+    if Version(torch.__version__) >= Version("2.9.0"):
+        eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
+    else:
+        # Too many recompilation failures on 2.8.0
+        eager_attention_forward = inplace_eager_attention_forward
+
     def forward_function(
         self,
         hidden_states: torch.Tensor,
@@ -683,11 +860,34 @@ def patch_GptOssAttention():
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
         if past_key_value is not None:
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        # flex_attention_with_sink only works for training since KV cache is wrong
+        # switch to flex_attention_with_sink which allows all to work
+        # if is_flex_attention_decoding(self, query_states) and has_static_cache:
+        #     attn_output, logsumexp = flex_attention_with_sink_decoding(
+        #         self,
+        #         query_states,
+        #         key_states,
+        #         value_states,
+        #     )
+        #     attn_output = flex_attention_add_sinks(
+        #         self,
+        #         attn_output,
+        #         logsumexp,
+        #     )
+        # else:
+        #     attn_output = flex_attention_with_sink(
+        #         self,
+        #         query_states,
+        #         key_states,
+        #         value_states,
+        #         attention_mask,
+        #         has_static_cache = has_static_cache,
+        #     )
+        # attn_weights = None
         if self.training:
             attn_output = flex_attention_with_sink(
                 self,
@@ -745,6 +945,351 @@ def patch_GptOssAttention():
 pass
 TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
+
+def patch_GptOssModel():
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel
+        from transformers.models.gpt_oss.modeling_gpt_oss import MoeModelOutputWithPast
+        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
+    try:
+        from transformers.models.gpt_oss.modeling_gpt_oss import DynamicCache
+    except Exception as e:
+        raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
+        DynamicCache = lambda *args, **kwargs: None
+
+    torch._dynamo.config.cache_size_limit = 256
+
+    # Disable mask creations since we don't need them for GPT-OSS
+    import transformers.masking_utils
+    import transformers.generation.utils
+    def wrap(f):
+        def return_attention_mask(*args, **kwargs):
+            if kwargs["input_embeds"].requires_grad:
+                if "attention_mask" in kwargs:
+                    return kwargs["attention_mask"]
+                for arg in args:
+                    if type(arg) is torch.Tensor and arg.dtype == torch.int32:
+                        return arg
+            else:
+                # Eager
+                return f(*args, **kwargs)
+            pass
+        return return_attention_mask
+    pass
+    create_causal_mask = getattr(
+        transformers.masking_utils,
+        "_old_create_causal_mask",
+        "create_causal_mask",
+    )
+    create_sliding_window_causal_mask = getattr(
+        transformers.masking_utils,
+        "_old_create_sliding_window_causal_mask",
+        "create_sliding_window_causal_mask",
+    )
+    if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
+        transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
+        transformers.masking_utils._old_create_sliding_window_causal_mask = _torch_compile(transformers.masking_utils.create_sliding_window_causal_mask, fullgraph = False, dynamic = True)
+        transformers.masking_utils.create_causal_mask = wrap(create_causal_mask)
+        transformers.masking_utils.create_sliding_window_causal_mask = wrap(create_sliding_window_causal_mask)
+        transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask
+        transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = transformers.masking_utils.create_sliding_window_causal_mask
+        transformers.masking_utils.create_masks_for_generate = wrap(transformers.masking_utils.create_masks_for_generate)
+        transformers.generation.utils.create_masks_for_generate = wrap(transformers.generation.utils.create_masks_for_generate)
+        transformers.masking_utils.__patched_causal_mask__ = True
+    pass
+
+    from ..flex_attention import (
+        is_flex_attention_decoding,
+        flex_attention_with_sink_decoding,
+        flex_attention_add_sinks,
+    )
+    apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
+
+    def pre_attention_decoding(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_values is not None:
+            cache_kwargs = {"cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        return query_states, key_states, value_states, input_shape
+    pass
+    # Do flex_attention_with_sink_decoding with cannot be compiled
+    # attn_output, logsumexp = flex_attention_with_sink_decoding(
+    #     self,
+    #     query_states,
+    #     key_states,
+    #     value_states,
+    # )
+    def post_attention_decoding(self_attn, attn_output, logsumexp, input_shape):
+        attn_output = flex_attention_add_sinks(self_attn, attn_output, logsumexp)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self_attn.o_proj(attn_output)
+        return attn_output
+    pass
+
+    # RMSNorm forward
+    def rms_layernorm_forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.square().mean(-1, keepdim=True)
+        variance += self.variance_epsilon
+        hidden_states *= torch.rsqrt_(variance)
+        hidden_states *= self.weight.to(hidden_states.device).to(torch.float32)
+        return hidden_states.to(input_dtype)  # main diff with Llama
+    pass
+
+    # Re-compiling for each new sequence length which is NOT ideal
+    @_torch_compile(dynamic = True, fullgraph = False, mode = "reduce-overhead")
+    def pre_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+    ):
+        hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
+        # Self Attention
+        query_states, key_states, value_states, input_shape = pre_attention_decoding(
+            self=self.self_attn,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+        return query_states, key_states, value_states, input_shape
+    pass
+    fused_torch_compile_options = get_torch_compile_options(
+        epilogue_fusion = True,
+        max_autotune = False, # Too slow
+        shape_padding = True,
+        cudagraphs = True,
+        coordinate_descent_tuning = False,
+        combo_kernels = False,
+        memory_planning = True,
+        multi_kernel = False, # Fails on torch 2.10 nightly
+        use_block_ptr = True,
+        logging = UNSLOTH_ENABLE_LOGGING,
+    )
+    @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    def post_forward(
+        self,
+        residual: torch.Tensor,
+        attn_output: torch.Tensor,
+        logsumexp: torch.Tensor,
+        input_shape,
+    ):
+        hidden_states = post_attention_decoding(self.self_attn, attn_output, logsumexp, input_shape)
+        hidden_states += residual
+
+        # Fully Connected
+        residual = hidden_states.clone()
+        hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
+        return hidden_states, residual
+    pass
+
+    def inference_forward(
+        self,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        use_cache,
+        cache_position,
+        position_embeddings,
+        **kwargs,
+    ):
+        residual = hidden_states.clone()
+        hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states += residual.to(hidden_states.device)
+
+        # Fully Connected
+        residual = hidden_states.clone()
+        hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
+        return hidden_states, residual
+    pass
+    if has_static_cache and Version(torch.__version__) >= Version("2.9.0"):
+        inference_forward = _torch_compile(inference_forward, dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> MoeModelOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if inputs_embeds is None:
+            # Account for CPU offloaded embed_tokens
+            embed_device = self.embed_tokens.weight.device
+            inputs_embeds = self.embed_tokens(input_ids.to(embed_device, non_blocking = True)).to(input_ids.device)
+        if not self.training:
+            inputs_embeds.requires_grad_(False)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        try:
+            torch._dynamo.mark_static (hidden_states, 0)
+            torch._dynamo.mark_dynamic(hidden_states, 1)
+            torch._dynamo.mark_static (hidden_states, 2)
+        except:
+            pass
+
+        # It may already have been prepared by e.g. `generate`
+        if not self.training and not isinstance(attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+            }
+            attention_mask = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
+
+        is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
+        if True:# not is_decoding or not has_static_cache:
+            bsz, qlen, hd = hidden_states.shape
+            if not self.training and qlen == 1 and isinstance(attention_mask, dict):
+                # Add hack since residuals need to clone outside of the torch.compile region??
+                # This forces it to free past residuals
+                torch.compiler.cudagraph_mark_step_begin()
+                for decoder_layer in self.layers:
+                    hidden_states, residual = inference_forward(
+                        decoder_layer,
+                        hidden_states,
+                        attention_mask[decoder_layer.attention_type],
+                        position_ids,
+                        past_key_values,
+                        use_cache,
+                        cache_position,
+                        position_embeddings,
+                        **kwargs,
+                    )
+                    if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
+                        hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
+                    else:
+                        hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
+                    hidden_states += residual
+                pass
+                hidden_states = rms_layernorm_forward(self.norm, hidden_states)
+            else:
+                for decoder_layer in self.layers:
+                    mask = attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask
+                    hidden_states = decoder_layer(
+                        hidden_states,
+                        attention_mask=mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        **kwargs,
+                    )
+                pass
+                hidden_states = self.norm(hidden_states)
+        else:
+            # Add hack since residuals need to clone outside of the torch.compile region??
+            # This forces it to free past residuals
+            torch.compiler.cudagraph_mark_step_begin()
+
+            for decoder_layer in self.layers:
+                residual = hidden_states.clone()
+                query_states, key_states, value_states, input_shape = pre_forward(
+                    decoder_layer,
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                )
+                # Graph Break here - need to investigate how we can fix this
+                attn_output, logsumexp = flex_attention_with_sink_decoding(
+                    decoder_layer.self_attn,
+                    query_states,
+                    key_states,
+                    value_states,
+                )
+                hidden_states, residual = post_forward(
+                    decoder_layer,
+                    residual,
+                    attn_output,
+                    logsumexp,
+                    input_shape,
+                )
+                if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
+                    hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
+                else:
+                    hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
+                hidden_states += residual.to(hidden_states.device)
+            pass
+            hidden_states = rms_layernorm_forward(self.norm, hidden_states)
+        pass
+        # Fix float16 / float32 mismatching
+        hidden_states = hidden_states.to(inputs_embeds.dtype)
+        return process_return(MoeModelOutputWithPast, {
+            "last_hidden_state" : hidden_states,
+            "past_key_values" : past_key_values,
+        })
+    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
+pass
+# Otherwise gibberish
+if Version(torch.__version__) >= Version("2.9.0"):
+    TEMPORARY_PATCHES.append(patch_GptOssModel)
 
 try:
     from openai_harmony import (
