@@ -850,10 +850,6 @@ def patch_GptOssAttention():
                 n_heads = self.config.num_attention_heads
                 n_kv_heads = getattr(self.config, "num_key_value_heads", n_heads)
                 head_dim = self.head_dim
-                print(n_heads)
-                print(n_kv_heads)
-                print(head_dim)
-                print(attention_mask.shape)
                 attn_output = flash_attention_left_padded(
                     self,
                     query_states,

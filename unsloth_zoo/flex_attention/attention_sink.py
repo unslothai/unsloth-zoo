@@ -322,9 +322,8 @@ def flash_attention_left_padded(
     K = key_states.transpose(1, 2)
     V = value_states.transpose(1, 2)
 
-    Q = Q.view(bsz, qlen, n_heads, head_dim)
-    K = K.view(bsz, qlen, n_kv_heads, head_dim)
-    V = V.view(bsz, qlen, n_kv_heads, head_dim)
+    bsz, heads_Q, qlen_Q, dim = Q.shape
+    _, heads_KV, qlen_KV, _ = K.shape
 
     # ---- lengths & cumulative starts (int32 on CUDA) ----
     seqlens = attention_mask.to(dtype=torch.int32, device=device).sum(dim=1)
@@ -335,10 +334,9 @@ def flash_attention_left_padded(
     flat_mask = attention_mask.reshape(-1).to(device=device)
     keep = flat_mask.nonzero(as_tuple=False).squeeze(-1)
 
-    flat_qlen = bsz * qlen
-    Q_flat = Q.reshape(flat_qlen, n_heads, head_dim)
-    K_flat = K.reshape(flat_qlen, n_kv_heads, head_dim)
-    V_flat = V.reshape(flat_qlen, n_kv_heads, head_dim)
+    Q_flat = Q.reshape(bsz * qlen_Q,  n_heads,    head_dim)
+    K_flat = K.reshape(bsz * qlen_KV, n_kv_heads, head_dim)
+    V_flat = V.reshape(bsz * qlen_KV, n_kv_heads, head_dim)
 
     Q_unpad = Q_flat.index_select(0, keep).contiguous()
     K_unpad = K_flat.index_select(0, keep).contiguous()
@@ -382,9 +380,9 @@ def flash_attention_left_padded(
     sink_scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
     attn_output = attn_output * sink_scale.unsqueeze(-1).transpose(0, 1).to(attn_output.dtype)
 
-    out_flat = Q_flat.new_zeros((flat_qlen, n_heads, head_dim))
+    out_flat = Q_flat.new_zeros((bsz * qlen_Q, n_heads, head_dim))
     out_flat[keep] = attn_output
-    attn_output = out_flat.view(bsz, qlen, n_heads, head_dim)
+    attn_output = out_flat.view(bsz, qlen_Q, n_heads, head_dim)
 
     attn_output = attn_output.contiguous()
     return attn_output
