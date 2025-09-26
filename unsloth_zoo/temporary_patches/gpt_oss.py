@@ -884,8 +884,6 @@ pass
 TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 
-global attention_mask_out
-attention_mask_out = None
 def patch_GptOssModel():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     try:
@@ -1144,10 +1142,6 @@ def patch_GptOssModel():
                 # Add hack since residuals need to clone outside of the torch.compile region??
                 # This forces it to free past residuals
                 torch.compiler.cudagraph_mark_step_begin()
-                print(attention_mask[self.layers[0].attention_type], attention_mask[self.layers[1].attention_type])
-                global attention_mask_out
-                attention_mask_out = attention_mask
-                raise
                 for decoder_layer in self.layers:
                     hidden_states, residual = inference_forward(
                         decoder_layer,
