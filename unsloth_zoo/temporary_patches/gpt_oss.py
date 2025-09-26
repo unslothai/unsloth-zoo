@@ -746,9 +746,20 @@ def patch_GptOssAttention():
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention
-        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb, repeat_kv
+        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
+
+    def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+        num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+        """
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
     def eager_attention_forward(
         module: nn.Module,
@@ -784,6 +795,8 @@ def patch_GptOssAttention():
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
     if Version(torch.__version__) >= Version("2.9.0"):
         eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
+    else:
+        eager_attention_forward = _torch_compile(eager_attention_forward, dynamic = True, fullgraph = True)
     def forward_function(
         self,
         hidden_states: torch.Tensor,
