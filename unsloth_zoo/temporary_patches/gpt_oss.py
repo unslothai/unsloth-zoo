@@ -982,13 +982,13 @@ def patch_GptOssModel():
     pass
     create_causal_mask = getattr(
         transformers.masking_utils,
-        "_old_create_causal_mask",
-        getattr(transformers.masking_utils,"create_causal_mask"),
+        "create_causal_mask",
+        getattr(transformers.masking_utils,"_old_create_causal_mask"),
     )
     create_sliding_window_causal_mask = getattr(
         transformers.masking_utils,
-        "_old_create_sliding_window_causal_mask",
-        getattr(transformers.masking_utils, "create_sliding_window_causal_mask"),
+        "create_sliding_window_causal_mask",
+        getattr(transformers.masking_utils, "_old_create_sliding_window_causal_mask"),
     )
     if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
         transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
