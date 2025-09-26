@@ -1160,7 +1160,7 @@ def patch_GptOssModel():
         # It may already have been prepared by e.g. `generate`
         bsz, qlen, hd = hidden_states.shape
         if not self.training and not isinstance(attention_mask, dict):
-            if qlen =f= 1 or not has_flash_attention_forward:
+            if qlen == 1 or not has_flash_attention_forward:
                 mask_kwargs = {
                     "config": self.config,
                     "input_embeds": inputs_embeds,
