@@ -839,7 +839,7 @@ def patch_GptOssAttention():
             attn_weights = None
         else:
             if has_flash_attention_forward:
-                sliding_window = getattr(self_attn, "sliding_window", None)
+                sliding_window = getattr(self, "sliding_window", None)
                 if sliding_window is not None:
                     # GPT-OSS includes attending to current token so minus 1
                     sliding_window = sliding_window - 1
