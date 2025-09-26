@@ -925,6 +925,7 @@ def patch_GptOssModel():
     # Disable mask creations since we don't need them for GPT-OSS
     import transformers.masking_utils
     import transformers.generation.utils
+    has_flash_attention_forward = hasattr(torch.ops.aten, "_flash_attention_forward")
     def wrap(f):
         def return_attention_mask(*args, **kwargs):
             if kwargs["input_embeds"].requires_grad:
@@ -934,8 +935,12 @@ def patch_GptOssModel():
                     if type(arg) is torch.Tensor and arg.dtype == torch.int32:
                         return arg
             else:
-                # Eager
-                return f(*args, **kwargs)
+                bsz, qlen, hd = kwargs["input_embeds"]
+                if qlen == 1:
+                    # Eager
+                    return f(*args, **kwargs)
+                else:
+                    return kwargs["attention_mask"]
             pass
         return return_attention_mask
     pass
@@ -1143,22 +1148,23 @@ def patch_GptOssModel():
             pass
 
         # It may already have been prepared by e.g. `generate`
+        bsz, qlen, hd = hidden_states.shape
         if not self.training and not isinstance(attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-            }
-            attention_mask = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
+            if qlen != 1 or not has_flash_attention_forward:
+                mask_kwargs = {
+                    "config": self.config,
+                    "input_embeds": inputs_embeds,
+                    "attention_mask": attention_mask,
+                    "cache_position": cache_position,
+                    "past_key_values": past_key_values,
+                }
+                attention_mask = {
+                    "full_attention": create_causal_mask(**mask_kwargs),
+                    "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+                }
 
         is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         if True:# not is_decoding or not has_static_cache:
-            bsz, qlen, hd = hidden_states.shape
             if not self.training and qlen == 1 and isinstance(attention_mask, dict):
                 # Add hack since residuals need to clone outside of the torch.compile region??
                 # This forces it to free past residuals
