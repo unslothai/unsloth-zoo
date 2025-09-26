@@ -750,6 +750,7 @@ def patch_GptOssAttention():
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
 
+    torch._dynamo.config.cache_size_limit = 256
     def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         """
         This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -761,6 +762,9 @@ def patch_GptOssAttention():
         hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
         return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+    F_softmax = torch.nn.functional.softmax
+    F_dropout = nn.functional.dropout
+    matmul = torch.matmul
     def eager_attention_forward(
         module: nn.Module,
         query: torch.Tensor,
@@ -773,10 +777,11 @@ def patch_GptOssAttention():
     ):
         key_states = repeat_kv(key, module.num_key_value_groups)
         value_states = repeat_kv(value, module.num_key_value_groups)
-        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+        attn_weights = matmul(query, key_states.transpose(2, 3))
+        attn_weights *= scaling
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
+            attn_weights += causal_mask
 
         sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
         combined_logits = torch.cat([attn_weights, sinks], dim=-1)
@@ -784,12 +789,13 @@ def patch_GptOssAttention():
         # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
         # when training with bsz>1 we clamp max values.
         # combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
-        probs = torch.nn.functional.softmax(combined_logits, dim=-1, dtype=torch.float32).to(combined_logits.dtype)
+        combined_logits[:] = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
+        probs = combined_logits
         scores = probs[..., :-1]  # we drop the sink here
-        attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_weights = F_dropout(scores, p=dropout, training=module.training, inplace=True)
+        attn_output = matmul(attn_weights, value_states, out = query)
         attn_output = attn_output.transpose(1, 2).contiguous()
-        return attn_output, attn_weights
+        return attn_output, None
     pass
 
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
