@@ -20,10 +20,18 @@ from .utils import (
     flex_attention,
     create_block_mask_cached,
     causal_mask,
-    generate_sliding_window,
+    generate_sliding_window_mask,
 )
 
 if HAS_FLEX_ATTENTION:
-    from .attention_sink import flex_attention_with_sink
+    from .attention_sink import (
+        old_flex_attention_with_sink,
+        flex_attention_with_sink,
+        is_flex_attention_decoding,
+        flex_attention_with_sink_decoding,
+        flex_attention_add_sinks,
+        flash_attention_left_padded,
+    )
 else:
+    old_flex_attention_with_sink = None
     flex_attention_with_sink = None

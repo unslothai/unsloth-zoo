@@ -291,16 +291,16 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         if extra_kwargs is None:
             extra_kwargs = {}
         def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states, input_ids, mask, advantages, scaling):
-            new_logits = torch.matmul(new_hidden_states, lm_head.t())
+            new_logits = torch.matmul(new_hidden_states.to(lm_head.dtype), lm_head.t())
             new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             with torch.no_grad():
                 if beta != 0.0:
-                    ref_logits = torch.matmul(ref_hidden_states, lm_head.t())
+                    ref_logits = torch.matmul(ref_hidden_states.to(lm_head.dtype), lm_head.t())
                     ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
                 else:
                     ref_logits = None
                 if old_hidden_states is not None:
-                    old_logits = torch.matmul(old_hidden_states, lm_head.t())
+                    old_logits = torch.matmul(old_hidden_states.to(lm_head.dtype), lm_head.t())
                     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
                 else: 
                     old_logits = None
@@ -453,7 +453,7 @@ def grpo_accumulated_loss(
 
     if not hasattr(trainer, '_autocast_dtype'):
         trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
-        if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = torch.float16
+        if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = None
     pass
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
@@ -475,17 +475,29 @@ def grpo_accumulated_loss(
         completion_input_ids = input_ids[:, -logits_to_keep:]
     
     unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
-    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):  
+
+    # Do not move hidden_states from device 1 to device 0:
+    for module in unwrapped_model.modules():
+        if hasattr(module, "_hf_hook") and hasattr(module._hf_hook, "io_same_decice"):
+            module._hf_hook.io_same_decice = False
+    pass
+
+    # Get autocaster
+    if trainer._autocast_dtype is None:
+        autocaster = nullcontext()
+    else:
+        autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
+    with autocaster:
         if pixel_values is None:
             new_hidden_states = unwrapped_model(
-                    input_ids = input_ids,
-                    attention_mask = attention_mask,
-                    pixel_values = pixel_values,
-                    image_grid_thw = image_grid_thw,
-                    pixel_attention_mask = pixel_attention_mask,
-                    image_sizes = image_sizes,
-                    #logits_to_keep = logits_to_keep + 1,
-                ).logits
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                pixel_values = pixel_values,
+                image_grid_thw = image_grid_thw,
+                pixel_attention_mask = pixel_attention_mask,
+                image_sizes = image_sizes,
+                # logits_to_keep = logits_to_keep + 1,
+            ).logits
 
             #keep extra logit as we generated a new token
             new_hidden_states = new_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
