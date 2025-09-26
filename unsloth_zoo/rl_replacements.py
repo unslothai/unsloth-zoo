@@ -475,9 +475,14 @@ def grpo_accumulated_loss(
         completion_input_ids = input_ids[:, -logits_to_keep:]
     
     unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
+
     # Do not move hidden_states from device 1 to device 0:
-    if hasattr(unwrapped_model, "_hf_hook") and hasattr(unwrapped_model._hf_hook, "io_same_decice"):
-        unwrapped_model._hf_hook.io_same_decice = False
+    for module in unwrapped_model.modules():
+        if hasattr(module, "_hf_hook") and hasattr(module._hf_hook, "io_same_decice"):
+            module._hf_hook.io_same_decice = False
+    pass
+
+    # Get autocaster
     if trainer._autocast_dtype is None:
         autocaster = nullcontext()
     else:
