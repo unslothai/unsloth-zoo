@@ -802,7 +802,8 @@ def patch_GptOssAttention():
     if Version(torch.__version__) >= Version("2.9.0"):
         eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
     else:
-        eager_attention_forward = _torch_compile(eager_attention_forward, dynamic = True, fullgraph = True)
+        # Too many recompilation failures on 2.8.0
+        pass
     def forward_function(
         self,
         hidden_states: torch.Tensor,
