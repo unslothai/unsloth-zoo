@@ -844,9 +844,6 @@ def patch_GptOssAttention():
                 if sliding_window is not None:
                     # GPT-OSS includes attending to current token so minus 1
                     sliding_window = sliding_window - 1
-                print(query_states.shape)
-                print(key_states.shape)
-                print(value_states.shape)
                 n_heads = self.config.num_attention_heads
                 n_kv_heads = getattr(self.config, "num_key_value_heads", n_heads)
                 head_dim = self.head_dim
