@@ -843,9 +843,7 @@ def patch_GptOssAttention():
     else:
         # Too many recompilation failures on 2.8.0
         eager_attention_forward = inplace_eager_attention_forward
-        pass
 
-    eager_attention_forward = inplace_eager_attention_forward
     def forward_function(
         self,
         hidden_states: torch.Tensor,
