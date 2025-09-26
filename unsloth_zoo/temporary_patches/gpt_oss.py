@@ -765,7 +765,7 @@ def patch_GptOssAttention():
     F_softmax = torch.nn.functional.softmax
     F_dropout = nn.functional.dropout
     matmul = torch.matmul
-    def eager_attention_forward(
+    def inplace_eager_attention_forward(
         module: nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -788,10 +788,42 @@ def patch_GptOssAttention():
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights += causal_mask
 
-        bsz, n_heads, qlen, kv_len = attn_weights.shape
         # sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
         # combined_logits = torch.cat([attn_weights, sinks], dim=-1)
         combined_logits[:, :, :, -1] = module.sinks.reshape(1, -1, 1)
+
+        # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
+        # when training with bsz>1 we clamp max values.
+        # combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        combined_logits[:] = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
+        probs = combined_logits
+        scores = probs[..., :-1]  # we drop the sink here
+        attn_weights = F_dropout(scores, p=dropout, training=module.training, inplace=True)
+        attn_output = matmul(attn_weights, value_states, out = query)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output, None
+    pass
+
+    def eager_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
+        attn_weights = matmul(query, key_states.transpose(2, 3))
+        attn_weights *= scaling
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights += causal_mask
+
+        sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        combined_logits = torch.cat([attn_weights, sinks], dim=-1)
 
         # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
         # when training with bsz>1 we clamp max values.
@@ -810,6 +842,7 @@ def patch_GptOssAttention():
         eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
     else:
         # Too many recompilation failures on 2.8.0
+        eager_attention_forward = inplace_eager_attention_forward
         pass
     def forward_function(
         self,
