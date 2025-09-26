@@ -784,7 +784,9 @@ def patch_GptOssAttention():
             attn_weights += causal_mask
 
         sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        print(attn_weights.shape, module.sinks.shape, sinks.shape)
         combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+        print(combined_logits.shape)
 
         # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
         # when training with bsz>1 we clamp max values.
