@@ -737,7 +737,6 @@ def patch_GptOssAttention():
             is_flex_attention_decoding,
             flex_attention_with_sink_decoding,
             flex_attention_add_sinks,
-            flash_attention_left_padded,
         )
         assert flex_attention_with_sink is not None
     except Exception as e:
@@ -783,10 +782,6 @@ def patch_GptOssAttention():
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
     if Version(torch.__version__) >= Version("2.9.0"):
         eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
-
-    has_flash_attention_forward = hasattr(torch.ops.aten, "_flash_attention_forward")
-    major_version, minor_version = torch.cuda.get_device_capability()
-    has_flash_attention_forward = has_flash_attention_forward and major_version >= 8
     def forward_function(
         self,
         hidden_states: torch.Tensor,
@@ -796,7 +791,6 @@ def patch_GptOssAttention():
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        bsz, qlen, hd = hidden_states.shape
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -841,41 +835,20 @@ def patch_GptOssAttention():
             )
             attn_weights = None
         else:
-            if has_flash_attention_forward and qlen != 1:
-                sliding_window = getattr(self, "sliding_window", None)
-                if sliding_window is not None:
-                    # GPT-OSS includes attending to current token so minus 1
-                    sliding_window = sliding_window - 1
-                n_heads = self.config.num_attention_heads
-                n_kv_heads = getattr(self.config, "num_key_value_heads", n_heads)
-                head_dim = self.head_dim
-                attn_output = flash_attention_left_padded(
-                    self,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    is_causal = True,
-                    window_size_left = sliding_window,
-                    dropout_p = 0.0 if not self.training else self.attention_dropout,
-                    scale = self.scaling,
-                )
-                attn_weights = None
-            else:
-                # Weirdly for inference, flex attention returns gibberish
-                # Most likely due to left padding
-                attn_output, attn_weights = eager_attention_forward(
-                    self,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    scaling=self.scaling,
-                    sliding_window=self.sliding_window,
-                    s_aux=self.sinks,  # diff with Llama
-                    **kwargs,
-                )
+            # Weirdly for inference, flex attention returns gibberish
+            # Most likely due to left padding
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                s_aux=self.sinks,  # diff with Llama
+                **kwargs,
+            )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
@@ -931,9 +904,6 @@ def patch_GptOssModel():
     # Disable mask creations since we don't need them for GPT-OSS
     import transformers.masking_utils
     import transformers.generation.utils
-    has_flash_attention_forward = hasattr(torch.ops.aten, "_flash_attention_forward")
-    major_version, minor_version = torch.cuda.get_device_capability()
-    has_flash_attention_forward = has_flash_attention_forward and major_version >= 8
     def wrap(f):
         def return_attention_mask(*args, **kwargs):
             if kwargs["input_embeds"].requires_grad:
@@ -943,11 +913,8 @@ def patch_GptOssModel():
                     if type(arg) is torch.Tensor and arg.dtype == torch.int32:
                         return arg
             else:
-                if kwargs["input_embeds"].shape[-1] == 1:
-                    # Eager
-                    return f(*args, **kwargs)
-                else:
-                    return kwargs["attention_mask"]
+                # Eager
+                return f(*args, **kwargs)
             pass
         return return_attention_mask
     pass
@@ -1155,23 +1122,22 @@ def patch_GptOssModel():
             pass
 
         # It may already have been prepared by e.g. `generate`
-        bsz, qlen, hd = hidden_states.shape
         if not self.training and not isinstance(attention_mask, dict):
-            if qlen == 1 or not has_flash_attention_forward:
-                mask_kwargs = {
-                    "config": self.config,
-                    "input_embeds": inputs_embeds,
-                    "attention_mask": attention_mask,
-                    "cache_position": cache_position,
-                    "past_key_values": past_key_values,
-                }
-                attention_mask = {
-                    "full_attention": create_causal_mask(**mask_kwargs),
-                    "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-                }
+            mask_kwargs = {
+                "config": self.config,
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+            }
+            attention_mask = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
 
         is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         if True:# not is_decoding or not has_static_cache:
+            bsz, qlen, hd = hidden_states.shape
             if not self.training and qlen == 1 and isinstance(attention_mask, dict):
                 # Add hack since residuals need to clone outside of the torch.compile region??
                 # This forces it to free past residuals
