@@ -347,6 +347,7 @@ def patch_model_and_tokenizer(
             if hasattr(param, "_pre_set_compute_dtype"):
                 param.data = param.data.to(param._pre_set_compute_dtype)
             elif param.dtype == torch.bfloat16:
+                print(param.data, param.data.shape, flush = True)
                 param.data = param.data.to(torch.float16)
 
         # Also convert buffers (like position embeddings)
