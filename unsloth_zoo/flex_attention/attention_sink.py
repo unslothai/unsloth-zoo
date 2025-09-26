@@ -153,7 +153,7 @@ def is_flex_attention_decoding(self_attn, query):
 pass
 
 
-def _flex_attention_with_sink(
+def flex_attention_with_sink(
     self_attn,
     query,
     key,
