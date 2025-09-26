@@ -785,7 +785,6 @@ def patch_GptOssAttention():
         eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
 
     has_flash_attention_forward = hasattr(torch.ops.aten, "_flash_attention_forward")
-    has_flash_attention_forward = False
     def forward_function(
         self,
         hidden_states: torch.Tensor,
@@ -927,7 +926,6 @@ def patch_GptOssModel():
     import transformers.masking_utils
     import transformers.generation.utils
     has_flash_attention_forward = hasattr(torch.ops.aten, "_flash_attention_forward")
-    has_flash_attention_forward = False
     def wrap(f):
         def return_attention_mask(*args, **kwargs):
             if kwargs["input_embeds"].requires_grad:
@@ -937,13 +935,11 @@ def patch_GptOssModel():
                     if type(arg) is torch.Tensor and arg.dtype == torch.int32:
                         return arg
             else:
-                print(kwargs["attention_mask"].shape, kwargs["input_embeds"].shape)
-                # bsz, qlen, hd = kwargs["input_embeds"].shape
-                # if qlen == 1:
-                # Eager
-                return f(*args, **kwargs)
-                # else:
-                #     return kwargs["attention_mask"]
+                if kwargs["input_embeds"].shape[-1] == 1:
+                    # Eager
+                    return f(*args, **kwargs)
+                else:
+                    return kwargs["attention_mask"]
             pass
         return return_attention_mask
     pass
