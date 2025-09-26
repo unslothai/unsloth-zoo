@@ -851,7 +851,7 @@ def patch_GptOssAttention():
                     attention_mask,
                     is_causal = True,
                     window_size_left = sliding_window,
-                    dropout = 0.0 if not self.training else self.attention_dropout,
+                    dropout_p = 0.0 if not self.training else self.attention_dropout,
                     scale = self.scaling,
                 )
                 attn_weights = None

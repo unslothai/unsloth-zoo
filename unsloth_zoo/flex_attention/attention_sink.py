@@ -355,7 +355,15 @@ def flash_attention_left_padded(
         kwargs["window_size_right"] = 0  # causal right window
 
     """
-    aten::_flash_attention_forward(Tensor query, Tensor key, Tensor value, Tensor? cum_seq_q, Tensor? cum_seq_k, SymInt max_q, SymInt max_k, float dropout_p, bool is_causal, bool return_debug_mask, *, float? scale=None, SymInt? window_size_left=None, SymInt? window_size_right=None, Tensor? seqused_k=None, Tensor? alibi_slopes=None) -> (Tensor output, Tensor softmax_logsumexp, Tensor rng_state, Tensor unused, Tensor debug_attn_mask)
+    aten::_flash_attention_forward(
+        Tensor query, Tensor key, Tensor value, Tensor?
+        cum_seq_q, Tensor? cum_seq_k,
+        SymInt max_q, SymInt max_k,
+        float dropout_p, bool is_causal, bool return_debug_mask, *,
+        float? scale=None,
+        SymInt? window_size_left=None, SymInt? window_size_right=None,
+        Tensor? seqused_k=None, Tensor? alibi_slopes=None) -> 
+    (Tensor output, Tensor softmax_logsumexp, Tensor rng_state, Tensor unused, Tensor debug_attn_mask)
     """
     attn_output, logsumexp, rng_state, _, _ = torch.ops.aten._flash_attention_forward(
         query = Q_unpad,
