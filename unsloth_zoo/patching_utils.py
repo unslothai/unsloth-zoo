@@ -359,9 +359,9 @@ def patch_model_and_tokenizer(
     pass
 
     # Upcast ot downcast if explicitly set
-    for name, module in model.named_modules():
-        if hasattr(module, "_pre_set_compute_dtype"):
-            module.to(module._pre_set_compute_dtype)
+    # for name, module in model.named_modules():
+    #     if hasattr(module, "_pre_set_compute_dtype"):
+    #         module.to(module._pre_set_compute_dtype)
     pass
 
     # Correct dtype
