@@ -318,12 +318,12 @@ def flash_attention_left_padded(
     n_kv_heads = getattr(self_attn.config, "num_key_value_heads", n_heads)
     head_dim = self_attn.head_dim
 
+    bsz, heads_Q, qlen_Q, dim = query_states.shape
+    _, heads_KV, qlen_KV, _ = key_states.shape
+
     Q = query_states.transpose(1, 2)
     K = key_states.transpose(1, 2)
     V = value_states.transpose(1, 2)
-
-    bsz, heads_Q, qlen_Q, dim = Q.shape
-    _, heads_KV, qlen_KV, _ = K.shape
 
     # ---- lengths & cumulative starts (int32 on CUDA) ----
     seqlens = attention_mask.to(dtype=torch.int32, device=device).sum(dim=1)
