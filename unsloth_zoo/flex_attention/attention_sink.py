@@ -311,7 +311,7 @@ def flash_attention_left_padded(
     scale = None,
 ):
     assert attention_mask.dtype in (torch.int32, torch.int64, torch.bool)
-    device = hidden_states.device
+    device = query_states.device
 
     bsz, qlen = attention_mask.shape
     n_heads = self_attn.config.num_attention_heads
