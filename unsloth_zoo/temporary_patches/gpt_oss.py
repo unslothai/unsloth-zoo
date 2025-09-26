@@ -1143,7 +1143,8 @@ def patch_GptOssModel():
                 # This forces it to free past residuals
                 torch.compiler.cudagraph_mark_step_begin()
                 decoder_layer = self.layers[0]
-                print(attention_mask[decoder_layer.attention_type].shape, position_ids.shape, cache_position.shape,
+                print(attention_mask[self.layers[0].attention_type].shape, attention_mask[self.layers[1].attention_type].shape,
+                        position_ids.shape, cache_position.shape,
                      position_embeddings[0].shape, position_embeddings[1].shape)
                 for decoder_layer in self.layers:
                     hidden_states, residual = inference_forward(
