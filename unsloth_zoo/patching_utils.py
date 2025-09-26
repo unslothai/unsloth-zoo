@@ -348,7 +348,9 @@ def patch_model_and_tokenizer(
                 param.data = param.data.to(param._pre_set_compute_dtype)
             elif param.dtype == torch.bfloat16:
                 print(param.data.shape, flush = True)
-                print(param.data, flush = True)
+                torch.cuda.synchronize(param.data.device)
+                for i in range(param.data.shape[0]):
+                    print(i, param.data[i], flush = True)
                 param.data = param.data.to(torch.float16)
 
         # Also convert buffers (like position embeddings)
