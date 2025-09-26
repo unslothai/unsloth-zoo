@@ -935,7 +935,7 @@ def patch_GptOssModel():
                     if type(arg) is torch.Tensor and arg.dtype == torch.int32:
                         return arg
             else:
-                bsz, qlen, hd = kwargs["input_embeds"]
+                bsz, qlen, hd = kwargs["input_embeds"].shape
                 if qlen == 1:
                     # Eager
                     return f(*args, **kwargs)
