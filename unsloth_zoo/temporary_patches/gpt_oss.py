@@ -1162,9 +1162,7 @@ def patch_GptOssModel():
             past_key_values = DynamicCache(config=self.config)
 
         if inputs_embeds is None:
-            # Account for CPU offloaded embed_tokens
-            embed_device = self.embed_tokens.weight.device
-            inputs_embeds = self.embed_tokens(input_ids.to(embed_device, non_blocking = True)).to(input_ids.device)
+            inputs_embeds = self.embed_tokens(input_ids)
         if not self.training:
             inputs_embeds.requires_grad_(False)
 
