@@ -2235,6 +2235,7 @@ def unsloth_compile_transformers(
                 if x in source_code:
                     can_remove = False
                     break
+            pass
             if can_remove: remove_causal_masks.append(module)
         pass
     pass
