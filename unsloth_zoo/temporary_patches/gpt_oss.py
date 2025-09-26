@@ -780,7 +780,7 @@ def patch_GptOssAttention():
 
         bsz, n_heads, qlen, _  = query.shape
         bsz, n_heads, kvlen, _ = key_states.shape
-        combined_logits = key_states.empty((bsz, n_heads, qlen, kvlen+1))
+        combined_logits = key_states.new_empty((bsz, n_heads, qlen, kvlen+1))
 
         attn_weights = matmul(query, key_states.transpose(2, 3), out = combined_logits[:,:,:,:kvlen])
         attn_weights *= scaling
