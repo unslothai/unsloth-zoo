@@ -51,13 +51,13 @@ from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compi
 
 EMPTY = inspect._empty
 
-def raise_error(f: str, exception: Any):
+def raise_error(f: str, exception: Any = None):
     # Raises error only if logging is on
     if UNSLOTH_ENABLE_LOGGING:
         logger.error(
             f"==================\n"\
             f"Failed to patch {f}. Error\n"\
-            f"{str(exception)}\n"\
+            f"{str(exception) if exception is not None else ''}\n"\
             f"==================\n"
         )
     return
