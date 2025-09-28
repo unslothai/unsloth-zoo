@@ -983,13 +983,17 @@ def patch_GptOssModel():
     create_causal_mask = getattr(
         transformers.masking_utils,
         "_old_create_causal_mask",
-        "create_causal_mask",
+        getattr(transformers.masking_utils, "create_causal_mask", None),
     )
     create_sliding_window_causal_mask = getattr(
         transformers.masking_utils,
         "_old_create_sliding_window_causal_mask",
-        "create_sliding_window_causal_mask",
+        getattr(transformers.masking_utils, "create_sliding_window_causal_mask", None),
     )
+    if create_causal_mask is None:
+        return raise_error("transformers.masking_utils.create_causal_mask")
+    if create_sliding_window_causal_mask is None:
+        return raise_error("transformers.masking_utils.create_sliding_window_causal_mask")
     if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
         transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
         transformers.masking_utils._old_create_sliding_window_causal_mask = _torch_compile(transformers.masking_utils.create_sliding_window_causal_mask, fullgraph = False, dynamic = True)
@@ -1287,9 +1291,7 @@ def patch_GptOssModel():
         })
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
 pass
-# Otherwise gibberish
-if Version(torch.__version__) >= Version("2.9.0"):
-    TEMPORARY_PATCHES.append(patch_GptOssModel)
+TEMPORARY_PATCHES.append(patch_GptOssModel)
 
 try:
     from openai_harmony import (
