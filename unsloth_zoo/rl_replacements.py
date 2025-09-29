@@ -150,6 +150,9 @@ def grpo_compute_loss(
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
     logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
     importance_sampling_level = kwargs.get("importance_sampling_level", "token")
+    num_items_in_batch = kwargs.get("num_items_in_batch", None)
+    current_gradient_accumulation_steps = kwargs.get("current_gradient_accumulation_steps", 1)
+    num_processes = kwargs.get("num_processes", 1)
 
     input_ids = input_ids.unsqueeze(-1)
 
@@ -251,11 +254,17 @@ def grpo_compute_loss(
     # https://github.com/huggingface/trl/blob/e8b8499f1f8d76838155b515e414ee98f757d6d5/trl/trainer/grpo_trainer.py#L1624
     if loss_type == "grpo":
         loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
+        loss = loss / current_gradient_accumulation_steps
     elif loss_type == "bnpo":
         loss = (loss_i * mask).sum() / mask.sum().clamp(min=1.0)
+        loss = loss / current_gradient_accumulation_steps
     elif loss_type == "dr_grpo":
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
-    else:
+        loss = loss / current_gradient_accumulation_steps
+    elif loss_type == "dapo":
+        normalizer = num_items_in_batch/ num_processes
+        loss = (loss_i * mask).sum() / normalizer
+    else: 
         raise ValueError(f"Unknown loss type: {loss_type}")
 
     # loss = (loss_i * mask).sum() / mask.sum()
@@ -446,6 +455,7 @@ def grpo_accumulated_loss(
     image_grid_thw = kwargs.get('image_grid_thw',None)
     pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
     image_sizes = kwargs.get('image_sizes',None)
+
     # Find closest multiple
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
