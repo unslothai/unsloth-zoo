@@ -1163,20 +1163,56 @@ def check_build_requirements():
             missing_packages.append(package)
 
     # Check for libcurl development headers
-    try:
-        result = subprocess.run(['pkg-config', '--exists', 'libcurl'], capture_output=True, text=True)
-        if result.returncode != 0:
-            missing_packages.append('libcurl4-openssl-dev')
-    except Exception:
-        # If pkg-config doesn't exist, check for curl-config
-        try:
-            result = subprocess.run(['curl-config', '--version'], capture_output=True, text=True)
-            if result.returncode != 0:
-                missing_packages.append('libcurl4-openssl-dev')
-        except Exception:
-            missing_packages.append('libcurl4-openssl-dev')
+    is_installed, package_name = check_libcurl_dev()
+    if not is_installed:
+        missing_packages.append(package_name)
 
     return list(set(missing_packages))  # Remove duplicates
+pass
+
+def check_libcurl_dev():
+    """Check if required libcurl dev package is installed (cross-platform)"""
+    system_type = check_linux_type()
+
+    if system_type == "debian":
+        package_name = "libcurl4-openssl-dev"
+        try:
+            result = subprocess.run(['dpkg','-l', package_name], capture_output = True, text = True)
+            is_installed = result.returncode == 0 and 'ii' in result.stdout
+            return is_installed, package_name
+        except Exception:
+            return False, package_name
+
+    elif system_type == "rpm":
+        package_name = "libcurl-dev"    
+        try:
+            result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True)
+            is_installed = result.returncode == 0
+            return is_installed, package_name
+        except Exception:
+            return False, package_name
+
+    return False, "libcurl4-openssl-dev"
+pass
+
+def check_linux_type():
+    """Determine the linux distribution type"""
+    import platform
+
+    system = platform.system().lower()
+
+    if system != "linux":
+        return "unknown"
+
+    # Check if it's Debian/Ubuntu-based:
+    if os.path.exists('/etc/debian_version'):
+        return 'debian'
+
+    # Check if it's RPM-based (CentOS/RHEL/Fedora):
+    elif any(os.path.exists(f) for f in ['/etc/redhat-release', '/etc/fedora-release']):
+        return 'rpm'
+
+    return 'unknown'
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
