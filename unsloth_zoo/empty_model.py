@@ -79,6 +79,8 @@ def compare_attributes(original_model, new_model):
         common_attrs = orig_attrs & new_attrs
         common_buffers = orig_attrs | buffer_names
         for attr in sorted(common_attrs):
+            if attr.startswith('.'):
+                continue
             try:
                 original_val = getattr(original_module, attr)
                 new_val = getattr(module, attr)
