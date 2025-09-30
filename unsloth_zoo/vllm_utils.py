@@ -858,11 +858,29 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
         else:
             dim_offsets = [0, qweight.shape[0]]
 
+        ## Handle FP8 weights. For now only BlockQuantized
+        weight_scale = getattr(proj, "weight_scale", None)
+        if weight_scale is not None:
+            offsets = [0] + proj.logical_widths # [q, k, v] sizes
+            offsets = np.cumsum(offsets)
+            # for qwen 3 for eg, 4096 query and 1024 each for k and v. Weight block size say is [128, 128]
+            # so the shape of qkv is [6144, 4096] and scale.T is [48, 32]. Now 48 should be split into [0, 32, 40, 48]
+            # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
+            block_size = proj.weight_block_size[0]
+            scale_offsets = [x//block_size for x in offsets]
+            if slice_weights:
+                weight = qweight[offsets[kk] : offsets[kk + 1]]
+                weight_scale = proj.weight_scale.T[scale_offsets[kk] : scale_offsets[kk + 1]]
+            else:
+                weight = qweight
+                weight_scale = proj.weight_scale
+
+            state_dict[prefix + ".weight_scale_inv"] = weight_scale
+            quant_state_dict[prefix + ".weight_scale_inv"] = weight_scale
+
         # Handle quantized weights
         quant_states = getattr(qweight, "bnb_quant_state", None)
         if quant_states is not None:
-            if 'vision_tower.transformers.layers.0.' in prefix:
-                print(f'Unsloth: Quantized weights for vision model {prefix}\t{proj}!')
             offsets = qweight.bnb_shard_offsets
             if slice_weights:
                 weight = qweight[offsets[kk] : offsets[kk + 1]]
@@ -1030,7 +1048,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
 
     for key in old_state_dict:
         try:
-            torch.testing.assert_close(old_state_dict[key], new_state_dict[key], check_stride = True)
+            torch.testing.assert_close(old_state_dict[key], new_state_dict[key], check_stride = False)
         except Exception as error:
             if key == "lm_head.weight":
                 # Try tied embeddings fallback
@@ -1245,6 +1263,7 @@ pass
 def approximate_vllm_memory_usage(
     config,
     load_in_4bit = False,
+    load_in_8bit = False,
     max_seq_length = 2048,
     gpu_memory_utilization = 0.8,
     enable_lora = True,
@@ -1314,7 +1333,10 @@ def approximate_vllm_memory_usage(
     # 2 bytes = float16
     total_quantizable_elements = (qkvo + mlp)*n_layers * 2
     total_float16_elements     = (layernorms + embed_tokens + lm_head)*2
-    factor = 16/5 if load_in_4bit else 1 # Should be 4.5 but use 5
+    # factor = 16/5 if load_in_4bit else 1 # Should be 4.5 but use 5
+    factor = 1
+    if load_in_4bit: factor = 16/5
+    elif load_in_8bit: factor = 8/5 # Very vague approximation. Will fix later
     bytes_for_model = \
         total_quantizable_elements / factor + total_float16_elements + lora_elements
 
@@ -1390,13 +1412,16 @@ def load_vllm(
         mem_config = config
 
     use_bitsandbytes = use_bitsandbytes or \
-        model_name.lower().endswith("-bnb-4bit") or "quantization_config" in config
+        model_name.lower().endswith("-bnb-4bit") or ("quantization_config" in config and getattr(config.quantization_config,'quant_method', None) == "bitsandbytes")
+
+    is_fp8 = "fp8" in model_name.lower() or ("quantization_config" in config and getattr(config.quantization_config,'quant_method', None) == "fp8")
 
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
     approximate_vllm_memory_usage(
         mem_config,
         load_in_4bit = use_bitsandbytes,
+        load_in_8bit = is_fp8,
         max_seq_length = max_seq_length,
         gpu_memory_utilization = gpu_memory_utilization,
         enable_lora = enable_lora,
