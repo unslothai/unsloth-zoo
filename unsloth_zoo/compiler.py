@@ -41,6 +41,7 @@ from .utils import (
     is_main_process,
     is_distributed,
     distributed_function,
+    get_lock,
 )
 from .log import logger
 import triton
@@ -284,26 +285,23 @@ def _get_compile_folder(use_tempfile = False):
     global UNSLOTH_COMPILE_USE_TEMP
     if UNSLOTH_COMPILE_USE_TEMP or use_tempfile:
         UNSLOTH_COMPILE_USE_TEMP = True
-        location = os.path.join(tempfile.gettempdir(), UNSLOTH_COMPILE_LOCATION)
-        if not os.path.exists(location):
-            logger.info(
-                f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
-            )
-            os.makedirs(location, exist_ok = True)
+        leaf = os.path.basename(UNSLOTH_COMPILE_LOCATION)
+        location = os.path.join(tempfile.gettempdir(), leaf)
+        logger.info(
+            f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
+        )
+        os.makedirs(location, exist_ok = True)
     else:
         location = UNSLOTH_COMPILE_LOCATION
-        if os.path.exists(location): return location, UNSLOTH_COMPILE_USE_TEMP
         try:
             # Try creating the directory
             os.makedirs(location, exist_ok = True)
-        except:
+            return location, UNSLOTH_COMPILE_USE_TEMP
+        except Exception as e:
+            logger.error(f"Unsloth: Failed to create directory `{UNSLOTH_COMPILE_LOCATION}` because {str(e)}")
+
             # Instead use a temporary location!
-            UNSLOTH_COMPILE_USE_TEMP = True
-            location = os.path.join(tempfile.gettempdir(), location)
-            os.makedirs(location, exist_ok = True)
-            logger.info(
-                f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
-            )
+            location, UNSLOTH_COMPILE_USE_TEMP = _get_compile_folder(use_tempfile = True)
     return location, UNSLOTH_COMPILE_USE_TEMP
 pass
 
@@ -594,11 +592,35 @@ def create_new_function(
 
     # Check location
     def write_file(function_location, write_new_source):
-        with open(function_location, "wb", buffering = 0) as file:
-            file.write(write_new_source.encode("utf-8"))
-            file.flush()
-            os.fsync(file.fileno())
-        return None
+        lock = get_lock(function_location)
+        new_write_bytes = write_new_source.encode("utf-8")
+        try:
+            with lock:
+                # existence check
+                try:
+                    st = os.stat(function_location)
+                except Exception as e:
+                    st = None
+
+                need_write = False
+                if st is None or st.st_size != len(new_write_bytes):
+                    need_write = True
+                else:
+                    with open(function_location, "rb") as f:
+                        need_write = f.read() != new_write_bytes
+
+                if need_write:
+                    with open(function_location, "wb", buffering = 0) as file:
+                        file.write(new_write_bytes)
+                        file.flush()
+                        os.fsync(file.fileno())
+            return None
+        except Exception as e:
+            # consider adding logging to main_process only
+            # counterpoint: we may want to see errors on all processes
+            if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+                logger.error(f"Unsloth: Failed to write file {function_location} because {str(e)}")
+            return None
     pass
 
     if overwrite or not os.path.isfile(function_location):
@@ -621,6 +643,8 @@ def create_new_function(
     new_module = None
 
     def import_module(compile_folder, name):
+        target_name = os.path.join(compile_folder, f"{name}.py")
+        lock = get_lock(target_name)
         # Add directory to sys.path temporarily if it's not already there
         if compile_folder not in sys.path:
             old_path = list(sys.path)
@@ -628,9 +652,15 @@ def create_new_function(
             if name in old_path:
                 raise OSError(f"Unsloth: File {name} already exists")
             sys.path.insert(0, compile_folder)
-        # Try standard import
-        new_module = importlib.import_module(name)
-        return new_module, old_path
+        try:
+            with lock:
+                # Try standard import
+                new_module = importlib.import_module(name)
+                return new_module, old_path
+        except Exception as e:
+            if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+                logger.error(f"Unsloth: Failed to import module {name} because {str(e)}")
+            raise e
     pass
 
     try:
@@ -656,10 +686,12 @@ def create_new_function(
             try:
                 module_name = f"unsloth_cache_{name}"
                 file_location = os.path.join(compile_folder, name) + ".py"
-                spec = importlib.util.spec_from_file_location(module_name, file_location)
-                new_module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = new_module
-                spec.loader.exec_module(new_module)
+                lock = get_lock(file_location)
+                with lock:
+                    spec = importlib.util.spec_from_file_location(module_name, file_location)
+                    new_module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_name] = new_module
+                    spec.loader.exec_module(new_module)
             except Exception as e:
                 raise RuntimeError(f"Direct module loading failed for {name}: {e}")
         pass
