@@ -994,17 +994,17 @@ def patch_GptOssModel():
         return raise_error("transformers.masking_utils.create_causal_mask")
     if create_sliding_window_causal_mask is None:
         return raise_error("transformers.masking_utils.create_sliding_window_causal_mask")
-    if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
-        transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
-        transformers.masking_utils._old_create_sliding_window_causal_mask = _torch_compile(transformers.masking_utils.create_sliding_window_causal_mask, fullgraph = False, dynamic = True)
-        transformers.masking_utils.create_causal_mask = wrap(create_causal_mask)
-        transformers.masking_utils.create_sliding_window_causal_mask = wrap(create_sliding_window_causal_mask)
-        transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask
-        transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = transformers.masking_utils.create_sliding_window_causal_mask
-        transformers.masking_utils.create_masks_for_generate = wrap(transformers.masking_utils.create_masks_for_generate)
-        transformers.generation.utils.create_masks_for_generate = wrap(transformers.generation.utils.create_masks_for_generate)
-        transformers.masking_utils.__patched_causal_mask__ = True
-    pass
+    # if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
+    #     transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
+    #     transformers.masking_utils._old_create_sliding_window_causal_mask = _torch_compile(transformers.masking_utils.create_sliding_window_causal_mask, fullgraph = False, dynamic = True)
+    #     transformers.masking_utils.create_causal_mask = wrap(create_causal_mask)
+    #     transformers.masking_utils.create_sliding_window_causal_mask = wrap(create_sliding_window_causal_mask)
+    #     transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask
+    #     transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = transformers.masking_utils.create_sliding_window_causal_mask
+    #     transformers.masking_utils.create_masks_for_generate = wrap(transformers.masking_utils.create_masks_for_generate)
+    #     transformers.generation.utils.create_masks_for_generate = wrap(transformers.generation.utils.create_masks_for_generate)
+    #     transformers.masking_utils.__patched_causal_mask__ = True
+    # pass
 
     from ..flex_attention import (
         is_flex_attention_decoding,
