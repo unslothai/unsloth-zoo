@@ -1229,6 +1229,10 @@ def patch_GptOssModel():
                 )
                 if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
                     hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
+                elif decoder_layer.mlp.experts.__class__.__name__ == "Mxfp4GptOssExperts":
+                    if mlp_forward is None:
+                        raise RuntimeError("Unsloth: MXFP4 forward is not found")
+                    hidden_states = mlp_forward(decoder_layer.mlp, hidden_states)
                 else:
                     hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
                 hidden_states += residual
