@@ -645,8 +645,8 @@ class GptOssMLP(nn.Module):
 pass
 
 def patch_gpt_oss_linearized():
-    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "")
-    if not model_name.endswith("-bnb-4bit"): return
+    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    if "_load_in_4bit_" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
     except Exception as e:
@@ -733,6 +733,7 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
     try:
         from ..flex_attention import (
             flex_attention_with_sink,
@@ -948,6 +949,7 @@ TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 def patch_GptOssModel():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel
@@ -994,17 +996,17 @@ def patch_GptOssModel():
         return raise_error("transformers.masking_utils.create_causal_mask")
     if create_sliding_window_causal_mask is None:
         return raise_error("transformers.masking_utils.create_sliding_window_causal_mask")
-    # if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
-    #     transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
-    #     transformers.masking_utils._old_create_sliding_window_causal_mask = _torch_compile(transformers.masking_utils.create_sliding_window_causal_mask, fullgraph = False, dynamic = True)
-    #     transformers.masking_utils.create_causal_mask = wrap(create_causal_mask)
-    #     transformers.masking_utils.create_sliding_window_causal_mask = wrap(create_sliding_window_causal_mask)
-    #     transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask
-    #     transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = transformers.masking_utils.create_sliding_window_causal_mask
-    #     transformers.masking_utils.create_masks_for_generate = wrap(transformers.masking_utils.create_masks_for_generate)
-    #     transformers.generation.utils.create_masks_for_generate = wrap(transformers.generation.utils.create_masks_for_generate)
-    #     transformers.masking_utils.__patched_causal_mask__ = True
-    # pass
+    if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
+        transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
+        transformers.masking_utils._old_create_sliding_window_causal_mask = _torch_compile(transformers.masking_utils.create_sliding_window_causal_mask, fullgraph = False, dynamic = True)
+        transformers.masking_utils.create_causal_mask = wrap(create_causal_mask)
+        transformers.masking_utils.create_sliding_window_causal_mask = wrap(create_sliding_window_causal_mask)
+        transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask
+        transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = transformers.masking_utils.create_sliding_window_causal_mask
+        transformers.masking_utils.create_masks_for_generate = wrap(transformers.masking_utils.create_masks_for_generate)
+        transformers.generation.utils.create_masks_for_generate = wrap(transformers.generation.utils.create_masks_for_generate)
+        transformers.masking_utils.__patched_causal_mask__ = True
+    pass
 
     from ..flex_attention import (
         is_flex_attention_decoding,
@@ -1207,33 +1209,83 @@ def patch_GptOssModel():
                 "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
             }
 
-        # is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
-        bsz, qlen, hd = hidden_states.shape
-        if not self.training and qlen == 1 and isinstance(attention_mask, dict):
+        is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
+        if True:# not is_decoding or not has_static_cache:
+            bsz, qlen, hd = hidden_states.shape
+            if not self.training and qlen == 1 and isinstance(attention_mask, dict):
+                # Add hack since residuals need to clone outside of the torch.compile region??
+                # This forces it to free past residuals
+                torch.compiler.cudagraph_mark_step_begin()
+                for decoder_layer in self.layers:
+                    hidden_states, residual = inference_forward(
+                        decoder_layer,
+                        hidden_states,
+                        attention_mask[decoder_layer.attention_type],
+                        position_ids,
+                        past_key_values,
+                        use_cache,
+                        cache_position,
+                        position_embeddings,
+                        **kwargs,
+                    )
+                    if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
+                        hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
+                    else:
+                        hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
+                    hidden_states += residual
+                pass
+                hidden_states = rms_layernorm_forward(self.norm, hidden_states)
+            else:
+                for decoder_layer in self.layers:
+                    mask = attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask
+                    hidden_states = decoder_layer(
+                        hidden_states,
+                        attention_mask=mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        **kwargs,
+                    )
+                pass
+                hidden_states = self.norm(hidden_states)
+        else:
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
             torch.compiler.cudagraph_mark_step_begin()
+
             for decoder_layer in self.layers:
-                hidden_states, residual = inference_forward(
+                residual = hidden_states.clone()
+                query_states, key_states, value_states, input_shape = pre_forward(
                     decoder_layer,
                     hidden_states,
-                    attention_mask[decoder_layer.attention_type],
-                    position_ids,
-                    past_key_values,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                    **kwargs,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                )
+                # Graph Break here - need to investigate how we can fix this
+                attn_output, logsumexp = flex_attention_with_sink_decoding(
+                    decoder_layer.self_attn,
+                    query_states,
+                    key_states,
+                    value_states,
+                )
+                hidden_states, residual = post_forward(
+                    decoder_layer,
+                    residual,
+                    attn_output,
+                    logsumexp,
+                    input_shape,
                 )
                 if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
                     hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
-                elif decoder_layer.mlp.experts.__class__.__name__ == "Mxfp4GptOssExperts":
-                    if mlp_forward is None:
-                        raise RuntimeError("Unsloth: MXFP4 forward is not found")
-                    hidden_states, _ = mlp_forward(decoder_layer.mlp, hidden_states)
                 else:
                     hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
-                hidden_states += residual
+                hidden_states += residual.to(hidden_states.device)
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         pass
