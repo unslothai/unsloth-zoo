@@ -1209,86 +1209,46 @@ def patch_GptOssModel():
                 "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
             }
 
-        is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
-        if True:# not is_decoding or not has_static_cache:
-            bsz, qlen, hd = hidden_states.shape
-            if not self.training and qlen == 1 and isinstance(attention_mask, dict):
-                # Add hack since residuals need to clone outside of the torch.compile region??
-                # This forces it to free past residuals
-                torch.compiler.cudagraph_mark_step_begin()
-                for decoder_layer in self.layers:
-                    hidden_states, residual = inference_forward(
-                        decoder_layer,
-                        hidden_states,
-                        attention_mask[decoder_layer.attention_type],
-                        position_ids,
-                        past_key_values,
-                        use_cache,
-                        cache_position,
-                        position_embeddings,
-                        **kwargs,
-                    )
-                    if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
-                        hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
-                    else:
-                        hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
-                    hidden_states += residual
-                pass
-                hidden_states = rms_layernorm_forward(self.norm, hidden_states)
-            else:
-                for decoder_layer in self.layers:
-                    mask = attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask
-                    hidden_states = decoder_layer(
-                        hidden_states,
-                        attention_mask=mask,
-                        position_ids=position_ids,
-                        past_key_values=past_key_values,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                        position_embeddings=position_embeddings,
-                        **kwargs,
-                    )
-                pass
-                hidden_states = self.norm(hidden_states)
-        else:
+        # is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
+        bsz, qlen, hd = hidden_states.shape
+        if not self.training and qlen == 1 and isinstance(attention_mask, dict):
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
             torch.compiler.cudagraph_mark_step_begin()
-
             for decoder_layer in self.layers:
-                residual = hidden_states.clone()
-                query_states, key_states, value_states, input_shape = pre_forward(
+                hidden_states, residual = inference_forward(
                     decoder_layer,
                     hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
-                # Graph Break here - need to investigate how we can fix this
-                attn_output, logsumexp = flex_attention_with_sink_decoding(
-                    decoder_layer.self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                )
-                hidden_states, residual = post_forward(
-                    decoder_layer,
-                    residual,
-                    attn_output,
-                    logsumexp,
-                    input_shape,
+                    attention_mask[decoder_layer.attention_type],
+                    position_ids,
+                    past_key_values,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
+                    **kwargs,
                 )
                 if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
                     hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
                 else:
                     hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
-                hidden_states += residual.to(hidden_states.device)
+                hidden_states += residual
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
-        pass
+        else:
+            for decoder_layer in self.layers:
+                mask = attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    attention_mask=mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+            pass
+            hidden_states = self.norm(hidden_states)
         # Fix float16 / float32 mismatching
         hidden_states = hidden_states.to(inputs_embeds.dtype)
         return process_return(MoeModelOutputWithPast, {
