@@ -407,7 +407,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             # Scale loss if needed for mixed precision training
             scaled_loss = loss * scaling
             # Must add .loss.detach otherwise autograd uses 2x VRAM
-            return scaled_loss, (loss.detach(), completion_length, mean_kl, delta.detach(), flat_is_ratio.detach())
+            return scaled_loss, (loss.detach(), completion_length, mean_kl, delta, flat_is_ratio)
         pass
 
         device =_new_hidden_states.device
@@ -592,6 +592,7 @@ def grpo_accumulated_loss(
             module._hf_hook.io_same_decice = False
     pass
 
+
     # Get autocaster
     if trainer._autocast_dtype is None:
         autocaster = nullcontext()
@@ -625,7 +626,7 @@ def grpo_accumulated_loss(
                 image_sizes = image_sizes,
                 logits_to_keep = logits_to_keep + 1,
             ).logits
-   
+
     loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
         new_hidden_states,
         old_hidden_states,
