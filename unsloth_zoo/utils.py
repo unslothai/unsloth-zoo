@@ -29,6 +29,9 @@ import os
 import time
 import contextlib
 import re
+import pathlib
+from typing import Optional
+from filelock import FileLock
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -121,6 +124,28 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
         result = function(*args, **kwargs)
     return result
 pass
+
+def _lock_path_for(target: str) -> str:
+    """ str needs to be a valid file path """
+    locks_dir = pathlib.Path(target).parent / ".locks"
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    return str(locks_dir / f".lock.{pathlib.Path(target).name}")
+
+def get_lock(target: str, timeout: Optional[int] = None) -> FileLock:
+    """
+    Get a lock for a target file.
+    target: str, the path to the file to lock
+    timeout: int, the timeout in seconds for the lock
+    If timeout is not provided, it will use the value of
+    the environment variable UNSLOTH_LOCK_TIMEOUT, otherwise 10 seconds.
+
+    Returns:
+        FileLock, the lock for the target file
+    """
+    lock_path = _lock_path_for(target)
+    if timeout is None:
+        timeout = int(os.environ.get("UNSLOTH_LOCK_TIMEOUT", "10"))
+    return FileLock(lock_path, timeout=timeout)
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
