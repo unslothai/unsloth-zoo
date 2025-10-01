@@ -30,9 +30,13 @@ import types
 import __future__
 import builtins as _py_builtins
 import os, gc, time, statistics
+import numpy as np
 import signal
 from contextlib import contextmanager
-import numpy as np
+from functools import wraps
+from typing import Callable, TypeVar, Any, Tuple
+T = TypeVar("T")
+
 class TimeoutError(Exception): pass
 
 
@@ -309,10 +313,54 @@ def time_limit(seconds):
 pass
 
 
-def execute_with_time_limit(timeout = 10, funtion, *args, **kwargs):
-    assert timeout > 0 # 0 does not work
-    with time_limit(timeout):
-        return function(*args, **kwargs)
+@contextmanager
+def time_limit(seconds: float):
+    """
+    Enforce a wall-clock time limit using SIGALRM/ITIMER_REAL.
+    - Works on Unix-like systems, main thread only.
+    - Interrupts many blocking syscalls but not all C extensions.
+    """
+    if seconds <= 0:
+        raise ValueError("Seconds must be > 0")
+
+    if not hasattr(signal, "setitimer"):
+        raise NotImplementedError("time_limit requires Unix setitimer/SIGALRM support")
+
+    def _handler(signum, frame):
+        raise TimeoutError(f"Timed out after {seconds}s")
+
+    old_handler = signal.getsignal(signal.SIGALRM)
+    prev_timer: Tuple[float, float] = signal.getitimer(signal.ITIMER_REAL)
+
+    try:
+        signal.signal(signal.SIGALRM, _handler)
+        signal.setitimer(signal.ITIMER_REAL, seconds)  # start new timer
+        yield
+    finally:
+        # Cancel our timer first, restore handler, then reinstate any previous timer.
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, old_handler)
+        if prev_timer != (0.0, 0.0):
+            # Restore any prior timer that was running before we entered.
+            signal.setitimer(signal.ITIMER_REAL, *prev_timer)
+pass
+
+def execute_with_time_limit(seconds: float) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator factory. Usage:
+        @execute_with_time_limit(10)
+        def my_func(...): ...
+    """
+    if seconds <= 0:
+        raise ValueError("seconds must be > 0")
+
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> T:
+            with time_limit(seconds):
+                return func(*args, **kwargs)
+        return wrapper
+    return decorator
 pass
 
 class Benchmarker:
