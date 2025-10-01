@@ -126,12 +126,66 @@ def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
 pass
 RL_REPLACEMENTS["left_pack_padding"] = left_pack_padding
 
+import torch
+
+def align_logprobs_with_mask(
+    logprob_tensor: torch.Tensor,
+    attention_mask: torch.Tensor,
+    pad_value: float = 0.0
+) -> torch.Tensor:
+    """
+    Aligns a log probability tensor with a given attention mask.
+    """
+
+    device = logprob_tensor.device
+    batch_size, logprob_seq_len = logprob_tensor.shape
+    mask_seq_len = attention_mask.shape[1]
+
+    padded_logprobs = torch.full(
+        attention_mask.shape,
+        fill_value=pad_value,
+        dtype=logprob_tensor.dtype,
+        device=device
+    )
+
+    left_pad_counts = torch.argmax(attention_mask, dim=1)
+
+    cols = torch.arange(logprob_seq_len, device=device)
+
+
+    dest_indices = left_pad_counts.unsqueeze(1) + cols
+
+    # Create destination row indices
+    # Shape: [batch_size, logprob_seq_len]
+    row_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(dest_indices)
+
+    # --- 4. Filter out-of-bounds indices and perform assignment ---
+    # Create a mask to identify only the indices that are within the bounds
+    # of the target tensor's sequence length.
+    valid_mask = dest_indices < mask_seq_len
+
+    # Use this mask to select only the valid row indices, column indices,
+    # and the corresponding values from the logprob tensor.
+    # This flattens the selected elements into 1D tensors.
+    valid_rows = row_indices[valid_mask]
+    valid_cols = dest_indices[valid_mask]
+    valid_vals = logprob_tensor[valid_mask]
+
+    # Place the valid values into their correct positions in the padded tensor
+    # using a single, efficient advanced indexing operation.
+    padded_logprobs[valid_rows, valid_cols] = valid_vals
+
+    return padded_logprobs
+
+RL_REPLACEMENTS["align_logprobs_with_mask_vectorized"] = align_logprobs_with_mask
+
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
 def grpo_compute_loss(
     ref_logits,
     new_logits,
     old_logits,
+    sampling_per_token_logps,
     input_ids,
     mask,
     beta,
@@ -196,6 +250,12 @@ def grpo_compute_loss(
             old = old_x - torch.logsumexp(old_logits, dim = -1)
         pass
     pass
+
+    # if self.use_vllm and self.vllm_importance_sampling_correction:
+    #     importance_sampling_ratio = torch.exp(old - sampling_per_token_logps)
+    #     importance_sampling_ratio = torch.clamp(
+    #         importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+    #     )
 
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
@@ -296,10 +356,10 @@ RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
 class UnslothEfficientGRPO(torch.autograd.Function):
     # All Unsloth Zoo code licensed under LGPLv3
     @staticmethod
-    def forward(ctx, _new_hidden_states, _old_hidden_states, _ref_hidden_states, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None):
+    def forward(ctx, _new_hidden_states, _old_hidden_states, _ref_hidden_states, _sampling_per_token_logps, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None):
         if extra_kwargs is None:
             extra_kwargs = {}
-        def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states, input_ids, mask, advantages, scaling):
+        def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states, sampling_per_token_logps, input_ids, mask, advantages, scaling):
             new_logits = torch.matmul(new_hidden_states.to(lm_head.dtype), lm_head.t())
             new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             with torch.no_grad():
@@ -323,6 +383,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 ref_logits,
                 new_logits,
                 old_logits,
+                sampling_per_token_logps,
                 input_ids,
                 mask,
                 beta,
@@ -346,6 +407,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             new_hidden_states_j,
             old_hidden_states_j,
             ref_hidden_states_j,
+            sampling_per_token_logps_j,
             input_ids_j,
             mask_j,
             advantages_j,
@@ -356,7 +418,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 compute_loss,
                 argnums = (0,),
                 has_aux = True,
-            )(new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j, input_ids_j, mask_j, advantages_j, scaling)
+            )(new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, scaling)
             accumulated_loss             .add_(unscaled_loss)
             accumulated_completion_length.add_(chunk_completion_length)
             accumulated_mean_kl          .add_(chunk_mean_kl)
@@ -381,6 +443,10 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             ref_hidden_states  = torch.chunk(_ref_hidden_states, chunks = n_chunks, dim = 0)
         else: 
             ref_hidden_states = [None] * n_chunks
+        if _sampling_per_token_logps is not None: 
+            sampling_per_token_logps  = torch.chunk(_sampling_per_token_logps, chunks = n_chunks, dim = 0)
+        else:
+            sampling_per_token_logps = [None] * n_chunks
         input_ids          = torch.chunk(_input_ids,         chunks = n_chunks, dim = 0)
         mask               = torch.chunk(_mask,              chunks = n_chunks, dim = 0)
         advantages         = torch.chunk(_advantages,        chunks = n_chunks, dim = 0)
@@ -391,8 +457,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         # Force torch.compile to use dynamic shapes for seqlen dim
         # mark_dynamic = lambda x: torch._dynamo.mark_dynamic(x, 1)
 
-        for (grad_inputs_j, new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j,  input_ids_j, mask_j, advantages_j,) in \
-            zip(grad_inputs_chunks, new_hidden_states, old_hidden_states, ref_hidden_states, input_ids, mask, advantages):
+        for (grad_inputs_j, new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, ) in \
+            zip(grad_inputs_chunks, new_hidden_states, old_hidden_states, ref_hidden_states, sampling_per_token_logps, input_ids, mask, advantages):
 
             # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
 
@@ -407,6 +473,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 new_hidden_states_j,
                 old_hidden_states_j,
                 ref_hidden_states_j,
+                sampling_per_token_logps_j,
                 input_ids_j,
                 mask_j,
                 advantages_j,
@@ -430,7 +497,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, dcompletion_length, dmean_kl):
         (grad_input,) = ctx.saved_tensors
-        return (grad_input, None, None, None, None, None, None, None, None, None, None)
+        return (grad_input, None, None, None, None, None, None, None, None, None, None, None)
     pass
 pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
@@ -455,7 +522,7 @@ def grpo_accumulated_loss(
     image_grid_thw = kwargs.get('image_grid_thw',None)
     pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
     image_sizes = kwargs.get('image_sizes',None)
-
+    sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None)
     # Find closest multiple
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
@@ -469,7 +536,8 @@ def grpo_accumulated_loss(
 
     lm_head = trainer.model.get_output_embeddings().weight
 
-    if pixel_values is None: 
+    if pixel_values is None:
+        #breakpoint() 
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
 
         max_left_pad = max(left_pad_tokens_per_prompt).item()
@@ -479,6 +547,10 @@ def grpo_accumulated_loss(
         completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
 
         completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
+        #TODO given the completion mask here we need to, handle the left pad tokens so the sizes of completion
+        #token or old logprobs are compatible with the importance sampling logprobs
+        sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
+        breakpoint()
         attention_mask =  input_ids != trainer.processing_class.pad_token_id
         attention_mask = attention_mask.to(attention_mask.dtype)
     else: 
@@ -530,6 +602,7 @@ def grpo_accumulated_loss(
         new_hidden_states,
         old_hidden_states,
         ref_hidden_states,
+        sampling_per_token_logps,
         lm_head,
         completion_input_ids,
         completion_mask,
