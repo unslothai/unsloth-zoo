@@ -2343,6 +2343,7 @@ def _test_get_vllm_state_dict(
         trust_remote_code = False,
         attn_implementation = "sdpa",
     )
+    config.model_name = model_name
 
     if not vllm_dynamic_quant_supported(model_name, config):
         raise NotImplementedError(f"Unsloth: Dynamic quant of {model_name} not supported in vLLM")

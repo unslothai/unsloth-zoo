@@ -125,11 +125,11 @@ pass
 def get_quant_type(config):
     quant_config = getattr(config, 'quantization_config', None)
     if quant_config:
+        from transformers.quantizers import AutoQuantizationConfig
         if isinstance(quant_config, dict):
             return quant_config.get('quant_method', None)
-        else:
-            # If for some reason quant_config is an object (say like BitsAndBytesConfig)
-            return getattr(quant_config, 'quant_method', None   )
+        elif isinstance(quant_config, AutoQuantizationConfig):
+            return getattr(quant_config, 'quant_method', None)
     return None
 
 # Unsloth Zoo - Utilities for Unsloth

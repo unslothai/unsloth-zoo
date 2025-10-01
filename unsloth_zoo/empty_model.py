@@ -30,7 +30,8 @@ from copy import deepcopy
 
 def is_comparable(val):
     # Don't treat tensors as comparable, only basic types
-    return isinstance(val, (int, float, bool, str, list, tuple, type(None), torch.dtype))
+    from enum import Enum
+    return isinstance(val, (int, float, bool, str, list, tuple, type(None), torch.dtype, Enum))
 
 def compare_dicts(orig_dict, new_dict, prefix=""):
     all_keys = set(orig_dict.keys()) | set(new_dict.keys())
@@ -158,6 +159,7 @@ def copy_attributes(original_model, new_model):
     # Extract all config keys at any level
     config_keys = _extract_all_config_keys(original_model.config) if hasattr(original_model, 'config') else set()
     config_keys = config_keys | {'config'}
+    extra_attrs = {'hf_quantizer', }
 
     copied_count = 0
     skipped_count = 0
@@ -195,6 +197,8 @@ def copy_attributes(original_model, new_model):
                     # Sometimes the .config in original model is of config class and not a dict. Copy it as is.
                     setattr(module, attr, deepcopy(original_val))
                     copied_count += 1
+                elif attr in extra_attrs:
+                    setattr(module, attr, getattr(original_module, attr))
             except:
                 skipped_count += 1
                 skipped_attrs.append(attr)
@@ -218,7 +222,13 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     try:
         from accelerate import init_empty_weights
         with init_empty_weights():
-            original_meta_model = AutoModelForCausalLM.from_config(config)
+            model_name = getattr(config, 'model_name')
+            if model_name is not None:
+                # This would persist quantization information.
+                print(f'Using {model_name=} found in the config')
+                original_meta_model = AutoModelForCausalLM.from_pretrained(model_name,dtype=config.dtype)
+            else:
+                original_meta_model = AutoModelForCausalLM.from_config(config)
     except Exception as e:
         print(f"Failed to create original_meta_model for AutoModelForCausalLM. Error {e}")
         original_meta_model = None
