@@ -310,7 +310,14 @@ def grpo_compute_loss(
 
     if use_vllm:
         loss_i = loss_i * importance_sampling_ratio     
-    
+        #delta for metric
+        with torch.no_grad():
+            delta = torch.abs(old - sampling_per_token_logps)
+            delta = delta * mask
+            flat_is_ratio = importance_sampling_ratio * mask
+    else:
+        delta = None
+        flat_is_ratio = None
     if beta != 0.0:
         loss_i = loss_i + beta * kl_i
     
@@ -346,7 +353,7 @@ def grpo_compute_loss(
                 mean_kl = mean_kl_per_reward.mean()
                 return completion_length, mean_kl
     completion_length, mean_kl = masked_batch_mean(kl_i)
-    return loss, completion_length, mean_kl
+    return loss, completion_length, mean_kl, delta, flat_is_ratio
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
@@ -385,7 +392,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             # else:
             #     old_logits = None
             # unsloth_zoo/rl_replacements.py
-            loss, completion_length, mean_kl = grpo_compute_loss(
+            loss, completion_length, mean_kl, delta, flat_is_ratio = grpo_compute_loss(
                 ref_logits,
                 new_logits,
                 old_logits,
@@ -400,7 +407,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             # Scale loss if needed for mixed precision training
             scaled_loss = loss * scaling
             # Must add .loss.detach otherwise autograd uses 2x VRAM
-            return scaled_loss, (loss.detach(), completion_length, mean_kl,)
+            return scaled_loss, (loss.detach(), completion_length, mean_kl, delta.detach(), flat_is_ratio.detach())
         pass
 
         device =_new_hidden_states.device
@@ -408,7 +415,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         accumulated_loss              = torch.zeros(1, device = device)
         accumulated_completion_length = torch.zeros(1, device = device)
         accumulated_mean_kl           = torch.zeros(1, device = device)
-
+        accumulated_delta             = []
+        accumulated_flat_is_ratio     = []
         def accumulate_chunk(
             new_hidden_states_j,
             old_hidden_states_j,
@@ -420,7 +428,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             scaling,
             grad_inputs_j,
         ):
-            (chunk_grad_input,), (chunk_loss, (unscaled_loss, chunk_completion_length, chunk_mean_kl,)) = torch.func.grad_and_value(
+            (chunk_grad_input,), (chunk_loss, (unscaled_loss, chunk_completion_length, chunk_mean_kl, chunk_delta, chunk_flat_is_ratio)) = torch.func.grad_and_value(
                 compute_loss,
                 argnums = (0,),
                 has_aux = True,
@@ -428,6 +436,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             accumulated_loss             .add_(unscaled_loss)
             accumulated_completion_length.add_(chunk_completion_length)
             accumulated_mean_kl          .add_(chunk_mean_kl)
+            accumulated_delta            .append(chunk_delta)
+            accumulated_flat_is_ratio    .append(chunk_flat_is_ratio)
             grad_inputs_j[:] = chunk_grad_input
         pass
 
@@ -492,16 +502,21 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         accumulated_loss             .div_(n_chunks)
         accumulated_completion_length.div_(n_chunks)
         accumulated_mean_kl          .div_(n_chunks)
+        if _sampling_per_token_logps is not None:
+            accumulated_delta = torch.cat(accumulated_delta, dim=0)
+            accumulated_flat_is_ratio = torch.cat(accumulated_flat_is_ratio, dim=0)
         ctx.save_for_backward(grad_inputs)
         return (
             accumulated_loss,
             accumulated_completion_length,
             accumulated_mean_kl,
+            accumulated_delta,
+            accumulated_flat_is_ratio
         )
     pass
 
     @staticmethod
-    def backward(ctx, grad_output, dcompletion_length, dmean_kl):
+    def backward(ctx, grad_output, dcompletion_length, dmean_kl, ddelta, ddflat_is_ratio):
         (grad_input,) = ctx.saved_tensors
         return (grad_input, None, None, None, None, None, None, None, None, None, None, None)
     pass
@@ -545,7 +560,6 @@ def grpo_accumulated_loss(
     lm_head = trainer.model.get_output_embeddings().weight
 
     if pixel_values is None:
-        #breakpoint() 
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
 
         max_left_pad = max(left_pad_tokens_per_prompt).item()
@@ -606,7 +620,7 @@ def grpo_accumulated_loss(
                 logits_to_keep = logits_to_keep + 1,
             ).logits
 
-    loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
+    loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
         new_hidden_states,
         old_hidden_states,
         ref_hidden_states,
@@ -621,10 +635,11 @@ def grpo_accumulated_loss(
         kwargs # pass kwargs as a dict
     )
 
+    
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
-    return loss, completion_length, mean_kl
+    return loss, completion_length, mean_kl, delta, flat_is_ratio
     # Old non efficient code path
     new_logits = torch.matmul(new_hidden_states, lm_head.t())
     new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
