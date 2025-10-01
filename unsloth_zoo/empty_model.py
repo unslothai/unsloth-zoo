@@ -54,6 +54,10 @@ def compare_attributes(original_model, new_model):
     type_mismatches = []
     value_mismatches = []
 
+    # Extract all config keys at any level
+    config_keys = _extract_all_config_keys(original_model.config) if hasattr(original_model, 'config') else set()
+    config_keys = config_keys | {'config'}
+
     for (name, module), (orig_name, original_module) in zip(
         new_model.named_modules() if new_model is not None else [],
         original_model.named_modules() if original_model is not None else []
@@ -99,7 +103,9 @@ def compare_attributes(original_model, new_model):
 
             try:
                 if isinstance(original_val, dict) and isinstance(new_val, dict):
-                    compare_dicts(original_val, new_val, prefix=f"{name}.{attr}")
+                    if attr in config_keys:
+                        # only compare those attributes that are relevant
+                        compare_dicts(original_val, new_val, prefix=f"{name}.{attr}")
                 elif original_comparable and new_comparable:
                     if original_val != new_val:
                         value_mismatches.append(f"{name}.{attr}: original {original_val} != new {new_val}")
