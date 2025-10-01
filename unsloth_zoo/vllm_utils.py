@@ -48,7 +48,7 @@ import functools
 import contextlib
 import inspect
 from functools import partial
-from .utils import _get_dtype
+from .utils import _get_dtype, get_quant_type
 from .empty_model import *
 from .hf_utils import (
     dtype_from_config,
@@ -1087,21 +1087,20 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     new_model, original_meta_model, layer_count, layer_names = create_empty_model(config, dtype, is_vision_model)
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
     quantization_config = getattr(config, "quantization_config", {})
-    is_bnb = getattr(quantization_config, 'quant_method', None) == 'bitsandbytes'
-    is_fp8 = getattr(quantization_config, 'quant_method', None) == 'fp8'
+    quant_method = get_quant_type(config)
     kwargs = dict()
     compute_dtype = dtype  # Do not use config file's dtype!
 
     if quantization_config != {} or bnb_config is not None:
         # Get quantization_config flags
         if quantization_config != {}:
-            if is_bnb:
+            if quant_method == 'bitsandbytes':
                 kwargs["compress_statistics"] = quantization_config["bnb_4bit_use_double_quant"]
                 kwargs["quant_type"] = quantization_config["bnb_4bit_quant_type"]
                 kwargs["quant_storage"] = _get_dtype(quantization_config["bnb_4bit_quant_storage"])
-            elif is_fp8:
+            elif quant_method == 'fp8':
                 kwargs['activation_scheme'] = quantization_config['activation_scheme']
-                kwargs['block_size'] = quantization_config['block_size']
+                kwargs['block_size'] = quantization_config['weight_block_size']
 
         # Get bnb_config flags
         elif bnb_config is not None:
@@ -1169,7 +1168,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             pass
 
             if layer_name in quant_state_dict:
-                # for attirbutes of type nn.Parameter, there's no .weight
+                # for attributes of type nn.Parameter, there's no .weight
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
                 layer = torch.nn.Parameter(weight, requires_grad = False)
                 exec(f"new_model.{layer_name_br} = layer")
@@ -1178,11 +1177,11 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 # This denotes that the model if FP8 dynamic quantized.
                 from transformers.integrations.finegrained_fp8 import FP8Linear
                 layer = FP8Linear(in_features=0,out_features=0,bias = has_bias,dtype=dtype,block_size=kwargs['block_size'],device=get_target_device(),activation_scheme=kwargs['activation_scheme'])
-                layer.in_features = in_features
-                layer.out_features = out_features
+                layer.in_features = weight.shape[1]
+                layer.out_features = weight.shape[0]
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
                 layer.bias = bias
-                layer.weight_scale_inv = quant_state_dict[f"{layer_name}.weight_scale_inv"]
+                layer.weight_scale_inv = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale_inv"], requires_grad = False)
 
             elif f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
@@ -1435,10 +1434,11 @@ def load_vllm(
     else:
         mem_config = config
 
+    quant_method = get_quant_type(config)
     use_bitsandbytes = use_bitsandbytes or \
-        model_name.lower().endswith("-bnb-4bit") or ("quantization_config" in config and getattr(config.quantization_config,'quant_method', None) == "bitsandbytes")
+        model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
 
-    is_fp8 = "fp8" in model_name.lower() or ("quantization_config" in config and getattr(config.quantization_config,'quant_method', None) == "fp8")
+    is_fp8 = "fp8" in model_name.lower() or (quant_method == "fp8")
 
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \

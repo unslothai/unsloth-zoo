@@ -122,6 +122,16 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
     return result
 pass
 
+def get_quant_type(config):
+    quant_config = getattr(config, 'quantization_config', None)
+    if quant_config:
+        if isinstance(quant_config, dict):
+            return quant_config.get('quant_method', None)
+        else:
+            # If for some reason quant_config is an object (say like BitsAndBytesConfig)
+            return getattr(quant_config, 'quant_method', None   )
+    return None
+
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
