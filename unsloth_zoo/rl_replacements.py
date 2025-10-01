@@ -316,8 +316,8 @@ def grpo_compute_loss(
             delta = delta * mask
             flat_is_ratio = importance_sampling_ratio * mask
     else:
-        delta = None
-        flat_is_ratio = None
+        delta = torch.tensor([])
+        flat_is_ratio = torch.tensor([])
     if beta != 0.0:
         loss_i = loss_i + beta * kl_i
     
@@ -502,9 +502,13 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         accumulated_loss             .div_(n_chunks)
         accumulated_completion_length.div_(n_chunks)
         accumulated_mean_kl          .div_(n_chunks)
+
         if _sampling_per_token_logps is not None:
             accumulated_delta = torch.cat(accumulated_delta, dim=0)
             accumulated_flat_is_ratio = torch.cat(accumulated_flat_is_ratio, dim=0)
+        else:
+            accumulated_delta = None
+            accumulated_flat_is_ratio = None
         ctx.save_for_backward(grad_inputs)
         return (
             accumulated_loss,
@@ -544,6 +548,8 @@ def grpo_accumulated_loss(
     pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
     image_sizes = kwargs.get('image_sizes',None)
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None)
+    #delete this from kwargs so less issues 
+    del kwargs["sampling_per_token_logps"]
     kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap
     kwargs["use_vllm"] = trainer.use_vllm
     # Find closest multiple
@@ -619,7 +625,7 @@ def grpo_accumulated_loss(
                 image_sizes = image_sizes,
                 logits_to_keep = logits_to_keep + 1,
             ).logits
-
+   
     loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
         new_hidden_states,
         old_hidden_states,
