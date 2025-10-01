@@ -207,7 +207,8 @@ def grpo_compute_loss(
     num_items_in_batch = kwargs.get("num_items_in_batch", None)
     current_gradient_accumulation_steps = kwargs.get("current_gradient_accumulation_steps", 1)
     num_processes = kwargs.get("num_processes", 1)
-
+    use_vllm = kwargs.get("use_vllm", False)
+    vllm_importance_sampling_cap = kwargs.get("vllm_importance_sampling_cap", 2.0)
     input_ids = input_ids.unsqueeze(-1)
 
     # Optional logit softcapping and logit dividing
@@ -251,11 +252,12 @@ def grpo_compute_loss(
         pass
     pass
 
-    # if self.use_vllm and self.vllm_importance_sampling_correction:
-    #     importance_sampling_ratio = torch.exp(old - sampling_per_token_logps)
-    #     importance_sampling_ratio = torch.clamp(
-    #         importance_sampling_ratio, max=self.vllm_importance_sampling_cap
-    #     )
+    if use_vllm:
+        #must filter out extra prompt tokens in begining after making input_ids left padded
+        importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
+        importance_sampling_ratio = torch.clamp(
+            importance_sampling_ratio, max=vllm_importance_sampling_cap
+        )
 
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
@@ -305,9 +307,13 @@ def grpo_compute_loss(
 
     loss_2 = coef_2 * advantages.unsqueeze(1)
     loss_i = -torch.min(loss_1, loss_2)
+
+    if use_vllm:
+        loss_i = loss_i * importance_sampling_ratio     
+    
     if beta != 0.0:
         loss_i = loss_i + beta * kl_i
-
+    
     mask = mask.to(torch.float32)
     n_mask_per_reward = mask.sum(1)
 
@@ -523,6 +529,8 @@ def grpo_accumulated_loss(
     pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
     image_sizes = kwargs.get('image_sizes',None)
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None)
+    kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap
+    kwargs["use_vllm"] = trainer.use_vllm
     # Find closest multiple
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
@@ -549,8 +557,8 @@ def grpo_accumulated_loss(
         completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
         #TODO given the completion mask here we need to, handle the left pad tokens so the sizes of completion
         #token or old logprobs are compatible with the importance sampling logprobs
-        sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
-        breakpoint()
+        if trainer.use_vllm:
+            sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
         attention_mask =  input_ids != trainer.processing_class.pad_token_id
         attention_mask = attention_mask.to(attention_mask.dtype)
     else: 
