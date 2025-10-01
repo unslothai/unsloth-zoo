@@ -37,8 +37,6 @@ from functools import wraps
 from typing import Callable, TypeVar, Any, Tuple
 T = TypeVar("T")
 
-class TimeoutError(Exception): pass
-
 
 @functools.lru_cache
 def _stdlib_names():
@@ -296,20 +294,6 @@ def create_locked_down_function(function):
     # Locks down function so it can see global variables of nothingness
     f = types.FunctionType(f.__code__, {})
     return f
-pass
-
-
-@contextmanager
-def time_limit(seconds):
-    def _handler(signum, frame):
-        raise TimeoutError(f"Timed out after {seconds}s")
-    old = signal.signal(signal.SIGALRM, _handler)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        signal.signal(signal.SIGALRM, old)
 pass
 
 
