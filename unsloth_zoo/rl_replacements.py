@@ -177,7 +177,7 @@ def align_logprobs_with_mask(
 
     return padded_logprobs
 
-RL_REPLACEMENTS["align_logprobs_with_mask_code"] = align_logprobs_with_mask
+RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
 
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
