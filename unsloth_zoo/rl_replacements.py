@@ -316,8 +316,8 @@ def grpo_compute_loss(
             delta = delta * mask
             flat_is_ratio = importance_sampling_ratio * mask
     else:
-        delta = torch.tensor([])
-        flat_is_ratio = torch.tensor([])
+        delta = torch.tensor([]).detach()
+        flat_is_ratio = torch.tensor([]).detach()
     if beta != 0.0:
         loss_i = loss_i + beta * kl_i
     
