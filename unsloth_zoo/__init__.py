@@ -99,5 +99,6 @@ from .temporary_patches import (
 from .rl_environments import (
     check_python_modules,
     create_locked_down_function,
+    execute_with_time_limit,
     Benchmarker,
 )

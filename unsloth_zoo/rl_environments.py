@@ -17,6 +17,7 @@
 __all__ = [
     "check_python_modules",
     "create_locked_down_function",
+    "execute_with_time_limit",
     "Benchmarker",
 ]
 
@@ -305,6 +306,13 @@ def time_limit(seconds):
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, old)
+pass
+
+
+def execute_with_time_limit(timeout = 10, funtion, *args, **kwargs):
+    assert timeout > 0 # 0 does not work
+    with time_limit(timeout):
+        return function(*args, **kwargs)
 pass
 
 class Benchmarker:
