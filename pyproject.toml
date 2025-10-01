@@ -46,6 +46,7 @@ dependencies = [
     "regex",
     "msgspec",
     "typing_extensions",
+    "filelock",
 ]
 
 [tool.setuptools.dynamic]
@@ -79,6 +80,7 @@ huggingface = [
     "regex",
     "msgspec",
     "typing_extensions",
+    "filelock",
 ]
 base = [
     "unsloth_zoo[huggingface]",

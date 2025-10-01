@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.9.13"
+__version__ = "2025.9.14"
 
 import os
 # Hugging Face Hub faster downloads
@@ -95,4 +95,10 @@ del os
 
 from .temporary_patches import (
     encode_conversations_with_harmony,
+)
+from .rl_environments import (
+    check_python_modules,
+    create_locked_down_function,
+    execute_with_time_limit,
+    Benchmarker,
 )
