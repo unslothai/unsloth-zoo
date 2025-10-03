@@ -1064,7 +1064,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     kwargs = dict()
     compute_dtype = dtype  # Do not use config file's dtype!
 
-    if quantization_config != {} or bnb_config is not None:
+    if quantization_config.get("quant_method", "") == "bitsandbytes" or bnb_config is not None:
         # Get quantization_config flags
         if quantization_config != {}:
             kwargs["compress_statistics"] = quantization_config["bnb_4bit_use_double_quant"]
@@ -1389,8 +1389,11 @@ def load_vllm(
     else:
         mem_config = config
 
-    use_bitsandbytes = use_bitsandbytes or \
-        model_name.lower().endswith("-bnb-4bit") or "quantization_config" in config
+    use_bitsandbytes = (
+        use_bitsandbytes or
+        model_name.lower().endswith("-bnb-4bit") or
+        "quantization_config" in config and config.quantization_config["quant_method"] == "bitsandbytes"
+    )
 
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
@@ -1608,12 +1611,22 @@ def load_vllm(
             pass
     pass
 
+    if use_bitsandbytes:
+        quantization = "bitsandbytes"
+        load_format = "bitsandbytes"
+    elif "quantization_config" in config:
+        quantization = config.quantization_config["quant_method"]
+        load_format = "auto"
+    else:
+        quantization = None
+        load_format = "auto"
+
     engine_args = dict(
         model                  = model_name,
         gpu_memory_utilization = actual_gpu_memory_utilization,
         max_model_len          = max_seq_length,
-        quantization           = "bitsandbytes" if use_bitsandbytes else None,
-        load_format            = "bitsandbytes" if use_bitsandbytes else "auto",
+        quantization           = quantization,
+        load_format            = load_format,
         kv_cache_dtype         = "fp8" if float8_kv_cache else "auto",
         dtype                  = dtype,
 
