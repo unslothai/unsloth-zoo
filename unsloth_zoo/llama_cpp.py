@@ -132,18 +132,24 @@ def use_local_gguf():
         logger.debug("Restored original Python environment")
 pass
 
-def install_package(package, sudo = False, print_output = False, print_outputs = None):
+def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
-    x = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+    # Choose package manager based on system type
+    if system_type == "rpm":
+        pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
+        install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
+    else:  # Default to debian/apt-get
+        install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
-        acceptance = input(f"Missing system packages. We need to execute `{x}` - do you accept? Press ENTER. Type NO if not.")
+        acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
         if "no" in str(acceptance).lower():
             raise RuntimeError(
-                f"Unsloth: Execution of `{x}` was cancelled!\n"\
+                f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
                 "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
             )
-    with subprocess.Popen(x, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+    with subprocess.Popen(install_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
 
@@ -154,7 +160,8 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
                     )
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                raise RuntimeError(f"[FAIL] Unsloth: apt-get does not exist when installing {package}? Is this NOT a Linux / Mac based computer?")
+                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
+                raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist when installing {package}? Is this NOT a Linux / Mac based computer?")
             elif "Unable to locate package" in line:
                 sp.terminate()
                 raise RuntimeError(f"[FAIL] Unsloth: Could not install package {package} since it does not exist.")
@@ -165,16 +172,21 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
 pass
 
 
-def do_we_need_sudo():
+def do_we_need_sudo(system_type="debian"):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check apt-get updating
     sudo = False
     print("Unsloth: Updating system package directories")
 
-    x = "apt-get update -y"
+    # Choose update command based on system type
+    if system_type == "rpm":
+        pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
+        update_cmd = f"{pkg_manager} check-update"
+    else:
+        update_cmd = "apt-get update -y"
 
     start_time = time.time()
-    with subprocess.Popen(x, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+    with subprocess.Popen(update_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
             if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
@@ -183,7 +195,8 @@ def do_we_need_sudo():
                 break
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                raise RuntimeError("[FAIL] Unsloth: apt-get does not exist? Is this NOT a Linux / Mac based computer?")
+                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
+                raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist? Is this NOT a Linux / Mac based computer?")
             elif "failure resolving" in line or "Err:" in line:
                 sp.terminate()
                 raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
@@ -195,10 +208,10 @@ def do_we_need_sudo():
     pass
 
     # Update all package lists as well
-    x = f"sudo apt-get update -y"
+    update_cmd_sudo = f"sudo {update_cmd}"
 
     start_time = time.time()
-    with subprocess.Popen(x, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+    with subprocess.Popen(update_cmd_sudo, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
             if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
@@ -237,7 +250,7 @@ def check_pip():
 pass
 
 
-def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None):
+def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
 
     with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, text=True) as sp:
@@ -272,17 +285,17 @@ def try_execute(command, sudo = False, print_output = False, print_outputs = Non
 pass
 
 
-def try_execute_with_auto_install(command, sudo=False, print_output=False, print_outputs=None, cwd = None):
+def try_execute_with_auto_install(command, sudo=False, print_output=False, print_outputs=None, cwd = None, system_type = "debian"):
     """Try to execute a command, and if it fails due to missing package, try to install it"""
     try:
-        try_execute(command, sudo, print_output, print_outputs, cwd)
+        try_execute(command, sudo, print_output, print_outputs, cwd, system_type)
     except RuntimeError as e:
         if "Command not found" in str(e):
             package_name = command.split(" ", 1)[0]
             print(f"Trying to install missing package: {package_name}")
-            install_package(package_name, sudo)
+            install_package(package_name, sudo, print_output, print_outputs, system_type)
             # Retry once
-            try_execute(command, sudo, print_output, print_outputs, cwd)
+            try_execute(command, sudo, print_output, print_outputs, cwd, system_type)
         else:
             raise
 pass
@@ -364,10 +377,9 @@ def install_llama_cpp(
     pass
 
     print_outputs = []
+    missing_packages, system_type = check_build_requirements()
     sudo = do_we_need_sudo()
-    kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs,}
-
-    missing_packages = check_build_requirements()
+    kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs, "system_type": system_type}
 
     if not missing_packages:
         print("Unsloth: All required system packages already installed!")
@@ -375,7 +387,7 @@ def install_llama_cpp(
         packages_to_install = " ".join(missing_packages)
         print(f"Unsloth: Missing packages: {packages_to_install}")
         print(f"Unsloth: Will attempt to install missing system packages.")
-        install_package(packages_to_install, sudo)
+        install_package(packages_to_install, sudo, system_type = system_type)
 
     print("Unsloth: Install llama.cpp and building - please wait 1 to 3 minutes")
     if gpu_support == "ON":
@@ -1153,11 +1165,21 @@ def check_build_requirements():
     }
 
     missing_packages = []
+    system_type = check_linux_type()  # Get system type first
 
     for tool, package in required_tools.items():
         try:
             result = subprocess.run(['which', tool], capture_output=True, text=True)
             if result.returncode != 0:
+                # Adjust package names for RPM-based systems
+                if system_type == "rpm":
+                    rpm_packages = {
+                        'build-essential': 'gcc gcc-c++ make',
+                        'cmake': 'cmake',
+                        'curl': 'curl',
+                        'git': 'git',
+                    }
+                    package = rpm_packages.get(package, package)
                 missing_packages.append(package)
         except Exception:
             missing_packages.append(package)
@@ -1167,7 +1189,7 @@ def check_build_requirements():
     if not is_installed:
         missing_packages.append(package_name)
 
-    return list(set(missing_packages))  # Remove duplicates
+    return list(set(missing_packages)), system_type  # Remove duplicates
 pass
 
 def check_libcurl_dev():
@@ -1184,7 +1206,7 @@ def check_libcurl_dev():
             return False, package_name
 
     elif system_type == "rpm":
-        package_name = "libcurl-dev"    
+        package_name = "libcurl-dev"
         try:
             result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True)
             is_installed = result.returncode == 0
