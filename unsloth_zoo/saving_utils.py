@@ -92,6 +92,7 @@ def find_skipped_quantized_modules(model):
         elif isinstance(module, torch.nn.Linear):
             skipped_modules.append(name)
     return skipped_modules, quantized_modules
+pass
 
 def create_huggingface_repo(
     model,
@@ -191,7 +192,8 @@ def check_if_quantized(module: torch.nn.Module) -> bool:
             # this is an FSDP-specific edge case
             # return weight  # type: ignore
             return False
-        raise TypeError(f"Input weight should be of type nn.Parameter, got {type(weight)} instead")
+        # raise TypeError(f"Input weight should be of type nn.Parameter, got {type(weight)} instead")
+        return False
 
     cls_name = weight.__class__.__name__
     if cls_name not in ("Params4bit", "Int8Params"):
@@ -428,9 +430,9 @@ def _merge_and_overwrite_lora(
     mm = None
     header_metadata = None
     length_of_header = 0
+
     # Only if overwriting
     try:
-
         # Memory map the file for direct access
         raw_pointer = open(filename_original, "r+b")
         mm = mmap.mmap(raw_pointer.fileno(), length=0, access=mmap.ACCESS_WRITE)
@@ -445,7 +447,10 @@ def _merge_and_overwrite_lora(
 
             # Update converted_lora_weights with actual safetensor keys
             converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-                lora_weights, safetensor_keys, model_class_name=model_class_name)
+                lora_weights,
+                safetensor_keys,
+                model_class_name = model_class_name,
+            )
 
             processed_mxfp4_keys = set()
 
@@ -466,7 +471,7 @@ def _merge_and_overwrite_lora(
                     if UNSLOTH_ENABLE_LOGGING:
                         logger.info(f"[DEBUG] Preserving MXFP4 tensor: {key}")
                     continue
-
+                pass
 
                 output_key = key
                 action_logged = False
@@ -493,8 +498,9 @@ def _merge_and_overwrite_lora(
 
                 del W
                 torch.cuda.empty_cache()
-
+            pass
             # Success! Direct overwrite completed
+        pass
         mm.flush()
         mm.close()
         raw_pointer.close()
@@ -533,14 +539,20 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
 
     # Convert lora_weights to safetensor format
     converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-        lora_weights, [], model_class_name=model_class_name)
+        lora_weights,
+        [],
+        model_class_name = model_class_name,
+    )
 
     with safe_open(filename_original, framework="pt", device="cpu") as file:  # Open original file for reading
         safetensor_keys = list(file.keys())
 
         # Update converted_lora_weights with actual safetensor keys
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-            lora_weights, safetensor_keys, model_class_name=model_class_name)
+            lora_weights,
+            safetensor_keys,
+            model_class_name = model_class_name,
+        )
 
         # Set to track mxfp4 keys that have already been processed
         processed_mxfp4_keys = set()
@@ -1050,7 +1062,7 @@ def merge_and_overwrite_lora(
 
         print("Unsloth: Merged 4bit model process completed.")
         return save_directory # <<<--- EARLY RETURN for 4-bit path
-
+    pass
 
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
@@ -1060,10 +1072,10 @@ def merge_and_overwrite_lora(
     elif save_method == "mxfp4":
         from transformers import AutoConfig
         model_config = AutoConfig.from_pretrained(
-                model_name,
-                token = None,
-                trust_remote_code = False,
-            )
+            model_name,
+            token = None,
+            trust_remote_code = False,
+        )
         model_config.save_pretrained(save_directory)
         # Remove the quantization_config in the config.json file if it exists,
     # as we are exporting the model in 16-bit format.
@@ -1195,8 +1207,8 @@ def merge_and_overwrite_lora(
 
         index_data = {"metadata": {}, "weight_map": weight_map}
         index_path = os.path.join(save_directory, "model.safetensors.index.json")
-        with open(index_path, "w", encoding="utf-8") as f:
-            json.dump(index_data, f, indent=4)
+        with open(index_path, "w", encoding = "utf-8") as f:
+            json.dump(index_data, f, indent = 4)
 
         if push_to_hub:
             upload_items("model.safetensors.index.json")
@@ -1277,7 +1289,7 @@ def _try_copy_all_from_cache(
 
     try:
         # Create target directory using os.makedirs
-        os.makedirs(target_dir_str, exist_ok=True)
+        os.makedirs(target_dir_str, exist_ok = True)
         if not os.access(target_dir_str, os.W_OK | os.X_OK):
              raise PermissionError(f"No write/execute permission for target directory: {target_dir_str}")
     except Exception as dir_err:
@@ -1285,7 +1297,7 @@ def _try_copy_all_from_cache(
         return False
 
     all_copied = True
-    for filename, cached_path in cached_paths_map.items():
+    for filename, cached_path in ProgressBar(cached_paths_map.items(), desc = f"Unsloth: Copying {len(filenames_to_check)} files from cache to {target_dir_str}."):
         try:
             # Pass string target_dir_str to copy helper
             _copy_file_from_source(cached_path, target_dir_str, filename)
@@ -1295,6 +1307,7 @@ def _try_copy_all_from_cache(
         except Exception as e:
             print(f"Cache copy failed: An unexpected error occurred copying {filename}: {e}")
             all_copied = False; break
+    pass
 
     if all_copied:
         print(f"Successfully copied all {len(filenames_to_check)} files from cache to {target_dir_str}.")
@@ -1356,6 +1369,7 @@ def _get_hf_cache_dir() -> Optional[Path]:
     # If none of the paths worked
     print("No existing and accessible Hugging Face cache directory found.")
     return None
+pass
 
 
 _PUSHING_CODE = \
