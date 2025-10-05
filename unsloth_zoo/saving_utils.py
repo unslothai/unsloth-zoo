@@ -939,120 +939,130 @@ def merge_and_overwrite_lora(
     # Directly downloads 16bit original weights and merges LoRA
     inner_model = model.base_model.model if isinstance(model, PeftModel) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
-    if not isinstance(model, PeftModel):
-        warnings.warn("Model is not a PeftModel (no Lora adapters detected). Skipping Merge. Please use save_pretrained() or push_to_hub() instead!")
-        return None
-    try:
-        model_name = get_model_name(model.config._name_or_path, load_in_4bit = False)
-    except:
-        model_name = model.config._name_or_path
-
-    final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
-    if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method == "merged_16bit":
-        warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
-        return None
-    if final_model_name is None:
-        warnings.warn(f"Model {model_name} not found locally or on HuggingFace")
-        return None
     model_name = final_model_name
     safetensors_list = []
     max_size_in_bytes = 0
     total_size_in_bytes = 0
     config = model.config
 
-    # Handle case for local model where config._name_or_path is a local os path
-    # https://github.com/unslothai/unsloth/issues/2140
-    is_local_path = False
-    if os.path.exists(model_name) and os.path.isdir(model_name):
-        is_local_path = True
-        print(f"Detected local model directory: {model_name}")
-
-        # Get safetensors files from local directory
-        for file in os.listdir(model_name):
-            if file.endswith(".safetensors"):
-                safetensors_list.append(file)
-                file_path = os.path.join(model_name, file)
-                file_size = os.path.getsize(file_path)
-                max_size_in_bytes = max(max_size_in_bytes, file_size)
-                total_size_in_bytes += file_size
-
-        # Check for index file
-        index_path = os.path.join(model_name, "model.safetensors.index.json")
-        if os.path.exists(index_path):
+    for _ in range(2):
+        if not isinstance(model, PeftModel):
+            warnings.warn("Model is not a PeftModel (no Lora adapters detected). Skipping Merge. Please use save_pretrained() or push_to_hub() instead!")
+            return None
+        # Must add check since 2nd loop might have got a new model name eg MXFP4 gpt-oss-20b-BF16
+        if len(safetensors_list) == 0:
             try:
-                with open(index_path, 'r', encoding = "utf-8") as f:
-                    index_data = json.load(f)
-                    # Extract file names from the index if available
-                    if "weight_map" in index_data:
-                        # Get unique filenames from weight map
-                        indexed_files = set(index_data["weight_map"].values())
-                        # Only use these if we didn't find files directly
-                        if not safetensors_list:
-                            safetensors_list = list(indexed_files)
-                            # Need to compute sizes for these files
-                            for file in safetensors_list:
-                                file_path = os.path.join(model_name, file)
-                                if os.path.exists(file_path):
-                                    file_size = os.path.getsize(file_path)
-                                    max_size_in_bytes = max(max_size_in_bytes, file_size)
-                                    total_size_in_bytes += file_size
-            except Exception as e:
-                print(f"Warning: Could not process index file: {e}")
-    else:
-        # Original HF repo logic
-        try:
-            file_list = HfFileSystem(token = token).ls(model_name, detail = True)
-        except:
-            original_model_id = get_original_model_id(model_name)
-            model_name = original_model_id
-            if original_model_id is None:
-                raise ValueError(f"Could not determine original model ID from {model_name}. "
-                                "If using a local model, ensure the path exists and contains safetensors files.")
-            file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+                model_name = get_model_name(model.config._name_or_path, load_in_4bit = False)
+            except:
+                model_name = model.config._name_or_path
+        pass
 
-        # Process HF file listing
-        for x in file_list:
-            if not x["name"].endswith(".safetensors"): continue
-            safetensors_list.append(os.path.split(x["name"])[-1])
-            max_size_in_bytes = max(max_size_in_bytes, x["size"])
-            total_size_in_bytes += x["size"]
+        final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
+        if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method == "merged_16bit":
+            warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
+            return None
+        if final_model_name is None:
+            warnings.warn(f"Model {model_name} not found locally or on HuggingFace")
+            return None
 
-    if not safetensors_list:
-         raise RuntimeError(f"No '.safetensors' files found for the base model: {model_name}")
-    assert(max_size_in_bytes != 0 and total_size_in_bytes != 0)
+        # Handle case for local model where config._name_or_path is a local os path
+        # https://github.com/unslothai/unsloth/issues/2140
+        is_local_path = False
+        if os.path.exists(model_name) and os.path.isdir(model_name):
+            is_local_path = True
+            print(f"Detected local model directory: {model_name}")
 
-    (
-        username, repo_id, hf_api, token,
-        output_dtype, element_size,
-        lora_weights, state_dict, save_size, free,
-        temp_file, save_directory, new_use_temp_file,
-        low_disk_space_usage, max_shard_size_in_bytes,
-    ) = prepare_saving(
-        model = model,
-        save_directory = save_directory,
-        push_to_hub = push_to_hub,
-        max_shard_size = "5GB",
-        private = private,
-        token = token,
-        output_dtype = output_dtype,
-        low_disk_space_usage = low_disk_space_usage,
-        merge_into_original = True,
-        min_size_in_bytes = max_size_in_bytes,
-        use_temp_file = use_temp_file,
-    )
-    use_temp_file = use_temp_file or new_use_temp_file
-    _save_dir_path = Path(save_directory)
+            # Get safetensors files from local directory
+            for file in os.listdir(model_name):
+                if file.endswith(".safetensors"):
+                    safetensors_list.append(file)
+                    file_path = os.path.join(model_name, file)
+                    file_size = os.path.getsize(file_path)
+                    max_size_in_bytes = max(max_size_in_bytes, file_size)
+                    total_size_in_bytes += file_size
 
-    # Extra path for gpt-oss-20b-BF16 -> if only attention layers are provided
-    all_lora_keys = "\n".join(lora_weights.keys())
-    only_attention_loras = all_lora_keys.count("self_attn") == (all_lora_keys.count("\n") + 1)
-    if only_attention_loras and save_method == "mxfp4" and model_name.endswith("-BF16"):
-        # Check if we have a non -BF16 version which might be MXFP4
-        try:
-            model_name = get_model_name(model_name.removesuffix("-BF16"), load_in_4bit = False)
-            print(f"Unsloth: Found MXFP4 variant = `{model_name}`")
-        except:
-            pass
+            # Check for index file
+            index_path = os.path.join(model_name, "model.safetensors.index.json")
+            if os.path.exists(index_path):
+                try:
+                    with open(index_path, 'r', encoding = "utf-8") as f:
+                        index_data = json.load(f)
+                        # Extract file names from the index if available
+                        if "weight_map" in index_data:
+                            # Get unique filenames from weight map
+                            indexed_files = set(index_data["weight_map"].values())
+                            # Only use these if we didn't find files directly
+                            if not safetensors_list:
+                                safetensors_list = list(indexed_files)
+                                # Need to compute sizes for these files
+                                for file in safetensors_list:
+                                    file_path = os.path.join(model_name, file)
+                                    if os.path.exists(file_path):
+                                        file_size = os.path.getsize(file_path)
+                                        max_size_in_bytes = max(max_size_in_bytes, file_size)
+                                        total_size_in_bytes += file_size
+                except Exception as e:
+                    print(f"Warning: Could not process index file: {e}")
+        else:
+            # Original HF repo logic
+            try:
+                file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+            except:
+                original_model_id = get_original_model_id(model_name)
+                model_name = original_model_id
+                if original_model_id is None:
+                    raise ValueError(f"Could not determine original model ID from {model_name}. "
+                                    "If using a local model, ensure the path exists and contains safetensors files.")
+                file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+
+            # Process HF file listing
+            for x in file_list:
+                if not x["name"].endswith(".safetensors"): continue
+                safetensors_list.append(os.path.split(x["name"])[-1])
+                max_size_in_bytes = max(max_size_in_bytes, x["size"])
+                total_size_in_bytes += x["size"]
+
+        if not safetensors_list:
+             raise RuntimeError(f"No '.safetensors' files found for the base model: {model_name}")
+        assert(max_size_in_bytes != 0 and total_size_in_bytes != 0)
+
+        (
+            username, repo_id, hf_api, token,
+            output_dtype, element_size,
+            lora_weights, state_dict, save_size, free,
+            temp_file, save_directory, new_use_temp_file,
+            low_disk_space_usage, max_shard_size_in_bytes,
+        ) = prepare_saving(
+            model = model,
+            save_directory = save_directory,
+            push_to_hub = push_to_hub,
+            max_shard_size = "5GB",
+            private = private,
+            token = token,
+            output_dtype = output_dtype,
+            low_disk_space_usage = low_disk_space_usage,
+            merge_into_original = True,
+            min_size_in_bytes = max_size_in_bytes,
+            use_temp_file = use_temp_file,
+        )
+        use_temp_file = use_temp_file or new_use_temp_file
+        _save_dir_path = Path(save_directory)
+
+        # Extra path for gpt-oss-20b-BF16 -> if only attention layers are provided
+        all_lora_keys = "\n".join(lora_weights.keys())
+        only_attention_loras = all_lora_keys.count("self_attn") == (all_lora_keys.count("\n") + 1)
+        if only_attention_loras and save_method == "mxfp4" and model_name.endswith("-BF16"):
+            # Check if we have a non -BF16 version which might be MXFP4
+            try:
+                model_name = get_model_name(model_name.removesuffix("-BF16"), load_in_4bit = False)
+                print(f"Unsloth: Found MXFP4 variant = `{model_name}`")
+                # Re-get all meta-data from scratch
+                continue
+            except:
+                pass
+        pass
+        # Stop loop and continue
+        break
     pass
 
     n_saved_modules = 0
