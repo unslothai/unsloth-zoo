@@ -740,3 +740,56 @@ def patch_MllamaVisionEncoderLayer():
 
 pass
 TEMPORARY_PATCHES.append(patch_MllamaVisionEncoderLayer)
+
+
+# Patch Siglip for forced float32 / float16 only
+def patch_SiglipEncoderLayer():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.siglip.modeling_siglip
+    except Exception as e:
+        return raise_error("transformers.models.siglip.modeling_siglip", e)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        output_attentions: Optional[bool] = False,
+    ) -> tuple[torch.FloatTensor]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`):
+                Input to the layer of shape `(batch, seq_len, embed_dim)`.
+            attention_mask (`torch.FloatTensor`):
+                Attention mask of shape `(batch, 1, q_len, k_v_seq_len)` where padding elements are indicated by very large negative values.
+            output_attentions (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+        """
+        hidden_states = hidden_states.to(torch.float32)
+        residual = hidden_states
+
+        hidden_states = self.layer_norm1(hidden_states)
+        hidden_states, attn_weights = self.self_attn(
+            hidden_states=hidden_states.to(torch.float16),
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+        )
+        hidden_states = hidden_states.to(torch.float32)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.layer_norm2(hidden_states)
+        hidden_states = self.mlp(hidden_states.to(torch.float16))
+        hidden_states = hidden_states.to(torch.float32)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (attn_weights,)
+
+        return outputs
+    pass
+    patch_function(transformers.models.siglip.modeling_siglip.SiglipEncoderLayer, "forward", forward)
+pass
+TEMPORARY_PATCHES.append(patch_SiglipEncoderLayer)
