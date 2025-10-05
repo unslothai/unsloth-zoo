@@ -1009,6 +1009,7 @@ def merge_and_overwrite_lora(
         temp_file, save_directory, new_use_temp_file,
         low_disk_space_usage, max_shard_size_in_bytes,
     ]
+    raise
 
     n_saved_modules = 0
     def upload_items(filename = None):
