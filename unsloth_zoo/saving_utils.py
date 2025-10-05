@@ -948,12 +948,10 @@ def merge_and_overwrite_lora(
         if not isinstance(model, PeftModel):
             warnings.warn("Model is not a PeftModel (no Lora adapters detected). Skipping Merge. Please use save_pretrained() or push_to_hub() instead!")
             return None
-        # Must add check since 2nd loop might have got a new model name eg MXFP4 gpt-oss-20b-BF16
-        if len(safetensors_list) == 0:
-            try:
-                model_name = get_model_name(model.config._name_or_path, load_in_4bit = False)
-            except:
-                model_name = model.config._name_or_path
+        try:
+            model_name = get_model_name(model.config._name_or_path, load_in_4bit = False)
+        except:
+            model_name = model.config._name_or_path
         pass
 
         final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
@@ -1057,6 +1055,9 @@ def merge_and_overwrite_lora(
                 model_name = get_model_name(model_name.removesuffix("-BF16"), load_in_4bit = False)
                 print(f"Unsloth: Found MXFP4 variant = `{model_name}`")
                 # Re-get all meta-data from scratch
+                safetensors_list = []
+                max_size_in_bytes = 0
+                total_size_in_bytes = 0
                 continue
             except:
                 pass
