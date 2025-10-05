@@ -877,8 +877,49 @@ def _remove_quantization_config(config_path: Path):
     pass
 pass
 
-global all_data
-all_data = []
+def fix_tokenizer_config_json(tokenizer, saved_folder):
+    # Add "chat_template" to tokenizer_config.json
+    tokenizer_config_path = os.path.join(saved_folder, "tokenizer_config.json")
+    if os.path.exists(tokenizer_config_path) and tokenizer is not None:
+        old_chat_template = getattr(tokenizer, "chat_template", None)
+        if old_chat_template is not None:
+            try:
+                with open(tokenizer_config_path, "r") as f:
+                    f = json.load(f)
+                if "chat_template" not in f or f["chat_template"] is None:
+                    f["chat_template"] = tokenizer.chat_template
+                with open(tokenizer_config_path, "w") as new_f:
+                    json.dump(f, new_f, indent = 2, ensure_ascii = False)
+            except:
+                pass
+        pass
+
+        # Remove chat_template if NULL
+        try:
+            with open(tokenizer_config_path, "r") as f:
+                f = json.load(f)
+            if "chat_template" in f and (f["chat_template"] == "" or f["chat_template"] is None):
+                del f["chat_template"]
+            with open(tokenizer_config_path, "w") as new_f:
+                json.dump(f, new_f, indent = 2, ensure_ascii = False)
+        except:
+            pass
+    pass
+    # Fix config.json using torch_dtype / dtype
+    config_file_path = os.path.join(saved_folder, "config.json")
+    if os.path.exists(config_file_path):
+        try:
+            with open(config_file_path, "r") as f:
+                data = f.read()
+            data = data.replace('"dtype"', '"torch_dtype"')
+            data = data.replace("'dtype'", "'torch_dtype'")
+            with open(config_file_path, "w") as f:
+                f.write(data)
+        except:
+            pass
+    return
+pass
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -907,7 +948,7 @@ def merge_and_overwrite_lora(
         model_name = model.config._name_or_path
 
     final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
-    if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method== "merged_16bit":
+    if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method == "merged_16bit":
         warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
         return None
     if final_model_name is None:
@@ -1001,15 +1042,18 @@ def merge_and_overwrite_lora(
     )
     use_temp_file = use_temp_file or new_use_temp_file
     _save_dir_path = Path(save_directory)
-    global all_data
-    all_data = [
-        username, repo_id, hf_api, token,
-        output_dtype, element_size,
-        lora_weights, state_dict, save_size, free,
-        temp_file, save_directory, new_use_temp_file,
-        low_disk_space_usage, max_shard_size_in_bytes,
-    ]
-    raise
+
+    # Extra path for gpt-oss-20b-BF16 -> if only attention layers are provided
+    all_lora_keys = "\n".join(lora_weights.keys())
+    only_attention_loras = all_lora_keys.count("self_attn") == (all_lora_keys.count("\n") + 1)
+    if only_attention_loras and save_method == "mxfp4" and model_name.endswith("-BF16"):
+        # Check if we have a non -BF16 version which might be MXFP4
+        try:
+            model_name = get_model_name(model_name.removesuffix("-BF16"), load_in_4bit = False)
+            print(f"Unsloth: Found MXFP4 variant = `{model_name}`")
+        except:
+            pass
+    pass
 
     n_saved_modules = 0
     def upload_items(filename = None):
@@ -1026,7 +1070,9 @@ def merge_and_overwrite_lora(
     pass
 
     # Save config / generation_config via no state_dict and tokenizer
-    if tokenizer is not None: tokenizer.save_pretrained(save_directory = save_directory,)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(save_directory = save_directory)
+        fix_tokenizer_config_json(tokenizer, save_directory)
 
     # --- Handle 4-bit merging first ---
     if save_method == "merged_4bit" or save_method == "forced_merged_4bit":
@@ -1060,6 +1106,7 @@ def merge_and_overwrite_lora(
             print(f"Unsloth: Merged 4bit model saved.")
         except Exception as e:
              raise RuntimeError(f"Failed to save merged 4-bit model: {e}")
+        fix_tokenizer_config_json(tokenizer, save_directory)
 
         # Upload the saved 4-bit model files
         if push_to_hub:
@@ -1092,6 +1139,7 @@ def merge_and_overwrite_lora(
     # as we are exporting the model in 16-bit format.
 
     # Step 2: Initial upload of non-model files (config, tokenizer)
+    fix_tokenizer_config_json(tokenizer, save_directory)
     if push_to_hub:
         upload_items()
 
