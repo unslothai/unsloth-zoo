@@ -24,7 +24,7 @@ from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype
 from .hf_utils import dtype_from_config
 from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
-
+from collections import defaultdict
 
 try:
     from transformers.integrations.mxfp4 import convert_moe_packed_tensors, convert_moe_packed_tensors_cpu
@@ -33,7 +33,7 @@ except (ImportError, ModuleNotFoundError):
     # when not using mxfp4.
     convert_moe_packed_tensors     = None
     convert_moe_packed_tensors_cpu = None
-
+pass
 
 MODEL_CARD = \
 """---
@@ -92,6 +92,7 @@ def find_skipped_quantized_modules(model):
         elif isinstance(module, torch.nn.Linear):
             skipped_modules.append(name)
     return skipped_modules, quantized_modules
+pass
 
 def create_huggingface_repo(
     model,
@@ -191,7 +192,8 @@ def check_if_quantized(module: torch.nn.Module) -> bool:
             # this is an FSDP-specific edge case
             # return weight  # type: ignore
             return False
-        raise TypeError(f"Input weight should be of type nn.Parameter, got {type(weight)} instead")
+        # raise TypeError(f"Input weight should be of type nn.Parameter, got {type(weight)} instead")
+        return False
 
     cls_name = weight.__class__.__name__
     if cls_name not in ("Params4bit", "Int8Params"):
@@ -410,8 +412,9 @@ def _merge_and_overwrite_lora(
         # This logic is extracted from your original 'working_code'.
         return _merge_and_overwrite_lora_mxfp4(
             save_directory, filename, lora_weights, output_dtype,
-            model_class_name, base_model_is_quantized, quant_type
+            model_class_name, base_model_is_quantized, quant_type,
         )
+    pass
 
     filename_original = os.path.join(save_directory, filename)  # Original file path
     count = 0
@@ -428,24 +431,27 @@ def _merge_and_overwrite_lora(
     mm = None
     header_metadata = None
     length_of_header = 0
+
     # Only if overwriting
     try:
-
         # Memory map the file for direct access
         raw_pointer = open(filename_original, "r+b")
-        mm = mmap.mmap(raw_pointer.fileno(), length=0, access=mmap.ACCESS_WRITE)
+        mm = mmap.mmap(raw_pointer.fileno(), length = 0, access = mmap.ACCESS_WRITE)
 
         # Parse safetensors header
         length_of_header = int.from_bytes(mm.read(8), "little")
         header_metadata = json.loads(mm.read(length_of_header))
         mm.seek(0)
 
-        with safe_open(filename_original, framework="pt", device="cpu") as file:
+        with safe_open(filename_original, framework = "pt", device = "cpu") as file:
             safetensor_keys = list(file.keys())
 
             # Update converted_lora_weights with actual safetensor keys
             converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-                lora_weights, safetensor_keys, model_class_name=model_class_name)
+                lora_weights,
+                safetensor_keys,
+                model_class_name = model_class_name,
+            )
 
             processed_mxfp4_keys = set()
 
@@ -466,7 +472,7 @@ def _merge_and_overwrite_lora(
                     if UNSLOTH_ENABLE_LOGGING:
                         logger.info(f"[DEBUG] Preserving MXFP4 tensor: {key}")
                     continue
-
+                pass
 
                 output_key = key
                 action_logged = False
@@ -493,8 +499,9 @@ def _merge_and_overwrite_lora(
 
                 del W
                 torch.cuda.empty_cache()
-
+            pass
             # Success! Direct overwrite completed
+        pass
         mm.flush()
         mm.close()
         raw_pointer.close()
@@ -533,14 +540,20 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
 
     # Convert lora_weights to safetensor format
     converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-        lora_weights, [], model_class_name=model_class_name)
+        lora_weights,
+        [],
+        model_class_name = model_class_name,
+    )
 
-    with safe_open(filename_original, framework="pt", device="cpu") as file:  # Open original file for reading
+    with safe_open(filename_original, framework = "pt", device = "cpu") as file: # Open original file for reading
         safetensor_keys = list(file.keys())
 
         # Update converted_lora_weights with actual safetensor keys
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-            lora_weights, safetensor_keys, model_class_name=model_class_name)
+            lora_weights,
+            safetensor_keys,
+            model_class_name = model_class_name,
+        )
 
         # Set to track mxfp4 keys that have already been processed
         processed_mxfp4_keys = set()
@@ -864,6 +877,48 @@ def _remove_quantization_config(config_path: Path):
     pass
 pass
 
+def fix_tokenizer_config_json(tokenizer, saved_folder):
+    # Add "chat_template" to tokenizer_config.json
+    tokenizer_config_path = os.path.join(saved_folder, "tokenizer_config.json")
+    if os.path.exists(tokenizer_config_path) and tokenizer is not None:
+        old_chat_template = getattr(tokenizer, "chat_template", None)
+        if old_chat_template is not None:
+            try:
+                with open(tokenizer_config_path, "r") as f:
+                    f = json.load(f)
+                if "chat_template" not in f or f["chat_template"] is None:
+                    f["chat_template"] = tokenizer.chat_template
+                with open(tokenizer_config_path, "w") as new_f:
+                    json.dump(f, new_f, indent = 2, ensure_ascii = False)
+            except:
+                pass
+        pass
+
+        # Remove chat_template if NULL
+        try:
+            with open(tokenizer_config_path, "r") as f:
+                f = json.load(f)
+            if "chat_template" in f and (f["chat_template"] == "" or f["chat_template"] is None):
+                del f["chat_template"]
+            with open(tokenizer_config_path, "w") as new_f:
+                json.dump(f, new_f, indent = 2, ensure_ascii = False)
+        except:
+            pass
+    pass
+    # Fix config.json using torch_dtype / dtype
+    config_file_path = os.path.join(saved_folder, "config.json")
+    if os.path.exists(config_file_path):
+        try:
+            with open(config_file_path, "r") as f:
+                data = f.read()
+            data = data.replace('"dtype"', '"torch_dtype"')
+            data = data.replace("'dtype'", "'torch_dtype'")
+            with open(config_file_path, "w") as f:
+                f.write(data)
+        except:
+            pass
+    return
+pass
 
 @torch.inference_mode
 def merge_and_overwrite_lora(
@@ -884,109 +939,135 @@ def merge_and_overwrite_lora(
     # Directly downloads 16bit original weights and merges LoRA
     inner_model = model.base_model.model if isinstance(model, PeftModel) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
-    if not isinstance(model, PeftModel):
-        warnings.warn("Model is not a PeftModel (no Lora adapters detected). Skipping Merge. Please use save_pretrained() or push_to_hub() instead!")
-        return None
-    try:
-        model_name = get_model_name(model.config._name_or_path, load_in_4bit = False)
-    except:
-        model_name = model.config._name_or_path
-
-    final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
-    if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method== "merged_16bit":
-        warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
-        return None
-    if final_model_name is None:
-        warnings.warn(f"Model {model_name} not found locally or on HuggingFace")
-        return None
-    model_name = final_model_name
     safetensors_list = []
     max_size_in_bytes = 0
     total_size_in_bytes = 0
     config = model.config
 
-    # Handle case for local model where config._name_or_path is a local os path
-    # https://github.com/unslothai/unsloth/issues/2140
-    is_local_path = False
-    if os.path.exists(model_name) and os.path.isdir(model_name):
-        is_local_path = True
-        print(f"Detected local model directory: {model_name}")
-
-        # Get safetensors files from local directory
-        for file in os.listdir(model_name):
-            if file.endswith(".safetensors"):
-                safetensors_list.append(file)
-                file_path = os.path.join(model_name, file)
-                file_size = os.path.getsize(file_path)
-                max_size_in_bytes = max(max_size_in_bytes, file_size)
-                total_size_in_bytes += file_size
-
-        # Check for index file
-        index_path = os.path.join(model_name, "model.safetensors.index.json")
-        if os.path.exists(index_path):
+    for loop_iteration in range(2):
+        if not isinstance(model, PeftModel):
+            warnings.warn("Model is not a PeftModel (no Lora adapters detected). Skipping Merge. Please use save_pretrained() or push_to_hub() instead!")
+            return None
+        if loop_iteration == 0:
+            # Only do on the first iteration since MXFP4 gpt-oss might already have executed this
             try:
-                with open(index_path, 'r', encoding = "utf-8") as f:
-                    index_data = json.load(f)
-                    # Extract file names from the index if available
-                    if "weight_map" in index_data:
-                        # Get unique filenames from weight map
-                        indexed_files = set(index_data["weight_map"].values())
-                        # Only use these if we didn't find files directly
-                        if not safetensors_list:
-                            safetensors_list = list(indexed_files)
-                            # Need to compute sizes for these files
-                            for file in safetensors_list:
-                                file_path = os.path.join(model_name, file)
-                                if os.path.exists(file_path):
-                                    file_size = os.path.getsize(file_path)
-                                    max_size_in_bytes = max(max_size_in_bytes, file_size)
-                                    total_size_in_bytes += file_size
-            except Exception as e:
-                print(f"Warning: Could not process index file: {e}")
-    else:
-        # Original HF repo logic
-        try:
-            file_list = HfFileSystem(token = token).ls(model_name, detail = True)
-        except:
-            original_model_id = get_original_model_id(model_name)
-            model_name = original_model_id
-            if original_model_id is None:
-                raise ValueError(f"Could not determine original model ID from {model_name}. "
-                                "If using a local model, ensure the path exists and contains safetensors files.")
-            file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+                model_name = get_model_name(model.config._name_or_path, load_in_4bit = False)
+            except:
+                model_name = model.config._name_or_path
+            pass
+        pass
 
-        # Process HF file listing
-        for x in file_list:
-            if not x["name"].endswith(".safetensors"): continue
-            safetensors_list.append(os.path.split(x["name"])[-1])
-            max_size_in_bytes = max(max_size_in_bytes, x["size"])
-            total_size_in_bytes += x["size"]
+        final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
+        if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method == "merged_16bit":
+            warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
+            return None
+        if final_model_name is None:
+            warnings.warn(f"Model {model_name} not found locally or on HuggingFace")
+            return None
+        model_name = final_model_name
 
-    if not safetensors_list:
-         raise RuntimeError(f"No '.safetensors' files found for the base model: {model_name}")
-    assert(max_size_in_bytes != 0 and total_size_in_bytes != 0)
+        # Handle case for local model where config._name_or_path is a local os path
+        # https://github.com/unslothai/unsloth/issues/2140
+        is_local_path = False
+        if os.path.exists(model_name) and os.path.isdir(model_name):
+            is_local_path = True
+            print(f"Detected local model directory: {model_name}")
 
-    (
-        username, repo_id, hf_api, token,
-        output_dtype, element_size,
-        lora_weights, state_dict, save_size, free,
-        temp_file, save_directory, new_use_temp_file,
-        low_disk_space_usage, max_shard_size_in_bytes,
-    ) = prepare_saving(
-        model = model,
-        save_directory = save_directory,
-        push_to_hub = push_to_hub,
-        max_shard_size = "5GB",
-        private = private,
-        token = token,
-        output_dtype = output_dtype,
-        low_disk_space_usage = low_disk_space_usage,
-        merge_into_original = True,
-        min_size_in_bytes = max_size_in_bytes,
-        use_temp_file = use_temp_file,
-    )
-    use_temp_file = use_temp_file or new_use_temp_file
-    _save_dir_path = Path(save_directory)
+            # Get safetensors files from local directory
+            for file in os.listdir(model_name):
+                if file.endswith(".safetensors"):
+                    safetensors_list.append(file)
+                    file_path = os.path.join(model_name, file)
+                    file_size = os.path.getsize(file_path)
+                    max_size_in_bytes = max(max_size_in_bytes, file_size)
+                    total_size_in_bytes += file_size
+
+            # Check for index file
+            index_path = os.path.join(model_name, "model.safetensors.index.json")
+            if os.path.exists(index_path):
+                try:
+                    with open(index_path, 'r', encoding = "utf-8") as f:
+                        index_data = json.load(f)
+                        # Extract file names from the index if available
+                        if "weight_map" in index_data:
+                            # Get unique filenames from weight map
+                            indexed_files = set(index_data["weight_map"].values())
+                            # Only use these if we didn't find files directly
+                            if not safetensors_list:
+                                safetensors_list = list(indexed_files)
+                                # Need to compute sizes for these files
+                                for file in safetensors_list:
+                                    file_path = os.path.join(model_name, file)
+                                    if os.path.exists(file_path):
+                                        file_size = os.path.getsize(file_path)
+                                        max_size_in_bytes = max(max_size_in_bytes, file_size)
+                                        total_size_in_bytes += file_size
+                except Exception as e:
+                    print(f"Warning: Could not process index file: {e}")
+        else:
+            # Original HF repo logic
+            try:
+                file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+            except:
+                original_model_id = get_original_model_id(model_name)
+                model_name = original_model_id
+                if original_model_id is None:
+                    raise ValueError(f"Could not determine original model ID from {model_name}. "
+                                    "If using a local model, ensure the path exists and contains safetensors files.")
+                file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+
+            # Process HF file listing
+            for x in file_list:
+                if not x["name"].endswith(".safetensors"): continue
+                safetensors_list.append(os.path.split(x["name"])[-1])
+                max_size_in_bytes = max(max_size_in_bytes, x["size"])
+                total_size_in_bytes += x["size"]
+
+        if not safetensors_list:
+             raise RuntimeError(f"No '.safetensors' files found for the base model: {model_name}")
+        assert(max_size_in_bytes != 0 and total_size_in_bytes != 0)
+
+        (
+            username, repo_id, hf_api, token,
+            output_dtype, element_size,
+            lora_weights, state_dict, save_size, free,
+            temp_file, save_directory, new_use_temp_file,
+            low_disk_space_usage, max_shard_size_in_bytes,
+        ) = prepare_saving(
+            model = model,
+            save_directory = save_directory,
+            push_to_hub = push_to_hub,
+            max_shard_size = "5GB",
+            private = private,
+            token = token,
+            output_dtype = output_dtype,
+            low_disk_space_usage = low_disk_space_usage,
+            merge_into_original = True,
+            min_size_in_bytes = max_size_in_bytes,
+            use_temp_file = use_temp_file,
+        )
+        use_temp_file = use_temp_file or new_use_temp_file
+        _save_dir_path = Path(save_directory)
+
+        # Extra path for gpt-oss-20b-BF16 -> if only attention layers are provided
+        all_lora_keys = "\n".join(lora_weights.keys())
+        only_attention_loras = all_lora_keys.count("self_attn") == (all_lora_keys.count("\n") + 1)
+        if only_attention_loras and save_method == "mxfp4" and model_name.endswith("-BF16"):
+            # Check if we have a non -BF16 version which might be MXFP4
+            try:
+                model_name = get_model_name(model_name.removesuffix("-BF16"), load_in_4bit = False)
+                print(f"Unsloth: Found MXFP4 variant = `{model_name}`")
+                # Re-get all meta-data from scratch
+                safetensors_list = []
+                max_size_in_bytes = 0
+                total_size_in_bytes = 0
+                continue
+            except:
+                pass
+        pass
+        # Stop loop and continue
+        break
+    pass
 
     n_saved_modules = 0
     def upload_items(filename = None):
@@ -1003,7 +1084,9 @@ def merge_and_overwrite_lora(
     pass
 
     # Save config / generation_config via no state_dict and tokenizer
-    if tokenizer is not None: tokenizer.save_pretrained(save_directory = save_directory,)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(save_directory = save_directory)
+        fix_tokenizer_config_json(tokenizer, save_directory)
 
     # --- Handle 4-bit merging first ---
     if save_method == "merged_4bit" or save_method == "forced_merged_4bit":
@@ -1037,6 +1120,7 @@ def merge_and_overwrite_lora(
             print(f"Unsloth: Merged 4bit model saved.")
         except Exception as e:
              raise RuntimeError(f"Failed to save merged 4-bit model: {e}")
+        fix_tokenizer_config_json(tokenizer, save_directory)
 
         # Upload the saved 4-bit model files
         if push_to_hub:
@@ -1050,7 +1134,7 @@ def merge_and_overwrite_lora(
 
         print("Unsloth: Merged 4bit model process completed.")
         return save_directory # <<<--- EARLY RETURN for 4-bit path
-
+    pass
 
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
@@ -1060,15 +1144,16 @@ def merge_and_overwrite_lora(
     elif save_method == "mxfp4":
         from transformers import AutoConfig
         model_config = AutoConfig.from_pretrained(
-                model_name,
-                token = None,
-                trust_remote_code = False,
-            )
+            model_name,
+            token = None,
+            trust_remote_code = False,
+        )
         model_config.save_pretrained(save_directory)
         # Remove the quantization_config in the config.json file if it exists,
     # as we are exporting the model in 16-bit format.
 
     # Step 2: Initial upload of non-model files (config, tokenizer)
+    fix_tokenizer_config_json(tokenizer, save_directory)
     if push_to_hub:
         upload_items()
 
@@ -1083,7 +1168,7 @@ def merge_and_overwrite_lora(
     # ONLY download/copy the original index if we are NOT dequantizing an MXFP4 model
     if (not (base_model_is_quantized and quant_type == "mxfp4") or (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")) and not needs_splitting:
         if is_local_path:
-            os.makedirs(save_directory, exist_ok=True)
+            os.makedirs(save_directory, exist_ok = True)
             # Copy from local
             if safe_tensor_index_files:
                 local_index_path = os.path.join(model_name, "model.safetensors.index.json")
@@ -1102,15 +1187,16 @@ def merge_and_overwrite_lora(
         if push_to_hub and safe_tensor_index_files:
             upload_items("model.safetensors.index.json")
         pass
+    pass
 
     # Step 4 : Handle retrieval of original 16-bit shards
     if not is_local_path and _hf_cache_dir is not None:
         copied_all_from_cache = _try_copy_all_from_cache(
-            repo_id=model_name,
-            filenames_to_check=safetensors_list,
-            target_dir_str=save_directory,
-            hf_cache_dir=_hf_cache_dir,
-            token=token,
+            repo_id = model_name,
+            filenames_to_check = safetensors_list,
+            target_dir_str = save_directory,
+            hf_cache_dir = _hf_cache_dir,
+            token = token,
         )
 
     if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
@@ -1160,7 +1246,7 @@ def merge_and_overwrite_lora(
     regenerate_index = ((base_model_is_quantized and quant_type == "mxfp4") or needs_splitting) and len(final_safetensors_list) > 1 and save_method != "mxfp4"
     weight_map = {}
 
-    for filename in ProgressBar(final_safetensors_list, desc="Unsloth: Merging weights into 16bit"):
+    for filename in ProgressBar(final_safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
         n_saved_modules += _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
@@ -1178,7 +1264,7 @@ def merge_and_overwrite_lora(
         # --- NEW LOGIC: Build the weight_map BEFORE deleting the file ---
         if regenerate_index:
             # We must open the file we just created to get its tensor keys
-            with safe_open(file_path, framework="pt", device="cpu") as f:
+            with safe_open(file_path, framework = "pt", device = "cpu") as f:
                 for key in f.keys():
                     weight_map[key] = filename
 
@@ -1195,8 +1281,8 @@ def merge_and_overwrite_lora(
 
         index_data = {"metadata": {}, "weight_map": weight_map}
         index_path = os.path.join(save_directory, "model.safetensors.index.json")
-        with open(index_path, "w", encoding="utf-8") as f:
-            json.dump(index_data, f, indent=4)
+        with open(index_path, "w", encoding = "utf-8") as f:
+            json.dump(index_data, f, indent = 4)
 
         if push_to_hub:
             upload_items("model.safetensors.index.json")
@@ -1230,7 +1316,7 @@ def merge_and_overwrite_lora(
         except Exception as e:
             print(f"Warning: Failed to remove temporary directory {save_directory}: {e}")
     pass
-    print("Unsloth: Merge process complete.")
+    print(f"Unsloth: Merge process complete. Saved to `{os.path.abspath(save_directory)}`")
 
     return save_directory
 pass
@@ -1277,7 +1363,7 @@ def _try_copy_all_from_cache(
 
     try:
         # Create target directory using os.makedirs
-        os.makedirs(target_dir_str, exist_ok=True)
+        os.makedirs(target_dir_str, exist_ok = True)
         if not os.access(target_dir_str, os.W_OK | os.X_OK):
              raise PermissionError(f"No write/execute permission for target directory: {target_dir_str}")
     except Exception as dir_err:
@@ -1285,7 +1371,7 @@ def _try_copy_all_from_cache(
         return False
 
     all_copied = True
-    for filename, cached_path in cached_paths_map.items():
+    for filename, cached_path in ProgressBar(cached_paths_map.items(), desc = f"Unsloth: Copying {len(filenames_to_check)} files from cache to `{target_dir_str}`"):
         try:
             # Pass string target_dir_str to copy helper
             _copy_file_from_source(cached_path, target_dir_str, filename)
@@ -1295,9 +1381,10 @@ def _try_copy_all_from_cache(
         except Exception as e:
             print(f"Cache copy failed: An unexpected error occurred copying {filename}: {e}")
             all_copied = False; break
+    pass
 
     if all_copied:
-        print(f"Successfully copied all {len(filenames_to_check)} files from cache to {target_dir_str}.")
+        print(f"Successfully copied all {len(filenames_to_check)} files from cache to `{target_dir_str}`")
         return True
     else:
         print("Failed to copy one or more files from cache. Will proceed with downloading.")
@@ -1356,6 +1443,7 @@ def _get_hf_cache_dir() -> Optional[Path]:
     # If none of the paths worked
     print("No existing and accessible Hugging Face cache directory found.")
     return None
+pass
 
 
 _PUSHING_CODE = \
@@ -1637,6 +1725,7 @@ def get_original_model_id(local_path: str):
             return config["base_model_name_or_path"]
 
     return None
+pass
 
 def _get_checkpoint_conversion_mapping(model_class_name):
     """Get the checkpoint conversion mapping for a specific model class"""
@@ -1648,8 +1737,6 @@ def _get_checkpoint_conversion_mapping(model_class_name):
     except (ImportError, AttributeError):
         return {}
 pass
-
-from collections import defaultdict
 
 
 def detect_keys_format(keys_to_check, forward_mapping):
@@ -1688,6 +1775,7 @@ def detect_keys_format(keys_to_check, forward_mapping):
     if count_matches_old_pattern > count_matches_new_pattern: return "old"
 
     return "new" # Default, assuming most models/keys will be in the "new" (current HF) format.
+pass
 
 def _convert_lora_keys_to_safetensor_format(
     lora_weights,        # Global dict of LoraStats objects
@@ -1883,7 +1971,7 @@ def check_model_quantization_status(model_name_or_path, token=None):
         config_path = os.path.join(model_name_or_path, "config.json")
         if os.path.exists(config_path):
             try:
-                with open(config_path, 'r', encoding="utf-8") as f:
+                with open(config_path, 'r', encoding = "utf-8") as f:
                     config = json.load(f)
             except:
                 pass

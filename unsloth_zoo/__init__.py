@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.9.14"
+__version__ = "2025.10.1"
 
 import os
 # Hugging Face Hub faster downloads
