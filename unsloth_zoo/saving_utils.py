@@ -939,7 +939,6 @@ def merge_and_overwrite_lora(
     # Directly downloads 16bit original weights and merges LoRA
     inner_model = model.base_model.model if isinstance(model, PeftModel) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
-    model_name = final_model_name
     safetensors_list = []
     max_size_in_bytes = 0
     total_size_in_bytes = 0
@@ -964,6 +963,7 @@ def merge_and_overwrite_lora(
         if final_model_name is None:
             warnings.warn(f"Model {model_name} not found locally or on HuggingFace")
             return None
+        model_name = final_model_name
 
         # Handle case for local model where config._name_or_path is a local os path
         # https://github.com/unslothai/unsloth/issues/2140
