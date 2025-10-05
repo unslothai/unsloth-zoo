@@ -944,14 +944,17 @@ def merge_and_overwrite_lora(
     total_size_in_bytes = 0
     config = model.config
 
-    for _ in range(2):
+    for loop_iteration in range(2):
         if not isinstance(model, PeftModel):
             warnings.warn("Model is not a PeftModel (no Lora adapters detected). Skipping Merge. Please use save_pretrained() or push_to_hub() instead!")
             return None
-        try:
-            model_name = get_model_name(model.config._name_or_path, load_in_4bit = False)
-        except:
-            model_name = model.config._name_or_path
+        if loop_iteration == 0:
+            # Only do on the first iteration since MXFP4 gpt-oss might already have executed this
+            try:
+                model_name = get_model_name(model.config._name_or_path, load_in_4bit = False)
+            except:
+                model_name = model.config._name_or_path
+            pass
         pass
 
         final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
