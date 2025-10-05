@@ -37,6 +37,7 @@ from .utils import (
 )
 from textwrap import dedent
 import re
+import os
 
 def patch_merge_quantization_configs():
     # Fixes some issues with merging quantization configs
