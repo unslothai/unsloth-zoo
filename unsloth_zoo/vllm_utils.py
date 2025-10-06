@@ -258,7 +258,11 @@ if importlib.util.find_spec("vllm") is not None:
         vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesLinearMethod._apply_4bit_weight = _apply_4bit_weight
 
         # Disable all not supported messages
-        from vllm.config import logger as vllm_config_logger
+        try:
+            from vllm.config import logger as vllm_config_logger
+        except:
+            # vLLM refactored a lot of configs. Most of them are backwards compatible for imports. This seems to not be.
+            from vllm.config.model import logger as vllm_config_logger
         vllm_config_logger.addFilter(HideLoggingMessage("not supported"))
         vllm_config_logger.addFilter(HideLoggingMessage("is not tested"))
         vllm_config_logger.addFilter(HideLoggingMessage("is not fully optimized"))
@@ -1439,6 +1443,8 @@ def load_vllm(
         model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method == "fp8")
+
+    assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
