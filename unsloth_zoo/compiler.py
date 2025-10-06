@@ -32,18 +32,15 @@ import subprocess
 import types
 import time
 import logging
-import tempfile
 import sys
 import textwrap
 from .utils import (
     Version,
     is_main_process,
-    is_distributed,
     distributed_function,
     get_lock,
     get_compile_folder,
-    UNSLOTH_COMPILE_LOCATION,
-    UNSLOTH_COMPILE_USE_TEMP,
+    write_file,
     COMBINED_UNSLOTH_NAME,
 )
 from .log import logger
@@ -522,81 +519,52 @@ def create_new_function(
     else:
         write_new_source = versioning + new_source
 
-    # Write function
-    global UNSLOTH_COMPILE_USE_TEMP
     file_source = None
     compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = False)
     function_location = os.path.join(compile_folder, f"{name}.py")
 
-    # Check if file was already created!
-    if not overwrite and os.path.isfile(function_location):
+    lock = get_lock(function_location)
+    try:
+        with lock:
+            # Check if file was already created!
+            if not overwrite and os.path.isfile(function_location):
+                # Check if exactly equivalent
+                with open(function_location, "r", encoding = "utf-8") as f:
+                    file_source = f.read()
 
-        # Check if exactly equivalent
-        with open(function_location, "r", encoding = "utf-8") as f:
-            file_source = f.read()
-
-        if file_source != write_new_source:
-            overwrite = True
-        elif not overwrite:
-            if "__UNSLOTH_VERSIONING__" not in file_source:
-                overwrite = True
-            else:
-                versions = file_source[:file_source.find('__UNSLOTH_VERSIONING__')]
-                if versioning[:versioning.find('__UNSLOTH_VERSIONING__')] != versions:
+                if file_source != write_new_source:
                     overwrite = True
+                elif not overwrite:
+                    if "__UNSLOTH_VERSIONING__" not in file_source:
+                        overwrite = True
+                    else:
+                        versions = file_source[:file_source.find('__UNSLOTH_VERSIONING__')]
+                        if versioning[:versioning.find('__UNSLOTH_VERSIONING__')] != versions:
+                            overwrite = True
+                    pass
+                pass
+            pass
+        pass
+    except Exception as e:
+        if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+            logger.error(f"Unsloth: Failed checking {function_location} because of {str(e)}")
+        pass
     pass
+
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
         overwrite = False
-
-    # Check location
-    def write_file(function_location, write_new_source):
-        lock = get_lock(function_location)
-        new_write_bytes = write_new_source.encode("utf-8")
-        try:
-            with lock:
-                # existence check
-                try:
-                    st = os.stat(function_location)
-                except Exception as e:
-                    st = None
-
-                need_write = False
-                if st is None or st.st_size != len(new_write_bytes):
-                    need_write = True
-                else:
-                    with open(function_location, "rb") as f:
-                        need_write = f.read() != new_write_bytes
-
-                if need_write:
-                    with open(function_location, "wb", buffering = 0) as file:
-                        file.write(new_write_bytes)
-                        file.flush()
-                        os.fsync(file.fileno())
-            return None
-        except Exception as e:
-            # consider adding logging to main_process only
-            # counterpoint: we may want to see errors on all processes
-            if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
-                logger.error(f"Unsloth: Failed to write file {function_location} because {str(e)}")
-            return None
-    pass
 
     if overwrite or not os.path.isfile(function_location):
         try:
             distributed_function(1, write_file, function_location, write_new_source)
         except Exception as error:
-            if UNSLOTH_COMPILE_USE_TEMP:
-                raise RuntimeError(error)
-            else:
-                # Failed so instead use a temporary directory
-                compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = True)
-                function_location = os.path.join(compile_folder, f"{name}.py")
-                distributed_function(1, write_file, function_location, write_new_source)
-            pass
+            # we now raise error right away since we determine
+            # compile location once at start
+            raise RuntimeError(error)
         pass
     pass
 
-    # Now import modules! Use a tempfile if it fails on the first try!
+    # Now import modules!
     old_path = None
     new_module = None
 
@@ -625,33 +593,17 @@ def create_new_function(
         new_module, old_path = import_module(compile_folder, name)
     except Exception as e:
         new_module = None
-        # Try using temp directory instead!
-        if not UNSLOTH_COMPILE_USE_TEMP:
-            compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = True)
-            function_location = os.path.join(compile_folder, f"{name}.py")
-            distributed_function(1, write_file, function_location, write_new_source)
-            if is_main_process():
-                logger.info(f"Standard import failed for {name}: {e}. Using tempfile instead!")
-            try:
-                new_module, old_path = import_module(compile_folder, name)
-            except Exception as e:
-                new_module = None
-                if is_main_process():
-                    logger.info(f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!")
-        pass
-        # Fallback to direct module loading
-        if new_module is None:
-            try:
-                module_name = f"unsloth_cache_{name}"
-                file_location = os.path.join(compile_folder, name) + ".py"
-                lock = get_lock(file_location)
-                with lock:
-                    spec = importlib.util.spec_from_file_location(module_name, file_location)
-                    new_module = importlib.util.module_from_spec(spec)
-                    sys.modules[module_name] = new_module
-                    spec.loader.exec_module(new_module)
-            except Exception as e:
-                raise RuntimeError(f"Direct module loading failed for {name}: {e}")
+        try:
+            module_name = f"unsloth_cache_{name}"
+            file_location = os.path.join(compile_folder, name) + ".py"
+            lock = get_lock(file_location)
+            with lock:
+                spec = importlib.util.spec_from_file_location(module_name, file_location)
+                new_module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = new_module
+                spec.loader.exec_module(new_module)
+        except Exception as e:
+            raise RuntimeError(f"Direct module loading failed for {name}: {e}")
         pass
     finally:
         # Restore original sys.path if we modified it

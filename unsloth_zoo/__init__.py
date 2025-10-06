@@ -63,42 +63,44 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1" # Blocking calls for debugging
 pass
 
+if os.environ.get("UNSLOTH_ZOO_UTILS_ONLY", "0") == "1":
+    del os
+else:
+    from importlib.util import find_spec
+    if find_spec("unsloth") is None:
+        raise ImportError("Please install Unsloth via `pip install unsloth`!")
+    pass
+    del find_spec
 
-from importlib.util import find_spec
-if find_spec("unsloth") is None:
-    raise ImportError("Please install Unsloth via `pip install unsloth`!")
-pass
-del find_spec
+    def get_device_type():
+        import torch
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            return "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            return "xpu"
+        raise NotImplementedError("Unsloth currently only works on NVIDIA GPUs and Intel GPUs.")
+    pass
+    DEVICE_TYPE : str = get_device_type()
 
-def get_device_type():
-    import torch
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        return "cuda"
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        return "xpu"
-    raise NotImplementedError("Unsloth currently only works on NVIDIA GPUs and Intel GPUs.")
-pass
-DEVICE_TYPE : str = get_device_type()
+    if not ("UNSLOTH_IS_PRESENT" in os.environ):
+        raise ImportError("Please install Unsloth via `pip install unsloth`!")
+    pass
 
-if not ("UNSLOTH_IS_PRESENT" in os.environ):
-    raise ImportError("Please install Unsloth via `pip install unsloth`!")
-pass
+    try:
+        print("🦥 Unsloth: Will patch your computer to enable 2x faster free finetuning.")
+    except:
+        print("Unsloth: Will patch your computer to enable 2x faster free finetuning.")
+    pass
+    # Log Unsloth-Zoo Utilities
+    os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
+    del os
 
-try:
-    print("🦥 Unsloth: Will patch your computer to enable 2x faster free finetuning.")
-except:
-    print("Unsloth: Will patch your computer to enable 2x faster free finetuning.")
-pass
-# Log Unsloth-Zoo Utilities
-os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
-del os
-
-from .temporary_patches import (
-    encode_conversations_with_harmony,
-)
-from .rl_environments import (
-    check_python_modules,
-    create_locked_down_function,
-    execute_with_time_limit,
-    Benchmarker,
-)
+    from .temporary_patches import (
+        encode_conversations_with_harmony,
+    )
+    from .rl_environments import (
+        check_python_modules,
+        create_locked_down_function,
+        execute_with_time_limit,
+        Benchmarker,
+    )
