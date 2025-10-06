@@ -15,7 +15,6 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 __all__ = [
-    "UNSLOTH_COMPILE_LOCATION",
     "get_transformers_model_type",
     "unsloth_compile_transformers",
     "create_new_function",
@@ -42,6 +41,10 @@ from .utils import (
     is_distributed,
     distributed_function,
     get_lock,
+    get_compile_folder,
+    UNSLOTH_COMPILE_LOCATION,
+    UNSLOTH_COMPILE_USE_TEMP,
+    COMBINED_UNSLOTH_NAME,
 )
 from .log import logger
 import triton
@@ -59,21 +62,6 @@ try:
     ScriptFunction = torch.jit.torch.jit.ScriptFunction
 except:
     ScriptFunction = None
-
-# Compiled cache location
-global COMBINED_UNSLOTH_NAME
-COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
-
-global UNSLOTH_COMPILE_LOCATION
-if 'UNSLOTH_COMPILE_LOCATION' not in globals():
-    _loc = os.getenv("UNSLOTH_COMPILE_LOCATION", None)
-    if _loc:
-        UNSLOTH_COMPILE_LOCATION = _loc
-    else:
-        UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
-
-global UNSLOTH_COMPILE_USE_TEMP
-UNSLOTH_COMPILE_USE_TEMP = False
 
 # Disable some compilations if old versions are seen
 OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
@@ -278,36 +266,6 @@ def replace_with_grouped_query_attention(module, source):
         flags = re.DOTALL | re.MULTILINE,
     )
     return source
-pass
-
-def _get_compile_folder(use_tempfile = False):
-    global UNSLOTH_COMPILE_LOCATION
-    global UNSLOTH_COMPILE_USE_TEMP
-    if UNSLOTH_COMPILE_USE_TEMP or use_tempfile:
-        UNSLOTH_COMPILE_USE_TEMP = True
-        leaf = os.path.basename(UNSLOTH_COMPILE_LOCATION)
-        location = os.path.join(tempfile.gettempdir(), leaf)
-        logger.info(
-            f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
-        )
-        os.makedirs(location, exist_ok = True)
-    else:
-        location = UNSLOTH_COMPILE_LOCATION
-        try:
-            # Try creating the directory
-            os.makedirs(location, exist_ok = True)
-            return location, UNSLOTH_COMPILE_USE_TEMP
-        except Exception as e:
-            logger.error(f"Unsloth: Failed to create directory `{UNSLOTH_COMPILE_LOCATION}` because {str(e)}")
-
-            # Instead use a temporary location!
-            location, UNSLOTH_COMPILE_USE_TEMP = _get_compile_folder(use_tempfile = True)
-    return location, UNSLOTH_COMPILE_USE_TEMP
-pass
-
-def get_compile_folder(use_tempfile = False):
-    location, UNSLOTH_COMPILE_USE_TEMP = distributed_function(2, _get_compile_folder, use_tempfile)
-    return location, UNSLOTH_COMPILE_USE_TEMP
 pass
 
 # Mask creation functions
@@ -701,7 +659,7 @@ def create_new_function(
             sys.path = old_path
 
     if new_module is None:
-        raise ImportError(f'Unsloth: Cannot import {name} from {UNSLOTH_COMPILE_LOCATION}')
+        raise ImportError(f'Unsloth: Cannot import {name} from {compile_folder}')
 
     return new_module
 pass

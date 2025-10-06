@@ -21,6 +21,10 @@ __all__ = [
     "is_distributed",
     "distributed_function",
     "torch_distributed_get_rank",
+    "UNSLOTH_COMPILE_LOCATION",
+    "UNSLOTH_COMPILE_USE_TEMP",
+    "COMBINED_UNSLOTH_NAME",
+    "get_compile_folder",
 ]
 
 from packaging.version import Version as TrueVersion
@@ -32,6 +36,56 @@ import re
 import pathlib
 from typing import Optional
 from filelock import FileLock
+import tempfile
+from unsloth_zoo.log import logger
+
+# Compiled cache location
+global COMBINED_UNSLOTH_NAME
+COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
+
+global UNSLOTH_COMPILE_LOCATION
+if 'UNSLOTH_COMPILE_LOCATION' not in globals():
+    _loc = os.getenv("UNSLOTH_COMPILE_LOCATION", None)
+    if _loc:
+        UNSLOTH_COMPILE_LOCATION = _loc
+    else:
+        UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
+
+global UNSLOTH_COMPILE_USE_TEMP
+UNSLOTH_COMPILE_USE_TEMP = False
+
+def _get_compile_folder(use_tempfile = False):
+    global UNSLOTH_COMPILE_LOCATION
+    global UNSLOTH_COMPILE_USE_TEMP
+    if UNSLOTH_COMPILE_USE_TEMP or use_tempfile:
+        UNSLOTH_COMPILE_USE_TEMP = True
+        leaf = os.path.basename(UNSLOTH_COMPILE_LOCATION)
+        location = os.path.join(tempfile.gettempdir(), leaf)
+        logger.info(
+            f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
+        )
+        os.makedirs(location, exist_ok = True)
+    else:
+        location = UNSLOTH_COMPILE_LOCATION
+        try:
+            # Try creating the directory
+            os.makedirs(location, exist_ok = True)
+            return location, UNSLOTH_COMPILE_USE_TEMP
+        except Exception as e:
+            logger.error(f"Unsloth: Failed to create directory `{UNSLOTH_COMPILE_LOCATION}` because {str(e)}")
+
+            # Instead use a temporary location!
+            location, UNSLOTH_COMPILE_USE_TEMP = _get_compile_folder(use_tempfile = True)
+    return location, UNSLOTH_COMPILE_USE_TEMP
+pass
+
+def get_compile_folder(use_tempfile = False, distributed = True):
+    if distributed:
+        location, UNSLOTH_COMPILE_USE_TEMP = distributed_function(2, _get_compile_folder, use_tempfile)
+    else:
+        location, UNSLOTH_COMPILE_USE_TEMP = _get_compile_folder(use_tempfile)
+    return location, UNSLOTH_COMPILE_USE_TEMP
+pass
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3

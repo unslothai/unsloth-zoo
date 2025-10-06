@@ -27,7 +27,7 @@ __all__ = [
     "patch_compiled_autograd",
 ]
 
-from .compiler import UNSLOTH_COMPILE_LOCATION
+from .utils import UNSLOTH_COMPILE_LOCATION
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
