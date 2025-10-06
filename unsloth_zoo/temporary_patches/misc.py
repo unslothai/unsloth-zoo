@@ -35,6 +35,7 @@ from .utils import (
     Unpack,
     _get_unique_storage_name,
 )
+from unsloth_zoo.utils import get_lock
 from textwrap import dedent
 import re
 import os
@@ -640,33 +641,41 @@ def fix_mamba_ssm_float32():
     # Try getting file for mamba_ssm
     try:
         ssd_chunk_scan_file = inspect.getfile(mamba_ssm.ops.triton.ssd_chunk_scan)
-        with open(ssd_chunk_scan_file, "r", encoding = "utf-8") as file: file = file.read()
     except Exception as e:
         return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
 
-    # Find dst +=|= tl.dot(a, b)
-    matches = list(re.finditer(
-        r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)",
-        file)
-    )
-    for match in matches:
-        old = match.group(0)
-        dst, adder, a, b = match.groups()
-        accumulator = '' if adder == "=" else f', acc = {dst}'
-        # Change to float32 if float16 seen otherwise leave as original precision
-        new = f" {dst} = tl.dot("\
-            f"{a}.to(tl.float32), "\
-            f"{b}.to(tl.float32)"\
-            f"{accumulator})"
-        file = file.replace(old, new)
-    pass
-
+    lock = get_lock(ssd_chunk_scan_file, timeout = 20)
     try:
-        # Reload module since we editted it
-        with open(ssd_chunk_scan_file, "w", encoding = "utf-8") as f: f.write(file)
-        importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
+        with lock:
+            with open(ssd_chunk_scan_file, "r", encoding = "utf-8") as file: file = file.read()
+            # Find dst +=|= tl.dot(a, b)
+            matches = list(re.finditer(
+                r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)",
+                file)
+            )
+            for match in matches:
+                old = match.group(0)
+                dst, adder, a, b = match.groups()
+                accumulator = '' if adder == "=" else f', acc = {dst}'
+                # Change to float32 if float16 seen otherwise leave as original precision
+                new = f" {dst} = tl.dot("\
+                    f"{a}.to(tl.float32), "\
+                    f"{b}.to(tl.float32)"\
+                    f"{accumulator})"
+                file = file.replace(old, new)
+            pass
+
+            try:
+                # Reload module since we editted it
+                with open(ssd_chunk_scan_file, "w", encoding = "utf-8") as f: f.write(file)
+                importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
+            except Exception as e:
+                return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
     except Exception as e:
-        return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+        if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+            logger.error(f"Unsloth: Failed to fix mamba_ssm.ops.triton.ssd_chunk_scan because {str(e)}")
+        pass
+    pass
 pass
 TEMPORARY_PATCHES.append(fix_mamba_ssm_float32)
 

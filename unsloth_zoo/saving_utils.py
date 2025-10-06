@@ -24,6 +24,7 @@ from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype
 from .hf_utils import dtype_from_config
 from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
+from unsloth_zoo.utils import get_lock, write_file
 from collections import defaultdict
 
 try:
@@ -864,59 +865,73 @@ pass
 
 def _remove_quantization_config(config_path: Path):
     assert config_path.exists(), "Given config does not exist"
-    with open(config_path, "r", encoding = "utf-8") as f:
-        config = json.load(f)
-    if "quantization_config" in config:
-        # Remove the quantization_config field
-        del config["quantization_config"]
-    else:
-        return
-    # Overwrite the config file
-    with open(config_path, "w", encoding = "utf-8") as f:
-        json.dump(config, f, indent = 4)
-    pass
+    lock = get_lock(config_path)
+    try:
+        with lock:
+            with open(config_path, "r", encoding = "utf-8") as f:
+                config = json.load(f)
+            if "quantization_config" in config:
+                # Remove the quantization_config field
+                del config["quantization_config"]
+            else:
+                return
+            # Overwrite the config file
+            with open(config_path, "w", encoding = "utf-8") as f:
+                json.dump(config, f, indent = 4)
+            pass
+    except Exception as e:
+        if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+            logger.error(f"Unsloth: Failed to remove quantization config because {str(e)}")
+        pass
 pass
 
 def fix_tokenizer_config_json(tokenizer, saved_folder):
     # Add "chat_template" to tokenizer_config.json
     tokenizer_config_path = os.path.join(saved_folder, "tokenizer_config.json")
-    if os.path.exists(tokenizer_config_path) and tokenizer is not None:
-        old_chat_template = getattr(tokenizer, "chat_template", None)
-        if old_chat_template is not None:
-            try:
-                with open(tokenizer_config_path, "r") as f:
-                    f = json.load(f)
-                if "chat_template" not in f or f["chat_template"] is None:
-                    f["chat_template"] = tokenizer.chat_template
-                with open(tokenizer_config_path, "w") as new_f:
-                    json.dump(f, new_f, indent = 2, ensure_ascii = False)
-            except:
+    lock = get_lock(tokenizer_config_path)
+    try:
+        with lock:
+            if os.path.exists(tokenizer_config_path) and tokenizer is not None:
+                old_chat_template = getattr(tokenizer, "chat_template", None)
+                if old_chat_template is not None:
+                    try:
+                        with open(tokenizer_config_path, "r") as f:
+                            f = json.load(f)
+                        if "chat_template" not in f or f["chat_template"] is None:
+                            f["chat_template"] = tokenizer.chat_template
+                        with open(tokenizer_config_path, "w") as new_f:
+                            json.dump(f, new_f, indent = 2, ensure_ascii = False)
+                    except:
+                        pass
                 pass
-        pass
 
-        # Remove chat_template if NULL
-        try:
-            with open(tokenizer_config_path, "r") as f:
-                f = json.load(f)
-            if "chat_template" in f and (f["chat_template"] == "" or f["chat_template"] is None):
-                del f["chat_template"]
-            with open(tokenizer_config_path, "w") as new_f:
-                json.dump(f, new_f, indent = 2, ensure_ascii = False)
-        except:
+                # Remove chat_template if NULL
+                try:
+                    with open(tokenizer_config_path, "r") as f:
+                        f = json.load(f)
+                    if "chat_template" in f and (f["chat_template"] == "" or f["chat_template"] is None):
+                        del f["chat_template"]
+                    with open(tokenizer_config_path, "w") as new_f:
+                        json.dump(f, new_f, indent = 2, ensure_ascii = False)
+                except:
+                    pass
             pass
-    pass
-    # Fix config.json using torch_dtype / dtype
-    config_file_path = os.path.join(saved_folder, "config.json")
-    if os.path.exists(config_file_path):
-        try:
-            with open(config_file_path, "r") as f:
-                data = f.read()
-            data = data.replace('"dtype"', '"torch_dtype"')
-            data = data.replace("'dtype'", "'torch_dtype'")
-            with open(config_file_path, "w") as f:
-                f.write(data)
-        except:
-            pass
+            # Fix config.json using torch_dtype / dtype
+            config_file_path = os.path.join(saved_folder, "config.json")
+            if os.path.exists(config_file_path):
+                try:
+                    with open(config_file_path, "r") as f:
+                        data = f.read()
+                    data = data.replace('"dtype"', '"torch_dtype"')
+                    data = data.replace("'dtype'", "'torch_dtype'")
+                    with open(config_file_path, "w") as f:
+                        f.write(data)
+                except:
+                    pass
+    except Exception as e:
+        if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+            logger.error(f"Unsloth: Failed to fix tokenizer config because {str(e)}")
+        pass
     return
 pass
 
@@ -1319,11 +1334,18 @@ def merge_and_overwrite_lora(
 
         index_data = {"metadata": {}, "weight_map": weight_map}
         index_path = os.path.join(save_directory, "model.safetensors.index.json")
-        with open(index_path, "w", encoding = "utf-8") as f:
-            json.dump(index_data, f, indent = 4)
+        lock = get_lock(index_path, timeout = 20)
+        try:
+            with lock:
+                with open(index_path, "w", encoding = "utf-8") as f:
+                    json.dump(index_data, f, indent = 4)
 
-        if push_to_hub:
-            upload_items("model.safetensors.index.json")
+                if push_to_hub:
+                    upload_items("model.safetensors.index.json")
+        except Exception as e:
+            if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+                logger.error(f"Unsloth: Failed to regenerate safetensors index because {str(e)}")
+            pass
 
     # Step 7: Final upload of all shards if not using low disk space mode and pushing
     if not low_disk_space_usage and push_to_hub:
