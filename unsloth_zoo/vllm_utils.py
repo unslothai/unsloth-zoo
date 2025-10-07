@@ -1205,7 +1205,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer = Linear(0, 0, device = get_target_device(), bias = has_bias)
                 layer.in_features  = weight.shape[1]
                 layer.out_features = weight.shape[0]
-                layer.weight = torch.nn.Parameter(weight, requires_grad = False)
+                # from vllm 0.11.1, the .weight is of dtype ModelWeightParameter, so try to extract the 'data' part
+                # https://github.com/vllm-project/vllm/commit/de94289a98d7ec52a5ef02719e01a1db8b505170#diff-7d6145ac4ba084231a441c2056c7fca23c3bae33e6542f4f602a6c9d4d2da64dL199-R208
+                layer.weight = torch.nn.Parameter(getattr(weight, 'data', weight), requires_grad = False)
                 layer.bias = bias
             else:
                 # LayerNorms (including vision norms)
