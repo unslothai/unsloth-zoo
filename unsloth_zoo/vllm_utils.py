@@ -867,22 +867,32 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
         ## Handle FP8 weights. For now only BlockQuantized
         weight_scale = getattr(proj, "weight_scale", None)
         if weight_scale is not None:
+            scale_suffix = '.weight_scale'
             offsets = [0] + proj.logical_widths # [q, k, v] sizes
             offsets = np.cumsum(offsets)
-            # for qwen 3 for eg, 4096 query and 1024 each for k and v. Weight block size say is [128, 128]
-            # so the shape of qkv is [6144, 4096] and scale.T is [48, 32]. Now 48 should be split into [0, 32, 40, 48]
-            # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
-            block_size = proj.weight_block_size[0]
-            scale_offsets = [x//block_size for x in offsets]
+            if weight_scale.ndim==2:
+                if weight_scale.shape[1]>1:
+                    # Block quantized has 2D weight scale
+                    # for qwen 3 for eg, 4096 query and 1024 each for k and v. Weight block size say is [128, 128]
+                    # so the shape of qkv is [6144, 4096] and scale.T is [48, 32]. Now 48 should be split into [0, 32, 40, 48]
+                    # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
+                    scale_suffix = '.weight_scale_inv'
+                    block_size = proj.weight_block_size[0]
+                    weight_scale = weight_scale.T
+                else:
+                    block_size = 1
+
+                scale_offsets = [x//block_size for x in offsets]
+                if slice_weights:
+                    weight_scale = weight_scale[scale_offsets[kk] : scale_offsets[kk + 1]]
+
             if slice_weights:
                 weight = qweight[offsets[kk] : offsets[kk + 1]]
-                weight_scale = proj.weight_scale.T[scale_offsets[kk] : scale_offsets[kk + 1]]
             else:
                 weight = qweight
-                weight_scale = proj.weight_scale
 
-            state_dict[prefix + ".weight_scale_inv"] = weight_scale
-            quant_state_dict[prefix + ".weight_scale_inv"] = weight_scale
+            state_dict[prefix + scale_suffix] = weight_scale
+            quant_state_dict[prefix + scale_suffix] = weight_scale
 
         # Handle quantized weights
         quant_states = getattr(qweight, "bnb_quant_state", None)
@@ -1177,6 +1187,15 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer = torch.nn.Parameter(weight, requires_grad = False)
                 exec(f"new_model.{layer_name_br} = layer")
                 continue
+            elif f"{layer_name}.weight_scale" in quant_state_dict:
+                # This is FP8 quantized but not block quant. Either dynamic or static
+                from compressed_tensor.linear.compressed_linear import CompressedLinear
+                layer = FP8Linear(in_features=0,out_features=0,bias = has_bias,dtype=dtype,block_size=kwargs['block_size'],device=get_target_device(),activation_scheme=kwargs['activation_scheme'])
+                layer.in_features = weight.shape[1]
+                layer.out_features = weight.shape[0]
+                layer.weight = torch.nn.Parameter(weight, requires_grad = False)
+                layer.bias = bias
+                layer.weight_scale_inv = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale_inv"], requires_grad = False)
             elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
                 # This denotes that the model if FP8 dynamic quantized.
                 from transformers.integrations.finegrained_fp8 import FP8Linear
