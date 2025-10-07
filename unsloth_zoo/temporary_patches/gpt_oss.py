@@ -644,6 +644,47 @@ class GptOssMLP(nn.Module):
         return routed_out, router_scores
 pass
 
+def patch_gpt_oss_pretrained_model():
+    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    if "_load_in_4bit_" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        from transformers.models.gpt_oss.modeling_gpt_oss import GptOssRMSNorm
+        from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
+        from transformers.models.gpt_oss.modeling_gpt_oss import GptOssAttention
+        from transformers.models.gpt_oss.modeling_gpt_oss import GptOssTopKRouter
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssPreTrainedModel", e)
+
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Parameter):
+            module.data.normal_(mean=0.0, std=std)
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, GptOssRMSNorm):
+            module.weight.data.fill_(1.0)
+        elif isinstance(module, GptOssExperts):
+            module.gate_up_proj.data.normal_(mean=0.0, std=std)
+            module.gate_up_proj_bias.data.zero_()
+            module.down_proj.data.normal_(mean=0.0, std=std)
+            module.down_proj_bias.data.zero_()
+        elif isinstance(module, GptOssAttention):
+            module.sinks.data.normal_(mean=0.0, std=std)
+        elif isinstance(module, GptOssTopKRouter): # change is here since our new Patched Router uses linear
+            module.linear.weight.data.normal_(mean=0.0, std=std)
+            module.linear.bias.data.normal_(mean=0.0, std=std)
+    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssPreTrainedModel, "_init_weights", _init_weights)
+pass
+TEMPORARY_PATCHES.append(patch_gpt_oss_pretrained_model)
+
+
 def patch_gpt_oss_linearized():
     if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
     if "_load_in_4bit_" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
