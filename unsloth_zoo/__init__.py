@@ -66,7 +66,6 @@ pass
 if os.environ.get("UNSLOTH_ZOO_UTILS_ONLY", "0") == "1":
     del os
 else:
-    print("unsloth_zoo: importing unsloth")
     from importlib.util import find_spec
     if find_spec("unsloth") is None:
         raise ImportError("Please install Unsloth via `pip install unsloth`!")
