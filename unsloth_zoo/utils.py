@@ -256,8 +256,6 @@ def write_file(function_location, write_new_source):
                     os.fsync(file.fileno())
         return None
     except Exception as e:
-        # consider adding logging to main_process only
-        # counterpoint: we may want to see errors on all processes
         if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
             logger.error(f"Unsloth: Failed to write file {function_location} because {str(e)}")
         return None
