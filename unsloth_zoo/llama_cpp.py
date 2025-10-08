@@ -104,6 +104,8 @@ def use_local_gguf():
     original_modules = set(sys.modules.keys())
     gguf_py_path = os.path.join("llama.cpp", "gguf-py")
 
+    original_gguf_modules = {}
+
     try:
         # Add gguf-py to sys.path if it exists
         if os.path.exists(gguf_py_path):
@@ -113,6 +115,7 @@ def use_local_gguf():
             # Remove system gguf modules to force reimport
             gguf_modules = [key for key in sys.modules.keys() if key.startswith('gguf')]
             for module in gguf_modules:
+                original_gguf_modules[module] = sys.modules[module]  # Store original
                 del sys.modules[module]
                 logger.debug(f"Removed system module {module}")
 
@@ -128,6 +131,11 @@ def use_local_gguf():
         for module in gguf_modules_to_remove:
             del sys.modules[module]
             logger.debug(f"Cleaned up module {module}")
+
+        # Restore original gguf modules
+        for module_name, module_obj in original_gguf_modules.items():
+            sys.modules[module_name] = module_obj
+            logger.debug(f"Restored original module {module_name}")
 
         logger.debug("Restored original Python environment")
 pass
