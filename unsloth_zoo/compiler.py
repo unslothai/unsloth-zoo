@@ -1339,6 +1339,15 @@ def apply_fused_lm_head(forward, module = None):
         forward = forward.replace(", **)", ")")
         forward = forward.replace(",**)", ")")
         forward = forward.replace(",** )", ")")
+
+        line_to_replace = "        logits = EMPTY_LOGITS"
+
+        replacement_block = """        if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
+        else:
+            logits = EMPTY_LOGITS"""
+        forward = forward.replace(line_to_replace, replacement_block)
+    
         # print(forward)
         return forward
     pass
