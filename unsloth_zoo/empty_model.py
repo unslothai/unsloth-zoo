@@ -78,8 +78,9 @@ def compare_attributes(original_model, new_model):
         # Find extra attributes (in new but not in original)
         extra_in_new = new_attrs - orig_attrs
         if extra_in_new:
-            for attr in sorted(extra_in_new):
-                print(f"EXTRA ATTRIBUTE: {name}.{attr} (exists in new model but not original)")
+            print(f'Found some extra attributes like: {list(extra_in_new)[:5]}...')
+            # for attr in sorted(extra_in_new):
+            #     print(f"EXTRA ATTRIBUTE: {name}.{attr} (exists in new model but not original)")
 
         # Compare common attributes and buffer names
         common_attrs = orig_attrs & new_attrs
