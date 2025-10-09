@@ -350,11 +350,15 @@ def patch_hf_quantizer():
     FineGrainedFP8HfQuantizer.is_trainable = property(make_trainable)
     FineGrainedFP8HfQuantizer.is_qat_trainable = property(make_trainable)
 
+    from transformers.quantizers.quantizer_fbgemm_fp8 import FbgemmFp8HfQuantizer
+    FbgemmFp8HfQuantizer.is_trainable = property(make_trainable)
+    FbgemmFp8HfQuantizer.is_qat_trainable = property(make_trainable)
+
 @torch.inference_mode()
 def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
 
-    if get_quant_type(config) == "fp8":
+    if get_quant_type(config) in ['fp8', 'fbgemm_fp8']:
         patch_hf_quantizer()
 
     if is_vision_model:
