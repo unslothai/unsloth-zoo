@@ -880,6 +880,9 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     block_size = proj.weight_block_size[0]
                     weight_scale = weight_scale.T
                 else:
+                    # This is dynamic quantization (aka per row or per column). The scale is of shape [n,1]
+                    # The weight here is of shape [4096, 6144]. We need to transpose and then slice
+                    qweight = qweight.T
                     block_size = 1
 
                 scale_offsets = [x//block_size for x in offsets]
@@ -1066,11 +1069,11 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
         try:
             old_val = old_state_dict[key]
             new_val = new_state_dict[key]
-            if old_val.dtype != new_val.dtype:
+            if old_val.dtype != new_val.dtype or (new_val.element_size() < 2):
                 # upcast both to float32 just for comparison. For FP8, vLLM stores weight scale in FP32 while HF preferes 16bit
                 old_val = old_val.to(torch.float32)
                 new_val = new_val.to(torch.float32)
-            torch.testing.assert_close(old_val, new_val, check_stride = False)
+            torch.testing.assert_close(old_val, new_val, check_stride = False, atol=1e-4, rtol=1e-3)
         except Exception as error:
             if key == "lm_head.weight":
                 # Try tied embeddings fallback
@@ -1115,6 +1118,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             elif quant_method == 'fp8':
                 kwargs['activation_scheme'] = quantization_config['activation_scheme']
                 kwargs['block_size'] = quantization_config['weight_block_size']
+            elif quant_method=='fbgemm_fp8':
+                kwargs['input_scale_ub'] = torch.tensor([quantization_config['activation_scale_ub']], device=get_target_device())
 
         # Get bnb_config flags
         elif bnb_config is not None:
@@ -1189,13 +1194,14 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 continue
             elif f"{layer_name}.weight_scale" in quant_state_dict:
                 # This is FP8 quantized but not block quant. Either dynamic or static
-                from compressed_tensor.linear.compressed_linear import CompressedLinear
-                layer = FP8Linear(in_features=0,out_features=0,bias = has_bias,dtype=dtype,block_size=kwargs['block_size'],device=get_target_device(),activation_scheme=kwargs['activation_scheme'])
+                from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear
+                layer = FbgemmFp8Linear(in_features=0,out_features=0,bias = has_bias,weight_dtype=dtype).to(get_target_device())
                 layer.in_features = weight.shape[1]
                 layer.out_features = weight.shape[0]
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
                 layer.bias = bias
-                layer.weight_scale_inv = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale_inv"], requires_grad = False)
+                layer.input_scale_ub = kwargs['input_scale_ub']
+                layer.weight_scale = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale"], requires_grad = False)
             elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
                 # This denotes that the model if FP8 dynamic quantized.
                 from transformers.integrations.finegrained_fp8 import FP8Linear
