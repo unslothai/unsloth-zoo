@@ -1202,6 +1202,10 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.bias = bias
                 layer.input_scale_ub = kwargs['input_scale_ub']
                 layer.weight_scale = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale"], requires_grad = False)
+                layer.quant_method = "fbgemm_fp8"
+                layer.weight.quant_method = "fbgemm_fp8"
+                layer.weight_scale.quant_method = "fbgemm_fp8"
+                layer.weight.input_scale_ub = kwargs['input_scale_ub']
             elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
                 # This denotes that the model if FP8 dynamic quantized.
                 from transformers.integrations.finegrained_fp8 import FP8Linear
@@ -1211,7 +1215,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
                 layer.bias = bias
                 layer.weight_scale_inv = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale_inv"], requires_grad = False)
-
+                layer.quant_method = "fp8"
             elif f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
@@ -1469,7 +1473,7 @@ def load_vllm(
     use_bitsandbytes = use_bitsandbytes or \
         model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
 
-    is_fp8 = "fp8" in model_name.lower() or (quant_method == "fp8")
+    is_fp8 = "fp8" in model_name.lower() or (quant_method in ["fp8", "fbgemm_fp8"])
 
     assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
