@@ -47,7 +47,12 @@ def compare_dicts(orig_dict, new_dict, prefix=""):
             print(f"Dict key {key_path} type mismatch: original {type(orig_val)} != new model {type(new_val)}")
 
 def compare_attributes(original_model, new_model):
-    from transformers.configuration_utils import PretrainedConfig
+    try:
+        from transformers.configuration_utils import PreTrainedConfig
+        PretrainedConfig = PreTrainedConfig
+    except:
+        from transformers.configuration_utils import PretrainedConfig
+
     print("=== ATTRIBUTE COMPARISON REPORT ===")
     missing_attrs = []
     type_mismatches = []
