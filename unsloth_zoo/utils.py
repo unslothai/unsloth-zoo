@@ -147,6 +147,17 @@ def get_lock(target: str, timeout: Optional[int] = None) -> FileLock:
         timeout = int(os.environ.get("UNSLOTH_LOCK_TIMEOUT", "10"))
     return FileLock(lock_path, timeout=timeout)
 
+  
+def get_quant_type(config):
+    quant_config = getattr(config, 'quantization_config', None)
+    if quant_config:
+        from transformers.quantizers import AutoQuantizationConfig
+        if isinstance(quant_config, dict):
+            return quant_config.get('quant_method', None)
+        elif isinstance(quant_config, AutoQuantizationConfig):
+            return getattr(quant_config, 'quant_method', None)
+    return None
+  
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
