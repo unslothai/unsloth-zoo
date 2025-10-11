@@ -865,11 +865,17 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             dim_offsets = [0, qweight.shape[0]]
 
         ## Handle FP8 weights. For now only BlockQuantized
-        weight_scale = getattr(proj, "weight_scale", None)
-        if weight_scale is not None:
-            scale_suffix = '.weight_scale'
+        if qweight.dtype==torch.float8_e4m3fn:
+            if hasattr(proj, 'weight_scale'):
+                weight_scale = proj.weight_scale
+            elif hasattr(proj, 'weight_scale_inv'):
+                weight_scale = proj.weight_scale_inv
+            else:
+                raise ValueError(f"Unsloth: Cannot find weight scale for FP8 weight {prefix}")
+
             offsets = [0] + proj.logical_widths # [q, k, v] sizes
             offsets = np.cumsum(offsets)
+            scale_suffix = '.weight_scale'
             if weight_scale.ndim==2:
                 if weight_scale.shape[1]>1:
                     # Block quantized has 2D weight scale
@@ -1202,10 +1208,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.bias = bias
                 layer.input_scale_ub = kwargs['input_scale_ub']
                 layer.weight_scale = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale"], requires_grad = False)
-                layer.quant_method = "fbgemm_fp8"
-                layer.weight.quant_method = "fbgemm_fp8"
-                layer.weight_scale.quant_method = "fbgemm_fp8"
                 layer.weight.input_scale_ub = kwargs['input_scale_ub']
+                layer.quant_method = "fbgemm_fp8"
             elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
                 # This denotes that the model if FP8 dynamic quantized.
                 from transformers.integrations.finegrained_fp8 import FP8Linear
@@ -1216,8 +1220,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.bias = bias
                 layer.weight_scale_inv = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale_inv"], requires_grad = False)
                 layer.quant_method = "fp8"
-                layer.weight.quant_method = 'fp8'
-                layer.weight_scale_inv.quant_method = 'fp8'
             elif f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
