@@ -1326,7 +1326,7 @@ def apply_fused_lm_head(forward, module = None):
         # Return logits back
         if "logits = outputs.logits" in cross_entropy_find:
             forward = forward.replace(
-                "logits = EMPTY_LOGITS",
+                "logits = self.lm_head(hidden_states[:, slice_indices, :]) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS",
                 "logits = outputs.logits",
             )
         # Fix vocab_size = (vocab_size=
