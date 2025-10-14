@@ -1,5 +1,3 @@
-
-
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
@@ -865,7 +863,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             dim_offsets = [0, qweight.shape[0]]
 
         ## Handle FP8 weights. For now only BlockQuantized
-        if qweight.dtype==torch.float8_e4m3fn:
+        if qweight.dtype == torch.float8_e4m3fn:
             if hasattr(proj, 'weight_scale'):
                 weight_scale = proj.weight_scale
             elif hasattr(proj, 'weight_scale_inv'):
@@ -1201,7 +1199,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             elif f"{layer_name}.weight_scale" in quant_state_dict:
                 # This is FP8 quantized but not block quant. Either dynamic or static
                 from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear
-                layer = FbgemmFp8Linear(in_features=0,out_features=0,bias = has_bias,weight_dtype=dtype).to(get_target_device())
+                layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
                 layer.in_features = weight.shape[1]
                 layer.out_features = weight.shape[0]
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
@@ -1213,7 +1211,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
                 # This denotes that the model if FP8 dynamic quantized.
                 from transformers.integrations.finegrained_fp8 import FP8Linear
-                layer = FP8Linear(in_features=0,out_features=0,bias = has_bias,dtype=dtype,block_size=kwargs['block_size'],device=get_target_device(),activation_scheme=kwargs['activation_scheme'])
+                layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias,dtype=dtype, block_size = kwargs['block_size'], device = get_target_device(),activation_scheme=kwargs['activation_scheme'])
                 layer.in_features = weight.shape[1]
                 layer.out_features = weight.shape[0]
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
@@ -1477,7 +1475,7 @@ def load_vllm(
     use_bitsandbytes = use_bitsandbytes or \
         model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
 
-    is_fp8 = "fp8" in model_name.lower() or (quant_method in ["fp8", "fbgemm_fp8"])
+    is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
     assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
