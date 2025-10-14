@@ -2148,7 +2148,7 @@ def unsloth_compile_transformers(
     # Get all functions as well
     functions = [x for x in functions if x not in torch_modules or not compile_torch_modules or not compile_custom_modules]
 
-    # Get all PretrainedModel classes
+    # Get all PreTrainedModel classes
     pretrained_modules = re.findall(r"class ([^\s]{1,})\(.+?PreTrainedModel\)", full_source)
 
     # Remove if no forward function

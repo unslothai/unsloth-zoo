@@ -1780,7 +1780,7 @@ pass
 def _convert_lora_keys_to_safetensor_format(
     lora_weights,        # Global dict of LoraStats objects
     safetensor_keys,     # List of keys from the CURRENT shard
-    model_class_name="PretrainedModel" # The actual model instance (e.g. Qwen2VLForConditionalGeneration)
+    model_class_name="PreTrainedModel" # The actual model instance (e.g. Qwen2VLForConditionalGeneration)
 ):
     import re
 

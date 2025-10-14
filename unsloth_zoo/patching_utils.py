@@ -242,7 +242,12 @@ pass
 
 def patch_to_dict():
     from functools import wraps
-    from transformers.configuration_utils import PretrainedConfig
+    try:
+        from transformers.configuration_utils import PreTrainedConfig
+        PretrainedConfig = PreTrainedConfig
+    except:
+        from transformers.configuration_utils import PretrainedConfig
+
     from .hf_utils import _normalize_dict_dtypes
     original_to_dict = PretrainedConfig.to_dict
     original_to_diff_dict = PretrainedConfig.to_diff_dict
