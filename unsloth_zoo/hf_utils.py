@@ -21,7 +21,12 @@ import torch
 import json
 import re
 from .log import logger
-from transformers import PretrainedConfig
+try:
+    from transformers import PreTrainedConfig
+    PretrainedConfig = PreTrainedConfig
+except:
+    from transformers import PretrainedConfig
+
 HAS_TORCH_DTYPE = "torch_dtype" in PretrainedConfig.__doc__
 
 __all__ = [
