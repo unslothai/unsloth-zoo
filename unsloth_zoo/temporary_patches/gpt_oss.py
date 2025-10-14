@@ -1373,7 +1373,13 @@ pass
 # RuntimeError: Unsloth: Failed to load model. Both AutoConfig and PeftConfig loading failed.
 # AutoConfig error: 'GptOssConfig' object has no attribute 'max_position_embeddings'
 try:
-    from transformers.configuration_utils import PretrainedConfig, layer_type_validation
+    from transformers.configuration_utils import layer_type_validation
+    try:
+        from transformers.configuration_utils import PreTrainedConfig
+        PretrainedConfig = PreTrainedConfig
+    except:
+        from transformers.configuration_utils import PretrainedConfig
+
     from transformers.modeling_rope_utils import rope_config_validation
 
     class Old_GptOssConfig(PretrainedConfig):
