@@ -412,7 +412,7 @@ def install_llama_cpp(
     pip = check_pip()
 
     print("Unsloth: Install GGUF and other packages")
-    try_execute(f"{pip} install gguf protobuf sentencepiece", **kwargs)
+    try_execute(f"{pip} install gguf protobuf sentencepiece mistral_common", **kwargs)
     if just_clone_repo: return llama_cpp_folder
 
     build_success = False
