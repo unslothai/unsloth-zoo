@@ -1004,6 +1004,12 @@ def merge_and_overwrite_lora(
                                         total_size_in_bytes += file_size
                 except Exception as e:
                     print(f"Warning: Could not process index file: {e}")
+            tokenizer_model_path = os.path.join(model_name, "tokenizer.model")
+            if os.path.exists(tokenizer_model_path):
+                os.makedirs(save_directory, exist_ok=True)
+                # Copy from local
+                shutil.copy2(tokenizer_model_path, os.path.join(save_directory, "tokenizer.model"))
+                print(f"Copied tokenizer.model from local model directory")
         else:
             # Original HF repo logic
             try:
@@ -1189,7 +1195,7 @@ def merge_and_overwrite_lora(
         pass
     pass
 
-    # Step 4 : Handle retrieval of original 16-bit shards
+    # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
     if not is_local_path and _hf_cache_dir is not None:
         copied_all_from_cache = _try_copy_all_from_cache(
             repo_id = model_name,
@@ -1198,6 +1204,13 @@ def merge_and_overwrite_lora(
             hf_cache_dir = _hf_cache_dir,
             token = token,
         )
+        copied_tokenizer_model_from_cache = _try_copy_all_from_cache(
+            repo_id=model_name,
+            filenames_to_check=["tokenizer.model"],
+            target_dir_str=save_directory,
+            hf_cache_dir=_hf_cache_dir,
+            token=token,
+        )
 
     if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
         print(f"Downloading safetensors for {model_name}...")
@@ -1205,6 +1218,15 @@ def merge_and_overwrite_lora(
             repo_id = model_name,
             local_dir = save_directory,
             allow_patterns = safe_tensor_index_files + safetensors_list,
+            local_dir_use_symlinks = False,
+        )
+
+    if not copied_tokenizer_model_from_cache and not low_disk_space_usage and not is_local_path:
+        print(f"Attempting to download tokenizer.model for {model_name}...")
+        snapshot_download(
+            repo_id = model_name,
+            local_dir = save_directory,
+            allow_patterns = ["tokenizer.model"],
             local_dir_use_symlinks = False,
         )
 
@@ -1240,13 +1262,29 @@ def merge_and_overwrite_lora(
         final_safetensors_list.extend(resulting_files)
     pass
 
+    if low_disk_space_usage and not is_local_path and not copied_all_from_cache:
+        tokenizer_model_path = os.path.join(save_directory, "tokenizer.model")
+        if not os.path.exists(tokenizer_model_path):
+            try:
+                hf_hub_download(
+                    repo_id = model_name,
+                    filename = "tokenizer.model",
+                    repo_type = "model",
+                    local_dir = save_directory,
+                    token = token,
+                )
+                print("Downloaded tokenizer.model")
+            except Exception as e:
+                # It's OK if the file doesn't exist (not all models have it)
+                print(f"Note: tokenizer.model not found (this is OK for non-SentencePiece models)")
+
     if needs_splitting:
         final_safetensors_list = renumber_safetensor_files(final_safetensors_list, save_directory)
 
     regenerate_index = ((base_model_is_quantized and quant_type == "mxfp4") or needs_splitting) and len(final_safetensors_list) > 1 and save_method != "mxfp4"
     weight_map = {}
 
-    for filename in ProgressBar(final_safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
+    for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         n_saved_modules += _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,

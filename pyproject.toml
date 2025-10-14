@@ -47,6 +47,7 @@ dependencies = [
     "msgspec",
     "typing_extensions",
     "filelock",
+    "mistral_common",
 ]
 
 [tool.setuptools.dynamic]
