@@ -874,8 +874,8 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             offsets = [0] + proj.logical_widths # [q, k, v] sizes
             offsets = np.cumsum(offsets)
             scale_suffix = '.weight_scale'
-            if weight_scale.ndim==2:
-                if weight_scale.shape[1]>1:
+            if weight_scale.ndim == 2:
+                if weight_scale.shape[1] > 1:
                     # Block quantized has 2D weight scale
                     # for qwen 3 for eg, 4096 query and 1024 each for k and v. Weight block size say is [128, 128]
                     # so the shape of qkv is [6144, 4096] and scale.T is [48, 32]. Now 48 should be split into [0, 32, 40, 48]
@@ -1077,7 +1077,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
                 # upcast both to float32 just for comparison. For FP8, vLLM stores weight scale in FP32 while HF preferes 16bit
                 old_val = old_val.to(torch.float32)
                 new_val = new_val.to(torch.float32)
-            torch.testing.assert_close(old_val, new_val, check_stride = False, atol=1e-4, rtol=1e-3)
+            torch.testing.assert_close(old_val, new_val, check_stride = False, atol = 1e-4, rtol = 1e-3)
         except Exception as error:
             if key == "lm_head.weight":
                 # Try tied embeddings fallback
@@ -1127,8 +1127,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 except ImportError:
                     raise ImportError("Unsloth: FP8 models need importing FP8Linear from `transformers.integrations.finegrained_fp8` but we don't see it.")
 
-            elif quant_method=='fbgemm_fp8':
-                kwargs['input_scale_ub'] = torch.tensor([quantization_config['activation_scale_ub']], device=get_target_device())
+            elif quant_method == 'fbgemm_fp8':
+                kwargs['input_scale_ub'] = torch.tensor([quantization_config['activation_scale_ub']], device = get_target_device())
                 try:
                     from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear
                 except ImportError:
@@ -1219,7 +1219,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.quant_method = "fbgemm_fp8"
             elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
                 # This denotes that the model if FP8 dynamic quantized.
-                layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias,dtype=dtype, block_size = kwargs['block_size'], device = get_target_device(),activation_scheme=kwargs['activation_scheme'])
+                layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias,dtype=dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
                 layer.in_features = weight.shape[1]
                 layer.out_features = weight.shape[0]
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
@@ -2514,7 +2514,7 @@ def _test_get_vllm_state_dict(
         # Check all hidden states manually
         input_ids = tokenizer(inputs[0], add_special_tokens = False, return_tensors = "pt")
         input_ids = input_ids["input_ids"].to("cuda", non_blocking = True)
-        # _test_same_model(model, new_model, input_ids)
+        _test_same_model(model, new_model, input_ids)
     else:
         # VLMs dont have a standardised forward pass mechanism. So we just test whole model forward pass and not layer wise
         # TODO: Maybe add layer wise checks
