@@ -1122,8 +1122,18 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             elif quant_method == 'fp8':
                 kwargs['activation_scheme'] = quantization_config['activation_scheme']
                 kwargs['block_size'] = quantization_config['weight_block_size']
+                try:
+                    from transformers.integrations.finegrained_fp8 import FP8Linear
+                except ImportError:
+                    raise ImportError("Unsloth: FP8 models need importing FP8Linear from `transformers.integrations.finegrained_fp8` but we don't see it.")
+
             elif quant_method=='fbgemm_fp8':
                 kwargs['input_scale_ub'] = torch.tensor([quantization_config['activation_scale_ub']], device=get_target_device())
+                try:
+                    from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear
+                except ImportError:
+                    raise ImportError("Unsloth: FP8 models need importing FbgemmFP8Linear from `transformers.integrations.fbgemm_fp8` but we don't see it.")
+
 
         # Get bnb_config flags
         elif bnb_config is not None:
@@ -1198,7 +1208,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 continue
             elif f"{layer_name}.weight_scale" in quant_state_dict:
                 # This is FP8 quantized but not block quant. Either dynamic or static
-                from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear
                 layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
                 layer.in_features = weight.shape[1]
                 layer.out_features = weight.shape[0]
@@ -1210,7 +1219,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.quant_method = "fbgemm_fp8"
             elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
                 # This denotes that the model if FP8 dynamic quantized.
-                from transformers.integrations.finegrained_fp8 import FP8Linear
                 layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias,dtype=dtype, block_size = kwargs['block_size'], device = get_target_device(),activation_scheme=kwargs['activation_scheme'])
                 layer.in_features = weight.shape[1]
                 layer.out_features = weight.shape[0]
