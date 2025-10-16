@@ -744,7 +744,9 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
             if layer_module is not None:
                 if "qkv" in layer_path:
-                    if model_type == "qwen2_5_vl":
+                    if model_type in ("qwen2_5_vl", "qwen3_vl"):
+                        # If the HF model too prefers having merged qkv, we do this
+                        # This is evident in qwen-2.5-vl and qwen-3-vl so far.
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
                     else:
                          get_state_dict(f"{layer_path.replace('qkv_proj', 'q_proj')}", 0, state_dict, layer_module)
