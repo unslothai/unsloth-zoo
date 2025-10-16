@@ -596,6 +596,10 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.transformer.layers.{kk}.feed_forward.up_proj",
             "model.vision_tower.transformer.layers.{kk}.feed_forward.down_proj",
 
+            # qwen 3 vl
+            "model.visual.blocks.{kk}.mlp.linear_fc1",
+            "model.visual.blocks.{kk}.mlp.linear_fc2",
+
         },
         'additional_layers': {
             "model.visual.merger.mlp.{kk}",
@@ -608,6 +612,11 @@ def get_model_layer_config(return_non_layered=True):
             "model.multi_modal_projector.patch_merger.merging_layer",
             "model.multi_modal_projector.linear_1",
             "model.multi_modal_projector.linear_2",
+
+            # qwen 3 vl
+            "model.visual.deepstack_merger_list.{kk}.linear_fc1",
+            "model.visual.deepstack_merger_list.{kk}.linear_fc2",
+
         },
         "non_layered_components":{
             # we do not handle quantization for these layers yet
@@ -637,6 +646,16 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.patch_positional_embedding",
             "model.vision_tower.patch_conv",
             "model.vision_tower.ln_pre",
+
+            # qwen 3 vl
+            "model.visual.pos_embed",
+            "model.visual.merger.linear_fc1",
+            "model.visual.merger.linear_fc2",
+            "model.visual.merger.norm.bias",
+            "model.visual.merger.norm",
+            "model.visual.deepstack_merger_list.0.norm",
+            "model.visual.deepstack_merger_list.1.norm",
+            "model.visual.deepstack_merger_list.2.norm",
         }
     }
 
