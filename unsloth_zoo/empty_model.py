@@ -234,8 +234,7 @@ def create_empty_causal_lm(config, dtype = torch.float16):
             model_name = getattr(config, 'model_name')
             if model_name is not None:
                 # This would persist quantization information.
-                print(f'Using {model_name=} found in the config')
-                original_meta_model = AutoModelForCausalLM.from_pretrained(model_name,dtype=config.dtype)
+                original_meta_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=config.dtype)
             else:
                 original_meta_model = AutoModelForCausalLM.from_config(config)
     except Exception as e:
