@@ -329,7 +329,9 @@ def train_on_responses_only(
         return _train_on_responses_only
 
     from multiprocessing import cpu_count
-    if num_proc is None or type(num_proc) is not int: num_proc = cpu_count()
+    if num_proc is None or type(num_proc) is not int:
+        num_proc = cpu_count()
+        num_proc = min(max(cpu_count()+4, 2), 64)
 
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):

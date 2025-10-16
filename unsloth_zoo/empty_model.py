@@ -27,10 +27,13 @@ import torch
 import re
 import os
 from copy import deepcopy
+from .utils import get_quant_type
+from .log import logger
 
 def is_comparable(val):
     # Don't treat tensors as comparable, only basic types
-    return isinstance(val, (int, float, bool, str, list, tuple, type(None), torch.dtype))
+    from enum import Enum
+    return isinstance(val, (int, float, bool, str, list, tuple, type(None), torch.dtype, Enum))
 
 def compare_dicts(orig_dict, new_dict, prefix=""):
     all_keys = set(orig_dict.keys()) | set(new_dict.keys())
@@ -58,6 +61,10 @@ def compare_attributes(original_model, new_model):
     type_mismatches = []
     value_mismatches = []
 
+    # Extract all config keys at any level
+    config_keys = _extract_all_config_keys(original_model.config) if hasattr(original_model, 'config') else set()
+    config_keys = config_keys | {'config'}
+
     for (name, module), (orig_name, original_module) in zip(
         new_model.named_modules() if new_model is not None else [],
         original_model.named_modules() if original_model is not None else []
@@ -77,13 +84,16 @@ def compare_attributes(original_model, new_model):
         # Find extra attributes (in new but not in original)
         extra_in_new = new_attrs - orig_attrs
         if extra_in_new:
-            for attr in sorted(extra_in_new):
-                print(f"EXTRA ATTRIBUTE: {name}.{attr} (exists in new model but not original)")
+            print(f'Found some extra attributes like: {list(extra_in_new)[:5]}...')
+            # for attr in sorted(extra_in_new):
+            #     print(f"EXTRA ATTRIBUTE: {name}.{attr} (exists in new model but not original)")
 
         # Compare common attributes and buffer names
         common_attrs = orig_attrs & new_attrs
         common_buffers = orig_attrs | buffer_names
         for attr in sorted(common_attrs):
+            if attr.startswith('.'):
+                continue
             try:
                 original_val = getattr(original_module, attr)
                 new_val = getattr(module, attr)
@@ -101,7 +111,9 @@ def compare_attributes(original_model, new_model):
 
             try:
                 if isinstance(original_val, dict) and isinstance(new_val, dict):
-                    compare_dicts(original_val, new_val, prefix=f"{name}.{attr}")
+                    if attr in config_keys:
+                        # only compare those attributes that are relevant
+                        compare_dicts(original_val, new_val, prefix=f"{name}.{attr}")
                 elif original_comparable and new_comparable:
                     if original_val != new_val:
                         value_mismatches.append(f"{name}.{attr}: original {original_val} != new {new_val}")
@@ -161,6 +173,7 @@ def copy_attributes(original_model, new_model):
     # Extract all config keys at any level
     config_keys = _extract_all_config_keys(original_model.config) if hasattr(original_model, 'config') else set()
     config_keys = config_keys | {'config'}
+    extra_attrs = {'hf_quantizer', }
 
     copied_count = 0
     skipped_count = 0
@@ -198,6 +211,8 @@ def copy_attributes(original_model, new_model):
                     # Sometimes the .config in original model is of config class and not a dict. Copy it as is.
                     setattr(module, attr, deepcopy(original_val))
                     copied_count += 1
+                elif attr in extra_attrs:
+                    setattr(module, attr, getattr(original_module, attr))
             except:
                 skipped_count += 1
                 skipped_attrs.append(attr)
@@ -221,7 +236,12 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     try:
         from accelerate import init_empty_weights
         with init_empty_weights():
-            original_meta_model = AutoModelForCausalLM.from_config(config)
+            model_name = getattr(config, 'model_name')
+            if model_name is not None:
+                # This would persist quantization information.
+                original_meta_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=config.dtype)
+            else:
+                original_meta_model = AutoModelForCausalLM.from_config(config)
     except Exception as e:
         print(f"Failed to create original_meta_model for AutoModelForCausalLM. Error {e}")
         original_meta_model = None
@@ -328,10 +348,31 @@ def create_empty_vision_model(config, dtype = torch.float16):
 
     return new_model, original_meta_model, num_layers
 
+def patch_hf_quantizer():
+    # To tell hf trainer that the quantized model is trainable
+    def make_trainable(self):
+        return True
+    try:
+        from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
+        FineGrainedFP8HfQuantizer.is_trainable = property(make_trainable)
+        FineGrainedFP8HfQuantizer.is_qat_trainable = property(make_trainable)
+    except Exception as e:
+        logger.warning(f"Failed to patch FineGrainedFP8HfQuantizer. Error {e}")
+
+    try:
+        from transformers.quantizers.quantizer_fbgemm_fp8 import FbgemmFp8HfQuantizer
+        FbgemmFp8HfQuantizer.is_trainable = property(make_trainable)
+        FbgemmFp8HfQuantizer.is_qat_trainable = property(make_trainable)
+    except Exception as e:
+        logger.warning(f"Failed to patch FbgemmFp8HfQuantizer. Error {e}")
 
 @torch.inference_mode()
 def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
+
+    if get_quant_type(config) in ('fp8', 'fbgemm_fp8'):
+        patch_hf_quantizer()
+
     if is_vision_model:
         new_model, original_meta_model, num_layers = create_empty_vision_model(config, dtype)
     else:
