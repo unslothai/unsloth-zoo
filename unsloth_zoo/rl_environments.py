@@ -34,6 +34,8 @@ import numpy as np
 import signal
 from contextlib import contextmanager
 from functools import wraps
+import threading
+import time
 from typing import Callable, TypeVar, Any, Tuple
 T = TypeVar("T")
 
@@ -301,32 +303,74 @@ pass
 def time_limit(seconds: float):
     """
     Enforce a wall-clock time limit using SIGALRM/ITIMER_REAL.
-    - Works on Unix-like systems, main thread only.
-    - Interrupts many blocking syscalls but not all C extensions.
+
+    Improvements vs. the original:
+      - Nest-safe: if used inside another time_limit, the earliest deadline wins.
+      - Correctly restores a pre-existing timer with remaining = previous_remaining - elapsed.
+      - Clear main-thread enforcement and better docs.
+
+    Notes:
+      - Unix-like systems only, main thread only.
+      - Not composable with *other* (non-time_limit) uses of SIGALRM: we take ownership
+        of SIGALRM while active and restore it afterward.
+      - Some C extensions may not be interruptible by signals; for bulletproof isolation
+        use the process-based fallback shown below.
     """
     if seconds <= 0:
-        raise ValueError("Seconds must be > 0")
+        raise ValueError("seconds must be > 0")
 
     if not hasattr(signal, "setitimer"):
         raise NotImplementedError("time_limit requires Unix setitimer/SIGALRM support")
 
-    def _handler(signum, frame):
-        raise TimeoutError(f"Timed out after {seconds}s")
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("time_limit must be used from the main thread")
 
+    # Snapshot current handler and timer before we modify anything.
     old_handler = signal.getsignal(signal.SIGALRM)
-    prev_timer: Tuple[float, float] = signal.getitimer(signal.ITIMER_REAL)
+    prev_remaining, prev_interval = signal.getitimer(signal.ITIMER_REAL)
+
+    # Our handler: raise a Python TimeoutError.
+    def _handler(signum, frame):
+        raise TimeoutError(f"Timed out after {seconds:g}s")
+    # Mark it so nested contexts can detect “our own” handler.
+    setattr(_handler, "__time_limit_handler__", True)
+
+    # Decide the delay we set now.
+    # If a previous timer exists *and* it appears to be ours (nested usage),
+    # respect the earlier deadline: schedule to min(previous_remaining, seconds).
+    nested_ours = getattr(old_handler, "__time_limit_handler__", False)
+    start = time.monotonic()
+    delay_now = seconds
+    if nested_ours and prev_remaining > 0.0:
+        delay_now = min(seconds, prev_remaining)
 
     try:
+        # Install our handler first so the next SIGALRM raises TimeoutError here.
         signal.signal(signal.SIGALRM, _handler)
-        signal.setitimer(signal.ITIMER_REAL, seconds)  # start new timer
+        # Be explicit about interrupted syscalls semantics (best-effort; platform-dependent).
+        try:
+            # False => restart system calls; we rely on raising from the handler anyway.
+            signal.siginterrupt(signal.SIGALRM, False)
+        except (AttributeError, OSError):
+            pass
+
+        # Start/adjust the process-wide real-time timer.
+        signal.setitimer(signal.ITIMER_REAL, delay_now)
         yield
+
     finally:
-        # Cancel our timer first, restore handler, then reinstate any previous timer.
+        # Stop our timer and restore the previous handler.
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, old_handler)
-        if prev_timer != (0.0, 0.0):
-            # Restore any prior timer that was running before we entered.
-            signal.setitimer(signal.ITIMER_REAL, *prev_timer)
+
+        # If a previous timer existed, restore it with the elapsed time subtracted.
+        if prev_remaining != 0.0 or prev_interval != 0.0:
+            elapsed = max(time.monotonic() - start, 0.0)
+            remaining = max(prev_remaining - elapsed, 0.0)
+            # NOTE: For periodic timers (prev_interval > 0), we don't try to simulate
+            # missed ticks while we owned SIGALRM. If you depend on periodic semantics,
+            # avoid mixing with time_limit.
+            signal.setitimer(signal.ITIMER_REAL, remaining, prev_interval)
 pass
 
 def execute_with_time_limit(seconds: float) -> Callable[[Callable[..., T]], Callable[..., T]]:
