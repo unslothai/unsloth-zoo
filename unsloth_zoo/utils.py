@@ -21,6 +21,10 @@ __all__ = [
     "is_distributed",
     "distributed_function",
     "torch_distributed_get_rank",
+    "UNSLOTH_COMPILE_LOCATION",
+    "UNSLOTH_COMPILE_USE_TEMP",
+    "COMBINED_UNSLOTH_NAME",
+    "get_compile_folder",
 ]
 
 from packaging.version import Version as TrueVersion
@@ -30,8 +34,59 @@ import time
 import contextlib
 import re
 import pathlib
+import zlib
 from typing import Optional
 from filelock import FileLock
+import tempfile
+from unsloth_zoo.log import logger
+
+# Compiled cache location
+global COMBINED_UNSLOTH_NAME
+COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
+
+global UNSLOTH_COMPILE_LOCATION
+if 'UNSLOTH_COMPILE_LOCATION' not in globals():
+    _loc = os.getenv("UNSLOTH_COMPILE_LOCATION", None)
+    if _loc:
+        UNSLOTH_COMPILE_LOCATION = _loc
+    else:
+        UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
+
+global UNSLOTH_COMPILE_USE_TEMP
+UNSLOTH_COMPILE_USE_TEMP = False
+
+def _get_compile_folder(use_tempfile = False):
+    global UNSLOTH_COMPILE_LOCATION
+    global UNSLOTH_COMPILE_USE_TEMP
+    if UNSLOTH_COMPILE_USE_TEMP or use_tempfile:
+        UNSLOTH_COMPILE_USE_TEMP = True
+        leaf = os.path.basename(UNSLOTH_COMPILE_LOCATION)
+        location = os.path.join(tempfile.gettempdir(), leaf)
+        logger.info(
+            f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
+        )
+        os.makedirs(location, exist_ok = True)
+    else:
+        location = UNSLOTH_COMPILE_LOCATION
+        try:
+            # Try creating the directory
+            os.makedirs(location, exist_ok = True)
+            return location, UNSLOTH_COMPILE_USE_TEMP
+        except Exception as e:
+            logger.error(f"Unsloth: Failed to create directory `{UNSLOTH_COMPILE_LOCATION}` because {str(e)}")
+
+            # Instead use a temporary location!
+            location, UNSLOTH_COMPILE_USE_TEMP = _get_compile_folder(use_tempfile = True)
+    return location, UNSLOTH_COMPILE_USE_TEMP
+pass
+
+def get_compile_folder(use_tempfile = False, distributed = True):
+    if distributed:
+        location, UNSLOTH_COMPILE_USE_TEMP = distributed_function(2, _get_compile_folder, use_tempfile)
+    else:
+        location, UNSLOTH_COMPILE_USE_TEMP = _get_compile_folder(use_tempfile)
+    return location, UNSLOTH_COMPILE_USE_TEMP
+pass
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -125,11 +180,29 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
     return result
 pass
 
+def _canon_key(p: str) -> str:
+    s = os.path.abspath(p)
+    if os.name == "nt":
+        s = os.path.normcase(s)
+    return os.path.normpath(s)
+
+def _slug(name: str, maxlen: int = 100) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
+    return (name or "_")[:maxlen]
+
+def _lock_name_for(target: str) -> str:
+    canon = _canon_key(target)
+    base  = _slug(pathlib.Path(canon).name)
+    h8    = f"{zlib.crc32(canon.encode('utf-8')) & 0xffffffff:08x}"
+    return f"{base}.{h8}.lock"
+
 def _lock_path_for(target: str) -> str:
     """ str needs to be a valid file path """
-    locks_dir = pathlib.Path(target).parent / ".locks"
+    base_dir = _get_compile_folder()[0]
+    locks_dir = pathlib.Path(base_dir) / ".locks"
     locks_dir.mkdir(parents=True, exist_ok=True)
-    return str(locks_dir / f".lock.{pathlib.Path(target).name}")
+    lock_name = _lock_name_for(target)
+    return str(locks_dir / lock_name)
 
 def get_lock(target: str, timeout: Optional[int] = None) -> FileLock:
     """
@@ -158,6 +231,36 @@ def get_quant_type(config):
             return getattr(quant_config, 'quant_method', None)
     return None
   
+def write_file(function_location, write_new_source):
+    lock = get_lock(function_location)
+    new_write_bytes = write_new_source.encode("utf-8")
+    try:
+        with lock:
+            # existence check
+            try:
+                st = os.stat(function_location)
+            except Exception as e:
+                st = None
+
+            need_write = False
+            if st is None or st.st_size != len(new_write_bytes):
+                need_write = True
+            else:
+                with open(function_location, "rb") as f:
+                    need_write = f.read() != new_write_bytes
+
+            if need_write:
+                with open(function_location, "wb", buffering = 0) as file:
+                    file.write(new_write_bytes)
+                    file.flush()
+                    os.fsync(file.fileno())
+        return None
+    except Exception as e:
+        if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+            logger.error(f"Unsloth: Failed to write file {function_location} because {str(e)}")
+        return None
+pass
+
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #

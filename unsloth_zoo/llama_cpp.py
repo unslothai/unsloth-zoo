@@ -39,6 +39,9 @@ import tempfile
 import logging
 import torch
 from pathlib import Path
+import os
+from unsloth_zoo.utils import get_lock
+from unsloth_zoo.log import logger
 
 # Get a logger instance
 logger = logging.getLogger(__name__)
@@ -141,102 +144,115 @@ def use_local_gguf():
 pass
 
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
-    # All Unsloth Zoo code licensed under LGPLv3
-    # Choose package manager based on system type
-    if system_type == "rpm":
-        pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
-    else:  # Default to debian/apt-get
-        install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+    lock = get_lock(f"install_package_{package}")
+    try:
+        with lock:
+            # All Unsloth Zoo code licensed under LGPLv3
+            # Choose package manager based on system type
+            if system_type == "rpm":
+                pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
+                install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
+            else:  # Default to debian/apt-get
+                install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
 
-    print(f"Unsloth: Installing packages: {package}")
-    if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
-        acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
-        if "no" in str(acceptance).lower():
-            raise RuntimeError(
-                f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
-                "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
-            )
-    with subprocess.Popen(install_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
-        for line in sp.stdout:
-            line = line.decode("utf-8", errors = "replace").rstrip()
-
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
-                sp.terminate()
-                raise RuntimeError(f"[FAIL] Unsloth: Permission denied when installing package {package}\n"\
-                                   "This operation requires elevated sudo/root permissions. Please manually install missing packages and retry again"
+            print(f"Unsloth: Installing packages: {package}")
+            if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
+                acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+                if "no" in str(acceptance).lower():
+                    raise RuntimeError(
+                        f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
+                        "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
                     )
-            elif line.endswith(COMMANDS_NOT_FOUND):
-                sp.terminate()
-                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
-                raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist when installing {package}? Is this NOT a Linux / Mac based computer?")
-            elif "Unable to locate package" in line:
-                sp.terminate()
-                raise RuntimeError(f"[FAIL] Unsloth: Could not install package {package} since it does not exist.")
-            if print_output: print(line, flush = True, end = "")
-            if print_outputs is not None: print_outputs.append(line)
-        pass
-    pass
+            with subprocess.Popen(install_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+                for line in sp.stdout:
+                    line = line.decode("utf-8", errors = "replace").rstrip()
+
+                    if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+                        sp.terminate()
+                        raise RuntimeError(f"[FAIL] Unsloth: Permission denied when installing package {package}\n"\
+                                        "This operation requires elevated sudo/root permissions. Please manually install missing packages and retry again"
+                            )
+                    elif line.endswith(COMMANDS_NOT_FOUND):
+                        sp.terminate()
+                        pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
+                        raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist when installing {package}? Is this NOT a Linux / Mac based computer?")
+                    elif "Unable to locate package" in line:
+                        sp.terminate()
+                        raise RuntimeError(f"[FAIL] Unsloth: Could not install package {package} since it does not exist.")
+                    if print_output: print(line, flush = True, end = "")
+                    if print_outputs is not None: print_outputs.append(line)
+                pass
+            pass
+    except Exception as e:
+        logger.error(f"Unsloth: Error installing package {package}: {e}", exc_info=True)
+        # raise RuntimeError(f"Unsloth: Error installing package {package}: {e}") from e
 pass
 
 
 def do_we_need_sudo(system_type="debian"):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check apt-get updating
-    sudo = False
-    print("Unsloth: Updating system package directories")
+    lock = get_lock("do_we_need_sudo")
+    try:
+        with lock:
+            sudo = False
+            print("Unsloth: Updating system package directories")
 
-    # Choose update command based on system type
-    if system_type == "rpm":
-        pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        update_cmd = f"{pkg_manager} check-update"
-    else:
-        update_cmd = "apt-get update -y"
+            # Choose update command based on system type
+            if system_type == "rpm":
+                pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
+                update_cmd = f"{pkg_manager} check-update"
+            else:
+                update_cmd = "apt-get update -y"
 
-    start_time = time.time()
-    with subprocess.Popen(update_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
-        for line in sp.stdout:
-            line = line.decode("utf-8", errors = "replace").rstrip()
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
-                sp.terminate()
-                sudo = True
-                break
-            elif line.endswith(COMMANDS_NOT_FOUND):
-                sp.terminate()
-                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
-                raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist? Is this NOT a Linux / Mac based computer?")
-            elif "failure resolving" in line or "Err:" in line:
-                sp.terminate()
-                raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
-            elif time.time() - start_time >= 180:
-                # Failure if longer than 3 minutes
-                sp.terminate()
-                raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
-        pass
-    pass
+            start_time = time.time()
+            with subprocess.Popen(update_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+                for line in sp.stdout:
+                    line = line.decode("utf-8", errors = "replace").rstrip()
+                    if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+                        sp.terminate()
+                        sudo = True
+                        break
+                    elif line.endswith(COMMANDS_NOT_FOUND):
+                        sp.terminate()
+                        pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
+                        raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist? Is this NOT a Linux / Mac based computer?")
+                    elif "failure resolving" in line or "Err:" in line:
+                        sp.terminate()
+                        raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
+                    elif time.time() - start_time >= 180:
+                        # Failure if longer than 3 minutes
+                        sp.terminate()
+                        raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
+                pass
+            pass
 
-    # Update all package lists as well
-    update_cmd_sudo = f"sudo {update_cmd}"
+            # Update all package lists as well
+            update_cmd_sudo = f"sudo {update_cmd}"
 
-    start_time = time.time()
-    with subprocess.Popen(update_cmd_sudo, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
-        for line in sp.stdout:
-            line = line.decode("utf-8", errors = "replace").rstrip()
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
-                sp.terminate()
-                raise RuntimeError("[FAIL] Unsloth: Tried with sudo, but still failed?")
-            elif "failure resolving" in line or "Err:" in line:
-                sp.terminate()
-                raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
-            elif time.time() - start_time >= 180:
-                # Failure if longer than 3 minutes
-                sp.terminate()
-                raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
-        pass
-    pass
+            start_time = time.time()
+            with subprocess.Popen(update_cmd_sudo, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+                for line in sp.stdout:
+                    line = line.decode("utf-8", errors = "replace").rstrip()
+                    if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+                        sp.terminate()
+                        raise RuntimeError("[FAIL] Unsloth: Tried with sudo, but still failed?")
+                    elif "failure resolving" in line or "Err:" in line:
+                        sp.terminate()
+                        raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
+                    elif time.time() - start_time >= 180:
+                        # Failure if longer than 3 minutes
+                        sp.terminate()
+                        raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
+                pass
+            pass
 
-    #if sudo: print("Unsloth: All commands will now use admin permissions (sudo)")
-    return sudo
+            #if sudo: print("Unsloth: All commands will now use admin permissions (sudo)")
+            return sudo
+    except Exception as e:
+        logger.error(f"Unsloth: Error checking if we need sudo: {e}", exc_info=True)
+        return False
+        # raise RuntimeError(f"Unsloth: Error checking if we need sudo: {e}") from e
 pass
 
 
@@ -369,113 +385,119 @@ def install_llama_cpp(
     gpu_support = False,
     just_clone_repo = False,
 ):
-    # All Unsloth Zoo code licensed under LGPLv3
-    # Installs llama.cpp
-    quantizer = None
-    converter = None
-
-    gpu_support = "ON" if gpu_support else "OFF"
-
-    if os.path.exists(llama_cpp_folder):
-        try:
-            quantizer, converter = check_llama_cpp(llama_cpp_folder = llama_cpp_folder)
-            print(f"Unsloth: llama.cpp folder already exists - will use `{llama_cpp_folder}`")
-            return quantizer, converter
-        except: print(f"Unsloth: llama.cpp folder exists but binaries not found - will rebuild")
-    pass
-
-    print_outputs = []
-    missing_packages, system_type = check_build_requirements()
-    sudo = do_we_need_sudo()
-    kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs, "system_type": system_type}
-
-    if not missing_packages:
-        print("Unsloth: All required system packages already installed!")
-    else:
-        packages_to_install = " ".join(missing_packages)
-        print(f"Unsloth: Missing packages: {packages_to_install}")
-        print(f"Unsloth: Will attempt to install missing system packages.")
-        install_package(packages_to_install, sudo, system_type = system_type)
-
-    print("Unsloth: Install llama.cpp and building - please wait 1 to 3 minutes")
-    if gpu_support == "ON":
-        print("Unsloth: Building llama.cpp with GPU support")
-
-    # Clone repo if it doesn't exist
-    if not os.path.exists(llama_cpp_folder):
-        print("Unsloth: Cloning llama.cpp repository")
-        try_execute_with_auto_install(
-            f"git clone https://github.com/ggml-org/llama.cpp {llama_cpp_folder}",
-            **kwargs
-        )
-
-    pip = check_pip()
-
-    print("Unsloth: Install GGUF and other packages")
-    try_execute(f"{pip} install gguf protobuf sentencepiece mistral_common", **kwargs)
-    if just_clone_repo: return llama_cpp_folder
-
-    build_success = False
-    build_errors = []
-
-    # Try make first
+    lock = get_lock(llama_cpp_folder)
     try:
-        if print_output: print("Trying to build with make...")
-        try_execute(f"make clean", cwd=llama_cpp_folder, **kwargs)
-        try_execute(f"make all -j", cwd=llama_cpp_folder, **kwargs)
-        build_success = True
-        print("Successfully built with make")
+        with lock:
+            # All Unsloth Zoo code licensed under LGPLv3
+            # Installs llama.cpp
+            quantizer = None
+            converter = None
+
+            gpu_support = "ON" if gpu_support else "OFF"
+
+            if os.path.exists(llama_cpp_folder):
+                try:
+                    quantizer, converter = check_llama_cpp(llama_cpp_folder = llama_cpp_folder)
+                    print(f"Unsloth: llama.cpp folder already exists - will use `{llama_cpp_folder}`")
+                    return quantizer, converter
+                except: print(f"Unsloth: llama.cpp folder exists but binaries not found - will rebuild")
+            pass
+
+            print_outputs = []
+            missing_packages, system_type = check_build_requirements()
+            sudo = do_we_need_sudo()
+            kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs, "system_type": system_type}
+
+            if not missing_packages:
+                print("Unsloth: All required system packages already installed!")
+            else:
+                packages_to_install = " ".join(missing_packages)
+                print(f"Unsloth: Missing packages: {packages_to_install}")
+                print(f"Unsloth: Will attempt to install missing system packages.")
+                install_package(packages_to_install, sudo, system_type = system_type)
+
+            print("Unsloth: Install llama.cpp and building - please wait 1 to 3 minutes")
+            if gpu_support == "ON":
+                print("Unsloth: Building llama.cpp with GPU support")
+
+            # Clone repo if it doesn't exist
+            if not os.path.exists(llama_cpp_folder):
+                print("Unsloth: Cloning llama.cpp repository")
+                try_execute_with_auto_install(
+                    f"git clone https://github.com/ggml-org/llama.cpp {llama_cpp_folder}",
+                    **kwargs
+                )
+
+            pip = check_pip()
+
+            print("Unsloth: Install GGUF and other packages")
+            try_execute(f"{pip} install gguf protobuf sentencepiece mistral_common", **kwargs)
+            if just_clone_repo: return llama_cpp_folder
+
+            build_success = False
+            build_errors = []
+
+            # Try make first
+            try:
+                if print_output: print("Trying to build with make...")
+                try_execute(f"make clean", cwd=llama_cpp_folder, **kwargs)
+                try_execute(f"make all -j", cwd=llama_cpp_folder, **kwargs)
+                build_success = True
+                print("Successfully built with make")
+            except Exception as e:
+                build_errors.append(f"Make failed: {str(e)}")
+                if print_output: print(f"Make failed, trying cmake...")
+                # Use cmake instead
+                try:
+                    # Clean up any partial build
+                    try_execute(f"rm -rf build", cwd=llama_cpp_folder, **kwargs)
+
+                    try_execute(
+                        f"cmake . -B build "\
+                        f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support} -DLLAMA_CURL=ON",
+                        cwd = llama_cpp_folder,
+                        **kwargs
+                    )
+                    try_execute(
+                        f"cmake --build build --config Release "\
+                        f"-j --clean-first --target "\
+                        f"{' '.join(llama_cpp_targets)}",
+                        cwd = llama_cpp_folder,
+                        **kwargs
+                    )
+                    # Move compiled objects to main folder
+                    try_execute(
+                        f"cp build/bin/llama-* .",
+                        cwd = llama_cpp_folder,
+                        **kwargs
+                    )
+                    build_success = True
+                    # Remove build folder
+                    try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
+                    if print_output: print("Successfully built with cmake")
+                except Exception as e:
+                    build_errors.append(f"CMake failed: {str(e)}")
+
+            if not build_success:
+                error_msg = "=== Unsloth: FAILED building llama.cpp ===\n"
+                error_msg += "\n".join(build_errors)
+                error_msg += "\n=== Full output log: ===\n"
+                error_msg += "".join(print_outputs)
+                raise RuntimeError(error_msg)
+
+            # Check if it installed correctly
+            try:
+                quantizer, converter = check_llama_cpp(llama_cpp_folder)
+                print(f"Unsloth: Successfully installed llama.cpp!")
+                return quantizer, converter
+            except Exception as e:
+                raise RuntimeError(
+                    f"Build appeared to succeed but can't find binaries: {str(e)}\n"
+                    f"Check the {llama_cpp_folder} directory for compiled binaries."
+                )
     except Exception as e:
-        build_errors.append(f"Make failed: {str(e)}")
-        if print_output: print(f"Make failed, trying cmake...")
-        # Use cmake instead
-        try:
-            # Clean up any partial build
-            try_execute(f"rm -rf build", cwd=llama_cpp_folder, **kwargs)
-
-            try_execute(
-                f"cmake . -B build "\
-                f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support} -DLLAMA_CURL=ON",
-                cwd = llama_cpp_folder,
-                **kwargs
-            )
-            try_execute(
-                f"cmake --build build --config Release "\
-                f"-j --clean-first --target "\
-                f"{' '.join(llama_cpp_targets)}",
-                cwd = llama_cpp_folder,
-                **kwargs
-            )
-            # Move compiled objects to main folder
-            try_execute(
-                f"cp build/bin/llama-* .",
-                cwd = llama_cpp_folder,
-                **kwargs
-            )
-            build_success = True
-            # Remove build folder
-            try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
-            if print_output: print("Successfully built with cmake")
-        except Exception as e:
-            build_errors.append(f"CMake failed: {str(e)}")
-
-    if not build_success:
-        error_msg = "=== Unsloth: FAILED building llama.cpp ===\n"
-        error_msg += "\n".join(build_errors)
-        error_msg += "\n=== Full output log: ===\n"
-        error_msg += "".join(print_outputs)
-        raise RuntimeError(error_msg)
-
-    # Check if it installed correctly
-    try:
-        quantizer, converter = check_llama_cpp(llama_cpp_folder)
-        print(f"Unsloth: Successfully installed llama.cpp!")
-        return quantizer, converter
-    except Exception as e:
-        raise RuntimeError(
-            f"Build appeared to succeed but can't find binaries: {str(e)}\n"
-            f"Check the {llama_cpp_folder} directory for compiled binaries."
-        )
+        logger.error(f"Unsloth: Error installing llama.cpp: {e}", exc_info=True)
+        # raise RuntimeError(f"Unsloth: Error installing llama.cpp: {e}") from e
 pass
 
 
@@ -646,8 +668,19 @@ def _download_convert_hf_to_gguf(
         # 4. Write Patched File
         patched_filename = f"llama.cpp/{name}.py"
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
-        with open(patched_filename, "wb") as file:
-            file.write(patched_content)
+        lock = get_lock(patched_filename)
+        try:
+            with lock:
+                try:
+                    with open(patched_filename, "rb") as file:
+                        existing_content = file.read()
+                except Exception as e:
+                    existing_content = None
+                if existing_content != patched_content:
+                    with open(patched_filename, "wb") as file:
+                        file.write(patched_content)
+        except Exception as e:
+            logger.error(f"Unsloth: Error saving patched script to {patched_filename}: {e}", exc_info=True)
 
         # 5. Parse Flags from Patched Content (same logic as before)
         logger.info("Unsloth: Parsing arguments from patched script...")
@@ -978,37 +1011,42 @@ def convert_to_gguf(
 
     # Execute conversions
     for args, output_file, description in runs_to_do:
-        if print_output: print(f"\nUnsloth: Converting {description}...")
-        args_str = " ".join(f"{k} {v}" for k, v in args.items())
-        command = f"python {converter_location} {args_str} {input_folder}"
-
+        lock = get_lock(f"{output_file}")
         try:
-            if print_output:
-                result = subprocess.run(command, shell=True, check=True, text=True,
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                print(result.stdout)
-            else:
-                subprocess.run(command, shell=True, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            if print_output and hasattr(e, 'stdout') and e.stdout:
-                print(e.stdout)
-            raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF: {e}")
+            with lock:
+                if print_output: print(f"\nUnsloth: Converting {description}...")
+                args_str = " ".join(f"{k} {v}" for k, v in args.items())
+                command = f"python {converter_location} {args_str} {input_folder}"
 
-        # Simple validation using native Python
-        if not os.path.exists(output_file):
-            raise RuntimeError(f"Unsloth: Failed to convert {description} - output file {output_file} not created")
+                try:
+                    if print_output:
+                        result = subprocess.run(command, shell=True, check=True, text=True,
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                        print(result.stdout)
+                    else:
+                        subprocess.run(command, shell=True, check=True, capture_output=True)
+                except subprocess.CalledProcessError as e:
+                    if print_output and hasattr(e, 'stdout') and e.stdout:
+                        print(e.stdout)
+                    raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF: {e}")
 
-        all_output_files.append(output_file)
+                # Simple validation using native Python
+                if not os.path.exists(output_file):
+                    raise RuntimeError(f"Unsloth: Failed to convert {description} - output file {output_file} not created")
 
-        if print_output:
-            file_size_bytes = os.path.getsize(output_file)
-            if file_size_bytes >= 1024**3:  # GB
-                size_str = f"{file_size_bytes / (1024**3):.1f}G"
-            elif file_size_bytes >= 1024**2:  # MB
-                size_str = f"{file_size_bytes / (1024**2):.1f}M"
-            else:
-                size_str = f"{file_size_bytes / 1024:.1f}K"
-            print(f"Unsloth: Successfully saved {description} GGUF to: {output_file} (size: {size_str})")
+                all_output_files.append(output_file)
+
+                if print_output:
+                    file_size_bytes = os.path.getsize(output_file)
+                    if file_size_bytes >= 1024**3:  # GB
+                        size_str = f"{file_size_bytes / (1024**3):.1f}G"
+                    elif file_size_bytes >= 1024**2:  # MB
+                        size_str = f"{file_size_bytes / (1024**2):.1f}M"
+                    else:
+                        size_str = f"{file_size_bytes / 1024:.1f}K"
+                    print(f"Unsloth: Successfully saved {description} GGUF to: {output_file} (size: {size_str})")
+        except Exception as e:
+            logger.error(f"Unsloth: Error converting {description} to GGUF: {e}", exc_info=True)
 
     return all_output_files, is_vlm
 pass

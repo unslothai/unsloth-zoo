@@ -307,6 +307,7 @@ def get_auto_processor(name, **kwargs):
 
     # Make a temporary directory to copy all files
     temp_directory = tempfile.TemporaryDirectory()
+    # no need for lock since we're using a temp directory
     temp_name = temp_directory.name
 
     # Make a fake config.json file with just the model_type
