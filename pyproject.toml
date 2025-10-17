@@ -86,9 +86,6 @@ huggingface = [
 base = [
     "unsloth_zoo[huggingface]",
 ]
-amd = [
-    "unsloth_zoo[huggingface]",
-]
 
 [project.urls]
 homepage = "http://www.unsloth.ai"
