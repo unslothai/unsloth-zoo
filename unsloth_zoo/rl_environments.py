@@ -304,81 +304,55 @@ def time_limit(seconds: float):
     """
     Enforce a wall-clock time limit using SIGALRM/ITIMER_REAL.
 
-    Improvements vs. the original:
-      - Nest-safe: if used inside another time_limit, the earliest deadline wins.
-      - Correctly restores a pre-existing timer with remaining = previous_remaining - elapsed.
-      - Clear main-thread enforcement and better docs.
-
-    Notes:
-      - Unix-like systems only, main thread only.
-      - Not composable with *other* (non-time_limit) uses of SIGALRM: we take ownership
-        of SIGALRM while active and restore it afterward.
-      - Some C extensions may not be interruptible by signals; for bulletproof isolation
-        use the process-based fallback shown below.
+    Key points:
+      - Nest-safe: earliest deadline wins.
+      - Restores any prior timer with remaining time corrected.
+      - **Interrupts** blocking syscalls so TimeoutError can be raised promptly.
+      - Unix-like OS, main thread only. Process-wide timer: not composable with other SIGALRM users.
     """
     if seconds <= 0:
         raise ValueError("seconds must be > 0")
-
     if not hasattr(signal, "setitimer"):
         raise NotImplementedError("time_limit requires Unix setitimer/SIGALRM support")
-
     if threading.current_thread() is not threading.main_thread():
         raise RuntimeError("time_limit must be used from the main thread")
 
-    # Snapshot current handler and timer before we modify anything.
     old_handler = signal.getsignal(signal.SIGALRM)
     prev_remaining, prev_interval = signal.getitimer(signal.ITIMER_REAL)
 
-    # Our handler: raise a Python TimeoutError.
     def _handler(signum, frame):
         raise TimeoutError(f"Timed out after {seconds:g}s")
-    # Mark it so nested contexts can detect “our own” handler.
     setattr(_handler, "__time_limit_handler__", True)
 
-    # Decide the delay we set now.
-    # If a previous timer exists *and* it appears to be ours (nested usage),
-    # respect the earlier deadline: schedule to min(previous_remaining, seconds).
     nested_ours = getattr(old_handler, "__time_limit_handler__", False)
     start = time.monotonic()
-    delay_now = seconds
-    if nested_ours and prev_remaining > 0.0:
-        delay_now = min(seconds, prev_remaining)
+    delay_now = min(seconds, prev_remaining) if (nested_ours and prev_remaining > 0.0) else seconds
 
     try:
-        # Install our handler first so the next SIGALRM raises TimeoutError here.
         signal.signal(signal.SIGALRM, _handler)
-        # Be explicit about interrupted syscalls semantics (best-effort; platform-dependent).
+
+        # IMPORTANT: ensure blocking syscalls are INTERRUPTED (no SA_RESTART),
+        # so control returns to Python and we can raise TimeoutError.
         try:
-            # False => restart system calls; we rely on raising from the handler anyway.
-            signal.siginterrupt(signal.SIGALRM, False)
+            signal.siginterrupt(signal.SIGALRM, True)
         except (AttributeError, OSError):
             pass
 
-        # Start/adjust the process-wide real-time timer.
         signal.setitimer(signal.ITIMER_REAL, delay_now)
         yield
-
     finally:
-        # Stop our timer and restore the previous handler.
+        # Cancel our timer and restore the previous handler.
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, old_handler)
 
-        # If a previous timer existed, restore it with the elapsed time subtracted.
+        # Restore prior timer with corrected remaining time.
         if prev_remaining != 0.0 or prev_interval != 0.0:
             elapsed = max(time.monotonic() - start, 0.0)
             remaining = max(prev_remaining - elapsed, 0.0)
-            # NOTE: For periodic timers (prev_interval > 0), we don't try to simulate
-            # missed ticks while we owned SIGALRM. If you depend on periodic semantics,
-            # avoid mixing with time_limit.
             signal.setitimer(signal.ITIMER_REAL, remaining, prev_interval)
 pass
 
 def execute_with_time_limit(seconds: float) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """
-    Decorator factory. Usage:
-        @execute_with_time_limit(10)
-        def my_func(...): ...
-    """
     if seconds <= 0:
         raise ValueError("seconds must be > 0")
 
