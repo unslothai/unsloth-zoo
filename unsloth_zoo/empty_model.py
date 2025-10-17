@@ -377,6 +377,7 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
         new_model, original_meta_model, num_layers = create_empty_vision_model(config, dtype)
     else:
         new_model, original_meta_model, num_layers = create_empty_causal_lm(config, dtype)
+    print(original_meta_model)
 
     # Get layer names from config
     layer_templates = get_model_layer_config(return_non_layered=False)
