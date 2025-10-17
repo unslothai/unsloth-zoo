@@ -603,6 +603,10 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.transformer.layers.{kk}.feed_forward.up_proj",
             "model.vision_tower.transformer.layers.{kk}.feed_forward.down_proj",
 
+            # qwen 3 vl
+            "model.visual.blocks.{kk}.mlp.linear_fc1",
+            "model.visual.blocks.{kk}.mlp.linear_fc2",
+
         },
         'additional_layers': {
             "model.visual.merger.mlp.{kk}",
@@ -615,6 +619,11 @@ def get_model_layer_config(return_non_layered=True):
             "model.multi_modal_projector.patch_merger.merging_layer",
             "model.multi_modal_projector.linear_1",
             "model.multi_modal_projector.linear_2",
+
+            # qwen 3 vl
+            "model.visual.deepstack_merger_list.{kk}.linear_fc1",
+            "model.visual.deepstack_merger_list.{kk}.linear_fc2",
+
         },
         "non_layered_components":{
             # we do not handle quantization for these layers yet
@@ -644,6 +653,16 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.patch_positional_embedding",
             "model.vision_tower.patch_conv",
             "model.vision_tower.ln_pre",
+
+            # qwen 3 vl
+            "model.visual.pos_embed",
+            "model.visual.merger.linear_fc1",
+            "model.visual.merger.linear_fc2",
+            "model.visual.merger.norm.bias",
+            "model.visual.merger.norm",
+            "model.visual.deepstack_merger_list.0.norm",
+            "model.visual.deepstack_merger_list.1.norm",
+            "model.visual.deepstack_merger_list.2.norm",
         }
     }
 
@@ -732,7 +751,9 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
             if layer_module is not None:
                 if "qkv" in layer_path:
-                    if model_type == "qwen2_5_vl":
+                    if model_type in ("qwen2_5_vl", "qwen3_vl"):
+                        # If the HF model too prefers having merged qkv, we do this
+                        # This is evident in qwen-2.5-vl and qwen-3-vl so far.
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
                     else:
                          get_state_dict(f"{layer_path.replace('qkv_proj', 'q_proj')}", 0, state_dict, layer_module)
