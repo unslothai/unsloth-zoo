@@ -34,6 +34,8 @@ import numpy as np
 import signal
 from contextlib import contextmanager
 from functools import wraps
+import threading
+import time
 from typing import Callable, TypeVar, Any, Tuple
 T = TypeVar("T")
 
@@ -301,40 +303,56 @@ pass
 def time_limit(seconds: float):
     """
     Enforce a wall-clock time limit using SIGALRM/ITIMER_REAL.
-    - Works on Unix-like systems, main thread only.
-    - Interrupts many blocking syscalls but not all C extensions.
+
+    Key points:
+      - Nest-safe: earliest deadline wins.
+      - Restores any prior timer with remaining time corrected.
+      - **Interrupts** blocking syscalls so TimeoutError can be raised promptly.
+      - Unix-like OS, main thread only. Process-wide timer: not composable with other SIGALRM users.
     """
     if seconds <= 0:
-        raise ValueError("Seconds must be > 0")
-
+        raise ValueError("seconds must be > 0")
     if not hasattr(signal, "setitimer"):
         raise NotImplementedError("time_limit requires Unix setitimer/SIGALRM support")
-
-    def _handler(signum, frame):
-        raise TimeoutError(f"Timed out after {seconds}s")
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("time_limit must be used from the main thread")
 
     old_handler = signal.getsignal(signal.SIGALRM)
-    prev_timer: Tuple[float, float] = signal.getitimer(signal.ITIMER_REAL)
+    prev_remaining, prev_interval = signal.getitimer(signal.ITIMER_REAL)
+
+    def _handler(signum, frame):
+        raise TimeoutError(f"Timed out after {seconds:g}s")
+    setattr(_handler, "__time_limit_handler__", True)
+
+    nested_ours = getattr(old_handler, "__time_limit_handler__", False)
+    start = time.monotonic()
+    delay_now = min(seconds, prev_remaining) if (nested_ours and prev_remaining > 0.0) else seconds
 
     try:
         signal.signal(signal.SIGALRM, _handler)
-        signal.setitimer(signal.ITIMER_REAL, seconds)  # start new timer
+
+        # IMPORTANT: ensure blocking syscalls are INTERRUPTED (no SA_RESTART),
+        # so control returns to Python and we can raise TimeoutError.
+        try:
+            signal.siginterrupt(signal.SIGALRM, True)
+        except (AttributeError, OSError):
+            pass
+
+        signal.setitimer(signal.ITIMER_REAL, delay_now)
         yield
     finally:
-        # Cancel our timer first, restore handler, then reinstate any previous timer.
+        # Cancel our timer and restore the previous handler.
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, old_handler)
-        if prev_timer != (0.0, 0.0):
-            # Restore any prior timer that was running before we entered.
-            signal.setitimer(signal.ITIMER_REAL, *prev_timer)
+
+        # Restore prior timer with corrected remaining time.
+        if prev_remaining != 0.0 or prev_interval != 0.0:
+            elapsed = max(time.monotonic() - start, 0.0)
+            remaining = max(prev_remaining - elapsed, 0.0)
+            signal.setitimer(signal.ITIMER_REAL, remaining, prev_interval)
 pass
 
 def execute_with_time_limit(seconds: float) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """
-    Decorator factory. Usage:
-        @execute_with_time_limit(10)
-        def my_func(...): ...
-    """
     if seconds <= 0:
         raise ValueError("seconds must be > 0")
 
