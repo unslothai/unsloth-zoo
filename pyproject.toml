@@ -60,7 +60,7 @@ include-package-data = false
 exclude = ["images*"]
 
 [project.optional-dependencies]
-huggingface = [
+huggingfacenotorch = [
     "packaging>=24.1",
     "tyro",
     "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,<=4.56.2",
@@ -76,12 +76,15 @@ huggingface = [
     "protobuf",
     "huggingface_hub>=0.34.0",
     "hf_transfer",
-    "cut_cross_entropy",
     "pillow",
     "regex",
     "msgspec",
     "typing_extensions",
     "filelock",
+]
+huggingface = [
+    "unsloth_zoo[huggingfacenotorch]",
+    "cut_cross_entropy",
 ]
 base = [
     "unsloth_zoo[huggingface]",
