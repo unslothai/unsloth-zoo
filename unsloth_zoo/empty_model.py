@@ -29,6 +29,7 @@ import os
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
+from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config
 
 def is_comparable(val):
     # Don't treat tensors as comparable, only basic types
@@ -235,13 +236,19 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     from transformers import AutoModelForCausalLM
     try:
         from accelerate import init_empty_weights
+        # Suppress warning on uninited weights
+        old_warn = os.environ.get("UNSLOTH_WARN_UNINITIALIZED", "1")
+        os.environ["UNSLOTH_WARN_UNINITIALIZED"] = "0"
         with init_empty_weights():
             model_name = getattr(config, 'model_name')
+            kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype_from_config(config)}
             if model_name is not None:
                 # This would persist quantization information.
-                original_meta_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=config.dtype)
+                original_meta_model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
             else:
                 original_meta_model = AutoModelForCausalLM.from_config(config)
+        # Suppress warning on uninited weights
+        os.environ["UNSLOTH_WARN_UNINITIALIZED"] = old_warn
     except Exception as e:
         print(f"Failed to create original_meta_model for AutoModelForCausalLM. Error {e}")
         original_meta_model = None
