@@ -233,6 +233,14 @@ def copy_attributes(original_model, new_model):
 @torch.inference_mode()
 def create_empty_causal_lm(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
+    IS_GEMMA   = config.model_type.startswith("gemma")
+    IS_GEMMA2  = config.model_type.startswith("gemma2")
+    IS_COHERE  = config.model_type.startswith("cohere")
+    IS_GRANITE = config.model_type.startswith("granite")
+    IS_FALCON_H1 = config.model_type.startswith("falcon_h1")
+    IS_LLAMA = config.model_type.startswith("llama")
+    IS_QWEN3 = config.model_type.startswith("qwen3")
+
     from transformers import AutoModelForCausalLM
     try:
         from accelerate import init_empty_weights
@@ -242,7 +250,7 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         with init_empty_weights():
             model_name = getattr(config, 'model_name')
             kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype_from_config(config)}
-            if model_name is not None:
+            if model_name is not None and not (IS_GEMMA or IS_GEMMA or IS_COHERE or IS_GRANITE or IS_FALCON_H1 or IS_LLAMA or IS_QWEN3):
                 # This would persist quantization information.
                 original_meta_model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
             else:
