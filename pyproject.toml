@@ -51,7 +51,6 @@ dependencies = [
 ]
 
 [tool.setuptools_scm]
-write_to = "unsloth_zoo/_version.py"
 fallback_version = "0.0.0"
 
 [tool.setuptools]
