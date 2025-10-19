@@ -70,15 +70,14 @@ if find_spec("unsloth") is None:
 pass
 del find_spec
 
-def get_device_type():
-    import torch
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        return "cuda"
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        return "xpu"
-    raise NotImplementedError("Unsloth currently only works on NVIDIA GPUs and Intel GPUs.")
-pass
-DEVICE_TYPE : str = get_device_type()
+from .device_type import (
+    is_hip,
+    get_device_type,
+    DEVICE_TYPE,
+    DEVICE_TYPE_TORCH,
+    DEVICE_COUNT,
+    ALLOW_PREQUANTIZED_MODELS,
+)
 
 if not ("UNSLOTH_IS_PRESENT" in os.environ):
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
