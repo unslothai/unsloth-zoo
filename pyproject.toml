@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "setuptools-scm>=8"]
+requires = ["setuptools==80.9.0", "setuptools-scm==9.2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -50,8 +50,8 @@ dependencies = [
     "mistral_common",
 ]
 
-[tool.setuptools_scm]
-fallback_version = "0.0.0"
+[tool.setuptools.dynamic]
+version = {attr = "unsloth_zoo.__init__.__version__"}
 
 [tool.setuptools]
 include-package-data = false
