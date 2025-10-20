@@ -39,6 +39,8 @@ from copy import deepcopy
 import math
 import gc
 import os
+import ast
+import sys
 import torch
 import json
 import psutil
@@ -60,7 +62,6 @@ from .temporary_patches.common import (
 )
 from .log import logger
 from .device_type import DEVICE_TYPE
-from unsloth.models.vision import VLLM_SUPPORTED_VLM
 global LORA_REQUEST_ID
 
 # Ignore logging messages
@@ -2360,9 +2361,50 @@ def _test_is_same_vlm(model, new_model, processor, test_backward=False):
                 mismatches.append(layer_name)
         print(f"Backward gradient statistics match for {len(matches)} layers: {matches}")
         print(f"Backward gradient statistics mismatch for {len(mismatches)} layers: {mismatches}")
+pass
 
 
-    pass
+def _read_unsloth_vision_source() -> str:
+    _VISION_TAIL = ("unsloth", "models", "vision.py")
+    from importlib.metadata import files, PackageNotFoundError, PackagePath
+    from pathlib import Path
+    # 1) Via installed distribution metadata (no import of the package)
+    try:
+        for entry in files("unsloth") or ():
+            if isinstance(entry, PackagePath):
+                parts = entry.parts
+                if len(parts) >= 3 and tuple(parts[-3:]) == _VISION_TAIL:
+                    return entry.read_text(encoding = "utf-8")
+    except PackageNotFoundError:
+        pass
+
+    # 2) Fallback: scan sys.path for a plain file
+    for base in map(Path, sys.path):
+        candidate = base.joinpath(*_VISION_TAIL)
+        if candidate.is_file():
+            return candidate.read_text(encoding = "utf-8")
+    raise FileNotFoundError("Could not locate unsloth/models/vision.py without importing it")
+pass
+
+
+def get_vllm_supported_vlm(_VAR_NAME = "VLLM_SUPPORTED_VLM"):
+    """
+    Parse VLLM_SUPPORTED_VLM from unsloth/models/vision.py as a literal.
+    """
+    src = _read_unsloth_vision_source()
+    tree = ast.parse(src)
+
+    # Support: `VLLM_SUPPORTED_VLM = [...]` and `VLLM_SUPPORTED_VLM: list[str] = [...]`
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            if any(getattr(t, "id", None) == _VAR_NAME for t in node.targets):
+                return ast.literal_eval(node.value)
+        elif isinstance(node, ast.AnnAssign):
+            if getattr(node.target, "id", None) == _VAR_NAME:
+                return ast.literal_eval(node.value)
+    raise ValueError(f"{_VAR_NAME} not found as a literal in unsloth/models/vision.py")
+pass
+
 
 @torch.inference_mode
 def _test_get_vllm_state_dict(
@@ -2419,6 +2461,7 @@ def _test_get_vllm_state_dict(
     if not is_vision_model:
         model_class = AutoModelForCausalLM
     else:
+        VLLM_SUPPORTED_VLM = get_vllm_supported_vlm()
         if model_type in VLLM_SUPPORTED_VLM:
             import transformers
             model_class = getattr(transformers, config.architectures[0])
