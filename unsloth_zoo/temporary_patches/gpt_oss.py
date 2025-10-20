@@ -535,7 +535,7 @@ pass
 
 
 # Combo kernels uses too much VRAM for low memory GPUs
-from unsloth import DEVICE_TYPE
+from ..device_type import DEVICE_TYPE
 if DEVICE_TYPE == "xpu":
     device_memory = torch.xpu.memory.mem_get_info(0)[-1]
 else:
