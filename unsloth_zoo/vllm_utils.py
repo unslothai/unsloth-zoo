@@ -1101,31 +1101,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
 pass
 
 @torch.inference_mode
-def create_empty_causal_lm(config, dtype = torch.float16):
-    # All Unsloth Zoo code licensed under LGPLv3
-    # Empty model from config
-    new_config = deepcopy(config)
-    new_config.intermediate_size = 0
-    new_config.hidden_size = 0
-    new_config.vocab_size = 1
-    new_config.pad_token_id = 0
-
-    # Set attention module head_dim
-    # Otherwise will get error if (head_dim)**-0.5 is seen like in Qwen
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    new_config.update({"head_dim" : head_dim})
-
-    from transformers import AutoModelForCausalLM
-    new_model = AutoModelForCausalLM.from_config(
-        new_config,
-        attn_implementation = "eager",
-    )
-
-    new_model = new_model.to(device = get_target_device(), dtype = dtype)
-
-
-@torch.inference_mode
-def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None):
+def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
     set_dtype_in_config(config, dtype)
@@ -1258,6 +1234,12 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.out_features = quant_state.shape[0]
                 layer.weight = Params4bit(data = weight, requires_grad = False, **kwargs)
                 layer.weight.quant_state = quant_state
+                layer.bias = bias
+
+                # Must override or else Bitsandbytes will error
+                layer.to = partial(_override_to, layer)
+                layer.weight.to = partial(_override_to, layer.weight)
+
             elif not any(x in layer_name for x in layernorm_names):
                 layer = Linear(0, 0, device = get_target_device(), bias = has_bias)
                 layer.in_features  = weight.shape[1]
@@ -1362,6 +1344,7 @@ def approximate_vllm_memory_usage(
     # Gets approximate max model length and max num sequences
 
     free_memory, total_memory = get_mem_info()
+
     free_memory = gpu_memory_utilization * free_memory
 
     vocab_size = config.vocab_size
@@ -1561,6 +1544,7 @@ def load_vllm(
         raise NotImplementedError(f"Unsloth: We do not support dtype = {dtype} yet!")
 
     free_memory, total_memory = get_mem_info()
+
     total_memory_gb = round(total_memory / 1024 / 1024 / 1024, 2)
 
     # Fix up vLLM compute_dtype for bitsandbytes
@@ -1595,6 +1579,7 @@ def load_vllm(
         enable_prefix_caching = True
     elif DEVICE_TYPE == "xpu":
         enable_prefix_caching = True
+
     pass
 
     # Use VLLM_USE_V1 for vllm >= 0.7.4 and CUDA >= 8.0
