@@ -228,33 +228,40 @@ def copy_attributes(original_model, new_model):
                 print(f"   Skipped: {skipped_attrs}")
             else:
                 print(f"   Sample: {skipped_attrs[:5]}... and {skipped_count-5} more")
+pass
 
 
-global data
-data = None
 @torch.inference_mode()
 def create_empty_causal_lm(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     from transformers import AutoModelForCausalLM
-    global data
-    data = [config, dtype]
-    raise
-    try:
-        from accelerate import init_empty_weights
-        # Suppress warning on uninited weights
-        old_warn = os.environ.get("UNSLOTH_WARN_UNINITIALIZED", "1")
-        os.environ["UNSLOTH_WARN_UNINITIALIZED"] = "0"
-        with init_empty_weights():
-            model_name = getattr(config, 'model_name')
-            kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype_from_config(config)}
-            if model_name is not None:
-                # This would persist quantization information.
+    from accelerate import init_empty_weights
+    # Suppress warning on uninited weights
+    old_warn = os.environ.get("UNSLOTH_WARN_UNINITIALIZED", "1")
+    os.environ["UNSLOTH_WARN_UNINITIALIZED"] = "0"
+    model_name = getattr(config, 'model_name')
+    kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype_from_config(config)}
+    original_meta_model = None
+    error = None
+    with init_empty_weights(include_buffers = True):
+        if model_name is not None:
+            try:
+                # This would persist quantization information for FP8 weights
                 original_meta_model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
-            else:
+            except Exception as e:
+                error = str(e)
+                original_meta_model = None
+        if original_meta_model is None:
+            try:
+                # We must do this for 4.57.0 and above
                 original_meta_model = AutoModelForCausalLM.from_config(config)
-        # Suppress warning on uninited weights
-        os.environ["UNSLOTH_WARN_UNINITIALIZED"] = old_warn
-    except Exception as e:
+            except Exception as e:
+                error = str(e)
+                original_meta_model = None
+    pass
+    # Suppress warning on uninited weights
+    os.environ["UNSLOTH_WARN_UNINITIALIZED"] = old_warn
+    if error is not None and original_meta_model is None:
         print(f"Failed to create original_meta_model for AutoModelForCausalLM. Error {e}")
         original_meta_model = None
 
