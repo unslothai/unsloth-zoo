@@ -198,6 +198,8 @@ class UnslothFusedLoss(torch.autograd.Function):
             n_chunks = extra_kwargs.pop("n_chunks")
         else:
             n_chunks = get_chunk_size(bsz, qlen, vocab_size, target_gb = target_gb)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
         __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
         __shift_states = torch.chunk(hidden_states.view(-1, hd), n_chunks, dim = 0)
         __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
