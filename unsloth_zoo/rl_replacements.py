@@ -23,7 +23,7 @@ import inspect
 import os
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
-from unsloth import DEVICE_TYPE
+from .device_type import DEVICE_TYPE
 from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()
 
