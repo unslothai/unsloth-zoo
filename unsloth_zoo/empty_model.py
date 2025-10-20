@@ -225,9 +225,9 @@ def copy_attributes(original_model, new_model):
         if skipped_count > 0:
             print(f"⏭️ Skipped {skipped_count} total attributes (tensors, modules, non-config dicts, etc.)")
             if skipped_count <= 10:
-                print(f"   Skipped: {skipped_attrs}")
+                print(f"    Skipped: {skipped_attrs}")
             else:
-                print(f"   Sample: {skipped_attrs[:5]}... and {skipped_count-5} more")
+                print(f"    Sample: {skipped_attrs[:5]}... and {skipped_count-5} more")
 pass
 
 
