@@ -1220,7 +1220,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.quant_method = "fbgemm_fp8"
             elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
                 # This denotes that the model if FP8 dynamic quantized.
-                layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype=dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
+                layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
                 layer.in_features = weight.shape[1]
                 layer.out_features = weight.shape[0]
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
