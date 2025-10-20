@@ -223,7 +223,7 @@ def copy_attributes(original_model, new_model):
         if dict_skipped_count > 0:
             print(f"📋 Skipped {dict_skipped_count} non-config dictionaries")
         if skipped_count > 0:
-            print(f"⏭️  Skipped {skipped_count} total attributes (tensors, modules, non-config dicts, etc.)")
+            print(f"⏭️ Skipped {skipped_count} total attributes (tensors, modules, non-config dicts, etc.)")
             if skipped_count <= 10:
                 print(f"   Skipped: {skipped_attrs}")
             else:

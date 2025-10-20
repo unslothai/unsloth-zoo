@@ -17,6 +17,7 @@
 __version__ = "2025.10.7"
 
 import os
+import warnings
 # Hugging Face Hub faster downloads
 if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
@@ -101,3 +102,14 @@ from .rl_environments import (
     execute_with_time_limit,
     Benchmarker,
 )
+
+# Top some pydantic warnings
+try:
+    # pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True
+    # was provided to the `Field()` function, which has no effect in the context it was used.
+    # 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment.
+    # This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+    warnings.filterwarnings(action = "ignore", category = UnsupportedFieldAttributeWarning)
+except:
+    pass
