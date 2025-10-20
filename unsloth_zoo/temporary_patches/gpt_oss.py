@@ -535,7 +535,12 @@ pass
 
 
 # Combo kernels uses too much VRAM for low memory GPUs
-use_combo_kernels = False if torch.cuda.memory.mem_get_info(0)[-1]/1024/1024/1024 <= 40 else True
+from unsloth import DEVICE_TYPE
+if DEVICE_TYPE == "xpu":
+    memory = torch.xpu.memory.mem_get_info(0)[-1]
+else:
+    memory = torch.cuda.memory.mem_get_info(0)[-1]
+use_combo_kernels = False if memory/1024/1024/1024 <= 40 else True
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False, # Too slow
