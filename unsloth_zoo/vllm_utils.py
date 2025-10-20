@@ -1464,7 +1464,7 @@ def load_vllm(
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     if unsloth_vllm_standby and gpu_memory_utilization < 0.9:
-        gpu_memory_utilization = 0.9
+        gpu_memory_utilization = 0.8
         logger.info("Unsloth: Standby mode is enabled. Increasing `gpu_memory_utilization` to 0.9.")
 
     if DEVICE_TYPE == "cuda":
