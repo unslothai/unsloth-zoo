@@ -301,7 +301,6 @@ pass
 
 
 def _retry_eintr(func, *args):
-    """Call func(*args), retrying on EINTR."""
     while True:
         try:
             return func(*args)
@@ -312,15 +311,15 @@ def _retry_eintr(func, *args):
 pass
 
 @contextmanager
-def time_limit(seconds: float):
+def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
     """
     Enforce a wall-clock time limit using SIGALRM/ITIMER_REAL.
 
-    Key points:
-      - Earliest-deadline wins against any *existing* ITIMER_REAL, no matter who set it.
-      - Nest-safe with itself; process-wide SIGALRM remains non-composable with other users.
-      - Cleanup is robust to EINTR and brief Ctrl+C during teardown.
-      - Unix-like OS, main thread only.
+    - Earliest deadline wins (respects any currently armed ITIMER_REAL).
+    - EINTR-safe setup/teardown; resists Ctrl+C during cleanup.
+    - strict=True: 'fail-closed' — if body returns after the deadline and the
+      SIGALRM handler didn't get to run, raise TimeoutError on exit anyway.
+    - Unix-like OS, main thread only. Process-wide SIGALRM: not composable with other users.
     """
     if seconds <= 0:
         raise ValueError("seconds must be > 0")
@@ -329,51 +328,64 @@ def time_limit(seconds: float):
     if threading.current_thread() is not threading.main_thread():
         raise RuntimeError("time_limit must be used from the main thread")
 
-    # Snapshot prior SIGALRM state and any already-armed real-time timer.
+    start = time.monotonic()
+    deadline_at = start + seconds
+
     old_handler = signal.getsignal(signal.SIGALRM)
     prev_remaining, prev_interval = signal.getitimer(signal.ITIMER_REAL)
 
-    # ALWAYS respect an existing ITIMER_REAL by taking the earliest deadline.
+    # Always respect any already-armed timer: take the earlier deadline.
     deadline = seconds if prev_remaining <= 0.0 else min(seconds, prev_remaining)
 
+    fired = False  # set by our handler
+
     def _handler(signum, frame):
-        # Report the actual deadline we armed (useful when nested or honoring an existing timer)
+        nonlocal fired
+        fired = True
+        # include the intended arming deadline for debugging
         raise TimeoutError(f"Timed out after {deadline:g}s")
 
-    # Mark so other code can detect our handler if needed
     setattr(_handler, "__time_limit_handler__", True)
 
-    start = time.monotonic()
-
-    # Install our handler and ensure SIGALRM interrupts blocking syscalls.
     _retry_eintr(signal.signal, signal.SIGALRM, _handler)
     try:
+        # Ensure blocking syscalls are interrupted (avoid SA_RESTART)
         try:
-            signal.siginterrupt(signal.SIGALRM, True)  # don't rely on SA_RESTART
+            signal.siginterrupt(signal.SIGALRM, True)
         except (AttributeError, OSError):
             pass
 
         _retry_eintr(signal.setitimer, signal.ITIMER_REAL, deadline)
         yield
     finally:
-        # Make teardown atomic wrt SIGINT and resilient to EINTR
+        # Make teardown atomic wrt SIGINT and robust to EINTR
         old_sigint = signal.getsignal(signal.SIGINT)
         try:
             _retry_eintr(signal.signal, signal.SIGINT, signal.SIG_IGN)
-
-            # Cancel our timer no matter what, then restore the previous SIGALRM handler.
             try:
-                _retry_eintr(signal.setitimer, signal.ITIMER_REAL, 0.0)
+                _retry_eintr(signal.setitimer, signal.ITIMER_REAL, 0.0)  # cancel ours
             finally:
                 _retry_eintr(signal.signal, signal.SIGALRM, old_handler)
 
-            # If there was a prior timer, re-arm it with corrected remaining time.
+            # Restore prior timer with corrected remaining time.
             if prev_remaining != 0.0 or prev_interval != 0.0:
                 elapsed = max(time.monotonic() - start, 0.0)
                 remaining = max(prev_remaining - elapsed, 0.0)
                 _retry_eintr(signal.setitimer, signal.ITIMER_REAL, remaining, prev_interval)
         finally:
             _retry_eintr(signal.signal, signal.SIGINT, old_sigint)
+
+        # ---- Fail-closed check (only if no TimeoutError was raised inside) ----
+        if strict and not fired:
+            now = time.monotonic()
+            if now > deadline_at + leeway:
+                # We exceeded wall time but the handler didn't get a chance to run.
+                # This typically means the body spent a long time in non-cooperative C code.
+                raise TimeoutError(
+                    f"Exceeded time limit ({seconds:g}s) without interrupt; "
+                    f"elapsed ≈ {now - start:.3f}s. "
+                    "The protected code likely blocked in a C extension or another SIGALRM user clobbered the timer."
+                )
 pass
 
 def execute_with_time_limit(seconds: float) -> Callable[[Callable[..., T]], Callable[..., T]]:
