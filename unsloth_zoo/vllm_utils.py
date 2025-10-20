@@ -59,7 +59,7 @@ from .temporary_patches.common import (
     UNSLOTH_ENABLE_LOGGING,
 )
 from .log import logger
-from unsloth import DEVICE_TYPE
+from ..device_type import DEVICE_TYPE
 from unsloth.models.vision import VLLM_SUPPORTED_VLM
 global LORA_REQUEST_ID
 

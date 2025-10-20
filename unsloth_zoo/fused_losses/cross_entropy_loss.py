@@ -26,7 +26,7 @@ import inspect
 import functools
 import math
 from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
-from unsloth import DEVICE_TYPE
+from ..device_type import DEVICE_TYPE
 
 @functools.cache
 def _get_mapping(autograd):
