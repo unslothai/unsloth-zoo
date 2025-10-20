@@ -252,7 +252,7 @@ def grpo_compute_loss(
         pass
     pass
 
-    if use_vllm:
+    if use_vllm and sampling_per_token_logps is not None:
         #must filter out extra prompt tokens in begining after making input_ids left padded
         importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
         importance_sampling_ratio = torch.clamp(
@@ -308,7 +308,7 @@ def grpo_compute_loss(
     loss_2 = coef_2 * advantages.unsqueeze(1)
     loss_i = -torch.min(loss_1, loss_2)
 
-    if use_vllm:
+    if use_vllm and sampling_per_token_logps is not None:
         loss_i = loss_i * importance_sampling_ratio     
         #delta for metric
         with torch.no_grad():
@@ -550,7 +550,7 @@ def grpo_accumulated_loss(
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None)
     #delete this from kwargs so less issues 
     del kwargs["sampling_per_token_logps"]
-    kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap
+    kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap if sampling_per_token_logps is not None else None
     kwargs["use_vllm"] = trainer.use_vllm
     # Find closest multiple
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
@@ -577,7 +577,7 @@ def grpo_accumulated_loss(
         completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
         #TODO given the completion mask here we need to, handle the left pad tokens so the sizes of completion
         #token or old logprobs are compatible with the importance sampling logprobs
-        if trainer.use_vllm:
+        if trainer.use_vllm and sampling_per_token_logps is not None:
             sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
         attention_mask =  input_ids != trainer.processing_class.pad_token_id
         attention_mask = attention_mask.to(attention_mask.dtype)
