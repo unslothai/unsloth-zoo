@@ -35,6 +35,7 @@ import signal
 from contextlib import contextmanager
 from functools import wraps
 import threading
+import errno
 import time
 from typing import Callable, TypeVar, Any, Tuple
 T = TypeVar("T")
@@ -299,16 +300,27 @@ def create_locked_down_function(function):
 pass
 
 
+def _retry_eintr(func, *args):
+    """Call func(*args), retrying on EINTR."""
+    while True:
+        try:
+            return func(*args)
+        except OSError as e:
+            if getattr(e, "errno", None) == errno.EINTR:
+                continue
+            raise
+pass
+
 @contextmanager
 def time_limit(seconds: float):
     """
     Enforce a wall-clock time limit using SIGALRM/ITIMER_REAL.
 
     Key points:
-      - Nest-safe: earliest deadline wins.
-      - Restores any prior timer with remaining time corrected.
-      - **Interrupts** blocking syscalls so TimeoutError can be raised promptly.
-      - Unix-like OS, main thread only. Process-wide timer: not composable with other SIGALRM users.
+      - Earliest-deadline wins against any *existing* ITIMER_REAL, no matter who set it.
+      - Nest-safe with itself; process-wide SIGALRM remains non-composable with other users.
+      - Cleanup is robust to EINTR and brief Ctrl+C during teardown.
+      - Unix-like OS, main thread only.
     """
     if seconds <= 0:
         raise ValueError("seconds must be > 0")
@@ -317,39 +329,51 @@ def time_limit(seconds: float):
     if threading.current_thread() is not threading.main_thread():
         raise RuntimeError("time_limit must be used from the main thread")
 
+    # Snapshot prior SIGALRM state and any already-armed real-time timer.
     old_handler = signal.getsignal(signal.SIGALRM)
     prev_remaining, prev_interval = signal.getitimer(signal.ITIMER_REAL)
 
+    # ALWAYS respect an existing ITIMER_REAL by taking the earliest deadline.
+    deadline = seconds if prev_remaining <= 0.0 else min(seconds, prev_remaining)
+
     def _handler(signum, frame):
-        raise TimeoutError(f"Timed out after {seconds:g}s")
+        # Report the actual deadline we armed (useful when nested or honoring an existing timer)
+        raise TimeoutError(f"Timed out after {deadline:g}s")
+
+    # Mark so other code can detect our handler if needed
     setattr(_handler, "__time_limit_handler__", True)
 
-    nested_ours = getattr(old_handler, "__time_limit_handler__", False)
     start = time.monotonic()
-    delay_now = min(seconds, prev_remaining) if (nested_ours and prev_remaining > 0.0) else seconds
 
+    # Install our handler and ensure SIGALRM interrupts blocking syscalls.
+    _retry_eintr(signal.signal, signal.SIGALRM, _handler)
     try:
-        signal.signal(signal.SIGALRM, _handler)
-
-        # IMPORTANT: ensure blocking syscalls are INTERRUPTED (no SA_RESTART),
-        # so control returns to Python and we can raise TimeoutError.
         try:
-            signal.siginterrupt(signal.SIGALRM, True)
+            signal.siginterrupt(signal.SIGALRM, True)  # don't rely on SA_RESTART
         except (AttributeError, OSError):
             pass
 
-        signal.setitimer(signal.ITIMER_REAL, delay_now)
+        _retry_eintr(signal.setitimer, signal.ITIMER_REAL, deadline)
         yield
     finally:
-        # Cancel our timer and restore the previous handler.
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        signal.signal(signal.SIGALRM, old_handler)
+        # Make teardown atomic wrt SIGINT and resilient to EINTR
+        old_sigint = signal.getsignal(signal.SIGINT)
+        try:
+            _retry_eintr(signal.signal, signal.SIGINT, signal.SIG_IGN)
 
-        # Restore prior timer with corrected remaining time.
-        if prev_remaining != 0.0 or prev_interval != 0.0:
-            elapsed = max(time.monotonic() - start, 0.0)
-            remaining = max(prev_remaining - elapsed, 0.0)
-            signal.setitimer(signal.ITIMER_REAL, remaining, prev_interval)
+            # Cancel our timer no matter what, then restore the previous SIGALRM handler.
+            try:
+                _retry_eintr(signal.setitimer, signal.ITIMER_REAL, 0.0)
+            finally:
+                _retry_eintr(signal.signal, signal.SIGALRM, old_handler)
+
+            # If there was a prior timer, re-arm it with corrected remaining time.
+            if prev_remaining != 0.0 or prev_interval != 0.0:
+                elapsed = max(time.monotonic() - start, 0.0)
+                remaining = max(prev_remaining - elapsed, 0.0)
+                _retry_eintr(signal.setitimer, signal.ITIMER_REAL, remaining, prev_interval)
+        finally:
+            _retry_eintr(signal.signal, signal.SIGINT, old_sigint)
 pass
 
 def execute_with_time_limit(seconds: float) -> Callable[[Callable[..., T]], Callable[..., T]]:
