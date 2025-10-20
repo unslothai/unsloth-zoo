@@ -230,11 +230,16 @@ def copy_attributes(original_model, new_model):
                 print(f"   Sample: {skipped_attrs[:5]}... and {skipped_count-5} more")
 
 
+global data
+data = None
 @torch.inference_mode()
 def create_empty_causal_lm(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     from transformers import AutoModelForCausalLM
     try:
+        global data
+        data = [config, dtype]
+        raise
         from accelerate import init_empty_weights
         # Suppress warning on uninited weights
         old_warn = os.environ.get("UNSLOTH_WARN_UNINITIALIZED", "1")
