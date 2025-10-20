@@ -1169,6 +1169,7 @@ def merge_and_overwrite_lora(
     needs_splitting = should_split_shards(is_t4, config, safetensors_list) if save_method == "merged_16bit" else False
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
+    copied_tokenizer_model_from_cache = False
     safe_tensor_index_files = ["model.safetensors.index.json"] if len(safetensors_list) > 1 else []
 
     # ONLY download/copy the original index if we are NOT dequantizing an MXFP4 model
