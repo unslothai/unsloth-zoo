@@ -242,7 +242,12 @@ pass
 
 def patch_to_dict():
     from functools import wraps
-    from transformers.configuration_utils import PretrainedConfig
+    try:
+        from transformers.configuration_utils import PreTrainedConfig
+        PretrainedConfig = PreTrainedConfig
+    except:
+        from transformers.configuration_utils import PretrainedConfig
+
     from .hf_utils import _normalize_dict_dtypes
     original_to_dict = PretrainedConfig.to_dict
     original_to_diff_dict = PretrainedConfig.to_diff_dict
@@ -251,12 +256,12 @@ def patch_to_dict():
     def wrapped_to_dict(self, *args, **kwargs):
         result = original_to_dict(self, *args, **kwargs)
         return _normalize_dict_dtypes(result)
-    
+
     @wraps(original_to_diff_dict)
     def wrapped_to_diff_dict(self, *args, **kwargs):
         result = original_to_diff_dict(self, *args, **kwargs)
         return _normalize_dict_dtypes(result)
-    
+
     wrapped_to_diff_dict._unsloth_patched = True
     if not getattr(PretrainedConfig, "_unsloth_patched", False):
         setattr(PretrainedConfig, "to_diff_dict", wrapped_to_diff_dict)
@@ -368,7 +373,7 @@ def patch_model_and_tokenizer(
             if key == "torch_dtype" or key == "dtype":
                 setattr(config, key, correct_dtype)
             else:
-                __fix_dtype(getattr(config, key))
+                __fix_dtype(getattr(config, key, None))
     m = model
     while hasattr(m, "model"):
         if hasattr(m, "dtype"):

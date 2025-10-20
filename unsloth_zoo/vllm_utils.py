@@ -39,6 +39,8 @@ from copy import deepcopy
 import math
 import gc
 import os
+import ast
+import sys
 import torch
 import json
 import psutil
@@ -46,7 +48,7 @@ import functools
 import contextlib
 import inspect
 from functools import partial
-from .utils import _get_dtype
+from .utils import _get_dtype, get_quant_type
 from .empty_model import *
 from .hf_utils import (
     dtype_from_config,
@@ -59,8 +61,7 @@ from .temporary_patches.common import (
     UNSLOTH_ENABLE_LOGGING,
 )
 from .log import logger
-from unsloth import DEVICE_TYPE
-from unsloth.models.vision import VLLM_SUPPORTED_VLM
+from .device_type import DEVICE_TYPE
 global LORA_REQUEST_ID
 
 # Ignore logging messages
@@ -256,7 +257,11 @@ if importlib.util.find_spec("vllm") is not None:
         vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesLinearMethod._apply_4bit_weight = _apply_4bit_weight
 
         # Disable all not supported messages
-        from vllm.config import logger as vllm_config_logger
+        try:
+            from vllm.config import logger as vllm_config_logger
+        except:
+            # vLLM refactored a lot of configs. Most of them are backwards compatible for imports. This seems to not be.
+            from vllm.config.model import logger as vllm_config_logger
         vllm_config_logger.addFilter(HideLoggingMessage("not supported"))
         vllm_config_logger.addFilter(HideLoggingMessage("is not tested"))
         vllm_config_logger.addFilter(HideLoggingMessage("is not fully optimized"))
@@ -858,11 +863,48 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
         else:
             dim_offsets = [0, qweight.shape[0]]
 
+        ## Handle FP8 weights. For now only BlockQuantized
+        if qweight.dtype == torch.float8_e4m3fn:
+            if hasattr(proj, 'weight_scale'):
+                weight_scale = proj.weight_scale
+            elif hasattr(proj, 'weight_scale_inv'):
+                weight_scale = proj.weight_scale_inv
+            else:
+                raise ValueError(f"Unsloth: Cannot find weight scale for FP8 weight {prefix}")
+
+            offsets = [0] + proj.logical_widths # [q, k, v] sizes
+            offsets = np.cumsum(offsets)
+            scale_suffix = '.weight_scale'
+            if weight_scale.ndim == 2:
+                if weight_scale.shape[1] > 1:
+                    # Block quantized has 2D weight scale
+                    # for qwen 3 for eg, 4096 query and 1024 each for k and v. Weight block size say is [128, 128]
+                    # so the shape of qkv is [6144, 4096] and scale.T is [48, 32]. Now 48 should be split into [0, 32, 40, 48]
+                    # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
+                    scale_suffix = '.weight_scale_inv'
+                    block_size = proj.weight_block_size[0]
+                    weight_scale = weight_scale.T
+                else:
+                    # This is dynamic quantization (aka per row or per column). The scale is of shape [n,1]
+                    # The weight here is of shape [4096, 6144]. We need to transpose and then slice
+                    qweight = qweight.T
+                    block_size = 1
+
+                scale_offsets = [x//block_size for x in offsets]
+                if slice_weights:
+                    weight_scale = weight_scale[scale_offsets[kk] : scale_offsets[kk + 1]]
+
+            if slice_weights:
+                weight = qweight[offsets[kk] : offsets[kk + 1]]
+            else:
+                weight = qweight
+
+            state_dict[prefix + scale_suffix] = weight_scale
+            quant_state_dict[prefix + scale_suffix] = weight_scale
+
         # Handle quantized weights
         quant_states = getattr(qweight, "bnb_quant_state", None)
         if quant_states is not None:
-            if 'vision_tower.transformers.layers.0.' in prefix:
-                print(f'Unsloth: Quantized weights for vision model {prefix}\t{proj}!')
             offsets = qweight.bnb_shard_offsets
             if slice_weights:
                 weight = qweight[offsets[kk] : offsets[kk + 1]]
@@ -1030,7 +1072,13 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
 
     for key in old_state_dict:
         try:
-            torch.testing.assert_close(old_state_dict[key], new_state_dict[key], check_stride = True)
+            old_val = old_state_dict[key]
+            new_val = new_state_dict[key]
+            if old_val.dtype != new_val.dtype or (new_val.element_size() < 2):
+                # upcast both to float32 just for comparison. For FP8, vLLM stores weight scale in FP32 while HF preferes 16bit
+                old_val = old_val.to(torch.float32)
+                new_val = new_val.to(torch.float32)
+            torch.testing.assert_close(old_val, new_val, check_stride = False, atol = 1e-4, rtol = 1e-3)
         except Exception as error:
             if key == "lm_head.weight":
                 # Try tied embeddings fallback
@@ -1061,15 +1109,32 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     new_model, original_meta_model, layer_count, layer_names = create_empty_model(config, dtype, is_vision_model)
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
     quantization_config = getattr(config, "quantization_config", {})
+    quant_method = get_quant_type(config)
     kwargs = dict()
     compute_dtype = dtype  # Do not use config file's dtype!
 
     if quantization_config != {} or bnb_config is not None:
         # Get quantization_config flags
         if quantization_config != {}:
-            kwargs["compress_statistics"] = quantization_config["bnb_4bit_use_double_quant"]
-            kwargs["quant_type"] = quantization_config["bnb_4bit_quant_type"]
-            kwargs["quant_storage"] = _get_dtype(quantization_config["bnb_4bit_quant_storage"])
+            if quant_method == 'bitsandbytes':
+                kwargs["compress_statistics"] = quantization_config["bnb_4bit_use_double_quant"]
+                kwargs["quant_type"] = quantization_config["bnb_4bit_quant_type"]
+                kwargs["quant_storage"] = _get_dtype(quantization_config["bnb_4bit_quant_storage"])
+            elif quant_method == 'fp8':
+                kwargs['activation_scheme'] = quantization_config['activation_scheme']
+                kwargs['block_size'] = quantization_config['weight_block_size']
+                try:
+                    from transformers.integrations.finegrained_fp8 import FP8Linear
+                except ImportError:
+                    raise ImportError("Unsloth: FP8 models need importing FP8Linear from `transformers.integrations.finegrained_fp8` but we don't see it.")
+
+            elif quant_method == 'fbgemm_fp8':
+                kwargs['input_scale_ub'] = torch.tensor([quantization_config['activation_scale_ub']], device = get_target_device())
+                try:
+                    from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear
+                except ImportError:
+                    raise ImportError("Unsloth: FP8 models need importing FbgemmFP8Linear from `transformers.integrations.fbgemm_fp8` but we don't see it.")
+
 
         # Get bnb_config flags
         elif bnb_config is not None:
@@ -1137,11 +1202,31 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             pass
 
             if layer_name in quant_state_dict:
-                # for attirbutes of type nn.Parameter, there's no .weight
+                # for attributes of type nn.Parameter, there's no .weight
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
                 layer = torch.nn.Parameter(weight, requires_grad = False)
                 exec(f"new_model.{layer_name_br} = layer")
                 continue
+            elif f"{layer_name}.weight_scale" in quant_state_dict:
+                # This is FP8 quantized but not block quant. Either dynamic or static
+                layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
+                layer.in_features = weight.shape[1]
+                layer.out_features = weight.shape[0]
+                layer.weight = torch.nn.Parameter(weight, requires_grad = False)
+                layer.bias = bias
+                layer.input_scale_ub = kwargs['input_scale_ub']
+                layer.weight_scale = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale"], requires_grad = False)
+                layer.weight.input_scale_ub = kwargs['input_scale_ub']
+                layer.quant_method = "fbgemm_fp8"
+            elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
+                # This denotes that the model if FP8 dynamic quantized.
+                layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
+                layer.in_features = weight.shape[1]
+                layer.out_features = weight.shape[0]
+                layer.weight = torch.nn.Parameter(weight, requires_grad = False)
+                layer.bias = bias
+                layer.weight_scale_inv = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale_inv"], requires_grad = False)
+                layer.quant_method = "fp8"
             elif f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
@@ -1160,7 +1245,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer = Linear(0, 0, device = get_target_device(), bias = has_bias)
                 layer.in_features  = weight.shape[1]
                 layer.out_features = weight.shape[0]
-                layer.weight = torch.nn.Parameter(weight, requires_grad = False)
+                # from vllm 0.11.1, the .weight is of dtype ModelWeightParameter, so try to extract the 'data' part
+                # https://github.com/vllm-project/vllm/commit/de94289a98d7ec52a5ef02719e01a1db8b505170#diff-7d6145ac4ba084231a441c2056c7fca23c3bae33e6542f4f602a6c9d4d2da64dL199-R208
+                layer.weight = torch.nn.Parameter(getattr(weight, 'data', weight), requires_grad = False)
                 layer.bias = bias
             else:
                 # LayerNorms (including vision norms)
@@ -1245,6 +1332,7 @@ pass
 def approximate_vllm_memory_usage(
     config,
     load_in_4bit = False,
+    load_in_8bit = False,
     max_seq_length = 2048,
     gpu_memory_utilization = 0.8,
     enable_lora = True,
@@ -1314,7 +1402,10 @@ def approximate_vllm_memory_usage(
     # 2 bytes = float16
     total_quantizable_elements = (qkvo + mlp)*n_layers * 2
     total_float16_elements     = (layernorms + embed_tokens + lm_head)*2
-    factor = 16/5 if load_in_4bit else 1 # Should be 4.5 but use 5
+    # factor = 16/5 if load_in_4bit else 1 # Should be 4.5 but use 5
+    factor = 1
+    if load_in_4bit: factor = 16/5
+    elif load_in_8bit: factor = 8/5 # Very vague approximation. Will fix later
     bytes_for_model = \
         total_quantizable_elements / factor + total_float16_elements + lora_elements
 
@@ -1372,8 +1463,9 @@ def load_vllm(
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
-    if unsloth_vllm_standby and gpu_memory_utilization < 0.9:
-        gpu_memory_utilization = 0.9
+    if unsloth_vllm_standby and gpu_memory_utilization < 0.8:
+        ## [TODO] Used to allow 0.9, but now 0.85 works only
+        gpu_memory_utilization = 0.8
         logger.info("Unsloth: Standby mode is enabled. Increasing `gpu_memory_utilization` to 0.9.")
 
     if DEVICE_TYPE == "cuda":
@@ -1389,14 +1481,20 @@ def load_vllm(
     else:
         mem_config = config
 
+    quant_method = get_quant_type(config)
     use_bitsandbytes = use_bitsandbytes or \
-        model_name.lower().endswith("-bnb-4bit") or "quantization_config" in config
+        model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
+
+    is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
+
+    assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
     approximate_vllm_memory_usage(
         mem_config,
         load_in_4bit = use_bitsandbytes,
+        load_in_8bit = is_fp8,
         max_seq_length = max_seq_length,
         gpu_memory_utilization = gpu_memory_utilization,
         enable_lora = enable_lora,
@@ -2264,9 +2362,50 @@ def _test_is_same_vlm(model, new_model, processor, test_backward=False):
                 mismatches.append(layer_name)
         print(f"Backward gradient statistics match for {len(matches)} layers: {matches}")
         print(f"Backward gradient statistics mismatch for {len(mismatches)} layers: {mismatches}")
+pass
 
 
-    pass
+def _read_unsloth_vision_source() -> str:
+    _VISION_TAIL = ("unsloth", "models", "vision.py")
+    from importlib.metadata import files, PackageNotFoundError, PackagePath
+    from pathlib import Path
+    # 1) Via installed distribution metadata (no import of the package)
+    try:
+        for entry in files("unsloth") or ():
+            if isinstance(entry, PackagePath):
+                parts = entry.parts
+                if len(parts) >= 3 and tuple(parts[-3:]) == _VISION_TAIL:
+                    return entry.read_text(encoding = "utf-8")
+    except PackageNotFoundError:
+        pass
+
+    # 2) Fallback: scan sys.path for a plain file
+    for base in map(Path, sys.path):
+        candidate = base.joinpath(*_VISION_TAIL)
+        if candidate.is_file():
+            return candidate.read_text(encoding = "utf-8")
+    raise FileNotFoundError("Could not locate unsloth/models/vision.py without importing it")
+pass
+
+
+def get_vllm_supported_vlm(_VAR_NAME = "VLLM_SUPPORTED_VLM"):
+    """
+    Parse VLLM_SUPPORTED_VLM from unsloth/models/vision.py as a literal.
+    """
+    src = _read_unsloth_vision_source()
+    tree = ast.parse(src)
+
+    # Support: `VLLM_SUPPORTED_VLM = [...]` and `VLLM_SUPPORTED_VLM: list[str] = [...]`
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            if any(getattr(t, "id", None) == _VAR_NAME for t in node.targets):
+                return ast.literal_eval(node.value)
+        elif isinstance(node, ast.AnnAssign):
+            if getattr(node.target, "id", None) == _VAR_NAME:
+                return ast.literal_eval(node.value)
+    raise ValueError(f"{_VAR_NAME} not found as a literal in unsloth/models/vision.py")
+pass
+
 
 @torch.inference_mode
 def _test_get_vllm_state_dict(
@@ -2294,6 +2433,7 @@ def _test_get_vllm_state_dict(
         trust_remote_code = False,
         attn_implementation = "sdpa",
     )
+    config.model_name = model_name
 
     if not vllm_dynamic_quant_supported(model_name, config):
         raise NotImplementedError(f"Unsloth: Dynamic quant of {model_name} not supported in vLLM")
@@ -2322,6 +2462,7 @@ def _test_get_vllm_state_dict(
     if not is_vision_model:
         model_class = AutoModelForCausalLM
     else:
+        VLLM_SUPPORTED_VLM = get_vllm_supported_vlm()
         if model_type in VLLM_SUPPORTED_VLM:
             import transformers
             model_class = getattr(transformers, config.architectures[0])

@@ -1311,7 +1311,7 @@ def apply_fused_lm_head(forward, module = None):
         replacement = cross_entropy_replacement.strip().split("\n")
         replacement = "\n".join((len(spaces)-4)*" " + x for x in replacement)
         replacement = \
-            "logits = EMPTY_LOGITS\n" + \
+            "logits = self.lm_head(hidden_states[:, slice_indices, :]) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS\n" + \
             (len(spaces)-4)*" " + "loss = None\n" + \
             replacement + "\n"
         try:
@@ -1326,7 +1326,7 @@ def apply_fused_lm_head(forward, module = None):
         # Return logits back
         if "logits = outputs.logits" in cross_entropy_find:
             forward = forward.replace(
-                "logits = EMPTY_LOGITS",
+                "logits = self.lm_head(hidden_states[:, slice_indices, :]) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS",
                 "logits = outputs.logits",
             )
         # Fix vocab_size = (vocab_size=
@@ -2035,7 +2035,14 @@ def unsloth_compile_transformers(
     except ModuleNotFoundError:
         return
     modeling_file = eval(model_location)
-    if hasattr(modeling_file, "__UNSLOTH_PATCHED__"): return
+    if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
+        # Get __UNSLOTH_SUPPORTS_SDPA__
+        if hasattr(modeling_file, "__UNSLOTH_SUPPORTS_SDPA__"):
+            if supports_sdpa is not None:
+                assert(type(supports_sdpa) is list and len(supports_sdpa) == 1)
+                supports_sdpa[0] = modeling_file.__UNSLOTH_SUPPORTS_SDPA__
+        return
+    pass
 
     # Use transformers model_type logger to suppress message: Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
     exec("model_logger.addFilter(HideLoggingMessage('`use_cache`'))", globals(), locals())
@@ -2148,7 +2155,7 @@ def unsloth_compile_transformers(
     # Get all functions as well
     functions = [x for x in functions if x not in torch_modules or not compile_torch_modules or not compile_custom_modules]
 
-    # Get all PretrainedModel classes
+    # Get all PreTrainedModel classes
     pretrained_modules = re.findall(r"class ([^\s]{1,})\(.+?PreTrainedModel\)", full_source)
 
     # Remove if no forward function
@@ -2189,6 +2196,7 @@ def unsloth_compile_transformers(
     torch_modules = [x for x in torch_modules if x not in removal]
 
     # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
+    final_supports_sdpa = True
     if supports_sdpa is not None:
         assert(type(supports_sdpa) is list and len(supports_sdpa) == 1)
         if ("_supports_sdpa = True" in full_source) and ("_supports_sdpa = False" not in full_source):
@@ -2197,7 +2205,10 @@ def unsloth_compile_transformers(
             if supports_sdpa[0] != False: supports_sdpa[0] = True
         else:
             supports_sdpa[0] = False
+            final_supports_sdpa = False
     pass
+    # Save supports_sdpa to solve secondary imports
+    modeling_file.__UNSLOTH_SUPPORTS_SDPA__ = final_supports_sdpa
 
     # Get functions which are called
     called_functions = []

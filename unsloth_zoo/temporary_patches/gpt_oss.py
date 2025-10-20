@@ -535,7 +535,12 @@ pass
 
 
 # Combo kernels uses too much VRAM for low memory GPUs
-use_combo_kernels = False if torch.cuda.memory.mem_get_info(0)[-1]/1024/1024/1024 <= 40 else True
+from ..device_type import DEVICE_TYPE
+if DEVICE_TYPE == "xpu":
+    device_memory = torch.xpu.memory.mem_get_info(0)[-1]
+else:
+    device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False, # Too slow
@@ -1373,7 +1378,13 @@ pass
 # RuntimeError: Unsloth: Failed to load model. Both AutoConfig and PeftConfig loading failed.
 # AutoConfig error: 'GptOssConfig' object has no attribute 'max_position_embeddings'
 try:
-    from transformers.configuration_utils import PretrainedConfig, layer_type_validation
+    from transformers.configuration_utils import layer_type_validation
+    try:
+        from transformers.configuration_utils import PreTrainedConfig
+        PretrainedConfig = PreTrainedConfig
+    except:
+        from transformers.configuration_utils import PretrainedConfig
+
     from transformers.modeling_rope_utils import rope_config_validation
 
     class Old_GptOssConfig(PretrainedConfig):
