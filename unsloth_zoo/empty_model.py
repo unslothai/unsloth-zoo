@@ -392,7 +392,7 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     if get_quant_type(config) in ('fp8', 'fbgemm_fp8'):
         patch_hf_quantizer()
 
-    if is_vision_model:
+    if is_vision_model and "textconfig" not in str(type(config)).lower():
         new_model, original_meta_model, num_layers = create_empty_vision_model(config, dtype)
     else:
         new_model, original_meta_model, num_layers = create_empty_causal_lm(config, dtype)
