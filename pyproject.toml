@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.4.0",
-    "torchao>=0.13.0,!=0.14.0",
+    "torchao>=0.13.0",
     "triton ; platform_system == 'Linux'",
     "triton_windows ; platform_system == 'Windows'",
     "packaging>=24.1",
@@ -47,7 +47,6 @@ dependencies = [
     "msgspec",
     "typing_extensions",
     "filelock",
-    "mistral_common",
 ]
 
 [tool.setuptools.dynamic]
