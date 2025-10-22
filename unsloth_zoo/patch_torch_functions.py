@@ -20,14 +20,8 @@ __all__ = [
 ]
 
 import os
-UNSLOTH_COMPILE_DEBUG = os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"
-torch_compile_options = {
-    "epilogue_fusion"   : True,
-    "max_autotune"      : False,
-    "shape_padding"     : True,
-    "trace.enabled"     : UNSLOTH_COMPILE_DEBUG,
-    "triton.cudagraphs" : False,
-}
+from .temporary_patches.common import torch_compile, UNSLOTH_ENABLE_LOGGING
+from .log import logger
 from torch import Tensor
 import torch
 from torch.nn import functional as F
@@ -42,7 +36,7 @@ from torch.nn.functional import (
 from typing import Callable, List, Optional, Tuple, Union
 
 
-@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
+@torch_compile
 def layer_norm(
     input: Tensor,
     normalized_shape: List[int],
@@ -70,7 +64,7 @@ def layer_norm(
 pass
 
 
-@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
+@torch_compile
 def cross_entropy(
     input: Tensor,
     target: Tensor,
@@ -176,4 +170,23 @@ def patch_torch_functions():
     # All Unsloth Zoo code licensed under LGPLv3
     torch.nn.functional.layer_norm    = layer_norm
     torch.nn.functional.cross_entropy = cross_entropy
+pass
+
+
+# Patch TorchAO functions
+try:
+    import torchao.quantization.qat.fake_quantizer
+    if not hasattr(torchao.quantization.qat.fake_quantizer, "__UNSLOTH_PATCHED__"):
+        qat_classes = dir(torchao.quantization.qat.fake_quantizer)
+        for qat_class in qat_classes:
+            if qat_class.startswith("_"): continue
+            qat_class = getattr(torchao.quantization.qat.fake_quantizer, qat_class)
+            if hasattr(qat_class, "forward"):
+                # Skip already compiled functions
+                if not hasattr(qat_class.forward, "get_compiler_config"):
+                    qat_class.forward = torch_compile(qat_class.forward)
+        torchao.quantization.qat.fake_quantizer.__UNSLOTH_PATCHED__ = True
+except Exception as e:
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.warning(f"TorchAO patching failed with exception = {str(e)}")
 pass

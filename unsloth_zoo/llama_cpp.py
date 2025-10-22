@@ -66,11 +66,11 @@ LLAMA_CPP_TARGETS = [
 ]
 
 PIP_OPTIONS = [
+    "uv pip", # Astral's uv
     "pip",
     "pip3",
     "python3 -m pip", # Python standalone installation
     "py -m pip", # Windows
-    "uv pip", # Astral's uv
     "poetry", # Poetry
 ]
 
