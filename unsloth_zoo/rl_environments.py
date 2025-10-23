@@ -388,15 +388,98 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
                 )
 pass
 
-def execute_with_time_limit(seconds: float) -> Callable[[Callable[..., T]], Callable[..., T]]:
+import multiprocessing as mp
+import traceback
+
+class RemoteTracebackError(RuntimeError):
+    pass
+
+def _run_in_subprocess(func, seconds, args, kwargs, *, start_method="spawn", kill_grace=1.0):
+    ctx = mp.get_context(start_method)
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+
+    def _child(entry_conn, f, a, kw):
+        try:
+            res = f(*a, **(kw or {}))
+            entry_conn.send(("ok", res))
+        except BaseException as e:
+            entry_conn.send(("err", (e.__class__.__name__, str(e), traceback.format_exc())))
+        finally:
+            try:
+                entry_conn.close()
+            except Exception:
+                pass
+
+    proc = ctx.Process(target=_child, args=(child_conn, func, args, kwargs))
+    proc.daemon = False
+    proc.start()
+    child_conn.close()
+
+    try:
+        # Wait for result up to 'seconds'
+        if parent_conn.poll(seconds):
+            kind, payload = parent_conn.recv()
+            proc.join()
+            if kind == "ok":
+                return payload
+            else:
+                name, msg, tb = payload
+                raise RemoteTracebackError(f"{name}: {msg}\nRemote traceback:\n{tb}")
+        else:
+            # Timeout: terminate, then kill if stubborn
+            proc.terminate()
+            proc.join(kill_grace)
+            if proc.is_alive():
+                try:
+                    proc.kill()  # POSIX+Py3.7+, Windows uses TerminateProcess under the hood
+                finally:
+                    proc.join()
+            raise TimeoutError(f"Timed out after {seconds:g}s")
+    except KeyboardInterrupt:
+        # Ensure no orphan on Ctrl+C
+        try:
+            proc.terminate()
+            proc.join(kill_grace)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+        finally:
+            raise
+    finally:
+        try:
+            parent_conn.close()
+        except Exception:
+            pass
+pass
+
+def execute_with_time_limit(
+    seconds: float,
+    *,
+    backend: str = "signal",
+    start_method: str = "process",
+    kill_grace: float = 1.0,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator that enforces a time limit.
+
+    backend:
+      - "signal": uses SIGALRM (fast, in-process; only cooperative C code).
+      - "process": runs function in a child and kills it on timeout (robust).
+    """
     if seconds <= 0:
         raise ValueError("seconds must be > 0")
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
-            with time_limit(seconds):
-                return func(*args, **kwargs)
+            if backend == "signal":
+                with time_limit(seconds):
+                    return func(*args, **kwargs)
+            elif backend == "process":
+                return _run_in_subprocess(func, seconds, args, kwargs,
+                                          start_method=start_method, kill_grace=kill_grace)
+            else:
+                raise ValueError("backend must be 'signal' or 'process'")
         return wrapper
     return decorator
 pass

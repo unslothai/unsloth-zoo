@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.10.9"
+__version__ = "2025.10.10"
 
 import os
 import warnings
@@ -111,5 +111,21 @@ try:
     # This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
     from pydantic.warnings import UnsupportedFieldAttributeWarning
     warnings.filterwarnings(action = "ignore", category = UnsupportedFieldAttributeWarning)
+except:
+    pass
+
+import logging
+# Ignore logging messages
+class HideLoggingMessage(logging.Filter):
+    __slots__ = "text",
+    def __init__(self, text): self.text = text
+    def filter(self, x): return not (self.text in x.getMessage())
+pass
+
+# Skipping import of cpp extensions due to incompatible torch version
+try:
+    from torchao import logger as torchao_logger
+    torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
+    del torchao_logger
 except:
     pass
