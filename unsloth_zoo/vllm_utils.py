@@ -1466,7 +1466,7 @@ def load_vllm(
     if unsloth_vllm_standby and gpu_memory_utilization <= 0.9:
         free_memory, total_memory = get_mem_info()
         # If T4 ie 15GB, we use 0.85 since it'll rarely OOM. Other GPUs 0.9
-        total_gb = free_memory/1024/1024/1024
+        total_gb = total_memory/1024/1024/1024
         ten_percent = total_gb * 0.1 # 1.46GB for T4
         if   ten_percent >= 4.0: gpu_memory_utilization = 0.925
         elif ten_percent >= 2.0: gpu_memory_utilization = 0.9
