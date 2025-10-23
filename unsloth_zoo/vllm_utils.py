@@ -1463,9 +1463,9 @@ def load_vllm(
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
-    if unsloth_vllm_standby and gpu_memory_utilization < 0.9:
-        gpu_memory_utilization = 0.9
-        logger.info("Unsloth: Standby mode is enabled. Increasing `gpu_memory_utilization` to 0.9.")
+    if unsloth_vllm_standby and gpu_memory_utilization < 0.85:
+        gpu_memory_utilization = 0.85
+        logger.info("Unsloth: Standby mode is enabled. Increasing `gpu_memory_utilization` to 0.85.")
 
     if DEVICE_TYPE == "cuda":
         major_version, minor_version = torch.cuda.get_device_capability()
