@@ -34,6 +34,9 @@ import numpy as np
 import signal
 from contextlib import contextmanager
 from functools import wraps
+import threading
+import errno
+import time
 from typing import Callable, TypeVar, Any, Tuple
 T = TypeVar("T")
 
@@ -297,43 +300,171 @@ def create_locked_down_function(function):
 pass
 
 
-@contextmanager
-def time_limit(seconds: float):
-    """
-    Enforce a wall-clock time limit using SIGALRM/ITIMER_REAL.
-    - Works on Unix-like systems, main thread only.
-    - Interrupts many blocking syscalls but not all C extensions.
-    """
-    if seconds <= 0:
-        raise ValueError("Seconds must be > 0")
-
-    if not hasattr(signal, "setitimer"):
-        raise NotImplementedError("time_limit requires Unix setitimer/SIGALRM support")
-
-    def _handler(signum, frame):
-        raise TimeoutError(f"Timed out after {seconds}s")
-
-    old_handler = signal.getsignal(signal.SIGALRM)
-    prev_timer: Tuple[float, float] = signal.getitimer(signal.ITIMER_REAL)
-
-    try:
-        signal.signal(signal.SIGALRM, _handler)
-        signal.setitimer(signal.ITIMER_REAL, seconds)  # start new timer
-        yield
-    finally:
-        # Cancel our timer first, restore handler, then reinstate any previous timer.
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        signal.signal(signal.SIGALRM, old_handler)
-        if prev_timer != (0.0, 0.0):
-            # Restore any prior timer that was running before we entered.
-            signal.setitimer(signal.ITIMER_REAL, *prev_timer)
+def _retry_eintr(func, *args):
+    while True:
+        try:
+            return func(*args)
+        except OSError as e:
+            if getattr(e, "errno", None) == errno.EINTR:
+                continue
+            raise
 pass
 
-def execute_with_time_limit(seconds: float) -> Callable[[Callable[..., T]], Callable[..., T]]:
+@contextmanager
+def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
     """
-    Decorator factory. Usage:
-        @execute_with_time_limit(10)
-        def my_func(...): ...
+    Enforce a wall-clock time limit using SIGALRM/ITIMER_REAL.
+
+    - Earliest deadline wins (respects any currently armed ITIMER_REAL).
+    - EINTR-safe setup/teardown; resists Ctrl+C during cleanup.
+    - strict=True: 'fail-closed' — if body returns after the deadline and the
+      SIGALRM handler didn't get to run, raise TimeoutError on exit anyway.
+    - Unix-like OS, main thread only. Process-wide SIGALRM: not composable with other users.
+    """
+    if seconds <= 0:
+        raise ValueError("seconds must be > 0")
+    if not hasattr(signal, "setitimer"):
+        raise NotImplementedError("time_limit requires Unix setitimer/SIGALRM support")
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("time_limit must be used from the main thread")
+
+    start = time.monotonic()
+    deadline_at = start + seconds
+
+    old_handler = signal.getsignal(signal.SIGALRM)
+    prev_remaining, prev_interval = signal.getitimer(signal.ITIMER_REAL)
+
+    # Always respect any already-armed timer: take the earlier deadline.
+    deadline = seconds if prev_remaining <= 0.0 else min(seconds, prev_remaining)
+
+    fired = False  # set by our handler
+
+    def _handler(signum, frame):
+        nonlocal fired
+        fired = True
+        # include the intended arming deadline for debugging
+        raise TimeoutError(f"Timed out after {deadline:g}s")
+
+    setattr(_handler, "__time_limit_handler__", True)
+
+    _retry_eintr(signal.signal, signal.SIGALRM, _handler)
+    try:
+        # Ensure blocking syscalls are interrupted (avoid SA_RESTART)
+        try:
+            signal.siginterrupt(signal.SIGALRM, True)
+        except (AttributeError, OSError):
+            pass
+
+        _retry_eintr(signal.setitimer, signal.ITIMER_REAL, deadline)
+        yield
+    finally:
+        # Make teardown atomic wrt SIGINT and robust to EINTR
+        old_sigint = signal.getsignal(signal.SIGINT)
+        try:
+            _retry_eintr(signal.signal, signal.SIGINT, signal.SIG_IGN)
+            try:
+                _retry_eintr(signal.setitimer, signal.ITIMER_REAL, 0.0)  # cancel ours
+            finally:
+                _retry_eintr(signal.signal, signal.SIGALRM, old_handler)
+
+            # Restore prior timer with corrected remaining time.
+            if prev_remaining != 0.0 or prev_interval != 0.0:
+                elapsed = max(time.monotonic() - start, 0.0)
+                remaining = max(prev_remaining - elapsed, 0.0)
+                _retry_eintr(signal.setitimer, signal.ITIMER_REAL, remaining, prev_interval)
+        finally:
+            _retry_eintr(signal.signal, signal.SIGINT, old_sigint)
+
+        # ---- Fail-closed check (only if no TimeoutError was raised inside) ----
+        if strict and not fired:
+            now = time.monotonic()
+            if now > deadline_at + leeway:
+                # We exceeded wall time but the handler didn't get a chance to run.
+                # This typically means the body spent a long time in non-cooperative C code.
+                raise TimeoutError(
+                    f"Exceeded time limit ({seconds:g}s) without interrupt; "
+                    f"elapsed ≈ {now - start:.3f}s. "
+                    "The protected code likely blocked in a C extension or another SIGALRM user clobbered the timer."
+                )
+pass
+
+import multiprocessing as mp
+import traceback
+
+class RemoteTracebackError(RuntimeError):
+    pass
+
+def _run_in_subprocess(func, seconds, args, kwargs, *, start_method="spawn", kill_grace=1.0):
+    ctx = mp.get_context(start_method)
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+
+    def _child(entry_conn, f, a, kw):
+        try:
+            res = f(*a, **(kw or {}))
+            entry_conn.send(("ok", res))
+        except BaseException as e:
+            entry_conn.send(("err", (e.__class__.__name__, str(e), traceback.format_exc())))
+        finally:
+            try:
+                entry_conn.close()
+            except Exception:
+                pass
+
+    proc = ctx.Process(target=_child, args=(child_conn, func, args, kwargs))
+    proc.daemon = False
+    proc.start()
+    child_conn.close()
+
+    try:
+        # Wait for result up to 'seconds'
+        if parent_conn.poll(seconds):
+            kind, payload = parent_conn.recv()
+            proc.join()
+            if kind == "ok":
+                return payload
+            else:
+                name, msg, tb = payload
+                raise RemoteTracebackError(f"{name}: {msg}\nRemote traceback:\n{tb}")
+        else:
+            # Timeout: terminate, then kill if stubborn
+            proc.terminate()
+            proc.join(kill_grace)
+            if proc.is_alive():
+                try:
+                    proc.kill()  # POSIX+Py3.7+, Windows uses TerminateProcess under the hood
+                finally:
+                    proc.join()
+            raise TimeoutError(f"Timed out after {seconds:g}s")
+    except KeyboardInterrupt:
+        # Ensure no orphan on Ctrl+C
+        try:
+            proc.terminate()
+            proc.join(kill_grace)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+        finally:
+            raise
+    finally:
+        try:
+            parent_conn.close()
+        except Exception:
+            pass
+pass
+
+def execute_with_time_limit(
+    seconds: float,
+    *,
+    backend: str = "signal",
+    start_method: str = "process",
+    kill_grace: float = 1.0,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator that enforces a time limit.
+
+    backend:
+      - "signal": uses SIGALRM (fast, in-process; only cooperative C code).
+      - "process": runs function in a child and kills it on timeout (robust).
     """
     if seconds <= 0:
         raise ValueError("seconds must be > 0")
@@ -341,8 +472,14 @@ def execute_with_time_limit(seconds: float) -> Callable[[Callable[..., T]], Call
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
-            with time_limit(seconds):
-                return func(*args, **kwargs)
+            if backend == "signal":
+                with time_limit(seconds):
+                    return func(*args, **kwargs)
+            elif backend == "process":
+                return _run_in_subprocess(func, seconds, args, kwargs,
+                                          start_method=start_method, kill_grace=kill_grace)
+            else:
+                raise ValueError("backend must be 'signal' or 'process'")
         return wrapper
     return decorator
 pass

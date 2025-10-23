@@ -14,9 +14,10 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.10.4"
+__version__ = "2025.10.10"
 
 import os
+import warnings
 # Hugging Face Hub faster downloads
 if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
@@ -70,15 +71,14 @@ if find_spec("unsloth") is None:
 pass
 del find_spec
 
-def get_device_type():
-    import torch
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        return "cuda"
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        return "xpu"
-    raise NotImplementedError("Unsloth currently only works on NVIDIA GPUs and Intel GPUs.")
-pass
-DEVICE_TYPE : str = get_device_type()
+from .device_type import (
+    is_hip,
+    get_device_type,
+    DEVICE_TYPE,
+    DEVICE_TYPE_TORCH,
+    DEVICE_COUNT,
+    ALLOW_PREQUANTIZED_MODELS,
+)
 
 if not ("UNSLOTH_IS_PRESENT" in os.environ):
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
@@ -102,3 +102,30 @@ from .rl_environments import (
     execute_with_time_limit,
     Benchmarker,
 )
+
+# Top some pydantic warnings
+try:
+    # pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True
+    # was provided to the `Field()` function, which has no effect in the context it was used.
+    # 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment.
+    # This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+    warnings.filterwarnings(action = "ignore", category = UnsupportedFieldAttributeWarning)
+except:
+    pass
+
+import logging
+# Ignore logging messages
+class HideLoggingMessage(logging.Filter):
+    __slots__ = "text",
+    def __init__(self, text): self.text = text
+    def filter(self, x): return not (self.text in x.getMessage())
+pass
+
+# Skipping import of cpp extensions due to incompatible torch version
+try:
+    from torchao import logger as torchao_logger
+    torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
+    del torchao_logger
+except:
+    pass

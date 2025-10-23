@@ -26,7 +26,7 @@ import inspect
 import functools
 import math
 from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
-from unsloth import DEVICE_TYPE
+from ..device_type import DEVICE_TYPE
 
 @functools.cache
 def _get_mapping(autograd):
@@ -113,7 +113,7 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
     """ Gets chunk size that fits the target max memory usage (1GB) """
     if target_gb is None:
         # Find current VRAM left in the GPU, and use 50% or less of it
-        free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu"  else torch.cuda.mem_get_info(0)
+        free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu" else torch.cuda.mem_get_info(0)
         free_gb = free / 1024 / 1024 / 1024
         free_gb = free_gb * 0.5
         target_gb = free_gb
@@ -198,6 +198,8 @@ class UnslothFusedLoss(torch.autograd.Function):
             n_chunks = extra_kwargs.pop("n_chunks")
         else:
             n_chunks = get_chunk_size(bsz, qlen, vocab_size, target_gb = target_gb)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
         __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
         __shift_states = torch.chunk(hidden_states.view(-1, hd), n_chunks, dim = 0)
         __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
