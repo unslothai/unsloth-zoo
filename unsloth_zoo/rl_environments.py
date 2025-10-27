@@ -560,13 +560,21 @@ def is_port_open(host, port):
 pass
 
 
-def launch_openenv(port = 8111, openenv_process = None, working_directory = None, environment = {}, openenv_class = None):
+def launch_openenv(
+    port : int = 8111,
+    openenv_process = None,
+    working_directory : str = None,
+    server : str = "envs.openspiel_env.server.app:app",
+    environment = {},
+    openenv_class = None,
+):
     """ Finds a new port or checks if the old open port actually works """
     # Check if OpenEnv is working first
     assert type(environment) is dict
     assert type(port) is int and port >= 0 and port <= (65535-1)
     assert type(working_directory) is str
     assert openenv_class is not None
+    assert type(server) is str
     localhost = f"http://localhost:{port}"
 
     def check_openenv_works(process):
@@ -590,7 +598,7 @@ def launch_openenv(port = 8111, openenv_process = None, working_directory = None
         localhost = f"http://localhost:{port}"
         print(f"Unsloth: Creating new OpenEnv process at port = {port}", end = "")
         openenv_process = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "envs.openspiel_env.server.app:app", "--host", "0.0.0.0", "--port", str(port)],
+            [sys.executable, "-m", "uvicorn", server, "--host", "0.0.0.0", "--port", str(port)],
             env = environment,
             stdout = subprocess.PIPE,
             stderr = subprocess.PIPE,
