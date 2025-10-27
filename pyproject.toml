@@ -87,7 +87,7 @@ base = [
 ]
 intelgpu = [
     "torch>=2.4.0",
-    "triton ; platform_system == 'Linux'",
+    "triton>=3.0.0 ; ('linux' in sys_platform)",
     "unsloth_zoo[huggingface]",
 ]
 
