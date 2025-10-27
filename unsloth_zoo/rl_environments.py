@@ -612,10 +612,11 @@ def launch_openenv(
         wait_trials = 0
         while not is_port_open("localhost", port):
             time.sleep(0.01)
-            print(".", end = "")
+            if wait_trials % 10 == 0:
+                print(".", end = "")
             wait_trials += 1
-            if wait_trials == 100:
-                raise TimeoutError("Unsloth: We tried launching a new OpenEnv Localhost for 10 seconds, but we still failed :(")
+            if wait_trials == 6000:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv Localhost for 60 seconds, but we still failed :(")
         print()
         openenv_process = openenv_class(base_url = localhost)
         openenv_process = check_openenv_works(openenv_process)
