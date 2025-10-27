@@ -585,6 +585,9 @@ def launch_openenv(
                     try: process.close()
                     except: pass
                     process = None
+                else:
+                    # It should work, so simply return the old one!
+                    return process
             except:
                 process = None
         return process
@@ -616,9 +619,10 @@ def launch_openenv(
         print()
         openenv_process = openenv_class(base_url = localhost)
         openenv_process = check_openenv_works(openenv_process)
-        if openenv_process is not None:
-            return port, openenv_process
+        if openenv_process is not None: break
         trials += 1
         if trials == 30:
             raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+    if openenv_process is not None:
+        return port, openenv_process
 pass
