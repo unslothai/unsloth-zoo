@@ -1124,18 +1124,15 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 kwargs['activation_scheme'] = quantization_config['activation_scheme']
                 kwargs['block_size'] = quantization_config['weight_block_size']
                 try:
-                    from transformers.integrations.finegrained_fp8 import FP8Linear
-                except ImportError:
+                    from transformers.integrations.finegrained_fp8 import FP8Linear # This has patched forward pass for LoRA and training support. Patched in unsloth/kernels/fp8.py
+                except:
                     raise ImportError("Unsloth: FP8 models need importing FP8Linear from `transformers.integrations.finegrained_fp8` but we don't see it.")
-
             elif quant_method == 'fbgemm_fp8':
                 kwargs['input_scale_ub'] = torch.tensor([quantization_config['activation_scale_ub']], device = get_target_device())
                 try:
-                    from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear
-                except ImportError:
+                    from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear # This has patched forward pass for LoRA and training support
+                except:
                     raise ImportError("Unsloth: FP8 models need importing FbgemmFP8Linear from `transformers.integrations.fbgemm_fp8` but we don't see it.")
-
-
         # Get bnb_config flags
         elif bnb_config is not None:
             kwargs["compress_statistics"] = bnb_config.bnb_4bit_use_double_quant
