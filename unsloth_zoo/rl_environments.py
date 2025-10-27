@@ -529,3 +529,86 @@ class Benchmarker:
             "timeouts" : timed_out,
         }
 pass
+
+####################
+##### Open Env #####
+####################
+import socket
+import requests
+import time
+import random
+import sys
+import subprocess
+
+def is_port_open(host, port):
+    """ Check if the port like localhost:8000 is open or closed """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(1)  # Set a timeout for the connection attempt
+        result = sock.connect_ex((host, port))
+        if result == 0:
+            return True  # Port is open
+        else:
+            return False # Port is closed or connection failed
+    except socket.error as e:
+        print(f"Socket error: {e}")
+        return False
+    finally:
+        sock.close()
+pass
+
+
+def launch_openenv(port = 8111, openenv_process = None, working_directory = None, environment = {}, openenv_class = None):
+    """ Finds a new port or checks if the old open port actually works """
+    # Check if OpenEnv is working first
+    assert type(environment) is dict
+    assert type(port) is int and port >= 0 and port <= (65535-1)
+    assert type(working_directory) is str
+    assert openenv_class is not None
+    localhost = f"http://localhost:{port}"
+
+    def check_openenv_works(process):
+        if process is not None:
+            try:
+                request = requests.get(f"{localhost}/health", timeout = 0.1).content
+                if b"healthy" not in request and hasattr(process, "close"):
+                    try: process.close()
+                    except: pass
+                    process = None
+            except:
+                process = None
+        return process
+    openenv_process = check_openenv_works(openenv_process)
+
+    # Otherwise, find the next port which can be used
+    trials = 0
+    while openenv_process is None:
+        # Port ID must be less than uint16_MAX
+        port = random.randint(9000, 65535-1)
+        localhost = f"http://localhost:{port}"
+        print(f"Unsloth: Creating new OpenEnv process at port = {port}", end = "")
+        openenv_process = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "envs.openspiel_env.server.app:app", "--host", "0.0.0.0", "--port", str(port)],
+            env = environment,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.PIPE,
+            text = True,
+            cwd = working_directory,
+        )
+        # Wait until port is open
+        wait_trials = 0
+        while not is_port_open("localhost", port):
+            time.sleep(0.01)
+            print(".", end = "")
+            wait_trials += 1
+            if wait_trials == 100:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv Localhost for 10 seconds, but we still failed :(")
+        print()
+        openenv_process = openenv_class(base_url = localhost)
+        openenv_process = check_openenv_works(openenv_process)
+        if openenv_process is not None:
+            return port, openenv_process
+        trials += 1
+        if trials == 30:
+            raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+pass
