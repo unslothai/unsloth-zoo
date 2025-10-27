@@ -15,8 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 __all__ = [
-	"UNSLOTH_ENABLE_LOGGING",
-	"logger",
+    "UNSLOTH_ENABLE_LOGGING",
+    "logger",
 ]
 
 import logging
@@ -28,4 +28,7 @@ logger = logging.getLogger(__name__)
 if UNSLOTH_ENABLE_LOGGING:
     logging.basicConfig(level = logging.INFO, format = '[%(name)s|%(levelname)s]%(message)s')
     logger.setLevel(logging.INFO)
+else:
+    logging.basicConfig(level = logging.WARNING, format = '[%(name)s|%(levelname)s]%(message)s')
+    logger.setLevel(logging.WARNING) 
 pass
