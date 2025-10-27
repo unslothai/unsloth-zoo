@@ -367,30 +367,10 @@ def create_empty_vision_model(config, dtype = torch.float16):
 
     return new_model, original_meta_model, num_layers
 
-def patch_hf_quantizer():
-    # To tell hf trainer that the quantized model is trainable
-    def make_trainable(self):
-        return True
-    try:
-        from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
-        FineGrainedFP8HfQuantizer.is_trainable = property(make_trainable)
-        FineGrainedFP8HfQuantizer.is_qat_trainable = property(make_trainable)
-    except Exception as e:
-        logger.warning(f"Failed to patch FineGrainedFP8HfQuantizer. Error {e}")
-
-    try:
-        from transformers.quantizers.quantizer_fbgemm_fp8 import FbgemmFp8HfQuantizer
-        FbgemmFp8HfQuantizer.is_trainable = property(make_trainable)
-        FbgemmFp8HfQuantizer.is_qat_trainable = property(make_trainable)
-    except Exception as e:
-        logger.warning(f"Failed to patch FbgemmFp8HfQuantizer. Error {e}")
 
 @torch.inference_mode()
 def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
-
-    if get_quant_type(config) in ('fp8', 'fbgemm_fp8'):
-        patch_hf_quantizer()
 
     if is_vision_model:
         new_model, original_meta_model, num_layers = create_empty_vision_model(config, dtype)
