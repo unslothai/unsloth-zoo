@@ -231,7 +231,7 @@ def copy_attributes(original_model, new_model):
 pass
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def create_empty_causal_lm(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     from transformers import AutoModelForCausalLM
@@ -293,7 +293,7 @@ def _set_config_attrs(config_obj, attrs_to_set):
 pass
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def create_empty_vision_model(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     model_type = config.model_type
@@ -385,7 +385,7 @@ def patch_hf_quantizer():
     except Exception as e:
         logger.warning(f"Failed to patch FbgemmFp8HfQuantizer. Error {e}")
 
-@torch.inference_mode()
+@torch.no_grad()
 def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
 
@@ -404,7 +404,7 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     return new_model, original_meta_model, num_layers, layer_names
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def set_additional_modules(new_model, quant_state_dict, config):
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
@@ -424,16 +424,24 @@ def set_additional_modules(new_model, quant_state_dict, config):
     #     padding_idx = pad_token_id,
     # )
     # we cannot use the normal embedding init because gemma3 uses Gemma3TextScaledWordEmbedding which wraps around nn.Embedding and has a scaling factor. This new init ensures that we respect the forward from original model.
-    num_embeddings, embedding_dim = quant_state_dict[embed_tokens_key].shape
-    embeddings = quant_state_dict[embed_tokens_key]
-    if isinstance(embeddings, torch.Tensor):
-        # in the newer vLLM versions, this seems to return a tensor which can't be assigned to embedding weight
-        # we need to convert that to nn.Paramter and then pass it on
-        embeddings = torch.nn.Parameter(embeddings, requires_grad = False)
-    language_model.embed_tokens.weight = embeddings
-    language_model.embed_tokens.padding_idx = pad_token_id
-    language_model.embed_tokens.num_embeddings = num_embeddings
-    language_model.embed_tokens.embedding_dim = embedding_dim
+    def set_embedding(module, embed_tokens_key, pad_token_id,detach=False, requires_grad=False):
+        num_embeddings, embedding_dim = quant_state_dict[embed_tokens_key].shape
+        embeddings = quant_state_dict[embed_tokens_key]
+        if detach: embeddings = embeddings.detach()
+        if isinstance(embeddings, torch.Tensor):
+            # in the newer vLLM versions, this seems to return a tensor which can't be assigned to embedding weight
+            # we need to convert that to nn.Paramter and then pass it on
+            embeddings = torch.nn.Parameter(embeddings, requires_grad = requires_grad)
+        module.weight = embeddings
+        module.padding_idx = pad_token_id
+        module.num_embeddings = num_embeddings
+        module.embedding_dim = embedding_dim
+
+    set_embedding(language_model.embed_tokens, embed_tokens_key, pad_token_id) # This sets the embedding that we generally find in language (sub)model
+
+    if 'model.visual.pos_embed.weight' in quant_state_dict:
+        # This is to handle visual embeddings in Qwen 3 VL
+        set_embedding(model.visual.pos_embed, 'model.visual.pos_embed.weight', None, detach=True)
 
     # Norm
     norm_key = f"{language_model_prefix}.norm.weight"
@@ -480,23 +488,37 @@ def set_additional_modules(new_model, quant_state_dict, config):
             elif hasattr(language_model, "tie_weights"):
                 language_model.tie_weights()
 
+    patch_embed_proj_weight_key = 'model.visual.patch_embed.proj.weight'
+    if patch_embed_proj_weight_key in quant_state_dict:
+        weight = quant_state_dict[patch_embed_proj_weight_key]
+        new_model.model.visual.patch_embed.proj.weight = torch.nn.Parameter(weight, requires_grad=False)
+
+    # Handle bias if it exists
+    patch_embed_proj_bias_key = 'model.visual.patch_embed.proj.bias'
+    if patch_embed_proj_bias_key in quant_state_dict:
+        bias = quant_state_dict[patch_embed_proj_bias_key]
+        new_model.model.visual.patch_embed.proj.bias = torch.nn.Parameter(bias, requires_grad=False)
+
     # Process additional keys
-    # For eg, `merger` in qwen2.5-vl or probably any other projection modules
+    # For any layers that are potentially in non layered components.
+    # Preferably norms, embeddings and convolution type layers.
     additional_keys = set(
         x for x in quant_state_dict.keys()
-        if not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head"))
+        if not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list", "visual.patch_embed"))
     )
+    print(f'Performing substitution for {additional_keys=}')
 
     for key in additional_keys:
-        replaced_key = re.sub(r"\.(\d+)\.", r"[\1].", key)
         # sometimes it can be in new_model.model. instead of new_model.
         for prefix in ['new_', 'new_model.']:
-            for suffix in ['', '.data']:
-                try:
-                    exec(f"{prefix}{replaced_key}{suffix} = quant_state_dict[key]")
-                    break
-                except:
-                    continue
+            try:
+                val = quant_state_dict[key]
+                if isinstance(val, torch.Tensor):
+                    val = torch.nn.Parameter(val,requires_grad=False)
+                exec(f"{prefix}{key} = val")
+                break
+            except:
+                continue
 
     pass
 pass
@@ -551,6 +573,9 @@ def get_model_layer_config(return_non_layered=True):
             # Mistral3 vision norms
             "model.vision_tower.transformer.layers.{kk}.attention_norm",
             "model.vision_tower.transformer.layers.{kk}.ffn_norm",
+
+            # qwen3 vl
+            "model.visual.deepstack_merger_list.{kk}.norm",
         },
         'vision_layers': {
 
@@ -621,6 +646,9 @@ def get_model_layer_config(return_non_layered=True):
 
         },
         'additional_layers': {
+            # Primarily for layers that are neither language decoder layers or vision transformer layers/blocks.
+            # Basically anything that is a merger, convertor or bridge in between. Preferably iterable layers
+
             "model.visual.merger.mlp.{kk}",
             "model.visual.merger.mlp.{kk}",
             'model.language_model.model.layers.{kk}.cross_attn_mlp_gate',
@@ -629,12 +657,13 @@ def get_model_layer_config(return_non_layered=True):
 
             # Mistral3
             "model.multi_modal_projector.patch_merger.merging_layer",
-            "model.multi_modal_projector.linear_1",
-            "model.multi_modal_projector.linear_2",
+            "model.multi_modal_projector.linear_{kk}",
+            # "model.multi_modal_projector.linear_2",
 
             # qwen 3 vl
             "model.visual.deepstack_merger_list.{kk}.linear_fc1",
             "model.visual.deepstack_merger_list.{kk}.linear_fc2",
+            "model.visual.merger.linear_fc{kk}",
 
         },
         "non_layered_components":{
@@ -667,14 +696,8 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.ln_pre",
 
             # qwen 3 vl
-            "model.visual.pos_embed",
-            "model.visual.merger.linear_fc1",
-            "model.visual.merger.linear_fc2",
-            "model.visual.merger.norm.bias",
+            # "model.visual.pos_embed",
             "model.visual.merger.norm",
-            "model.visual.deepstack_merger_list.0.norm",
-            "model.visual.deepstack_merger_list.1.norm",
-            "model.visual.deepstack_merger_list.2.norm",
         }
     }
 
