@@ -19,6 +19,8 @@ __all__ = [
     "create_locked_down_function",
     "execute_with_time_limit",
     "Benchmarker",
+    "is_port_open",
+    "launch_openenv",
 ]
 
 import ast
@@ -388,15 +390,98 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
                 )
 pass
 
-def execute_with_time_limit(seconds: float) -> Callable[[Callable[..., T]], Callable[..., T]]:
+import multiprocessing as mp
+import traceback
+
+class RemoteTracebackError(RuntimeError):
+    pass
+
+def _run_in_subprocess(func, seconds, args, kwargs, *, start_method="spawn", kill_grace=1.0):
+    ctx = mp.get_context(start_method)
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+
+    def _child(entry_conn, f, a, kw):
+        try:
+            res = f(*a, **(kw or {}))
+            entry_conn.send(("ok", res))
+        except BaseException as e:
+            entry_conn.send(("err", (e.__class__.__name__, str(e), traceback.format_exc())))
+        finally:
+            try:
+                entry_conn.close()
+            except Exception:
+                pass
+
+    proc = ctx.Process(target=_child, args=(child_conn, func, args, kwargs))
+    proc.daemon = False
+    proc.start()
+    child_conn.close()
+
+    try:
+        # Wait for result up to 'seconds'
+        if parent_conn.poll(seconds):
+            kind, payload = parent_conn.recv()
+            proc.join()
+            if kind == "ok":
+                return payload
+            else:
+                name, msg, tb = payload
+                raise RemoteTracebackError(f"{name}: {msg}\nRemote traceback:\n{tb}")
+        else:
+            # Timeout: terminate, then kill if stubborn
+            proc.terminate()
+            proc.join(kill_grace)
+            if proc.is_alive():
+                try:
+                    proc.kill()  # POSIX+Py3.7+, Windows uses TerminateProcess under the hood
+                finally:
+                    proc.join()
+            raise TimeoutError(f"Timed out after {seconds:g}s")
+    except KeyboardInterrupt:
+        # Ensure no orphan on Ctrl+C
+        try:
+            proc.terminate()
+            proc.join(kill_grace)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+        finally:
+            raise
+    finally:
+        try:
+            parent_conn.close()
+        except Exception:
+            pass
+pass
+
+def execute_with_time_limit(
+    seconds: float,
+    *,
+    backend: str = "signal",
+    start_method: str = "process",
+    kill_grace: float = 1.0,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator that enforces a time limit.
+
+    backend:
+      - "signal": uses SIGALRM (fast, in-process; only cooperative C code).
+      - "process": runs function in a child and kills it on timeout (robust).
+    """
     if seconds <= 0:
         raise ValueError("seconds must be > 0")
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
-            with time_limit(seconds):
-                return func(*args, **kwargs)
+            if backend == "signal":
+                with time_limit(seconds):
+                    return func(*args, **kwargs)
+            elif backend == "process":
+                return _run_in_subprocess(func, seconds, args, kwargs,
+                                          start_method=start_method, kill_grace=kill_grace)
+            else:
+                raise ValueError("backend must be 'signal' or 'process'")
         return wrapper
     return decorator
 pass
@@ -445,4 +530,100 @@ class Benchmarker:
             "exceptions" : exceptions,
             "timeouts" : timed_out,
         }
+pass
+
+####################
+##### Open Env #####
+####################
+import socket
+import requests
+import time
+import random
+import sys
+import subprocess
+
+def is_port_open(host, port):
+    """ Check if the port like localhost:8000 is open or closed """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(1)  # Set a timeout for the connection attempt
+        result = sock.connect_ex((host, port))
+        if result == 0:
+            return True  # Port is open
+        else:
+            return False # Port is closed or connection failed
+    except socket.error as e:
+        print(f"Socket error: {e}")
+        return False
+    finally:
+        sock.close()
+pass
+
+
+def launch_openenv(
+    port : int = 8111,
+    openenv_process = None,
+    working_directory : str = None,
+    server : str = "envs.openspiel_env.server.app:app",
+    environment = {},
+    openenv_class = None,
+):
+    """ Finds a new port or checks if the old open port actually works """
+    # Check if OpenEnv is working first
+    assert type(environment) is dict
+    assert type(port) is int and port >= 0 and port <= (65535-1)
+    assert type(working_directory) is str
+    assert openenv_class is not None
+    assert type(server) is str
+    localhost = f"http://localhost:{port}"
+
+    def check_openenv_works(process):
+        if process is not None:
+            try:
+                request = requests.get(f"{localhost}/health", timeout = 0.1).content
+                if b"healthy" not in request and hasattr(process, "close"):
+                    try: process.close()
+                    except: pass
+                    process = None
+                else:
+                    # It should work, so simply return the old one!
+                    return process
+            except:
+                process = None
+        return process
+    openenv_process = check_openenv_works(openenv_process)
+
+    # Otherwise, find the next port which can be used
+    trials = 0
+    while openenv_process is None:
+        # Port ID must be less than uint16_MAX
+        port = random.randint(9000, 65535-1)
+        localhost = f"http://localhost:{port}"
+        print(f"Unsloth: Creating new OpenEnv process at port = {port}", end = "")
+        openenv_process = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", server, "--host", "0.0.0.0", "--port", str(port)],
+            env = environment,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.PIPE,
+            text = True,
+            cwd = working_directory,
+        )
+        # Wait until port is open
+        wait_trials = 0
+        while not is_port_open("localhost", port):
+            time.sleep(0.01)
+            if wait_trials % 10 == 0:
+                print(".", end = "")
+            wait_trials += 1
+            if wait_trials == 6000:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv Localhost for 60 seconds, but we still failed :(")
+        print()
+        openenv_process = openenv_class(base_url = localhost)
+        openenv_process = check_openenv_works(openenv_process)
+        if openenv_process is not None: break
+        trials += 1
+        if trials == 30:
+            raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+    if openenv_process is not None:
+        return port, openenv_process
 pass

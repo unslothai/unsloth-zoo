@@ -1124,18 +1124,15 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 kwargs['activation_scheme'] = quantization_config['activation_scheme']
                 kwargs['block_size'] = quantization_config['weight_block_size']
                 try:
-                    from transformers.integrations.finegrained_fp8 import FP8Linear
-                except ImportError:
+                    from transformers.integrations.finegrained_fp8 import FP8Linear # This has patched forward pass for LoRA and training support. Patched in unsloth/kernels/fp8.py
+                except:
                     raise ImportError("Unsloth: FP8 models need importing FP8Linear from `transformers.integrations.finegrained_fp8` but we don't see it.")
-
             elif quant_method == 'fbgemm_fp8':
                 kwargs['input_scale_ub'] = torch.tensor([quantization_config['activation_scale_ub']], device = get_target_device())
                 try:
-                    from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear
-                except ImportError:
+                    from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear # This has patched forward pass for LoRA and training support
+                except:
                     raise ImportError("Unsloth: FP8 models need importing FbgemmFP8Linear from `transformers.integrations.fbgemm_fp8` but we don't see it.")
-
-
         # Get bnb_config flags
         elif bnb_config is not None:
             kwargs["compress_statistics"] = bnb_config.bnb_4bit_use_double_quant
@@ -1463,10 +1460,17 @@ def load_vllm(
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
-    if unsloth_vllm_standby and gpu_memory_utilization < 0.8:
-        ## [TODO] Used to allow 0.9, but now 0.8 works only
-        gpu_memory_utilization = 0.8
-        logger.info("Unsloth: Standby mode is enabled. Increasing `gpu_memory_utilization` to 0.8.")
+    if unsloth_vllm_standby and gpu_memory_utilization <= 0.9:
+        free_memory, total_memory = get_mem_info()
+        # If T4 ie 15GB, we use 0.85 since it'll rarely OOM. Other GPUs 0.9
+        total_gb = total_memory/1024/1024/1024
+        ten_percent = total_gb * 0.1 # 1.46GB for T4
+        if   ten_percent >= 4.0: gpu_memory_utilization = 0.925
+        elif ten_percent >= 2.0: gpu_memory_utilization = 0.9
+        elif ten_percent >= 1.4: gpu_memory_utilization = 0.85
+        elif ten_percent >= 1.0: gpu_memory_utilization = 0.8
+        else: gpu_memory_utilization = 0.75
+        logger.info(f"Unsloth: Standby mode is enabled. Changing `gpu_memory_utilization` to {gpu_memory_utilization}.")
 
     if DEVICE_TYPE == "cuda":
         major_version, minor_version = torch.cuda.get_device_capability()
