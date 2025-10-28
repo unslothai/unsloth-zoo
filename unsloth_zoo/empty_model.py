@@ -424,10 +424,9 @@ def set_additional_modules(new_model, quant_state_dict, config):
     #     padding_idx = pad_token_id,
     # )
     # we cannot use the normal embedding init because gemma3 uses Gemma3TextScaledWordEmbedding which wraps around nn.Embedding and has a scaling factor. This new init ensures that we respect the forward from original model.
-    def set_embedding(module, embed_tokens_key, pad_token_id,detach=False, requires_grad=False):
+    def set_embedding(module, embed_tokens_key, pad_token_id, requires_grad=False):
         num_embeddings, embedding_dim = quant_state_dict[embed_tokens_key].shape
         embeddings = quant_state_dict[embed_tokens_key]
-        if detach: embeddings = embeddings.detach()
         if isinstance(embeddings, torch.Tensor):
             # in the newer vLLM versions, this seems to return a tensor which can't be assigned to embedding weight
             # we need to convert that to nn.Paramter and then pass it on
@@ -441,7 +440,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
 
     if 'model.visual.pos_embed.weight' in quant_state_dict:
         # This is to handle visual embeddings in Qwen 3 VL
-        set_embedding(model.visual.pos_embed, 'model.visual.pos_embed.weight', None, detach=True)
+        set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
     # Norm
     norm_key = f"{language_model_prefix}.norm.weight"
@@ -727,6 +726,12 @@ def get_model_layer_counts(config):
         return {
             "text_layers": getattr(config, "num_hidden_layers", 32),
             "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+        }
+    elif model_type == "qwen3_vl":
+        return {
+            "text_layers": getattr(config, "num_hidden_layers", 36),
+            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 24),
+            "deepstack_layers": getattr(config.vision_config, "deepstack_depth", 3),
         }
     elif model_type == "gemma3":
         return {
