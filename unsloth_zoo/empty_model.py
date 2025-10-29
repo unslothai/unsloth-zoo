@@ -231,7 +231,7 @@ def copy_attributes(original_model, new_model):
 pass
 
 
-@torch.no_grad()
+@torch.inference_mode
 def create_empty_causal_lm(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     from transformers import AutoModelForCausalLM
@@ -293,7 +293,7 @@ def _set_config_attrs(config_obj, attrs_to_set):
 pass
 
 
-@torch.no_grad()
+@torch.inference_mode
 def create_empty_vision_model(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     model_type = config.model_type
@@ -360,6 +360,8 @@ def create_empty_vision_model(config, dtype = torch.float16):
     # Set minimal sizes for different model types
     if model_type == "qwen2_5_vl":
         new_config.vision_config.out_hidden_size = 1
+    elif model_type == "qwen3_vl":
+        new_config.vision_config.out_hidden_size = 1
 
 
     num_layers = max(text_layers, vision_layers)
@@ -385,7 +387,7 @@ def patch_hf_quantizer():
     except Exception as e:
         logger.warning(f"Failed to patch FbgemmFp8HfQuantizer. Error {e}")
 
-@torch.no_grad()
+@torch.inference_mode
 def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
 
@@ -404,7 +406,7 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     return new_model, original_meta_model, num_layers, layer_names
 
 
-@torch.no_grad()
+@torch.inference_mode
 def set_additional_modules(new_model, quant_state_dict, config):
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
