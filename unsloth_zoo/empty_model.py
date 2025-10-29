@@ -296,7 +296,7 @@ pass
 @torch.inference_mode
 def create_empty_vision_model(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
-    model_type = config.model_type
+    model_type = get_model_type(config)
 
     from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 
@@ -489,23 +489,12 @@ def set_additional_modules(new_model, quant_state_dict, config):
             elif hasattr(language_model, "tie_weights"):
                 language_model.tie_weights()
 
-    patch_embed_proj_weight_key = 'model.visual.patch_embed.proj.weight'
-    if patch_embed_proj_weight_key in quant_state_dict:
-        weight = quant_state_dict[patch_embed_proj_weight_key]
-        new_model.model.visual.patch_embed.proj.weight = torch.nn.Parameter(weight, requires_grad=False)
-
-    # Handle bias if it exists
-    patch_embed_proj_bias_key = 'model.visual.patch_embed.proj.bias'
-    if patch_embed_proj_bias_key in quant_state_dict:
-        bias = quant_state_dict[patch_embed_proj_bias_key]
-        new_model.model.visual.patch_embed.proj.bias = torch.nn.Parameter(bias, requires_grad=False)
-
     # Process additional keys
     # For any layers that are potentially in non layered components.
     # Preferably norms, embeddings and convolution type layers.
     additional_keys = set(
         x for x in quant_state_dict.keys()
-        if not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list", "visual.patch_embed"))
+        if not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list"))
     )
     print(f'Performing substitution for {additional_keys=}')
 
@@ -697,7 +686,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.ln_pre",
 
             # qwen 3 vl
-            # "model.visual.pos_embed",
+            "model.visual.pos_embed",
             "model.visual.merger.norm",
         }
     }
@@ -705,6 +694,13 @@ def get_model_layer_config(return_non_layered=True):
     # Convert sets to sorted lists for deterministic order
     return {key: sorted(list(value)) for key, value in layer_templates.items() if key!='non_layered_components' or return_non_layered}
 
+def get_model_type(config):
+    model_type = getattr(config, "model_type", "causal_lm")
+    if hasattr(config, "vision_config"):
+        # vllm curretly seems to be having qwen 2.5 vl model type as qwen2_5_vl_text for some reason
+        # aka vllm_config.model_type is qwen2_5_vl_text but config.vision_config.model_type is qwen2_5_vl
+        model_type = getattr(config.vision_config, "model_type", model_type)
+    return model_type
 
 def get_model_layer_counts(config):
     """
@@ -716,7 +712,7 @@ def get_model_layer_counts(config):
     Returns:
         int or dict: Number of layers (int for causal_lm, dict for VL models)
     """
-    model_type = getattr(config, "model_type", "causal_lm")
+    model_type = get_model_type(config)
 
     if model_type == "mllama":
         return {
@@ -727,12 +723,12 @@ def get_model_layer_counts(config):
     elif model_type == "qwen2_5_vl":
         return {
             "text_layers": getattr(config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(config.vision_config, "depth", 32),
         }
     elif model_type == "qwen3_vl":
         return {
             "text_layers": getattr(config, "num_hidden_layers", 36),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 24),
+            "vision_layers": getattr(config.vision_config, "depth", 27),
             "deepstack_layers": getattr(config.vision_config, "deepstack_depth", 3),
         }
     elif model_type == "gemma3":
@@ -768,7 +764,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
     a model-specific configuration. This approach is more robust and avoids
     failures by correctly identifying layer paths and parameters.
     """
-    model_type = vllm_internals.config.model_type
+    model_type = get_model_type(vllm_internals.config)
     layer_config = get_model_layer_config()
 
     all_layered_templates = (
@@ -850,4 +846,14 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
     if component is not None:
         weight = component._linear.weight
         state_dict[f'{path}.weight'] = weight.reshape(weight.shape[0], 3, 14, 14)
+        quant_state_dict[f'{path}.weight'] = state_dict[f'{path}.weight']
+
+    # for qwen3 vl, only needed in specific vllm which had this PR which uses Linear instead of Conv3d
+    # https://github.com/vllm-project/vllm/pull/27418
+    path = "model.visual.patch_embed.proj"
+    vision_config = vllm_internals.config.vision_config
+    component = _get_nested_attr(vllm_internals, path)
+    if component is not None:
+        weight = component.weight
+        state_dict[f'{path}.weight'] = weight.reshape(vision_config.hidden_size, vision_config.in_channels, vision_config.temporal_patch_size, vision_config.patch_size, vision_config.patch_size)
         quant_state_dict[f'{path}.weight'] = state_dict[f'{path}.weight']

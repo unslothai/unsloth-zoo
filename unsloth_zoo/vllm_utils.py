@@ -499,7 +499,11 @@ pass
 
 def patch_vllm_enable_sleep_mode():
     from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map, AllocationData
-    from vllm.utils import is_pin_memory_available
+    try:
+        from vllm.utils import is_pin_memory_available
+    except:
+        # in some newer versions, this is not available in vllm.utils
+        from vllm.utils.platform_utils import is_pin_memory_available
     from typing import Optional, Union, Tuple, Any
 
     logger.info(f"Unsloth: Enabling vLLM standby mode")
