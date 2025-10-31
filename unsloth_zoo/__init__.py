@@ -24,23 +24,6 @@ if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 pass
 
-import logging
-# Ignore logging messages
-class HideLoggingMessage(logging.Filter):
-    __slots__ = "text",
-    def __init__(self, text): self.text = text
-    def filter(self, x): return not (self.text in x.getMessage())
-pass
-
-# Skipping import of cpp extensions due to incompatible torch version
-try:
-    from torchao import logger as torchao_logger
-    torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
-    del torchao_logger
-except:
-    pass
-del HideLoggingMessage, logging
-
 # More stable downloads
 if os.environ.get("UNSLOTH_STABLE_DOWNLOADS", "0") == "1":
     os.environ["HF_HUB_ETAG_TIMEOUT"] = "30" # Default is 10 seconds
