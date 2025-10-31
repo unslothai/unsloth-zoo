@@ -123,6 +123,19 @@ elif (major_torch == 2) and (minor_torch < 2):
     delete_key("PYTORCH_ALLOC_CONF")
 pass
 
+# Suppress WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.7.0+cu126 for torchao version 0.14.1
+# Please see https://github.com/pytorch/ao/issues/2919 for more info
+import logging
+torchao_logger = logging.getLogger("torchao")
+# Ignore logging messages
+class HideLoggingMessage(logging.Filter):
+    __slots__ = "text",
+    def __init__(self, text): self.text = text
+    def filter(self, x): return not (self.text in x.getMessage())
+pass
+torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
+del logging, torchao_logger, HideLoggingMessage
+
 from .device_type import (
     is_hip,
     get_device_type,
@@ -185,19 +198,6 @@ from .rl_environments import (
     is_port_open,
     launch_openenv,
 )
-
-# Suppress WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.7.0+cu126 for torchao version 0.14.1
-# Please see https://github.com/pytorch/ao/issues/2919 for more info
-import logging
-torchao_logger = logging.getLogger("torchao")
-# Ignore logging messages
-class HideLoggingMessage(logging.Filter):
-    __slots__ = "text",
-    def __init__(self, text): self.text = text
-    def filter(self, x): return not (self.text in x.getMessage())
-pass
-torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
-del logging, torchao_logger, HideLoggingMessage
 
 # Top some pydantic warnings
 try:
