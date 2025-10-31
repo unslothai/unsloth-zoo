@@ -82,37 +82,32 @@ from .device_type import (
     ALLOW_PREQUANTIZED_MODELS,
 )
 
-# Optimize VRAM usage by reducing fragmentation and improving memory pinning.
-# TODO(billishyahao): Add HIP-specific optimizations if needed.
-def _set_memory_optimizations():
-    standby = os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1"
-    cuda_enabled = DEVICE_TYPE == "cuda"
-    hip_enabled = DEVICE_TYPE == "hip"
-
-    if (cuda_enabled or hip_enabled) and not standby:
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
-            "expandable_segments:True,"
-            "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
-        )
-        os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
-    elif (cuda_enabled or hip_enabled) and standby:
-        # Remove expandable_segments if UNSLOTH_VLLM_STANDBY is enabled
-        def _remove_expandable_segments(key):
-            conf = os.environ.get(key, "")
-            if "expandable_segments:True" in conf:
-                os.environ[key] = re.sub(
-                    r"expandable_segments:True,?", "", conf
-                )
-        warnings.warn(
-            "Unsloth: `UNSLOTH_VLLM_STANDBY` is on, but requires `expandable_segments` to be off.\n"\
-            "We will remove `expandable_segments`.",
-            stacklevel = 2,
-        )
-        _remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
-        _remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
-_set_memory_optimizations()
-del _set_memory_optimizations
-
+# Reduce VRAM usage by reducing fragmentation
+# And optimize pinning of memory
+# TODO(billishyahao): need to add hip related optimization...
+if (DEVICE_TYPE in ("cuda", "hip")) and (os.environ.get("UNSLOTH_VLLM_STANDBY", "0")=="0"):
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = \
+        "expandable_segments:True,"\
+        "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
+    os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
+elif (DEVICE_TYPE in ("cuda", "hip")) and (os.environ.get("UNSLOTH_VLLM_STANDBY", "0")=="1") and \
+    ("expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")):
+    warnings.warn(
+        "Unsloth: `UNSLOTH_VLLM_STANDBY` is on, but requires `expandable_segments` to be off.\n"\
+        "We will remove `expandable_segments`.",
+        stacklevel = 2,
+    )
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = re.sub(
+        r"expandable\_segments\:True\,?",
+        "",
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"],
+    )
+    os.environ["PYTORCH_HIP_ALLOC_CONF"] = re.sub(
+        r"expandable\_segments\:True\,?",
+        "",
+        os.environ["PYTORCH_HIP_ALLOC_CONF"],
+    )
+pass
 # We support Pytorch 2
 # Fixes https://github.com/unslothai/unsloth/issues/38
 torch_version = str(re.match(r"[0-9\.]{3,}", str(torch.__version__)).group(0)).split(".")
