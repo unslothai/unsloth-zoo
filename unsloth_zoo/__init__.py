@@ -173,6 +173,24 @@ pass
 os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 del os
 
+import logging
+# Ignore logging messages
+class HideLoggingMessage(logging.Filter):
+    __slots__ = "text",
+    def __init__(self, text): self.text = text
+    def filter(self, x): return not (self.text in x.getMessage())
+pass
+
+# Skipping import of cpp extensions due to incompatible torch version
+try:
+    from torchao import logger as torchao_logger
+    torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
+    del torchao_logger
+except:
+    pass
+del HideLoggingMessage, logging
+
+
 from .temporary_patches import (
     encode_conversations_with_harmony,
 )
@@ -193,22 +211,6 @@ try:
     # This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
     from pydantic.warnings import UnsupportedFieldAttributeWarning
     warnings.filterwarnings(action = "ignore", category = UnsupportedFieldAttributeWarning)
+    del warnings, UnsupportedFieldAttributeWarning
 except:
     pass
-
-import logging
-# Ignore logging messages
-class HideLoggingMessage(logging.Filter):
-    __slots__ = "text",
-    def __init__(self, text): self.text = text
-    def filter(self, x): return not (self.text in x.getMessage())
-pass
-
-# Skipping import of cpp extensions due to incompatible torch version
-try:
-    from torchao import logger as torchao_logger
-    torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
-    del torchao_logger
-except:
-    pass
-del HideLoggingMessage
