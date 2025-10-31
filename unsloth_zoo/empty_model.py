@@ -358,7 +358,7 @@ def create_empty_vision_model(config, dtype = torch.float16):
     vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
 
     # Set minimal sizes for different model types
-    if model_type == "qwen2_5_vl":
+    if "qwen2_5_vl" in model_type:
         new_config.vision_config.out_hidden_size = 1
 
 
@@ -661,7 +661,7 @@ def get_model_layer_counts(config):
             "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
             "global_layers": getattr(config.vision_config, "num_global_layers", 8),
         }
-    elif model_type == "qwen2_5_vl":
+    elif "qwen2_5_vl" in model_type:
         return {
             "text_layers": getattr(config, "num_hidden_layers", 32),
             "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
@@ -724,7 +724,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
             if layer_module is not None:
                 if "qkv" in layer_path:
-                    if model_type == "qwen2_5_vl":
+                    if "qwen2_5_vl" in model_type:
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
                     else:
                          get_state_dict(f"{layer_path.replace('qkv_proj', 'q_proj')}", 0, state_dict, layer_module)
