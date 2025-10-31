@@ -186,6 +186,13 @@ from .rl_environments import (
     launch_openenv,
 )
 
+# Suppress WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.7.0+cu126 for torchao version 0.14.1
+# Please see https://github.com/pytorch/ao/issues/2919 for more info
+import logging
+torchao_logger = logging.getLogger("torchao")
+torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
+del logging, torchao_logger
+
 # Top some pydantic warnings
 try:
     # pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True
