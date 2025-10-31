@@ -190,8 +190,14 @@ from .rl_environments import (
 # Please see https://github.com/pytorch/ao/issues/2919 for more info
 import logging
 torchao_logger = logging.getLogger("torchao")
+# Ignore logging messages
+class HideLoggingMessage(logging.Filter):
+    __slots__ = "text",
+    def __init__(self, text): self.text = text
+    def filter(self, x): return not (self.text in x.getMessage())
+pass
 torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
-del logging, torchao_logger
+del logging, torchao_logger, HideLoggingMessage
 
 # Top some pydantic warnings
 try:
