@@ -136,6 +136,7 @@ pass
 torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
 del logging, torchao_logger, HideLoggingMessage
 
+# Get device types and other variables
 from .device_type import (
     is_hip,
     get_device_type,
