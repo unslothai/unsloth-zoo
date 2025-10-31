@@ -499,7 +499,12 @@ pass
 
 def patch_vllm_enable_sleep_mode():
     from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map, AllocationData
-    from vllm.utils import is_pin_memory_available
+    try:
+        from vllm.utils import is_pin_memory_available
+    except:
+        from vllm.utils.platform_utils import is_pin_memory_available
+    pass
+
     from typing import Optional, Union, Tuple, Any
 
     logger.info(f"Unsloth: Enabling vLLM standby mode")
@@ -883,7 +888,13 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
                     scale_suffix = '.weight_scale_inv'
                     block_size = proj.weight_block_size[0]
-                    weight_scale = weight_scale.T
+                    a, b = qweight.shape
+                    p, q = weight_scale.shape
+                    if ((a > b and q > p) or (a < b and q < p)) and (a // q == block_size and b // p == block_size):
+                        # For H100 (at least), the scale seems to be a transpose of what HF expects, while on L4 it is right shape.
+                        # So be smart in transposing only if necessary.
+                        # When the shapes misalign, we detect by comparing them with block size.
+                        weight_scale = weight_scale.T
                 else:
                     # This is dynamic quantization (aka per row or per column). The scale is of shape [n,1]
                     # The weight here is of shape [4096, 6144]. We need to transpose and then slice
