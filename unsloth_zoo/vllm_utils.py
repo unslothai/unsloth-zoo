@@ -1730,7 +1730,7 @@ def load_vllm(
                     print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM.config.CompilationConfig. Skipping.")
                 pass
             pass
-            compilation_config = CompilationConfig(compile_flags)
+            compilation_config = CompilationConfig(**compile_flags)
         except Exception as e:
             print(f"Unsloth: FAILED getting compilation_config with error = {str(e)}")
     pass
