@@ -250,15 +250,15 @@ def grpo_compute_loss(
             old_x = torch.gather(old_logits, dim = -1, index = input_ids).squeeze(-1)
             old = old_x - torch.logsumexp(old_logits, dim = -1)
         pass
+        if use_vllm and sampling_per_token_logps is not None:
+            #must filter out extra prompt tokens in begining after making input_ids left padded
+            importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
+            importance_sampling_ratio = torch.clamp(
+                importance_sampling_ratio, max=vllm_importance_sampling_cap
+            )
+        pass
     pass
-
-    if use_vllm and sampling_per_token_logps is not None:
-        #must filter out extra prompt tokens in begining after making input_ids left padded
-        importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
-        importance_sampling_ratio = torch.clamp(
-            importance_sampling_ratio, max=vllm_importance_sampling_cap
-        )
-
+    
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
     if beta != 0.0:
