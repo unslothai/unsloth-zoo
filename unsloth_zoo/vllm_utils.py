@@ -1767,6 +1767,7 @@ def load_vllm(
             else:
                 # Disable for A100, L40 etc
                 disable_cascade_attn = True
+                print("Unsloth: Disabling `disable_cascade_attn` in vLLM to allow for better on policy RL!")
             engine_args["disable_cascade_attn"] = disable_cascade_attn
     pass
 
