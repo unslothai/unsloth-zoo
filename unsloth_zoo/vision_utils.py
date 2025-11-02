@@ -68,7 +68,8 @@ from functools import lru_cache
 import requests
 import torchvision
 from packaging import version
-from typing import Union, Tuple, List, Dict
+from typing import Union, Tuple, List, Dict, Sequence
+from itertools import takewhile
 try:
     from torchvision import io, transforms
     from torchvision.transforms import InterpolationMode
@@ -264,7 +265,12 @@ def _read_video_torchvision(
         pts_unit="sec",
         output_format="TCHW",
     )
-    total_frames, video_fps = video.size(0), info["video_fps"]
+    try:
+        video_fps = info["video_fps"]
+    except Exception as e:
+        print('error getting video_fps there is probably a path issue', e)
+        video_fps = 2.0
+    total_frames, video_fps = video.size(0), video_fps
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: torchvision:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
@@ -404,6 +410,9 @@ def _read_video_torchcodec(
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: set TORCHCODEC_NUM_THREADS: {TORCHCODEC_NUM_THREADS}")
     video_path = ele["video"]
+    # Support file URI scheme
+    if isinstance(video_path, str) and video_path.startswith("file://"):
+        video_path = video_path[7:]
     st = time.time()
     decoder = VideoDecoder(video_path, num_ffmpeg_threads=TORCHCODEC_NUM_THREADS)
     video_fps = decoder.metadata.average_fps
@@ -417,6 +426,11 @@ def _read_video_torchcodec(
     idx = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
     sample_fps = nframes / max(total_frames, 1e-6) * video_fps
     video = decoder.get_frames_at(indices=idx).data
+    # Ensure channel-first layout (T, C, H, W). torchcodec returns NHWC.
+    if hasattr(video, "ndim") and video.ndim == 4:
+        # If second dim looks like height and last dim like channels, permute to TCHW
+        if video.shape[-1] in (1, 3, 4) and video.shape[1] not in (1, 3, 4):
+            video = video.permute(0, 3, 1, 2).contiguous()
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: torchcodec:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
     return video, sample_fps
@@ -435,10 +449,10 @@ FORCE_UNSLOTH_VIDEO_READER = os.getenv("FORCE_UNSLOTH_VIDEO_READER", None)
 def get_video_reader_backend() -> str:
     if FORCE_UNSLOTH_VIDEO_READER is not None:
         video_reader_backend = FORCE_UNSLOTH_VIDEO_READER
-    elif is_torchcodec_available():
-        video_reader_backend = "torchcodec"
     elif is_decord_available():
         video_reader_backend = "decord"
+    elif is_torchcodec_available():
+        video_reader_backend = "torchcodec"
     elif HAS_TORCHVISION:
         video_reader_backend = "torchvision"
     else:
@@ -489,7 +503,7 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
             [resized_height, resized_width],
             interpolation=InterpolationMode.BICUBIC,
             antialias=True,
-        ).float()
+        )
         if return_video_sample_fps:
             return video, sample_fps
         return video
@@ -501,7 +515,7 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
         images = [
             fetch_image({"image": video_element, **process_info}, size_factor=image_factor)
             for video_element in ele["video"]
-        ]
+   ]
         nframes = ceil_by_factor(len(images), FRAME_FACTOR)
         if len(images) < nframes:
             images.extend([images[-1]] * (nframes - len(images)))
@@ -519,7 +533,7 @@ def collapse_fps(fps, tol=1e-4):
     if not vals:
         return None
     f0 = vals[0]
-    return float(f0) if all(isclose(v, f0, rel_tol=tol, abs_tol=tol) for v in vals[1:]) else vals
+    return float(f0) if all(math.isclose(v, f0, rel_tol=tol, abs_tol=tol) for v in vals[1:]) else vals
 
 
 def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> List[Dict]:
@@ -636,7 +650,7 @@ class UnslothVisionDataCollator:
         response_part    = None,
         force_match      = True, # Match newlines as well!
         num_proc         = None,
-        completion_only_loss = False,
+        completion_only_loss = True,
         pad_to_multiple_of = None,
         resize_dimension = 0, # can be 0, 1, 'max' or 'min' (max resizes based on the max of height width, min the min size, 0 the first dim, etc)
         snap_to_patch_size = False,
@@ -797,7 +811,8 @@ class UnslothVisionDataCollator:
             # Dataset with 2 columns messages / images
             image, video, video_kwarg = self._extract_images_videos_for_example(example, messages)
             image = self._resize_images_inplace(image)
-            images.append(image)
+            if len(image) > 0:
+                images.append(image)
 
             if len(video) > 0:  # Works for list, tuple or tensor
                 videos.append(video)
@@ -809,14 +824,15 @@ class UnslothVisionDataCollator:
         # Tokenize the texts and process the images
         proc_kwargs = dict(
             text=texts,
-            images=images,
             padding=True,
             truncation=self.truncation,
             max_length=self.max_seq_length,
             return_tensors="pt",
             add_special_tokens=False,
         )
-        if len(videos) > 0:
+        if images and len(images) > 0:
+            proc_kwargs["images"] = images
+        if videos and len(videos) > 0:
             proc_kwargs["videos"] = videos
             video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
             for k, v in video_kwargs.items():
@@ -827,7 +843,10 @@ class UnslothVisionDataCollator:
 
         # Cannot remove due to bidirectional attention from Gemma 3!
         # batch.pop("token_type_ids", None)
-        batch = self._cast_pixel_values_dtype_inplace(batch)
+        if 'pixel_values' in batch:
+            batch = self._cast_pixel_values_dtype_inplace(batch)
+        if 'pixel_values_videos' in batch:
+            batch = self._cast_pixel_values_dtype_inplace(batch, 'pixel_values_videos')
 
         # Mask image tokens and pad tokens
         labels = batch["input_ids"].clone()
@@ -878,9 +897,9 @@ class UnslothVisionDataCollator:
                     message["content"] = content[0]["text"]
         return messages
 
-    def _render_chat(self, messages):
+    def _render_chat(self, prompt_messages, completion_messages=None, add_generation_prompt=False, continue_final_message=False):
         return self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
+            prompt_messages + (completion_messages or []), tokenize=False, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message
         )
 
     def _extract_images_videos_for_example(self, example, messages):
@@ -902,6 +921,8 @@ class UnslothVisionDataCollator:
     def _extract_images_for_pc(self, example, p_msgs, c_msgs):
         # PC: prefer embedded across prompt+completion; else top-level first image; else []
         imgs = None
+        vids = None
+        vids_kwarg = None
         try:
             msg_list = (p_msgs or []) + (c_msgs or [])
             if msg_list:
@@ -912,6 +933,16 @@ class UnslothVisionDataCollator:
                 )
                 if imgs is None: imgs = []
                 if vids is None: vids = []
+            else:
+                if "images" in example:
+                    vision_infos = [{'image': example['images'][i]} for i in range(len(example['images']))]
+                    imgs, vids, vids_kwarg = process_vision_info(
+                        vision_infos,
+                        size_factor=self.patch_size*2,
+                        return_video_kwargs=True,
+                    )
+                    if imgs is None: imgs = []
+                    if vids is None: vids = []
         except Exception:
             imgs = []
             vids = []
@@ -925,7 +956,7 @@ class UnslothVisionDataCollator:
                 math.ceil(x/factor) if x >= image_size - 1e-6 else math.floor(x/factor+0.5)
             )))
 
-        if image is None or self.image_size is None:
+        if image is None or self.image_size is None or (isinstance(self.image_size, (tuple, list)) and len(self.image_size) == 0):
             return image or []
         # Resize images
         image_size = self.image_size
@@ -947,9 +978,9 @@ class UnslothVisionDataCollator:
 
         return image
 
-    def _cast_pixel_values_dtype_inplace(self, batch):
+    def _cast_pixel_values_dtype_inplace(self, batch, key='pixel_values'):
         # Pixtral accepts multiple images, so we have to cast it individually
-        pixel_values = batch["pixel_values"]
+        pixel_values = batch[key]
         if type(pixel_values) is list:
             for j, pixel_value_j in enumerate(pixel_values):
                 if type(pixel_value_j) is list:
@@ -958,9 +989,9 @@ class UnslothVisionDataCollator:
                 else:
                     pixel_values[j] = pixel_value_j.to(self.dtype)
             pass
-            batch["pixel_values"] = pixel_values
+            batch[key] = pixel_values
         else:
-            batch["pixel_values"] = batch["pixel_values"].to(self.dtype)
+            batch[key] = batch[key].to(self.dtype)
         pass
         return batch
 
@@ -976,67 +1007,110 @@ class UnslothVisionDataCollator:
             raise ValueError("Tokenizer must define `pad_token_id` for prompt–completion collation.")
         return pad_id
 
-    def _flush_to_side(self, attention_mask, input_ids, side, pad_token_id, extra_masks: tuple | list | None = None):
-        """Compact non-pad tokens toward `side`. Returns (attn, ids, extras...)."""
+    @torch.no_grad()
+    def _flush_to_side(
+        self,
+        attention_mask: torch.Tensor,
+        input_ids:     torch.Tensor,
+        side:          str,
+        pad_token_id:  int,
+        extra_tensors: Sequence[torch.Tensor] | None = None,
+        extra_pad_values: Sequence[int | float | bool] | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
         B, L = input_ids.shape
-        new_ids = torch.full_like(input_ids, pad_token_id)
-        new_attn = torch.zeros_like(attention_mask)
-        new_extras = None
-        if extra_masks is not None:
-            new_extras = [torch.zeros_like(m) for m in extra_masks]
-        keep = attention_mask.bool()
-        for i in range(B):
-            k = int(attention_mask[i].sum().item())
-            if k == 0:
-                continue
-            src = input_ids[i][keep[i]]
+        device = input_ids.device
+
+        keep = attention_mask.to(device=device, dtype=torch.bool)
+        k    = keep.sum(dim=1)
+        rank = keep.to(device=device, dtype=torch.int64).cumsum(dim=1) - 1
+
+        if side == "left":
+            dst = (L - k).unsqueeze(1) + rank
+        elif side == "right":
+            dst = rank
+        else:
+            raise ValueError("side must be 'left' or 'right'")
+
+        new_ids  = input_ids.new_full((B, L), pad_token_id)
+        new_attn = attention_mask.new_zeros((B, L))
+
+        ridx, csrc = keep.nonzero(as_tuple=True)
+        cdst = dst[ridx, csrc].to(torch.long)
+
+        new_ids[ridx,  cdst] = input_ids[ridx, csrc]
+        if new_attn.dtype == torch.bool:
+            new_attn[ridx, cdst] = True
+        else:
+            new_attn[ridx, cdst] = 1
+
+        # Extras move in lock-step; fill pads with provided pad values (default 0)
+        new_extras: list[torch.Tensor] = []
+        if extra_tensors is not None:
+            if extra_pad_values is None:
+                extra_pad_values = [0] * len(extra_tensors)
+            assert len(extra_pad_values) == len(extra_tensors), "extra_pad_values must match extra_tensors"
+            for m, padv in zip(extra_tensors, extra_pad_values):
+                out = m.new_full(m.shape, padv)
+                out[ridx, cdst] = m[ridx, csrc]
+                new_extras.append(out)
+
+        max_k = int(k.max().item())
+        if 0 < max_k < L:
             if side == "left":
-                new_ids[i, L - k:] = src
-                new_attn[i, L - k:] = 1
-                if new_extras is not None:
-                    for idx, m in enumerate(extra_masks):
-                        new_extras[idx][i, L - k:] = m[i][keep[i]]
+                sl = slice(L - max_k, L)
             else:
-                new_ids[i, :k] = src
-                new_attn[i, :k] = 1
-                if new_extras is not None:
-                    for idx, m in enumerate(extra_masks):
-                        new_extras[idx][i, :k] = m[i][keep[i]]
-        if new_extras is None:
-            return new_attn, new_ids, ()
+                sl = slice(0, max_k)
+            new_ids  = new_ids[:,  sl]
+            new_attn = new_attn[:, sl]
+            if new_extras:
+                new_extras = [e[:, sl] for e in new_extras]
+
         return new_attn, new_ids, tuple(new_extras)
 
-    def _truncate_by_side(self, input_ids, attention_mask, completion_mask, side, max_len):
-        if side == "left":
-            input_ids = input_ids[:, -max_len:]
-            attention_mask = attention_mask[:, -max_len:]
-            completion_mask = completion_mask[:, -max_len:]
-        else:
-            input_ids = input_ids[:, :max_len]
-            attention_mask = attention_mask[:, :max_len]
-            completion_mask = completion_mask[:, :max_len]
-        return input_ids, attention_mask, completion_mask
+    def _truncate_by_side(self, input_ids, attention_mask, completion_mask, side, max_len, token_type_ids=None):
+        _, L = input_ids.shape
+        if L <= max_len:
+            return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
+        sl = slice(-max_len, None) if side == "left" else slice(0, max_len)
 
-    def _pad_to_multiple(self, input_ids, attention_mask, completion_mask, side, pad_id, multiple):
+        input_ids       = input_ids[:, sl]
+        attention_mask  = attention_mask[:, sl]
+        completion_mask = completion_mask[:, sl]
+
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids[:, sl]
+        return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
+
+    def _pad_to_multiple(self, input_ids, attention_mask, completion_mask, side, pad_id, multiple, token_type_ids=None, token_type_pad_id=0):
         B, L = input_ids.shape
         L2 = ((L + multiple - 1) // multiple) * multiple
         if L2 == L:
-            return input_ids, attention_mask, completion_mask
+            return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
         pad_len = L2 - L
+
         pad_ids = torch.full((B, pad_len), pad_id, dtype=input_ids.dtype, device=input_ids.device)
-        zeros = torch.zeros_like(pad_ids)
+        zeros_att = torch.zeros((B, pad_len), dtype=attention_mask.dtype, device=attention_mask.device)
+        zeros_comp = torch.zeros((B, pad_len), dtype=completion_mask.dtype, device=completion_mask.device)
+
+        if token_type_ids is not None:
+            pad_token_type_ids = torch.full((B, pad_len), token_type_pad_id, dtype=token_type_ids.dtype, device=token_type_ids.device)
+
         if side == "left":
             input_ids = torch.cat((pad_ids, input_ids), dim=1)
-            attention_mask = torch.cat((zeros, attention_mask), dim=1)
-            completion_mask = torch.cat((zeros, completion_mask), dim=1)
+            attention_mask = torch.cat((zeros_att, attention_mask), dim=1)
+            completion_mask = torch.cat((zeros_comp, completion_mask), dim=1)
+            if token_type_ids is not None:
+                token_type_ids = torch.cat((pad_token_type_ids, token_type_ids), dim=1)
         else:
             input_ids = torch.cat((input_ids, pad_ids), dim=1)
-            attention_mask = torch.cat((attention_mask, zeros), dim=1)
-            completion_mask = torch.cat((completion_mask, zeros), dim=1)
-        return input_ids, attention_mask, completion_mask
+            attention_mask = torch.cat((attention_mask, zeros_att), dim=1)
+            completion_mask = torch.cat((completion_mask, zeros_comp), dim=1)
+            if token_type_ids is not None:
+                token_type_ids = torch.cat((token_type_ids, pad_token_type_ids), dim=1)
+        return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
     def _collate_prompt_completion(self, examples):
-        prompt_texts, completion_texts, images = [], [], []
+        prompt_texts, completion_texts, images, videos = [], [], [], []
 
         for ex in examples:
             p, c = ex["prompt"], ex["completion"]
@@ -1049,7 +1123,7 @@ class UnslothVisionDataCollator:
                 self._validate_and_normalize_first_message(p)
                 if self.assistant_single_content:
                     self._collapse_assistant_content(p)
-                p_txt = self._render_chat(p)
+                p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False)
             else:
                 p_txt = str(p)
 
@@ -1057,60 +1131,99 @@ class UnslothVisionDataCollator:
                 self._validate_and_normalize_first_message(c)
                 if self.assistant_single_content:
                     self._collapse_assistant_content(c)
-                c_txt = self._render_chat(c)
+                pc_txt = self._render_chat(prompt_messages=p, completion_messages=c)
+                # some models append common template items so this removes them.
+                # see trl/data_utils.py
+                p_txt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(p_txt, pc_txt)))
+                c_txt = pc_txt[len(p_txt):]
             else:
                 c_txt = str(c)
 
             # Images: prefer embedded; else first top-level image; else []
-            imgs = self._extract_images_for_pc(ex, p if is_p_msgs else None, c if is_c_msgs else None)
+            imgs, vids, vids_kwarg = self._extract_images_for_pc(ex, p if is_p_msgs else None, c if is_c_msgs else None)
             imgs = self._resize_images_inplace(imgs)
 
             prompt_texts.append(p_txt)
             completion_texts.append(c_txt)
-            images.append(imgs)
+            if imgs and len(imgs) > 0:
+                images.append(imgs)
 
-        # Encode prompts (LEFT pad) with images
-        proc_prompts = self.processor(
-            images=images,
-            text=prompt_texts,
+            if vids and len(vids) > 0:  # Works for list, tuple or tensor
+                videos.append(vids)
+                if vids_kwarg is None:
+                    vids_kwarg = {"fps": []}
+                vids_kwarg['fps'].extend(vids_kwarg['fps'])
+
+        prompt_kwargs = dict(
             padding=True,
             padding_side="left",
             return_tensors="pt",
             add_special_tokens=False,
         )
-        # Encode completions (RIGHT pad) text-only
-        proc_completions = self.processor(
-            text=completion_texts,
+        completion_kwargs = dict(
             padding=True,
             padding_side="right",
             return_tensors="pt",
             add_special_tokens=False,
         )
+        if len(images) > 0:
+            prompt_kwargs["images"] = images
+        if len(videos) > 0:
+            prompt_kwargs["videos"] = videos
+            vids_kwarg["fps"] = collapse_fps(vids_kwarg['fps'])
+            for k, v in vids_kwarg.items():
+                prompt_kwargs[k] = v
+
+        proc_prompts = self.processor(text=prompt_texts, **prompt_kwargs)
+        # Encode completions (RIGHT pad) text-only
+        proc_completions = self.processor(text=completion_texts, **completion_kwargs)
 
         p_ids, c_ids = proc_prompts["input_ids"], proc_completions["input_ids"]
         p_m, c_m = proc_prompts["attention_mask"], proc_completions["attention_mask"]
+        p_tt, c_tt = proc_prompts.get("token_type_ids", None), proc_completions.get("token_type_ids", None)
+
         input_ids = torch.cat((p_ids, c_ids), dim=1)
         attention_mask = torch.cat((p_m, c_m), dim=1)
         completion_mask = torch.cat((torch.zeros_like(p_m), c_m), dim=1)
+        if p_tt is not None and c_tt is not None:
+            token_type_ids = torch.cat((p_tt, c_tt), dim=1)
+        else:
+            token_type_ids = None
 
         # Flush to tokenizer default padding side
         pad_id = self._pad_token_id_or_fail()
         flush_side = self._tokenizer_padding_side()
-        attention_mask, input_ids, (completion_mask,) = self._flush_to_side(
-            attention_mask, input_ids, flush_side, pad_id, (completion_mask,)
-        )
-
-        # Truncate with side awareness
-        if self.max_seq_length is not None:
-            input_ids, attention_mask, completion_mask = self._truncate_by_side(
-                input_ids, attention_mask, completion_mask, flush_side, self.max_seq_length
+        if token_type_ids is not None:
+            attention_mask, input_ids, (completion_mask, token_type_ids) = self._flush_to_side(
+                attention_mask, input_ids, flush_side, pad_id, (completion_mask, token_type_ids)
             )
 
-        # Optional pad-to-multiple-of (manual in PC)
-        if self.pad_to_multiple_of and self.pad_to_multiple_of > 1:
-            input_ids, attention_mask, completion_mask = self._pad_to_multiple(
-                input_ids, attention_mask, completion_mask, flush_side, pad_id, self.pad_to_multiple_of
+            # Truncate with side awareness
+            if self.max_seq_length is not None:
+                input_ids, attention_mask, completion_mask, token_type_ids = self._truncate_by_side(
+                    input_ids, attention_mask, completion_mask, flush_side, self.max_seq_length, token_type_ids=token_type_ids
+                )
+
+            # Optional pad-to-multiple-of (manual in PC)
+            if self.pad_to_multiple_of and self.pad_to_multiple_of > 1:
+                input_ids, attention_mask, completion_mask, token_type_ids = self._pad_to_multiple(
+                    input_ids, attention_mask, completion_mask, flush_side, pad_id, self.pad_to_multiple_of, token_type_ids=token_type_ids
+                )
+        else:
+            attention_mask, input_ids, (completion_mask,) = self._flush_to_side(
+                attention_mask, input_ids, flush_side, pad_id, (completion_mask,)
             )
+
+            # Truncate with side awareness
+            if self.max_seq_length is not None:
+                input_ids, attention_mask, completion_mask = self._truncate_by_side(
+                    input_ids, attention_mask, completion_mask, flush_side, self.max_seq_length
+                )
+
+            if self.pad_to_multiple_of and self.pad_to_multiple_of > 1:
+                input_ids, attention_mask, completion_mask = self._pad_to_multiple(
+                    input_ids, attention_mask, completion_mask, flush_side, pad_id, self.pad_to_multiple_of
+                )
 
         # Labels: mask attention pads + image/pad tokens; completion-only if requested
         labels = input_ids.clone()
@@ -1124,6 +1237,12 @@ class UnslothVisionDataCollator:
         out["input_ids"] = input_ids
         out["attention_mask"] = attention_mask
         out["labels"] = labels
-        self._cast_pixel_values_dtype_inplace(out)
+        if token_type_ids is not None:
+            out["token_type_ids"] = token_type_ids
+        if 'pixel_values' in out:
+            out = self._cast_pixel_values_dtype_inplace(out)
+        if 'pixel_values_videos' in out:
+            out = self._cast_pixel_values_dtype_inplace(out, 'pixel_values_videos')
+
         return out
 pass
