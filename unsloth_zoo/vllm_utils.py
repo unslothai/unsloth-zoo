@@ -1713,6 +1713,7 @@ def load_vllm(
             )
             good_keys = inspect.signature(CompilationConfig).parameters.keys()
             # Use new cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE mode for maximum performance
+            # See https://docs.vllm.ai/en/v0.10.2/api/vllm/config/compilation.html#vllm.config.compilation.CUDAGraphMode
             if "cudagraph_mode" in good_keys:
                 try:
                     from vllm.config import CUDAGraphMode
