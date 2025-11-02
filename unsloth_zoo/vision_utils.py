@@ -449,10 +449,10 @@ FORCE_UNSLOTH_VIDEO_READER = os.getenv("FORCE_UNSLOTH_VIDEO_READER", None)
 def get_video_reader_backend() -> str:
     if FORCE_UNSLOTH_VIDEO_READER is not None:
         video_reader_backend = FORCE_UNSLOTH_VIDEO_READER
-    elif is_torchcodec_available():
-        video_reader_backend = "torchcodec"
     elif is_decord_available():
         video_reader_backend = "decord"
+    elif is_torchcodec_available():
+        video_reader_backend = "torchcodec"
     elif HAS_TORCHVISION:
         video_reader_backend = "torchvision"
     else:
@@ -650,7 +650,7 @@ class UnslothVisionDataCollator:
         response_part    = None,
         force_match      = True, # Match newlines as well!
         num_proc         = None,
-        completion_only_loss = False,
+        completion_only_loss = True,
         pad_to_multiple_of = None,
         resize_dimension = 0, # can be 0, 1, 'max' or 'min' (max resizes based on the max of height width, min the min size, 0 the first dim, etc)
         snap_to_patch_size = False,
