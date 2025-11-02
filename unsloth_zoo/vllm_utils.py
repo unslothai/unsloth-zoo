@@ -1685,7 +1685,7 @@ def load_vllm(
     if compilation_config == 3:
         try:
             from vllm.config import CompilationConfig, CompilationLevel
-            compilation_config = CompilationConfig(
+            compile_flags = dict(
                 level = 3,
                 backend = "inductor",
                 # cache_dir = "unsloth_compiled_vllm_cache", # Pytorch fails to load from cache
@@ -1711,8 +1711,27 @@ def load_vllm(
                     use_block_ptr = True,
                 )
             )
-        except:
+            good_keys = inspect.signature(CompilationConfig).parameters.keys()
+            # Use new cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE mode for maximum performance
+            if "cudagraph_mode" in good_keys:
+                try:
+                    from vllm.config import CUDAGraphMode
+                    compile_flags["cudagraph_mode"] = CUDAGraphMode.FULL_AND_PIECEWISE
+                    del compile_flags["full_cuda_graph"]
+                except Exception as e:
+                    print("Unsloth: Failed getting `from vllm.config import CUDAGraphMode` and `CUDAGraphMode.FULL_AND_PIECEWISE`")
+            else:
+                print("Unsloth: `cudagraph_mode` is not in `from vllm.config import CompilationConfig`")
+            old_keys = list(compile_flags.keys())
+            for key in old_keys:
+                if key not in good_keys:
+                    del compile_flags[key]
+                    print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM.config.CompilationConfig. Skipping.")
+                pass
             pass
+            compilation_config = CompilationConfig(compile_flags)
+        except Exception as e:
+            print(f"Unsloth: FAILED getting compilation_config with error = {str(e)}")
     pass
 
     engine_args = dict(
