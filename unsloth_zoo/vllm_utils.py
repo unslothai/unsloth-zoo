@@ -48,7 +48,7 @@ import functools
 import contextlib
 import inspect
 from functools import partial
-from .utils import _get_dtype, get_quant_type
+from .utils import _get_dtype, get_quant_type, Version
 from .empty_model import *
 from .hf_utils import (
     dtype_from_config,
@@ -511,11 +511,12 @@ def patch_vllm_enable_sleep_mode():
     def __init__(self):
         # This is a replica of the original CuMemAllocator.__init__()
         # with no changes except modification to error message for better readability
-        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        assert "expandable_segments:True" not in conf, \
-            ("Standby mode is not supported with expandable segments.\n"
-            "Please set environment variable PYTORCH_CUDA_ALLOC_CONF without `expandable_segments:True`.\n"
-            )
+        for check in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF",):
+            conf = os.environ.get(check, "")
+            assert "expandable_segments:True" not in conf, \
+                ("Standby mode is not supported with expandable segments.\n"
+                f"Please set environment variable {check} without `expandable_segments:True`.\n"
+                )
 
         self.pointer_to_data: dict[int, AllocationData] = {}
         self.current_tag: str = CuMemAllocator.default_tag
@@ -1750,6 +1751,24 @@ def load_vllm(
         # To reduce memory usage, we limit the number of images/videos per prompt
         # TODO: Make it configurable by user
         engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
+
+    # [[CRITICAL for RL on policy]]
+    # Check for Cascade Attention which fails on A100 / L40 for vLLM < 0.11.0 versions
+    # Ada Lovelace 8.9 and Ampere 8.0
+    # See https://github.com/vllm-project/flash-attention/pull/87
+    # import vllm.vllm_flash_attn
+    # vllm.vllm_flash_attn.__version__ == 2.7.2.post1
+    if DEVICE_TYPE == "cuda":
+        major_version, minor_version = torch.cuda.get_device_capability()
+        if major_version < 9:
+            from vllm import __version__ as vllm_version
+            if Version(vllm_version) >= Version("0.11.0"):
+                disable_cascade_attn = False
+            else:
+                # Disable for A100, L40 etc
+                disable_cascade_attn = True
+            engine_args["disable_cascade_attn"] = disable_cascade_attn
+    pass
 
     good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
     old_keys = list(engine_args.keys())
