@@ -1474,16 +1474,21 @@ def load_vllm(
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
-    if unsloth_vllm_standby and gpu_memory_utilization <= 0.9:
-        free_memory, total_memory = get_mem_info()
-        # If T4 ie 15GB, we use 0.85 since it'll rarely OOM. Other GPUs 0.9
-        total_gb = total_memory/1024/1024/1024
-        ten_percent = total_gb * 0.1 # 1.46GB for T4
-        if   ten_percent >= 4.0: gpu_memory_utilization = 0.925
-        elif ten_percent >= 2.0: gpu_memory_utilization = 0.9
-        elif ten_percent >= 1.4: gpu_memory_utilization = 0.85
-        elif ten_percent >= 1.0: gpu_memory_utilization = 0.8
-        else: gpu_memory_utilization = 0.75
+
+    free_memory, total_memory = get_mem_info()
+    # If T4 ie 15GB, we use 0.85 since it'll rarely OOM. Other GPUs 0.9
+    # L4 with ~22GB seems to work at 0.89 but not 0.9 due to larget cuda graphs/large max num sequences we impose
+    total_gb = total_memory/1024/1024/1024
+    ten_percent = total_gb * 0.1 # 1.46GB for T4
+    if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
+    elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
+    elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
+    elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
+    elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
+    else: standby_target_gpu_util = 0.75
+
+    if unsloth_vllm_standby and gpu_memory_utilization < standby_target_gpu_util:
+        gpu_memory_utilization = standby_target_gpu_util
         logger.info(f"Unsloth: Standby mode is enabled. Changing `gpu_memory_utilization` to {gpu_memory_utilization}.")
 
     if DEVICE_TYPE == "cuda":
