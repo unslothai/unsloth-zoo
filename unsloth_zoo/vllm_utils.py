@@ -1522,7 +1522,7 @@ def load_vllm(
     # Determine the maximum LoRA rank since vLLM restricts the rank to some values
     new_max_lora_rank = determine_max_lora_rank(max_lora_rank)
     if new_max_lora_rank != max_lora_rank:
-        print(f"Unsloth: Changing the maximum lora rank to {new_max_lora_rank} from {max_lora_rank} fro vLLM.")
+        print(f"Unsloth: Changing the maximum lora rank to {new_max_lora_rank} from {max_lora_rank} for vLLM.")
     max_lora_rank = new_max_lora_rank
 
     quant_method = get_quant_type(config)
