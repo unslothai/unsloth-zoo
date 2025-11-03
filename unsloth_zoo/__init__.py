@@ -14,12 +14,11 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.10.12"
+__version__ = "2025.11.1"
 
 import os
 import warnings
 import re
-import torch
 # Hugging Face Hub faster downloads
 if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
@@ -31,6 +30,12 @@ if os.environ.get("UNSLOTH_STABLE_DOWNLOADS", "0") == "1":
     os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30" # Default is 10 seconds
     os.environ["HF_HUB_DISABLE_XET"] = "1" # Disable XET
 pass
+
+# Check offline mode as well
+if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+if os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1":
+    os.environ["HF_HUB_OFFLINE"] = "1"
 
 # Disable XET Cache for now
 os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
@@ -70,9 +75,68 @@ pass
 from importlib.util import find_spec
 if find_spec("unsloth") is None:
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
+if find_spec("torch") is None:
+    raise ImportError(
+        "Unsloth: Pytorch is not installed. Go to https://pytorch.org/.\n"\
+        "We also have some installation instructions on our Github page."
+    )
 pass
-del find_spec
 
+# Reduce VRAM usage by reducing fragmentation
+# And optimize pinning of memory
+if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0":
+    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = \
+            "expandable_segments:True,"\
+            "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
+    if "PYTORCH_HIP_ALLOC_CONF" not in os.environ:
+        # [TODO] Check if AMD works with roundup_power2_divisions
+        os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
+    if "PYTORCH_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+elif os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1":
+    for key in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF",):
+        if "expandable_segments:True" in os.environ.get(key, ""):
+            warnings.warn(
+                "Unsloth: `UNSLOTH_VLLM_STANDBY` is on, but requires `expandable_segments` to be off. "\
+                "We will remove `expandable_segments`.",
+                stacklevel = 2,
+            )
+            os.environ[key] = re.sub(r"expandable\_segments\:True\,?", "", os.environ[key])
+pass
+
+# We support Pytorch 2
+# Fixes https://github.com/unslothai/unsloth/issues/38
+from importlib.metadata import version as importlib_version
+torch_version = str(re.match(r"[0-9\.]{3,}", str(importlib_version("torch"))).group(0)).split(".")
+major_torch, minor_torch = torch_version[0], torch_version[1]
+major_torch, minor_torch = int(major_torch), int(minor_torch)
+def delete_key(key):
+    if key in os.environ: del os.environ[key]
+if (major_torch < 2):
+    raise ImportError("Unsloth only supports Pytorch 2 for now. Please update your Pytorch to 2.1.\n"\
+                      "We have some installation instructions on our Github page.")
+elif (major_torch == 2) and (minor_torch < 2):
+    # Disable expandable_segments
+    delete_key("PYTORCH_CUDA_ALLOC_CONF")
+    delete_key("PYTORCH_HIP_ALLOC_CONF")
+    delete_key("PYTORCH_ALLOC_CONF")
+pass
+
+# Suppress WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.7.0+cu126 for torchao version 0.14.1
+# Please see https://github.com/pytorch/ao/issues/2919 for more info
+import logging
+torchao_logger = logging.getLogger("torchao")
+# Ignore logging messages
+class HideLoggingMessage(logging.Filter):
+    __slots__ = "text",
+    def __init__(self, text): self.text = text
+    def filter(self, x): return not (self.text in x.getMessage())
+pass
+torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
+del logging, torchao_logger, HideLoggingMessage
+
+# Get device types and other variables
 from .device_type import (
     is_hip,
     get_device_type,
@@ -82,46 +146,25 @@ from .device_type import (
     ALLOW_PREQUANTIZED_MODELS,
 )
 
-# Reduce VRAM usage by reducing fragmentation
-# And optimize pinning of memory
-# TODO(billishyahao): need to add hip related optimization...
-if (DEVICE_TYPE in ("cuda", "hip")) and (os.environ.get("UNSLOTH_VLLM_STANDBY", "0")=="0"):
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = \
-        "expandable_segments:True,"\
-        "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
-    os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
-elif (DEVICE_TYPE in ("cuda", "hip")) and (os.environ.get("UNSLOTH_VLLM_STANDBY", "0")=="1") and \
-    ("expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")):
-    warnings.warn(
-        "Unsloth: `UNSLOTH_VLLM_STANDBY` is on, but requires `expandable_segments` to be off.\n"\
-        "We will remove `expandable_segments`.",
-        stacklevel = 2,
-    )
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = re.sub(
-        r"expandable\_segments\:True\,?",
-        "",
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"],
-    )
-    os.environ["PYTORCH_HIP_ALLOC_CONF"] = re.sub(
-        r"expandable\_segments\:True\,?",
-        "",
-        os.environ["PYTORCH_HIP_ALLOC_CONF"],
-    )
+# Torch 2.9 removed PYTORCH_HIP_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF
+if major_torch == 2 and minor_torch >= 9:
+    for key in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF",):
+        if key in os.environ and "PYTORCH_ALLOC_CONF" not in os.environ:
+            os.environ["PYTORCH_ALLOC_CONF"] = os.environ[key]
+            delete_key(key)
+else:
+    # Specify PYTORCH_CUDA_ALLOC_CONF or PYTORCH_HIP_ALLOC_CONF
+    if DEVICE_TYPE == "hip":
+        if "PYTORCH_HIP_ALLOC_CONF" not in os.environ and "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
+            os.environ["PYTORCH_HIP_ALLOC_CONF"] = os.environ["PYTORCH_CUDA_ALLOC_CONF"]
+            delete_key("PYTORCH_CUDA_ALLOC_CONF")
+        if "PYTORCH_HIP_ALLOC_CONF" not in os.environ and "PYTORCH_ALLOC_CONF" in os.environ:
+            os.environ["PYTORCH_HIP_ALLOC_CONF"] = os.environ["PYTORCH_ALLOC_CONF"]
+            delete_key("PYTORCH_ALLOC_CONF")
+    elif DEVICE_TYPE == "cuda":
+        delete_key("PYTORCH_HIP_ALLOC_CONF")
+        delete_key("PYTORCH_ALLOC_CONF")
 pass
-# We support Pytorch 2
-# Fixes https://github.com/unslothai/unsloth/issues/38
-torch_version = str(re.match(r"[0-9\.]{3,}", str(torch.__version__)).group(0)).split(".")
-major_torch, minor_torch = torch_version[0], torch_version[1]
-major_torch, minor_torch = int(major_torch), int(minor_torch)
-if (major_torch < 2):
-    raise ImportError("Unsloth only supports Pytorch 2 for now. Please update your Pytorch to 2.1.\n"\
-                      "We have some installation instructions on our Github page.")
-elif (major_torch == 2) and (minor_torch < 2):
-    # Disable expandable_segments
-    del os.environ["PYTORCH_CUDA_ALLOC_CONF"]
-    del os.environ["PYTORCH_HIP_ALLOC_CONF"]
-pass
-
 # CCE fails on Torch 2.8 and above
 # OutOfResources: out of resource: shared memory, Required: 98304, Hardware limit: 65536. Reducing block sizes or `num_stages`
 if (major_torch >= 2 and minor_torch >= 8) or (major_torch > 2):
@@ -129,7 +172,7 @@ if (major_torch >= 2 and minor_torch >= 8) or (major_torch > 2):
 elif DEVICE_TYPE == "hip":
     # CCE also fails in HIP / AMD
     os.environ["UNSLOTH_ENABLE_CCE"] = "0"
-
+del delete_key, major_torch, minor_torch, torch_version, importlib_version, find_spec
 
 if not ("UNSLOTH_IS_PRESENT" in os.environ):
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
@@ -143,6 +186,7 @@ pass
 # Log Unsloth-Zoo Utilities
 os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 del os
+
 
 from .temporary_patches import (
     encode_conversations_with_harmony,
@@ -164,21 +208,6 @@ try:
     # This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
     from pydantic.warnings import UnsupportedFieldAttributeWarning
     warnings.filterwarnings(action = "ignore", category = UnsupportedFieldAttributeWarning)
-except:
-    pass
-
-import logging
-# Ignore logging messages
-class HideLoggingMessage(logging.Filter):
-    __slots__ = "text",
-    def __init__(self, text): self.text = text
-    def filter(self, x): return not (self.text in x.getMessage())
-pass
-
-# Skipping import of cpp extensions due to incompatible torch version
-try:
-    from torchao import logger as torchao_logger
-    torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
-    del torchao_logger
+    del warnings, UnsupportedFieldAttributeWarning
 except:
     pass

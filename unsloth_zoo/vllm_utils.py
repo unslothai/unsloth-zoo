@@ -48,7 +48,7 @@ import functools
 import contextlib
 import inspect
 from functools import partial
-from .utils import _get_dtype, get_quant_type
+from .utils import _get_dtype, get_quant_type, Version
 from .empty_model import *
 from .hf_utils import (
     dtype_from_config,
@@ -502,9 +502,8 @@ def patch_vllm_enable_sleep_mode():
     try:
         from vllm.utils import is_pin_memory_available
     except:
+        # in some newer versions, this is not available in vllm.utils
         from vllm.utils.platform_utils import is_pin_memory_available
-    pass
-
     from typing import Optional, Union, Tuple, Any
 
     logger.info(f"Unsloth: Enabling vLLM standby mode")
@@ -512,11 +511,12 @@ def patch_vllm_enable_sleep_mode():
     def __init__(self):
         # This is a replica of the original CuMemAllocator.__init__()
         # with no changes except modification to error message for better readability
-        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        assert "expandable_segments:True" not in conf, \
-            ("Standby mode is not supported with expandable segments.\n"
-            "Please set environment variable PYTORCH_CUDA_ALLOC_CONF without `expandable_segments:True`.\n"
-            )
+        for check in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF",):
+            conf = os.environ.get(check, "")
+            assert "expandable_segments:True" not in conf, \
+                ("Standby mode is not supported with expandable segments.\n"
+                f"Please set environment variable {check} without `expandable_segments:True`.\n"
+                )
 
         self.pointer_to_data: dict[int, AllocationData] = {}
         self.current_tag: str = CuMemAllocator.default_tag
@@ -1463,6 +1463,35 @@ def approximate_vllm_memory_usage(
 pass
 
 
+def determine_max_lora_rank(lora_rank = 16):
+    """vLLM doesn't allow any LoRA rank, so we need to get the next largest"""
+    possible_max_ranks = [8, 16, 32, 64, 128, 256, 320, 512]
+    try:
+        import vllm.config.lora
+        if hasattr(vllm.config.lora, "MaxLoRARanks"):
+            possible_max_ranks = str(vllm.config.lora.MaxLoRARanks)
+        else:
+            lora_config = inspect.getsource(vllm.config.lora)
+            text = "possible_max_ranks"
+            l = lora_config.find(text)
+            if l != -1:
+                r = lora_config.find("\n", l + len(text))
+                possible_max_ranks = lora_config[l : r]
+    except:
+        pass
+    if type(possible_max_ranks) is str:
+        possible_max_ranks = re.findall(r"[\d]{1,}", possible_max_ranks)
+        possible_max_ranks = [int(x) for x in possible_max_ranks]
+    for max_lora_rank in possible_max_ranks:
+        if max_lora_rank >= lora_rank:
+            return max_lora_rank
+    raise RuntimeError(
+        f"Unsloth: vLLM does not support LoRA ranks of {lora_rank}.\n"\
+        "Only `{possible_max_ranks}` is supported."
+    )
+pass
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -1524,6 +1553,12 @@ def load_vllm(
         mem_config = config.text_config
     else:
         mem_config = config
+
+    # Determine the maximum LoRA rank since vLLM restricts the rank to some values
+    new_max_lora_rank = determine_max_lora_rank(max_lora_rank)
+    if new_max_lora_rank != max_lora_rank:
+        print(f"Unsloth: Changing the maximum lora rank to {new_max_lora_rank} from {max_lora_rank} for vLLM.")
+    max_lora_rank = new_max_lora_rank
 
     quant_method = get_quant_type(config)
     use_bitsandbytes = use_bitsandbytes or \
@@ -1720,7 +1755,7 @@ def load_vllm(
     if compilation_config == 3:
         try:
             from vllm.config import CompilationConfig, CompilationLevel
-            compilation_config = CompilationConfig(
+            compile_flags = dict(
                 level = 3,
                 backend = "inductor",
                 # cache_dir = "unsloth_compiled_vllm_cache", # Pytorch fails to load from cache
@@ -1746,8 +1781,28 @@ def load_vllm(
                     use_block_ptr = True,
                 )
             )
-        except:
+            good_keys = inspect.signature(CompilationConfig).parameters.keys()
+            # Use new cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE mode for maximum performance
+            # See https://docs.vllm.ai/en/v0.10.2/api/vllm/config/compilation.html#vllm.config.compilation.CUDAGraphMode
+            if "cudagraph_mode" in good_keys:
+                try:
+                    from vllm.config import CUDAGraphMode
+                    compile_flags["cudagraph_mode"] = CUDAGraphMode.FULL_AND_PIECEWISE
+                    del compile_flags["full_cuda_graph"]
+                except Exception as e:
+                    print("Unsloth: Failed getting `from vllm.config import CUDAGraphMode` and `CUDAGraphMode.FULL_AND_PIECEWISE`")
+            else:
+                print("Unsloth: `cudagraph_mode` is not in `from vllm.config import CompilationConfig`")
+            old_keys = list(compile_flags.keys())
+            for key in old_keys:
+                if key not in good_keys:
+                    del compile_flags[key]
+                    print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM.config.CompilationConfig. Skipping.")
+                pass
             pass
+            compilation_config = CompilationConfig(**compile_flags)
+        except Exception as e:
+            print(f"Unsloth: FAILED getting compilation_config with error = {str(e)}")
     pass
 
     engine_args = dict(
@@ -1786,6 +1841,25 @@ def load_vllm(
         # To reduce memory usage, we limit the number of images/videos per prompt
         # TODO: Make it configurable by user
         engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
+
+    # [[CRITICAL for RL on policy]]
+    # Check for Cascade Attention which fails on A100 / L40 for vLLM < 0.11.0 versions
+    # Ada Lovelace 8.9 and Ampere 8.0
+    # See https://github.com/vllm-project/flash-attention/pull/87
+    # import vllm.vllm_flash_attn
+    # vllm.vllm_flash_attn.__version__ == 2.7.2.post1
+    if DEVICE_TYPE == "cuda":
+        major_version, minor_version = torch.cuda.get_device_capability()
+        if major_version < 9:
+            from vllm import __version__ as vllm_version
+            if Version(vllm_version) >= Version("0.11.0"):
+                disable_cascade_attn = False
+            else:
+                # Disable for A100, L40 etc
+                disable_cascade_attn = True
+                print("Unsloth: Disabling `disable_cascade_attn` in vLLM to allow for better on policy RL!")
+            engine_args["disable_cascade_attn"] = disable_cascade_attn
+    pass
 
     good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
     old_keys = list(engine_args.keys())
