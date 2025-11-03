@@ -98,7 +98,7 @@ elif os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1":
     for key in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF",):
         if "expandable_segments:True" in os.environ.get(key, ""):
             warnings.warn(
-                "Unsloth: `UNSLOTH_VLLM_STANDBY` is on, but requires `expandable_segments` to be off.\n"\
+                "Unsloth: `UNSLOTH_VLLM_STANDBY` is on, but requires `expandable_segments` to be off. "\
                 "We will remove `expandable_segments`.",
                 stacklevel = 2,
             )
