@@ -626,7 +626,14 @@ def grpo_accumulated_loss(
                 image_sizes = image_sizes,
                 logits_to_keep = logits_to_keep + 1,
             ).logits
-
+            
+    # Ensure old/ref states never carry grads across micro-batches
+    if old_hidden_states is not None and torch.is_tensor(old_hidden_states):
+        old_hidden_states = old_hidden_states.detach()
+    
+    if ref_hidden_states is not None and torch.is_tensor(ref_hidden_states):
+        ref_hidden_states = ref_hidden_states.detach()
+    
     loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
         new_hidden_states,
         old_hidden_states,
