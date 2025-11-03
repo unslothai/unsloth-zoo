@@ -911,6 +911,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     if sm_cap==90 and cutlass_block_fp8_supported and not should_use_deepgemm:
                         # For H100 (at least), the scale seems to be a transpose of what HF expects, while on L4 it is right shape.
                         # This is done by vLLM based on a few checks that we replicated above.
+                        # https://github.com/vllm-project/vllm/blob/294c805f1df9ddf62c2290989710da9d48ab4973/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1172-L1179
                         weight_scale = weight_scale.T
                         logger.info(f"Unsloth: Transposed weight scale for {prefix} for weight shape {qweight.shape} and scale shape {weight_scale.shape}")
                     pass
