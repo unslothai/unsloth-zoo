@@ -1455,6 +1455,10 @@ def determine_max_lora_rank(lora_rank = 16):
     for max_lora_rank in possible_max_ranks:
         if max_lora_rank >= lora_rank:
             return max_lora_rank
+    raise RuntimeError(
+        f"Unsloth: vLLM does not support LoRA ranks of {lora_rank}.\n"\
+        "Only `{possible_max_ranks}` is supported."
+    )
 pass
 
 
@@ -1519,6 +1523,7 @@ def load_vllm(
     new_max_lora_rank = determine_max_lora_rank(max_lora_rank)
     if new_max_lora_rank != max_lora_rank:
         print(f"Unsloth: Changing the maximum lora rank to {new_max_lora_rank} from {max_lora_rank} fro vLLM.")
+    max_lora_rank = new_max_lora_rank
 
     quant_method = get_quant_type(config)
     use_bitsandbytes = use_bitsandbytes or \
