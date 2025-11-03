@@ -895,7 +895,8 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     if ((a > b and q > p) or (a < b and q < p)) and (a // q == block_size and b // p == block_size):
                         # For H100 (at least), the scale seems to be a transpose of what HF expects, while on L4 it is right shape.
                         # So be smart in transposing only if necessary.
-                        # When the shapes misalign, we detect by comparing them with block size.
+                        # When the shapes misalign, we detect by comparing them with block size. Probably depends on the kernel implementation (not sure).
+                        # https://github.com/vllm-project/vllm/blob/853a8eb53b89f9f3468ab553e86a964cb4e6cd1e/vllm/model_executor/layers/quantization/fp8.py#L594-L613
                         weight_scale = weight_scale.T
                 else:
                     # This is dynamic quantization (aka per row or per column). The scale is of shape [n,1]
