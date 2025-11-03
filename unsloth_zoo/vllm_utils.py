@@ -908,7 +908,6 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     scale_suffix = '.weight_scale_inv'
                     block_size = proj.weight_block_size[0]
                     should_use_deepgemm = is_deep_gemm_supported and getattr(proj, "orig_dtype", torch.bfloat16) == torch.bfloat16 and qweight.shape[0] % 128 == 0 and qweight.shape[1] % 128 == 0
-                    print(f'{prefix=} {sm_cap=} {cutlass_block_fp8_supported=} {should_use_deepgemm=}')
                     if sm_cap==90 and cutlass_block_fp8_supported and not should_use_deepgemm:
                         # For H100 (at least), the scale seems to be a transpose of what HF expects, while on L4 it is right shape.
                         # This is done by vLLM based on a few checks that we replicated above.
