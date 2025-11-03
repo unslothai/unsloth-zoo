@@ -1310,10 +1310,16 @@ def apply_fused_lm_head(forward, module = None):
             spaces = finder[0][3]
         replacement = cross_entropy_replacement.strip().split("\n")
         replacement = "\n".join((len(spaces)-4)*" " + x for x in replacement)
-        replacement = \
-            "logits = self.lm_head(hidden_states[:, slice_indices, :]) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS\n" + \
-            (len(spaces)-4)*" " + "loss = None\n" + \
-            replacement + "\n"
+        if "slice_indices" in forward:
+            replacement = \
+                "logits = self.lm_head(hidden_states[:, slice_indices, :]) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS\n" + \
+                (len(spaces)-4)*" " + "loss = None\n" + \
+                replacement + "\n"
+        else:
+            replacement = \
+                "logits = self.lm_head(hidden_states) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS\n" + \
+                (len(spaces)-4)*" " + "loss = None\n" + \
+                replacement + "\n"
         try:
             forward = regex.sub(
                 cross_entropy_find,
@@ -1327,6 +1333,10 @@ def apply_fused_lm_head(forward, module = None):
         if "logits = outputs.logits" in cross_entropy_find:
             forward = forward.replace(
                 "logits = self.lm_head(hidden_states[:, slice_indices, :]) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS",
+                "logits = outputs.logits",
+            )
+            forward = forward.replace(
+                "logits = self.lm_head(hidden_states) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS",
                 "logits = outputs.logits",
             )
         # Fix vocab_size = (vocab_size=
