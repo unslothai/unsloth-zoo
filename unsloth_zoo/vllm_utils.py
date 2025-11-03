@@ -721,33 +721,35 @@ def patch_vllm_graph_capture():
     except Exception as e:
         print(f"Unsloth: Could not patch vLLM V1 graph capture: {e}")
 
-    # Also patch vLLM v0
-    try:
-        from vllm.worker.model_runner import GPUModelRunnerBase, logger
-        logger.info('Unsloth: Patching vLLM v0 graph capture')
-        original_capture_model_v0 = GPUModelRunnerBase.capture_model
+    from packaging.utils import Version
+    if Version(vllm.__version__) < Version("0.11.0"):
+        # Also patch vLLM v0. vLLM v0 is deprecated in vLLM v0.11.0 so only do when appropriate.
+        try:
+            from vllm.worker.model_runner import GPUModelRunnerBase, logger
+            logger.info('Unsloth: Patching vLLM v0 graph capture')
+            original_capture_model_v0 = GPUModelRunnerBase.capture_model
 
-        @wraps(original_capture_model_v0)
-        def capture_model_wrapper_v0(self, *args, **kwargs):
-            logger.info("Unsloth: Running patched vLLM v0 `capture_model`.")
-            start_time = time.perf_counter()
+            @wraps(original_capture_model_v0)
+            def capture_model_wrapper_v0(self, *args, **kwargs):
+                logger.info("Unsloth: Running patched vLLM v0 `capture_model`.")
+                start_time = time.perf_counter()
 
-            with suppress_gc_collect():
-                result = original_capture_model_v0(self, *args, **kwargs)
+                with suppress_gc_collect():
+                    result = original_capture_model_v0(self, *args, **kwargs)
 
-            end_time = time.perf_counter()
-            logger.info(
-                "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
-                end_time - start_time
-            )
-            for _ in range(2):
-                gc.collect()
-                torch.cuda.empty_cache()
-            return result
-        pass
-        GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
-    except Exception as e:
-        print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
+                end_time = time.perf_counter()
+                logger.info(
+                    "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
+                    end_time - start_time
+                )
+                for _ in range(2):
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                return result
+            pass
+            GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
+        except Exception as e:
+            print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
 pass
 
 
