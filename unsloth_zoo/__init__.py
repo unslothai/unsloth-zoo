@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.10.13"
+__version__ = "2025.11.1"
 
 import os
 import warnings
@@ -98,7 +98,7 @@ elif os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1":
     for key in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF",):
         if "expandable_segments:True" in os.environ.get(key, ""):
             warnings.warn(
-                "Unsloth: `UNSLOTH_VLLM_STANDBY` is on, but requires `expandable_segments` to be off.\n"\
+                "Unsloth: `UNSLOTH_VLLM_STANDBY` is on, but requires `expandable_segments` to be off. "\
                 "We will remove `expandable_segments`.",
                 stacklevel = 2,
             )
@@ -123,6 +123,20 @@ elif (major_torch == 2) and (minor_torch < 2):
     delete_key("PYTORCH_ALLOC_CONF")
 pass
 
+# Suppress WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.7.0+cu126 for torchao version 0.14.1
+# Please see https://github.com/pytorch/ao/issues/2919 for more info
+import logging
+torchao_logger = logging.getLogger("torchao")
+# Ignore logging messages
+class HideLoggingMessage(logging.Filter):
+    __slots__ = "text",
+    def __init__(self, text): self.text = text
+    def filter(self, x): return not (self.text in x.getMessage())
+pass
+torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
+del logging, torchao_logger, HideLoggingMessage
+
+# Get device types and other variables
 from .device_type import (
     is_hip,
     get_device_type,
@@ -173,6 +187,7 @@ pass
 os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 del os
 
+
 from .temporary_patches import (
     encode_conversations_with_harmony,
 )
@@ -193,22 +208,6 @@ try:
     # This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
     from pydantic.warnings import UnsupportedFieldAttributeWarning
     warnings.filterwarnings(action = "ignore", category = UnsupportedFieldAttributeWarning)
+    del warnings, UnsupportedFieldAttributeWarning
 except:
     pass
-
-import logging
-# Ignore logging messages
-class HideLoggingMessage(logging.Filter):
-    __slots__ = "text",
-    def __init__(self, text): self.text = text
-    def filter(self, x): return not (self.text in x.getMessage())
-pass
-
-# Skipping import of cpp extensions due to incompatible torch version
-try:
-    from torchao import logger as torchao_logger
-    torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
-    del torchao_logger
-except:
-    pass
-del HideLoggingMessage
