@@ -859,6 +859,23 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
 
+    capability = torch.cuda.get_device_capability()
+    sm_cap = capability[0] * 10 + capability[1]
+
+    try:
+        from vllm.utils.deep_gemm import is_deep_gemm_supported as vllm_is_deep_gemm_supported
+        is_deep_gemm_supported = vllm_is_deep_gemm_supported()
+    except Exception as e:
+        logger.info(f"Unsloth: Could not import vLLM deep_gemm: {e}")
+        is_deep_gemm_supported = False
+
+    try:
+        cutlass_block_fp8_supported = torch.ops._C.cutlass_scaled_mm_supports_block_fp8(sm_cap)
+    except Exception as e:
+        logger.info(f"Unsloth: Could not import vLLM cutlass_block_fp8_supported: {e}")
+        cutlass_block_fp8_supported = False
+    pass
+
     def get_state_dict(prefix, kk, state_dict, proj, slice_weights=True, slice_index=-1):
         proj = getattr(proj, "base_layer", proj)
         qweight = proj.weight
@@ -890,14 +907,18 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
                     scale_suffix = '.weight_scale_inv'
                     block_size = proj.weight_block_size[0]
+                    should_use_deepgemm = is_deep_gemm_supported and getattr(proj, "orig_dtype", torch.bfloat16) == torch.bfloat16 and qweight.shape[0] % 128 == 0 and qweight.shape[1] % 128 == 0
+                    print(f'{prefix=} {sm_cap=} {cutlass_block_fp8_supported=} {should_use_deepgemm=}')
+                    if sm_cap==90 and cutlass_block_fp8_supported and not should_use_deepgemm:
+                        # For H100 (at least), the scale seems to be a transpose of what HF expects, while on L4 it is right shape.
+                        # This is done by vLLM based on a few checks that we replicated above.
+                        weight_scale = weight_scale.T
+                        logger.info(f"Unsloth: Transposed weight scale for {prefix} for weight shape {qweight.shape} and scale shape {weight_scale.shape}")
+                    pass
                     a, b = qweight.shape
                     p, q = weight_scale.shape
-                    if ((a > b and q > p) or (a < b and q < p)) and (a // q == block_size and b // p == block_size):
-                        # For H100 (at least), the scale seems to be a transpose of what HF expects, while on L4 it is right shape.
-                        # So be smart in transposing only if necessary.
-                        # When the shapes misalign, we detect by comparing them with block size. Probably depends on the kernel implementation (not sure).
-                        # https://github.com/vllm-project/vllm/blob/853a8eb53b89f9f3468ab553e86a964cb4e6cd1e/vllm/model_executor/layers/quantization/fp8.py#L594-L613
-                        weight_scale = weight_scale.T
+                    # This is just a sanity check to ensure that we don't end up with wrongly sliced weight of shape [0, x] :)
+                    assert a // p == proj.weight_block_size[0] and b // q == proj.weight_block_size[1], f"Unsloth: vLLM weight has unexpected weight shape {qweight.shape} and scale {weight_scale.shape} and block size {proj.weight_block_size}"
                 else:
                     # This is dynamic quantization (aka per row or per column). The scale is of shape [n,1]
                     # The weight here is of shape [4096, 6144]. We need to transpose and then slice
