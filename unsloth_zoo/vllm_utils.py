@@ -1433,6 +1433,31 @@ def approximate_vllm_memory_usage(
 pass
 
 
+def determine_max_lora_rank(lora_rank = 16):
+    """vLLM doesn't allow any LoRA rank, so we need to get the next largest"""
+    possible_max_ranks = [8, 16, 32, 64, 128, 256, 320, 512]
+    try:
+        import vllm.config.lora
+        if hasattr(vllm.config.lora, "MaxLoRARanks"):
+            possible_max_ranks = str(vllm.config.lora.MaxLoRARanks)
+        else:
+            lora_config = inspect.getsource(vllm.config.lora)
+            text = "possible_max_ranks"
+            l = lora_config.find(text)
+            if l != -1:
+                r = lora_config.find("\n", l + len(text))
+                possible_max_ranks = lora_config[l : r]
+    except:
+        pass
+    if type(possible_max_ranks) is str:
+        possible_max_ranks = re.findall(r"[\d]{1,}", possible_max_ranks)
+        possible_max_ranks = [int(x) for x in possible_max_ranks]
+    for max_lora_rank in possible_max_ranks:
+        if max_lora_rank >= lora_rank:
+            return max_lora_rank
+pass
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -1489,6 +1514,11 @@ def load_vllm(
         mem_config = config.text_config
     else:
         mem_config = config
+
+    # Determine the maximum LoRA rank since vLLM restricts the rank to some values
+    new_max_lora_rank = determine_max_lora_rank(max_lora_rank)
+    if new_max_lora_rank != max_lora_rank:
+        print(f"Unsloth: Changing the maximum lora rank to {new_max_lora_rank} from {max_lora_rank} fro vLLM.")
 
     quant_method = get_quant_type(config)
     use_bitsandbytes = use_bitsandbytes or \
