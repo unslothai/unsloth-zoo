@@ -98,7 +98,7 @@ def compute_fused_ce_loss(
     # Since we overwrite torch.compile(torch.nn.functional.cross_entropy)
     # We might get double compile errors, so use the uncompiled version
     cross_entropy = \
-        torch.nn.functional._uncompiled_cross_entropy if
+        torch.nn.functional._uncompiled_cross_entropy if \
         hasattr(torch.nn.functional, "_uncompiled_cross_entropy") else \
         torch.nn.functional.cross_entropy
     loss = cross_entropy(
