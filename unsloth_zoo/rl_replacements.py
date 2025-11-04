@@ -175,7 +175,7 @@ def align_logprobs_with_mask(
     padded_logprobs[valid_rows, valid_cols] = valid_vals
 
     return padded_logprobs
-
+pass
 RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
 
 
@@ -187,7 +187,8 @@ def grpo_update_SamplingParams(SamplingParams, generation_kwargs, vllm_sampling_
                 overwrited_key = getattr(vllm_sampling_params, key)
                 if overwrited_key is not None:
                     generation_kwargs[key] = overwrited_key
-   return generation_kwargs
+    return generation_kwargs
+pass
 RL_REPLACEMENTS["grpo_update_SamplingParams"] = grpo_update_SamplingParams
 
 
