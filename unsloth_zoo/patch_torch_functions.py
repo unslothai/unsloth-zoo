@@ -168,8 +168,12 @@ pass
 
 def patch_torch_functions():
     # All Unsloth Zoo code licensed under LGPLv3
-    torch.nn.functional.layer_norm    = layer_norm
-    torch.nn.functional.cross_entropy = cross_entropy
+    if not hasattr(torch.nn.functional, "_uncompiled_layer_norm"):
+        torch.nn.functional._uncompiled_layer_norm = torch.nn.functional.layer_norm
+        torch.nn.functional.layer_norm = layer_norm
+    if not hasattr(torch.nn.functional, "_uncompiled_cross_entropy"):
+        torch.nn.functional._uncompiled_cross_entropy = torch.nn.functional.cross_entropy
+        torch.nn.functional.cross_entropy = cross_entropy
 pass
 
 
