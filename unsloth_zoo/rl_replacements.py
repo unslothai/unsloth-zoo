@@ -185,7 +185,7 @@ def grpo_update_SamplingParams(SamplingParams, generation_kwargs, vllm_sampling_
         for key in good_sampling_params_keys:
             if hasattr(vllm_sampling_params, key):
                 overwrited_key = getattr(vllm_sampling_params, key)
-                if overwrited_key is not None:
+                if overwrited_key is not None and (type(overwrited_key) in (list, tuple,) and len(overwrited_key) != 0):
                     generation_kwargs[key] = overwrited_key
     return generation_kwargs
 pass
