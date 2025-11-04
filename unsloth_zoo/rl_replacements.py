@@ -626,7 +626,6 @@ def grpo_accumulated_loss(
                 image_sizes = image_sizes,
                 logits_to_keep = logits_to_keep + 1,
             ).logits
-            
     loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
         new_hidden_states,
         old_hidden_states,
