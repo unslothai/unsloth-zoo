@@ -1201,7 +1201,13 @@ def merge_and_overwrite_lora(
             if safe_tensor_index_files:
                 local_index_path = os.path.join(model_name, "model.safetensors.index.json")
                 if os.path.exists(local_index_path):
-                    shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
+                    try:
+                        shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
+                    except shutil.SameFileError:
+                        pass
+                    except Exception as e:
+                        print(f"Error copying model.safetensors.index.json: {e}")
+                        raise e
         else:
             # Download from HF
             if "model.safetensors.index.json" in [f for f in safe_tensor_index_files]:
