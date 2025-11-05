@@ -931,10 +931,10 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     # Keep strings to check padding
     parsed = [(m.group(1), m.group(2), m.group(3)) for m in matches]
     
-    # shard and total have same padding
-    for prefix, shard_str, total_str in parsed:
-        if len(shard_str) != len(total_str):
-            return False
+    # shard and total have same padding: turned off as deepseekocr padding is different
+    # for prefix, shard_str, total_str in parsed:
+    #     if len(shard_str) != len(total_str):
+    #         return False
     
     # same prefix and total
     prefixes, _, totals = zip(*parsed)
