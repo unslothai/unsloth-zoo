@@ -95,13 +95,7 @@ def compute_fused_ce_loss(
 
     # Calculate cross entropy loss
     reduction = "sum" if n_items is not None else "mean"
-    # Since we overwrite torch.compile(torch.nn.functional.cross_entropy)
-    # We might get double compile errors, so use the uncompiled version
-    cross_entropy = \
-        torch.nn.functional._uncompiled_cross_entropy if \
-        hasattr(torch.nn.functional, "_uncompiled_cross_entropy") else \
-        torch.nn.functional.cross_entropy
-    loss = cross_entropy(
+    loss = torch.nn.functional.cross_entropy(
         input  = logits.view(-1, vocab_size).float().contiguous(),
         target = labels.view(-1).to(device).contiguous(),
         reduction = reduction,
