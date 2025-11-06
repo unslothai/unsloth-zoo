@@ -920,6 +920,26 @@ def fix_tokenizer_config_json(tokenizer, saved_folder):
     return
 pass
 
+def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
+    """Check if filenames follow HF sharded naming: model-00001-of-00005.safetensors"""
+    pattern = re.compile(r'^(.+?)-(\d+)-of-(\d+)\.safetensors$')
+    
+    matches = [pattern.match(f) for f in filenames]
+    if not all(matches):
+        return False
+    
+    # Keep strings to check padding
+    parsed = [(m.group(1), m.group(2), m.group(3)) for m in matches]
+    
+    # shard and total have same padding: turned off as deepseekocr padding is different
+    # for prefix, shard_str, total_str in parsed:
+    #     if len(shard_str) != len(total_str):
+    #         return False
+    
+    # same prefix and total
+    prefixes, _, totals = zip(*parsed)
+    return len(set(prefixes)) == 1 and len(set(totals)) == 1
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -1170,7 +1190,8 @@ def merge_and_overwrite_lora(
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
     copied_tokenizer_model_from_cache = False
-    safe_tensor_index_files = ["model.safetensors.index.json"] if len(safetensors_list) > 1 else []
+    is_hf_sharded = is_hf_sharded_safetensors(safetensors_list)
+    safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded) else []
 
     # ONLY download/copy the original index if we are NOT dequantizing an MXFP4 model
     if (not (base_model_is_quantized and quant_type == "mxfp4") or (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")) and not needs_splitting:
@@ -1180,7 +1201,13 @@ def merge_and_overwrite_lora(
             if safe_tensor_index_files:
                 local_index_path = os.path.join(model_name, "model.safetensors.index.json")
                 if os.path.exists(local_index_path):
-                    shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
+                    try:
+                        shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
+                    except shutil.SameFileError:
+                        pass
+                    except Exception as e:
+                        print(f"Error copying model.safetensors.index.json: {e}")
+                        raise e
         else:
             # Download from HF
             if "model.safetensors.index.json" in [f for f in safe_tensor_index_files]:
@@ -1282,7 +1309,8 @@ def merge_and_overwrite_lora(
     if needs_splitting:
         final_safetensors_list = renumber_safetensor_files(final_safetensors_list, save_directory)
 
-    regenerate_index = ((base_model_is_quantized and quant_type == "mxfp4") or needs_splitting) and len(final_safetensors_list) > 1 and save_method != "mxfp4"
+    is_final_safetensors_list_sharded = is_hf_sharded_safetensors(final_safetensors_list)
+    regenerate_index = ((base_model_is_quantized and quant_type == "mxfp4") or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded) and save_method != "mxfp4"
     weight_map = {}
 
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):

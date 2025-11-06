@@ -126,7 +126,6 @@ def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
 pass
 RL_REPLACEMENTS["left_pack_padding"] = left_pack_padding
 
-import torch
 
 def align_logprobs_with_mask(
     logprob_tensor: torch.Tensor,
@@ -176,8 +175,21 @@ def align_logprobs_with_mask(
     padded_logprobs[valid_rows, valid_cols] = valid_vals
 
     return padded_logprobs
-
+pass
 RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
+
+
+def grpo_update_SamplingParams(SamplingParams, generation_kwargs, vllm_sampling_params = None):
+    good_sampling_params_keys = inspect.signature(SamplingParams).parameters.keys()
+    if vllm_sampling_params is not None:
+        for key in good_sampling_params_keys:
+            if hasattr(vllm_sampling_params, key):
+                overwrited_key = getattr(vllm_sampling_params, key)
+                if overwrited_key is not None and (type(overwrited_key) in (list, tuple,) and len(overwrited_key) != 0):
+                    generation_kwargs[key] = overwrited_key
+    return generation_kwargs
+pass
+RL_REPLACEMENTS["grpo_update_SamplingParams"] = grpo_update_SamplingParams
 
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
@@ -250,15 +262,15 @@ def grpo_compute_loss(
             old_x = torch.gather(old_logits, dim = -1, index = input_ids).squeeze(-1)
             old = old_x - torch.logsumexp(old_logits, dim = -1)
         pass
+        if use_vllm and sampling_per_token_logps is not None:
+            #must filter out extra prompt tokens in begining after making input_ids left padded
+            importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
+            importance_sampling_ratio = torch.clamp(
+                importance_sampling_ratio, max=vllm_importance_sampling_cap
+            )
+        pass
     pass
-
-    if use_vllm and sampling_per_token_logps is not None:
-        #must filter out extra prompt tokens in begining after making input_ids left padded
-        importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
-        importance_sampling_ratio = torch.clamp(
-            importance_sampling_ratio, max=vllm_importance_sampling_cap
-        )
-
+    
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
     if beta != 0.0:
@@ -626,7 +638,6 @@ def grpo_accumulated_loss(
                 image_sizes = image_sizes,
                 logits_to_keep = logits_to_keep + 1,
             ).logits
-
     loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
         new_hidden_states,
         old_hidden_states,

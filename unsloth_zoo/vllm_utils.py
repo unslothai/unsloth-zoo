@@ -28,6 +28,7 @@ __all__ = [
     "generate_batches",
     "convert_lora_modules",
     "return_lora_modules",
+    "get_lora_supported_ranks",
 ]
 
 from typing import Optional, List, Tuple, Dict, Any
@@ -721,33 +722,35 @@ def patch_vllm_graph_capture():
     except Exception as e:
         print(f"Unsloth: Could not patch vLLM V1 graph capture: {e}")
 
-    # Also patch vLLM v0
-    try:
-        from vllm.worker.model_runner import GPUModelRunnerBase, logger
-        logger.info('Unsloth: Patching vLLM v0 graph capture')
-        original_capture_model_v0 = GPUModelRunnerBase.capture_model
+    from packaging.utils import Version
+    if Version(vllm.__version__) < Version("0.11.0"):
+        # Also patch vLLM v0. vLLM v0 is deprecated in vLLM v0.11.0 so only do when appropriate.
+        try:
+            from vllm.worker.model_runner import GPUModelRunnerBase, logger
+            logger.info('Unsloth: Patching vLLM v0 graph capture')
+            original_capture_model_v0 = GPUModelRunnerBase.capture_model
 
-        @wraps(original_capture_model_v0)
-        def capture_model_wrapper_v0(self, *args, **kwargs):
-            logger.info("Unsloth: Running patched vLLM v0 `capture_model`.")
-            start_time = time.perf_counter()
+            @wraps(original_capture_model_v0)
+            def capture_model_wrapper_v0(self, *args, **kwargs):
+                logger.info("Unsloth: Running patched vLLM v0 `capture_model`.")
+                start_time = time.perf_counter()
 
-            with suppress_gc_collect():
-                result = original_capture_model_v0(self, *args, **kwargs)
+                with suppress_gc_collect():
+                    result = original_capture_model_v0(self, *args, **kwargs)
 
-            end_time = time.perf_counter()
-            logger.info(
-                "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
-                end_time - start_time
-            )
-            for _ in range(2):
-                gc.collect()
-                torch.cuda.empty_cache()
-            return result
-        pass
-        GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
-    except Exception as e:
-        print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
+                end_time = time.perf_counter()
+                logger.info(
+                    "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
+                    end_time - start_time
+                )
+                for _ in range(2):
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                return result
+            pass
+            GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
+        except Exception as e:
+            print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
 pass
 
 
@@ -857,6 +860,23 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
 
+    capability = torch.cuda.get_device_capability()
+    sm_cap = capability[0] * 10 + capability[1]
+
+    try:
+        from vllm.utils.deep_gemm import is_deep_gemm_supported as vllm_is_deep_gemm_supported
+        is_deep_gemm_supported = vllm_is_deep_gemm_supported()
+    except Exception as e:
+        logger.info(f"Unsloth: Could not import vLLM deep_gemm: {e}")
+        is_deep_gemm_supported = False
+
+    try:
+        cutlass_block_fp8_supported = torch.ops._C.cutlass_scaled_mm_supports_block_fp8(sm_cap)
+    except Exception as e:
+        logger.info(f"Unsloth: Could not import vLLM cutlass_block_fp8_supported: {e}")
+        cutlass_block_fp8_supported = False
+    pass
+
     def get_state_dict(prefix, kk, state_dict, proj, slice_weights=True, slice_index=-1):
         proj = getattr(proj, "base_layer", proj)
         qweight = proj.weight
@@ -888,7 +908,18 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
                     scale_suffix = '.weight_scale_inv'
                     block_size = proj.weight_block_size[0]
-                    weight_scale = weight_scale.T
+                    should_use_deepgemm = is_deep_gemm_supported and getattr(proj, "orig_dtype", torch.bfloat16) == torch.bfloat16 and qweight.shape[0] % 128 == 0 and qweight.shape[1] % 128 == 0
+                    if sm_cap==90 and cutlass_block_fp8_supported and not should_use_deepgemm:
+                        # For H100 (at least), the scale seems to be a transpose of what HF expects, while on L4 it is right shape.
+                        # This is done by vLLM based on a few checks that we replicated above.
+                        # https://github.com/vllm-project/vllm/blob/294c805f1df9ddf62c2290989710da9d48ab4973/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1172-L1179
+                        weight_scale = weight_scale.T
+                        logger.info(f"Unsloth: Transposed weight scale for {prefix} for weight shape {qweight.shape} and scale shape {weight_scale.shape}")
+                    pass
+                    a, b = qweight.shape
+                    p, q = weight_scale.shape
+                    # This is just a sanity check to ensure that we don't end up with wrongly sliced weight of shape [0, x] :)
+                    assert a // p == proj.weight_block_size[0] and b // q == proj.weight_block_size[1], f"Unsloth: vLLM weight has unexpected weight shape {qweight.shape} and scale {weight_scale.shape} and block size {proj.weight_block_size}"
                 else:
                     # This is dynamic quantization (aka per row or per column). The scale is of shape [n,1]
                     # The weight here is of shape [4096, 6144]. We need to transpose and then slice
@@ -1433,8 +1464,8 @@ def approximate_vllm_memory_usage(
 pass
 
 
-def determine_max_lora_rank(lora_rank = 16):
-    """vLLM doesn't allow any LoRA rank, so we need to get the next largest"""
+@functools.cache
+def get_lora_supported_ranks():
     possible_max_ranks = [8, 16, 32, 64, 128, 256, 320, 512]
     try:
         import vllm.config.lora
@@ -1452,6 +1483,13 @@ def determine_max_lora_rank(lora_rank = 16):
     if type(possible_max_ranks) is str:
         possible_max_ranks = re.findall(r"[\d]{1,}", possible_max_ranks)
         possible_max_ranks = [int(x) for x in possible_max_ranks]
+    return possible_max_ranks
+pass
+
+
+def determine_max_lora_rank(lora_rank = 16):
+    """vLLM doesn't allow any LoRA rank, so we need to get the next largest"""
+    possible_max_ranks = get_lora_supported_ranks()
     for max_lora_rank in possible_max_ranks:
         if max_lora_rank >= lora_rank:
             return max_lora_rank
@@ -1494,16 +1532,21 @@ def load_vllm(
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
-    if unsloth_vllm_standby and gpu_memory_utilization <= 0.9:
-        free_memory, total_memory = get_mem_info()
-        # If T4 ie 15GB, we use 0.85 since it'll rarely OOM. Other GPUs 0.9
-        total_gb = total_memory/1024/1024/1024
-        ten_percent = total_gb * 0.1 # 1.46GB for T4
-        if   ten_percent >= 4.0: gpu_memory_utilization = 0.925
-        elif ten_percent >= 2.0: gpu_memory_utilization = 0.9
-        elif ten_percent >= 1.4: gpu_memory_utilization = 0.85
-        elif ten_percent >= 1.0: gpu_memory_utilization = 0.8
-        else: gpu_memory_utilization = 0.75
+
+    free_memory, total_memory = get_mem_info()
+    # If T4 ie 15GB, we use 0.85 since it'll rarely OOM. Other GPUs 0.9
+    # L4 with ~22GB seems to work at 0.89 but not 0.9 due to larget cuda graphs/large max num sequences we impose
+    total_gb = total_memory/1024/1024/1024
+    ten_percent = total_gb * 0.1 # 1.46GB for T4
+    if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
+    elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
+    elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
+    elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
+    elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
+    else: standby_target_gpu_util = 0.75
+
+    if unsloth_vllm_standby and gpu_memory_utilization < standby_target_gpu_util:
+        gpu_memory_utilization = standby_target_gpu_util
         logger.info(f"Unsloth: Standby mode is enabled. Changing `gpu_memory_utilization` to {gpu_memory_utilization}.")
 
     if DEVICE_TYPE == "cuda":

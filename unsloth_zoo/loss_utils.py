@@ -106,7 +106,11 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
                 ignore_index = ignore_index,
                 reduction    = reduction,
             )
-            if reduction == "sum": loss = loss / num_items_in_batch
+            if reduction == "sum":
+                # just in case users pass an int for num_items_in_batch, which could be the case for custom trainer
+                if torch.is_tensor(num_items_in_batch):
+                    num_items_in_batch = num_items_in_batch.to(loss.device)
+                loss = loss / num_items_in_batch
         return loss
     pass
     
