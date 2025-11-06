@@ -28,6 +28,7 @@ __all__ = [
     "generate_batches",
     "convert_lora_modules",
     "return_lora_modules",
+    "get_lora_supported_ranks",
 ]
 
 from typing import Optional, List, Tuple, Dict, Any
@@ -1463,8 +1464,8 @@ def approximate_vllm_memory_usage(
 pass
 
 
-def determine_max_lora_rank(lora_rank = 16):
-    """vLLM doesn't allow any LoRA rank, so we need to get the next largest"""
+@functools.cache
+def get_lora_supported_ranks():
     possible_max_ranks = [8, 16, 32, 64, 128, 256, 320, 512]
     try:
         import vllm.config.lora
@@ -1482,6 +1483,13 @@ def determine_max_lora_rank(lora_rank = 16):
     if type(possible_max_ranks) is str:
         possible_max_ranks = re.findall(r"[\d]{1,}", possible_max_ranks)
         possible_max_ranks = [int(x) for x in possible_max_ranks]
+    return possible_max_ranks
+pass
+
+
+def determine_max_lora_rank(lora_rank = 16):
+    """vLLM doesn't allow any LoRA rank, so we need to get the next largest"""
+    possible_max_ranks = get_lora_supported_ranks()
     for max_lora_rank in possible_max_ranks:
         if max_lora_rank >= lora_rank:
             return max_lora_rank
