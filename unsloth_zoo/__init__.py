@@ -14,22 +14,24 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.11.2"
+__version__ = "2025.11.3"
 
 import os
 import warnings
 import re
+# Stop TOKENIZERS_PARALLELISM warning
+if "TOKENIZERS_PARALLELISM" not in os.environ:
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # Hugging Face Hub faster downloads
 if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-pass
 
 # More stable downloads
 if os.environ.get("UNSLOTH_STABLE_DOWNLOADS", "0") == "1":
     os.environ["HF_HUB_ETAG_TIMEOUT"] = "30" # Default is 10 seconds
     os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30" # Default is 10 seconds
     os.environ["HF_HUB_DISABLE_XET"] = "1" # Disable XET
-pass
 
 # Check offline mode as well
 if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
@@ -45,7 +47,6 @@ os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = "64"
 # More verbose HF Hub info
 if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
     os.environ["HF_HUB_VERBOSITY"] = "info"
-pass
 
 # More logging for Triton
 os.environ["TRITON_DISABLE_LINE_INFO"] = "1" # Reduces Triton binary size
@@ -58,7 +59,6 @@ if (os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1") or \
     os.environ["TRITON_FRONT_END_DEBUGGING"] = "0" # Debugging
     os.environ["TRITON_ALWAYS_COMPILE"] = "1" # Always compile kernels
     os.environ["NCCL_DEBUG"] = "WARN" # Warn on NCCL issues
-pass
 
 # Triton compile debugging
 if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
@@ -69,7 +69,6 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
     # Also fails on get_int1_ty for example (bool)
     os.environ["TRITON_INTERPRET"] = "0"
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1" # Blocking calls for debugging
-pass
 
 
 from importlib.util import find_spec
@@ -80,7 +79,6 @@ if find_spec("torch") is None:
         "Unsloth: Pytorch is not installed. Go to https://pytorch.org/.\n"\
         "We also have some installation instructions on our Github page."
     )
-pass
 
 # Reduce VRAM usage by reducing fragmentation
 # And optimize pinning of memory
@@ -103,7 +101,6 @@ elif os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1":
                 stacklevel = 2,
             )
             os.environ[key] = re.sub(r"expandable\_segments\:True\,?", "", os.environ[key])
-pass
 
 # We support Pytorch 2
 # Fixes https://github.com/unslothai/unsloth/issues/38
@@ -121,7 +118,6 @@ elif (major_torch == 2) and (minor_torch < 2):
     delete_key("PYTORCH_CUDA_ALLOC_CONF")
     delete_key("PYTORCH_HIP_ALLOC_CONF")
     delete_key("PYTORCH_ALLOC_CONF")
-pass
 
 # Suppress WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.7.0+cu126 for torchao version 0.14.1
 # Please see https://github.com/pytorch/ao/issues/2919 for more info
@@ -132,7 +128,7 @@ class HideLoggingMessage(logging.Filter):
     __slots__ = "text",
     def __init__(self, text): self.text = text
     def filter(self, x): return not (self.text in x.getMessage())
-pass
+
 torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
 del logging, torchao_logger, HideLoggingMessage
 
@@ -164,7 +160,7 @@ else:
     elif DEVICE_TYPE == "cuda":
         delete_key("PYTORCH_HIP_ALLOC_CONF")
         delete_key("PYTORCH_ALLOC_CONF")
-pass
+
 # CCE fails on Torch 2.8 and above
 # OutOfResources: out of resource: shared memory, Required: 98304, Hardware limit: 65536. Reducing block sizes or `num_stages`
 if (major_torch >= 2 and minor_torch >= 8) or (major_torch > 2):
@@ -176,17 +172,14 @@ del delete_key, major_torch, minor_torch, torch_version, importlib_version, find
 
 if not ("UNSLOTH_IS_PRESENT" in os.environ):
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
-pass
 
 try:
     print("🦥 Unsloth: Will patch your computer to enable 2x faster free finetuning.")
 except:
     print("Unsloth: Will patch your computer to enable 2x faster free finetuning.")
-pass
+
 # Log Unsloth-Zoo Utilities
 os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
-del os
-
 
 from .temporary_patches import (
     encode_conversations_with_harmony,
@@ -208,6 +201,8 @@ try:
     # This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
     from pydantic.warnings import UnsupportedFieldAttributeWarning
     warnings.filterwarnings(action = "ignore", category = UnsupportedFieldAttributeWarning)
-    del warnings, UnsupportedFieldAttributeWarning
+    del UnsupportedFieldAttributeWarning
 except:
     pass
+
+del os, warnings, re
