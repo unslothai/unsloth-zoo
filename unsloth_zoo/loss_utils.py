@@ -348,7 +348,18 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)
                     mark_dynamic(token_type_ids, 1)
-                token_counts.append(token_count.sum())
+                count = token_count.sum()
+                if "packed_seq_lengths" in x:
+                    seq_lengths = x["packed_seq_lengths"]
+                    if torch.is_tensor(seq_lengths):
+                        seq_lengths = seq_lengths.to(device = count.device)
+                        num_sequences = torch.count_nonzero(seq_lengths > 0)
+                    else:
+                        num_sequences = sum(1 for length in seq_lengths if length > 0)
+                    extra_sequences = num_sequences - 1
+                    if extra_sequences > 0:
+                        count = count - count.new_tensor(extra_sequences)
+                token_counts.append(count)
             pass
             num_items_in_batch = sum(token_counts)
 
