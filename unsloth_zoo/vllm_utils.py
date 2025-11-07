@@ -1386,29 +1386,25 @@ def vllm_weights_memory_usage(
     is_vision_model = False,
 ):
 
-    _, original_meta_model, num_layers, layer_names = create_empty_model(config, dtype = torch.float16, is_vision_model = is_vision_model)
+    _, original_meta_model, _, _ = create_empty_model(config, dtype = torch.float16, is_vision_model = is_vision_model)
     meta_model_state_dict = original_meta_model.state_dict()
     quant_config = getattr(config, "quantization_config", None)
     non_quantized_keys = []
     if quant_config:
         non_quantized_keys = getattr(quant_config, "llm_int8_skip_modules", [])
 
-    def count_from_shape(shape):
-        count = 1
-        for s in shape:
-            count *= s
-        return count
     weight_size = 0
     qweight_size = 1 if load_in_8bit else 0.5 if load_in_4bit else 2
     for n,p in meta_model_state_dict.items():
         if 'norm' in n:
-            weight_size += p.numel() * 2 # asssume 32bit for norm
+            weight_size += p.numel() * 4 # asssume 32bit for norm aka 4B
         elif any(key in n for key in non_quantized_keys):
-            # if anything in non_quantized_keys is a substring of n, then prefer using original dtype size (1 byte)
-            weight_size += p.numel()
+            # if anything in non_quantized_keys is a substring of n, then prefer using original dtype size (2 byte)
+            weight_size += p.numel() * 2
         else:
             # otherwise, add to the weight size
             weight_size += p.numel() * qweight_size
+    logger.info(f"Unsloth: Estimate for vLLM weights = {weight_size / (2**30)} GiB")
     return weight_size
 
 
@@ -1430,11 +1426,8 @@ def vllm_memory_usage(
 
     weight_size = vllm_weights_memory_usage(config, load_in_4bit = load_in_4bit, load_in_8bit = load_in_8bit)
     text_config = getattr(config, "text_config", config) #try using text config for VLMs
-    vision_config = getattr(config, "vision_config", None)
 
-    vocab_size = text_config.vocab_size
     hd = text_config.hidden_size
-    context_length = text_config.max_position_embeddings
     mlp_size = text_config.intermediate_size
     n_layers = text_config.num_hidden_layers
     n_kv_heads = getattr(text_config, "num_key_value_heads", 1)
@@ -1442,7 +1435,8 @@ def vllm_memory_usage(
     # Group Query Attention
     kv_size = hd // n_heads * n_kv_heads
 
-    kv_cache_per_token = 2 * kv_size * n_layers
+    kv_cache_scale = 1 if float8_kv_cache else 2
+    kv_cache_per_token = kv_size * n_layers * kv_cache_scale
     kv_cache_for_max_tokens = max_seq_length * kv_cache_per_token
 
     # Activation memory - assume bsz=2 (this is an overkill tbh)
@@ -1452,6 +1446,8 @@ def vllm_memory_usage(
     activation_mlp  = bsz * (mlp_size + mlp_size)
     total_activation = activation_qkv + residual_memory + activation_mlp
     activation_memory_per_token = total_activation * 2 # Assuming 16bit for activation
+
+    logger.info(f"Unsloth: Estimate for vLLM activation per token = {total_activation / (2**10)} KB and KV Cache per token = {kv_cache_per_token / (2**10)} KB")
 
 
     # LoRA modules on all QKVO, MLP
@@ -1466,9 +1462,9 @@ def vllm_memory_usage(
     if not enable_lora: lora_elements = 0
 
     # necessary: usable_memory > weight_memory + activation_memory + kv_cache + lora + cuda graphs + overhead
-    mem_left_for_kvcache_and_activations = usable_memory - weight_size - lora_elements - kv_cache_for_max_tokens
+    mem_left_for_kvcache_and_activations = usable_memory - weight_size - lora_elements - kv_cache_for_max_tokens - min(0.1 * total_memory, 4*(2**30)) # min of 10% or 4GiB overhead for eg cuda graphs
     assert mem_left_for_kvcache_and_activations > 0, "Unsloth: Not enough memory to load vLLM for this model"
-    mem_left_for_kvcache_and_activations = mem_left_for_kvcache_and_activations * min(0.1 * free_memory, 4*(2**30)) # min of 10% or 4GiB overhead for eg cuda graphs
+    mem_left_for_kvcache_and_activations = mem_left_for_kvcache_and_activations
 
 
     def vllm_v1_memory_check():
@@ -1695,11 +1691,6 @@ def load_vllm(
         if float8_kv_cache and major_version < 8:
             raise NotImplementedError("Unsloth: Your GPU is too old for float8 KV cache! Set it to False.")
 
-    if hasattr(config, "text_config"):
-        mem_config = config.text_config
-    else:
-        mem_config = config
-
     # Determine the maximum LoRA rank since vLLM restricts the rank to some values
     new_max_lora_rank = determine_max_lora_rank(max_lora_rank)
     if new_max_lora_rank != max_lora_rank:
@@ -1716,8 +1707,8 @@ def load_vllm(
 
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
-    approximate_vllm_memory_usage(
-        mem_config,
+    vllm_memory_usage(
+        config,
         load_in_4bit = use_bitsandbytes,
         load_in_8bit = is_fp8,
         max_seq_length = max_seq_length,
@@ -1802,29 +1793,7 @@ def load_vllm(
 
     pass
 
-    # Use VLLM_USE_V1 for vllm >= 0.7.4 and CUDA >= 8.0
-    # [FAILS] for bitsandbytes - https://github.com/unslothai/unsloth/issues/2102
-    # if importlib.util.find_spec("vllm") and (major_version >= 8):
-    #     from importlib.metadata import version as importlib_version
-    #     from packaging.version import Version
-    #     if Version(importlib_version("vllm")) > Version("0.7.3"):
-    #         os.environ["VLLM_USE_V1"] = "1"
-    # pass
-
     from vllm import LLM, LLMEngine, AsyncLLMEngine, EngineArgs, AsyncEngineArgs
-
-    # # Default vLLM max_num_seqs is 256
-    # approx_max_num_seqs = 256
-    # if   memory_left_for_kv_cache_gb <=  2: approx_max_num_seqs = 128 # - 32
-    # elif memory_left_for_kv_cache_gb <=  4: approx_max_num_seqs = 160 # - 32
-    # elif memory_left_for_kv_cache_gb <=  8: approx_max_num_seqs = 192 # - 32
-    # elif memory_left_for_kv_cache_gb <= 12: approx_max_num_seqs = 224 # - 32
-    # elif memory_left_for_kv_cache_gb <= 16: approx_max_num_seqs = 256 # Default
-    # elif memory_left_for_kv_cache_gb <= 24: approx_max_num_seqs = 288 # + 32
-    # elif memory_left_for_kv_cache_gb <= 40: approx_max_num_seqs = 320 # + 32
-    # elif memory_left_for_kv_cache_gb <= 48: approx_max_num_seqs = 226 # + 16
-    # elif memory_left_for_kv_cache_gb <= 80: approx_max_num_seqs = 368 # + 32
-    # else: approx_max_num_seqs = 400 # + 32
 
     approx_max_num_seqs = 64 # We really do not need more than 64 sequences at a time.
 
@@ -1841,23 +1810,6 @@ def load_vllm(
     # float8 KV cache can fit more sequences in 1 go so more throughput
     if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
 
-    # vLLM default max_num_batched_tokens is 2048
-    # chunked_prefill_tokens = 2048 if vllm_backend_check() == "V0" else 8192 # we don't seem to be passing this to vLLM loadup
-    # if not is_vision_model:
-    #     if   memory_left_for_kv_cache_gb <=  8: chunked_prefill_tokens = 1024 # + 0
-    #     elif memory_left_for_kv_cache_gb <= 12: chunked_prefill_tokens = 1536 # + 512
-    #     elif memory_left_for_kv_cache_gb <= 16: chunked_prefill_tokens = 2048 # + 512
-    #     elif memory_left_for_kv_cache_gb <= 24: chunked_prefill_tokens = 3072 # + 1024
-    #     elif memory_left_for_kv_cache_gb <= 40: chunked_prefill_tokens = 4096 # + 1024
-    #     elif memory_left_for_kv_cache_gb <= 48: chunked_prefill_tokens = 4608 # + 512
-    #     elif memory_left_for_kv_cache_gb <= 80: chunked_prefill_tokens = 8192 # + 4096
-    #     else: chunked_prefill_tokens = 8192 # + 0
-
-    #     # vLLM errors out from max_seq_length (2048) being bigger than chunked_prefill_tokens (1024)
-    #     chunked_prefill_tokens = max_seq_length
-
-    # Scale num_seqs by conservativeness
-    # approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
 
     # Check max RAM usage for vLLM (swap space) default is 4GB
     memory = psutil.virtual_memory()
