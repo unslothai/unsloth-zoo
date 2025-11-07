@@ -1461,11 +1461,12 @@ def vllm_memory_usage(
     lora_elements = lora_elements*n_layers * 2
     if not enable_lora: lora_elements = 0
 
+    msg = f"Please increase `gpu_memory_utilization` or decrease `max_seq_length`. Ideally use Unsloth vLLM Standby if not already using"
+
     # necessary: usable_memory > weight_memory + activation_memory + kv_cache + lora + cuda graphs + overhead
     mem_left_for_kvcache_and_activations = usable_memory - weight_size - lora_elements - kv_cache_for_max_tokens - min(0.1 * total_memory, 4*(2**30)) # min of 10% or 4GiB overhead for eg cuda graphs
-    assert mem_left_for_kvcache_and_activations > 0, "Unsloth: Not enough memory to load vLLM for this model"
+    assert mem_left_for_kvcache_and_activations > 0, f"Unsloth: Not enough memory to load vLLM for this model. {msg}"
     mem_left_for_kvcache_and_activations = mem_left_for_kvcache_and_activations
-
 
     def vllm_v1_memory_check():
         # Now we should fit in activations and if there's any additional memory, let it be used for KV cache
@@ -1485,19 +1486,24 @@ def vllm_memory_usage(
         # 1. If seq len < 32K, we use seq len. Else we use max num batched tokens
         fittable_activation_tokens = mem_left_for_kvcache_and_activations // activation_memory_per_token
         profile_tokens = max_seq_length if max_seq_length < 32768 else 2048
-        assert fittable_activation_tokens > profile_tokens, "Unsloth: Not enough memory to load vLLM for this model"
+        assert fittable_activation_tokens > profile_tokens, f"Unsloth: Not enough memory to load vLLM for this model. {msg}"
         return profile_tokens
 
-    profile_tokens = vllm_v0_memory_check() if vllm_backend_check() == "V0" else vllm_v1_memory_check()
+    max_num_batched_tokens = vllm_v0_memory_check() if vllm_backend_check() == "V0" else vllm_v1_memory_check()
+    assert max_num_batched_tokens >= 2048, f"Unsloth: we recommend having at least 2048 batched tokens for vLLM. {msg}"
+    logger.info(f'Unsloth: Profile tokens = {max_num_batched_tokens}')
 
     # Calculate how many requests of full lenght can we fit in
-    mem_left = mem_left_for_kvcache_and_activations - profile_tokens * activation_memory_per_token
+    mem_left = mem_left_for_kvcache_and_activations - max_num_batched_tokens * activation_memory_per_token
     kv_seqs = mem_left // (kv_cache_per_token * max_seq_length) + 1 # we already accounted for this before
+
 
     if kv_seqs > 8:
         max_num_batched_tokens *= 2 # If we can fit in >8 full length requests, we better use that memory to speed up prefill (wont be a lot of speed up for RL)
 
     final_mem_left_for_kv_cache = usable_memory - weight_size - lora_elements - max_num_batched_tokens * activation_memory_per_token
+
+    logger.info(f'{max_num_batched_tokens=} {kv_seqs=} {final_mem_left_for_kv_cache / (2**30)=} GiB')
 
     return max_num_batched_tokens, 64, gpu_memory_utilization, final_mem_left_for_kv_cache / (2**30)
 
