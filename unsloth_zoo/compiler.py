@@ -1613,7 +1613,7 @@ pass
 MOE_ROUTING_WEIGHTS_CAST_PATTERN = r"(\brouting_weights\s*=\s*routing_weights\.to\(\s*)hidden_states(\.dtype\s*\))"
 MOE_ROUTING_WEIGHTS_CAST_REPLACE = r"\1router_logits\2"
 
-def patch_moe_routing_weights_cast(module_cls: Any, source: str) -> str:
+def patch_moe_routing_weights_cast(module_cls: Any, source: str) -> Tuple[str, Dict[str, str]]:
     new_route_sources = {}
     for method_name, obj in module_cls.__dict__.items():
         if isinstance(obj, (staticmethod, classmethod)):
