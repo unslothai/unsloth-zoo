@@ -1440,7 +1440,7 @@ def vllm_memory_usage(
     kv_cache_per_token = kv_size * n_layers * kv_cache_scale
     kv_cache_for_max_tokens = max_seq_length * kv_cache_per_token
 
-    total_activation = transformer_layer_activation_memory(hd, kv_size, mlp_size, bsz=1, residual_factor=2) * n_layers
+    total_activation = transformer_layer_activation_memory(hd, kv_size, mlp_size, bsz=1, residual_factor=2)
 
     logger.info(f"Unsloth: Estimate for vLLM activation per token = {total_activation / (2**10)} KB and KV Cache per token = {kv_cache_per_token / (2**10)} KB")
 

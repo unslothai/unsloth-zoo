@@ -23,6 +23,7 @@ __all__ = [
     "copy_attributes",
     "get_mm_dummy_batch_from_hf_config",
     "get_mm_dummy_batch_shapes",
+    "transformer_layer_activation_memory",
 ]
 
 import torch
