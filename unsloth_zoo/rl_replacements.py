@@ -265,7 +265,7 @@ def grpo_compute_loss(
     # new_x = torch.gather(new_logits, dim = -1, index = input_ids).squeeze(-1)
     # new = new_x - torch.logsumexp(new_logits, dim = -1)
     # x_i - logsumexp(x_i)
-    with torch.no_grad():
+    # with torch.no_grad():
     #     if beta != 0.0:
     #         assert ref_logits is not None, "ref_logits should not be None when beta != 0.0"
             
@@ -293,14 +293,14 @@ def grpo_compute_loss(
     #         old_x = torch.gather(old_logits, dim = -1, index = input_ids).squeeze(-1)
     #         old = old_x - torch.logsumexp(old_logits, dim = -1)
     #     pass
-        if use_vllm and sampling_per_token_logps is not None:
-            #must filter out extra prompt tokens in begining after making input_ids left padded
-            importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
-            importance_sampling_ratio = torch.clamp(
-                importance_sampling_ratio, max=vllm_importance_sampling_cap
-            )
-        pass
-    pass
+        # if use_vllm and sampling_per_token_logps is not None:
+        #     #must filter out extra prompt tokens in begining after making input_ids left padded
+        #     importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
+        #     importance_sampling_ratio = torch.clamp(
+        #         importance_sampling_ratio, max=vllm_importance_sampling_cap
+        #     )
+        # pass
+    # pass
     
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
@@ -351,16 +351,16 @@ def grpo_compute_loss(
     loss_2 = coef_2 * advantages.unsqueeze(1)
     loss_i = -torch.min(loss_1, loss_2)
 
-    if use_vllm and sampling_per_token_logps is not None:
-        loss_i = loss_i * importance_sampling_ratio     
-        #delta for metric
-        with torch.no_grad():
-            delta = torch.abs(old - sampling_per_token_logps)
-            delta = delta * mask
-            flat_is_ratio = importance_sampling_ratio * mask
-    else:
-        delta = torch.tensor([]).detach()
-        flat_is_ratio = torch.tensor([]).detach()
+    # if false and use_vllm and sampling_per_token_logps is not None:
+    #     loss_i = loss_i * importance_sampling_ratio     
+    #     #delta for metric
+    #     with torch.no_grad():
+    #         delta = torch.abs(old - sampling_per_token_logps)
+    #         delta = delta * mask
+    #         flat_is_ratio = importance_sampling_ratio * mask
+    # else:
+    delta = torch.tensor([]).detach()
+    flat_is_ratio = torch.tensor([]).detach()
     if beta != 0.0:
         loss_i = loss_i + beta * kl_i
     
