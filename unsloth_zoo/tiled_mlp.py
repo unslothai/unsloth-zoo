@@ -86,6 +86,9 @@ class TiledMLP(torch.autograd.Function):
     @torch_amp_custom_fwd
     def forward(ctx, mlp_forward, mlp_module, x, preserve_rng_state, num_shards):
         # num_shards is probably the wrong name and it should be n_splits
+        # num_shards is also not guaranteed. It could end up having num_shards + 1
+        # the main thing is the shard seq length is all the same unless it's not 
+        # evenly divisible with sequence length. Then the last shard will have the remainder.
         ctx.shard_dim = -2
         B, S, H = x.shape
         # ctx.num_shards = int(max(1, min(S, math.ceil(S / max(1, H)))))
@@ -220,7 +223,7 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
             padded_length = padded_length,
         )
         n_shards, remainder = divmod(flat_qlen, max_flat_qlen)
-        if remainder != 0: n_shards += 1
+        # if remainder != 0: n_shards += 1
 
         # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
