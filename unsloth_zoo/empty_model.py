@@ -1054,18 +1054,18 @@ def get_memory_estimate(config, dummy_batch, encoder_budget):
     model_type = get_model_type(config)
     vision_config = getattr(config, "vision_config", None)
     dtype_bytes = 2 # 2 for fp16 or bf16
+    encoder_output_shape = config.text_config.hidden_size
     saved_states_memory = 0
     if model_type in ['qwen3_vl', 'qwen2_5_vl']:
         # we have pixel_values or pixel_values_videos
         if 'pixel_values' in dummy_batch:
-            dummy_batch_memory = dummy_batch['pixel_values'].numel() * 2
+            dummy_batch_memory = dummy_batch['pixel_values'].numel() * dtype_bytes
             seq_len = dummy_batch['pixel_values'].shape[0]
         elif 'pixel_values_videos' in dummy_batch:
-            dummy_batch_memory = dummy_batch['pixel_values_videos'].numel() * 2
+            dummy_batch_memory = dummy_batch['pixel_values_videos'].numel() * dtype_bytes
             seq_len = dummy_batch['pixel_values_videos'].shape[0]
         else:
             raise ValueError(f"Pixel values not found in dummy batch for model {config.model_name}")
-        encoder_output_shape = config.text_config.hidden_size
         vision_out_dim = getattr(vision_config, "out_hidden_size", config.vision_config.hidden_size)
         num_saved_states = len(getattr(vision_config, 'deepstack_visual_indexes', [])) # will be 0 for qwen2.5-vl
         saved_states_memory = (seq_len // 4) * vision_out_dim * dtype_bytes * num_saved_states # /4 since we reshape in forward.
@@ -1076,8 +1076,17 @@ def get_memory_estimate(config, dummy_batch, encoder_budget):
             tps = getattr(config, 'mm_tokens_per_image', 256) ** 0.5
             kernel_size = ppi // tps
             seq_len = pixel_values.shape[0] * pixel_values.shape[1] * pixel_values.shape[2] / (kernel_size ** 2)
-            dummy_batch_memory = pixel_values.numel() * 2
-            encoder_output_shape = config.text_config.hidden_size
+            dummy_batch_memory = pixel_values.numel() * dtype_bytes
+        else:
+            raise ValueError(f"Pixel values not found in dummy batch for model {config.model_name}")
+    elif model_type in ['mistral3']:
+        if 'pixel_values' in dummy_batch:
+            pixel_values = dummy_batch['pixel_values']
+            seq_len = pixel_values.shape[0]
+            dummy_batch_memory = pixel_values.numel() * dtype_bytes
+            spatial_merge_size = getattr(config, 'spatial_merge_size', 2) ** 2
+            seq_len = pixel_values.numel() // (spatial_merge_size * (getattr(vision_config, 'patch_size', 14) ** 2) * 3) # seq_len is the number of images * number of tokens per image
+            dummy_batch_memory += seq_len * config.text_config.hidden_size * dtype_bytes
         else:
             raise ValueError(f"Pixel values not found in dummy batch for model {config.model_name}")
 
@@ -1095,14 +1104,14 @@ def vision_activation_estimate(config, model_name=None, mm_args=None):
     mlp_size = vision_config.intermediate_size
     num_vision_layers = getattr(vision_config, "depth", getattr(vision_config, "num_hidden_layers", 0))
 
-    # Try to get max_mm_items_per_batch from MultiModalBudget if vLLM is available
-    max_mm_items_per_batch = 1  # Default fallback
     dummy_batch, encoder_budget = get_dummy_batch(config, model_name, mm_args)
 
-    total_memory, seq_len = get_memory_estimate(config, dummy_batch, encoder_budget)
+    additional_memory, seq_len = get_memory_estimate(config, dummy_batch, encoder_budget)
 
     del dummy_batch
 
-    memory_estimate = transformer_layer_activation_memory(hd, hd, mlp_size, max_mm_items_per_batch) * seq_len
+    activation_memory_estimate = transformer_layer_activation_memory(hd, hd, mlp_size) * seq_len
 
-    return memory_estimate
+    vision_overhead = additional_memory + activation_memory_estimate
+
+    return vision_overhead
