@@ -1419,6 +1419,7 @@ def vllm_memory_usage(
     max_loras = 1,
     float8_kv_cache = False,
     account_for_gradients = True,
+    is_vision_model = False,
 ):
 
     free_memory, total_memory = get_mem_info()
@@ -1439,13 +1440,7 @@ def vllm_memory_usage(
     kv_cache_per_token = kv_size * n_layers * kv_cache_scale
     kv_cache_for_max_tokens = max_seq_length * kv_cache_per_token
 
-    # Activation memory - assume bsz=2 (this is an overkill tbh)
-    bsz = 2
-    activation_qkv  = bsz * (hd + kv_size + kv_size)
-    residual_memory = bsz*2
-    activation_mlp  = bsz * (mlp_size + mlp_size)
-    total_activation = activation_qkv + residual_memory + activation_mlp
-    activation_memory_per_token = total_activation * 2 # Assuming 16bit for activation
+    total_activation = transformer_layer_activation_memory(hd, kv_size, mlp_size, bsz=1, residual_factor=2) * n_layers
 
     logger.info(f"Unsloth: Estimate for vLLM activation per token = {total_activation / (2**10)} KB and KV Cache per token = {kv_cache_per_token / (2**10)} KB")
 
@@ -1503,7 +1498,7 @@ def vllm_memory_usage(
 
     final_mem_left_for_kv_cache = usable_memory - weight_size - lora_elements - max_num_batched_tokens * activation_memory_per_token
 
-    logger.info(f'{max_num_batched_tokens=} {kv_seqs=} {final_mem_left_for_kv_cache / (2**30)=} GiB')
+    logger.info(f'For {max_num_batched_tokens=} activation memory is {max_num_batched_tokens * activation_memory_per_token / (2**30)} GiB. {kv_seqs=} {final_mem_left_for_kv_cache / (2**30)=} GiB')
 
     return max_num_batched_tokens, 64, gpu_memory_utilization, final_mem_left_for_kv_cache / (2**30)
 
