@@ -818,8 +818,24 @@ def vllm_dynamic_quant_supported(
 pass
 
 
-@torch.inference_mode
 def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
+    # If the vllm state dict was quantized using torchao, we will run into
+    # the following error when calling ops like aten.t() in inference mode.
+    # This is a bug in PyTorch that affects all tensor subclasses.
+    #
+    #     Cannot set version_counter for inference tensor
+    #
+    # For now, we work around this issue by using torch.no_grad in this case.
+    # See https://github.com/pytorch/pytorch/issues/164872 for more details
+    if get_quant_type(config) == "torchao":
+        ctx_manager = torch.no_grad()
+    else:
+        ctx_manager = torch.inference_mode()
+    with ctx_manager:
+        return _get_vllm_state_dict(llm, return_state_dict, config, is_vision_model)
+
+
+def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
     # vllm_state_dict = {}

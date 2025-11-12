@@ -590,13 +590,15 @@ def grpo_accumulated_loss(
     image_grid_thw = kwargs.get('image_grid_thw',None)
     pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
     image_sizes = kwargs.get('image_sizes',None)
+
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None)
     temperature = kwargs.get("temperature", 1.0)
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
     logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
+
     #delete this from kwargs so less issues 
-    del kwargs["sampling_per_token_logps"]
+    sampling_per_token_logps = kwargs.pop("sampling_per_token_logps", None)
     kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap if sampling_per_token_logps is not None else None
     kwargs["use_vllm"] = trainer.use_vllm
     # Find closest multiple
