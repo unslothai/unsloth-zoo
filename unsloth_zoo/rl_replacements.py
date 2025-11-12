@@ -226,7 +226,17 @@ def align_logprobs_with_mask(
 
 RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
 
-
+def grpo_update_SamplingParams(SamplingParams, generation_kwargs, vllm_sampling_params = None):
+    good_sampling_params_keys = inspect.signature(SamplingParams).parameters.keys()
+    if vllm_sampling_params is not None:
+        for key in good_sampling_params_keys:
+            if hasattr(vllm_sampling_params, key):
+                overwrited_key = getattr(vllm_sampling_params, key)
+                if overwrited_key is not None and (type(overwrited_key) in (list, tuple,) and len(overwrited_key) != 0):
+                    generation_kwargs[key] = overwrited_key
+    return generation_kwargs
+pass
+RL_REPLACEMENTS["grpo_update_SamplingParams"] = grpo_update_SamplingParams
 # Custom compiled GRPO loss - creates 3 Triton kernels
 def grpo_compute_loss(
     ref,
@@ -254,52 +264,14 @@ def grpo_compute_loss(
     vllm_importance_sampling_cap = kwargs.get("vllm_importance_sampling_cap", 2.0)
     input_ids = input_ids.unsqueeze(-1)
 
-    # # Optional logit softcapping and logit dividing
-    # if logit_scale_multiply != 0: new_logits = new_logits * logit_scale_multiply
-    # if logit_scale_divide   != 0: new_logits = new_logits / logit_scale_divide
-    # if logit_softcapping    != 0: new_logits = new_logits * torch.tanh(new_logits / logit_softcapping)
-
-    # new_logits = new_logits.to(torch.float32)
-    # # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-    # if temperature != 1.0: new_logits = new_logits / temperature
-    # new_x = torch.gather(new_logits, dim = -1, index = input_ids).squeeze(-1)
-    # new = new_x - torch.logsumexp(new_logits, dim = -1)
-    # x_i - logsumexp(x_i)
-    # with torch.no_grad():
-    #     if beta != 0.0:
-    #         assert ref_logits is not None, "ref_logits should not be None when beta != 0.0"
-            
-    #         # Optional logit softcapping and logit dividing
-    #         if logit_scale_multiply != 0: ref_logits = ref_logits * logit_scale_multiply
-    #         if logit_scale_divide   != 0: ref_logits = ref_logits / logit_scale_divide
-    #         if logit_softcapping    != 0: ref_logits = ref_logits * torch.tanh(ref_logits / logit_softcapping)
-
-    #         ref_logits = ref_logits.to(torch.float32)
-    #         # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-    #         if temperature != 1.0: ref_logits = ref_logits / temperature
-    #         ref_x = torch.gather(ref_logits, dim = -1, index = input_ids).squeeze(-1)
-    #         ref = ref_x - torch.logsumexp(ref_logits, dim = -1)
-    #     pass
-
-    #     if old_logits is not None:
-    #         # Optional logit softcapping and logit dividing
-    #         if logit_scale_multiply != 0: old_logits = old_logits * logit_scale_multiply
-    #         if logit_scale_divide   != 0: old_logits = old_logits / logit_scale_divide
-    #         if logit_softcapping    != 0: old_logits = old_logits * torch.tanh(old_logits / logit_softcapping)
-
-    #         old_logits = old_logits.to(torch.float32)
-    #         # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-    #         if temperature != 1.0: old_logits = old_logits / temperature
-    #         old_x = torch.gather(old_logits, dim = -1, index = input_ids).squeeze(-1)
-    #         old = old_x - torch.logsumexp(old_logits, dim = -1)
-    #     pass
-        # if use_vllm and sampling_per_token_logps is not None:
-        #     #must filter out extra prompt tokens in begining after making input_ids left padded
-        #     importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
-        #     importance_sampling_ratio = torch.clamp(
-        #         importance_sampling_ratio, max=vllm_importance_sampling_cap
-        #     )
-        # pass
+    with torch.no_grad():
+        if use_vllm and sampling_per_token_logps is not None:
+            #must filter out extra prompt tokens in begining after making input_ids left padded
+            importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
+            importance_sampling_ratio = torch.clamp(
+                importance_sampling_ratio, max=vllm_importance_sampling_cap
+            )
+    pass
     # pass
     
     # Reverse KL
@@ -351,16 +323,16 @@ def grpo_compute_loss(
     loss_2 = coef_2 * advantages.unsqueeze(1)
     loss_i = -torch.min(loss_1, loss_2)
 
-    # if false and use_vllm and sampling_per_token_logps is not None:
-    #     loss_i = loss_i * importance_sampling_ratio     
-    #     #delta for metric
-    #     with torch.no_grad():
-    #         delta = torch.abs(old - sampling_per_token_logps)
-    #         delta = delta * mask
-    #         flat_is_ratio = importance_sampling_ratio * mask
-    # else:
-    delta = torch.tensor([]).detach()
-    flat_is_ratio = torch.tensor([]).detach()
+    if use_vllm and sampling_per_token_logps is not None:
+        loss_i = loss_i * importance_sampling_ratio     
+        #delta for metric
+        with torch.no_grad():
+            delta = torch.abs(old - sampling_per_token_logps)
+            delta = delta * mask
+            flat_is_ratio = importance_sampling_ratio * mask
+    else:
+        delta = torch.tensor([]).detach()
+        flat_is_ratio = torch.tensor([]).detach()
     if beta != 0.0:
         loss_i = loss_i + beta * kl_i
     
@@ -416,25 +388,6 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         if extra_kwargs is None:
             extra_kwargs = {}
         def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states, sampling_per_token_logps, input_ids, mask, advantages, scaling):
-            # new_logits = torch.matmul(new_hidden_states.to(lm_head.dtype), lm_head.t())
-            # new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-            # with torch.no_grad():
-            #     if beta != 0.0:
-            #         ref_logits = torch.matmul(ref_hidden_states.to(lm_head.dtype), lm_head.t())
-            #         ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-            #     else:
-            #         ref_logits = None
-            #     if old_hidden_states is not None:
-            #         old_logits = torch.matmul(old_hidden_states.to(lm_head.dtype), lm_head.t())
-            #         old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-            #     else: 
-            #         old_logits = None
-            # if old_hidden_states is not None: 
-            #     old_logits = torch.matmul(old_hidden_states, lm_head.t()) #last logit already excluded
-            #     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-            # else:
-            #     old_logits = None
-            # unsloth_zoo/rl_replacements.py
             loss, completion_length, mean_kl, delta, flat_is_ratio = grpo_compute_loss(
                 ref_hidden_states,
                 new_hidden_states,
@@ -460,6 +413,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         accumulated_mean_kl           = torch.zeros(1, device = device)
         accumulated_delta             = []
         accumulated_flat_is_ratio     = []
+
         def accumulate_chunk(
             new_hidden_states_j,
             old_hidden_states_j,
@@ -641,6 +595,41 @@ def grpo_accumulated_loss(
             module._hf_hook.io_same_decice = False
     pass
 
+    # Assumes B is determined from a pre-model-call tensor like input_ids
+    B = input_ids.shape[0] 
+    all_logprobs_list = []
+
+    # --- 1. Helper function for optional tensors ---
+    def chunk_optional(tensor, chunks):
+        if tensor is None:
+            return [None] * chunks
+        return torch.chunk(tensor, chunks=chunks, dim=0)
+
+    # --- 2. Chunk all model inputs AND logprob inputs ---
+    input_ids_chunks = torch.chunk(input_ids, chunks=B, dim=0)
+    attention_mask_chunks = torch.chunk(attention_mask, chunks=B, dim=0)
+    completion_ids_chunks = torch.chunk(completion_input_ids, chunks=B, dim=0)
+
+    pixel_values_chunks = chunk_optional(pixel_values, B)
+    image_grid_thw_chunks = chunk_optional(image_grid_thw, B)
+    pixel_attention_mask_chunks = chunk_optional(pixel_attention_mask, B)
+
+    # Handle image_sizes (might be list or tensor)
+    if image_sizes is not None and not isinstance(image_sizes, torch.Tensor):
+        image_sizes_chunks = [[size] for size in image_sizes] # Chunk a list
+    else:
+        image_sizes_chunks = chunk_optional(image_sizes, B) # Chunk a tensor or None
+
+    # --- 3. Zip all chunked inputs together ---
+    zipped_inputs = zip(
+        input_ids_chunks,
+        attention_mask_chunks,
+        pixel_values_chunks,
+        image_grid_thw_chunks,
+        pixel_attention_mask_chunks,
+        image_sizes_chunks,
+        completion_ids_chunks # Added for the logprob calculation
+    )
 
     # Get autocaster
     if trainer._autocast_dtype is None:
@@ -648,45 +637,50 @@ def grpo_accumulated_loss(
     else:
         autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
     with autocaster:
-        if pixel_values is None:
-            new_hidden_states = unwrapped_model(
-                input_ids = input_ids,
-                attention_mask = attention_mask,
-                pixel_values = pixel_values,
-                image_grid_thw = image_grid_thw,
-                pixel_attention_mask = pixel_attention_mask,
-                image_sizes = image_sizes,
-                # logits_to_keep = logits_to_keep + 1,
-            ).logits
+        for (
+            input_ids_chunk,
+            attention_mask_chunk,
+            pixel_values_chunk,
+            image_grid_thw_chunk,
+            pixel_attention_mask_chunk,
+            image_sizes_chunk,
+            input_ids_chunk_for_logprobs # This is the chunk from completion_ids_chunks
+        ) in zipped_inputs:
 
-            #keep extra logit as we generated a new token
-            new_hidden_states = new_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
-        else: 
-            new_hidden_states = unwrapped_model(
-                input_ids = input_ids,
-                attention_mask = attention_mask,
-                pixel_values = pixel_values,
-                image_grid_thw = image_grid_thw,
-                pixel_attention_mask = pixel_attention_mask,
-                image_sizes = image_sizes,
-                logits_to_keep = logits_to_keep+1, 
-            ).logits
-            new_hidden_states= new_hidden_states[:,:-1,:]
+            # --- 4a. Compute hidden states (model call) ---
+            if pixel_values is None:
+                new_hidden_states_chunk = unwrapped_model(
+                    input_ids = input_ids_chunk,
+                    attention_mask = attention_mask_chunk,
+                    pixel_values = pixel_values_chunk,
+                    image_grid_thw = image_grid_thw_chunk,
+                    pixel_attention_mask = pixel_attention_mask_chunk,
+                    image_sizes = image_sizes_chunk,
+                ).logits
+                
+                # --- 4b. Post-process hidden states ---
+                new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
+                
+            else: 
+                new_hidden_states_chunk = unwrapped_model(
+                    input_ids = input_ids_chunk,
+                    attention_mask = attention_mask_chunk,
+                    pixel_values = pixel_values_chunk,
+                    image_grid_thw = image_grid_thw_chunk,
+                    pixel_attention_mask = pixel_attention_mask_chunk,
+                    image_sizes = image_sizes_chunk,
+                    logits_to_keep = logits_to_keep + 1, 
+                ).logits
+                
+                # --- 4b. Post-process hidden states ---
+                new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
 
-        B = new_hidden_states.shape[0] 
-        
-        all_logprobs_list = []
-        hidden_states_chunks           = torch.chunk(new_hidden_states,               chunks=B, dim=0)
-        completion_ids_chunks = torch.chunk(completion_input_ids, chunks=B, dim=0)
-
-        # 2. Iterate over the chunks
-        for logits_chunk, input_ids_chunk in zip(hidden_states_chunks, completion_ids_chunks):
-            
+            # --- 4c. Compute logprobs ---
             logprobs_chunk = chunked_hidden_states_selective_log_softmax(
-                logits_chunk,
+                new_hidden_states_chunk,
                 lm_head, 
-                input_ids_chunk, 
-                chunks = 64, # Because this chunk's batch size is 1
+                input_ids_chunk_for_logprobs, # Use the chunked completion_ids
+                chunks = 8, # Because this chunk's batch size is 1
                 logit_scale_multiply = logit_scale_multiply, 
                 logit_scale_divide = logit_scale_divide,
                 logit_softcapping = logit_softcapping, 
@@ -695,6 +689,7 @@ def grpo_accumulated_loss(
             
             all_logprobs_list.append(logprobs_chunk)
 
+        # --- 5. Concatenate final results ---
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
 
 
