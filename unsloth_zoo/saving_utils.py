@@ -2096,22 +2096,27 @@ def determine_base_model_source(model_name, token=None):
     if local_path:
         local_is_quantized, local_quant_type = check_model_quantization_status(local_path)
 
-    # Priority 1: Local unquantized OR Local mxfp4
-    if local_path and (not local_is_quantized or local_quant_type == "mxfp4"):
-        if not local_is_quantized:
-            return (local_path, True, "local_unquantized", False, None)
-        else:  # local_quant_type == "mxfp4"
-            return (local_path, True, "local_mxfp4", True, "mxfp4")
+    # Priority 1: Local unquantized
+    if local_path and not local_is_quantized:
+        return (local_path, True, "local_unquantized", False, None)
 
-    # Priority 2: HF unquantized
+    # Priority 2: Local mxfp4
+    if local_path and local_is_quantized and local_quant_type == "mxfp4":  # local_quant_type == "mxfp4"
+        return (local_path, True, "local_mxfp4", True, "mxfp4")
+
+    # Priority 3: HF unquantized
     if hf_exists and not hf_is_quantized:
         return (model_name, False, "HF_unquantized", False, None)
 
-    # Priority 3: HF quantized (covers both "both quantized" and "just HF quantized")
+    # Priority 4: HF quantized (covers both "both quantized" and "just HF quantized")
     if hf_exists and hf_is_quantized:
         return (model_name, False, f"HF_{hf_quant_type}", True, hf_quant_type)
 
-    # Priority 4: Nothing suitable found
+    # Priority 5: Local other quantization
+    if local_path and local_is_quantized:
+        return (local_path, True, f"local_{local_quant_type}", True, local_quant_type)
+
+    # Priority 6: Nothing suitable found
     return (None, False, "", False, None)
 pass
 
