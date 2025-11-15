@@ -239,7 +239,7 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     # Suppress warning on uninited weights
     old_warn = os.environ.get("UNSLOTH_WARN_UNINITIALIZED", "1")
     os.environ["UNSLOTH_WARN_UNINITIALIZED"] = "0"
-    model_name = getattr(config, 'model_name')
+    model_name = getattr(config, 'model_name', None)
     kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype_from_config(config)}
     original_meta_model = None
     error = None
