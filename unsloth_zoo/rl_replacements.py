@@ -610,15 +610,70 @@ def grpo_accumulated_loss(
     attention_mask_chunks = torch.chunk(attention_mask, chunks=B, dim=0)
     completion_ids_chunks = torch.chunk(completion_input_ids, chunks=B, dim=0)
 
-    pixel_values_chunks = chunk_optional(pixel_values, B)
-    image_grid_thw_chunks = chunk_optional(image_grid_thw, B)
-    pixel_attention_mask_chunks = chunk_optional(pixel_attention_mask, B)
+    # 1. Pre-calculate batch-dependent padding (if needed)
+    # This logic MUST run on the full batch BEFORE looping
+    if pixel_values is None:
+        attention_mask = input_ids != self.processing_class.pad_token_id
+        attention_mask = attention_mask.to(attention_mask.dtype)
+        
+        left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, self.processing_class.pad_token_id)
+        max_left_pad = max(left_pad_tokens_per_prompt).item()
+        
+        input_ids = left_pack_padding(input_ids, self.processing_class.pad_token_id)
+    else:
+        # This branch is simpler and doesn't need pre-calculation
+        max_left_pad = 0 # Not used, but defined for clarity
 
-    # Handle image_sizes (might be list or tensor)
+    # 2. Chunk all model inputs
+    input_ids_chunks = torch.chunk(input_ids, chunks=B, dim=0)
+    attention_mask_chunks = torch.chunk(attention_mask, chunks=B, dim=0)
+
+    def chunk_optional(tensor, chunks):
+        if tensor is None:
+            return [None] * chunks
+        return torch.chunk(tensor, chunks=chunks, dim=0)
+
+    pixel_values_chunks = [None] * B
+    image_grid_thw_chunks = [None] * B
+    pixel_attention_mask_chunks = [None] * B
+
+    # === THIS IS THE ADAPTED LOGIC YOU REQUESTED ===
+    if image_grid_thw is not None and pixel_values is not None:
+        # This logic assumes image_grid_thw.shape[0] == B
+        # (i.e., one image_grid_thw entry per sample)
+        if image_grid_thw.shape[0] != B:
+            raise ValueError(
+                f"This logic requires image_grid_thw.shape[0] ({image_grid_thw.shape[0]}) "
+                f"to be equal to batch size B ({B})."
+            )
+
+        # 1. Calculate the number of patches (rows) for each sample.
+        # This is the equivalent of your `prod(-1)` logic.
+        # `rows_per_sample` will be a 1D tensor of shape (B,), e.g., [50, 60, 50]
+        rows_per_sample = image_grid_thw.prod(dim=-1) 
+        rows_per_sample_list = rows_per_sample.cpu().tolist()
+
+        # 2. Split the flattened tensors using this list of sizes.
+        # This is the per-sample equivalent of your start/end_pixel_idx logic.
+        pixel_values_chunks = list(torch.split(pixel_values, rows_per_sample_list, dim=0))
+        if pixel_attention_mask is not None:
+            # Assume pixel_attention_mask is also flattened
+            pixel_attention_mask_chunks = list(torch.split(pixel_attention_mask, rows_per_sample_list, dim=0))
+
+        # 3. Chunk image_grid_thw normally (by B)
+        image_grid_thw_chunks = list(torch.chunk(image_grid_thw, chunks=B, dim=0))
+
+    elif pixel_values is not None:
+        # Simple case where pixel_values is (B, ...) and no grid is given
+        pixel_values_chunks = list(torch.chunk(pixel_values, chunks=B, dim=0))
+        if pixel_attention_mask is not None:
+            pixel_attention_mask_chunks = list(torch.chunk(pixel_attention_mask, chunks=B, dim=0))
+    
     if image_sizes is not None and not isinstance(image_sizes, torch.Tensor):
         image_sizes_chunks = [[size] for size in image_sizes] # Chunk a list
     else:
         image_sizes_chunks = chunk_optional(image_sizes, B) # Chunk a tensor or None
+
 
     # --- 3. Zip all chunked inputs together ---
     zipped_inputs = zip(
