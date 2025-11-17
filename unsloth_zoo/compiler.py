@@ -1562,12 +1562,76 @@ def patch_gradient_checkpointing(module, source):
         .replace("ARGS", args).replace("$", spaces)
     forward = forward.replace(forward[span[0] : span[1]], replacer)
 
+    # Confirm no equal signs seen - might be "attention_mask=causal_mask_mapping" vs "attention_mask=attention_mask"
+    if '=' in args:
+        return None
     # Also fix init
     spaces = init.find("def")
     init = init + "\n" + (spaces + 4) * " " + "self.gradient_checkpointing = False\n\n"
 
-    # Confirm no equal signs seen - might be "attention_mask=causal_mask_mapping" vs "attention_mask=attention_mask"
-    if "=" in init: return None
+    return init, forward
+pass
+
+def strip_kw_from_module_calls(src: str, modulelist_item: str) -> str:
+    for_pattern = re.compile(
+        rf"for (?:[^\s,]+,\s*)?(?P<layer>\w+)\s+in\s+"
+        rf"(?:enumerate\({re.escape(modulelist_item)}\)|{re.escape(modulelist_item)})\s*:",
+        re.MULTILINE,
+    )
+    layer_vars = {m.group("layer") for m in for_pattern.finditer(src)}
+    if not layer_vars:
+        return src
+
+    kw_at_start_pattern = re.compile(
+        r'(^|,)(\s*)([A-Za-z_]\w*)\s*=\s*',
+        re.MULTILINE,
+    )
+
+    def strip_kw_names(args: str) -> str:
+        return kw_at_start_pattern.sub(r'\1\2', args)
+
+    for layer in layer_vars:
+        call_pattern = re.compile(
+            rf"""
+            (^[ \t]+)
+            (\w+)\s*=\s*
+            {re.escape(layer)}
+            \(
+                (
+                    [^)]*?
+                )
+            \)
+            """,
+            re.MULTILINE | re.DOTALL | re.VERBOSE,
+        )
+
+        def replace_call(m: re.Match) -> str:
+            indent, outvar, args = m.group(1), m.group(2), m.group(3)
+            new_args = strip_kw_names(args)
+            return f"{indent}{outvar} = {layer}({new_args})"
+
+        src = call_pattern.sub(replace_call, src)
+
+    return src
+
+def patch_gradient_checkpointing_layer_caller(module, source):
+    # All Unsloth Zoo code licensed under LGPLv3
+    try: init = inspect.getsource(source.__init__)
+    except: return None
+    if "nn.ModuleList" not in init: return None
+    try: forward = inspect.getsource(source.forward)
+    except: return None
+    if "_gradient_checkpointing_func" in forward: return None
+
+    modulelist_items = re.findall(r"(self\.[^\s]{1,}) = .*?nn\.ModuleList\(", init)
+    if len(modulelist_items) != 1: return None
+    modulelist_item = modulelist_items[0]
+
+    forward = strip_kw_from_module_calls(forward, modulelist_item)
+    spaces = init.find("def")
+    if 'self.gradient_checkpointing =' not in init:
+        init = init + "\n" + (spaces + 4) * " " + "self.gradient_checkpointing = False\n\n"
+
     return init, forward
 pass
 
@@ -1729,6 +1793,14 @@ def patch_lora_forwards(torch_compile_options):
             "def unsloth_forward",
             1,
         )
+
+        # Remove variant_kwargs = {k: kwargs.pop(k, None) for k in VARIANT_KWARG_KEYS}
+        # No need for alora for now
+        variant_kwarg_keys = "variant_kwargs = {k: kwargs.pop(k, None) for k in VARIANT_KWARG_KEYS}"
+        variant_found = source.find(variant_kwarg_keys)
+        if variant_found != -1:
+            variant_end = source.find("\n", variant_found + len(variant_kwarg_keys))
+            source = source.replace(source[variant_found : variant_end], "")
 
         # Check failed upcasting
         replacements = [
@@ -2034,6 +2106,10 @@ DISABLE_COMPILE_MODULES = [
     "GptOssMLP",
     "GptOssExperts",
     "Gemma3nTextModel",
+]
+
+FIX_GC_LAYER_CALLER_MODULES = [
+    "WhisperDecoder",
 ]
 
 
@@ -2602,9 +2678,13 @@ def unsloth_compile_transformers(
         for module in other_classes:
             source = eval(f"{model_location}.{module}")
             if "(GradientCheckpointingLayer)" in full_source:
-                # Uses GC layers which is in new transformers - no need to patch
-                continue
-            output = patch_gradient_checkpointing(module, source)
+                if module in FIX_GC_LAYER_CALLER_MODULES:
+                    output = patch_gradient_checkpointing_layer_caller(module, source)
+                else:
+                    # Uses GC layers which is in new transformers - no need to patch
+                    continue
+            else:
+                output = patch_gradient_checkpointing(module, source)
             if output is None: continue
 
             init, forward = output
