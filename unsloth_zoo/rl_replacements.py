@@ -551,6 +551,8 @@ def grpo_accumulated_loss(
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
     logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
 
+    prev_max_left_pad    = kwargs.get("max_left_pad", None)
+
     #delete this from kwargs so less issues 
     sampling_per_token_logps = kwargs.pop("sampling_per_token_logps", None)
     kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap if sampling_per_token_logps is not None else None
@@ -569,9 +571,14 @@ def grpo_accumulated_loss(
     lm_head = trainer.model.get_output_embeddings().weight
 
     if pixel_values is None:
+        # if trainer.state.global_step==5:
+        #     breakpoint()
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
 
         max_left_pad = max(left_pad_tokens_per_prompt).item()
+
+        if max_left_pad < max(prev_max_left_pad).item() and (logits_to_keep +max_left_pad) != old_hidden_states.shape[1]:
+            max_left_pad =  max(prev_max_left_pad).item()
 
         input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
 
@@ -610,23 +617,23 @@ def grpo_accumulated_loss(
     attention_mask_chunks = torch.chunk(attention_mask, chunks=B, dim=0)
     completion_ids_chunks = torch.chunk(completion_input_ids, chunks=B, dim=0)
 
-    # 1. Pre-calculate batch-dependent padding (if needed)
-    # This logic MUST run on the full batch BEFORE looping
-    if pixel_values is None:
-        attention_mask = input_ids != self.processing_class.pad_token_id
-        attention_mask = attention_mask.to(attention_mask.dtype)
+    # # 1. Pre-calculate batch-dependent padding (if needed)
+    # # This logic MUST run on the full batch BEFORE looping
+    # if pixel_values is None:
+    #     attention_mask = input_ids != trainer.processing_class.pad_token_id
+    #     attention_mask = attention_mask.to(attention_mask.dtype)
         
-        left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, self.processing_class.pad_token_id)
-        max_left_pad = max(left_pad_tokens_per_prompt).item()
-        
-        input_ids = left_pack_padding(input_ids, self.processing_class.pad_token_id)
-    else:
-        # This branch is simpler and doesn't need pre-calculation
-        max_left_pad = 0 # Not used, but defined for clarity
+    #     left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
+    #     max_left_pad = max(left_pad_tokens_per_prompt).item()
+    #     breakpoint()
+    #     input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
+    # else:
+    #     # This branch is simpler and doesn't need pre-calculation
+    #     max_left_pad = 0 # Not used, but defined for clarity
 
     # 2. Chunk all model inputs
-    input_ids_chunks = torch.chunk(input_ids, chunks=B, dim=0)
-    attention_mask_chunks = torch.chunk(attention_mask, chunks=B, dim=0)
+    # input_ids_chunks = torch.chunk(input_ids, chunks=B, dim=0)
+    # attention_mask_chunks = torch.chunk(attention_mask, chunks=B, dim=0)
 
     def chunk_optional(tensor, chunks):
         if tensor is None:
@@ -699,7 +706,7 @@ def grpo_accumulated_loss(
             image_grid_thw_chunk,
             pixel_attention_mask_chunk,
             image_sizes_chunk,
-            input_ids_chunk_for_logprobs # This is the chunk from completion_ids_chunks
+            completion_ids # This is the chunk from completion_ids_chunks
         ) in zipped_inputs:
 
             # --- 4a. Compute hidden states (model call) ---
@@ -715,7 +722,7 @@ def grpo_accumulated_loss(
                 
                 # --- 4b. Post-process hidden states ---
                 new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
-                
+                new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
             else: 
                 new_hidden_states_chunk = unwrapped_model(
                     input_ids = input_ids_chunk,
@@ -729,12 +736,12 @@ def grpo_accumulated_loss(
                 
                 # --- 4b. Post-process hidden states ---
                 new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
-
             # --- 4c. Compute logprobs ---
+            #breakpoint()
             logprobs_chunk = chunked_hidden_states_selective_log_softmax(
                 new_hidden_states_chunk,
                 lm_head, 
-                input_ids_chunk_for_logprobs, # Use the chunked completion_ids
+                completion_ids, # Use the chunked completion_ids
                 chunks = 8, # Because this chunk's batch size is 1
                 logit_scale_multiply = logit_scale_multiply, 
                 logit_scale_divide = logit_scale_divide,
@@ -746,8 +753,11 @@ def grpo_accumulated_loss(
 
         # --- 5. Concatenate final results ---
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
-
-
+        try:
+            (old_hidden_states * completion_mask) - sampling_per_token_logps
+        except:
+            breakpoint()
+        #breakpoint()
         loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
             new_logprobs,
             old_hidden_states,
