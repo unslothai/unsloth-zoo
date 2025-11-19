@@ -571,8 +571,6 @@ def grpo_accumulated_loss(
     lm_head = trainer.model.get_output_embeddings().weight
 
     if pixel_values is None:
-        # if trainer.state.global_step==5:
-        #     breakpoint()
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
 
         max_left_pad = max(left_pad_tokens_per_prompt).item()
@@ -585,8 +583,7 @@ def grpo_accumulated_loss(
         completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
 
         completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
-        #TODO given the completion mask here we need to, handle the left pad tokens so the sizes of completion
-        #token or old logprobs are compatible with the importance sampling logprobs
+
         if trainer.use_vllm and sampling_per_token_logps is not None:
             sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
         attention_mask =  input_ids != trainer.processing_class.pad_token_id
@@ -596,44 +593,22 @@ def grpo_accumulated_loss(
     
     unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
 
-    # Do not move hidden_states from device 1 to device 0:
     for module in unwrapped_model.modules():
         if hasattr(module, "_hf_hook") and hasattr(module._hf_hook, "io_same_decice"):
             module._hf_hook.io_same_decice = False
     pass
 
-    # Assumes B is determined from a pre-model-call tensor like input_ids
     B = input_ids.shape[0] 
     all_logprobs_list = []
 
-    # --- 1. Helper function for optional tensors ---
     def chunk_optional(tensor, chunks):
         if tensor is None:
             return [None] * chunks
         return torch.chunk(tensor, chunks=chunks, dim=0)
 
-    # --- 2. Chunk all model inputs AND logprob inputs ---
     input_ids_chunks = torch.chunk(input_ids, chunks=B, dim=0)
     attention_mask_chunks = torch.chunk(attention_mask, chunks=B, dim=0)
     completion_ids_chunks = torch.chunk(completion_input_ids, chunks=B, dim=0)
-
-    # # 1. Pre-calculate batch-dependent padding (if needed)
-    # # This logic MUST run on the full batch BEFORE looping
-    # if pixel_values is None:
-    #     attention_mask = input_ids != trainer.processing_class.pad_token_id
-    #     attention_mask = attention_mask.to(attention_mask.dtype)
-        
-    #     left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
-    #     max_left_pad = max(left_pad_tokens_per_prompt).item()
-    #     breakpoint()
-    #     input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
-    # else:
-    #     # This branch is simpler and doesn't need pre-calculation
-    #     max_left_pad = 0 # Not used, but defined for clarity
-
-    # 2. Chunk all model inputs
-    # input_ids_chunks = torch.chunk(input_ids, chunks=B, dim=0)
-    # attention_mask_chunks = torch.chunk(attention_mask, chunks=B, dim=0)
 
     def chunk_optional(tensor, chunks):
         if tensor is None:
@@ -644,45 +619,32 @@ def grpo_accumulated_loss(
     image_grid_thw_chunks = [None] * B
     pixel_attention_mask_chunks = [None] * B
 
-    # === THIS IS THE ADAPTED LOGIC YOU REQUESTED ===
     if image_grid_thw is not None and pixel_values is not None:
-        # This logic assumes image_grid_thw.shape[0] == B
-        # (i.e., one image_grid_thw entry per sample)
         if image_grid_thw.shape[0] != B:
             raise ValueError(
                 f"This logic requires image_grid_thw.shape[0] ({image_grid_thw.shape[0]}) "
                 f"to be equal to batch size B ({B})."
             )
 
-        # 1. Calculate the number of patches (rows) for each sample.
-        # This is the equivalent of your `prod(-1)` logic.
-        # `rows_per_sample` will be a 1D tensor of shape (B,), e.g., [50, 60, 50]
         rows_per_sample = image_grid_thw.prod(dim=-1) 
         rows_per_sample_list = rows_per_sample.cpu().tolist()
 
-        # 2. Split the flattened tensors using this list of sizes.
-        # This is the per-sample equivalent of your start/end_pixel_idx logic.
         pixel_values_chunks = list(torch.split(pixel_values, rows_per_sample_list, dim=0))
         if pixel_attention_mask is not None:
-            # Assume pixel_attention_mask is also flattened
             pixel_attention_mask_chunks = list(torch.split(pixel_attention_mask, rows_per_sample_list, dim=0))
 
-        # 3. Chunk image_grid_thw normally (by B)
         image_grid_thw_chunks = list(torch.chunk(image_grid_thw, chunks=B, dim=0))
 
     elif pixel_values is not None:
-        # Simple case where pixel_values is (B, ...) and no grid is given
         pixel_values_chunks = list(torch.chunk(pixel_values, chunks=B, dim=0))
         if pixel_attention_mask is not None:
             pixel_attention_mask_chunks = list(torch.chunk(pixel_attention_mask, chunks=B, dim=0))
     
     if image_sizes is not None and not isinstance(image_sizes, torch.Tensor):
-        image_sizes_chunks = [[size] for size in image_sizes] # Chunk a list
+        image_sizes_chunks = [[size] for size in image_sizes] 
     else:
-        image_sizes_chunks = chunk_optional(image_sizes, B) # Chunk a tensor or None
+        image_sizes_chunks = chunk_optional(image_sizes, B) 
 
-
-    # --- 3. Zip all chunked inputs together ---
     zipped_inputs = zip(
         input_ids_chunks,
         attention_mask_chunks,
@@ -690,10 +652,9 @@ def grpo_accumulated_loss(
         image_grid_thw_chunks,
         pixel_attention_mask_chunks,
         image_sizes_chunks,
-        completion_ids_chunks # Added for the logprob calculation
+        completion_ids_chunks 
     )
 
-    # Get autocaster
     if trainer._autocast_dtype is None:
         autocaster = nullcontext()
     else:
@@ -706,10 +667,9 @@ def grpo_accumulated_loss(
             image_grid_thw_chunk,
             pixel_attention_mask_chunk,
             image_sizes_chunk,
-            completion_ids # This is the chunk from completion_ids_chunks
+            completion_ids 
         ) in zipped_inputs:
 
-            # --- 4a. Compute hidden states (model call) ---
             if pixel_values is None:
                 new_hidden_states_chunk = unwrapped_model(
                     input_ids = input_ids_chunk,
@@ -720,7 +680,6 @@ def grpo_accumulated_loss(
                     image_sizes = image_sizes_chunk,
                 ).logits
                 
-                # --- 4b. Post-process hidden states ---
                 new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
                 new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
             else: 
@@ -734,15 +693,13 @@ def grpo_accumulated_loss(
                     logits_to_keep = logits_to_keep + 1, 
                 ).logits
                 
-                # --- 4b. Post-process hidden states ---
                 new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
-            # --- 4c. Compute logprobs ---
-            #breakpoint()
+
             logprobs_chunk = chunked_hidden_states_selective_log_softmax(
                 new_hidden_states_chunk,
                 lm_head, 
-                completion_ids, # Use the chunked completion_ids
-                chunks = 8, # Because this chunk's batch size is 1
+                completion_ids, 
+                chunks = 8,
                 logit_scale_multiply = logit_scale_multiply, 
                 logit_scale_divide = logit_scale_divide,
                 logit_softcapping = logit_softcapping, 
