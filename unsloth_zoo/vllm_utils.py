@@ -1813,7 +1813,7 @@ def load_vllm(
                     max_autotune = False, # Too slow
                     shape_padding = False,
                     debug = False,
-                    cudagraphs = False,
+                    cudagraphs = True,
                     coordinate_descent_tuning = False, # Too slow
                     logging = True, # Enable compile logs
                     combo_kernels = False, # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
