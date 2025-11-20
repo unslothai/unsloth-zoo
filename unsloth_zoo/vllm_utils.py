@@ -1830,7 +1830,7 @@ def load_vllm(
                     logging = True, # Enable compile logs
                     combo_kernels = combo_kernels, # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
                     group_fusion = True,
-                    memory_planning = True,
+                    memory_planning = False,
                     use_block_ptr = True,
 
                     multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
