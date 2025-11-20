@@ -1804,9 +1804,13 @@ def load_vllm(
             if Version(vllm_version) > Version("0.11.0") or Version(torch_version) > Version("2.9.0"):
                 cudagraphs = False # Weirdly if we set it to True, we get
                 # [rank0]: RuntimeError: These storage data ptrs are not allocated in pool (0, 2) but should be {612290048}
-                combo_kernels = True # Latest works now!
+                combo_kernels = True # Latest works now only on Llama it seems
                 if total_memory_gb <= 70:
                     combo_kernels = False # Too slow on less than 80GB GPUs
+                # We still see
+                # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
+                # Try unsloth/gemma-3-4b-it
+                combo_kernels = False
             else:
                 cudagraphs = True
                 combo_kernels = False
@@ -1830,7 +1834,7 @@ def load_vllm(
                     cudagraphs = cudagraphs,
                     coordinate_descent_tuning = False, # Too slow
                     logging = True, # Enable compile logs
-                    combo_kernels = combo_kernels, # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
+                    combo_kernels = combo_kernels,
                     group_fusion = True,
                     memory_planning = True,
                     use_block_ptr = True,
