@@ -545,7 +545,8 @@ def grpo_accumulated_loss(
     pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
     image_sizes = kwargs.get('image_sizes',None)
 
-    sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None)
+    sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if trainer.vllm_importance_sampling_correction else None
+    breakpoint()
     temperature = kwargs.get("temperature", 1.0)
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
@@ -584,8 +585,10 @@ def grpo_accumulated_loss(
 
         completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
 
-        if trainer.use_vllm and sampling_per_token_logps is not None:
+        if trainer.use_vllm and sampling_per_token_logps is not None and trainer.vllm_importance_sampling_correction:
             sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
+        else: 
+            sampling_per_token_logps = None
         attention_mask =  input_ids != trainer.processing_class.pad_token_id
         attention_mask = attention_mask.to(attention_mask.dtype)
     else: 
