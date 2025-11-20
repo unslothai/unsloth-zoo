@@ -43,6 +43,7 @@ import os
 import ast
 import sys
 import torch
+from torch import __version__ as torch_version
 import json
 import psutil
 import functools
@@ -90,6 +91,7 @@ def get_mem_info():
 pass
 
 if importlib.util.find_spec("vllm") is not None:
+    from vllm import __version__ as vllm_version
 
     # Patch excessive warning messages
     if not UNSLOTH_ENABLE_LOGGING:
@@ -1797,6 +1799,22 @@ def load_vllm(
     if compilation_config == 3:
         try:
             from vllm.config import CompilationConfig
+
+            # Torch versions >= 2.9.0 or vllm_version > 0.11.0
+            if Version(vllm_version) > Version("0.11.0") or Version(torch_version) > Version("2.9.0"):
+                cudagraphs = False # Weirdly if we set it to True, we get
+                # [rank0]: RuntimeError: These storage data ptrs are not allocated in pool (0, 2) but should be {612290048}
+                combo_kernels = True # Latest works now only on Llama it seems
+                if total_memory_gb <= 70:
+                    combo_kernels = False # Too slow on less than 80GB GPUs
+                # We still see
+                # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
+                # Try unsloth/gemma-3-4b-it
+                combo_kernels = False
+            else:
+                cudagraphs = True
+                combo_kernels = False
+
             compile_flags = dict(
                 level = 3,
                 backend = "inductor",
@@ -1813,14 +1831,16 @@ def load_vllm(
                     max_autotune = False, # Too slow
                     shape_padding = True,
                     debug = False,
-                    cudagraphs = True,
+                    cudagraphs = cudagraphs,
                     coordinate_descent_tuning = False, # Too slow
                     logging = True, # Enable compile logs
-                    combo_kernels = False, # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
+                    combo_kernels = combo_kernels,
                     group_fusion = True,
                     memory_planning = True,
-                    multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
                     use_block_ptr = True,
+
+                    multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
+                    # [rank0]: TypeError: 'NoneType' object does not support the context manager protocol
                 )
             )
             good_keys = inspect.signature(CompilationConfig).parameters.keys()
@@ -1893,7 +1913,6 @@ def load_vllm(
     if DEVICE_TYPE == "cuda":
         major_version, minor_version = torch.cuda.get_device_capability()
         if major_version < 9:
-            from vllm import __version__ as vllm_version
             if Version(vllm_version) >= Version("0.11.0"):
                 disable_cascade_attn = False
             else:
