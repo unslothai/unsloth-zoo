@@ -1804,9 +1804,9 @@ def load_vllm(
             if Version(vllm_version) > Version("0.11.0") or Version(torch_version) > Version("2.9.0"):
                 cudagraphs = False # Weirdly if we set it to True, we get
                 # [rank0]: RuntimeError: These storage data ptrs are not allocated in pool (0, 2) but should be {612290048}
-                combo_kernels = False # Latest works now!
+                combo_kernels = True # Latest works now!
             else:
-                cudagraphs = False
+                cudagraphs = True
                 combo_kernels = False
 
             compile_flags = dict(
@@ -1830,7 +1830,7 @@ def load_vllm(
                     logging = True, # Enable compile logs
                     combo_kernels = combo_kernels, # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
                     group_fusion = True,
-                    memory_planning = False,
+                    memory_planning = True,
                     use_block_ptr = True,
 
                     multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
