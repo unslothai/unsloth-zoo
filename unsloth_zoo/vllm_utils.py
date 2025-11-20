@@ -1796,7 +1796,7 @@ def load_vllm(
 
     if compilation_config == 3:
         try:
-            from vllm.config import CompilationConfig, CompilationLevel
+            from vllm.config import CompilationConfig
             compile_flags = dict(
                 level = 3,
                 backend = "inductor",

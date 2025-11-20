@@ -36,15 +36,14 @@ from filelock import FileLock
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        version = str(version)
-        try:
-            return TrueVersion(version)
-        except Exception as e:
-            version = re.match(r"[0-9\.]{1,}", version)
-            if version is None:
-                raise Exception(str(e))
-            version = version.group(0).rstrip(".")
-            return TrueVersion(version)
+        new_version = str(version)
+        new_version = re.match(r"[0-9\.]{1,}", new_version)
+        if new_version is None:
+            raise Exception(str(e))
+        new_version = new_version.group(0).rstrip(".")
+        if new_version != version:
+            new_version += ".1" # Add .1 for dev / alpha / beta / rc
+        return TrueVersion(new_version)
     except:
         from inspect import getframeinfo, stack
         caller = getframeinfo(stack()[1][0])
