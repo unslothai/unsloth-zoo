@@ -1813,13 +1813,16 @@ def load_vllm(
                     max_autotune = False, # Too slow
                     shape_padding = True,
                     debug = False,
-                    cudagraphs = False,
+                    cudagraphs = True,
                     coordinate_descent_tuning = False, # Too slow
                     logging = True, # Enable compile logs
                     combo_kernels = True, # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
                     group_fusion = True,
                     memory_planning = True,
+
                     multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
+                    # [rank0]: TypeError: 'NoneType' object does not support the context manager protocol
+
                     use_block_ptr = True,
                 )
             )
