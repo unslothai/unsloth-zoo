@@ -1817,10 +1817,10 @@ def load_vllm(
                     coordinate_descent_tuning = False, # Too slow
                     logging = True, # Enable compile logs
                     combo_kernels = False, # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
-                    group_fusion = False,
+                    group_fusion = True,
                     memory_planning = False,
                     multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
-                    use_block_ptr = False,
+                    use_block_ptr = True,
                 )
             )
             good_keys = inspect.signature(CompilationConfig).parameters.keys()
