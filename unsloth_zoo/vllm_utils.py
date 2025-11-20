@@ -1809,18 +1809,18 @@ def load_vllm(
                 use_cudagraph = True,
                 use_inductor = True,
                 inductor_compile_config = get_torch_compile_options(
-                    epilogue_fusion = True,
+                    epilogue_fusion = False,
                     max_autotune = False, # Too slow
-                    shape_padding = True,
+                    shape_padding = False,
                     debug = False,
-                    cudagraphs = True,
+                    cudagraphs = False,
                     coordinate_descent_tuning = False, # Too slow
                     logging = True, # Enable compile logs
                     combo_kernels = False, # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
-                    group_fusion = True,
+                    group_fusion = False,
                     memory_planning = False,
                     multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
-                    use_block_ptr = True,
+                    use_block_ptr = False,
                 )
             )
             good_keys = inspect.signature(CompilationConfig).parameters.keys()
