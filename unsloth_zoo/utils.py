@@ -43,7 +43,7 @@ def Version(version):
         new_version = new_version.group(0).rstrip(".")
         if new_version != version:
             new_version += ".1" # Add .1 for dev / alpha / beta / rc
-        return TrueVersion(version)
+        return TrueVersion(new_version)
     except:
         from inspect import getframeinfo, stack
         caller = getframeinfo(stack()[1][0])
