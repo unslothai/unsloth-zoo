@@ -1805,6 +1805,8 @@ def load_vllm(
                 cudagraphs = False # Weirdly if we set it to True, we get
                 # [rank0]: RuntimeError: These storage data ptrs are not allocated in pool (0, 2) but should be {612290048}
                 combo_kernels = True # Latest works now!
+                if total_memory_gb <= 70:
+                    combo_kernels = False # Too slow on less than 80GB GPUs
             else:
                 cudagraphs = True
                 combo_kernels = False
