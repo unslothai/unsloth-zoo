@@ -174,8 +174,6 @@ def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
 pass
 RL_REPLACEMENTS["left_pack_padding"] = left_pack_padding
 
-import torch
-
 def align_logprobs_with_mask(
     logprob_tensor: torch.Tensor,
     attention_mask: torch.Tensor,
