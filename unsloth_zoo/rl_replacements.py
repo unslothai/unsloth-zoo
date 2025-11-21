@@ -709,7 +709,6 @@ def grpo_accumulated_loss(
             
             all_logprobs_list.append(logprobs_chunk)
 
-        # # --- 5. Concatenate final results ---
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
 
         loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
@@ -727,7 +726,6 @@ def grpo_accumulated_loss(
             kwargs 
         )
 
-    
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
