@@ -60,6 +60,8 @@ def chunked_selective_log_softmax(logits, index):
     return all_per_token_logps
 pass
 
+RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
+
 # More memory efficient by chunking on (bsz+qlen) dimension
 # Exactly equivalent to the above
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
@@ -105,9 +107,8 @@ def chunked_hidden_states_selective_log_softmax(
     
     all_per_token_logps = all_per_token_logps.reshape((hidden_states.shape[0], hidden_states.shape[1]))
     return all_per_token_logps
-
-RL_REPLACEMENTS["selective_log_softmax"] = chunked_hidden_states_selective_log_softmax
-
+    
+RL_REPLACEMENTS["grpo_selective_log_softmax"] = chunked_hidden_states_selective_log_softmax
 
 def calculate_pad_tokens_in_prompt(
     input_ids: torch.Tensor,
