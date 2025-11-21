@@ -385,14 +385,14 @@ RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
 class UnslothEfficientGRPO(torch.autograd.Function):
     # All Unsloth Zoo code licensed under LGPLv3
     @staticmethod
-    def forward(ctx, _new_hidden_states, _old_hidden_states, _ref_hidden_states, _sampling_per_token_logps, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None):
+    def forward(ctx, _new_logps, _old_logps, _ref_logps, _sampling_per_token_logps, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None):
         if extra_kwargs is None:
             extra_kwargs = {}
-        def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states, sampling_per_token_logps, input_ids, mask, advantages, scaling):
+        def compute_loss(new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages, scaling):
             loss, completion_length, mean_kl, delta, flat_is_ratio = grpo_compute_loss(
-                ref_hidden_states,
-                new_hidden_states,
-                old_hidden_states,
+                ref_logps,
+                new_logps,
+                old_logps,
                 sampling_per_token_logps,
                 input_ids,
                 mask,
@@ -407,8 +407,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             return scaled_loss, (loss.detach(), completion_length, mean_kl, delta, flat_is_ratio)
         pass
 
-        device =_new_hidden_states.device
-        grad_inputs = torch.empty_like(_new_hidden_states)
+        device =_new_logps.device
+        grad_inputs = torch.empty_like(_new_logps)
         accumulated_loss              = torch.zeros(1, device = device)
         accumulated_completion_length = torch.zeros(1, device = device)
         accumulated_mean_kl           = torch.zeros(1, device = device)
@@ -416,9 +416,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         accumulated_flat_is_ratio     = []
 
         def accumulate_chunk(
-            new_hidden_states_j,
-            old_hidden_states_j,
-            ref_hidden_states_j,
+            new_logps_j,
+            old_logps_j,
+            ref_logps_j,
             sampling_per_token_logps_j,
             input_ids_j,
             mask_j,
@@ -430,7 +430,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 compute_loss,
                 argnums = (0,),
                 has_aux = True,
-            )(new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, scaling)
+            )(new_logps_j, old_logps_j, ref_logps_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, scaling)
             accumulated_loss             .add_(unscaled_loss)
             accumulated_completion_length.add_(chunk_completion_length)
             accumulated_mean_kl          .add_(chunk_mean_kl)
@@ -448,15 +448,15 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         )
 
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
-        new_hidden_states  = torch.chunk(_new_hidden_states, chunks = n_chunks, dim = 0)
-        if _old_hidden_states is not None: 
-            old_hidden_states  = torch.chunk(_old_hidden_states, chunks = n_chunks, dim = 0)
+        new_logps  = torch.chunk(_new_logps, chunks = n_chunks, dim = 0)
+        if _old_logps is not None: 
+            old_logps  = torch.chunk(_old_logps, chunks = n_chunks, dim = 0)
         else: 
-            old_hidden_states = [None] * n_chunks
-        if _ref_hidden_states is not None: 
-            ref_hidden_states  = torch.chunk(_ref_hidden_states, chunks = n_chunks, dim = 0)
+            old_logps = [None] * n_chunks
+        if _ref_logps is not None: 
+            ref_logps  = torch.chunk(_ref_logps, chunks = n_chunks, dim = 0)
         else: 
-            ref_hidden_states = [None] * n_chunks
+            ref_logps = [None] * n_chunks
         if _sampling_per_token_logps is not None: 
             sampling_per_token_logps  = torch.chunk(_sampling_per_token_logps, chunks = n_chunks, dim = 0)
         else:
@@ -471,8 +471,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         # Force torch.compile to use dynamic shapes for seqlen dim
         # mark_dynamic = lambda x: torch._dynamo.mark_dynamic(x, 1)
 
-        for (grad_inputs_j, new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, ) in \
-            zip(grad_inputs_chunks, new_hidden_states, old_hidden_states, ref_hidden_states, sampling_per_token_logps, input_ids, mask, advantages):
+        for (grad_inputs_j, new_logps_j, old_logps_j, ref_logps_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, ) in \
+            zip(grad_inputs_chunks, new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages):
 
             # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
 
@@ -484,9 +484,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             # mark_dynamic(mask_j)
             #breakpoint()
             accumulate_chunk(
-                new_hidden_states_j,
-                old_hidden_states_j,
-                ref_hidden_states_j,
+                new_logps_j,
+                old_logps_j,
+                ref_logps_j,
                 sampling_per_token_logps_j,
                 input_ids_j,
                 mask_j,
@@ -533,8 +533,8 @@ def grpo_accumulated_loss(
     logits_to_keep,
     completion_mask,
     advantages,
-    old_hidden_states,
-    ref_hidden_states, 
+    old_logps,
+    ref_logps, 
     n_chunks = -1,
     **kwargs,
 ):
@@ -575,7 +575,7 @@ def grpo_accumulated_loss(
 
         max_left_pad = max(left_pad_tokens_per_prompt).item()
 
-        if max_left_pad < max(prev_max_left_pad).item() and (logits_to_keep +max_left_pad) != old_hidden_states.shape[1]:
+        if max_left_pad < max(prev_max_left_pad).item() and (logits_to_keep +max_left_pad) != old_logps.shape[1]:
             max_left_pad =  max(prev_max_left_pad).item()
 
         input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
@@ -602,11 +602,6 @@ def grpo_accumulated_loss(
 
     B = input_ids.shape[0] 
     all_logprobs_list = []
-
-    def chunk_optional(tensor, chunks):
-        if tensor is None:
-            return [None] * chunks
-        return torch.chunk(tensor, chunks=chunks, dim=0)
 
     input_ids_chunks = torch.chunk(input_ids, chunks=B, dim=0)
     attention_mask_chunks = torch.chunk(attention_mask, chunks=B, dim=0)
@@ -714,8 +709,8 @@ def grpo_accumulated_loss(
 
         loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
             new_logprobs,
-            old_hidden_states,
-            ref_hidden_states,
+            old_logps,
+            ref_logps,
             sampling_per_token_logps,
             lm_head,
             completion_input_ids,
