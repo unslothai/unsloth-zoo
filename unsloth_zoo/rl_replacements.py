@@ -482,7 +482,6 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             #     mark_dynamic(old_hidden_states_j)
             # mark_dynamic(input_ids_j)
             # mark_dynamic(mask_j)
-            #breakpoint()
             accumulate_chunk(
                 new_logps_j,
                 old_logps_j,
@@ -554,7 +553,7 @@ def grpo_accumulated_loss(
     prev_max_left_pad    = kwargs.get("max_left_pad", None)
 
     #delete this from kwargs so less issues 
-    sampling_per_token_logps = kwargs.pop("sampling_per_token_logps", None)
+    _ = kwargs.pop("sampling_per_token_logps", None)
     kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap if sampling_per_token_logps is not None else None
     kwargs["use_vllm"] = trainer.use_vllm
     # Find closest multiple
