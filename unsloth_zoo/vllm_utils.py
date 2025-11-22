@@ -1639,24 +1639,20 @@ def load_vllm(
 
     assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
-    # max_num_batched_tokens, approx_max_num_seqs, \
-    # actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
-    # approximate_vllm_memory_usage(
-    #     mem_config,
-    #     load_in_4bit = use_bitsandbytes,
-    #     load_in_8bit = is_fp8,
-    #     max_seq_length = max_seq_length,
-    #     gpu_memory_utilization = gpu_memory_utilization,
-    #     enable_lora = enable_lora,
-    #     max_lora_rank = max_lora_rank,
-    #     max_loras = max_loras,
-    #     float8_kv_cache = float8_kv_cache,
-    #     account_for_gradients = training,
-    # )
-    max_num_batched_tokens = 4096
-    approx_max_num_seqs = 16
-    actual_gpu_memory_utilization = gpu_memory_utilization
-    memory_left_for_kv_cache_gb = 20
+    max_num_batched_tokens, approx_max_num_seqs, \
+    actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
+    approximate_vllm_memory_usage(
+        mem_config,
+        load_in_4bit = use_bitsandbytes,
+        load_in_8bit = is_fp8,
+        max_seq_length = max_seq_length,
+        gpu_memory_utilization = gpu_memory_utilization,
+        enable_lora = enable_lora,
+        max_lora_rank = max_lora_rank,
+        max_loras = max_loras,
+        float8_kv_cache = float8_kv_cache,
+        account_for_gradients = training,
+    )
 
     enable_chunked_prefill = True
     is_mllama = "mllama" in config.model_type
