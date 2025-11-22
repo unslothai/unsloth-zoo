@@ -939,7 +939,13 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                     # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
                     scale_suffix = '.weight_scale_inv'
                     block_size = proj.weight_block_size[0]
-                    if needs_transpose_check:
+                    is_compressed_linear = "CompressedTensors" in str(type(getattr(proj, 'quant_method', None)))
+                    if is_compressed_linear:
+                        # Compressed linear doesn't seem to transpose the weight scale inv
+                        # Also preferes the name weight_scale (without _inv suffix)
+                        # We detect it based on the quant_method we see in proj's attributes
+                        scale_suffix = '.weight_scale'
+                    elif needs_transpose_check:
                         should_use_deepgemm = is_deep_gemm_supported and getattr(proj, "orig_dtype", torch.bfloat16) == torch.bfloat16 and qweight.shape[0] % 128 == 0 and qweight.shape[1] % 128 == 0
                         if sm_cap==90 and cutlass_block_fp8_supported and not should_use_deepgemm:
                             # For H100 (at least), the scale seems to be a transpose of what HF expects, while on L4 it is right shape.
@@ -1266,13 +1272,23 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 bias = None
             pass
 
+            # check if either of layer_name.weight_scale or layer_name.weight_scale_inv exists and set that attribute to fp8_weight_scale
+            fp8_weight_scale = None
+            if f"{layer_name}.weight_scale" in quant_state_dict:
+                fp8_weight_scale = quant_state_dict[f"{layer_name}.weight_scale"]
+            elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
+                fp8_weight_scale = quant_state_dict[f"{layer_name}.weight_scale_inv"]
+            pass
+
+            if fp8_weight_scale is not None: assert fp8_weight_scale.ndim in [1,2], f"we only support row quantized (ndim=1) and block quantized(ndim=2) fp8 but found {fp8_weight_scale.ndim}"
+
             if layer_name in quant_state_dict:
                 # for attributes of type nn.Parameter, there's no .weight
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
                 layer = torch.nn.Parameter(weight, requires_grad = False)
                 exec(f"new_model.{layer_name_br} = layer")
                 continue
-            elif f"{layer_name}.weight_scale" in quant_state_dict:
+            elif fp8_weight_scale.ndim == 1:
                 # This is FP8 quantized but not block quant. Either dynamic or static
                 layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
                 layer.in_features = weight.shape[1]
@@ -1283,7 +1299,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.weight_scale = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale"], requires_grad = False)
                 layer.weight.input_scale_ub = kwargs['input_scale_ub']
                 layer.quant_method = "fbgemm_fp8"
-            elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
+            elif fp8_weight_scale.ndim == 2:
                 # This denotes that the model if FP8 dynamic quantized.
                 layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
                 layer.in_features = weight.shape[1]
@@ -1610,20 +1626,24 @@ def load_vllm(
 
     assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
-    max_num_batched_tokens, approx_max_num_seqs, \
-    actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
-    approximate_vllm_memory_usage(
-        mem_config,
-        load_in_4bit = use_bitsandbytes,
-        load_in_8bit = is_fp8,
-        max_seq_length = max_seq_length,
-        gpu_memory_utilization = gpu_memory_utilization,
-        enable_lora = enable_lora,
-        max_lora_rank = max_lora_rank,
-        max_loras = max_loras,
-        float8_kv_cache = float8_kv_cache,
-        account_for_gradients = training,
-    )
+    # max_num_batched_tokens, approx_max_num_seqs, \
+    # actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
+    # approximate_vllm_memory_usage(
+    #     mem_config,
+    #     load_in_4bit = use_bitsandbytes,
+    #     load_in_8bit = is_fp8,
+    #     max_seq_length = max_seq_length,
+    #     gpu_memory_utilization = gpu_memory_utilization,
+    #     enable_lora = enable_lora,
+    #     max_lora_rank = max_lora_rank,
+    #     max_loras = max_loras,
+    #     float8_kv_cache = float8_kv_cache,
+    #     account_for_gradients = training,
+    # )
+    max_num_batched_tokens = 4096
+    approx_max_num_seqs = 16
+    actual_gpu_memory_utilization = gpu_memory_utilization
+    memory_left_for_kv_cache_gb = 20
 
     enable_chunked_prefill = True
     is_mllama = "mllama" in config.model_type
@@ -1871,7 +1891,7 @@ def load_vllm(
         enable_chunked_prefill = enable_chunked_prefill, # LoRA fails with chunked prefill as at Feb 2025
         # max_seq_len_to_capture fails for V1
         # max_seq_len_to_capture = min(8192, max_seq_length + 256), # Default is 8192 for CUDAGraphs
-        compilation_config     = compilation_config, # 0, 1, 2, 3
+        # compilation_config     = compilation_config, # 0, 1, 2, 3
         enforce_eager          = enforce_eager,
         swap_space             = swap_space, # Low memory devices like Colab (13GB) default 4GB
         device                 = device,
