@@ -1308,7 +1308,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
                 layer.bias = bias
                 layer.input_scale_ub = kwargs['input_scale_ub']
-                layer.weight_scale = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale"], requires_grad = False)
+                layer.weight_scale = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
                 layer.weight.input_scale_ub = kwargs['input_scale_ub']
                 layer.quant_method = "fbgemm_fp8"
             elif fp8_weight_scale.ndim == 2:
@@ -1318,7 +1318,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.out_features = weight.shape[0]
                 layer.weight = torch.nn.Parameter(weight, requires_grad = False)
                 layer.bias = bias
-                layer.weight_scale_inv = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale_inv"], requires_grad = False)
+                layer.weight_scale_inv = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
                 layer.quant_method = "fp8"
             elif f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
