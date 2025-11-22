@@ -1300,26 +1300,27 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer = torch.nn.Parameter(weight, requires_grad = False)
                 exec(f"new_model.{layer_name_br} = layer")
                 continue
-            elif fp8_weight_scale.ndim == 1:
-                # This is FP8 quantized but not block quant. Either dynamic or static
-                layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
-                layer.in_features = weight.shape[1]
-                layer.out_features = weight.shape[0]
-                layer.weight = torch.nn.Parameter(weight, requires_grad = False)
-                layer.bias = bias
-                layer.input_scale_ub = kwargs['input_scale_ub']
-                layer.weight_scale = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
-                layer.weight.input_scale_ub = kwargs['input_scale_ub']
-                layer.quant_method = "fbgemm_fp8"
-            elif fp8_weight_scale.ndim == 2:
-                # This denotes that the model if FP8 dynamic quantized.
-                layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
-                layer.in_features = weight.shape[1]
-                layer.out_features = weight.shape[0]
-                layer.weight = torch.nn.Parameter(weight, requires_grad = False)
-                layer.bias = bias
-                layer.weight_scale_inv = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
-                layer.quant_method = "fp8"
+            elif fp8_weight_scale is not None:
+                if fp8_weight_scale.ndim == 1:
+                    # This is FP8 quantized but not block quant. Either dynamic or static
+                    layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
+                    layer.in_features = weight.shape[1]
+                    layer.out_features = weight.shape[0]
+                    layer.weight = torch.nn.Parameter(weight, requires_grad = False)
+                    layer.bias = bias
+                    layer.input_scale_ub = kwargs['input_scale_ub']
+                    layer.weight_scale = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
+                    layer.weight.input_scale_ub = kwargs['input_scale_ub']
+                    layer.quant_method = "fbgemm_fp8"
+                elif fp8_weight_scale.ndim == 2:
+                    # This denotes that the model if FP8 dynamic quantized.
+                    layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
+                    layer.in_features = weight.shape[1]
+                    layer.out_features = weight.shape[0]
+                    layer.weight = torch.nn.Parameter(weight, requires_grad = False)
+                    layer.bias = bias
+                    layer.weight_scale_inv = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
+                    layer.quant_method = "fp8"
             elif f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
