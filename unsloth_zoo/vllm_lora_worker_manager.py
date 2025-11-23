@@ -117,14 +117,17 @@ class WorkerLoRAManager(AbstractWorkerManager):
                 hf_to_vllm_mapper = model.hf_to_vllm_mapper
 
             if getattr(lora_request, "lora_tensors", None) is not None:
+                tensors = lora_request.lora_tensors.copy()
+                if lora_request.lora_embeddings is not None:
+                    tensors.update(lora_request.lora_embeddings)
+
                 lora = self._lora_model_cls.from_lora_tensors(
                     lora_model_id=lora_request.lora_int_id,
-                    tensors=lora_request.lora_tensors,
+                    tensors=tensors,
                     peft_helper=peft_helper,
                     device=None, # Keep whatever the original device was
                     dtype=self.lora_config.lora_dtype,
-                    embeddings=lora_request.lora_embeddings,
-                    target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
+                    target_embedding_padding=self.vocab_size + getattr(self.lora_config, "lora_extra_vocab_size", 0),
                     embedding_modules=self.embedding_modules,
                     embedding_padding_modules=self.embedding_padding_modules,
                     weights_mapper=hf_to_vllm_mapper
@@ -138,7 +141,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
                     device="cpu", # Local checkpoint is CPU
                     dtype=self.lora_config.lora_dtype,
                     target_embedding_padding=self.vocab_size +
-                    self.lora_config.lora_extra_vocab_size,
+                    getattr(self.lora_config, "lora_extra_vocab_size", 0),
                     embedding_modules=self.embedding_modules,
                     embedding_padding_modules=self.embedding_padding_modules,
                     weights_mapper=hf_to_vllm_mapper
@@ -157,10 +160,6 @@ class WorkerLoRAManager(AbstractWorkerManager):
             # For BadRequestError
             raise e
 
-        if lora.extra_vocab_size > self.lora_config.lora_extra_vocab_size:
-            raise ValueError(f"LoRA added vocab size {lora.extra_vocab_size} "
-                             f"is greater than lora_extra_vocab_size "
-                             f"{self.lora_config.lora_extra_vocab_size}.")
         return lora
 
     def add_dummy_lora(self, lora_request: LoRARequest, rank: int) -> bool:
