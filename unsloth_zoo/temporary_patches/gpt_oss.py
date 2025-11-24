@@ -844,10 +844,10 @@ def patch_GptOssAttention():
     pass
 
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
-    if Version(torch.__version__) >= Version("2.9.0"):
+    if Version(torch.__version__) >= Version("2.10.0"):
         eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
     else:
-        # Too many recompilation failures on 2.8.0
+        # Too many recompilation failures on 2.8.0, 2.9.0
         eager_attention_forward = inplace_eager_attention_forward
 
     def forward_function(
@@ -1156,7 +1156,8 @@ def patch_GptOssModel():
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         return hidden_states, residual
     pass
-    if has_static_cache and Version(torch.__version__) >= Version("2.9.0"):
+    if has_static_cache and Version(torch.__version__) >= Version("2.10.0"):
+        # torch 2.9.0 has excessive compilations
         inference_forward = _torch_compile(inference_forward, dynamic = None, fullgraph = True, options = fused_torch_compile_options)
 
     def forward(
