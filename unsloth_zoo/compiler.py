@@ -806,8 +806,8 @@ def create_standalone_class(
     source = source + full_class
 
     # Remove @auto_docstring
-    source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{1,}\))?", "", source)
-    source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{1,}\))?", "", source)
+    source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
     # source = source.replace("@auto_docstring", "")
 
     # Fix Gemma 3 ignore_index being not set!
