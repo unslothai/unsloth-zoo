@@ -1594,6 +1594,8 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
+    # vLLM 0.11.2 seems to must have flash-attn installed for Qwen3-VL!
+
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
     standby_util_override = os.getenv("UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE", "0") != "0"
@@ -1962,6 +1964,7 @@ def load_vllm(
 
     # Quick exit
     if return_args: return engine_args
+    print(engine_args)
 
     # Keep trying until success (2 times)
     trials = 0
