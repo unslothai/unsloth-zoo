@@ -1964,7 +1964,6 @@ def load_vllm(
 
     # Quick exit
     if return_args: return engine_args
-    print(engine_args)
 
     # Keep trying until success (2 times)
     trials = 0
