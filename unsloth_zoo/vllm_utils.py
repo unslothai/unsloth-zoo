@@ -1677,7 +1677,7 @@ def load_vllm(
     # Also seems to process 2x less sequences in 1 go so less throughput?
     # Maybe FP8 Flashinfer is much better
     # See https://docs.vllm.ai/en/latest/serving/env_vars.html
-    if importlib.util.find_spec("flashinfer"):
+    if importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
         # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
         if not use_bitsandbytes and major_version >= 8:
             os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
