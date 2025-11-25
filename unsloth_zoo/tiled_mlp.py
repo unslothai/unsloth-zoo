@@ -218,6 +218,8 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
         flat_qlen = bsz*qlen
         try:
             intermediate_size = mlp_module.config.intermediate_size
+            if isinstance(intermediate_size, (list, tuple)):
+                intermediate_size = intermediate_size[0]
         except:
             intermediate_size = hd * 4
 
