@@ -243,7 +243,7 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype_from_config(config)}
     original_meta_model = None
     error = None
-    with init_empty_weights(include_buffers = True):
+    with init_empty_weights():
         if model_name is not None:
             try:
                 # This would persist quantization information for FP8 weights
@@ -314,7 +314,7 @@ def create_empty_vision_model(config, dtype = torch.float16):
     try:
         # Use accelerate's init_empty_weights, not transformers.modeling_utils
         from accelerate import init_empty_weights
-        with init_empty_weights(include_buffers = True):
+        with init_empty_weights():
             original_meta_model = model_cls(config)
     except Exception as e:
         print(f"Failed to create original_meta_model for {model_cls.__name__}. Error {e}")
