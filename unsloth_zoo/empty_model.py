@@ -243,7 +243,13 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype_from_config(config)}
     original_meta_model = None
     error = None
-    with init_empty_weights():
+    # [NOTE] init_empty_weights(include_buffers = True) is wrong
+    # include_buffers=False is required because buffers (non-trainable tensors like
+    # embed_scale, position_ids) must be initialized with actual values, not on meta
+    # device. Models like Gemma 3 use embed_scale as a buffer in their embedding layer.
+    # With include_buffers=True, buffers become empty meta tensors with no data,
+    # causing attribute access failures during inference.
+    with init_empty_weights(include_buffers = False):
         if model_name is not None:
             try:
                 # This would persist quantization information for FP8 weights
