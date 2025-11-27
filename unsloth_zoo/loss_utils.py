@@ -351,6 +351,8 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                 count = token_count.sum()
                 seq_lengths = x.get("packed_seq_lengths")
                 if seq_lengths is not None:
+                    # When packing N sequences, there are N-1 internal boundaries
+                    # that shouldn't be counted as valid training positions
                     count -= torch.count_nonzero(seq_lengths > 0).item() - 1
                 token_counts.append(count)
             pass
