@@ -320,6 +320,12 @@ def create_empty_vision_model(config, dtype = torch.float16):
     try:
         # Use accelerate's init_empty_weights, not transformers.modeling_utils
         from accelerate import init_empty_weights
+        # [NOTE] init_empty_weights(include_buffers = True) is wrong
+        # include_buffers=False is required because buffers (non-trainable tensors like
+        # embed_scale, position_ids) must be initialized with actual values, not on meta
+        # device. Models like Gemma 3 use embed_scale as a buffer in their embedding layer.
+        # With include_buffers=True, buffers become empty meta tensors with no data,
+        # causing attribute access failures during inference.
         with init_empty_weights():
             original_meta_model = model_cls(config)
     except Exception as e:
