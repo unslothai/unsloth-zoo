@@ -365,7 +365,8 @@ def train_on_responses_only(
     # Edit data collator as well if not DataCollatorForSeq2Seq
     from transformers import DataCollatorForSeq2Seq
     if hasattr(trainer, "data_collator") and \
-        not isinstance(trainer.data_collator, DataCollatorForSeq2Seq):
+        not isinstance(trainer.data_collator, DataCollatorForSeq2Seq) and \
+        not getattr(trainer.args, "packing", False):
         trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer)
 
     # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
