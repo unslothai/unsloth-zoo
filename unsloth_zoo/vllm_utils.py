@@ -1563,6 +1563,49 @@ def determine_max_lora_rank(lora_rank = 16):
 pass
 
 
+def vllm_supports_flashinfer(config) -> bool:
+    """
+    Approximately checks if a vLLM model supports FLASHINFER by checking vLLM's ModelRegistry
+    then inspecting if `self.attn_backend not in` is seen.
+    For eg Qwen3-VL does not work with flashinfer.
+    """
+    architectures = getattr(config, "architectures", None) or []
+    try:
+        from vllm.model_executor.models.registry import ModelRegistry
+        model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
+    except Exception as e:
+        print(f"Unsloth: Failed resolving config.json during `vllm_supports_flashinfer`.\n{str(e)}")
+        return True
+
+    module = inspect.getmodule(model_cls)
+    if module is None: return True
+    
+    def _module_disallows_flashinfer(module):
+        ATTENTION_BACKEND_GUARD_REGEX = re.compile(
+            r"if\s+self\.attn_backend\s+not\s+in\s*{\s*(?P<body>.*?)\s*}:",
+            re.DOTALL,
+        )
+        try:
+            source = inspect.getsource(module)
+        except:
+            return False
+
+        matches = list(ATTENTION_BACKEND_GUARD_REGEX.finditer(source))
+        if not matches: return False
+
+        # For each guard, see if FLASHINFER appears in the allowed set.
+        for m in matches:
+            body = m.group("body")
+            if "FLASHINFER" in body:
+                return False
+        # We found a guard, but none of its allowed sets mention FLASHINFER.
+        # That's exactly the Qwen3-VL pattern:
+        # { FLASH_ATTN, TORCH_SDPA, ROCM_AITER_FA }
+        return True
+    return not _module_disallows_flashinfer(module)
+pass
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -1711,8 +1754,13 @@ def load_vllm(
     # Maybe FP8 Flashinfer is much better
     # See https://docs.vllm.ai/en/latest/serving/env_vars.html
     if importlib.util.find_spec("flashinfer"):
-        # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
-        if not use_bitsandbytes and major_version >= 8:
+        # Check if FLASHINFER is supported - for eg Qwen3-VL and Qwen2-VL do not work
+        if not vllm_supports_flashinfer(config):
+            if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER"
+                print(f"Unsloth: `{model_name} does not support `VLLM_ATTENTION_BACKEND==FLASHINFER`. Will disable")
+            del os.environ["VLLM_ATTENTION_BACKEND"]
+        elif not use_bitsandbytes and major_version >= 8:
+            # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
             os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
 
         # Flashinfer sampler maybe makes it somewhat faster on newer GPUs
