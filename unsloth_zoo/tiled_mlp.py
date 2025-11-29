@@ -137,7 +137,8 @@ class TiledMLP(torch.autograd.Function):
         extra_outputs = []
         x = x.view(-1, H)
         with torch.no_grad():
-            for i, x_split in enumerate(torch.split(x, ctx.split_sizes, dim=0)):
+            x_splits = torch.split(x, ctx.split_sizes, dim=0)
+            for i, x_split in enumerate(x_splits):
                 x_split = x_split.unsqueeze(0)
                 out = TiledMLP.handle_output(mlp_forward(x_split), extra_outputs)
 
