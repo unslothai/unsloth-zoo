@@ -1565,43 +1565,77 @@ pass
 
 def vllm_supports_flashinfer(config) -> bool:
     """
-    Approximately checks if a vLLM model supports FLASHINFER by checking vLLM's ModelRegistry
-    then inspecting if `self.attn_backend not in` is seen.
+    Approximately checks if a vLLM model supports FLASHINFER by checking
+    vLLM's ModelRegistry, then inspecting if an `if self.attn_backend not in { ... }`
+    guard excludes FLASHINFER.
+
     For eg Qwen3-VL does not work with flashinfer.
     """
-    architectures = getattr(config, "architectures", None) or []
     try:
         from vllm.model_executor.models.registry import ModelRegistry
-        model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
     except Exception as e:
-        print(f"Unsloth: Failed resolving config.json during `vllm_supports_flashinfer`.\n{str(e)}")
+        print(
+            f"Unsloth: Failed loading vLLM model class for arch {arch} "
+            f"during `vllm_supports_flashinfer`.\n{e}"
+        )
+        return True
+
+    architectures = getattr(config, "architectures", None) or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+
+    # --- Get the vLLM model class without using resolve_model_cls() ---
+    model_cls = None
+    for arch in architectures:
+        registered = getattr(ModelRegistry, "models", {}).get(arch)
+        if registered is None:
+            continue
+        try:
+            # _BaseRegisteredModel.load_model_cls() – works across versions
+            model_cls = registered.load_model_cls()
+            break
+        except Exception as e:
+            print(
+                f"Unsloth: Failed loading vLLM model class for arch {arch} "
+                f"during `vllm_supports_flashinfer`.\n{e}"
+            )
+            return True
+
+    if model_cls is None:
+        # Unknown architecture for vLLM; let vLLM handle it and don't block FLASHINFER.
         return True
 
     module = inspect.getmodule(model_cls)
-    if module is None: return True
-    
-    def _module_disallows_flashinfer(module):
+    if module is None:
+        return True
+
+    def _module_disallows_flashinfer(module) -> bool:
         ATTENTION_BACKEND_GUARD_REGEX = re.compile(
             r"if\s+self\.attn_backend\s+not\s+in\s*{\s*(?P<body>.*?)\s*}:",
             re.DOTALL,
         )
         try:
             source = inspect.getsource(module)
-        except:
+        except Exception:
+            # Can't inspect source – don't claim FLASHINFER is disallowed.
             return False
 
         matches = list(ATTENTION_BACKEND_GUARD_REGEX.finditer(source))
-        if not matches: return False
+        if not matches:
+            return False
 
         # For each guard, see if FLASHINFER appears in the allowed set.
         for m in matches:
             body = m.group("body")
             if "FLASHINFER" in body:
+                # Some allowed-set includes FLASHINFER → don't disallow.
                 return False
-        # We found a guard, but none of its allowed sets mention FLASHINFER.
+
+        # We found at least one guard, but none of its allowed sets mention FLASHINFER.
         # That's exactly the Qwen3-VL pattern:
         # { FLASH_ATTN, TORCH_SDPA, ROCM_AITER_FA }
         return True
+
     return not _module_disallows_flashinfer(module)
 pass
 
