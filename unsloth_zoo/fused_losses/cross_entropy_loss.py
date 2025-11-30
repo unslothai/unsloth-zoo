@@ -28,6 +28,10 @@ import math
 import os
 from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 from ..device_type import DEVICE_TYPE
+        
+
+TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
+N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)
 
 @functools.cache
 def _get_mapping(autograd):
@@ -362,13 +366,8 @@ def unsloth_fused_ce_loss(
     # Get mixed precision scaling if seen
     scaling = scaler.get_scale() if scaler is not None else scaling
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
-    if target_gb is None and 'n_chunks' not in kwargs:
-        target_gb = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
-        n_chunks = kwargs.get("n_chunks", os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None))
-        if target_gb:
-            target_gb = float(target_gb)
-        elif n_chunks:
-            kwargs["n_chunks"] = max(int(n_chunks), 1)
+    if TARGET_GB: target_gb = float(TARGET_GB)
+    elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
     return apply_autograd_function(UnslothFusedLoss, dict(
         loss_function = compute_fused_ce_loss,
         hidden_states = hidden_states,
