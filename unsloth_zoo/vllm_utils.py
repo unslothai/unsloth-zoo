@@ -1436,6 +1436,7 @@ def approximate_vllm_memory_usage(
     max_loras = 1,
     float8_kv_cache = False,
     account_for_gradients = True,
+    parallel_sequences = 64,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
@@ -1664,14 +1665,13 @@ def load_vllm(
     unsloth_vllm_standby   : bool = False,
     is_vision_model        : bool = False,
     return_args            : bool = False, # Just return args
+    parallel_sequences     : int = 64, # max_num_seqs (how many seqs to process in parallel. Default vLLM 256)
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
     assert(config is not None)
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
-
-    # vLLM 0.11.2 seems to must have flash-attn installed for Qwen3-VL!
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
@@ -1797,10 +1797,16 @@ def load_vllm(
         elif not use_bitsandbytes and major_version >= 8:
             # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
             os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+        elif Version(vllm_version) >= Version("0.11.0"):
+            # On 0.11.0, Flashinfer also works!
+            os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
 
         # Flashinfer sampler maybe makes it somewhat faster on newer GPUs
         # Tesla T4 is 280 tok/s vs 330 tok/s
         if major_version >= 8:
+            os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
+        elif Version(vllm_version) >= Version("0.11.0"):
+            # On 0.11.0, Flashinfer also works!
             os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
         else:
             os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
@@ -1818,7 +1824,6 @@ def load_vllm(
         enable_prefix_caching = True
     elif DEVICE_TYPE == "xpu":
         enable_prefix_caching = True
-
     pass
 
     # Use VLLM_USE_V1 for vllm >= 0.7.4 and CUDA >= 8.0
@@ -1833,25 +1838,48 @@ def load_vllm(
     from vllm import LLM, LLMEngine, AsyncLLMEngine, EngineArgs, AsyncEngineArgs
 
     # Default vLLM max_num_seqs is 256
-    approx_max_num_seqs = 256
-    if   memory_left_for_kv_cache_gb <=  2: approx_max_num_seqs = 128 # - 32
-    elif memory_left_for_kv_cache_gb <=  4: approx_max_num_seqs = 160 # - 32
-    elif memory_left_for_kv_cache_gb <=  8: approx_max_num_seqs = 192 # - 32
-    elif memory_left_for_kv_cache_gb <= 12: approx_max_num_seqs = 224 # - 32
-    elif memory_left_for_kv_cache_gb <= 16: approx_max_num_seqs = 256 # Default
-    elif memory_left_for_kv_cache_gb <= 24: approx_max_num_seqs = 288 # + 32
-    elif memory_left_for_kv_cache_gb <= 40: approx_max_num_seqs = 320 # + 32
-    elif memory_left_for_kv_cache_gb <= 48: approx_max_num_seqs = 226 # + 16
-    elif memory_left_for_kv_cache_gb <= 80: approx_max_num_seqs = 368 # + 32
-    else: approx_max_num_seqs = 400 # + 32
-
-    max_num_batched_tokens = 2048
+    # This is how many sequences can be processed in parallel
+    # We do 64 on smaller GPUs
+    # batch_size = 16, num_generations = 4 for eg.
+    # We expand max_batched_tokens to 4096 on small GPUs and 8192 on large ones.
+    """
+    Benchmarks for max_batched_tokens, max_num_seqs
+    Around after max_num_seqs>=64, we see linear increase in memory usage.
+    | max_model_len | max_batched_tokens | max_num_seqs | Profiling Time | Non-KV Memory | Torch Peak | Non-Torch Forward | Weights |
+    |--------------:|-------------------:|-------------:|---------------:|--------------:|-----------:|------------------:|--------:|
+    | 2048          | 2048               | 8            | 11.18s         | 7.87GiB       | 0.18GiB    | 0.13GiB           | 7.56GiB |
+    | 4096          | 4096               | 8            | 10.87s         | 8.01GiB       | 0.32GiB    | 0.13GiB           | 7.56GiB |
+    | 8192          | 8192               | 8            | 11.24s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
+    | 8192          | 8192               | 16           | 11.48s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
+    | 8192          | 8192               | 32           | 11.09s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
+    | 8192          | 8192               | 64           | 11.09s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
+    | 8192          | 8192               | 128          | 11.38s         | 8.45GiB       | 0.76GiB    | 0.13GiB           | 7.56GiB |
+    | 8192          | 8192               | 256          | 11.84s         | 9.14GiB       | 1.45GiB    | 0.13GiB           | 7.56GiB |
+    | 8192          | 8192               | 512          | 11.50s         | 10.52GiB      | 2.83GiB    | 0.13GiB           | 7.56GiB |
+    | 8192          | 8192               | 1024         | 11.03s         | 13.28GiB      | 5.59GiB    | 0.13GiB           | 7.56GiB |
+    | 8192          | 8192               | 2048         | 11.63s         | 18.80GiB      | 11.11GiB   | 0.13GiB           | 7.56GiB |
+    | 16384         | 16384              | 8            | 11.21s         | 8.89GiB       | 1.20GiB    | 0.13GiB           | 7.56GiB |
+    | 32768         | 32768              | 8            | 11.27s         | 10.07GiB      | 2.38GiB    | 0.13GiB           | 7.56GiB |
+    """
+    approx_max_num_seqs = 256 # vLLM default
+    max_num_batched_tokens = 2048 # vLLM default
+    if   memory_left_for_kv_cache_gb <=  2: max_num_batched_tokens, approx_max_num_seqs = 2048, 8   # - 8
+    elif memory_left_for_kv_cache_gb <=  4: max_num_batched_tokens, approx_max_num_seqs = 2048, 16  # - 16
+    elif memory_left_for_kv_cache_gb <=  8: max_num_batched_tokens, approx_max_num_seqs = 4096, 32  # - 16
+    elif memory_left_for_kv_cache_gb <= 12: max_num_batched_tokens, approx_max_num_seqs = 4096, 48  # - 16
+    elif memory_left_for_kv_cache_gb <= 16: max_num_batched_tokens, approx_max_num_seqs = 6144, 64  # Default
+    elif memory_left_for_kv_cache_gb <= 24: max_num_batched_tokens, approx_max_num_seqs = 6144, 80  # + 16
+    elif memory_left_for_kv_cache_gb <= 40: max_num_batched_tokens, approx_max_num_seqs = 8192, 96  # + 16
+    elif memory_left_for_kv_cache_gb <= 48: max_num_batched_tokens, approx_max_num_seqs = 8192, 112 # + 16
+    elif memory_left_for_kv_cache_gb <= 80: max_num_batched_tokens, approx_max_num_seqs = 8192, 128 # + 16
+    elif memory_left_for_kv_cache_gb >  80: max_num_batched_tokens, approx_max_num_seqs = 8192, 256 # + 16
 
     if is_vision_model:
         # In vLLM profiling, each sequence contributes to an image. Which is generally in the order of thousand tokens.
         # We don't want to go beyond 16 sequences for vision models.
         # TODO: In vLLM V1, iirc, the profiling sets a cap on the max seqs based on the budget. Check it out.
         print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
+        # [TODO] Check this
         approx_max_num_seqs = 1
         # Single image would contribute to 6404 tokens in Llama 3.2 for eg. So have some more for text
         # For qwen 2.5 VL, this single image/video contributes to 16Ki tokens
@@ -1877,6 +1905,7 @@ def load_vllm(
 
     # Scale num_seqs by conservativeness
     approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
+    approx_max_num_seqs = max(approx_max_num_seqs, 1)
 
     # Check max RAM usage for vLLM (swap space) default is 4GB
     memory = psutil.virtual_memory()
