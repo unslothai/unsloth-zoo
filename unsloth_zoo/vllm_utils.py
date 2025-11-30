@@ -1690,7 +1690,7 @@ def load_vllm(
     else: standby_target_gpu_util = 0.75
 
     if unsloth_vllm_standby and not standby_util_override:
-        if gpu_memory_utilization < standby_target_gpu_util
+        if gpu_memory_utilization < standby_target_gpu_util:
             gpu_memory_utilization = standby_target_gpu_util
         print(f"Unsloth: Standby mode is enabled. Changing `gpu_memory_utilization` to {gpu_memory_utilization}.")
 
