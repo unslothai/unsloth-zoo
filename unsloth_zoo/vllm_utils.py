@@ -1665,7 +1665,7 @@ def load_vllm(
     unsloth_vllm_standby   : bool = False,
     is_vision_model        : bool = False,
     return_args            : bool = False, # Just return args
-    parallel_sequences     : int = 64, # max_num_seqs (how many seqs to process in parallel. Default vLLM 256)
+    max_num_seqs           : int = 256, # how many seqs to process in parallel. Default vLLM 256
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
@@ -1861,7 +1861,7 @@ def load_vllm(
     | 16384         | 16384              | 8            | 11.21s         | 8.89GiB       | 1.20GiB    | 0.13GiB           | 7.56GiB |
     | 32768         | 32768              | 8            | 11.27s         | 10.07GiB      | 2.38GiB    | 0.13GiB           | 7.56GiB |
     """
-    approx_max_num_seqs = 256 # vLLM default
+    approx_max_num_seqs = max_num_seqs # vLLM default is 256
     max_num_batched_tokens = 2048 # vLLM default
     if   memory_left_for_kv_cache_gb <=  2: max_num_batched_tokens, approx_max_num_seqs = 2048, 8   # - 8
     elif memory_left_for_kv_cache_gb <=  4: max_num_batched_tokens, approx_max_num_seqs = 2048, 16  # - 16
