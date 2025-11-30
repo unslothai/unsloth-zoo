@@ -1756,7 +1756,7 @@ def load_vllm(
     if importlib.util.find_spec("flashinfer"):
         # Check if FLASHINFER is supported - for eg Qwen3-VL and Qwen2-VL do not work
         if not vllm_supports_flashinfer(config):
-            if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER"
+            if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
                 print(f"Unsloth: `{model_name} does not support `VLLM_ATTENTION_BACKEND==FLASHINFER`. Will disable")
             del os.environ["VLLM_ATTENTION_BACKEND"]
         elif not use_bitsandbytes and major_version >= 8:
