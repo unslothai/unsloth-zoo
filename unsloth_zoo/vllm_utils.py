@@ -2120,6 +2120,12 @@ def load_vllm(
     # Unpatch vLLM compute_dtype for bitsandbytes
     unpatch_vllm_compute_dtype(BitsAndBytesConfig)
 
+    # Check if sleep mode, and send the model to sleep
+    # This is to counteract OOMs before GRPO is launched like pre-inference runs
+    if unsloth_vllm_standby and not standby_util_override:
+        print(f"Unsloth: Standby mode is enabled. Pre-sleeping vLLM model to reduce OOMs.")
+        llm.sleep(os.environ.get('VLLM_SLEEP_MODE', "1"))
+
     # Cleanup
     for _ in range(3):
         gc.collect()
