@@ -137,7 +137,8 @@ class TiledMLP(torch.autograd.Function):
         extra_outputs = []
         x = x.view(-1, H)
         with torch.no_grad():
-            for i, x_split in enumerate(torch.split(x, ctx.split_sizes, dim=0)):
+            x_splits = torch.split(x, ctx.split_sizes, dim=0)
+            for i, x_split in enumerate(x_splits):
                 x_split = x_split.unsqueeze(0)
                 out = TiledMLP.handle_output(mlp_forward(x_split), extra_outputs)
 
@@ -245,11 +246,14 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
 
     def tiled_forward_arctic_size(self, x):
         B, S, H = x.shape
-        n_shards = int(max(1, min(S, math.ceil(S / max(1, H)))))
+        chunk_size = max(1, H)
+        n_shards, remainder = divmod(S, chunk_size)
+        n_shards = max(1, n_shards)
+        # remainder gets added to the last shard in the forward pass
 
         # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
-        return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards, 0)
+        return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards, chunk_size)
 
     if target_arctic:
         mlp_module.forward = MethodType(tiled_forward_arctic_size, mlp_module)
