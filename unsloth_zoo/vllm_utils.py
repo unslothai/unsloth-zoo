@@ -1869,8 +1869,8 @@ def load_vllm(
     max_num_batched_tokens = 2048 # vLLM default
     if   memory_left_for_kv_cache_gb <=  2: max_num_batched_tokens, approx_max_num_seqs = 2048, 8   # - 8
     elif memory_left_for_kv_cache_gb <=  4: max_num_batched_tokens, approx_max_num_seqs = 2048, 16  # - 16
-    elif memory_left_for_kv_cache_gb <=  8: max_num_batched_tokens, approx_max_num_seqs = 4096, 32  # - 16
-    elif memory_left_for_kv_cache_gb <= 12: max_num_batched_tokens, approx_max_num_seqs = 4096, 48  # - 16
+    elif memory_left_for_kv_cache_gb <=  8: max_num_batched_tokens, approx_max_num_seqs = 2048, 32  # - 16
+    elif memory_left_for_kv_cache_gb <= 12: max_num_batched_tokens, approx_max_num_seqs = 2048, 48  # - 16
     elif memory_left_for_kv_cache_gb <= 16: max_num_batched_tokens, approx_max_num_seqs = 6144, 64  # Default
     elif memory_left_for_kv_cache_gb <= 24: max_num_batched_tokens, approx_max_num_seqs = 6144, 80  # + 16
     elif memory_left_for_kv_cache_gb <= 40: max_num_batched_tokens, approx_max_num_seqs = 8192, 96  # + 16
