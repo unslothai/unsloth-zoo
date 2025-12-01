@@ -271,7 +271,6 @@ def grpo_compute_loss(
                 importance_sampling_ratio, max=vllm_importance_sampling_cap
             )
     pass
-    # pass
     
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
