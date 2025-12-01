@@ -80,6 +80,7 @@ def patch_qwen3_moe():
             # this will be used to easily index which expert is going to be sollicitated
             expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
+            global data
             data = [selected_experts, self, final_hidden_states, hidden_states, routing_weights, batch_size, sequence_length, hidden_dim]
             raise
             # Loop over all available experts in the model and perform the computation on each expert
