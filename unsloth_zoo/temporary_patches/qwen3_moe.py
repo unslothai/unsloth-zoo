@@ -52,9 +52,9 @@ def patch_qwen3_moe():
     try:
         import transformers.models.qwen3_moe.modeling_qwen3_moe
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts # New transformers has this
-        old_transformers = True
-    except Exception as e:
         old_transformers = False
+    except Exception as e:
+        old_transformers = True
 
     if old_transformers:
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
