@@ -106,7 +106,11 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
                 ignore_index = ignore_index,
                 reduction    = reduction,
             )
-            if reduction == "sum": loss = loss / num_items_in_batch
+            if reduction == "sum":
+                # just in case users pass an int for num_items_in_batch, which could be the case for custom trainer
+                if torch.is_tensor(num_items_in_batch):
+                    num_items_in_batch = num_items_in_batch.to(loss.device)
+                loss = loss / num_items_in_batch
         return loss
     pass
     
@@ -344,7 +348,13 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)
                     mark_dynamic(token_type_ids, 1)
-                token_counts.append(token_count.sum())
+                count = token_count.sum()
+                seq_lengths = x.get("packed_seq_lengths")
+                if seq_lengths is not None:
+                    # When packing N sequences, there are N-1 internal boundaries
+                    # that shouldn't be counted as valid training positions
+                    count -= torch.count_nonzero(seq_lengths > 0).item() - 1
+                token_counts.append(count)
             pass
             num_items_in_batch = sum(token_counts)
 

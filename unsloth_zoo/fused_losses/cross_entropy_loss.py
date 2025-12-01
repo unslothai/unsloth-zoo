@@ -25,8 +25,13 @@ from typing import Optional, Tuple, Callable, Dict
 import inspect
 import functools
 import math
+import os
 from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 from ..device_type import DEVICE_TYPE
+        
+
+TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
+N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)
 
 @functools.cache
 def _get_mapping(autograd):
@@ -95,13 +100,7 @@ def compute_fused_ce_loss(
 
     # Calculate cross entropy loss
     reduction = "sum" if n_items is not None else "mean"
-    # Since we overwrite torch.compile(torch.nn.functional.cross_entropy)
-    # We might get double compile errors, so use the uncompiled version
-    cross_entropy = \
-        torch.nn.functional._uncompiled_cross_entropy if \
-        hasattr(torch.nn.functional, "_uncompiled_cross_entropy") else \
-        torch.nn.functional.cross_entropy
-    loss = cross_entropy(
+    loss = torch.nn.functional.cross_entropy(
         input  = logits.view(-1, vocab_size).float().contiguous(),
         target = labels.view(-1).to(device).contiguous(),
         reduction = reduction,
@@ -367,6 +366,8 @@ def unsloth_fused_ce_loss(
     # Get mixed precision scaling if seen
     scaling = scaler.get_scale() if scaler is not None else scaling
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
+    if TARGET_GB: target_gb = float(TARGET_GB)
+    elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
     return apply_autograd_function(UnslothFusedLoss, dict(
         loss_function = compute_fused_ce_loss,
         hidden_states = hidden_states,

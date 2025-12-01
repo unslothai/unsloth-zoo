@@ -171,9 +171,11 @@ def patch_torch_functions():
     if not hasattr(torch.nn.functional, "_uncompiled_layer_norm"):
         torch.nn.functional._uncompiled_layer_norm = torch.nn.functional.layer_norm
         torch.nn.functional.layer_norm = layer_norm
-    if not hasattr(torch.nn.functional, "_uncompiled_cross_entropy"):
-        torch.nn.functional._uncompiled_cross_entropy = torch.nn.functional.cross_entropy
-        torch.nn.functional.cross_entropy = cross_entropy
+    # Remove compiling cross_entropy since too many errors
+    # We already compile this most likely anyways
+    # if not hasattr(torch.nn.functional, "_uncompiled_cross_entropy"):
+    #     torch.nn.functional._uncompiled_cross_entropy = torch.nn.functional.cross_entropy
+    #     torch.nn.functional.cross_entropy = cross_entropy
 pass
 
 

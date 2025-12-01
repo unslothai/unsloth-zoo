@@ -175,13 +175,14 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         "config.accumulated_cache_size_limit = 1024", # Bump up a bit from 256
         f"config.suppress_errors = {not debug and ignore_errors}", # Supress errors for now
         f"config.do_not_emit_runtime_asserts = {not debug}",
-        "config.cache_size_limit = 1024", # Flex Attention
         "config.inline_inbuilt_nn_modules = True", # Torch 2.5 Regional recompilation
         "config.numpy_default_float = 'float32'",
         # FAILS for Gemma!
         "config.compiled_autograd = False", # New Torch 2.4 feature which can compile backwards passes
         # https://pytorch.org/tutorials/intermediate/compiled_autograd_tutorial.html
-        "config.recompile_limit = 32", # Increase recompile amounts to 32 - then will do eager
+        # [NOTE] recompile_limit and cache_size_limit are equivalent!
+        "config.recompile_limit = 1024", # Increase recompile amounts to 1024 - then will do eager
+        "config.cache_size_limit = 1024", # Flex Attention
         # f"config.fail_on_recompile_limit_hit = {not debug and ignore_errors}", # Ignore recompiles CANNOT be used in tandem with suppress_errors
         "config.allow_unspec_int_on_nn_module = True", # Integers in modules will auto wrap torch.tensor(self.vocab_size)
         f"config.optimize_ddp = {not debug}", # Optimizes DDP, but can error out so disable on debug
