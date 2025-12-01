@@ -568,10 +568,10 @@ def grpo_accumulated_loss(
     if pixel_values is None:
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
 
-        max_left_pad = max(left_pad_tokens_per_prompt).item()
+        max_left_pad = torch.max(left_pad_tokens_per_prompt).item()
 
-        if max_left_pad < max(prev_max_left_pad).item() and (logits_to_keep +max_left_pad) != old_logps.shape[1]:
-            max_left_pad =  max(prev_max_left_pad).item()
+        if max_left_pad < torch.max(prev_max_left_pad).item() and (logits_to_keep +max_left_pad) != old_logps.shape[1]:
+            max_left_pad =  torch.max(prev_max_left_pad).item()
 
         input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
 
