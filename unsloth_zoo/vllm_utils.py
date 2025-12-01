@@ -1429,7 +1429,7 @@ def vllm_backend_check():
     major,minor = torch.cuda.get_device_capability()
     sm_capability = major * 10 + minor
     vllm_version = Version(vllm.__version__)
-    if sm_capability < 80 or vllm_version < Version("0.9"):
+    if vllm_version < Version("0.9"):
         # These use vLLM V0. V1 was introduced in 0.9 but is not supported by GPUs with SM < 80
         return "V0"
     elif vllm_version >= Version("0.11.0"):
@@ -1437,7 +1437,7 @@ def vllm_backend_check():
         return "V1"
     else:
         # Check for env var VLLM_USE_V1. If it is not set explicitly, assume V1
-        if os.getenv("VLLM_USE_V1", "0") != "0":
+        if os.getenv("VLLM_USE_V1", "0") != "0" and sm_capability >= 80:
             return "V1"
         else:
             return "V0"
