@@ -1688,7 +1688,9 @@ def load_vllm(
     elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
     elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
     else: standby_target_gpu_util = 0.75
-    standby_target_gpu_util = 0.75
+    # Reduce memory usage for newer vLLM versions since it OOMs
+    if Version(vllm_version) >= Version("0.11.0"):
+        standby_target_gpu_util *= 0.95
 
     if unsloth_vllm_standby and not standby_util_override:
         if gpu_memory_utilization < standby_target_gpu_util:
@@ -1871,8 +1873,8 @@ def load_vllm(
     max_num_batched_tokens = 2048 # vLLM default
     if   memory_left_for_kv_cache_gb <=  2: max_num_batched_tokens, approx_max_num_seqs = 2048, 8   # - 8
     elif memory_left_for_kv_cache_gb <=  4: max_num_batched_tokens, approx_max_num_seqs = 2048, 16  # - 16
-    elif memory_left_for_kv_cache_gb <=  8: max_num_batched_tokens, approx_max_num_seqs = 2048, 32  # - 16
-    elif memory_left_for_kv_cache_gb <= 12: max_num_batched_tokens, approx_max_num_seqs = 2048, 48  # - 16
+    elif memory_left_for_kv_cache_gb <=  8: max_num_batched_tokens, approx_max_num_seqs = 4096, 32  # - 16
+    elif memory_left_for_kv_cache_gb <= 12: max_num_batched_tokens, approx_max_num_seqs = 4096, 48  # - 16
     elif memory_left_for_kv_cache_gb <= 16: max_num_batched_tokens, approx_max_num_seqs = 6144, 64  # Default
     elif memory_left_for_kv_cache_gb <= 24: max_num_batched_tokens, approx_max_num_seqs = 6144, 80  # + 16
     elif memory_left_for_kv_cache_gb <= 40: max_num_batched_tokens, approx_max_num_seqs = 8192, 96  # + 16
