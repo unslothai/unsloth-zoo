@@ -38,7 +38,8 @@ from .utils import (
     process_return,
 )
 
-
+global data
+data = []
 def patch_qwen3_moe():
     # https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L213
     # Transformers >= 5       uses self.gate_up_proj = nn.Parameter(...)
@@ -79,13 +80,13 @@ def patch_qwen3_moe():
             # this will be used to easily index which expert is going to be sollicitated
             expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
+            data = [selected_experts, self, final_hidden_states, hidden_states, routing_weights, batch_size, sequence_length, hidden_dim]
+            raise
             # Loop over all available experts in the model and perform the computation on each expert
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
             for expert_idx in expert_hit:
                 expert_layer = self.experts[expert_idx]
                 idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-                print(idx, top_x)
-                raise
 
                 # Index the correct hidden states and compute the expert hidden state for
                 # the current expert. We need to make sure to multiply the output hidden
