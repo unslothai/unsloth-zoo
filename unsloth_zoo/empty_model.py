@@ -21,6 +21,9 @@ __all__ = [
     "get_model_layer_config",
     "compare_attributes",
     "copy_attributes",
+    "get_mm_dummy_batch_from_hf_config",
+    # "get_mm_dummy_batch_shapes",
+    "transformer_layer_activation_memory",
 ]
 
 import torch
@@ -849,3 +852,279 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
         weight = component.weight
         state_dict[f'{path}.weight'] = weight.reshape(vision_config.hidden_size, vision_config.in_channels, vision_config.temporal_patch_size, vision_config.patch_size, vision_config.patch_size)
         quant_state_dict[f'{path}.weight'] = state_dict[f'{path}.weight']
+
+
+def transformer_layer_activation_memory(hd, kv_size, mlp_size, bsz=1,residual_factor=2):
+    # Activation memory - assume bsz=2 (this is an overkill tbh)
+    bsz = 1
+    activation_qkvo  = bsz * (2 * hd + kv_size + kv_size) # 2 * hd for q and o
+    residual_memory = bsz * hd * residual_factor
+    activation_mlp  = bsz * (mlp_size + mlp_size)
+    total_activation = activation_qkvo + residual_memory + activation_mlp
+    activation_memory_per_token = total_activation * 2 # Assuming 16bit for activation
+    return activation_memory_per_token
+
+def get_mm_dummy_batch_from_hf_config(
+    hf_config,
+    model_name: str | None = None,
+    max_model_len: int = 2048,
+    max_num_seqs: int = 256,
+    max_num_batched_tokens: int = 8192,
+    modality: str | None = None,
+    max_items_per_batch: int | None = None,
+    device: torch.types.Device | None = None,
+    pin_memory: bool = False,
+):
+    """
+    Create a dummy batch of multimodal inputs from HuggingFace config.
+
+    This function wraps vLLM's get_mm_dummy_batch but works with HF config
+    instead of vLLM's ModelConfig and SchedulerConfig.
+
+    Args:
+        hf_config: HuggingFace model config (transformers.PretrainedConfig)
+        model_name: Optional model name/path. If None, will try to get from config.
+        max_model_len: Maximum model sequence length.
+        max_num_seqs: Maximum number of sequences for scheduler config.
+        max_num_batched_tokens: Maximum batched tokens for scheduler config.
+        modality: Optional modality to use. If None, will use the modality
+            with maximum tokens from the budget.
+        max_items_per_batch: Optional maximum items per batch. If None, will
+            use the value from the budget.
+        device: Device to place tensors on.
+        pin_memory: Whether to pin memory for faster transfer.
+
+    Returns:
+        BatchedTensorInputs: A batched tensor inputs dictionary ready for
+            multimodal encoder processing.
+    """
+    try:
+        from vllm.config import ModelConfig, SchedulerConfig
+        from vllm.multimodal import MULTIMODAL_REGISTRY
+        from vllm.v1.worker.utils import MultiModalBudget
+        from vllm.multimodal.inputs import BatchedTensorInputs
+        from vllm.multimodal.utils import group_mm_kwargs_by_modality
+    except ImportError as e:
+        raise ImportError(
+            "vLLM is required for get_mm_dummy_batch_from_hf_config. "
+            f"Install it or ensure it's in your path. Error: {e}"
+        )
+
+    # Get model name from config if not provided
+    if model_name is None:
+        model_name = getattr(hf_config, "model_name", None) or getattr(hf_config, "_name_or_path", None)
+        if model_name is None:
+            raise ValueError(
+                "model_name must be provided or available in config.model_name/config._name_or_path"
+            )
+
+    # Create vLLM ModelConfig from HF config
+    # ModelConfig can be created with just the model name, and it will load the config
+    model_config = ModelConfig(
+        model=model_name,
+        max_model_len=max_model_len,
+    )
+
+    # Create SchedulerConfig
+    scheduler_config = SchedulerConfig(
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+    )
+
+    # Create multimodal budget
+    mm_budget = MultiModalBudget(
+        model_config=model_config,
+        scheduler_config=scheduler_config,
+        mm_registry=MULTIMODAL_REGISTRY,
+    )
+
+    # Get encoder budget
+    encoder_budget = mm_budget.get_encoder_budget()
+    if encoder_budget == 0:
+        raise ValueError(
+            "Encoder budget is 0. Cannot create dummy batch for multimodal inputs."
+        )
+
+    # Determine modality and max items if not provided
+    if modality is None:
+        modality = mm_budget.get_modality_with_max_tokens()
+
+    if max_items_per_batch is None:
+        max_items_per_batch = mm_budget.max_items_per_batch_by_modality[modality]
+
+    # Get dummy decoder data from the registry
+    dummy_decoder_data = MULTIMODAL_REGISTRY.get_decoder_dummy_data(
+        model_config=model_config,
+        seq_len=max_model_len,
+        mm_counts={modality: 1},
+        cache=mm_budget.cache,
+    )
+
+    # Extract the dummy multimodal item
+    dummy_mm_data = dummy_decoder_data.multi_modal_data
+    dummy_mm_item = dummy_mm_data[modality][0]
+
+    # Replicate the item to create a batch
+    dummy_mm_items = [dummy_mm_item] * max_items_per_batch
+
+    # Group and batch the multimodal kwargs
+    batched_dummy_mm_inputs = next(
+        mm_kwargs_group
+        for _, _, mm_kwargs_group in group_mm_kwargs_by_modality(
+            dummy_mm_items,
+            device=device,
+            pin_memory=pin_memory,
+            merge_by_field_config=True,  # Default to True for new code
+        )
+    )
+
+    return batched_dummy_mm_inputs
+
+
+# def get_mm_dummy_batch_shapes(hf_config, model_name: str | None = None, **kwargs):
+#     """
+#     Get shapes of multimodal dummy batch from HuggingFace config.
+
+#     Convenience function that returns just the shapes dictionary.
+
+#     Args:
+#         hf_config: HuggingFace model config
+#         model_name: Optional model name/path
+#         **kwargs: Additional arguments passed to get_mm_dummy_batch_from_hf_config
+
+#     Returns:
+#         dict: Dictionary mapping tensor names to their shapes
+#     """
+#     batched_inputs = get_mm_dummy_batch_from_hf_config(hf_config, model_name, **kwargs)
+
+#     def extract_shapes(obj, prefix=""):
+#         """Recursively extract shapes from nested structure."""
+#         shapes = {}
+#         if isinstance(obj, torch.Tensor):
+#             key = prefix if prefix else "root"
+#             shapes[key] = {
+#                 "shape": tuple(obj.shape),
+#                 "dtype": str(obj.dtype),
+#                 "device": str(obj.device),
+#             }
+#         elif isinstance(obj, dict):
+#             for k, v in obj.items():
+#                 new_prefix = f"{prefix}.{k}" if prefix else k
+#                 shapes.update(extract_shapes(v, new_prefix))
+#         elif isinstance(obj, (list, tuple)):
+#             for i, item in enumerate(obj):
+#                 new_prefix = f"{prefix}[{i}]" if prefix else f"[{i}]"
+#                 shapes.update(extract_shapes(item, new_prefix))
+#         return shapes
+
+#     return extract_shapes(batched_inputs)
+
+def get_dummy_batch(config, model_name=None, limit_mm_per_prompt=None):
+    from vllm.config import ModelConfig, SchedulerConfig
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+    from vllm.v1.worker.utils import MultiModalBudget
+
+    model_config_kwargs = {
+        "model": model_name,
+        "max_model_len": getattr(config, "max_position_embeddings", 2048),
+        "limit_mm_per_prompt": limit_mm_per_prompt,
+    }
+
+    vllm_model_config = ModelConfig(**model_config_kwargs)
+
+    # Create a dummy scheduler config for getting mm_budget
+    vllm_scheduler_config = SchedulerConfig(
+        max_num_seqs=16,
+        max_num_batched_tokens=1024,
+    )
+    mm_budget = MultiModalBudget(
+        model_config=vllm_model_config,
+        scheduler_config=vllm_scheduler_config,
+        mm_registry=MULTIMODAL_REGISTRY,
+    )
+    encoder_budget = mm_budget.get_encoder_budget()
+
+    # Get the modality with max tokens and its max_items_per_batch
+    # This matches what GPUModelRunner does at lines 3776-3779
+    modality = mm_budget.get_modality_with_max_tokens()
+    max_mm_items_per_batch = mm_budget.max_items_per_batch_by_modality[modality]
+
+    # Create dummy batch inputs (like vLLM does at lines 3791-3794)
+    dummy_batch = get_mm_dummy_batch_from_hf_config(
+        hf_config=config,
+        model_name=model_name,
+        max_model_len=getattr(config, "max_position_embeddings", 2048),
+        modality=modality,
+        max_items_per_batch=max_mm_items_per_batch,
+        max_num_seqs=256,
+        max_num_batched_tokens=8192,
+    )
+
+    return dummy_batch, encoder_budget
+
+
+def get_memory_estimate(config, dummy_batch, encoder_budget):
+    model_type = get_model_type(config)
+    vision_config = getattr(config, "vision_config", None)
+    dtype_bytes = 2 # 2 for fp16 or bf16
+    encoder_output_shape = config.text_config.hidden_size
+    saved_states_memory = 0
+    if model_type in ['qwen3_vl', 'qwen2_5_vl']:
+        # we have pixel_values or pixel_values_videos
+        if 'pixel_values' in dummy_batch:
+            dummy_batch_memory = dummy_batch['pixel_values'].numel() * dtype_bytes
+            seq_len = dummy_batch['pixel_values'].shape[0]
+        elif 'pixel_values_videos' in dummy_batch:
+            dummy_batch_memory = dummy_batch['pixel_values_videos'].numel() * dtype_bytes
+            seq_len = dummy_batch['pixel_values_videos'].shape[0]
+        else:
+            raise ValueError(f"Pixel values not found in dummy batch for model {config.model_name}")
+        vision_out_dim = getattr(vision_config, "out_hidden_size", config.vision_config.hidden_size)
+        num_saved_states = len(getattr(vision_config, 'deepstack_visual_indexes', [])) # will be 0 for qwen2.5-vl
+        saved_states_memory = (seq_len // 4) * vision_out_dim * dtype_bytes * num_saved_states # /4 since we reshape in forward.
+    elif model_type in ['gemma3']:
+        if 'pixel_values' in dummy_batch:
+            pixel_values = dummy_batch['pixel_values']
+            ppi = getattr(vision_config, 'image_size', 896) // getattr(vision_config, 'patch_size', 16)
+            tps = getattr(config, 'mm_tokens_per_image', 256) ** 0.5
+            kernel_size = ppi // tps
+            seq_len = pixel_values.shape[0] * pixel_values.shape[1] * pixel_values.shape[2] / (kernel_size ** 2)
+            dummy_batch_memory = pixel_values.numel() * dtype_bytes
+        else:
+            raise ValueError(f"Pixel values not found in dummy batch for model {config.model_name}")
+    elif model_type in ['mistral3']:
+        if 'pixel_values' in dummy_batch:
+            pixel_values = dummy_batch['pixel_values']
+            seq_len = pixel_values.shape[0]
+            dummy_batch_memory = pixel_values.numel() * dtype_bytes
+            spatial_merge_size = getattr(config, 'spatial_merge_size', 2) ** 2
+            seq_len = pixel_values.numel() // (spatial_merge_size * (getattr(vision_config, 'patch_size', 14) ** 2) * 3) # seq_len is the number of images * number of tokens per image
+            dummy_batch_memory += seq_len * config.text_config.hidden_size * dtype_bytes
+        else:
+            raise ValueError(f"Pixel values not found in dummy batch for model {config.model_name}")
+
+    encoder_output_memory = encoder_budget * encoder_output_shape
+    total_memory = dummy_batch_memory + encoder_output_memory + saved_states_memory
+
+    return total_memory, seq_len
+
+
+def vision_activation_estimate(config, model_name=None, mm_args=None):
+
+    vision_config = getattr(config, "vision_config", None)
+
+    hd = vision_config.hidden_size
+    mlp_size = vision_config.intermediate_size
+    num_vision_layers = getattr(vision_config, "depth", getattr(vision_config, "num_hidden_layers", 0))
+
+    dummy_batch, encoder_budget = get_dummy_batch(config, model_name, mm_args)
+
+    additional_memory, seq_len = get_memory_estimate(config, dummy_batch, encoder_budget)
+
+    del dummy_batch
+
+    activation_memory_estimate = transformer_layer_activation_memory(hd, hd, mlp_size) * seq_len
+
+    vision_overhead = additional_memory + activation_memory_estimate
+
+    return vision_overhead

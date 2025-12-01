@@ -293,7 +293,7 @@ def new_init(
     vllm_config: VllmConfig,
     device: torch.device,
     embedding_modules: dict[str, str],
-    embedding_padding_modules: list[str],
+    embedding_padding_modules: list[str] = [],
     lora_model_cls: type[LoRAModel] = LoRAModel,
 ):
 
