@@ -556,7 +556,7 @@ def grpo_accumulated_loss(
     logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
     prev_max_left_pad    = kwargs.get("max_left_pad", 0) #Always get max_left_pad for when training LLMs, enabled by deafult.  
 
-    #delete this from kwargs so less issues 
+    #Delete this from kwargs so less issues 
     _ = kwargs.pop("sampling_per_token_logps", None)
     kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap if sampling_per_token_logps is not None else None
     kwargs["use_vllm"] = trainer.use_vllm
