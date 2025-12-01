@@ -116,34 +116,35 @@ class WorkerLoRAManager(AbstractWorkerManager):
                     and model.hf_to_vllm_mapper is not None):
                 hf_to_vllm_mapper = model.hf_to_vllm_mapper
 
+            # Prepare common arguments
             lora_extra_vocab_size = getattr(self.lora_config, "lora_extra_vocab_size", 0)
+            kwargs = {
+                "lora_model_id": lora_request.lora_int_id,
+                "peft_helper": peft_helper,
+                "dtype": self.lora_config.lora_dtype,
+                "weights_mapper": hf_to_vllm_mapper,
+            }
 
             if getattr(lora_request, "lora_tensors", None) is not None:
-
-                lora = self._lora_model_cls.from_lora_tensors(
-                    lora_model_id=lora_request.lora_int_id,
-                    tensors=lora_request.lora_tensors,
-                    peft_helper=peft_helper,
-                    device=None, # Keep whatever the original device was
-                    dtype=self.lora_config.lora_dtype,
-                    target_embedding_padding=self.vocab_size + lora_extra_vocab_size,
-                    embedding_modules=self.embedding_modules,
-                    embedding_padding_modules=self.embedding_padding_modules,
-                    weights_mapper=hf_to_vllm_mapper
-                )
+                load_method = self._lora_model_cls.from_lora_tensors
+                kwargs["tensors"] = lora_request.lora_tensors
+                kwargs["device"] = None # Keep whatever the original device was
             else:
-                lora = self._lora_model_cls.from_local_checkpoint(
-                    lora_path,
-                    expected_lora_modules,
-                    peft_helper=peft_helper,
-                    lora_model_id=lora_request.lora_int_id,
-                    device="cpu", # Local checkpoint is CPU
-                    dtype=self.lora_config.lora_dtype,
-                    target_embedding_padding=self.vocab_size + lora_extra_vocab_size,
-                    embedding_modules=self.embedding_modules,
-                    embedding_padding_modules=self.embedding_padding_modules,
-                    weights_mapper=hf_to_vllm_mapper
-                )
+                load_method = self._lora_model_cls.from_local_checkpoint
+                kwargs["lora_path"] = lora_path
+                kwargs["expected_lora_modules"] = expected_lora_modules
+                kwargs["device"] = "cpu" # Local checkpoint is CPU
+
+            # Check signature for backward compatibility
+            sig = inspect.signature(load_method)
+            if "model_vocab_size" in sig.parameters:
+                kwargs["model_vocab_size"] = self.vocab_size + lora_extra_vocab_size
+            else:
+                kwargs["target_embedding_padding"] = self.vocab_size + lora_extra_vocab_size
+                kwargs["embedding_modules"] = self.embedding_modules
+                kwargs["embedding_padding_modules"] = self.embedding_padding_modules
+
+            lora = load_method(**kwargs)
 
         except FileNotFoundError as e:
             # FileNotFoundError should be raised if both
