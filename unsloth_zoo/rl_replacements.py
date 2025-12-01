@@ -546,8 +546,7 @@ def grpo_accumulated_loss(
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
     logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
-
-    prev_max_left_pad    = kwargs.get("max_left_pad", None)
+    prev_max_left_pad    = kwargs.get("max_left_pad", 0)
 
     #delete this from kwargs so less issues 
     _ = kwargs.pop("sampling_per_token_logps", None)
