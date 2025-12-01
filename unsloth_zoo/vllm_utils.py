@@ -43,6 +43,7 @@ import os
 import ast
 import sys
 import torch
+from torch import __version__ as torch_version
 import json
 import psutil
 import functools
@@ -90,6 +91,7 @@ def get_mem_info():
 pass
 
 if importlib.util.find_spec("vllm") is not None:
+    from vllm import __version__ as vllm_version
 
     # Patch excessive warning messages
     if not UNSLOTH_ENABLE_LOGGING:
@@ -939,7 +941,13 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                     # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
                     scale_suffix = '.weight_scale_inv'
                     block_size = proj.weight_block_size[0]
-                    if needs_transpose_check:
+                    is_compressed_linear = "CompressedTensors" in str(type(getattr(proj, 'quant_method', None)))
+                    if is_compressed_linear:
+                        # Compressed linear doesn't seem to transpose the weight scale inv
+                        # Also preferes the name weight_scale (without _inv suffix)
+                        # We detect it based on the quant_method we see in proj's attributes
+                        scale_suffix = '.weight_scale'
+                    elif needs_transpose_check:
                         should_use_deepgemm = is_deep_gemm_supported and getattr(proj, "orig_dtype", torch.bfloat16) == torch.bfloat16 and qweight.shape[0] % 128 == 0 and qweight.shape[1] % 128 == 0
                         if sm_cap==90 and cutlass_block_fp8_supported and not should_use_deepgemm:
                             # For H100 (at least), the scale seems to be a transpose of what HF expects, while on L4 it is right shape.
@@ -1201,6 +1209,18 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear # This has patched forward pass for LoRA and training support
                 except:
                     raise ImportError("Unsloth: FP8 models need importing FbgemmFP8Linear from `transformers.integrations.fbgemm_fp8` but we don't see it.")
+            elif quant_method == 'compressed-tensors':
+                kwargs['activation_scheme'] = 'dynamic' # mark it dynamic for now
+                block_size = [128, 128] # The default we override if we find in config
+                config_groups = quantization_config.get('config_groups', None)
+                group_0 = config_groups.get(0, None) if config_groups else None
+                weights = group_0.get('weight', None) if group_0 else None
+                block_size = weights.get('block_size', block_size) if weights else block_size
+                kwargs['block_size'] = block_size
+                try:
+                    from transformers.integrations.finegrained_fp8 import FP8Linear # This has patched forward pass for LoRA and training support. Patched in unsloth/kernels/fp8.py
+                except:
+                    raise ImportError("Unsloth: FP8 models need importing FP8Linear from `transformers.integrations.finegrained_fp8` but we don't see it.")
         # Get bnb_config flags
         elif bnb_config is not None:
             kwargs["compress_statistics"] = bnb_config.bnb_4bit_use_double_quant
@@ -1266,32 +1286,43 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 bias = None
             pass
 
+            # check if either of layer_name.weight_scale or layer_name.weight_scale_inv exists and set that attribute to fp8_weight_scale
+            fp8_weight_scale = None
+            if f"{layer_name}.weight_scale" in quant_state_dict:
+                fp8_weight_scale = quant_state_dict[f"{layer_name}.weight_scale"]
+            elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
+                fp8_weight_scale = quant_state_dict[f"{layer_name}.weight_scale_inv"]
+            pass
+
+            if fp8_weight_scale is not None: assert fp8_weight_scale.ndim in [1,2], f"we only support row quantized (ndim=1) and block quantized(ndim=2) fp8 but found {fp8_weight_scale.ndim}"
+
             if layer_name in quant_state_dict:
                 # for attributes of type nn.Parameter, there's no .weight
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
                 layer = torch.nn.Parameter(weight, requires_grad = False)
                 exec(f"new_model.{layer_name_br} = layer")
                 continue
-            elif f"{layer_name}.weight_scale" in quant_state_dict:
-                # This is FP8 quantized but not block quant. Either dynamic or static
-                layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
-                layer.in_features = weight.shape[1]
-                layer.out_features = weight.shape[0]
-                layer.weight = torch.nn.Parameter(weight, requires_grad = False)
-                layer.bias = bias
-                layer.input_scale_ub = kwargs['input_scale_ub']
-                layer.weight_scale = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale"], requires_grad = False)
-                layer.weight.input_scale_ub = kwargs['input_scale_ub']
-                layer.quant_method = "fbgemm_fp8"
-            elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
-                # This denotes that the model if FP8 dynamic quantized.
-                layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
-                layer.in_features = weight.shape[1]
-                layer.out_features = weight.shape[0]
-                layer.weight = torch.nn.Parameter(weight, requires_grad = False)
-                layer.bias = bias
-                layer.weight_scale_inv = torch.nn.Parameter(quant_state_dict[f"{layer_name}.weight_scale_inv"], requires_grad = False)
-                layer.quant_method = "fp8"
+            elif fp8_weight_scale is not None:
+                if fp8_weight_scale.ndim == 1:
+                    # This is FP8 quantized but not block quant. Either dynamic or static
+                    layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
+                    layer.in_features = weight.shape[1]
+                    layer.out_features = weight.shape[0]
+                    layer.weight = torch.nn.Parameter(weight, requires_grad = False)
+                    layer.bias = bias
+                    layer.input_scale_ub = kwargs['input_scale_ub']
+                    layer.weight_scale = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
+                    layer.weight.input_scale_ub = kwargs['input_scale_ub']
+                    layer.quant_method = "fbgemm_fp8"
+                elif fp8_weight_scale.ndim == 2:
+                    # This denotes that the model if FP8 dynamic quantized.
+                    layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
+                    layer.in_features = weight.shape[1]
+                    layer.out_features = weight.shape[0]
+                    layer.weight = torch.nn.Parameter(weight, requires_grad = False)
+                    layer.bias = bias
+                    layer.weight_scale_inv = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
+                    layer.quant_method = "fp8"
             elif f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
@@ -1563,6 +1594,8 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
+    # vLLM 0.11.2 seems to must have flash-attn installed for Qwen3-VL!
+
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
     standby_util_override = os.getenv("UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE", "0") != "0"
@@ -1797,6 +1830,22 @@ def load_vllm(
     if compilation_config == 3:
         try:
             from vllm.config import CompilationConfig
+
+            # Torch versions >= 2.9.0 or vllm_version > 0.11.0
+            if Version(vllm_version) > Version("0.11.0") or Version(torch_version) > Version("2.9.0"):
+                cudagraphs = False # Weirdly if we set it to True, we get
+                # [rank0]: RuntimeError: These storage data ptrs are not allocated in pool (0, 2) but should be {612290048}
+                combo_kernels = True # Latest works now only on Llama it seems
+                if total_memory_gb <= 70:
+                    combo_kernels = False # Too slow on less than 80GB GPUs
+                # We still see
+                # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
+                # Try unsloth/gemma-3-4b-it
+                combo_kernels = False
+            else:
+                cudagraphs = True
+                combo_kernels = False
+
             compile_flags = dict(
                 level = 3,
                 backend = "inductor",
@@ -1813,14 +1862,16 @@ def load_vllm(
                     max_autotune = False, # Too slow
                     shape_padding = True,
                     debug = False,
-                    cudagraphs = True,
+                    cudagraphs = cudagraphs,
                     coordinate_descent_tuning = False, # Too slow
                     logging = True, # Enable compile logs
-                    combo_kernels = False, # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
+                    combo_kernels = combo_kernels,
                     group_fusion = True,
                     memory_planning = True,
-                    multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
                     use_block_ptr = True,
+
+                    multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
+                    # [rank0]: TypeError: 'NoneType' object does not support the context manager protocol
                 )
             )
             good_keys = inspect.signature(CompilationConfig).parameters.keys()
@@ -1893,7 +1944,6 @@ def load_vllm(
     if DEVICE_TYPE == "cuda":
         major_version, minor_version = torch.cuda.get_device_capability()
         if major_version < 9:
-            from vllm import __version__ as vllm_version
             if Version(vllm_version) >= Version("0.11.0"):
                 disable_cascade_attn = False
             else:
