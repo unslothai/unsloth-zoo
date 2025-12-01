@@ -39,7 +39,7 @@ from .utils import (
 )
 
 
-def patch_Qwen3MoeSparseMoeBlock_old():
+def patch_qwen3_moe():
     # https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L213
     # Transformers >= 5       uses self.gate_up_proj = nn.Parameter(...)
     # whilst old transformers uses self.experts = nn.ModuleList(...)
