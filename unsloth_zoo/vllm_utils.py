@@ -773,13 +773,6 @@ def patch_vllm(debug = True):
         logger.info(f'Unsloth: Patching vLLM to enable standby.')
         patch_vllm_enable_sleep_mode()
     patch_vllm_graph_capture()
-    # GuidedDecodingParmas is renamed to StructuredOutputsParams in vLLM
-    # https://github.com/vllm-project/vllm/pull/22772/files
-    # trl still wants to use GuidedDecodingParams. This is a temporary patch till trl updates
-    try:
-        from vllm.sampling_params import GuidedDecodingParams
-    except ImportError:
-        vllm.sampling_params.GuidedDecodingParams = vllm.sampling_params.StructuredOutputsParams
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
 pass
