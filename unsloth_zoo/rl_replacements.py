@@ -116,7 +116,7 @@ def calculate_pad_tokens_in_prompt(
     pad_token_id: int
 ) -> torch.Tensor:
     """
-    Given prompt tensor, it returns all the left padded tokens in that sequence. so [pad, pad, pad, cat] = 3 tokens 
+    Given prompt tensor, it returns all the left padded tokens in that sequence. so [pad, pad, pad, cat] = 3 tokens
     """
     if logits_to_keep >= input_ids.shape[1]:
         raise ValueError("logits_to_keep must be smaller than the sequence length.")
@@ -227,6 +227,14 @@ RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
 
 def grpo_update_SamplingParams(SamplingParams, generation_kwargs, vllm_sampling_params = None):
     good_sampling_params_keys = inspect.signature(SamplingParams).parameters.keys()
+
+    # Filter generation_kwargs
+    new_generation_kwargs = {}
+    for key in generation_kwargs.keys():
+        if key in good_sampling_params_keys:
+            new_generation_kwargs[key] = generation_kwargs[key]
+    generation_kwargs = new_generation_kwargs
+
     if vllm_sampling_params is not None:
         for key in good_sampling_params_keys:
             if hasattr(vllm_sampling_params, key):
@@ -271,7 +279,7 @@ def grpo_compute_loss(
                 importance_sampling_ratio, max=vllm_importance_sampling_cap
             )
     pass
-    
+
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
     if beta != 0.0:
@@ -322,7 +330,7 @@ def grpo_compute_loss(
     loss_i = -torch.min(loss_1, loss_2)
 
     if use_vllm and sampling_per_token_logps is not None:
-        loss_i = loss_i * importance_sampling_ratio     
+        loss_i = loss_i * importance_sampling_ratio
         #delta for metric
         with torch.no_grad():
             delta = torch.abs(old - sampling_per_token_logps)
@@ -333,7 +341,7 @@ def grpo_compute_loss(
         flat_is_ratio = torch.tensor([]).detach()
     if beta != 0.0:
         loss_i = loss_i + beta * kl_i
-    
+
     mask = mask.to(torch.float32)
     n_mask_per_reward = mask.sum(1)
 
@@ -350,7 +358,7 @@ def grpo_compute_loss(
     elif loss_type == "dapo":
         normalizer = num_items_in_batch/ num_processes
         loss = (loss_i * mask).sum() / normalizer
-    else: 
+    else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
     # loss = (loss_i * mask).sum() / mask.sum()
@@ -475,7 +483,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
 
             # mark_dynamic(new_hidden_states_j)
             # mark_dynamic(ref_hidden_states_j)
-            # if old_hidden_states_j is not None: 
+            # if old_hidden_states_j is not None:
             #     mark_dynamic(old_hidden_states_j)
             # mark_dynamic(input_ids_j)
             # mark_dynamic(mask_j)
@@ -585,9 +593,9 @@ def grpo_accumulated_loss(
             sampling_per_token_logps = None
         attention_mask =  input_ids != trainer.processing_class.pad_token_id
         attention_mask = attention_mask.to(attention_mask.dtype)
-    else: 
+    else:
         completion_input_ids = input_ids[:, -logits_to_keep:]
-    
+
     unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
 
     for module in unwrapped_model.modules():

@@ -20,6 +20,7 @@ from .gemma import *
 from .misc import *
 from .gemma3n import *
 from .gpt_oss import *
+from .qwen3_moe import *
 from .pixtral import *
 from .mxfp4 import *
 from .bitsandbytes import *
