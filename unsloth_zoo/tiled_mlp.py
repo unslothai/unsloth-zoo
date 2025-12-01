@@ -33,6 +33,10 @@ __all__ = [
     "patch_mlp",
 ]
 
+FIRST_PASS = True
+UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+UNSLOTH_ENABLE_TILED_LOGGING = UNSLOTH_ENABLE_LOGGING and os.environ.get("UNSLOTH_ENABLE_TILED_LOGGING", "0") == "1"
+
 torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = DEVICE_TYPE)
 torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = DEVICE_TYPE)
 
@@ -72,7 +76,7 @@ class TiledMLP(torch.autograd.Function):
                 extra_lists[i].append(extra)
             return output[0]  # Return main output
         return output  # Single tensor
-    
+
     @staticmethod
     def structure_output(main_output, extra_lists):
         """Reconstruct original structure"""
@@ -84,19 +88,27 @@ class TiledMLP(torch.autograd.Function):
 
     @staticmethod
     @torch_amp_custom_fwd
-    def forward(ctx, mlp_forward, mlp_module, x, preserve_rng_state, num_shards):
+    def forward(ctx, mlp_forward, mlp_module, x, preserve_rng_state, num_shards, max_flat_qlen):
         # num_shards is probably the wrong name and it should be n_splits
         # num_shards is also not guaranteed. It could end up having num_shards + 1
-        # the main thing is the shard seq length is all the same unless it's not 
+        # the main thing is the shard seq length is all the same unless it's not
         # evenly divisible with sequence length. Then the last shard will have the remainder.
         ctx.shard_dim = -2
         B, S, H = x.shape
         # ctx.num_shards = int(max(1, min(S, math.ceil(S / max(1, H)))))
         ctx.num_shards = num_shards
-        qlen_chunk_size, remainder = divmod(B*S, min(max(1, num_shards), B*S))
+        if max_flat_qlen:
+            qlen_chunk_size = min(max_flat_qlen, B*S)
+            remainder = max(0, B*S - qlen_chunk_size * num_shards)
+        else:
+            qlen_chunk_size, remainder = divmod(B*S, min(max(1, num_shards), B*S))
         split_sizes = [qlen_chunk_size]*num_shards
         if remainder != 0: split_sizes.append(remainder)
         ctx.split_sizes = split_sizes
+        global FIRST_PASS
+        if (FIRST_PASS and UNSLOTH_ENABLE_LOGGING) or UNSLOTH_ENABLE_TILED_LOGGING:
+            print(f"Unsloth: Enabling TiledMLP to reduce VRAM usage! chunk size: {split_sizes[0]}")
+            FIRST_PASS = False
 
         ctx.device_type = _infer_device_type(x)
         ctx.mlp_forward = mlp_forward
@@ -125,7 +137,8 @@ class TiledMLP(torch.autograd.Function):
         extra_outputs = []
         x = x.view(-1, H)
         with torch.no_grad():
-            for i, x_split in enumerate(torch.split(x, ctx.split_sizes, dim=0)):
+            x_splits = torch.split(x, ctx.split_sizes, dim=0)
+            for i, x_split in enumerate(x_splits):
                 x_split = x_split.unsqueeze(0)
                 out = TiledMLP.handle_output(mlp_forward(x_split), extra_outputs)
 
@@ -185,7 +198,7 @@ class TiledMLP(torch.autograd.Function):
                 torch.autograd.backward(outputs, grad_output_shard)
                 start_idx += split_size
 
-        return None, None, x_gradients, None, None
+        return None, None, x_gradients, None, None, None
 
 def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length = 128):
     preserve_rng_state = False
@@ -206,6 +219,8 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
         flat_qlen = bsz*qlen
         try:
             intermediate_size = mlp_module.config.intermediate_size
+            if isinstance(intermediate_size, (list, tuple)):
+                intermediate_size = intermediate_size[0]
         except:
             intermediate_size = hd * 4
 
@@ -223,19 +238,22 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
             padded_length = padded_length,
         )
         n_shards, remainder = divmod(flat_qlen, max_flat_qlen)
-        # if remainder != 0: n_shards += 1
+        n_shards = max(1, n_shards)
 
         # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
-        return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards)
+        return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards, max_flat_qlen)
 
     def tiled_forward_arctic_size(self, x):
         B, S, H = x.shape
-        n_shards = int(max(1, min(S, math.ceil(S / max(1, H)))))
+        chunk_size = max(1, H)
+        n_shards, remainder = divmod(S, chunk_size)
+        n_shards = max(1, n_shards)
+        # remainder gets added to the last shard in the forward pass
 
         # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
-        return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards)
+        return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards, chunk_size)
 
     if target_arctic:
         mlp_module.forward = MethodType(tiled_forward_arctic_size, mlp_module)

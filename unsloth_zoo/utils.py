@@ -96,32 +96,28 @@ def is_distributed():
 pass
 
 def distributed_function(n = 1, function = None, *args, **kwargs):
-    if is_distributed():
-        if is_main_process():
-            object_list = function(*args, **kwargs)
-            if n == 1: object_list = [object_list]
-        else:
-            object_list = [None for _ in range(n)]
-        # broadcast_object_list auto blocks so no need for barrier
-        if not torch_distributed_is_initialized():
-            # But check if the function even works!
-            # This happens when torch_distributed_is_torchelastic_launched()==True but
-            # torch_distributed_is_initialized()==False
-            # Trick is to just add a 0.01+0.01*RANK second sleep and print with flush
-            time.sleep(0.01 + 0.01*int(os.environ.get("RANK", "0")))
-            with contextlib.redirect_stdout(None):
-                print("", flush = True)
-            object_list = function(*args, **kwargs)
-            if n == 1: object_list = [object_list]
-        else:
-            torch.distributed.broadcast_object_list(object_list, src = 0)
-        if n == 1:
-            result = object_list[0]
-        else:
-            result = object_list
+    assert function is not None
+
+    # Not launched distributed at all
+    if not is_distributed():
+        out = function(*args, **kwargs)
+        return out if n == 1 else out
+
+    # Multi-process: only main executes the function
+    if is_main_process():
+        out = function(*args, **kwargs)
+        obj_list = [out] if n == 1 else list(out)
     else:
-        result = function(*args, **kwargs)
-    return result
+        obj_list = [None for _ in range(n)]
+
+    # If the process group is initialized, we can synchronize / share the result
+    if torch_distributed_is_initialized():
+        # Broadcast result to all ranks
+        dist.broadcast_object_list(obj_list, src = 0)
+        # Barrier to make sure everyone waits until main is done
+        dist.barrier()
+
+    return obj_list[0] if n == 1 else obj_list
 pass
 
 def _lock_path_for(target: str) -> str:
