@@ -71,6 +71,7 @@ def patch_qwen3_moe():
                 routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
             # we cast back to the input dtype
             routing_weights = routing_weights.to(hidden_states.dtype)
+            router_scores = torch.zeros_like(router_logits, dtype = hidden_states.dtype).scatter_(1, selected_experts, routing_weights)
 
             final_hidden_states = torch.zeros(
                 (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
@@ -81,7 +82,7 @@ def patch_qwen3_moe():
             expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
             global data
-            data = [selected_experts, self, final_hidden_states, hidden_states, routing_weights, batch_size, sequence_length, hidden_dim]
+            data = [selected_experts, self, final_hidden_states, hidden_states, routing_weights, batch_size, sequence_length, hidden_dim, router_scores]
             raise
             # Loop over all available experts in the model and perform the computation on each expert
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
