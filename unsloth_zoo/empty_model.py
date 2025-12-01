@@ -22,7 +22,7 @@ __all__ = [
     "compare_attributes",
     "copy_attributes",
     "get_mm_dummy_batch_from_hf_config",
-    "get_mm_dummy_batch_shapes",
+    # "get_mm_dummy_batch_shapes",
     "transformer_layer_activation_memory",
 ]
 
@@ -854,11 +854,11 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
         quant_state_dict[f'{path}.weight'] = state_dict[f'{path}.weight']
 
 
-def transformer_layer_activation_memory(hd, kv_size, mlp_size, bsz=1,):
+def transformer_layer_activation_memory(hd, kv_size, mlp_size, bsz=1,residual_factor=2):
     # Activation memory - assume bsz=2 (this is an overkill tbh)
     bsz = 1
     activation_qkvo  = bsz * (2 * hd + kv_size + kv_size) # 2 * hd for q and o
-    residual_memory = bsz * hd * 2
+    residual_memory = bsz * hd * residual_factor
     activation_mlp  = bsz * (mlp_size + mlp_size)
     total_activation = activation_qkvo + residual_memory + activation_mlp
     activation_memory_per_token = total_activation * 2 # Assuming 16bit for activation
