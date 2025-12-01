@@ -1688,7 +1688,7 @@ def load_vllm(
     elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
     elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
     else: standby_target_gpu_util = 0.75
-    standby_target_gpu_util = 0.8
+    standby_target_gpu_util = 0.75
 
     if unsloth_vllm_standby and not standby_util_override:
         if gpu_memory_utilization < standby_target_gpu_util:
