@@ -262,7 +262,10 @@ def assert_same_keys(model, new_state_dict):
     inner_model = model.base_model.model if hasattr(model, "base_model") else model
     original_keys = inner_model.state_dict().keys()
     all_original_keys = set()
+    def _should_ignore(key: str) -> bool:
+        return ("modules_to_save" in key) or ("original_module" in key)
     for x in original_keys:
+        if _should_ignore(x): continue
         where_weight = x.rfind(".weight")
         where_bias   = x.rfind(".bias")
         if where_weight != -1: x = x[:where_weight + len(".weight")]
@@ -275,7 +278,8 @@ def assert_same_keys(model, new_state_dict):
 
         all_original_keys.add(x)
     pass
-    difference = all_original_keys ^ set(new_state_dict)
+    filtered_new_keys = {k for k in new_state_dict.keys() if not _should_ignore(k)}
+    difference = all_original_keys ^ filtered_new_keys
     if len(difference) != 0:
         raise RuntimeError(f"Unsloth: Extracted keys = {difference} do not match!")
     pass
