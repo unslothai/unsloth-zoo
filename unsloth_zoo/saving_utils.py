@@ -923,6 +923,22 @@ def _remove_quantization_config(config_path: Path):
     pass
 pass
 
+def _remove_transformers_version(config_path: Path):
+    if not config_path.exists():
+        return
+    try:
+        with open(config_path, "r", encoding = "utf-8") as f:
+            config = json.load(f)
+    except Exception:
+        return
+    if "transformers_version" not in config:
+        return
+    del config["transformers_version"]
+    with open(config_path, "w", encoding = "utf-8") as f:
+        json.dump(config, f, indent = 4)
+    pass
+pass
+
 def fix_tokenizer_config_json(tokenizer, saved_folder):
     # Add "chat_template" to tokenizer_config.json
     tokenizer_config_path = os.path.join(saved_folder, "tokenizer_config.json")
@@ -1213,6 +1229,7 @@ def merge_and_overwrite_lora(
     if save_method == "merged_16bit":
         config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
+        _remove_transformers_version(config_path = Path(save_directory) / "config.json")
     elif save_method == "mxfp4":
         from transformers import AutoConfig
         model_config = AutoConfig.from_pretrained(
