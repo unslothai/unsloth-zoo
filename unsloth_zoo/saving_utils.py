@@ -171,6 +171,27 @@ def _merge_lora(W, lora_stats, name):
 pass
 
 
+def _get_modules_to_save_weight(module):
+    modules_to_save = getattr(module, "modules_to_save", None)
+    if modules_to_save is None:
+        return None
+
+    # Prefer the active/default adapter if present, else first entry
+    for key in ("default",):
+        try:
+            candidate = modules_to_save[key]
+            if hasattr(candidate, "weight"):
+                return candidate.weight
+        except Exception:
+            continue
+
+    for _, candidate in modules_to_save.items():
+        if hasattr(candidate, "weight"):
+            return candidate.weight
+
+    return None
+
+
 def check_if_quantized(module: torch.nn.Module) -> bool:
     # All Unsloth Zoo code licensed under LGPLv3
     # Adapted from https://github.com/huggingface/peft/blob/main/src/peft/utils/integrations.py
@@ -301,6 +322,17 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             module_count += 1
             remove_keys.add(name)
             remove_keys.add(name[:-len(".base_layer")])
+
+        elif getattr(module, "modules_to_save", None) is not None:
+            saved_weight = _get_modules_to_save_weight(module)
+            if saved_weight is not None:
+                lora_weights[name].module = module
+                expand_module_keys(name, module, remove_keys)
+                remove_keys.add(name)
+            else:
+                new_keys = expand_module_keys(name, module, set())
+                remove_keys.update(new_keys)
+                remove_keys.add(name)
 
         elif (not merge_into_original) and check_if_quantized(module):
             lora_weights[name].module = module
@@ -487,9 +519,19 @@ def _merge_and_overwrite_lora(
                 lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
                 lora_stats = converted_lora_weights.get(lora_key, None)
 
-                if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                    W = _merge_lora(W, lora_stats, output_key)
-                    count += 1
+                if lora_stats is not None:
+                    # Prefer modules_to_save weights if present
+                    if getattr(lora_stats, "lora_A", None) is None and getattr(lora_stats, "module", None) is not None:
+                        saved_weight = _get_modules_to_save_weight(lora_stats.module)
+                        if saved_weight is None and hasattr(lora_stats.module, "weight"):
+                            saved_weight = lora_stats.module.weight
+                        if saved_weight is not None:
+                            target_dtype = output_dtype if output_dtype is not None else W_original_dtype
+                            W = saved_weight.to(W.device, dtype = target_dtype, non_blocking = True)
+                            count += 1
+                    elif hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                        W = _merge_lora(W, lora_stats, output_key)
+                        count += 1
 
                 # FIXED: Direct tensor writing using torch
                 success = _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, W, W_original_dtype)
