@@ -103,6 +103,12 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
         out = function(*args, **kwargs)
         return out if n == 1 else out
 
+    # torchrun/accelerate sets distributed env vars before the PG is initialized.
+    # In that window we cannot broadcast results yet, so just execute locally.
+    if not torch_distributed_is_initialized():
+        out = function(*args, **kwargs)
+        return out if n == 1 else out
+
     # Multi-process: only main executes the function
     if is_main_process():
         out = function(*args, **kwargs)

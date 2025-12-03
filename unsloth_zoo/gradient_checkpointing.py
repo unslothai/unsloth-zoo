@@ -31,12 +31,21 @@ from .device_type import (
     ALLOW_PREQUANTIZED_MODELS,
 )
 
-try:
-    from unsloth.context_parallel import get_active_context_parallel_manager
-except Exception:  # pragma: no cover - optional dependency
-
-    def get_active_context_parallel_manager():
+def _lazy_get_active_context_parallel_manager():  # pragma: no cover - runtime resolution
+    """Resolve `unsloth.context_parallel` lazily to dodge import-order issues."""
+    global get_active_context_parallel_manager
+    try:
+        from unsloth.context_parallel import (
+            get_active_context_parallel_manager as _real_get_active_cp_manager,
+        )
+    except Exception:
         return None
+    get_active_context_parallel_manager = _real_get_active_cp_manager
+    return _real_get_active_cp_manager()
+
+
+def get_active_context_parallel_manager():
+    return _lazy_get_active_context_parallel_manager()
 
 __all__ = [
     "calculate_n_gradient_checkpoints",
