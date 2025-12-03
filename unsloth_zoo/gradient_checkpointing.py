@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import torch
+import contextlib
 import numpy as np
 from typing import Union, Optional, List, Any, Callable, Tuple
 from packaging.version import Version
@@ -29,6 +30,13 @@ from .device_type import (
     DEVICE_COUNT,
     ALLOW_PREQUANTIZED_MODELS,
 )
+
+try:
+    from unsloth.context_parallel import get_active_context_parallel_manager
+except Exception:  # pragma: no cover - optional dependency
+
+    def get_active_context_parallel_manager():
+        return None
 
 __all__ = [
     "calculate_n_gradient_checkpoints",
@@ -376,6 +384,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         # Check if no requires_grad in inputs
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
+        ctx._context_parallel_manager = get_active_context_parallel_manager()
         # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
         ctx.device_type = _infer_device_type(*args)
         ctx.device_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs(
@@ -551,6 +560,14 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             device_autocast_ctx = torch.amp.autocast(
                 device_type=ctx.device_type, **ctx.device_autocast_kwargs
             ) if torch.amp.is_autocast_available(ctx.device_type) else contextlib.nullcontext()
+            cpu_autocast_ctx = torch.amp.autocast(
+                "cpu", **ctx.cpu_autocast_kwargs
+            ) if torch.amp.is_autocast_available("cpu") else contextlib.nullcontext()
+            cp_replay_ctx = (
+                ctx._context_parallel_manager.replay_context()
+                if getattr(ctx, "_context_parallel_manager", None)
+                else contextlib.nullcontext()
+            )
 
             # detached_inputs = detach_variable(tuple(inputs))
             detached_inputs = []
@@ -571,7 +588,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 detached_inputs[0] = x
             pass
 
-            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
+            with torch.enable_grad(), device_autocast_ctx, cpu_autocast_ctx, cp_replay_ctx:  # type: ignore[attr-defined]
                 outputs = ctx.run_function(*detached_inputs)
             pass
         pass
