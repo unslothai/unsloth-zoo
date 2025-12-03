@@ -23,15 +23,16 @@ __all__ = [
     "torch_distributed_get_rank",
 ]
 
-from packaging.version import Version as TrueVersion
-import torch
 import os
-import time
-import contextlib
-import re
 import pathlib
-from typing import Optional
+import re
 from filelock import FileLock
+from packaging.version import Version as TrueVersion
+from typing import Optional
+
+import torch
+import torch.distributed as dist
+
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3

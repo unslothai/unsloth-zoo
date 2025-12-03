@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import torch
+import contextlib
 import numpy as np
 from typing import Union, Optional, List, Any, Callable, Tuple
 from packaging.version import Version
@@ -560,6 +561,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             device_autocast_ctx = torch.amp.autocast(
                 device_type=ctx.device_type, **ctx.device_autocast_kwargs
             ) if torch.amp.is_autocast_available(ctx.device_type) else contextlib.nullcontext()
+            cpu_autocast_ctx = torch.amp.autocast(
+                "cpu", **ctx.cpu_autocast_kwargs
+            ) if torch.amp.is_autocast_available("cpu") else contextlib.nullcontext()
 
             # detached_inputs = detach_variable(tuple(inputs))
             detached_inputs = []
@@ -580,7 +584,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 detached_inputs[0] = x
             pass
 
-            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
+            with torch.enable_grad(), device_autocast_ctx, cpu_autocast_ctx:  # type: ignore[attr-defined]
                 outputs = ctx.run_function(*detached_inputs)
             pass
         pass
