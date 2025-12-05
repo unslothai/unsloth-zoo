@@ -131,7 +131,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
                 kwargs["device"] = None # Keep whatever the original device was
             else:
                 load_method = self._lora_model_cls.from_local_checkpoint
-                kwargs["lora_path"] = lora_path
+                kwargs["lora_dir"] = lora_path
                 kwargs["expected_lora_modules"] = expected_lora_modules
                 kwargs["device"] = "cpu" # Local checkpoint is CPU
 
@@ -293,7 +293,7 @@ def new_init(
     vllm_config: VllmConfig,
     device: torch.device,
     embedding_modules: dict[str, str],
-    embedding_padding_modules: list[str],
+    embedding_padding_modules: Optional[list[str]] = [],
     lora_model_cls: type[LoRAModel] = LoRAModel,
 ):
 
