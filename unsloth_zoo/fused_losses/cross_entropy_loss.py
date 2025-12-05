@@ -215,9 +215,9 @@ class UnslothFusedLoss(torch.autograd.Function):
             n_chunks = get_chunk_size(bsz, qlen, vocab_size, target_gb = target_gb)
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
-        __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
-        __shift_states = torch.chunk(hidden_states.view(-1, hd), n_chunks, dim = 0)
-        __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
+        __labels_chunks = torch.chunk(labels,                     n_chunks, dim = 0)
+        __state_chunks  = torch.chunk(hidden_states.view(-1, hd), n_chunks, dim = 0)
+        __grad_chunks   = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
 
         def accumulate_chunk(
             n_chunks,
@@ -247,7 +247,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    shift_labels, # Shift labels inside kernel if requested
                     **kwargs,
                 )
                 grad_lm_head.add_(chunk_grad_lm_head)
@@ -265,7 +265,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    shift_labels, # Shift labels inside kernel if requested
                     **kwargs,
                 )
                 grad_lm_head.add_(chunk_grad_lm_head)
@@ -282,7 +282,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    shift_labels, # Shift labels inside kernel if requested
                     **kwargs,
                 )
                 grad_lm_head_bias.add_(chunk_grad_lm_head_bias)
@@ -299,7 +299,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    shift_labels, # Shift labels inside kernel if requested
                     **kwargs,
                 )
             pass
@@ -314,8 +314,11 @@ class UnslothFusedLoss(torch.autograd.Function):
                 options = torch_compile_options,
             )
 
-        for (grad_inputs_j, hidden_states_j, labels_j,) in \
-            zip(__grad_inputs, __shift_states, __shift_labels,):
+        for grad_inputs_j, hidden_states_j, labels_j in zip(
+            __grad_chunks,
+            __state_chunks,
+            __labels_chunks,
+        ):
             accumulate_chunk(
                 n_chunks = n_chunks,
                 grad_inputs_j = grad_inputs_j,
