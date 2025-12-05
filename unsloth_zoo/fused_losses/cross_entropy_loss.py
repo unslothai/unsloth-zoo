@@ -169,7 +169,8 @@ class UnslothFusedLoss(torch.autograd.Function):
 
         # Debug logging for context parallelism
         if os.environ.get("UNSLOTH_CP_DEBUG"):
-            print(f"[CP-DEBUG][focus][UnslothFusedLoss.forward] shift_labels={shift_labels} hidden_states_shape={hidden_states.shape} labels_shape={labels.shape}")
+            valid_tokens = (labels != -100).sum().item()
+            print(f"[CP-DEBUG][focus][UnslothFusedLoss.forward] shift_labels={shift_labels} hidden_states_shape={hidden_states.shape} labels_shape={labels.shape} valid_tokens={valid_tokens}")
 
         # Get shifted labels first
         if shift_labels:
@@ -193,6 +194,8 @@ class UnslothFusedLoss(torch.autograd.Function):
         # Counteract DataParallel having multiple items since it does scatter & gather
         if divisor.numel() != 1: divisor = divisor.ravel()[0]
         divisor = divisor.to(dtype = torch.float32, device = device)
+        if os.environ.get("UNSLOTH_CP_DEBUG"):
+            print(f"[CP-DEBUG][focus][UnslothFusedLoss.forward] divisor={divisor.item()} n_items={n_items}")
         # Check what needs gradients
         lm_head_requires_grad = lm_head_weight is not None and lm_head_weight.requires_grad
         lm_head_bias_requires_grad = lm_head_bias is not None and lm_head_bias.requires_grad
