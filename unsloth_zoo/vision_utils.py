@@ -159,17 +159,28 @@ def fetch_image(
     image_obj = None
     if isinstance(image, Image.Image):
         image_obj = image
-    elif image.startswith("http://") or image.startswith("https://"):
-        image_obj = Image.open(requests.get(image, stream=True).raw)
-    elif image.startswith("file://"):
-        image_obj = Image.open(image[7:])
-    elif image.startswith("data:image"):
-        if "base64," in image:
-            _, base64_data = image.split("base64,", 1)
-            data = base64.b64decode(base64_data)
-            image_obj = Image.open(BytesIO(data))
-    else:
-        image_obj = Image.open(image)
+    elif isinstance(image, str):
+        if image.startswith("http://") or image.startswith("https://"):
+            image_obj = Image.open(requests.get(image, stream=True).raw)
+        elif image.startswith("file://"):
+            image_obj = Image.open(image[7:])
+        elif image.startswith("data:image"):
+            if "base64," in image:
+                _, base64_data = image.split("base64,", 1)
+                data = base64.b64decode(base64_data)
+                image_obj = Image.open(BytesIO(data))
+        else:
+            image_obj = Image.open(image)
+    elif isinstance(image, bytes):
+        image_obj = Image.open(BytesIO(image))
+    elif isinstance(image, dict):
+        if "bytes" in image and image["bytes"]:
+            image_obj = Image.open(BytesIO(image["bytes"]))
+        elif "path" in image and image["path"]:
+            image_obj = Image.open(image["path"])
+        elif "url" in image and image["url"]:
+            image_obj = Image.open(requests.get(image["url"], stream=True).raw)
+
     if image_obj is None:
         raise ValueError(f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}")
     image = image_obj.convert("RGB")
@@ -800,6 +811,7 @@ class UnslothVisionDataCollator:
                 # Only affects Mistral V3 I think!
                 if self.assistant_single_content:
                     messages = self._collapse_assistant_content(messages)
+                messages = self._clean_none_keys(messages)
             pass
 
             message = self.processor.apply_chat_template(
@@ -904,7 +916,7 @@ class UnslothVisionDataCollator:
 
     def _extract_images_videos_for_example(self, example, messages):
         if "images" in example:
-            image = [example["images"][0]]
+            image = list(example["images"])
             video = []
             video_kwarg = None
         else:
@@ -1123,6 +1135,7 @@ class UnslothVisionDataCollator:
                 self._validate_and_normalize_first_message(p)
                 if self.assistant_single_content:
                     self._collapse_assistant_content(p)
+                p = self._clean_none_keys(p)
                 p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False)
             else:
                 p_txt = str(p)
@@ -1131,6 +1144,7 @@ class UnslothVisionDataCollator:
                 self._validate_and_normalize_first_message(c)
                 if self.assistant_single_content:
                     self._collapse_assistant_content(c)
+                c = self._clean_none_keys(c)
                 pc_txt = self._render_chat(prompt_messages=p, completion_messages=c)
                 # some models append common template items so this removes them.
                 # see trl/data_utils.py
@@ -1245,4 +1259,14 @@ class UnslothVisionDataCollator:
             out = self._cast_pixel_values_dtype_inplace(out, 'pixel_values_videos')
 
         return out
+    def _clean_none_keys(self, messages):
+        """Remove None-valued keys added by Arrow serialization"""
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    for k in list(item.keys()):
+                        if item[k] is None:
+                            del item[k]
+        return messages
 pass
