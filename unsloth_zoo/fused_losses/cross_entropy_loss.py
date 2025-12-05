@@ -331,6 +331,8 @@ class UnslothFusedLoss(torch.autograd.Function):
                 **extra_kwargs,
             )
         pass
+        if os.environ.get("UNSLOTH_CP_DEBUG"):
+            print(f"[CP-DEBUG][focus][UnslothFusedLoss.forward] accumulated_loss={accumulated_loss.item()}")
         ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
         ctx.scaling = scaling
         return accumulated_loss
