@@ -169,7 +169,7 @@ class UnslothFusedLoss(torch.autograd.Function):
 
         # Debug logging for context parallelism
         if os.environ.get("UNSLOTH_CP_DEBUG"):
-            print(f"[CP-DEBUG][focus][UnslothFusedLoss.forward] shift_labels={shift_labels} labels_shape={labels.shape}")
+            print(f"[CP-DEBUG][focus][UnslothFusedLoss.forward] shift_labels={shift_labels} hidden_states_shape={hidden_states.shape} labels_shape={labels.shape}")
 
         # Get shifted labels first
         if shift_labels:
@@ -183,6 +183,9 @@ class UnslothFusedLoss(torch.autograd.Function):
             _labels[..., -1] = -100
             _labels = _labels.view(-1)
             labels = _labels
+        else:
+            # Labels are pre-shifted, just flatten them
+            labels = labels.view(-1)
         pass
 
         # N items divisor
