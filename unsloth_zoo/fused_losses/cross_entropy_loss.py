@@ -167,6 +167,10 @@ class UnslothFusedLoss(torch.autograd.Function):
         device = lm_head_weight.device
         if extra_kwargs is None: extra_kwargs = {}
 
+        # Debug logging for context parallelism
+        if os.environ.get("UNSLOTH_CP_DEBUG"):
+            print(f"[CP-DEBUG][focus][UnslothFusedLoss.forward] shift_labels={shift_labels} labels_shape={labels.shape}")
+
         # Get shifted labels first
         if shift_labels:
             _labels = torch.empty_like(labels, device = device)
@@ -372,6 +376,9 @@ def unsloth_fused_ce_loss(
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
     # Remove shift_labels from kwargs if present to avoid duplicate in extra_kwargs
     kwargs.pop("shift_labels", None)
+    # Debug logging for context parallelism
+    if os.environ.get("UNSLOTH_CP_DEBUG"):
+        print(f"[CP-DEBUG][focus][unsloth_fused_ce_loss] shift_labels={shift_labels} labels_shape={labels.shape}")
     return apply_autograd_function(UnslothFusedLoss, dict(
         loss_function = compute_fused_ce_loss,
         hidden_states = hidden_states,
