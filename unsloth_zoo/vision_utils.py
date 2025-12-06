@@ -1259,6 +1259,7 @@ class UnslothVisionDataCollator:
             out = self._cast_pixel_values_dtype_inplace(out, 'pixel_values_videos')
 
         return out
+
     def _clean_none_keys(self, messages):
         """Remove None-valued keys added by Arrow serialization"""
         for message in messages:
