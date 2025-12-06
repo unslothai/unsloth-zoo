@@ -539,7 +539,7 @@ from ..device_type import DEVICE_TYPE
 if DEVICE_TYPE == "xpu":
     device_memory = torch.xpu.memory.mem_get_info(0)[-1]
 else:
-    device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+    device_memory = 16*1024*1024*1024
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
