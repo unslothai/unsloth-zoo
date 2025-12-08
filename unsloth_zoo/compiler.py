@@ -172,6 +172,8 @@ except:
     torch_dynamo_eval_frame = None
     torch_compiler_set_stance = None
 pass
+
+from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
 """
 
 _disabled_sdpa_code = f"""{_license_header}
