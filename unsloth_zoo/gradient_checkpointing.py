@@ -345,6 +345,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
 
     # Allocate buffers to how many GPUs
     n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
+    print("DEVICE_TYPE_TORCH", DEVICE_TYPE_TORCH, "n_gpus", n_gpus)
     GPU_BUFFERS = tuple([torch.empty(2*256*2048, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
 
     BACKWARD_PASS = True
