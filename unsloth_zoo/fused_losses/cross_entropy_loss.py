@@ -167,11 +167,6 @@ class UnslothFusedLoss(torch.autograd.Function):
         device = lm_head_weight.device
         if extra_kwargs is None: extra_kwargs = {}
 
-        # Debug logging for context parallelism
-        if os.environ.get("UNSLOTH_CP_DEBUG"):
-            valid_tokens = (labels != -100).sum().item()
-            print(f"[CP-DEBUG][focus][UnslothFusedLoss.forward] shift_labels={shift_labels} hidden_states_shape={hidden_states.shape} labels_shape={labels.shape} valid_tokens={valid_tokens}")
-
         # Get shifted labels first
         if shift_labels:
             _labels = torch.empty_like(labels, device = device)
@@ -188,14 +183,14 @@ class UnslothFusedLoss(torch.autograd.Function):
             # Labels are pre-shifted, just flatten them
             labels = labels.view(-1)
         pass
+        # Labels are now in their final shifted form, so avoid shifting again inside the kernel.
+        shift_labels = False
 
         # N items divisor
         divisor = n_items if n_items is not None else (labels != -100).sum()
         # Counteract DataParallel having multiple items since it does scatter & gather
         if divisor.numel() != 1: divisor = divisor.ravel()[0]
         divisor = divisor.to(dtype = torch.float32, device = device)
-        if os.environ.get("UNSLOTH_CP_DEBUG"):
-            print(f"[CP-DEBUG][focus][UnslothFusedLoss.forward] divisor={divisor.item()} n_items={n_items}")
         # Check what needs gradients
         lm_head_requires_grad = lm_head_weight is not None and lm_head_weight.requires_grad
         lm_head_bias_requires_grad = lm_head_bias is not None and lm_head_bias.requires_grad
@@ -334,8 +329,6 @@ class UnslothFusedLoss(torch.autograd.Function):
                 **extra_kwargs,
             )
         pass
-        if os.environ.get("UNSLOTH_CP_DEBUG"):
-            print(f"[CP-DEBUG][focus][UnslothFusedLoss.forward] accumulated_loss={accumulated_loss.item()}")
         ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
         ctx.scaling = scaling
         return accumulated_loss
@@ -387,9 +380,6 @@ def unsloth_fused_ce_loss(
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
     # Remove shift_labels from kwargs if present to avoid duplicate in extra_kwargs
     kwargs.pop("shift_labels", None)
-    # Debug logging for context parallelism
-    if os.environ.get("UNSLOTH_CP_DEBUG"):
-        print(f"[CP-DEBUG][focus][unsloth_fused_ce_loss] shift_labels={shift_labels} labels_shape={labels.shape}")
     return apply_autograd_function(UnslothFusedLoss, dict(
         loss_function = compute_fused_ce_loss,
         hidden_states = hidden_states,
