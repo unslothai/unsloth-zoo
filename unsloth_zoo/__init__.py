@@ -118,6 +118,16 @@ elif (major_torch == 2) and (minor_torch < 2):
     delete_key("PYTORCH_CUDA_ALLOC_CONF")
     delete_key("PYTORCH_HIP_ALLOC_CONF")
     delete_key("PYTORCH_ALLOC_CONF")
+elif bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")):
+    # Expandable segments does NOT work on WSL
+    delete_key("PYTORCH_CUDA_ALLOC_CONF")
+    delete_key("PYTORCH_HIP_ALLOC_CONF")
+    delete_key("PYTORCH_ALLOC_CONF")
+elif os.name == 'nt':
+    # Expandable segments does NOT work on Windows
+    delete_key("PYTORCH_CUDA_ALLOC_CONF")
+    delete_key("PYTORCH_HIP_ALLOC_CONF")
+    delete_key("PYTORCH_ALLOC_CONF")
 
 # Suppress WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.7.0+cu126 for torchao version 0.14.1
 # Please see https://github.com/pytorch/ao/issues/2919 for more info
