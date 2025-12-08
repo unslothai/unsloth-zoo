@@ -1701,13 +1701,16 @@ torch_addmm = torch.addmm
 torch_add   = torch.add
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
-    xA = dropout(x) @ lora_A.weight.t()
+    # Use result.dtype (bfloat16 from base layer) since x may have been cast to float32
+    # by _cast_input_dtype when autocast is disabled
+    target_dtype = result.dtype
+    xA = dropout(x).to(target_dtype) @ lora_A.weight.to(target_dtype).t()
     # output = result + scaling * xA @ lora_B.weight.t()
     shape = result.shape
     output = torch_addmm(
         result.view(-1, shape[-1]),
         xA.view(-1, xA.shape[-1]),
-        lora_B.weight.t(),
+        lora_B.weight.to(target_dtype).t(),
         alpha = scaling,
         beta = 1,
     ).view(shape)
@@ -1715,10 +1718,10 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     bias = lora_B.bias
     if bias is not None:
         output = torch_add(
-        output,
-        bias,
-        alpha = scaling,
-    )
+            output,
+            bias.to(target_dtype),
+            alpha = scaling,
+        )
     return output
 pass
 
@@ -1744,10 +1747,10 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     bias = lora_B.bias
     if bias is not None:
         output = torch_add(
-        output,
-        bias.to(torch_float16),
-        alpha = scaling,
-    )
+            output,
+            bias.to(torch_float16),
+            alpha = scaling,
+        )
     return output
 pass
 
