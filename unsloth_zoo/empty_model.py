@@ -268,7 +268,7 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     # Suppress warning on uninited weights
     os.environ["UNSLOTH_WARN_UNINITIALIZED"] = old_warn
     if error is not None and original_meta_model is None:
-        print(f"Failed to create original_meta_model for AutoModelForCausalLM. Error {e}")
+        print(f"Failed to create original_meta_model for AutoModelForCausalLM. Error {error}")
         original_meta_model = None
 
     new_config = deepcopy(config)
