@@ -1267,9 +1267,8 @@ class UnslothVisionDataCollator:
             if isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict):
-                        old_keys = list(item.keys())
-                        for k in old_keys:
-                            if item[k] is None:
-                                del item[k]
+                        keys_to_remove = [k for k, v in item.items() if v is None]
+                        for k in keys_to_remove:
+                            del item[k]
         return messages
 pass
