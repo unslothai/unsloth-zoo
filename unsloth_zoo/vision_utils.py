@@ -182,7 +182,7 @@ def fetch_image(
             image_obj = Image.open(requests.get(image["url"], stream=True).raw)
 
     if image_obj is None:
-        raise ValueError(f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}")
+        raise ValueError(f"Unrecognized image input. We support local path, http url, base64 and PIL.Image, bytes and dict formats. Instead we got `{type(image).__name__}`")
     image = image_obj.convert("RGB")
     ## resize
     if "resized_height" in ele and "resized_width" in ele:
