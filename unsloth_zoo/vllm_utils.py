@@ -564,11 +564,19 @@ def patch_vllm_enable_sleep_mode():
         true_offloads = 0
         total_offloads = 0
 
+        # Initialize sleeping_ptrs set if not present (tracks which ptrs are currently unmapped/sleeping)
+        if not hasattr(self, '_sleeping_ptrs'):
+            self._sleeping_ptrs = set()
+
         for ptr, data in self.pointer_to_data.items():
             total_offloads += 1
             handle = data.handle
             if data.tag == 'weights':
                 # In unsloth's case we have weights managed by unsloth. So we neither offload/delete them nor onload/create them here.
+                continue
+            # Skip if already sleeping (already unmapped)
+            if ptr in self._sleeping_ptrs:
+                logger.debug(f"Skipping already sleeping ptr {ptr} with tag {data.tag}")
                 continue
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
@@ -584,6 +592,7 @@ def patch_vllm_enable_sleep_mode():
             logger.debug(f"data's tag is {data.tag} and is offloaded to cpu? {data.tag in offload_tags}")
 
             unmap_and_release(handle)
+            self._sleeping_ptrs.add(ptr)  # Mark as sleeping/unmapped
             true_offloads += 1
         pass
 
@@ -603,13 +612,23 @@ def patch_vllm_enable_sleep_mode():
             back to GPU memory.
         """
         delete_memory()
+
+        # Initialize sleeping_ptrs set if not present
+        if not hasattr(self, '_sleeping_ptrs'):
+            self._sleeping_ptrs = set()
+
         for ptr, data in self.pointer_to_data.items():
             if data.tag == "weights":
                 # In unsloth's case we have weights managed by unsloth. So we neither offload/delete them nor onload/create them here.
                 continue
             if tags is None or data.tag in tags:
+                # Only create_and_map if this ptr is actually sleeping (was unmapped)
+                if ptr not in self._sleeping_ptrs:
+                    logger.debug(f"Skipping already awake ptr {ptr} with tag {data.tag}")
+                    continue
                 handle = data.handle
                 create_and_map(handle)
+                self._sleeping_ptrs.discard(ptr)  # Mark as awake/mapped
                 if data.cpu_backup_tensor is not None:
                     cpu_backup_tensor = data.cpu_backup_tensor
                     if cpu_backup_tensor is not None:
@@ -653,7 +672,7 @@ def patch_vllm_enable_sleep_mode():
         def check_sleep_mode(self):
             # LLM object has llm_engine as an attribute
             engine = getattr(self, "llm_engine", self)
-            return hasattr(engine, "vllm_config") and hasattr(engine.vllm_config, "model_config") and getattr(engine.vllm_config.model_config, "enable_sleep_mode", False)
+            return (hasattr(engine, "vllm_config") and hasattr(engine.vllm_config, "model_config") and getattr(engine.vllm_config.model_config, "enable_sleep_mode", False)) and (hasattr(engine, "model_executor") and hasattr(engine.model_executor, "is_sleeping") and engine.model_executor.is_sleeping)
 
         import functools
         @functools.wraps(original_generate)
