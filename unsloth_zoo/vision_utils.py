@@ -1266,8 +1266,9 @@ class UnslothVisionDataCollator:
             content = message.get("content")
             if isinstance(content, list):
                 for item in content:
-                    for k in list(item.keys()):
-                        if item[k] is None:
-                            del item[k]
+                    if isinstance(item, dict):
+                        for k in list(item.keys()):
+                            if item[k] is None:
+                                del item[k]
         return messages
 pass
