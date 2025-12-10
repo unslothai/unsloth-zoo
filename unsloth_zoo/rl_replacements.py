@@ -62,19 +62,21 @@ pass
 
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
 
-# More memory efficient by chunking on (bsz+qlen) dimension
-# Exactly equivalent to the above
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_hidden_states_selective_log_softmax(
-    hidden_states, 
-    lm_head, 
-    index, 
-    chunks=4,
-    logit_scale_multiply=0.0, 
-    logit_scale_divide=0.0, 
-    logit_softcapping=0.0, 
-    temperature=1.0
-):
+    hidden_states: torch.Tensor,
+    lm_head: torch.Tensor,
+    index: torch.Tensor,
+    chunks: int = 4,
+    logit_scale_multiply: float = 0.0,
+    logit_scale_divide: float = 0.0,
+    logit_softcapping: float = 0.0,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    More memory efficient by chunking on (bsz+qlen) dimension.
+    Exactly equivalent to the non-chunked version.
+    """
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1]) 
     flat_index = index.reshape(-1)                                    
 
