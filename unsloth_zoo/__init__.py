@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.11.6"
+__version__ = "2025.12.3"
 
 import os
 import warnings
@@ -115,6 +115,16 @@ if (major_torch < 2):
                       "We have some installation instructions on our Github page.")
 elif (major_torch == 2) and (minor_torch < 2):
     # Disable expandable_segments
+    delete_key("PYTORCH_CUDA_ALLOC_CONF")
+    delete_key("PYTORCH_HIP_ALLOC_CONF")
+    delete_key("PYTORCH_ALLOC_CONF")
+elif bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")):
+    # Expandable segments does NOT work on WSL
+    delete_key("PYTORCH_CUDA_ALLOC_CONF")
+    delete_key("PYTORCH_HIP_ALLOC_CONF")
+    delete_key("PYTORCH_ALLOC_CONF")
+elif os.name == 'nt':
+    # Expandable segments does NOT work on Windows
     delete_key("PYTORCH_CUDA_ALLOC_CONF")
     delete_key("PYTORCH_HIP_ALLOC_CONF")
     delete_key("PYTORCH_ALLOC_CONF")
