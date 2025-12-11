@@ -98,13 +98,9 @@ pass
 def distributed_function(n = 1, function = None, *args, **kwargs):
     assert function is not None
 
-    # Not launched distributed at all
-    if not is_distributed():
-        out = function(*args, **kwargs)
-        return out if n == 1 else out
-
-    # If process group isn't initialized yet, all ranks must run independently.
-    # This happens during import when torchrun is used but init_process_group() wasn't called yet.
+    # Run independently if process group isn't initialized yet.
+    # This covers both: (1) not distributed at all, and (2) torchrun launched
+    # but init_process_group() wasn't called yet (e.g. during module imports).
     # Ref: https://github.com/unslothai/unsloth/issues/3703
     if not torch_distributed_is_initialized():
         out = function(*args, **kwargs)
