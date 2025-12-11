@@ -1024,6 +1024,9 @@ def merge_and_overwrite_lora(
     safetensors_list = []
     max_size_in_bytes = 0
     total_size_in_bytes = 0
+    # Collect all tensor keys encountered across shards so we can reason about tied embeddings
+    # (embed_tokens/lm_head) in the final sanity check without assuming both tensors exist on disk.
+    safetensor_keys_seen = set()
     config = model.config
 
     for loop_iteration in range(2):
@@ -1397,6 +1400,11 @@ def merge_and_overwrite_lora(
             with safe_open(file_path, framework = "pt", device = "cpu") as f:
                 for key in f.keys():
                     weight_map[key] = filename
+                    safetensor_keys_seen.add(key)
+        else:
+            # Even when not regenerating an index, record tensor keys for tied-weight sanity checks.
+            with safe_open(file_path, framework = "pt", device = "cpu") as f:
+                safetensor_keys_seen.update(f.keys())
 
         if low_disk_space_usage and push_to_hub:
             upload_items(filename)
@@ -1427,9 +1435,22 @@ def merge_and_overwrite_lora(
 
 
     # Step 7: Check for errors
-    if len(lora_weights) != n_saved_modules:
+    effective_loras = len(lora_weights)
+    # For tied embeddings, PEFT can register both embed_tokens and lm_head as modules_to_save even
+    # though only one tensor exists on disk. If we see both logical modules but only one backing
+    # tensor key across shards, treat them as a single merged target to avoid an off-by-one on the
+    # sanity check while keeping the invariant meaningful for non-tied models.
+    has_embed = any(key.endswith("embed_tokens") for key in lora_weights)
+    has_head  = any(key.endswith("lm_head") for key in lora_weights)
+    if has_embed and has_head:
+        has_embed_tensor = any("embed_tokens" in key for key in safetensor_keys_seen)
+        has_head_tensor  = any("lm_head"      in key for key in safetensor_keys_seen)
+        if has_embed_tensor ^ has_head_tensor:  # exactly one side present on disk
+            effective_loras -= 1
+
+    if effective_loras != n_saved_modules:
         raise RuntimeError(
-            f"Unsloth: Saving LoRA finetune failed since # of LoRAs = {len(lora_weights)} "\
+            f"Unsloth: Saving LoRA finetune failed since # of LoRAs = {effective_loras} "\
             f"does not match # of saved modules = {n_saved_modules}. Please file a bug report!"
         )
     pass
