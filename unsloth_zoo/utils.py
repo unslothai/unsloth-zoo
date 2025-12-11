@@ -103,6 +103,13 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
         out = function(*args, **kwargs)
         return out if n == 1 else out
 
+    # If process group isn't initialized yet, all ranks must run independently.
+    # This happens during import when torchrun is used but init_process_group() wasn't called yet.
+    # Ref: https://github.com/unslothai/unsloth/issues/3703
+    if not torch_distributed_is_initialized():
+        out = function(*args, **kwargs)
+        return out if n == 1 else out
+
     # Multi-process: only main executes the function
     if is_main_process():
         out = function(*args, **kwargs)
@@ -142,7 +149,7 @@ def get_lock(target: str, timeout: Optional[int] = None) -> FileLock:
         timeout = int(os.environ.get("UNSLOTH_LOCK_TIMEOUT", "10"))
     return FileLock(lock_path, timeout=timeout)
 
-  
+
 def get_quant_type(config):
     quant_config = getattr(config, 'quantization_config', None)
     if quant_config:
@@ -152,7 +159,7 @@ def get_quant_type(config):
         elif isinstance(quant_config, AutoQuantizationConfig):
             return getattr(quant_config, 'quant_method', None)
     return None
-  
+
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
