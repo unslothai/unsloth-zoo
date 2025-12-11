@@ -454,6 +454,9 @@ def _merge_and_overwrite_lora(
 
     filename_original = os.path.join(save_directory, filename)  # Original file path
     count = 0
+    # Collect keys for this shard so the caller can aggregate without re-reading the file (avoids
+    # an extra safetensors pass purely for tied-embedding bookkeeping).
+    safetensor_keys_seen = set()
 
     # Convert lora_weights to safetensor format
     converted_lora_weights = _convert_lora_keys_to_safetensor_format(
@@ -481,6 +484,7 @@ def _merge_and_overwrite_lora(
 
         with safe_open(filename_original, framework = "pt", device = "cpu") as file:
             safetensor_keys = list(file.keys())
+            safetensor_keys_seen.update(safetensor_keys)
 
             # Update converted_lora_weights with actual safetensor keys
             converted_lora_weights = _convert_lora_keys_to_safetensor_format(
@@ -553,7 +557,7 @@ def _merge_and_overwrite_lora(
         raw_pointer.close()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return count
+        return count, safetensor_keys_seen
 
     except Exception as e:
         raise RuntimeError(f"Model merge failed with error: {e}")
@@ -570,7 +574,7 @@ def _merge_and_overwrite_lora(
                 raw_pointer.close()
             except:
                 pass
-    return count
+    return count, safetensor_keys_seen
 pass
 
 @torch.inference_mode
@@ -580,6 +584,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     filename_original = os.path.join(save_directory, filename)  # Original file path
     tensors = OrderedDict()
     count = 0
+    safetensor_keys_seen = set()
     import psutil
     import pickle
     limit = 700 * 1024 * 1024  # 700MB
@@ -593,6 +598,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
 
     with safe_open(filename_original, framework = "pt", device = "cpu") as file: # Open original file for reading
         safetensor_keys = list(file.keys())
+        safetensor_keys_seen.update(safetensor_keys)
 
         # Update converted_lora_weights with actual safetensor keys
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
@@ -757,7 +763,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
         except:
             pass
 
-    return count
+    return count, safetensor_keys_seen
 pass
 
 from huggingface_hub import (
@@ -1024,9 +1030,6 @@ def merge_and_overwrite_lora(
     safetensors_list = []
     max_size_in_bytes = 0
     total_size_in_bytes = 0
-    # Collect all tensor keys encountered across shards so we can reason about tied embeddings
-    # (embed_tokens/lm_head) in the final sanity check without assuming both tensors exist on disk.
-    safetensor_keys_seen = set()
     config = model.config
 
     for loop_iteration in range(2):
@@ -1379,8 +1382,12 @@ def merge_and_overwrite_lora(
     regenerate_index = ((base_model_is_quantized and quant_type == "mxfp4") or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded) and save_method != "mxfp4"
     weight_map = {}
 
+    # Collect all tensor keys encountered across shards so we can reason about tied embeddings
+    # (embed_tokens/lm_head) in the final sanity check without assuming both tensors exist on disk.
+    safetensor_keys_seen = set()
+
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
-        n_saved_modules += _merge_and_overwrite_lora(
+        merged_count, shard_keys = _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
             lora_weights = lora_weights,
@@ -1390,6 +1397,8 @@ def merge_and_overwrite_lora(
             quant_type = quant_type,
             save_method = save_method,
         )
+        n_saved_modules += merged_count
+        safetensor_keys_seen.update(shard_keys)
         torch.cuda.empty_cache()
 
         file_path = os.path.join(save_directory, filename)
@@ -1400,11 +1409,6 @@ def merge_and_overwrite_lora(
             with safe_open(file_path, framework = "pt", device = "cpu") as f:
                 for key in f.keys():
                     weight_map[key] = filename
-                    safetensor_keys_seen.add(key)
-        else:
-            # Even when not regenerating an index, record tensor keys for tied-weight sanity checks.
-            with safe_open(file_path, framework = "pt", device = "cpu") as f:
-                safetensor_keys_seen.update(f.keys())
 
         if low_disk_space_usage and push_to_hub:
             upload_items(filename)
@@ -1439,7 +1443,7 @@ def merge_and_overwrite_lora(
     # For tied embeddings, PEFT can register both embed_tokens and lm_head as modules_to_save even
     # though only one tensor exists on disk. If we see both logical modules but only one backing
     # tensor key across shards, treat them as a single merged target to avoid an off-by-one on the
-    # sanity check while keeping the invariant meaningful for non-tied models.
+    # sanity check while keeping the check meaningful for non-tied models.
     has_embed = any(key.endswith("embed_tokens") for key in lora_weights)
     has_head  = any(key.endswith("lm_head") for key in lora_weights)
     if has_embed and has_head:
