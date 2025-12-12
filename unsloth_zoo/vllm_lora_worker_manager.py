@@ -21,8 +21,14 @@ except ImportError:
 
 from vllm.config import LoRAConfig
 from vllm.logger import init_logger
-from vllm.lora.models import (LoRAModel, LoRAModelManager,
-                              LRUCacheLoRAModelManager, create_lora_manager)
+try:
+    from vllm.lora.models import (LoRAModel, LoRAModelManager,
+                                LRUCacheLoRAModelManager, create_lora_manager)
+except ImportError:
+    # Newer vLLM version moved/split lora methods
+    # https://github.com/vllm-project/vllm/pull/30253
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.model_manager import LoRAModelManager, LRUCacheLoRAModelManager, create_lora_manager
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
