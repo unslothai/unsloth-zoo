@@ -156,6 +156,7 @@ def patch_qwen3_moe():
             final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
             return final_hidden_states.to(hidden_states.dtype), router_logits
     else:
+        # Use static loop over all experts to avoid data-dependent loop that breaks torch.compile
         def forward(
             self,
             hidden_states: torch.Tensor,
@@ -163,25 +164,27 @@ def patch_qwen3_moe():
             top_k_weights: torch.Tensor,
         ) -> torch.Tensor:
             final_hidden_states = torch.zeros_like(hidden_states)
-            num_experts = top_k_weights.shape[1]
-            with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=num_experts + 1)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            num_experts = self.num_experts
 
-            for expert_idx in expert_hit:
-                expert_idx = expert_idx[0]
-                if expert_idx == num_experts:
-                    continue
-                _, token_idx = torch.where(expert_mask[expert_idx])
+            # Loop over all experts (static range) instead of data-dependent expert_hit
+            # No early exit for empty tensors - operations handle empty tensors gracefully
+            for expert_idx in range(num_experts):
+                # Find tokens assigned to this expert
+                token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
+                # Operations below handle empty tensors correctly (no-op for index_add_ with empty index)
                 current_state = hidden_states[token_idx]
                 gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
                 current_hidden_states = self.act_fn(gate) * up
                 current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-                current_hidden_states = current_hidden_states * top_k_weights[token_idx, expert_idx, None]
+                current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
                 final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
             return final_hidden_states
-    patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", forward)
+    # For old transformers, patch Qwen3MoeSparseMoeBlock
+    # For new transformers, patch Qwen3MoeExperts (which has the expert loop)
+    if old_transformers:
+        patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", forward)
+    else:
+        patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_qwen3_moe)
