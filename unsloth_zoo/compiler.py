@@ -2663,7 +2663,7 @@ def unsloth_compile_transformers(
                 continue
 
             module_class = eval(f"modeling_file.{module}")
-            if hasattr(module_class, "forward") and issubclass(module_class, GenerationMixin):
+            if isinstance(module_class, type) and hasattr(module_class, "forward") and issubclass(module_class, GenerationMixin):
                 try:
                     source = inspect.getsource(module_class.forward)
                 except:
