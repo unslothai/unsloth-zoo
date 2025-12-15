@@ -115,10 +115,28 @@ def get_peft_regex(
 
     # Check if regex is wrong since model does not have vision parts
     check = any(re.search(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
-    if not check:
-        regex_matcher = \
+    if check:
+        print(f"Unsloth: Primary regex matched (finetune_vision_layers={finetune_vision_layers})")
+    else:
+        # Build exclusion pattern based on finetune_* flags to prevent fallback from being too permissive
+        exclude_patterns = []
+        if not finetune_vision_layers:
+            exclude_patterns += vision_tags
+        if not finetune_language_layers:
+            exclude_patterns += language_tags
+
+        if exclude_patterns:
+            exclusion = r"(?!.*(?:" + "|".join(exclude_patterns) + r"))"
+        else:
+            exclusion = ""
+
+        regex_matcher = exclusion + \
             r".*?(?:" + regex_components + \
             r").*?"   + match_linear_modules + ".*?"
+
+        print(f"Unsloth: Using fallback regex for target_modules (primary pattern found no matches)")
+        print(f"Unsloth:   Exclusion patterns: {exclude_patterns if exclude_patterns else 'none'}")
+        print(f"Unsloth:   Final regex: {regex_matcher[:80]}{'...' if len(regex_matcher) > 80 else ''}")
     pass
 
     # Final check to confirm if matches exist
