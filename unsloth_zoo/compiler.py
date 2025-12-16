@@ -2662,7 +2662,7 @@ def unsloth_compile_transformers(
             if OLD_CUDA_ARCH_VERSION or OLD_TORCH_VERSION or OLD_TRITON_VERSION:
                 continue
 
-            module_class = eval(f"modeling_file.{module}")
+            module_class = getattr(modeling_file, module)
             if isinstance(module_class, type) and hasattr(module_class, "forward") and issubclass(module_class, GenerationMixin):
                 try:
                     source = inspect.getsource(module_class.forward)
