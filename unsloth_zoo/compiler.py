@@ -1836,13 +1836,29 @@ def patch_lora_forwards(torch_compile_options):
                 if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0" \
                 else COMPILED_LORA_FORWARD_forced_float32
 
+            # Fix for 8-bit layers: use torch._dynamo.disable decorator
+            # to prevent bitsandbytes 8-bit ops from being compiled (causes dimension errors)
+            extra_prepend = ""
+            if "8bit" in child.lower():
+                # Replace base_layer calls with a dynamo-disabled helper function
+                source = source.replace(
+                    "result = self.base_layer(x, *args, **kwargs)",
+                    "result = _call_8bit_base_layer(self.base_layer, x, *args, **kwargs)"
+                )
+                extra_prepend = (
+                    "\nimport torch._dynamo\n"
+                    "@torch._dynamo.disable\n"
+                    "def _call_8bit_base_layer(base_layer, x, *args, **kwargs):\n"
+                    "    return base_layer(x, *args, **kwargs)\n"
+                )
+
             forward = create_new_function(
                 f"{child}_peft_forward",
                 compiled_lora_forward + source,
                 parent,
                 dir(eval(parent)),
                 prepend = \
-                    f"\ntorch_compile_options = {torch_compile_options}\n"
+                    f"\ntorch_compile_options = {torch_compile_options}\n" + extra_prepend
             ).unsloth_forward
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
@@ -2646,8 +2662,8 @@ def unsloth_compile_transformers(
             if OLD_CUDA_ARCH_VERSION or OLD_TORCH_VERSION or OLD_TRITON_VERSION:
                 continue
 
-            module_class = eval(f"modeling_file.{module}")
-            if hasattr(module_class, "forward") and issubclass(module_class, GenerationMixin):
+            module_class = getattr(modeling_file, module)
+            if isinstance(module_class, type) and hasattr(module_class, "forward") and issubclass(module_class, GenerationMixin):
                 try:
                     source = inspect.getsource(module_class.forward)
                 except:
