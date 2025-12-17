@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.12.4"
+__version__ = "2025.12.5"
 
 import os
 import warnings
@@ -141,6 +141,14 @@ class HideLoggingMessage(logging.Filter):
 
 torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
 del logging, torchao_logger, HideLoggingMessage
+
+# Flax classes are deprecated and will be removed in Diffusers v1.0.0.
+try:
+    from diffusers.utils import logger as diffusers_logger
+    diffusers_logger.addFilter(HideLoggingMessage("are deprecated"))
+    del diffusers_logger
+except:
+    pass
 
 # Get device types and other variables
 from .device_type import (
