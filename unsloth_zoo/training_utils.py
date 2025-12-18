@@ -189,26 +189,31 @@ def prepare_model_for_training(
         if use_gradient_checkpointing == "unsloth":
             m._offloaded_gradient_checkpointing = True
         if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-            m.gradient_checkpointing_enable()
+            gc_kwargs = {"use_reentrant": use_reentrant}
+            m.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs = gc_kwargs
+            )
         m = m.model
     pass
     if use_gradient_checkpointing == "unsloth":
         m._offloaded_gradient_checkpointing = True
     if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-        m.gradient_checkpointing_enable()
+        gc_kwargs = {"use_reentrant": use_reentrant}
+        m.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs = gc_kwargs
+        )
 
     # Also set HF version manually to stop failures
     if hasattr(model, "_set_gradient_checkpointing"):
         model._set_gradient_checkpointing()
 
-    # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
-    if use_reentrant:
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-        else:
-            def make_inputs_require_grad(module, input, output):
-                output.requires_grad_(True)
-            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+    # Ensure inputs require grad for checkpointing regardless of reentrancy choice.
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    else:
+        def make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
     pass
 
     # Upcast modules_to_save
