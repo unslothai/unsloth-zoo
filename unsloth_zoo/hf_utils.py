@@ -106,7 +106,7 @@ def _normalize_dict_dtypes(obj):
     return _dtype_stringify(obj)
 
 
-def get_transformers_model_type(config):
+def get_transformers_model_type(config, trust_remote_code=False):
     """ Gets model_type from config file - can be PEFT or normal HF """
     if config is None:
         raise RuntimeError(
@@ -159,9 +159,22 @@ def get_transformers_model_type(config):
         if model_types is None:
             from transformers import AutoConfig
             try:
-                config = AutoConfig.from_pretrained(base_model_name_or_path)
+                config = AutoConfig.from_pretrained(
+                    base_model_name_or_path,
+                    trust_remote_code=trust_remote_code,
+                )
                 retry_config = True
-            except:
+            except ImportError as error:
+                config = None
+                raise error
+            except Exception as error:
+                from transformers import __version__ as transformers_version
+                autoconfig_error = str(error)
+                if "architecture" in autoconfig_error:
+                    raise ValueError(
+                        f"`{base_model_name_or_path}` is not supported yet in `transformers=={transformers_version}`.\n"
+                        f"Please update transformers via `pip install --upgrade transformers` and try again."
+                    )
                 config = None
         pass
     else:
