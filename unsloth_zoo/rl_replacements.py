@@ -610,7 +610,6 @@ def grpo_accumulated_loss(
 
     all_logprobs_list = []
 
-    #input_ids_chunks = torch.chunk(input_ids, chunks=B, dim=0)
     attention_mask_chunks = torch.chunk(attention_mask, chunks=B, dim=0)
     completion_ids_chunks = torch.chunk(completion_input_ids, chunks=B, dim=0)
 
@@ -791,7 +790,7 @@ def grpo_accumulated_loss(
                 new_hidden_states_chunk,
                 lm_head, 
                 completion_ids, 
-                chunks = 8,
+                chunks = input_ids.shape[0]*2,
                 logit_scale_multiply = logit_scale_multiply, 
                 logit_scale_divide = logit_scale_divide,
                 logit_softcapping = logit_softcapping, 
