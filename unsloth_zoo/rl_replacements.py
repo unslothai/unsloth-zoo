@@ -661,6 +661,74 @@ def grpo_accumulated_loss(
         autocaster = nullcontext()
     else:
         autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
+
+    def to_device(tensor, device, non_blocking=True):
+        if tensor is None: return None
+        return tensor.to(device, non_blocking=non_blocking)
+
+    class Unsloth_Offloaded_Log_Softmax(torch.autograd.Function):
+        """
+        Manual Gradient Checkpointing/CPU Offloading for Log Softmax.
+        """
+        @staticmethod
+        def forward(ctx, hidden_states, lm_head, index, chunks, 
+                    logit_scale_multiply, logit_scale_divide, 
+                    logit_softcapping, temperature):
+            
+            ctx.saved_hidden_states = to_device(hidden_states, "cpu", non_blocking=True)
+            ctx.device = hidden_states.device
+            ctx.dtype = hidden_states.dtype
+            
+            ctx.lm_head = lm_head
+            ctx.index = index
+            ctx.args = (chunks, logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature)
+            
+            with torch.no_grad():
+                output = chunked_hidden_states_selective_log_softmax(
+                    hidden_states, lm_head, index, *ctx.args
+                )
+                
+            return output
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            # 1. Restore hidden_states from CPU to GPU
+            hidden_states = to_device(ctx.saved_hidden_states, ctx.device)
+            hidden_states = hidden_states.to(ctx.dtype)
+            hidden_states.requires_grad_(True)
+            
+            lm_head = ctx.lm_head.detach()
+            lm_head.requires_grad_(True)
+            
+            index = ctx.index
+            
+            with torch.enable_grad():
+                output = chunked_hidden_states_selective_log_softmax(
+                    hidden_states, lm_head, index, *ctx.args
+                )
+                
+            torch.autograd.backward(output, grad_output)
+
+            return (
+                hidden_states.grad,  
+                lm_head.grad,        
+                None,                
+                None,                
+                None,                
+                None,                
+                None,               
+                None,                
+            )
+
+    def efficient_log_softmax(hidden_states, lm_head, index, chunks=32, 
+                            logit_scale_multiply=0.0, logit_scale_divide=0.0, 
+                            logit_softcapping=0.0, temperature=1.0):
+        return Unsloth_Offloaded_Log_Softmax.apply(
+            hidden_states, lm_head, index, chunks, 
+            logit_scale_multiply, logit_scale_divide, 
+            logit_softcapping, temperature
+        )
+    
     with autocaster:
         for (
             input_ids_chunk,
