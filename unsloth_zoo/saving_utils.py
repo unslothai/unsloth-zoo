@@ -72,6 +72,7 @@ except:
         from huggingface_hub.utils._token import get_token
     pass
 pass
+from transformers.modeling_utils import PushToHubMixin
 import json
 import os
 from pathlib import Path
