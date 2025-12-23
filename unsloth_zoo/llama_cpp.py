@@ -58,11 +58,12 @@ COMMANDS_NOT_FOUND = (
 # llama.cpp specific targets - all takes 90s. Below takes 60s
 LLAMA_CPP_TARGETS = [
     "llama-quantize",
-    "llama-export-lora",
+    # "llama-export-lora",
     "llama-cli",
-    "llama-llava-cli",
+    # "llama-llava-cli",
     "llama-mtmd-cli",
     "llama-gguf-split",
+    "llama-server",
 ]
 
 PIP_OPTIONS = [
