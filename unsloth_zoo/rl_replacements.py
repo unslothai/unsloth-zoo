@@ -848,15 +848,15 @@ def grpo_accumulated_loss(
                 
                 new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
 
-            logprobs_chunk = chunked_hidden_states_selective_log_softmax(
-                new_hidden_states_chunk,
+            logprobs_chunk = efficient_log_softmax(
+                new_hidden_states_chunk, 
                 lm_head, 
                 completion_ids, 
-                chunks = batch_size*multiplier,
-                logit_scale_multiply = logit_scale_multiply, 
-                logit_scale_divide = logit_scale_divide,
-                logit_softcapping = logit_softcapping, 
-                temperature = temperature
+                chunks=  batch_size*multiplier, 
+                logit_scale_multiply=logit_scale_multiply,
+                logit_scale_divide=logit_scale_divide,
+                logit_softcapping=logit_softcapping,
+                temperature=temperature
             )
             #This is needed to avoid race conditions with GPT OSS offload_embbed=True
             #However, it seems that this line does not slow down or disrupt models. 
