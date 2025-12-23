@@ -227,6 +227,45 @@ def align_logprobs_with_mask(
 
 RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
 
+def autotune_batch_and_chunks(
+    total_input_rows, 
+    seq_len, 
+    hidden_size, 
+    vocab_size, 
+    dtype_bytes=2,
+):
+    final_m = max(2, seq_len // 4096)
+    
+    if torch.cuda.is_available():
+        free_bytes, _ = torch.cuda.mem_get_info()
+        limit_gb = (free_bytes / (1024**3))*.80
+
+    bytes_to_gb = 1024**3
+
+    b_vals = torch.arange(total_input_rows, 0, -1, device='cpu', dtype=torch.float32)
+
+    hidden_gb = (b_vals * seq_len * hidden_size * dtype_bytes) / bytes_to_gb
+
+    base_logits = ((b_vals/total_input_rows) * b_vals * seq_len * vocab_size * dtype_bytes) / bytes_to_gb
+    logits_gb = base_logits / final_m
+
+    total_mem_gb = hidden_gb + logits_gb
+    
+    valid_mask = total_mem_gb <= limit_gb
+    valid_indices = torch.nonzero(valid_mask, as_tuple=False)
+
+    if valid_indices.shape[0] == 0:
+        #something went so wrong....
+        return 2, final_m
+
+    best_idx = valid_indices[0].item()
+    final_b = int(b_vals[best_idx].item())
+
+    return final_b, final_m
+
+RL_REPLACEMENTS["grpo_autotune_batch_and_chunks"] = autotune_batch_and_chunks
+
+
 def grpo_update_SamplingParams(SamplingParams, generation_kwargs, vllm_sampling_params = None):
     good_sampling_params_keys = inspect.signature(SamplingParams).parameters.keys()
 
@@ -574,7 +613,33 @@ def grpo_accumulated_loss(
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
     lm_head = trainer.model.get_output_embeddings().weight
-
+    dtype_bytes = 16 if trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
+    # --- EXECUTE AUTOTUNE ---
+    total_rows = input_ids.shape[0]
+    seq_len = input_ids.shape[1]
+    hidden_dim = lm_head.shape[1]
+    vocab_dim = lm_head.shape[0]
+    #This should only need to be called once 
+    if not hasattr(trainer, "_has_autotuned"):
+        trainer._has_autotuned = True
+        B, multiplier = autotune_batch_and_chunks(
+            total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes
+        )
+        trainer._grpo_autotuned_batch = total_rows//B 
+        trainer._multiplier = multiplier
+        B = trainer._grpo_autotuned_batch
+        multiplier = trainer._multiplier
+    # 2. If not the first time, check if we are on an accumulation step
+    elif trainer._step % trainer.current_gradient_accumulation_steps == 0:
+        B = trainer._grpo_autotuned_batch
+        multiplier = trainer._multiplier
+        del trainer._has_autotuned
+        del trainer._grpo_autotuned_batch
+        del trainer._multiplier 
+    else:
+        B = trainer._grpo_autotuned_batch
+        multiplier = trainer._multiplier
+        
     if pixel_values is None:
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
 
@@ -604,9 +669,6 @@ def grpo_accumulated_loss(
         if hasattr(module, "_hf_hook") and hasattr(module._hf_hook, "io_same_decice"):
             module._hf_hook.io_same_decice = False
     pass
-
-    #TODO automatically determine this number
-    B = 1 #input_ids.shape[0] #//2
 
     all_logprobs_list = []
 
@@ -790,7 +852,7 @@ def grpo_accumulated_loss(
                 new_hidden_states_chunk,
                 lm_head, 
                 completion_ids, 
-                chunks = input_ids.shape[0]*2,
+                chunks = batch_size*multiplier,
                 logit_scale_multiply = logit_scale_multiply, 
                 logit_scale_divide = logit_scale_divide,
                 logit_softcapping = logit_softcapping, 
