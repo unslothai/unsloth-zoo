@@ -156,42 +156,71 @@ def patch_qwen3_moe():
             final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
             return final_hidden_states.to(hidden_states.dtype), router_logits
     else:
-        # Optimized vectorized implementation for new transformers (Qwen3MoeExperts)
-        # Uses einsum to compute all experts at once - torch.compile compatible
+        # Pure torch loop-based implementation for new transformers (5.0+)
+        # Memory efficient but needs torch.compiler.disable due to data-dependent loop
+
+        @torch.compiler.disable
         def forward(
             self,
             hidden_states: torch.Tensor,
             top_k_index: torch.Tensor,
             top_k_weights: torch.Tensor,
         ) -> torch.Tensor:
-            n_tokens, hidden_dim = hidden_states.shape
-            _, top_k = top_k_index.shape
-            num_experts = self.num_experts
-            intermediate_size = self.gate_up_proj.shape[1] // 2
+            """
+            Loop-based MoE forward pass. Loops over experts that have tokens routed to them.
+            Uses @torch.compiler.disable because the loop is data-dependent.
+            """
+            final_hidden_states = torch.zeros_like(hidden_states)
 
-            # Step 1: First linear for ALL experts at once (single einsum)
-            all_gate_up = torch.einsum('th,eih->tei', hidden_states, self.gate_up_proj)
+            # Create expert mask and find which experts have tokens
+            with torch.no_grad():
+                expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
+                expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
+                expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
-            # Step 2: Gather top-k experts' outputs
-            gather_idx = top_k_index.unsqueeze(-1).expand(-1, -1, 2 * intermediate_size)
-            selected_gate_up = torch.gather(all_gate_up, dim=1, index=gather_idx)
+            # Only loop over experts that actually have tokens routed to them
+            for expert_idx in expert_hit:
+                expert_idx = expert_idx[0]
+                if expert_idx == self.num_experts:
+                    continue
 
-            # Step 3: Activation (SwiGLU)
-            gate, up = selected_gate_up.chunk(2, dim=-1)
-            intermediate = self.act_fn(gate) * up
+                # Find which tokens are routed to this expert
+                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
 
-            # Step 4: Down projection - fully vectorized using one-hot selection
-            all_down = torch.einsum('tki,ehi->tkeh', intermediate, self.down_proj)
-            selection = F.one_hot(top_k_index, num_classes=num_experts).to(all_down.dtype)
-            selected_down = (all_down * selection.unsqueeze(-1)).sum(dim=2)
+                # Gather only the tokens for this expert
+                current_state = hidden_states[token_idx]
 
-            # Apply weights and sum over top_k
-            return (selected_down * top_k_weights.unsqueeze(-1)).sum(dim=1)
+                # Compute gate_up projection for this expert only
+                gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                current_hidden_states = self.act_fn(gate) * up
+
+                # Compute down projection for this expert only
+                current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+
+                # Apply routing weights
+                current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+
+                # Scatter back to final output
+                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+            return final_hidden_states
+
+        # Also disable compilation for the SparseMoeBlock
+        # since fullgraph=True cannot inline a torch.compiler.disable'd function
+        @torch.compiler.disable
+        def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            batch_size, sequence_length, hidden_dim = hidden_states.shape
+            hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+            _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+            final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+            return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
     # For old transformers, patch Qwen3MoeSparseMoeBlock
     # For new transformers, patch Qwen3MoeExperts (which has the expert loop)
     if old_transformers:
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", forward)
     else:
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts, "forward", forward)
+        patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", sparse_moe_block_forward)
 pass
 TEMPORARY_PATCHES.append(patch_qwen3_moe)
