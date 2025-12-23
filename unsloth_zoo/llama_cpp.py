@@ -39,6 +39,7 @@ import tempfile
 import logging
 import torch
 from pathlib import Path
+import psutil
 
 # Get a logger instance
 logger = logging.getLogger(__name__)
@@ -419,11 +420,17 @@ def install_llama_cpp(
     build_success = False
     build_errors = []
 
+    # Check for Colab / Kaggle, and deduct some CPUs to conserve memory
+    cpu_count = psutil.cpu_count()
+    if IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT:
+        cpu_count = cpu_count - 1
+        cpu_count = min(cpu_count, 1)
+
     # Try make first
     try:
         if print_output: print("Trying to build with make...")
-        try_execute(f"make clean", cwd=llama_cpp_folder, **kwargs)
-        try_execute(f"make all -j", cwd=llama_cpp_folder, **kwargs)
+        try_execute(f"make clean", cwd = llama_cpp_folder, **kwargs)
+        try_execute(f"make all -j{cpu_count}", cwd = llama_cpp_folder, **kwargs)
         build_success = True
         print("Successfully built with make")
     except Exception as e:
@@ -432,7 +439,7 @@ def install_llama_cpp(
         # Use cmake instead
         try:
             # Clean up any partial build
-            try_execute(f"rm -rf build", cwd=llama_cpp_folder, **kwargs)
+            try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
 
             try_execute(
                 f"cmake . -B build "\
@@ -442,7 +449,7 @@ def install_llama_cpp(
             )
             try_execute(
                 f"cmake --build build --config Release "\
-                f"-j --clean-first --target "\
+                f"-j{cpu_count} --clean-first --target "\
                 f"{' '.join(llama_cpp_targets)}",
                 cwd = llama_cpp_folder,
                 **kwargs
@@ -1027,7 +1034,6 @@ def quantize_gguf(
     # Use llama-quantize for fast quantization of GGUF files.
 
     if n_threads is None:
-        import psutil
         n_threads = psutil.cpu_count()
         if n_threads is None:
             n_threads = 1
