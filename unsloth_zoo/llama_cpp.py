@@ -1246,6 +1246,48 @@ def check_linux_type():
     return 'unknown'
 pass
 
+
+@lru_cache(1)
+def _check_llama_cpp_appended_system_message():
+    # See https://github.com/ggml-org/llama.cpp/issues/18323
+    # See https://docs.unsloth.ai/basics/inference-and-deployment/llama-server-and-openai-endpoint#llama-server-quirks
+    llama_cpp_chat_file = "https://raw.githubusercontent.com/ggml-org/llama.cpp/refs/heads/master/common/chat.cpp"
+    llama_cpp_appended = '''Respond in JSON format, either with `tool_call` (a request to call tools) or with `response` reply to the user's request'''
+    check = requests.get(llama_cpp_chat_file, timeout = 5)
+    try:
+        check.raise_for_status()
+        check = check.content.decode("utf-8")
+        if llama_cpp_appended in check:
+            logger.info("llama.cpp appends an extra system message for tools. You should consider this.")
+            return llama_cpp_appended
+    except:
+        pass
+    return ""
+
+
+def add_llama_cpp_system_message(messages, tools, inplace = False):
+    # See https://github.com/ggml-org/llama.cpp/issues/18323
+    # See https://docs.unsloth.ai/basics/inference-and-deployment/llama-server-and-openai-endpoint#llama-server-quirks
+    extra = _check_llama_cpp_appended_system_message()
+    if len(messages) == 0 or messages is None:
+        return messages
+    if tools is None or len(tools) == 0:
+        # Does not affect non tools
+        return messages
+    if extra == "":
+        return messages
+    if messages[0]["role"] == "system":
+        if inplace:
+            messages[0]["content"] = messages[0]["content"] + "\n\n" + extra
+        else:
+            messages = [{"role" : "system", "content" : messages[0]["content"]}] + messages[1:]
+    else:
+        if inplace:
+            messages.insert(0, {"role" : "system", "content" : extra})
+        else:
+            messages = [{"role" : "system", "content" : extra}] + messages
+    return messages
+
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
