@@ -80,6 +80,7 @@ def _init_triton_allocator():
             return _PERSISTENT_BUFFER
 
         triton.set_allocator(persistent_alloc_fn)
+        triton._unsloth_allocator_set = True
         _TRITON_ALLOCATOR_INITIALIZED = True
     except Exception:
         pass
