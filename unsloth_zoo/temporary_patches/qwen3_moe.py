@@ -39,6 +39,126 @@ from .utils import (
 )
 
 
+# ============================================================================
+# Grouped GEMM kernel integration for MoE training acceleration
+# ============================================================================
+
+# Global flag to check if grouped GEMM is available
+_GROUPED_GEMM_AVAILABLE = None
+_GROUPED_GEMM_WARNED = False
+_TRITON_ALLOCATOR_INITIALIZED = False
+_PERSISTENT_BUFFER = None
+
+
+def _init_triton_allocator():
+    """
+    Initialize a persistent Triton allocator to avoid memory allocation overhead per call.
+    This significantly reduces GPU utilization fluctuation.
+    """
+    global _TRITON_ALLOCATOR_INITIALIZED, _PERSISTENT_BUFFER
+    if _TRITON_ALLOCATOR_INITIALIZED:
+        return
+
+    try:
+        import triton
+
+        # Create a persistent buffer that grows as needed
+        # This avoids allocating new memory on every kernel call
+        _buffer_cache = {}
+
+        def persistent_alloc_fn(size: int, alignment: int, stream):
+            global _PERSISTENT_BUFFER
+            # Round up size to avoid frequent reallocations
+            rounded_size = ((size + 1024 * 1024 - 1) // (1024 * 1024)) * (1024 * 1024)
+
+            if _PERSISTENT_BUFFER is None or _PERSISTENT_BUFFER.numel() < rounded_size:
+                # Allocate with some headroom to reduce reallocations
+                _PERSISTENT_BUFFER = torch.empty(
+                    rounded_size * 2, device="cuda", dtype=torch.int8
+                )
+                _PERSISTENT_BUFFER.__hibernate__ = {"type": "ignore"}
+            return _PERSISTENT_BUFFER
+
+        triton.set_allocator(persistent_alloc_fn)
+        _TRITON_ALLOCATOR_INITIALIZED = True
+    except Exception:
+        pass
+
+
+def _check_grouped_gemm_available():
+    """Check if Unsloth grouped GEMM kernels are available."""
+    global _GROUPED_GEMM_AVAILABLE
+    if _GROUPED_GEMM_AVAILABLE is None:
+        try:
+            # The grouped_gemm module uses relative imports like `from grouped_gemm.kernels...`
+            # so we need to add its parent directory to sys.path
+            import sys
+            import unsloth
+            unsloth_path = os.path.dirname(unsloth.__file__)
+            moe_kernels_path = os.path.join(unsloth_path, "kernels", "moe")
+            if moe_kernels_path not in sys.path:
+                sys.path.insert(0, moe_kernels_path)
+            from grouped_gemm.interface import grouped_gemm, supports_tma
+            _GROUPED_GEMM_AVAILABLE = True
+            # Initialize persistent allocator when grouped GEMM is available
+            _init_triton_allocator()
+        except (ImportError, ModuleNotFoundError) as e:
+            _GROUPED_GEMM_AVAILABLE = False
+    return _GROUPED_GEMM_AVAILABLE
+
+
+def _supports_tma():
+    """Check if TMA (Tensor Memory Accelerator) is supported (sm90+ / Hopper)."""
+    return torch.cuda.get_device_capability()[0] >= 9
+
+
+# Pre-allocated buffers for routing to avoid per-call allocations
+_ROUTING_BUFFERS = {}
+
+
+def _get_routing_indices_optimized(selected_experts, num_experts):
+    """
+    Optimized token→expert mapping for grouped GEMM.
+    Uses bincount instead of histc to avoid float conversion overhead.
+    Reuses buffers when possible to reduce memory allocation pressure.
+
+    Returns:
+        token_counts_by_expert: (num_experts,) token counts per expert
+        gather_indices: (total_tokens,) indices for gathering tokens in expert order
+    """
+    flat_experts = selected_experts.view(-1)
+
+    # bincount is faster than histc since it doesn't require float conversion
+    token_counts_by_expert = torch.bincount(
+        flat_experts,
+        minlength=num_experts
+    ).to(torch.int32)
+
+    # argsort with stable=True preserves order within each expert
+    gather_indices = flat_experts.argsort(stable=True)
+
+    return token_counts_by_expert, gather_indices
+
+
+@torch.no_grad()
+def _get_routing_indices(selected_experts, num_experts):
+    """
+    Compute token→expert mapping for grouped GEMM.
+    Wrapper that uses optimized implementation.
+
+    Returns:
+        token_counts_by_expert: (num_experts,) token counts per expert
+        gather_indices: (total_tokens,) indices for gathering tokens in expert order
+    """
+    return _get_routing_indices_optimized(selected_experts, num_experts)
+
+
+def _silu_and_mul(x):
+    """Fused SiLU activation and element-wise multiply for gate/up projections."""
+    gate, up = x.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
 def patch_qwen3_moe():
     # https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L213
     # Transformers >= 5       uses self.gate_up_proj = nn.Parameter(...)
@@ -156,57 +276,185 @@ def patch_qwen3_moe():
             final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
             return final_hidden_states.to(hidden_states.dtype), router_logits
     else:
-        # Pure torch loop-based implementation for new transformers (5.0+)
-        # Memory efficient but needs torch.compiler.disable due to data-dependent loop
+        # ====================================================================
+        # New transformers (5.0+) with stacked expert weights
+        # Uses Triton grouped GEMM kernels for high performance
+        # ====================================================================
 
-        @torch.compiler.disable
-        def forward(
-            self,
-            hidden_states: torch.Tensor,
-            top_k_index: torch.Tensor,
-            top_k_weights: torch.Tensor,
-        ) -> torch.Tensor:
-            """
-            Loop-based MoE forward pass. Loops over experts that have tokens routed to them.
-            Uses @torch.compiler.disable because the loop is data-dependent.
-            """
-            final_hidden_states = torch.zeros_like(hidden_states)
+        use_grouped_gemm = _check_grouped_gemm_available()
 
-            # Create expert mask and find which experts have tokens
-            with torch.no_grad():
-                expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
-                expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        if use_grouped_gemm:
+            # Import grouped GEMM interface (sys.path was set by _check_grouped_gemm_available)
+            from grouped_gemm.interface import grouped_gemm, supports_tma
+            # Import autotune cache
+            from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
 
-            # Only loop over experts that actually have tokens routed to them
-            for expert_idx in expert_hit:
-                expert_idx = expert_idx[0]
-                if expert_idx == self.num_experts:
-                    continue
+            # Cache for kernel configs - created once and reused
+            _MODEL_DIMS_AND_CONFIGS = None
 
-                # Find which tokens are routed to this expert
-                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            def _get_use_tma():
+                """Cache TMA support check to avoid repeated GPU queries."""
+                # This should be graph-safe (returns bool constant during trace)
+                return supports_tma()
 
-                # Gather only the tokens for this expert
-                current_state = hidden_states[token_idx]
+            def forward(
+                self,
+                hidden_states: torch.Tensor,
+                top_k_index: torch.Tensor,
+                top_k_weights: torch.Tensor,
+            ) -> torch.Tensor:
+                """
+                Grouped GEMM MoE forward pass using Triton kernels.
 
-                # Compute gate_up projection for this expert only
-                gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-                current_hidden_states = self.act_fn(gate) * up
+                Uses fused permutation (permute_x for first GEMM, permute_y for second GEMM)
+                to minimize memory traffic and achieve high GPU utilization.
 
-                # Compute down projection for this expert only
-                current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+                Uses cached kernel configs (created once at start) for efficient operation.
+                """
+                nonlocal _MODEL_DIMS_AND_CONFIGS
 
-                # Apply routing weights
-                current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+                num_tokens, hidden_dim = hidden_states.shape
+                top_k = top_k_index.shape[1]
 
-                # Scatter back to final output
-                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+                # Cache model dimensions and kernel configs on first call
+                # This block runs in eager mode or during tracing
+                if _MODEL_DIMS_AND_CONFIGS is None:
+                    intermediate_dim = self.gate_up_proj.shape[1] // 2
 
-            return final_hidden_states
+                    # Autotune first GEMM
+                    gemm1_configs = get_or_autotune_moe_kernels(
+                        num_experts=self.num_experts,
+                        hidden_dim=hidden_dim,
+                        intermediate_dim=intermediate_dim * 2,
+                        top_k=top_k,
+                        dtype=hidden_states.dtype,
+                    )
 
-        # Also disable compilation for the SparseMoeBlock
-        # since fullgraph=True cannot inline a torch.compiler.disable'd function
+                    # Autotune second GEMM
+                    gemm2_configs = get_or_autotune_moe_kernels(
+                        num_experts=self.num_experts,
+                        hidden_dim=intermediate_dim,
+                        intermediate_dim=hidden_dim, # Output dim for 2nd GEMM is hidden_dim
+                        top_k=top_k,
+                        dtype=hidden_states.dtype,
+                    )
+
+                    _MODEL_DIMS_AND_CONFIGS = (intermediate_dim, gemm1_configs, gemm2_configs)
+
+                # Unpack cached configs
+                intermediate_dim, gemm1_configs, gemm2_configs = _MODEL_DIMS_AND_CONFIGS
+
+                # Unpack specific kernel configs
+                fwd_config_1, bwd_dX_config_1, bwd_dW_config_1 = gemm1_configs
+                fwd_config_2, bwd_dX_config_2, bwd_dW_config_2 = gemm2_configs
+
+                # Compute routing indices for grouped GEMM
+                token_counts_by_expert, gather_indices = _get_routing_indices(
+                    top_k_index, self.num_experts
+                )
+
+                # First grouped GEMM: gate_up projection
+                first_gemm_output = grouped_gemm(
+                    X=hidden_states,
+                    W=self.gate_up_proj,
+                    m_sizes=token_counts_by_expert,
+                    topk=top_k,
+                    gather_indices=gather_indices,
+                    permute_x=True,
+                    permute_y=False,
+                    autotune=False, # We use cached configs
+                    kernel_config_fwd=fwd_config_1,
+                    kernel_config_bwd_dX=bwd_dX_config_1,
+                    kernel_config_bwd_dW=bwd_dW_config_1,
+                    is_first_gemm=True,
+                )
+
+                # Apply SiLU activation and multiply gate with up
+                intermediate = _silu_and_mul(first_gemm_output)
+
+                # Second grouped GEMM: down projection
+                second_gemm_output = grouped_gemm(
+                    X=intermediate,
+                    W=self.down_proj,
+                    m_sizes=token_counts_by_expert,
+                    topk=top_k,
+                    gather_indices=gather_indices,
+                    permute_x=False,
+                    permute_y=True,
+                    autotune=False, # We use cached configs
+                    kernel_config_fwd=fwd_config_2,
+                    kernel_config_bwd_dX=bwd_dX_config_2,
+                    kernel_config_bwd_dW=bwd_dW_config_2,
+                    is_first_gemm=False,
+                )
+
+                # Apply routing weights and sum across top_k experts
+                # Output shape: (num_tokens, top_k, hidden_dim) -> (num_tokens, hidden_dim)
+                final_hidden_states = (
+                    second_gemm_output.view(num_tokens, top_k, hidden_dim)
+                    * top_k_weights[..., None]
+                )
+                final_hidden_states = final_hidden_states.sum(dim=1)
+
+                return final_hidden_states
+        else:
+            # Fallback: Pure PyTorch loop-based implementation
+            global _GROUPED_GEMM_WARNED
+            if not _GROUPED_GEMM_WARNED:
+                logger.warning(
+                    "Unsloth grouped GEMM kernels not available. "
+                    "Falling back to PyTorch loop implementation. "
+                    "For faster MoE training, install unsloth kernels."
+                )
+                _GROUPED_GEMM_WARNED = True
+
+            @torch.compiler.disable
+            def forward(
+                self,
+                hidden_states: torch.Tensor,
+                top_k_index: torch.Tensor,
+                top_k_weights: torch.Tensor,
+            ) -> torch.Tensor:
+                """
+                Loop-based MoE forward pass. Loops over experts that have tokens routed to them.
+                Uses @torch.compiler.disable because the loop is data-dependent.
+                """
+                final_hidden_states = torch.zeros_like(hidden_states)
+
+                # Create expert mask and find which experts have tokens
+                with torch.no_grad():
+                    expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
+                    expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
+                    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+                # Only loop over experts that actually have tokens routed to them
+                for expert_idx in expert_hit:
+                    expert_idx = expert_idx[0]
+                    if expert_idx == self.num_experts:
+                        continue
+
+                    # Find which tokens are routed to this expert
+                    top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+
+                    # Gather only the tokens for this expert
+                    current_state = hidden_states[token_idx]
+
+                    # Compute gate_up projection for this expert only
+                    gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                    current_hidden_states = self.act_fn(gate) * up
+
+                    # Compute down projection for this expert only
+                    current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+
+                    # Apply routing weights
+                    current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+
+                    # Scatter back to final output
+                    final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+                return final_hidden_states
+
+        # SparseMoeBlock forward is disabled from compilation due to dynamic routing
         @torch.compiler.disable
         def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             batch_size, sequence_length, hidden_dim = hidden_states.shape
