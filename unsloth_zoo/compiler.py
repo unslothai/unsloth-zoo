@@ -1030,7 +1030,8 @@ RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1
 
 n_items = None
 if (\\9) != () and type(\\9) is dict:
-    n_items = (\\9).get("num_items_in_batch", None) or (\\9).get("n_items", None)
+    n_items = (\\9).get("num_items_in_batch", None)
+    if n_items is None: n_items = (\\9).get("n_items", None)
 if n_items is None:
     all_locals = locals()
     if 'loss_kwargs' in all_locals:
