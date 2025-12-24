@@ -72,6 +72,11 @@ def _init_triton_allocator():
             rounded_size = ((size + 1024 * 1024 - 1) // (1024 * 1024)) * (1024 * 1024)
 
             if _PERSISTENT_BUFFER is None or _PERSISTENT_BUFFER.numel() < rounded_size:
+                logger.warning(
+                    f"Unsloth: Allocating new persistent MoE buffer. "
+                    f"Old size: {(_PERSISTENT_BUFFER.numel() / 1024**3) if _PERSISTENT_BUFFER is not None else 0:.3f} GB. "
+                    f"New size: {(rounded_size * 2 / 1024**3):.3f} GB."
+                )
                 # Allocate with some headroom to reduce reallocations
                 _PERSISTENT_BUFFER = torch.empty(
                     rounded_size * 2, device="cuda", dtype=torch.int8
@@ -88,6 +93,10 @@ def _init_triton_allocator():
 
 def _check_grouped_gemm_available():
     """Check if Unsloth grouped GEMM kernels are available."""
+    # Check if user wants to force disable Triton kernels
+    if os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1":
+        return False
+
     global _GROUPED_GEMM_AVAILABLE
     if _GROUPED_GEMM_AVAILABLE is None:
         try:
@@ -95,7 +104,15 @@ def _check_grouped_gemm_available():
             # so we need to add its parent directory to sys.path
             import sys
             import unsloth
-            unsloth_path = os.path.dirname(unsloth.__file__)
+
+            if hasattr(unsloth, "__file__") and unsloth.__file__ is not None:
+                unsloth_path = os.path.dirname(unsloth.__file__)
+            else:
+                 # Fallback for namespace package or editable install
+                 unsloth_path = list(unsloth.__path__)[0]
+                 if os.path.exists(os.path.join(unsloth_path, "unsloth", "kernels")):
+                     unsloth_path = os.path.join(unsloth_path, "unsloth")
+
             moe_kernels_path = os.path.join(unsloth_path, "kernels", "moe")
             if moe_kernels_path not in sys.path:
                 sys.path.insert(0, moe_kernels_path)
@@ -329,6 +346,7 @@ def patch_qwen3_moe():
                         intermediate_dim=intermediate_dim * 2,
                         top_k=top_k,
                         dtype=hidden_states.dtype,
+                        seq_len=4096, # Reduce from 8192 to save memory
                     )
 
                     # Autotune second GEMM
@@ -338,9 +356,13 @@ def patch_qwen3_moe():
                         intermediate_dim=hidden_dim, # Output dim for 2nd GEMM is hidden_dim
                         top_k=top_k,
                         dtype=hidden_states.dtype,
+                        seq_len=4096, # Reduce from 8192 to save memory
                     )
 
                     _MODEL_DIMS_AND_CONFIGS = (intermediate_dim, gemm1_configs, gemm2_configs)
+
+                    # Clear autotuning memory overhead to prevent fragmentation
+                    torch.cuda.empty_cache()
 
                 # Unpack cached configs
                 intermediate_dim, gemm1_configs, gemm2_configs = _MODEL_DIMS_AND_CONFIGS
