@@ -69,17 +69,19 @@ def _init_triton_allocator():
         def persistent_alloc_fn(size: int, alignment: int, stream):
             global _PERSISTENT_BUFFER
             # Round up size to avoid frequent reallocations
-            rounded_size = ((size + 1024 * 1024 - 1) // (1024 * 1024)) * (1024 * 1024)
+            # Round to nearest 128 bytes for alignment
+            rounded_size = ((size + 128 - 1) // 128) * 128
 
-            if _PERSISTENT_BUFFER is None or _PERSISTENT_BUFFER.numel() < rounded_size:
-                logger.warning(
-                    f"Unsloth: Allocating new persistent MoE buffer. "
-                    f"Old size: {(_PERSISTENT_BUFFER.numel() / 1024**3) if _PERSISTENT_BUFFER is not None else 0:.3f} GB. "
-                    f"New size: {(rounded_size * 2 / 1024**3):.3f} GB."
-                )
-                # Allocate with some headroom to reduce reallocations
+            if _PERSISTENT_BUFFER is None or _PERSISTENT_BUFFER.numel() * _PERSISTENT_BUFFER.element_size() < rounded_size:
+
+                # Calculate current size in GB for logging
+                current_size_gb = (_PERSISTENT_BUFFER.numel() * _PERSISTENT_BUFFER.element_size() / 1024**3) if _PERSISTENT_BUFFER is not None else 0
+                new_size_gb = (rounded_size * 1.1 / 1024**3)
+
+                # Allocate with small headroom (10%) to reduce reallocations
+                # Use ByteTensor (uint8) for raw byte storage
                 _PERSISTENT_BUFFER = torch.empty(
-                    rounded_size * 2, device="cuda", dtype=torch.int8
+                    int(rounded_size * 1.1), device="cuda", dtype=torch.uint8
                 )
                 _PERSISTENT_BUFFER.__hibernate__ = {"type": "ignore"}
             return _PERSISTENT_BUFFER
@@ -346,7 +348,6 @@ def patch_qwen3_moe():
                         intermediate_dim=intermediate_dim * 2,
                         top_k=top_k,
                         dtype=hidden_states.dtype,
-                        seq_len=4096, # Reduce from 8192 to save memory
                     )
 
                     # Autotune second GEMM
@@ -356,7 +357,6 @@ def patch_qwen3_moe():
                         intermediate_dim=hidden_dim, # Output dim for 2nd GEMM is hidden_dim
                         top_k=top_k,
                         dtype=hidden_states.dtype,
-                        seq_len=4096, # Reduce from 8192 to save memory
                     )
 
                     _MODEL_DIMS_AND_CONFIGS = (intermediate_dim, gemm1_configs, gemm2_configs)
@@ -493,5 +493,7 @@ def patch_qwen3_moe():
     else:
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts, "forward", forward)
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", sparse_moe_block_forward)
+
+    transformers.models.qwen3_moe.modeling_qwen3_moe.__UNSLOTH_PATCHED__ = True
 pass
 TEMPORARY_PATCHES.append(patch_qwen3_moe)
