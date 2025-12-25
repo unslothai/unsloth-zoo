@@ -318,10 +318,15 @@ def forward_triton_grouped_gemm(
         top_k_index, self.num_experts
     )
 
+    if self.gate_up_proj.shape[1] == hidden_dim:
+         w1 = self.gate_up_proj
+    else:
+         w1 = self.gate_up_proj.transpose(-2, -1)
+
     # First grouped GEMM: gate_up projection
     first_gemm_output = grouped_gemm(
         X=hidden_states,
-        W=self.gate_up_proj,
+        W=w1,
         m_sizes=token_counts_by_expert,
         topk=top_k,
         gather_indices=gather_indices,
@@ -337,10 +342,16 @@ def forward_triton_grouped_gemm(
     # Apply SiLU activation and multiply gate with up
     intermediate = _silu_and_mul(first_gemm_output)
 
-    # Second grouped GEMM: down projection
+    # Grouped GEMM 2: down projection
+
+    if self.down_proj.shape[1] == inter.shape[-1]:
+         w2 = self.down_proj
+    else:
+         w2 = self.down_proj.transpose(-2, -1)
+
     second_gemm_output = grouped_gemm(
         X=intermediate,
-        W=self.down_proj,
+        W=w2,
         m_sizes=token_counts_by_expert,
         topk=top_k,
         gather_indices=gather_indices,

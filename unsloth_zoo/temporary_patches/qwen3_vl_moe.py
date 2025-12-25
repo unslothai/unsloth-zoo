@@ -177,6 +177,7 @@ def patch_qwen3_vl_moe():
                 Uses cached kernel configs (created once at start) for efficient operation.
                 """
                 return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
+
         else:
              # Fallback
             @torch.compiler.disable
@@ -214,9 +215,15 @@ def patch_qwen3_vl_moe():
                 return final_hidden_states
 
         # SparseMoeBlock forward
-        @torch.compiler.disable
+        # @torch.compiler.disable
         def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            batch_size, sequence_length, hidden_dim = hidden_states.shape
+            if hidden_states.dim() == 3:
+                batch_size, sequence_length, hidden_dim = hidden_states.shape
+            else:
+                total_tokens, hidden_dim = hidden_states.shape
+                batch_size = 1
+                sequence_length = total_tokens
+
             hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
 
             # self.gate is nn.Linear - so it returns logits!
@@ -227,7 +234,10 @@ def patch_qwen3_vl_moe():
             routing_weights = routing_weights.to(hidden_states.dtype)
 
             final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
-            return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+            if hidden_states.dim() == 3:
+                return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+            return final_hidden_states
 
     if old_transformers:
         patch_function(transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextSparseMoeBlock, "forward", forward)
