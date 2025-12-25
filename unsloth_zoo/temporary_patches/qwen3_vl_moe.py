@@ -46,7 +46,6 @@ from .moe_utils import (
 )
 
 def patch_qwen3_vl_moe():
-    print("Unsloth: Qwen3 VL MoE Patch v2 Loaded")
     try:
         import transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe
         transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextSparseMoeBlock
@@ -146,7 +145,7 @@ def patch_qwen3_vl_moe():
              _TORCH_GROUPED_MM_AVAILABLE = True
 
         if not _TORCH_GROUPED_MM_AVAILABLE and not use_grouped_gemm:
-             print("Unsloth Warning: torch._grouped_mm and Triton kernels unavailable. Using slow loop fallback for MoE.")
+             logger.warning("Unsloth Warning: torch._grouped_mm and Triton kernels unavailable. Using slow loop fallback for MoE.")
 
         if _TORCH_GROUPED_MM_AVAILABLE:
             def forward(

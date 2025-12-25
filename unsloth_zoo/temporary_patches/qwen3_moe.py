@@ -43,8 +43,6 @@ from .utils import (
 # Grouped GEMM kernel integration for MoE training acceleration
 # ============================================================================
 
-# Global flag to check if grouped GEMM is available
-# Global flag to check if grouped GEMM is available
 from .moe_utils import (
     _check_grouped_gemm_available,
     _TORCH_GROUPED_MM_AVAILABLE,
@@ -237,7 +235,7 @@ def patch_qwen3_moe():
                 """
                 global _LOGGED_BACKEND
                 if not _LOGGED_BACKEND:
-                    print(f"Unsloth: Using PyTorch Loop for MoE (Fallback - Slowest)")
+                    logger.warning(f"Unsloth: Using PyTorch Loop for MoE (Fallback - Slowest)")
                     _LOGGED_BACKEND = True
 
                 final_hidden_states = torch.zeros_like(hidden_states)

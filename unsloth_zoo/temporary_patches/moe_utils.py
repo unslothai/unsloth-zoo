@@ -32,15 +32,13 @@ def _init_triton_allocator():
     This significantly reduces GPU utilization fluctuation.
     """
     global _TRITON_ALLOCATOR_INITIALIZED, _PERSISTENT_BUFFER
-    if _TRITON_ALLOCATOR_INITIALIZED:
-        return
+    if _TRITON_ALLOCATOR_INITIALIZED: return
 
     try:
         import triton
 
         # Create a persistent buffer that grows as needed
         # This avoids allocating new memory on every kernel call
-        _buffer_cache = {}
 
         def persistent_alloc_fn(size: int, alignment: int, stream):
             global _PERSISTENT_BUFFER
@@ -49,15 +47,10 @@ def _init_triton_allocator():
             rounded_size = ((size + 128 - 1) // 128) * 128
 
             if _PERSISTENT_BUFFER is None or _PERSISTENT_BUFFER.numel() * _PERSISTENT_BUFFER.element_size() < rounded_size:
-
-                # Calculate current size in GB for logging
-                # current_size_gb = (_PERSISTENT_BUFFER.numel() * _PERSISTENT_BUFFER.element_size() / 1024**3) if _PERSISTENT_BUFFER is not None else 0
-                # new_size_gb = (rounded_size * 1.1 / 1024**3)
-
                 # Allocate with small headroom (10%) to reduce reallocations
                 # Use ByteTensor (uint8) for raw byte storage
                 _PERSISTENT_BUFFER = torch.empty(
-                    int(rounded_size * 1.1), device="cuda", dtype=torch.uint8
+                    int(rounded_size * 1.1), device = "cuda", dtype = torch.uint8
                 )
                 _PERSISTENT_BUFFER.__hibernate__ = {"type": "ignore"}
             return _PERSISTENT_BUFFER
@@ -167,7 +160,7 @@ def forward_native_grouped_mm(
     """
     global _LOGGED_BACKEND
     if not _LOGGED_BACKEND:
-        print(f"Unsloth: Using torch._grouped_mm for MoE (Fastest Native Path)")
+        logger.info(f"Unsloth: Using torch._grouped_mm for MoE (Fastest Native Path)")
         _LOGGED_BACKEND = True
 
     if hidden_states.dim() == 2:
@@ -258,7 +251,7 @@ def forward_triton_grouped_gemm(
     """
     global _LOGGED_BACKEND
     if not _LOGGED_BACKEND:
-        print(f"Unsloth: Using Triton Grouped GEMM for MoE (Fastest Triton Path)")
+        logger.info(f"Unsloth: Using Triton Grouped GEMM for MoE (Fastest Triton Path)")
         _LOGGED_BACKEND = True
 
     # Import grouped GEMM interface (sys.path was set by _check_grouped_gemm_available)
