@@ -45,7 +45,10 @@ from .utils import (
 
 # Global flag to check if grouped GEMM is available
 _GROUPED_GEMM_AVAILABLE = None
+_TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
+_TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 _GROUPED_GEMM_WARNED = False
+_LOGGED_BACKEND = False
 _TRITON_ALLOCATOR_INITIALIZED = False
 _PERSISTENT_BUFFER = None
 
@@ -303,7 +306,91 @@ def patch_qwen3_moe():
 
         use_grouped_gemm = _check_grouped_gemm_available()
 
-        if use_grouped_gemm:
+        if _TORCH_GROUPED_MM_AVAILABLE:
+            def forward(
+                self,
+                hidden_states: torch.Tensor,
+                top_k_index: torch.Tensor,
+                top_k_weights: torch.Tensor,
+            ) -> torch.Tensor:
+                """
+                Native Pytorch grouped GEMM MoE forward pass.
+                Uses torch._grouped_mm which is significantly faster than loop and works without Triton dependencies.
+                """
+                global _LOGGED_BACKEND
+                if not _LOGGED_BACKEND:
+                    print(f"Unsloth: Using torch._grouped_mm for MoE (Fastest Native Path)")
+                    _LOGGED_BACKEND = True
+
+                if hidden_states.dim() == 2:
+                    sequence_length, hidden_dim = hidden_states.shape
+                    batch_size = 1
+                else:
+                    batch_size, sequence_length, hidden_dim = hidden_states.shape
+
+                hidden_states = hidden_states.view(-1, hidden_dim)
+
+                # 1. Calculate routing
+                flat_top_k = top_k_index.view(-1)
+                num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
+
+                # 2. Sort indices to group tokens by expert
+                sorted_indices = torch.argsort(flat_top_k, stable=True)
+                token_indices = sorted_indices // top_k_index.shape[1]
+
+                # 3. Permute Input
+                # We need to gather inputs. Since we may have expanded top_k, we use token_indices to map back to original input
+                permuted_input = hidden_states[token_indices]
+
+                # 4. Prepare Grouped MM arguments
+                offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+
+                # gate_up_proj is [E, 2*H, H]. We transpose to [E, H, 2*H] for x @ w
+                if hasattr(self, "gate_up_proj"):
+                    w1 = self.gate_up_proj.transpose(-2, -1)
+                    mm1_out = torch._grouped_mm(permuted_input, w1, offs=offsets)
+                    gate, up = mm1_out.chunk(2, dim=-1)
+                elif hasattr(self, "w1") and hasattr(self, "w3"):
+                    w1 = self.w1.transpose(-2, -1)
+                    w3 = self.w3.transpose(-2, -1)
+                    gate = torch._grouped_mm(permuted_input, w1, offs=offsets)
+                    up = torch._grouped_mm(permuted_input, w3, offs=offsets)
+                else:
+                    raise AttributeError("MoE layer must have 'gate_up_proj' or 'w1'/'w3'.")
+
+                # Activation
+                inter = F.silu(gate) * up
+
+                # Grouped GEMM 2
+                if hasattr(self, "down_proj"):
+                    w2 = self.down_proj.transpose(-2, -1)
+                elif hasattr(self, "w2"):
+                    w2 = self.w2.transpose(-2, -1)
+                else:
+                    raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
+
+                mm2_out = torch._grouped_mm(inter, w2, offs=offsets)
+
+                # 5. Apply Routing Weights
+                flat_weights = top_k_weights.view(-1)
+                permuted_weights = flat_weights[sorted_indices]
+                mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+
+                # 6. Scatter Add (Reduce)
+                final_hidden_states = torch.zeros(
+                    (batch_size * sequence_length, hidden_dim),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device
+                )
+
+                final_hidden_states.index_add_(0, token_indices, mm2_out.to(hidden_states.dtype))
+
+                if hidden_states.dim() == 2:
+                     return final_hidden_states
+
+                return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+
+        elif use_grouped_gemm:
             # Import grouped GEMM interface (sys.path was set by _check_grouped_gemm_available)
             from grouped_gemm.interface import grouped_gemm, supports_tma
             # Import autotune cache
@@ -331,6 +418,11 @@ def patch_qwen3_moe():
 
                 Uses cached kernel configs (created once at start) for efficient operation.
                 """
+                global _LOGGED_BACKEND
+                if not _LOGGED_BACKEND:
+                    print(f"Unsloth: Using Triton Grouped GEMM for MoE (Fastest Triton Path)")
+                    _LOGGED_BACKEND = True
+
                 nonlocal _MODEL_DIMS_AND_CONFIGS
 
                 num_tokens, hidden_dim = hidden_states.shape
@@ -442,6 +534,11 @@ def patch_qwen3_moe():
                 Loop-based MoE forward pass. Loops over experts that have tokens routed to them.
                 Uses @torch.compiler.disable because the loop is data-dependent.
                 """
+                global _LOGGED_BACKEND
+                if not _LOGGED_BACKEND:
+                    print(f"Unsloth: Using PyTorch Loop for MoE (Fallback - Slowest)")
+                    _LOGGED_BACKEND = True
+
                 final_hidden_states = torch.zeros_like(hidden_states)
 
                 # Create expert mask and find which experts have tokens
