@@ -365,15 +365,18 @@ def unsloth_fused_ce_loss(
     scaler = trainer.accelerator.scaler if trainer is not None else None
     # Get mixed precision scaling if seen
     scaling = scaler.get_scale() if scaler is not None else scaling
+
+    if torch.is_tensor(n_items):
+        n_items = n_items.to(lm_head_weight.device)  # Keep the same device when using multiple GPUs
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
     return apply_autograd_function(UnslothFusedLoss, dict(
         loss_function = compute_fused_ce_loss,
-        hidden_states = hidden_states,
+        hidden_states = hidden_states.to(lm_head_weight.device),
         lm_head_weight = lm_head_weight,
         lm_head_bias = lm_head_bias,
-        labels = labels,
+        labels = labels.to(lm_head_weight.device),
         mask = mask,
         n_items = n_items,
         scaling = scaling,
