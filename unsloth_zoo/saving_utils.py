@@ -109,7 +109,7 @@ def create_huggingface_repo(
     if token is None: token = get_token()
     api = HfApi(token = token)
     repo_url = api.create_repo(
-        repo_id=repo_id,
+        repo_id = repo_id,
         private = private,
         exist_ok = True,  # don't error if repo already exists
     )
