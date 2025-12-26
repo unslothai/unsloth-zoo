@@ -367,7 +367,7 @@ def unsloth_fused_ce_loss(
     scaling = scaler.get_scale() if scaler is not None else scaling
 
     if torch.is_tensor(n_items):
-        n_items = n_items.to(lm_head_weight.device)  # Keep the same device when using multiple GPUs
+        n_items = n_items.to(lm_head_weight.device, non_blocking=True)  # Keep the same device when using multiple GPUs
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
