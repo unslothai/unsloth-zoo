@@ -110,7 +110,7 @@ def create_huggingface_repo(
     api = HfApi(token = token)
     repo_url = api.create_repo(
         repo_id=repo_id,
-        private=private,
+        private = private,
         exist_ok = True,  # don't error if repo already exists
     )
     username = repo_id.split("/")[0]
