@@ -237,6 +237,8 @@ def autotune_batch_and_chunks(
 ):
     if multiplier is None:
         final_m = max(2, seq_len // 4096)
+    else:
+        final_m = multiplier
     
     if torch.cuda.is_available():
         free_bytes, _ = torch.cuda.mem_get_info()
