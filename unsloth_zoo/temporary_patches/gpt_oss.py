@@ -522,6 +522,11 @@ class GptOssTopKRouter(nn.Module):
         self.hidden_dim = config.hidden_size
         self.linear = nn.Linear(self.hidden_dim, self.num_experts, dtype=dtype_from_config(config))
 
+    @property
+    def weight(self):
+        """Expose linear layer weight for compatibility with transformers _init_weights"""
+        return self.linear.weight
+
     @torch_compile(dynamic = True, fullgraph = True)
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
