@@ -624,7 +624,6 @@ def grpo_accumulated_loss(
     hidden_dim = lm_head.shape[1]
     vocab_dim = lm_head.shape[0]
     
-    #This should only need to be called once 
     if trainer.args.unsloth_grpo_mini_batch is None: 
         if not hasattr(trainer, "_has_autotuned"):
             trainer._has_autotuned = True
@@ -635,7 +634,6 @@ def grpo_accumulated_loss(
             trainer.args.unsloth_logit_chunk_multiplier = multiplier
             B = trainer.args.unsloth_grpo_mini_batch
             multiplier = trainer.args.unsloth_logit_chunk_multiplier
-        #If not the first time, check if we are on an accumulation step
         elif trainer._step % trainer.current_gradient_accumulation_steps == 0:
             B = trainer.args.unsloth_grpo_mini_batch
             multiplier = trainer.args.unsloth_logit_chunk_multiplier
@@ -788,7 +786,6 @@ def grpo_accumulated_loss(
 
         @staticmethod
         def backward(ctx, grad_output):
-            # 1. Restore hidden_states from CPU to GPU
             hidden_states = to_device(ctx.saved_hidden_states, ctx.device)
             hidden_states = hidden_states.to(ctx.dtype)
             hidden_states.requires_grad_(True)
@@ -865,7 +862,7 @@ def grpo_accumulated_loss(
                 new_hidden_states_chunk, 
                 lm_head, 
                 completion_ids, 
-                chunks=  batch_size*multiplier, 
+                chunks=  input_ids.shape[0]*multiplier, 
                 logit_scale_multiply=logit_scale_multiply,
                 logit_scale_divide=logit_scale_divide,
                 logit_softcapping=logit_softcapping,
