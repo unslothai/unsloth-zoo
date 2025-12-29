@@ -271,7 +271,7 @@ def patch_gpt_oss():
             self.gate_up_proj_precision_config = None
             self.down_proj_precision_config = None
 
-        def forward(self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx) -> torch.Tensor:
+        def forward(self, hidden_states: torch.Tensor, routing_data=None, gather_idx=None, scatter_idx=None, router_indices=None, routing_weights=None, **kwargs) -> torch.Tensor:
             with torch_cuda_device(hidden_states.device):
                 if not hasattr(self, "act"):
                     self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
