@@ -271,7 +271,26 @@ def patch_gpt_oss():
             self.gate_up_proj_precision_config = None
             self.down_proj_precision_config = None
 
-        def forward(self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx) -> torch.Tensor:
+        def forward(self, hidden_states: torch.Tensor, routing_data=None, gather_idx=None, scatter_idx=None, *, router_indices=None, routing_weights=None) -> torch.Tensor:
+            # Support both old API (routing_data, gather_idx, scatter_idx) and new transformers API (router_indices, routing_weights)
+            # The new API is used in transformers 4.57+ when unsloth_tiled_mlp=True
+            if router_indices is not None and routing_data is None:
+                # New API: compute routing_data from router_indices and routing_weights
+                # router_indices: (batch * seq, top_k) - indices of selected experts
+                # routing_weights: (batch * seq, top_k) - weights for each selected expert
+                with torch_cuda_device(hidden_states.device):
+                    # Import the routing function from triton_kernels
+                    routing_fn = torch.compiler.disable(triton_kernels.routing.routing)
+                    # Compute a router_logits approximation from the routing weights
+                    num_tokens = hidden_states.shape[0]
+                    top_k = router_indices.shape[-1] if router_indices.dim() > 1 else 1
+                    router_logits = torch.zeros(num_tokens, self.num_experts, device=hidden_states.device, dtype=hidden_states.dtype)
+                    if router_indices.dim() > 1:
+                        for i in range(top_k):
+                            router_logits.scatter_(1, router_indices[:, i:i+1], routing_weights[:, i:i+1])
+                    else:
+                        router_logits.scatter_(1, router_indices.unsqueeze(-1), routing_weights.unsqueeze(-1))
+                    routing_data, gather_idx, scatter_idx = routing_fn(router_logits, top_k)
             with torch_cuda_device(hidden_states.device):
                 if not hasattr(self, "act"):
                     self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
