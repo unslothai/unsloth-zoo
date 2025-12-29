@@ -186,14 +186,7 @@ def patch_qwen3_moe():
                 return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
         else:
             # Fallback: Pure PyTorch loop-based implementation
-            global _GROUPED_GEMM_WARNED
-            if not _GROUPED_GEMM_WARNED:
-                logger.warning(
-                    "Unsloth grouped GEMM kernels not available. "
-                    "Falling back to PyTorch loop implementation. "
-                    "For faster MoE training, install unsloth kernels."
-                )
-                _GROUPED_GEMM_WARNED = True
+
 
             @torch.compiler.disable
             def forward(
@@ -206,10 +199,7 @@ def patch_qwen3_moe():
                 Loop-based MoE forward pass. Loops over experts that have tokens routed to them.
                 Uses @torch.compiler.disable because the loop is data-dependent.
                 """
-                global _LOGGED_BACKEND
-                if not _LOGGED_BACKEND:
-                    logger.warning(f"Unsloth: Using PyTorch Loop for MoE (Fallback - Slowest)")
-                    _LOGGED_BACKEND = True
+
 
                 final_hidden_states = torch.zeros_like(hidden_states)
 

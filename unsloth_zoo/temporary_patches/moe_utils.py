@@ -16,13 +16,12 @@
 import torch
 import torch.nn.functional as F
 import os
-from .utils import logger
+
 
 # Global flag to check if grouped GEMM is available
 _GROUPED_GEMM_AVAILABLE = None
 _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
-_GROUPED_GEMM_WARNED = False
-_LOGGED_BACKEND = False
+
 _TRITON_ALLOCATOR_INITIALIZED = False
 _PERSISTENT_BUFFER = None
 
@@ -95,13 +94,6 @@ def _check_grouped_gemm_available():
             _GROUPED_GEMM_AVAILABLE = False
     return _GROUPED_GEMM_AVAILABLE
 
-
-
-
-
-
-
-
 def _get_routing_indices_optimized(selected_experts, num_experts):
     """
     Optimized token→expert mapping for grouped GEMM.
@@ -155,10 +147,7 @@ def forward_native_grouped_mm(
     Native Pytorch grouped GEMM MoE forward pass.
     Uses torch._grouped_mm which is significantly faster than loop and works without Triton dependencies.
     """
-    global _LOGGED_BACKEND
-    if not _LOGGED_BACKEND:
-        logger.info(f"Unsloth: Using torch._grouped_mm for MoE (Fastest Native Path)")
-        _LOGGED_BACKEND = True
+
 
     if hidden_states.dim() == 2:
         sequence_length, hidden_dim = hidden_states.shape
@@ -246,10 +235,7 @@ def forward_triton_grouped_gemm(
     """
     Grouped GEMM MoE forward pass using Triton kernels.
     """
-    global _LOGGED_BACKEND
-    if not _LOGGED_BACKEND:
-        logger.info(f"Unsloth: Using Triton Grouped GEMM for MoE (Fastest Triton Path)")
-        _LOGGED_BACKEND = True
+
 
     # Import grouped GEMM interface (sys.path was set by _check_grouped_gemm_available)
     from grouped_gemm.interface import grouped_gemm
