@@ -1003,20 +1003,46 @@ def convert_to_gguf(
             raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF: {e}")
 
         # Simple validation using native Python
-        if not os.path.exists(output_file):
+        # For large models (>50GB), llama.cpp creates sharded files like:
+        # model.BF16-00001-of-00002.gguf instead of model.BF16.gguf
+        import glob
+        output_exists = os.path.exists(output_file)
+        sharded_files = []
+        if not output_exists:
+            # Check for sharded output files (pattern: basename-00001-of-NNNNN.gguf)
+            base_name = output_file.rsplit('.gguf', 1)[0]
+            sharded_pattern = f"{base_name}-*-of-*.gguf"
+            sharded_files = sorted(glob.glob(sharded_pattern))
+            output_exists = len(sharded_files) > 0
+
+        if not output_exists:
             raise RuntimeError(f"Unsloth: Failed to convert {description} - output file {output_file} not created")
 
-        all_output_files.append(output_file)
-
-        if print_output:
-            file_size_bytes = os.path.getsize(output_file)
-            if file_size_bytes >= 1024**3:  # GB
-                size_str = f"{file_size_bytes / (1024**3):.1f}G"
-            elif file_size_bytes >= 1024**2:  # MB
-                size_str = f"{file_size_bytes / (1024**2):.1f}M"
-            else:
-                size_str = f"{file_size_bytes / 1024:.1f}K"
-            print(f"Unsloth: Successfully saved {description} GGUF to: {output_file} (size: {size_str})")
+        if sharded_files:
+            # For sharded files, add all shards to the output list
+            all_output_files.extend(sharded_files)
+            if print_output:
+                total_size = sum(os.path.getsize(f) for f in sharded_files)
+                if total_size >= 1024**3:
+                    size_str = f"{total_size / (1024**3):.1f}G"
+                elif total_size >= 1024**2:
+                    size_str = f"{total_size / (1024**2):.1f}M"
+                else:
+                    size_str = f"{total_size / 1024:.1f}K"
+                print(f"Unsloth: Successfully saved {description} GGUF to {len(sharded_files)} shards (total size: {size_str})")
+                for shard in sharded_files:
+                    print(f"  - {shard}")
+        else:
+            all_output_files.append(output_file)
+            if print_output:
+                file_size_bytes = os.path.getsize(output_file)
+                if file_size_bytes >= 1024**3:  # GB
+                    size_str = f"{file_size_bytes / (1024**3):.1f}G"
+                elif file_size_bytes >= 1024**2:  # MB
+                    size_str = f"{file_size_bytes / (1024**2):.1f}M"
+                else:
+                    size_str = f"{file_size_bytes / 1024:.1f}K"
+                print(f"Unsloth: Successfully saved {description} GGUF to: {output_file} (size: {size_str})")
 
     return all_output_files, is_vlm
 pass
