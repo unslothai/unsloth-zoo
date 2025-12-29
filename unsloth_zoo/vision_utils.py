@@ -1123,6 +1123,7 @@ class UnslothVisionDataCollator:
 
     def _collate_prompt_completion(self, examples):
         prompt_texts, completion_texts, images, videos = [], [], [], []
+        video_kwargs = {'fps': []}  # Accumulator for video fps across all samples
 
         for ex in examples:
             p, c = ex["prompt"], ex["completion"]
@@ -1164,9 +1165,8 @@ class UnslothVisionDataCollator:
 
             if vids and len(vids) > 0:  # Works for list, tuple or tensor
                 videos.append(vids)
-                if vids_kwarg is None:
-                    vids_kwarg = {"fps": []}
-                vids_kwarg['fps'].extend(vids_kwarg['fps'])
+                if vids_kwarg is not None and 'fps' in vids_kwarg:
+                    video_kwargs['fps'].extend(vids_kwarg['fps'])
 
         prompt_kwargs = dict(
             padding=True,
@@ -1184,8 +1184,8 @@ class UnslothVisionDataCollator:
             prompt_kwargs["images"] = images
         if len(videos) > 0:
             prompt_kwargs["videos"] = videos
-            vids_kwarg["fps"] = collapse_fps(vids_kwarg['fps'])
-            for k, v in vids_kwarg.items():
+            video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
+            for k, v in video_kwargs.items():
                 prompt_kwargs[k] = v
 
         proc_prompts = self.processor(text=prompt_texts, **prompt_kwargs)
