@@ -145,11 +145,27 @@ pass
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
     # Choose package manager based on system type
+    sudo_prefix = 'sudo ' if sudo else ''
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
+        install_cmd = f"{sudo_prefix}{pkg_manager} install {package} -y"
+    elif system_type == "arch":
+        install_cmd = f"{sudo_prefix}pacman -S --noconfirm {package}"
+    elif system_type == "gentoo":
+        install_cmd = f"{sudo_prefix}emerge --ask=n {package}"
+    elif system_type == "alpine":
+        install_cmd = f"{sudo_prefix}apk add {package}"
+    elif system_type == "suse":
+        install_cmd = f"{sudo_prefix}zypper install -y {package}"
+    elif system_type == "unknown":
+        raise RuntimeError(
+            f"[FAIL] Unsloth: Could not detect your Linux distribution's package manager.\n"
+            f"Supported: apt-get (Debian/Ubuntu), yum/dnf (RHEL/Fedora), pacman (Arch), emerge (Gentoo), apk (Alpine), zypper (openSUSE).\n"
+            f"Please manually install the required package: {package}\n"
+            f"See: https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
     else:  # Default to debian/apt-get
-        install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+        install_cmd = f"{sudo_prefix}apt-get install {package} -y"
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
@@ -170,8 +186,16 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
                     )
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
-                raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist when installing {package}? Is this NOT a Linux / Mac based computer?")
+                pkg_mgr_names = {
+                    "rpm": "yum/dnf", "arch": "pacman", "gentoo": "emerge",
+                    "alpine": "apk", "suse": "zypper", "debian": "apt-get"
+                }
+                pkg_mgr_name = pkg_mgr_names.get(system_type, "package manager")
+                raise RuntimeError(
+                    f"[FAIL] Unsloth: {pkg_mgr_name} does not exist when installing {package}.\n"
+                    f"Please manually install the required packages.\n"
+                    f"See: https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+                )
             elif "Unable to locate package" in line:
                 sp.terminate()
                 raise RuntimeError(f"[FAIL] Unsloth: Could not install package {package} since it does not exist.")
@@ -184,7 +208,7 @@ pass
 
 def do_we_need_sudo(system_type="debian"):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Check apt-get updating
+    # Check if we need sudo for package operations
     sudo = False
     print("Unsloth: Updating system package directories")
 
@@ -192,7 +216,19 @@ def do_we_need_sudo(system_type="debian"):
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
         update_cmd = f"{pkg_manager} check-update"
-    else:
+    elif system_type == "arch":
+        update_cmd = "pacman -Sy"
+    elif system_type == "gentoo":
+        update_cmd = "emerge --sync"
+    elif system_type == "alpine":
+        update_cmd = "apk update"
+    elif system_type == "suse":
+        update_cmd = "zypper refresh"
+    elif system_type == "unknown":
+        # For unknown systems, skip the update check and assume sudo is needed
+        print("Unsloth: Unknown Linux distribution, skipping package manager check")
+        return True
+    else:  # Default to debian/apt-get
         update_cmd = "apt-get update -y"
 
     start_time = time.time()
@@ -205,8 +241,16 @@ def do_we_need_sudo(system_type="debian"):
                 break
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
-                raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist? Is this NOT a Linux / Mac based computer?")
+                pkg_mgr_names = {
+                    "rpm": "yum/dnf", "arch": "pacman", "gentoo": "emerge",
+                    "alpine": "apk", "suse": "zypper", "debian": "apt-get"
+                }
+                pkg_mgr_name = pkg_mgr_names.get(system_type, "package manager")
+                raise RuntimeError(
+                    f"[FAIL] Unsloth: {pkg_mgr_name} does not exist.\n"
+                    f"Please manually install the required packages.\n"
+                    f"See: https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+                )
             elif "failure resolving" in line or "Err:" in line:
                 sp.terminate()
                 raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
@@ -1248,6 +1292,22 @@ def check_linux_type():
     # Check if it's RPM-based (CentOS/RHEL/Fedora):
     elif any(os.path.exists(f) for f in ['/etc/redhat-release', '/etc/fedora-release']):
         return 'rpm'
+
+    # Check if it's Arch-based (Arch, Manjaro, EndeavourOS):
+    elif os.path.exists('/etc/arch-release') or os.path.exists('/usr/bin/pacman'):
+        return 'arch'
+
+    # Check if it's Gentoo-based:
+    elif os.path.exists('/etc/gentoo-release') or os.path.exists('/usr/bin/emerge'):
+        return 'gentoo'
+
+    # Check if it's Alpine-based:
+    elif os.path.exists('/etc/alpine-release') or os.path.exists('/sbin/apk'):
+        return 'alpine'
+
+    # Check if it's openSUSE-based:
+    elif os.path.exists('/etc/SuSE-release') or os.path.exists('/etc/SUSE-brand'):
+        return 'suse'
 
     return 'unknown'
 pass
