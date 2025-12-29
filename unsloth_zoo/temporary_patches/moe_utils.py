@@ -96,13 +96,10 @@ def _check_grouped_gemm_available():
     return _GROUPED_GEMM_AVAILABLE
 
 
-def _supports_tma():
-    """Check if TMA (Tensor Memory Accelerator) is supported (sm90+ / Hopper)."""
-    return torch.cuda.get_device_capability()[0] >= 9
 
 
-# Pre-allocated buffers for routing to avoid per-call allocations
-_ROUTING_BUFFERS = {}
+
+
 
 
 def _get_routing_indices_optimized(selected_experts, num_experts):

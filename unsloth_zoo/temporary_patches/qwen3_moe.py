@@ -23,19 +23,12 @@ import inspect
 from .common import (
     TEMPORARY_PATCHES,
     torch_compile,
-    _torch_compile,
-    get_torch_compile_options,
-    UNSLOTH_ENABLE_LOGGING,
 )
 from .utils import (
     patch_function,
-    patch_function_past_key_values,
-    dedent,
-    KWARGS_TYPE,
+    patch_function,
     raise_error,
     logger,
-    Cache,
-    process_return,
 )
 
 
@@ -126,46 +119,26 @@ def patch_qwen3_moe():
 
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             """ """
-            batch_size, sequence_length, hidden_dim = hidden_states.shape
-            hidden_states = hidden_states.view(-1, hidden_dim)
-            # router_logits: (batch * sequence_length, n_experts)
-            # router_logits = self.gate(hidden_states)
-
-            # routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-            # routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-            # if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
-            #     routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-            # # we cast back to the input dtype
-            # routing_weights = routing_weights.to(hidden_states.dtype)
-            # router_scores = torch.zeros_like(router_logits, dtype = hidden_states.dtype).scatter_(1, selected_experts, routing_weights)
             router_scores, selected_experts, router_logits = router_forward(self, hidden_states)
             final_hidden_states = torch.zeros(
                 (batch_size * sequence_length, hidden_dim), dtype=torch.float32, device=hidden_states.device
             )
 
-            # One hot encode the selected experts to create an expert mask
+            # one hot encode the selected experts to create an expert mask
             # this will be used to easily index which expert is going to be sollicitated
-            # expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
             # Loop over all available experts in the model and perform the computation on each expert
-            # expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            # for expert_idx in expert_hit:
             for expert_idx in range(self.num_experts):
                 expert_layer = self.experts[expert_idx]
-                # idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
                 token_idx, _ = torch.where(selected_experts == expert_idx)
 
                 # Index the correct hidden states and compute the expert hidden state for
                 # the current expert. We need to make sure to multiply the output hidden
                 # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-                # current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-                # current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
                 current_state = hidden_states[token_idx].reshape(-1, hidden_dim)
                 current_hidden_states = expert_layer(current_state) * router_scores[token_idx, expert_idx, None]
 
                 # However `index_add_` only support torch tensors for indexing so we'll use
                 # the `top_x` tensor here.
-                # final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
                 final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(torch.float32))
             final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
             return final_hidden_states.to(hidden_states.dtype), router_logits
