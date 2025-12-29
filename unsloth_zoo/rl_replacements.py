@@ -644,7 +644,10 @@ def grpo_accumulated_loss(
             B = trainer.unsloth_grpo_mini_batch
             multiplier = trainer.args.unsloth_logit_chunk_multiplier
     else: 
-        B = trainer.args.unsloth_grpo_mini_batch
+        if trainer.args.unsloth_grpo_mini_batch > total_rows: 
+            B = total_rows
+        else:
+            B = trainer.args.unsloth_grpo_mini_batch
 
         if trainer.args.unsloth_logit_chunk_multiplier is None:
             multiplier = max(2, seq_len // 4096)
