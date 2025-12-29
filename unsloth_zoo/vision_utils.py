@@ -682,7 +682,11 @@ class UnslothVisionDataCollator:
         self.pad_to_multiple_of = pad_to_multiple_of
         self.snap_to_patch_size = snap_to_patch_size
         try:
-            self.patch_size = model.config.vision_config.patch_size
+            patch_size = model.config.vision_config.patch_size
+            # Handle tuple patch sizes (e.g., (14, 14) for InternVL3) - use first element
+            if isinstance(patch_size, (tuple, list)):
+                patch_size = patch_size[0]
+            self.patch_size = patch_size
         except:
             if hasattr(model.config, 'vision_config') and hasattr(model.config.vision_config, 'model_type'):
                 lower_name = model.config.vision_config.model_type.lower()
