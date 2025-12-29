@@ -615,31 +615,43 @@ def grpo_accumulated_loss(
 
     lm_head = trainer.model.get_output_embeddings().weight
     dtype_bytes = 16 if trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
-    # --- EXECUTE AUTOTUNE ---
+
     total_rows = input_ids.shape[0]
     seq_len = input_ids.shape[1]
     hidden_dim = lm_head.shape[1]
     vocab_dim = lm_head.shape[0]
+    
     #This should only need to be called once 
-    if not hasattr(trainer, "_has_autotuned"):
-        trainer._has_autotuned = True
-        B, multiplier = autotune_batch_and_chunks(
-            total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes
-        )
-        trainer._grpo_autotuned_batch = total_rows//B 
-        trainer._multiplier = multiplier
-        B = trainer._grpo_autotuned_batch
-        multiplier = trainer._multiplier
-    # 2. If not the first time, check if we are on an accumulation step
-    elif trainer._step % trainer.current_gradient_accumulation_steps == 0:
-        B = trainer._grpo_autotuned_batch
-        multiplier = trainer._multiplier
-        del trainer._has_autotuned
-        del trainer._grpo_autotuned_batch
-        del trainer._multiplier 
-    else:
-        B = trainer._grpo_autotuned_batch
-        multiplier = trainer._multiplier
+    if trainer.args.unsloth_grpo_mini_batch is None: 
+        if not hasattr(trainer, "_has_autotuned"):
+            trainer._has_autotuned = True
+            B, multiplier = autotune_batch_and_chunks(
+                total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
+            )
+            trainer.args.unsloth_grpo_mini_batch = total_rows//B 
+            trainer.args.unsloth_logit_chunk_multiplier = multiplier
+            B = trainer.args.unsloth_grpo_mini_batch
+            multiplier = trainer.args.unsloth_logit_chunk_multiplier
+        #If not the first time, check if we are on an accumulation step
+        elif trainer._step % trainer.current_gradient_accumulation_steps == 0:
+            B = trainer.args.unsloth_grpo_mini_batch
+            multiplier = trainer.args.unsloth_logit_chunk_multiplier
+            del trainer._has_autotuned
+            del trainer.args.unsloth_grpo_mini_batch
+            del trainer.args.unsloth_logit_chunk_multiplier 
+        else:
+            B = trainer.unsloth_grpo_mini_batch
+            multiplier = trainer.args.unsloth_logit_chunk_multiplier
+    else: 
+        B = trainer.args.unsloth_grpo_mini_batch
+
+        if trainer.args.unsloth_logit_chunk_multiplier is None:
+            multiplier = max(2, seq_len // 4096)
+        else: 
+            multiplier = trainer.args.unsloth_logit_chunk_multiplier
+
+        if trainer.current_gradient_accumulation_steps * trainer.args.per_device_train_batch_size >= trainer.num_generations:
+            B = B*trainer.current_gradient_accumulation_steps
         
     if pixel_values is None:
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
