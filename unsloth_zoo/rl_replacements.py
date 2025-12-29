@@ -232,6 +232,7 @@ def autotune_batch_and_chunks(
     seq_len, 
     hidden_size, 
     vocab_size, 
+    dtype_bytes=16,
     multiplier=None
 ):
     if multiplier is None:
