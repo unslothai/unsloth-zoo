@@ -884,11 +884,11 @@ def fix_tokenizer_config_json(tokenizer, saved_folder):
         old_chat_template = getattr(tokenizer, "chat_template", None)
         if old_chat_template is not None:
             try:
-                with open(tokenizer_config_path, "r") as f:
+                with open(tokenizer_config_path, "r", encoding="utf-8") as f:
                     f = json.load(f)
                 if "chat_template" not in f or f["chat_template"] is None:
                     f["chat_template"] = tokenizer.chat_template
-                with open(tokenizer_config_path, "w") as new_f:
+                with open(tokenizer_config_path, "w", encoding="utf-8") as new_f:
                     json.dump(f, new_f, indent = 2, ensure_ascii = False)
             except:
                 pass
@@ -896,11 +896,11 @@ def fix_tokenizer_config_json(tokenizer, saved_folder):
 
         # Remove chat_template if NULL
         try:
-            with open(tokenizer_config_path, "r") as f:
+            with open(tokenizer_config_path, "r", encoding="utf-8") as f:
                 f = json.load(f)
             if "chat_template" in f and (f["chat_template"] == "" or f["chat_template"] is None):
                 del f["chat_template"]
-            with open(tokenizer_config_path, "w") as new_f:
+            with open(tokenizer_config_path, "w", encoding="utf-8") as new_f:
                 json.dump(f, new_f, indent = 2, ensure_ascii = False)
         except:
             pass
@@ -909,11 +909,11 @@ def fix_tokenizer_config_json(tokenizer, saved_folder):
     config_file_path = os.path.join(saved_folder, "config.json")
     if os.path.exists(config_file_path):
         try:
-            with open(config_file_path, "r") as f:
+            with open(config_file_path, "r", encoding="utf-8") as f:
                 data = f.read()
             data = data.replace('"dtype"', '"torch_dtype"')
             data = data.replace("'dtype'", "'torch_dtype'")
-            with open(config_file_path, "w") as f:
+            with open(config_file_path, "w", encoding="utf-8") as f:
                 f.write(data)
         except:
             pass
