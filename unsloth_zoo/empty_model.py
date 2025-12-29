@@ -342,8 +342,9 @@ def create_empty_vision_model(config, dtype = torch.float16):
 
     new_config = deepcopy(config)
 
-    # Common text attributes
-    _set_config_attrs(new_config.text_config, {
+    # Common text attributes - use getattr to handle configs without text_config
+    text_config = getattr(new_config, "text_config", new_config)
+    _set_config_attrs(text_config, {
         "num_attention_heads": 1,
         "num_key_value_heads": 1,
         "hidden_size": 1,
@@ -366,7 +367,9 @@ def create_empty_vision_model(config, dtype = torch.float16):
         "num_attention_heads": 1,
     })
 
-    text_layers = config.text_config.num_hidden_layers
+    # Use getattr to handle configs without text_config (e.g., Qwen2Config)
+    config_text = getattr(config, "text_config", config)
+    text_layers = getattr(config_text, "num_hidden_layers", 32)
     vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
 
     # Set minimal sizes for different model types
