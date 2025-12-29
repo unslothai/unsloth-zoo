@@ -484,10 +484,18 @@ def standardize_data_formats(
     }
 
     if not isinstance(dataset, IterableDataset):
-        from multiprocessing import cpu_count
-        
-        if num_proc is None or type(num_proc) is not int: 
-          num_proc = cpu_count()
+        if num_proc is None or type(num_proc) is not int:
+            # Use memory-aware default to avoid OOM crashes
+            num_proc = min(max(psutil.cpu_count()+4, 2), 64)
+            try:
+                memory = psutil.virtual_memory()
+                memory_gb_left = memory.available / (1024 ** 3)
+                if memory_gb_left < 10:
+                    num_proc = 1  # Too risky with low memory
+                else:
+                    num_proc = min(num_proc, int(memory_gb_left))
+            except:
+                pass
 
         dataset_map_kwargs['num_proc'] = num_proc
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
