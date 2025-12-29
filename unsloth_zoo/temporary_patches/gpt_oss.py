@@ -1345,7 +1345,7 @@ def encode_conversations_with_harmony(
             )
         elif message["role"] == "assistant":
             if "thinking" in message:
-                x = Message.from_role_and_content(Role.ASSISTANT, message["content"])
+                x = Message.from_role_and_content(Role.ASSISTANT, message["thinking"])
                 x = x.with_channel("analysis")
             elif "tool_calls" in message:
                 x = Message.from_role_and_content(Role.ASSISTANT, message['tool_calls'][0]["arguments"])
