@@ -342,8 +342,9 @@ def create_empty_vision_model(config, dtype = torch.float16):
 
     new_config = deepcopy(config)
 
-    # Common text attributes
-    _set_config_attrs(new_config.text_config, {
+    # Common text attributes - use text_config if it exists, otherwise use config directly
+    text_config = getattr(new_config, 'text_config', None) or new_config
+    _set_config_attrs(text_config, {
         "num_attention_heads": 1,
         "num_key_value_heads": 1,
         "hidden_size": 1,
@@ -354,20 +355,28 @@ def create_empty_vision_model(config, dtype = torch.float16):
     })
 
     # Common vision attributes
-    _set_config_attrs(new_config.vision_config, {
-        "hidden_size": 1,
-        "intermediate_size": 1,
-        "patch_size": 1,
-        "image_size": 1,
-        "vision_output_dim": 1,
-        # The following are different names for the same concept
-        "num_heads": 1,
-        "attention_heads": 1,
-        "num_attention_heads": 1,
-    })
+    vision_config = getattr(new_config, 'vision_config', None)
+    if vision_config is not None:
+        _set_config_attrs(vision_config, {
+            "hidden_size": 1,
+            "intermediate_size": 1,
+            "patch_size": 1,
+            "image_size": 1,
+            "vision_output_dim": 1,
+            # The following are different names for the same concept
+            "num_heads": 1,
+            "attention_heads": 1,
+            "num_attention_heads": 1,
+        })
 
-    text_layers = config.text_config.num_hidden_layers
-    vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
+    # Get text layers from text_config if available, otherwise from config directly
+    original_text_config = getattr(config, 'text_config', None) or config
+    text_layers = getattr(original_text_config, 'num_hidden_layers', 32)
+    original_vision_config = getattr(config, 'vision_config', None)
+    if original_vision_config is not None:
+        vision_layers = getattr(original_vision_config, "num_hidden_layers", None) or getattr(original_vision_config, "depth", 0)
+    else:
+        vision_layers = 0
 
     # Set minimal sizes for different model types
     if model_type == "qwen2_5_vl":
@@ -707,26 +716,32 @@ def get_model_layer_counts(config):
     model_type = get_model_type(config)
 
     if model_type == "mllama":
+        text_config = getattr(config, 'text_config', None) or config
+        vision_config = getattr(config, 'vision_config', None)
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
-            "global_layers": getattr(config.vision_config, "num_global_layers", 8),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32) if vision_config else 0,
+            "global_layers": getattr(vision_config, "num_global_layers", 8) if vision_config else 0,
         }
     elif model_type == "qwen2_5_vl":
+        vision_config = getattr(config, 'vision_config', None)
         return {
             "text_layers": getattr(config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "depth", 32),
+            "vision_layers": getattr(vision_config, "depth", 32) if vision_config else 0,
         }
     elif model_type == "qwen3_vl":
+        vision_config = getattr(config, 'vision_config', None)
         return {
             "text_layers": getattr(config, "num_hidden_layers", 36),
-            "vision_layers": getattr(config.vision_config, "depth", 27),
-            "deepstack_layers": getattr(config.vision_config, "deepstack_depth", 3),
+            "vision_layers": getattr(vision_config, "depth", 27) if vision_config else 0,
+            "deepstack_layers": getattr(vision_config, "deepstack_depth", 3) if vision_config else 0,
         }
     elif model_type == "gemma3":
+        text_config = getattr(config, 'text_config', None) or config
+        vision_config = getattr(config, 'vision_config', None)
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32) if vision_config else 0,
         }
     else:
         # Standard causal LM
