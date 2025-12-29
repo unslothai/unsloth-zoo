@@ -142,14 +142,29 @@ def use_local_gguf():
         logger.debug("Restored original Python environment")
 pass
 
+def _get_install_cmd(package, sudo, system_type):
+    """Get install command for a given system type"""
+    sudo_prefix = "sudo " if sudo else ""
+    if system_type == "rpm":
+        pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
+        return f"{sudo_prefix}{pkg_manager} install {package} -y", pkg_manager
+    elif system_type == "arch":
+        return f"{sudo_prefix}pacman -S --noconfirm {package}", "pacman"
+    elif system_type == "alpine":
+        return f"{sudo_prefix}apk add {package}", "apk"
+    elif system_type == "suse":
+        return f"{sudo_prefix}zypper install -y {package}", "zypper"
+    elif system_type == "gentoo":
+        return f"{sudo_prefix}emerge {package}", "emerge"
+    else:  # debian or unknown
+        return f"{sudo_prefix}apt-get install {package} -y", "apt-get"
+pass
+
+
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
     # Choose package manager based on system type
-    if system_type == "rpm":
-        pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
-    else:  # Default to debian/apt-get
-        install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+    install_cmd, pkg_mgr_name = _get_install_cmd(package, sudo, system_type)
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
@@ -170,9 +185,8 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
                     )
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
                 raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist when installing {package}? Is this NOT a Linux / Mac based computer?")
-            elif "Unable to locate package" in line:
+            elif "Unable to locate package" in line or "not found" in line.lower():
                 sp.terminate()
                 raise RuntimeError(f"[FAIL] Unsloth: Could not install package {package} since it does not exist.")
             if print_output: print(line, flush = True, end = "")
@@ -182,18 +196,32 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
 pass
 
 
+def _get_pkg_manager_info(system_type):
+    """Get package manager command and name for a given system type"""
+    if system_type == "rpm":
+        pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
+        return pkg_manager, f"{pkg_manager} check-update", pkg_manager
+    elif system_type == "arch":
+        return "pacman", "pacman -Sy", "pacman"
+    elif system_type == "alpine":
+        return "apk", "apk update", "apk"
+    elif system_type == "suse":
+        return "zypper", "zypper refresh", "zypper"
+    elif system_type == "gentoo":
+        return "emerge", "emerge --sync", "emerge"
+    else:  # debian or unknown (fallback to debian)
+        return "apt-get", "apt-get update -y", "apt-get"
+pass
+
+
 def do_we_need_sudo(system_type="debian"):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Check apt-get updating
+    # Check package manager updating
     sudo = False
     print("Unsloth: Updating system package directories")
 
     # Choose update command based on system type
-    if system_type == "rpm":
-        pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        update_cmd = f"{pkg_manager} check-update"
-    else:
-        update_cmd = "apt-get update -y"
+    pkg_manager, update_cmd, pkg_mgr_name = _get_pkg_manager_info(system_type)
 
     start_time = time.time()
     with subprocess.Popen(update_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
@@ -205,7 +233,6 @@ def do_we_need_sudo(system_type="debian"):
                 break
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
                 raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist? Is this NOT a Linux / Mac based computer?")
             elif "failure resolving" in line or "Err:" in line:
                 sp.terminate()
@@ -1170,6 +1197,53 @@ def assert_correct_gguf(model_name, model, tokenizer):
 pass
 
 
+def _get_package_names_for_system(system_type):
+    """Get package name mappings for different systems"""
+    if system_type == "rpm":
+        return {
+            'build-essential': 'gcc gcc-c++ make',
+            'cmake': 'cmake',
+            'curl': 'curl',
+            'git': 'git',
+        }
+    elif system_type == "arch":
+        return {
+            'build-essential': 'base-devel',
+            'cmake': 'cmake',
+            'curl': 'curl',
+            'git': 'git',
+        }
+    elif system_type == "alpine":
+        return {
+            'build-essential': 'build-base',
+            'cmake': 'cmake',
+            'curl': 'curl',
+            'git': 'git',
+        }
+    elif system_type == "suse":
+        return {
+            'build-essential': 'gcc gcc-c++ make',
+            'cmake': 'cmake',
+            'curl': 'curl',
+            'git': 'git',
+        }
+    elif system_type == "gentoo":
+        return {
+            'build-essential': 'sys-devel/gcc',
+            'cmake': 'dev-build/cmake',
+            'curl': 'net-misc/curl',
+            'git': 'dev-vcs/git',
+        }
+    else:  # debian
+        return {
+            'build-essential': 'build-essential',
+            'cmake': 'cmake',
+            'curl': 'curl',
+            'git': 'git',
+        }
+pass
+
+
 def check_build_requirements():
     """Check if build requirements are available (tool-based approach)"""
     required_tools = {
@@ -1181,22 +1255,16 @@ def check_build_requirements():
 
     missing_packages = []
     system_type = check_linux_type()  # Get system type first
+    package_names = _get_package_names_for_system(system_type)
 
     for tool, package in required_tools.items():
         try:
             result = subprocess.run(['which', tool], capture_output=True, text=True)
             if result.returncode != 0:
-                # Adjust package names for RPM-based systems
-                if system_type == "rpm":
-                    rpm_packages = {
-                        'build-essential': 'gcc gcc-c++ make',
-                        'cmake': 'cmake',
-                        'curl': 'curl',
-                        'git': 'git',
-                    }
-                    package = rpm_packages.get(package, package)
+                package = package_names.get(package, package)
                 missing_packages.append(package)
         except Exception:
+            package = package_names.get(package, package)
             missing_packages.append(package)
 
     # Check for libcurl development headers
@@ -1221,9 +1289,45 @@ def check_libcurl_dev():
             return False, package_name
 
     elif system_type == "rpm":
-        package_name = "libcurl-dev"
+        package_name = "libcurl-devel"
         try:
             result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True)
+            is_installed = result.returncode == 0
+            return is_installed, package_name
+        except Exception:
+            return False, package_name
+
+    elif system_type == "arch":
+        package_name = "curl"  # Arch includes dev headers in main package
+        try:
+            result = subprocess.run(['pacman', '-Q', package_name], capture_output = True, text = True)
+            is_installed = result.returncode == 0
+            return is_installed, package_name
+        except Exception:
+            return False, package_name
+
+    elif system_type == "alpine":
+        package_name = "curl-dev"
+        try:
+            result = subprocess.run(['apk', 'info', '-e', package_name], capture_output = True, text = True)
+            is_installed = result.returncode == 0
+            return is_installed, package_name
+        except Exception:
+            return False, package_name
+
+    elif system_type == "suse":
+        package_name = "libcurl-devel"
+        try:
+            result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True)
+            is_installed = result.returncode == 0
+            return is_installed, package_name
+        except Exception:
+            return False, package_name
+
+    elif system_type == "gentoo":
+        package_name = "net-misc/curl"  # Gentoo includes dev headers with USE flags
+        try:
+            result = subprocess.run(['equery', 'l', package_name], capture_output = True, text = True)
             is_installed = result.returncode == 0
             return is_installed, package_name
         except Exception:
@@ -1248,6 +1352,22 @@ def check_linux_type():
     # Check if it's RPM-based (CentOS/RHEL/Fedora):
     elif any(os.path.exists(f) for f in ['/etc/redhat-release', '/etc/fedora-release']):
         return 'rpm'
+
+    # Check if it's Arch-based:
+    elif os.path.exists('/etc/arch-release') or os.path.exists('/usr/bin/pacman'):
+        return 'arch'
+
+    # Check if it's Alpine-based:
+    elif os.path.exists('/etc/alpine-release') or os.path.exists('/sbin/apk'):
+        return 'alpine'
+
+    # Check if it's openSUSE-based:
+    elif os.path.exists('/etc/SuSE-release') or os.path.exists('/etc/SUSE-brand'):
+        return 'suse'
+
+    # Check if it's Gentoo-based:
+    elif os.path.exists('/etc/gentoo-release') or os.path.exists('/usr/bin/emerge'):
+        return 'gentoo'
 
     return 'unknown'
 pass
