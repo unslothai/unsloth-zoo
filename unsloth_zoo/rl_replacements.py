@@ -652,9 +652,6 @@ def grpo_accumulated_loss(
             multiplier = max(2, seq_len // 4096)
         else: 
             multiplier = trainer.args.unsloth_logit_chunk_multiplier
-
-        if trainer.current_gradient_accumulation_steps * trainer.args.per_device_train_batch_size >= trainer.num_generations:
-            B = B*trainer.current_gradient_accumulation_steps
         
     if pixel_values is None:
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
