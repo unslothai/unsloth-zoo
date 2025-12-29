@@ -198,8 +198,10 @@ def prepare_model_for_training(
         m.gradient_checkpointing_enable()
 
     # Also set HF version manually to stop failures
+    # Only enable if use_gradient_checkpointing is True or "unsloth"
     if hasattr(model, "_set_gradient_checkpointing"):
-        model._set_gradient_checkpointing()
+        enable = use_gradient_checkpointing in (True, "unsloth")
+        model._set_gradient_checkpointing(enable=enable)
 
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:
