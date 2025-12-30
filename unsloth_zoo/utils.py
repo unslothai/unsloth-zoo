@@ -25,6 +25,7 @@ __all__ = [
 
 from packaging.version import Version as TrueVersion
 import torch
+import torch.distributed as dist
 import os
 import time
 import contextlib
