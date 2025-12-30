@@ -650,7 +650,7 @@ def grpo_accumulated_loss(
             B = trainer.args.unsloth_grpo_mini_batch
 
         if trainer.args.unsloth_logit_chunk_multiplier is None:
-            multiplier = max(2, seq_len // 4096)
+            multiplier = max(4, seq_len // 4096)
         else: 
             multiplier = trainer.args.unsloth_logit_chunk_multiplier
         
@@ -819,8 +819,8 @@ def grpo_accumulated_loss(
     def efficient_log_softmax(hidden_states, lm_head, index, chunks=32, 
                             logit_scale_multiply=0.0, logit_scale_divide=0.0, 
                             logit_softcapping=0.0, temperature=1, batch_size=8):
-        if index.shape[1] <= 1024 and batch_size <= 8:
-            #We save a gigabyte with the normal path under these specific conditions
+        if (index.shape[1] <= 1024 and batch_size <= 8) or batch_size==1:
+            #We save a gigabyte or speed with the normal path under these specific conditions
             return chunked_hidden_states_selective_log_softmax(
                 hidden_states,
                 lm_head,
@@ -870,6 +870,7 @@ def grpo_accumulated_loss(
                     pixel_attention_mask = pixel_attention_mask_chunk,
                     image_sizes = image_sizes_chunk,
                     logits_to_keep = logits_to_keep + 1, 
+                    batch_size = B
                 ).logits
                 
                 new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
