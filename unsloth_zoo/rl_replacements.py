@@ -879,7 +879,7 @@ def grpo_accumulated_loss(
                 new_hidden_states_chunk, 
                 lm_head, 
                 completion_ids, 
-                chunks=  input_ids.shape[0]*multiplier, 
+                chunks=input_ids_chunk.shape[0]*multiplier, 
                 logit_scale_multiply=logit_scale_multiply,
                 logit_scale_divide=logit_scale_divide,
                 logit_softcapping=logit_softcapping,
