@@ -820,7 +820,7 @@ def grpo_accumulated_loss(
                             logit_scale_multiply=0.0, logit_scale_divide=0.0, 
                             logit_softcapping=0.0, temperature=1, batch_size=8):
         if index.shape[1] <= 1024 and batch_size <= 8:
-            #We save a gigabyte with the normal path under tehse specific conditions
+            #We save a gigabyte with the normal path under these specific conditions
             return chunked_hidden_states_selective_log_softmax(
                 hidden_states,
                 lm_head,
