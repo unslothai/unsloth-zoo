@@ -236,7 +236,7 @@ def autotune_batch_and_chunks(
     multiplier=None
 ):
     if multiplier is None:
-        final_m = max(2, seq_len // 4096)
+        final_m = max(4, seq_len // 4096)
     else:
         final_m = multiplier
     
@@ -259,8 +259,8 @@ def autotune_batch_and_chunks(
     valid_indices = torch.nonzero(valid_mask, as_tuple=False)
 
     if valid_indices.shape[0] == 0:
-        #something went so wrong....
-        return 2, final_m
+        #This means your GPU will OOM
+        return 4, final_m
 
     best_idx = valid_indices[0].item()
     final_b = int(b_vals[best_idx].item())
