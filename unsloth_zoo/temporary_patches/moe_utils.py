@@ -61,6 +61,7 @@ def _init_triton_allocator():
         pass
 
 
+
 def _check_grouped_gemm_available():
     """Check if Unsloth grouped GEMM kernels are available."""
     # Check if user wants to force disable Triton kernels
@@ -93,6 +94,50 @@ def _check_grouped_gemm_available():
         except (ImportError, ModuleNotFoundError) as e:
             _GROUPED_GEMM_AVAILABLE = False
     return _GROUPED_GEMM_AVAILABLE
+
+
+def select_moe_backend():
+    """
+    Selects the MoE backend based on UNSLOTH_MOE_BACKEND environment variable and availability.
+    Choices: "grouped_mm", "unsloth_triton", "native_torch".
+    Default if unspecified: "grouped_mm".
+    """
+    # Choices ordered by preference
+    # (backend_name, is_available)
+    choices = [
+        ("grouped_mm",     hasattr(torch, "_grouped_mm")),
+        ("unsloth_triton", _check_grouped_gemm_available()),
+        ("native_torch",   True),
+    ]
+
+    # 1. Check environment variable
+    requested_backend = os.environ.get("UNSLOTH_MOE_BACKEND")
+
+    # User explicitly requested a backend
+    if requested_backend:
+        # Check against available choices
+        is_valid = False
+        is_available = False
+
+        for name, available in choices:
+            if name == requested_backend:
+                is_valid = True
+                is_available = available
+                break
+
+        if is_valid:
+            if is_available:
+                return requested_backend
+            else:
+                print(f"Unsloth: '{requested_backend}' backend requested but is not available. Falling back to next available.")
+
+    # 2. Automatic selection (first available in preference order)
+    for name, available in choices:
+        if available:
+            return name
+
+    return "native_torch"
+
 
 def _get_routing_indices_optimized(selected_experts, num_experts):
     """
@@ -294,7 +339,7 @@ def forward_triton_grouped_gemm(
         top_k_index, self.num_experts
     )
 
-    if self.gate_up_proj.shape[1] == hidden_dim:
+    if self.gate_up_proj.shape[-1] == hidden_dim:
          w1 = self.gate_up_proj
     else:
          w1 = self.gate_up_proj.transpose(-2, -1)
@@ -320,7 +365,7 @@ def forward_triton_grouped_gemm(
 
     # Grouped GEMM 2: down projection
 
-    if self.down_proj.shape[1] == inter.shape[-1]:
+    if self.down_proj.shape[-1] == intermediate.shape[-1]:
          w2 = self.down_proj
     else:
          w2 = self.down_proj.transpose(-2, -1)

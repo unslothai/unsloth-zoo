@@ -43,6 +43,7 @@ from .moe_utils import (
     _TORCH_GROUPED_MM_AVAILABLE,
     forward_native_grouped_mm,
     forward_triton_grouped_gemm,
+    select_moe_backend,
 )
 
 def patch_qwen3_vl_moe():
@@ -138,16 +139,9 @@ def patch_qwen3_vl_moe():
         # New transformers with stacked expert weights
         # ====================================================================
 
-        use_grouped_gemm = _check_grouped_gemm_available()
+        backend = select_moe_backend()
 
-        # Force grouped mm usage if available to avoid fallback entirely
-        if hasattr(torch, "_grouped_mm"):
-             _TORCH_GROUPED_MM_AVAILABLE = True
-
-        if not _TORCH_GROUPED_MM_AVAILABLE and not use_grouped_gemm:
-             logger.warning("Unsloth Warning: torch._grouped_mm and Triton kernels unavailable. Using slow loop fallback for MoE.")
-
-        if _TORCH_GROUPED_MM_AVAILABLE:
+        if backend == "grouped_mm":
             def forward(
                 self,
                 hidden_states: torch.Tensor,
@@ -160,7 +154,7 @@ def patch_qwen3_vl_moe():
                 """
                 return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
 
-        elif use_grouped_gemm:
+        elif backend == "unsloth_triton":
              def forward(
                 self,
                 hidden_states: torch.Tensor,

@@ -41,6 +41,7 @@ from .moe_utils import (
     _TORCH_GROUPED_MM_AVAILABLE,
     forward_native_grouped_mm,
     forward_triton_grouped_gemm,
+    select_moe_backend,
 )
 
 
@@ -143,14 +144,15 @@ def patch_qwen3_moe():
             final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
             return final_hidden_states.to(hidden_states.dtype), router_logits
     else:
-        # ====================================================================
+    # ====================================================================
         # New transformers (5.0+) with stacked expert weights
         # Uses Triton grouped GEMM kernels for high performance
         # ====================================================================
 
-        use_grouped_gemm = _check_grouped_gemm_available()
+        backend = select_moe_backend()
 
-        if _TORCH_GROUPED_MM_AVAILABLE:
+        if backend == "grouped_mm":
+
             def forward(
                 self,
                 hidden_states: torch.Tensor,
@@ -163,7 +165,7 @@ def patch_qwen3_moe():
                 """
                 return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
 
-        elif use_grouped_gemm:
+        elif backend == "unsloth_triton":
             # Import grouped GEMM interface (sys.path was set by _check_grouped_gemm_available)
             from grouped_gemm.interface import grouped_gemm, supports_tma
             # Import autotune cache
@@ -184,6 +186,7 @@ def patch_qwen3_moe():
                 Uses cached kernel configs (created once at start) for efficient operation.
                 """
                 return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
+
         else:
             # Fallback: Pure PyTorch loop-based implementation
 
