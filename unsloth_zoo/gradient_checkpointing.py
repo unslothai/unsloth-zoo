@@ -20,6 +20,7 @@ from typing import Union, Optional, List, Any, Callable, Tuple
 from packaging.version import Version
 import os
 import warnings
+import gc
 from .utils import _get_dtype
 from .device_type import (
     is_hip,
@@ -818,6 +819,8 @@ def unpatch_unsloth_smart_gradient_checkpointing():
             if type(GPU_BUFFERS) is list: GPU_BUFFERS[i] = None
         CPU_BUFFERS = None
         GPU_BUFFERS = None
+        torch.cuda.empty_cache()
+        gc.collect()
 
     if (torch.utils.checkpoint.checkpoint.__name__ == "unsloth_checkpoint") and \
         hasattr(torch.utils.checkpoint, "_old_checkpoint"):

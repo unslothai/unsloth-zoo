@@ -581,19 +581,19 @@ def patch_tokenizer(model, tokenizer):
         tokenizer.pad_token = possible_pad_token
         if model is not None:
             model.config.update({"pad_token_id" : tokenizer.pad_token_id})
-            if getattr(model, "generation_config") is not None:
+            if getattr(model, "generation_config", None) is not None:
                 model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
     else:
         if model is not None:
             if model.config.pad_token_id is None:
                 model.config.update({"pad_token_id" : tokenizer.pad_token_id})
-                if getattr(model, "generation_config") is not None:
+                if getattr(model, "generation_config", None) is not None:
                     model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
         pass
     pass
 
     if model is not None:
-        if getattr(model, "generation_config") is not None:
+        if getattr(model, "generation_config", None) is not None:
             if hasattr(model.config, "max_position_embeddings"):
                 model.generation_config.update(max_length = model.config.max_position_embeddings)
     pass

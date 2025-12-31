@@ -656,6 +656,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 temp_filename = temp_file.name
                 # Save the merged tensor to a unique temp file
                 torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+                del W
                 # Load it back as a memory-mapped object. The OS will manage paging this from disk.
                 W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
 
@@ -2498,6 +2499,12 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
 
         # Write directly to memory map
         mm[index_L:index_R] = bytes(byte_data)
+
+        # Clear memory
+        del data_ptr
+        del tensor_view
+        del tensor_formatted
+        del tensor
 
         return True
 
