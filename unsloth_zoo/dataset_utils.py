@@ -195,6 +195,7 @@ def train_on_responses_only(
     the labels with -100 for the instruction part.
     """
     # All Unsloth Zoo code licensed under LGPLv3
+    import psutil  # Import at function level to ensure it's captured during compilation
     if tokenizer is None and trainer is not None:
         tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
     # Get non vision tokenizer
@@ -329,7 +330,6 @@ def train_on_responses_only(
         return _train_on_responses_only
 
     if num_proc is None or type(num_proc) is not int:
-        import psutil
         num_proc = min(max(psutil.cpu_count()+4, 2), 64)
         # Check memory left so we can reduce multiprocessing to converse memory
         memory_gb_left = psutil.virtual_memory().available / (1024**3)
@@ -517,6 +517,7 @@ def sft_prepare_dataset(
     dataset_name: str,
 ) -> Union[Dataset, IterableDataset]:
     # All Unsloth Zoo code licensed under LGPLv3
+    import psutil  # Import at function level to ensure it's captured during compilation
     try:
         if isinstance(dataset, ConstantLengthDataset): return dataset
     except:
@@ -613,7 +614,6 @@ def sft_prepare_dataset(
         if not isinstance(dataset, IterableDataset):
             dataset_num_proc = getattr(args, "dataset_num_proc", None)
             if dataset_num_proc is None:
-                import psutil
                 dataset_num_proc = max(psutil.cpu_count()+4, 2)
                 # Check memory left so we can reduce multiprocessing to converse memory
                 memory_gb_left = psutil.virtual_memory().available / (1024**3)
