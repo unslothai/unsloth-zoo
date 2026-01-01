@@ -66,7 +66,7 @@ elif DEVICE_TYPE == "xpu":
     except:
         HAS_CUT_CROSS_ENTROPY = False
 else:
-    pass
+    HAS_CUT_CROSS_ENTROPY = False
 pass
 
 __all__ = [

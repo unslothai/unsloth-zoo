@@ -238,6 +238,7 @@ def PatchRLStatistics(algorithm = "grpo_trainer", other_metrics = []):
             f"Unsloth for {algorithm.upper()} is not yet implemented! Just ignore this function.\n"\
             f"We support: `{list(all_metrics.keys())}`"
         )
+        return
     pass
     _PatchRLStatistics(all_metrics[algorithm] + other_metrics, algorithm)
 pass
