@@ -1640,6 +1640,7 @@ def load_vllm(
     gpu_memory_utilization : float = 0.8,
     max_seq_length         : int   = 8192,
     dtype                  : torch.dtype = None,
+    revision               = None,
     training               : bool = True,
     float8_kv_cache        : bool = False,
     random_state           : int  = 0,
@@ -2013,6 +2014,7 @@ def load_vllm(
 
     engine_args = dict(
         model                  = model_name,
+        revision               = revision,
         gpu_memory_utilization = actual_gpu_memory_utilization,
         max_model_len          = max_seq_length,
         quantization           = "bitsandbytes" if use_bitsandbytes else None,
