@@ -25,6 +25,7 @@ __all__ = [
 ]
 
 import ast
+import inspect
 import sys
 import sysconfig
 from pathlib import Path
@@ -731,8 +732,14 @@ def execute_with_time_limit(
     backend:
       - "signal": uses SIGALRM (fast, in-process; only cooperative C code).
       - "process": runs function in a child and kills it on timeout (robust).
+      - "auto": uses signal backend if function source is safe, otherwise process.
 
-    start_method (only used when backend="process"):
+    If backend="signal" but the function contains patterns that could escape
+    signal-based timeouts (detected via check_signal_escape_patterns), or if
+    the function source cannot be inspected, automatically falls back to
+    the process backend.
+
+    start_method (only used when backend="process" or auto fallback):
       - "fork": copies parent process memory (fast, works in notebooks/Colab).
       - "spawn": starts fresh Python interpreter (slower, safer for CUDA).
       - "forkserver": reuses a server process for forking (balance of both).
@@ -745,16 +752,30 @@ def execute_with_time_limit(
         )
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        # Determine effective backend based on function safety
+        effective_backend = backend
+        if backend in ("signal", "auto"):
+            try:
+                source = inspect.getsource(func)
+                safe, _ = check_signal_escape_patterns(source)
+                if not safe:
+                    effective_backend = "process"
+                elif backend == "auto":
+                    effective_backend = "signal"
+            except (OSError, TypeError):
+                # Cannot inspect source (built-in, lambda, etc.) - use process
+                effective_backend = "process"
+
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
-            if backend == "signal":
+            if effective_backend == "signal":
                 with time_limit(seconds):
                     return func(*args, **kwargs)
-            elif backend == "process":
+            elif effective_backend == "process":
                 return _run_in_subprocess(func, seconds, args, kwargs,
                                           start_method=start_method, kill_grace=kill_grace)
             else:
-                raise ValueError("backend must be 'signal' or 'process'")
+                raise ValueError("backend must be 'signal', 'process', or 'auto'")
         return wrapper
     return decorator
 pass
