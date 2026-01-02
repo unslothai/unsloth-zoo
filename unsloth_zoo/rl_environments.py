@@ -476,7 +476,7 @@ def execute_with_time_limit(
         raise ValueError("seconds must be > 0")
     if start_method not in _VALID_START_METHODS:
         raise ValueError(
-            f"start_method must be one of {sorted(_VALID_START_METHODS)}, got {start_method!r}"
+            f"Unsloth: start_method must be one of {sorted(_VALID_START_METHODS)}, got {start_method!r}"
         )
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
