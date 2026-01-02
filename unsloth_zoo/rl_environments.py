@@ -141,6 +141,75 @@ def check_signal_escape_patterns(code: str):
       - signal_tampering: list of signal manipulation patterns found
       - exception_catching: list of exception catching patterns found
       - warnings: list of warning messages
+
+    Signal Tampering Patterns (code can disable/ignore the timeout signal):
+    -----------------------------------------------------------------------
+    1. signal.signal(SIGALRM, SIG_IGN) - Ignores the alarm signal entirely
+       Example that escapes:
+           import signal
+           signal.signal(signal.SIGALRM, signal.SIG_IGN)
+           while True: pass  # Runs forever, timeout never fires
+
+    2. signal.setitimer(ITIMER_REAL, 0) - Disables the timer completely
+       Example that escapes:
+           import signal
+           signal.setitimer(signal.ITIMER_REAL, 0)
+           while True: pass  # Timer disabled, runs forever
+
+    3. signal.alarm(0) - Cancels any pending alarm
+       Example that escapes:
+           import signal
+           signal.alarm(0)
+           while True: pass  # Alarm cancelled, runs forever
+
+    4. signal.pthread_sigmask(SIG_BLOCK, [SIGALRM]) - Blocks signal delivery
+       Example that escapes:
+           import signal
+           signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGALRM])
+           while True: pass  # Signal blocked, runs forever
+
+    Exception Catching Patterns (code can catch and suppress TimeoutError):
+    -----------------------------------------------------------------------
+    The signal backend raises TimeoutError when time expires. If code catches
+    this exception, it can suppress the timeout and continue running.
+
+    5. except TimeoutError - Catches the specific timeout exception
+       Example that escapes:
+           while True:
+               try:
+                   do_work()
+               except TimeoutError:
+                   pass  # Caught! Loop continues, runs forever
+
+    6. except Exception - Catches TimeoutError (it inherits from Exception)
+       Example that escapes:
+           while True:
+               try:
+                   do_work()
+               except Exception:
+                   pass  # TimeoutError caught, runs forever
+
+    7. except BaseException - Catches everything including TimeoutError
+       Example that escapes:
+           while True:
+               try:
+                   do_work()
+               except BaseException:
+                   pass  # Everything caught, runs forever
+
+    8. Bare except: - Catches all exceptions
+       Example that escapes:
+           while True:
+               try:
+                   do_work()
+               except:
+                   pass  # All exceptions caught, runs forever
+
+    Why use backend="process" instead:
+    ----------------------------------
+    The process backend runs code in a subprocess and uses SIGKILL to terminate
+    it on timeout. SIGKILL cannot be caught, ignored, or blocked by any code,
+    making it immune to all escape patterns above.
     """
     try:
         tree = ast.parse(code)
