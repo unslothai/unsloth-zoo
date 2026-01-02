@@ -105,13 +105,13 @@ def create_huggingface_repo(
     if repo_id.count("/") != 1:
         raise TypeError(f"Unsloth: You are pushing to Hugging Face, but {repo_id} is not a valid repo.")
 
-    from huggingface_hub import ModelCard
+    from huggingface_hub import ModelCard, HfApi
     if token is None: token = get_token()
-    repo_id = PushToHubMixin._create_repo(
-        PushToHubMixin,
+    api = HfApi(token = token)
+    repo_url = api.create_repo(
         repo_id = repo_id,
         private = private,
-        token = token,
+        exist_ok = True,  # don't error if repo already exists
     )
     username = repo_id.split("/")[0]
 
@@ -139,7 +139,6 @@ def create_huggingface_repo(
     card = ModelCard(content)
     card.push_to_hub(repo_id, token = token, commit_message = "Unsloth Model Card")
 
-    from huggingface_hub import HfApi
     hf_api = HfApi(token = token)
     return username, repo_id, hf_api
 pass
