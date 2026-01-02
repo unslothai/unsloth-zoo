@@ -451,6 +451,8 @@ def _run_in_subprocess(func, seconds, args, kwargs, *, start_method="spawn", kil
             pass
 pass
 
+_VALID_START_METHODS = frozenset({"fork", "spawn", "forkserver"})
+
 def execute_with_time_limit(
     seconds: float,
     *,
@@ -464,9 +466,18 @@ def execute_with_time_limit(
     backend:
       - "signal": uses SIGALRM (fast, in-process; only cooperative C code).
       - "process": runs function in a child and kills it on timeout (robust).
+
+    start_method (only used when backend="process"):
+      - "fork": copies parent process memory (fast, works in notebooks/Colab).
+      - "spawn": starts fresh Python interpreter (slower, safer for CUDA).
+      - "forkserver": reuses a server process for forking (balance of both).
     """
     if seconds <= 0:
         raise ValueError("seconds must be > 0")
+    if start_method not in _VALID_START_METHODS:
+        raise ValueError(
+            f"start_method must be one of {sorted(_VALID_START_METHODS)}, got {start_method!r}"
+        )
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
