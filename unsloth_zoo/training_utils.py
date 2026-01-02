@@ -116,9 +116,18 @@ def prepare_model_for_training(
         # We need to upcast to float32
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
+        # For full finetuning, update config dtype to match actual weight dtype.
+        # The KV cache uses model.config.torch_dtype, but weights are upcast to float32.
+        # Without this, generation fails with dtype mismatch in index_copy_().
+        if full_finetuning:
+            model._unsloth_original_dtype = dtype
+            model.config.torch_dtype = torch.float32
     elif dtype == torch.bfloat16 and float32_mixed_precision:
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
+        if full_finetuning:
+            model._unsloth_original_dtype = dtype
+            model.config.torch_dtype = torch.float32
     elif dtype == torch.bfloat16:
         mixed_precision_dtype = torch.bfloat16
         os.environ["UNSLOTH_MIXED_PRECISION"] = "bfloat16"
