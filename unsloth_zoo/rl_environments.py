@@ -168,37 +168,41 @@ def check_signal_escape_patterns(code: str):
            signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGALRM])
            while True: pass  # Signal blocked, runs forever
 
-    Exception Catching Patterns (code can catch and suppress TimeoutError):
-    -----------------------------------------------------------------------
+    Exception Catching Patterns (only dangerous INSIDE A LOOP):
+    -----------------------------------------------------------
     The signal backend raises TimeoutError when time expires. If code catches
-    this exception, it can suppress the timeout and continue running.
+    this exception INSIDE A LOOP, it can suppress the timeout and continue.
 
-    5. except TimeoutError - Catches the specific timeout exception
-       Example that escapes:
+    NOTE: Exception catching OUTSIDE a loop is safe because control returns
+    to the caller after the handler. These patterns are only flagged when
+    detected inside a while/for loop.
+
+    5. except TimeoutError in loop - Catches and continues looping
+       ESCAPES (inside loop):
            while True:
                try:
                    do_work()
                except TimeoutError:
                    pass  # Caught! Loop continues, runs forever
 
-    6. except Exception - Catches TimeoutError (it inherits from Exception)
-       Example that escapes:
+       SAFE (outside loop):
+           try:
+               do_work()
+           except TimeoutError:
+               return "default"  # Returns to caller, does NOT escape
+
+    6. except Exception in loop - Catches TimeoutError (inherits from Exception)
+       ESCAPES (inside loop):
            while True:
                try:
                    do_work()
                except Exception:
                    pass  # TimeoutError caught, runs forever
 
-    7. except BaseException - Catches everything including TimeoutError
-       Example that escapes:
-           while True:
-               try:
-                   do_work()
-               except BaseException:
-                   pass  # Everything caught, runs forever
+    7. except BaseException in loop - Catches everything including TimeoutError
 
-    8. Bare except: - Catches all exceptions
-       Example that escapes:
+    8. Bare except: in loop - Catches all exceptions
+       ESCAPES (inside loop):
            while True:
                try:
                    do_work()
@@ -229,6 +233,7 @@ def check_signal_escape_patterns(code: str):
         def __init__(self):
             self.imports_signal = False
             self.signal_aliases = {"signal"}
+            self.loop_depth = 0  # Track if we're inside a loop
 
         def visit_Import(self, node: ast.Import):
             for alias in node.names:
@@ -246,6 +251,16 @@ def check_signal_escape_patterns(code: str):
                                       "ITIMER_REAL", "pthread_sigmask", "SIG_BLOCK", "alarm"):
                         self.signal_aliases.add(alias.asname or alias.name)
             self.generic_visit(node)
+
+        def visit_While(self, node: ast.While):
+            self.loop_depth += 1
+            self.generic_visit(node)
+            self.loop_depth -= 1
+
+        def visit_For(self, node: ast.For):
+            self.loop_depth += 1
+            self.generic_visit(node)
+            self.loop_depth -= 1
 
         def visit_Call(self, node: ast.Call):
             func = node.func
@@ -306,20 +321,26 @@ def check_signal_escape_patterns(code: str):
             self.generic_visit(node)
 
         def visit_ExceptHandler(self, node: ast.ExceptHandler):
-            # Check for bare except or catching TimeoutError/BaseException
+            # Only flag exception catching if inside a loop (where it can suppress timeout)
+            # Exception catching outside loops will naturally propagate after the handler
+            if self.loop_depth == 0:
+                self.generic_visit(node)
+                return
+
+            # Check for bare except or catching TimeoutError/BaseException inside a loop
             if node.type is None:
                 # Bare except:
                 exception_catching.append({
-                    "type": "bare_except",
+                    "type": "bare_except_in_loop",
                     "line": node.lineno,
-                    "description": "Bare except catches all exceptions including TimeoutError",
+                    "description": "Bare except in loop catches TimeoutError and continues looping",
                 })
             elif isinstance(node.type, ast.Name):
                 if node.type.id in ("TimeoutError", "BaseException", "Exception"):
                     exception_catching.append({
-                        "type": f"catches_{node.type.id}",
+                        "type": f"catches_{node.type.id}_in_loop",
                         "line": node.lineno,
-                        "description": f"Catches {node.type.id} which may suppress timeout",
+                        "description": f"Catches {node.type.id} in loop - may suppress timeout and continue",
                     })
             elif isinstance(node.type, ast.Tuple):
                 # except (TimeoutError, ValueError):
@@ -327,9 +348,9 @@ def check_signal_escape_patterns(code: str):
                     if isinstance(elt, ast.Name):
                         if elt.id in ("TimeoutError", "BaseException", "Exception"):
                             exception_catching.append({
-                                "type": f"catches_{elt.id}",
+                                "type": f"catches_{elt.id}_in_loop",
                                 "line": node.lineno,
-                                "description": f"Catches {elt.id} which may suppress timeout",
+                                "description": f"Catches {elt.id} in loop - may suppress timeout and continue",
                             })
             self.generic_visit(node)
 
