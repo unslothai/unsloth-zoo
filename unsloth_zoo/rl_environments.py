@@ -38,7 +38,6 @@ from contextlib import contextmanager
 from functools import wraps
 import threading
 import errno
-import time
 from typing import Callable, TypeVar, Any, Tuple
 T = TypeVar("T")
 
@@ -291,10 +290,8 @@ pass
 
 def create_locked_down_function(function):
     """
-    Creates a singular Python function which disallows the following:
-    1. No globals or
+    Creates a singular Python function which disallows globals.
     """
-    output_function = {}
     f = load_single_function(function)
     # Locks down function so it can see global variables of nothingness
     f = types.FunctionType(f.__code__, {})
@@ -458,7 +455,7 @@ def execute_with_time_limit(
     seconds: float,
     *,
     backend: str = "signal",
-    start_method: str = "process",
+    start_method: str = "fork",
     kill_grace: float = 1.0,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
