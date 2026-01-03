@@ -22,7 +22,6 @@ __all__ = [
     "Benchmarker",
     "is_port_open",
     "launch_openenv",
-    "_get_openenv_pythonpath",
 ]
 
 import ast
@@ -863,17 +862,17 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
     """
     root_client = os.path.join(working_directory, "envs", "openspiel_env", "client.py")
     src_client = os.path.join(working_directory, "src", "envs", "openspiel_env", "client.py")
+    src_path = os.path.join(working_directory, "src")
 
     if os.path.exists(root_client):
         # New structure: envs at root + openenv in src
-        return f"{working_directory}:{working_directory}/src"
+        return f"{working_directory}{os.pathsep}{src_path}"
     elif os.path.exists(src_client):
         # Old structure: everything in src
-        return f"{working_directory}/src"
+        return src_path
     else:
         # Fallback: try both paths
-        return f"{working_directory}:{working_directory}/src"
-pass
+        return f"{working_directory}{os.pathsep}{src_path}"
 
 
 def launch_openenv(
@@ -894,7 +893,7 @@ def launch_openenv(
 
     # Auto-fix PYTHONPATH for OpenEnv compatibility
     correct_pythonpath = _get_openenv_pythonpath(working_directory)
-    if "PYTHONPATH" not in environment or environment.get("PYTHONPATH") != correct_pythonpath:
+    if environment.get("PYTHONPATH") != correct_pythonpath:
         environment = dict(environment)  # Don't mutate original
         environment["PYTHONPATH"] = correct_pythonpath
 
