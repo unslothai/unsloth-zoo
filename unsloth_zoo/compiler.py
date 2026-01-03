@@ -527,6 +527,8 @@ def create_new_function(
     items = [x for x in functions if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))]
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source: items += ["SiglipEncoder"]
+    # Patch for Qwen3MoeExperts
+    if "Qwen3MoeExperts" in new_source: items += ["Qwen3MoeExperts"]
     # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
@@ -1693,7 +1695,7 @@ def patch_moe_routing_weights_cast(module_cls: Any, source: str) -> Tuple[str, D
         new_route_source, replaced_count = re.subn(MOE_ROUTING_WEIGHTS_CAST_PATTERN, MOE_ROUTING_WEIGHTS_CAST_REPLACE, new_route_source)
         if replaced_count > 0:
             new_route_sources[method_name] = new_route_source
-    
+
     return re.sub(MOE_ROUTING_WEIGHTS_CAST_PATTERN, MOE_ROUTING_WEIGHTS_CAST_REPLACE, source), new_route_sources
 pass
 
