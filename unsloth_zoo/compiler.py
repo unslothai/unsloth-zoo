@@ -1855,7 +1855,7 @@ def patch_lora_forwards(torch_compile_options):
             # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
             # if used in source but not available in parent module
             variant_kwarg_import = ""
-            if "VARIANT_KWARG_KEYS" in source:
+            if re.search(r'\bVARIANT_KWARG_KEYS\b', source):
                 variant_kwarg_import = "from peft.tuners.lora.layer import VARIANT_KWARG_KEYS\n"
 
             forward = create_new_function(
@@ -1863,9 +1863,7 @@ def patch_lora_forwards(torch_compile_options):
                 compiled_lora_forward + source,
                 parent,
                 dir(eval(parent)),
-                prepend = \
-                    f"\n{variant_kwarg_import}" \
-                    f"torch_compile_options = {torch_compile_options}\n" + extra_prepend
+                prepend = f"\n{variant_kwarg_import}torch_compile_options = {torch_compile_options}\n" + extra_prepend
             ).unsloth_forward
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
