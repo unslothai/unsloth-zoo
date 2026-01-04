@@ -125,8 +125,8 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
-    if target_gb == 0:
-        raise RuntimeError("Unsloth: No GPU memory available for fused cross entropy.")
+    if target_gb <= 1e-9: # Use a small epsilon for float comparison
+        raise RuntimeError("Unsloth: No or negligible GPU memory available for fused cross entropy.")
 
     multiplier = (vocab_size * 4 / 1024 / 1024 / 1024) / (target_gb)
     multiplier = multiplier / 4 # Output only multiples of 4
