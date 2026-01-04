@@ -1853,10 +1853,16 @@ def patch_lora_forwards(torch_compile_options):
                 )
 
             # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
-            # if used in source but not available in parent module
+            # if used in source but not available in parent module.
+            # Use try/except with fallback in case peft moves the constant in future versions.
             variant_kwarg_import = ""
             if re.search(r'\bVARIANT_KWARG_KEYS\b', source):
-                variant_kwarg_import = "from peft.tuners.lora.layer import VARIANT_KWARG_KEYS\n"
+                variant_kwarg_import = (
+                    "try:\n"
+                    "    from peft.tuners.lora.layer import VARIANT_KWARG_KEYS\n"
+                    "except ImportError:\n"
+                    "    VARIANT_KWARG_KEYS = ['alora_offsets']\n"
+                )
 
             forward = create_new_function(
                 f"{child}_peft_forward",
