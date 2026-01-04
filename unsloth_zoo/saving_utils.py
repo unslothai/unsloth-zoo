@@ -105,13 +105,13 @@ def create_huggingface_repo(
     if repo_id.count("/") != 1:
         raise TypeError(f"Unsloth: You are pushing to Hugging Face, but {repo_id} is not a valid repo.")
 
-    from huggingface_hub import ModelCard
+    from huggingface_hub import ModelCard, HfApi
     if token is None: token = get_token()
-    repo_id = PushToHubMixin._create_repo(
-        PushToHubMixin,
+    api = HfApi(token = token)
+    repo_url = api.create_repo(
         repo_id = repo_id,
         private = private,
-        token = token,
+        exist_ok = True,  # don't error if repo already exists
     )
     username = repo_id.split("/")[0]
 
@@ -139,7 +139,6 @@ def create_huggingface_repo(
     card = ModelCard(content)
     card.push_to_hub(repo_id, token = token, commit_message = "Unsloth Model Card")
 
-    from huggingface_hub import HfApi
     hf_api = HfApi(token = token)
     return username, repo_id, hf_api
 pass
@@ -656,6 +655,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 temp_filename = temp_file.name
                 # Save the merged tensor to a unique temp file
                 torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+                del W
                 # Load it back as a memory-mapped object. The OS will manage paging this from disk.
                 W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
 
@@ -2498,6 +2498,12 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
 
         # Write directly to memory map
         mm[index_L:index_R] = bytes(byte_data)
+
+        # Clear memory
+        del data_ptr
+        del tensor_view
+        del tensor_formatted
+        del tensor
 
         return True
 

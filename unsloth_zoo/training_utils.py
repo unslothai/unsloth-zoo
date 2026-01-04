@@ -116,9 +116,18 @@ def prepare_model_for_training(
         # We need to upcast to float32
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
+        # For full finetuning, update config dtype to match actual weight dtype.
+        # The KV cache uses model.config.torch_dtype, but weights are upcast to float32.
+        # Without this, generation fails with dtype mismatch in index_copy_().
+        if full_finetuning:
+            model._unsloth_original_dtype = dtype
+            model.config.torch_dtype = torch.float32
     elif dtype == torch.bfloat16 and float32_mixed_precision:
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
+        if full_finetuning:
+            model._unsloth_original_dtype = dtype
+            model.config.torch_dtype = torch.float32
     elif dtype == torch.bfloat16:
         mixed_precision_dtype = torch.bfloat16
         os.environ["UNSLOTH_MIXED_PRECISION"] = "bfloat16"
@@ -199,7 +208,13 @@ def prepare_model_for_training(
 
     # Also set HF version manually to stop failures
     if hasattr(model, "_set_gradient_checkpointing"):
-        model._set_gradient_checkpointing()
+        if use_gradient_checkpointing in (True, "unsloth"):
+            model._set_gradient_checkpointing()
+        else:
+            # Ensure checkpointing stays disabled if explicitly requested.
+            for module in model.modules():
+                if hasattr(module, "gradient_checkpointing"):
+                    module.gradient_checkpointing = False
 
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:
