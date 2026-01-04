@@ -25,6 +25,7 @@ __all__ = [
 
 from packaging.version import Version as TrueVersion
 import torch
+import torch.distributed as dist
 import os
 import time
 import contextlib
@@ -39,7 +40,7 @@ def Version(version):
         new_version = str(version)
         new_version = re.match(r"[0-9\.]{1,}", new_version)
         if new_version is None:
-            raise Exception(str(e))
+            raise ValueError(f"Invalid version format: {version}")
         new_version = new_version.group(0).rstrip(".")
         if new_version != version:
             new_version += ".1" # Add .1 for dev / alpha / beta / rc

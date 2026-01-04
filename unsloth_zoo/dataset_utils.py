@@ -22,7 +22,6 @@ __all__ = [
 
 from typing import Union, Callable, Optional, List, Dict
 import torch
-import psutil
 
 # From https://www.geeksforgeeks.org/longest-common-substring-array-strings/
 # Longest Common Substring in an Array of Strings
@@ -330,7 +329,8 @@ def train_on_responses_only(
         return _train_on_responses_only
 
     if num_proc is None or type(num_proc) is not int:
-        num_proc = min(max(psutil.cpu_count()+4, 2), 64)
+        import psutil
+        num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
         # Check memory left so we can reduce multiprocessing to converse memory
         memory_gb_left = psutil.virtual_memory().available / (1024**3)
         if memory_gb_left <= 2:
@@ -613,7 +613,8 @@ def sft_prepare_dataset(
         if not isinstance(dataset, IterableDataset):
             dataset_num_proc = getattr(args, "dataset_num_proc", None)
             if dataset_num_proc is None:
-                dataset_num_proc = max(psutil.cpu_count()+4, 2)
+                import psutil
+                dataset_num_proc = max((psutil.cpu_count() or 1)+4, 2)
                 # Check memory left so we can reduce multiprocessing to converse memory
                 memory_gb_left = psutil.virtual_memory().available / (1024**3)
                 if memory_gb_left <= 4:
