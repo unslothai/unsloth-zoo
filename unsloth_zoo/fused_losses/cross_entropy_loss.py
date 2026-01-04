@@ -343,7 +343,16 @@ class UnslothFusedLoss(torch.autograd.Function):
             grad_scale = float(grad_output)
         scaling_val = float(scaling) if not torch.is_tensor(scaling) else float(scaling.detach().cpu().item())
 
-        scale_factor = (grad_scale / scaling_val) if scaling_val != 0.0 else 1.0
+        if scaling_val == 0.0:
+            if grad_scale != 0.0:
+                raise RuntimeError(
+                    "Unsloth fused CE loss: received non-zero grad_output with scaling=0. "
+                    "This would produce incorrect zero gradients."
+                )
+            scale_factor = 1.0
+        else:
+            scale_factor = grad_scale / scaling_val
+
         if UNSLOTH_ENABLE_LOGGING:
             if scale_factor == 1.0:
                 torch._assert(
@@ -351,9 +360,21 @@ class UnslothFusedLoss(torch.autograd.Function):
                     f"Fused losses expect grad_output to be all {scaling}, but got {grad_output.ravel()[:10]}",
                 )
             else:
-                logger.info(
-                    f"Fused losses grad_output scaled by {scale_factor} (got {grad_scale}, expected {scaling_val})"
-                )
+                world_size = None
+                try:
+                    import torch.distributed as dist
+                    if dist.is_available() and dist.is_initialized():
+                        world_size = dist.get_world_size()
+                except Exception:
+                    world_size = None
+                if world_size is not None:
+                    logger.info(
+                        f"Fused losses grad_output scaled by {scale_factor} (got {grad_scale}, expected {scaling_val} or {scaling_val * world_size})"
+                    )
+                else:
+                    logger.info(
+                        f"Fused losses grad_output scaled by {scale_factor} (got {grad_scale}, expected {scaling_val})"
+                    )
         if scale_factor != 1.0:
             grad_inputs.mul_(scale_factor)
             if grad_lm_head is not None: grad_lm_head.mul_(scale_factor)
