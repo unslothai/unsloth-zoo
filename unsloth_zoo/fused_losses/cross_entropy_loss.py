@@ -344,6 +344,16 @@ class UnslothFusedLoss(torch.autograd.Function):
         scaling_val = float(scaling) if not torch.is_tensor(scaling) else float(scaling.detach().cpu().item())
 
         scale_factor = (grad_scale / scaling_val) if scaling_val != 0.0 else 1.0
+        if UNSLOTH_ENABLE_LOGGING:
+            if scale_factor == 1.0:
+                torch._assert(
+                    torch.all(grad_output == scaling),
+                    f"Fused losses expect grad_output to be all {scaling}, but got {grad_output.ravel()[:10]}",
+                )
+            else:
+                logger.info(
+                    f"Fused losses grad_output scaled by {scale_factor} (got {grad_scale}, expected {scaling_val})"
+                )
         if scale_factor != 1.0:
             grad_inputs.mul_(scale_factor)
             if grad_lm_head is not None: grad_lm_head.mul_(scale_factor)
