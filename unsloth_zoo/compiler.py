@@ -54,6 +54,8 @@ from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
 from .temporary_patches.common import get_torch_compile_options
 from .hf_utils import get_transformers_model_type
+from packaging import version
+import peft
 
 try:
     ScriptFunction = torch.jit.torch.jit.ScriptFunction
@@ -1854,9 +1856,12 @@ def patch_lora_forwards(torch_compile_options):
 
             # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
             # if used in source but not available in parent module
-            # variant_kwarg_import = ""
-            # if re.search(r'\bVARIANT_KWARG_KEYS\b', source):
-            variant_kwarg_import = "from peft.tuners.lora.layer import VARIANT_KWARG_KEYS\n"
+            variant_kwarg_import = ""
+
+            if version.parse(peft.__version__) >= version.parse("0.18.0"):
+                variant_kwarg_import = (
+                    "from peft.tuners.lora.layer import VARIANT_KWARG_KEYS\n"
+                )
 
             forward = create_new_function(
                 f"{child}_peft_forward",
