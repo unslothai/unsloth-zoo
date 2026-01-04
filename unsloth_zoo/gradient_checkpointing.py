@@ -867,28 +867,6 @@ def reset_unsloth_gradient_checkpointing_buffers():
     if len(CPU_BUFFERS) == 0:
         return
 
-    # Get dtype from existing buffer
-    dtype = None
-    for buf in CPU_BUFFERS:
-        if buf is not None and hasattr(buf, "dtype"):
-            dtype = buf.dtype
-            break
-    pass
-
-    if dtype is None:
-        # Fallback to determining dtype from device capability
-        if DEVICE_TYPE == "cuda":
-            major_version, minor_version = torch.cuda.get_device_capability()
-            SUPPORTS_BFLOAT16 = (major_version >= 8)
-        elif DEVICE_TYPE == "hip":
-            SUPPORTS_BFLOAT16 = True
-        elif DEVICE_TYPE == "xpu":
-            SUPPORTS_BFLOAT16 = True
-        else:
-            SUPPORTS_BFLOAT16 = True
-        dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
-    pass
-
     # Reset CPU buffers to initial size and remove excess buffers
     for i in range(len(CPU_BUFFERS)):
         if i < INITIAL_CPU_BUFFER_COUNT:
