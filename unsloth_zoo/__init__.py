@@ -129,6 +129,30 @@ elif os.name == 'nt':
     delete_key("PYTORCH_HIP_ALLOC_CONF")
     delete_key("PYTORCH_ALLOC_CONF")
 
+# Expandable segments does NOT work with vLLM on Blackwell GPUs (SM100)
+# vLLM's CuMemAllocator uses torch.cuda.MemPool which rejects expandable_segments
+def _check_blackwell_vllm():
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        # Check for SM100 (Blackwell: B200, B100, etc.)
+        for i in range(torch.cuda.device_count()):
+            major, minor = torch.cuda.get_device_capability(i)
+            if major == 10:
+                # Check if vLLM is installed
+                if importlib.util.find_spec("vllm") is not None:
+                    return True
+        return False
+    except Exception:
+        return False
+
+if _check_blackwell_vllm():
+    delete_key("PYTORCH_CUDA_ALLOC_CONF")
+    delete_key("PYTORCH_HIP_ALLOC_CONF")
+    delete_key("PYTORCH_ALLOC_CONF")
+del _check_blackwell_vllm
+
 # Suppress WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.7.0+cu126 for torchao version 0.14.1
 # Please see https://github.com/pytorch/ao/issues/2919 for more info
 import logging
