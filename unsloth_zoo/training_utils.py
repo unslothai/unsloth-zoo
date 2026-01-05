@@ -22,10 +22,9 @@ from transformers import get_scheduler as transformers_get_scheduler
 from transformers import Trainer
 from transformers.trainer_utils import seed_worker as trainer_utils_seed_worker
 from tqdm import tqdm as ProgressBar
-from packaging.version import Version
 import time
 from typing import Any, Optional, List, Dict, Tuple
-from .utils import _get_dtype
+from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
 import os
 import re
@@ -208,7 +207,13 @@ def prepare_model_for_training(
 
     # Also set HF version manually to stop failures
     if hasattr(model, "_set_gradient_checkpointing"):
-        model._set_gradient_checkpointing()
+        if use_gradient_checkpointing in (True, "unsloth"):
+            model._set_gradient_checkpointing()
+        else:
+            # Ensure checkpointing stays disabled if explicitly requested.
+            for module in model.modules():
+                if hasattr(module, "gradient_checkpointing"):
+                    module.gradient_checkpointing = False
 
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:

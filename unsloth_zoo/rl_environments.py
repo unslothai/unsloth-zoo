@@ -852,6 +852,29 @@ def is_port_open(host, port):
 pass
 
 
+def _get_openenv_pythonpath(working_directory: str) -> str:
+    """
+    Auto-detect OpenEnv version and return correct PYTHONPATH.
+
+    OpenEnv structure changed at commit 83dda10 ("move envs to root"):
+    - New structure (commit 151+): envs/ at root, openenv in src/
+    - Old structure (commits 514-152): envs/ in src/
+    """
+    root_client = os.path.join(working_directory, "envs", "openspiel_env", "client.py")
+    src_client = os.path.join(working_directory, "src", "envs", "openspiel_env", "client.py")
+    src_path = os.path.join(working_directory, "src")
+
+    if os.path.exists(root_client):
+        # New structure: envs at root + openenv in src
+        return f"{working_directory}{os.pathsep}{src_path}"
+    elif os.path.exists(src_client):
+        # Old structure: everything in src
+        return src_path
+    else:
+        # Fallback: try both paths
+        return f"{working_directory}{os.pathsep}{src_path}"
+
+
 def launch_openenv(
     port : int = 8111,
     openenv_process = None,
@@ -867,6 +890,13 @@ def launch_openenv(
     assert type(working_directory) is str
     assert openenv_class is not None
     assert type(server) is str
+
+    # Auto-fix PYTHONPATH for OpenEnv compatibility
+    correct_pythonpath = _get_openenv_pythonpath(working_directory)
+    if environment.get("PYTHONPATH") != correct_pythonpath:
+        environment = dict(environment)  # Don't mutate original
+        environment["PYTHONPATH"] = correct_pythonpath
+
     localhost = f"http://localhost:{port}"
 
     def check_openenv_works(process):
