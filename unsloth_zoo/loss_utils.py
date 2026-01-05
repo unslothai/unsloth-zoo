@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import torch
-from packaging.version import Version
+from .utils import Version
 import os
 import math
 import functools

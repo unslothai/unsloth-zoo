@@ -22,10 +22,9 @@ from transformers import get_scheduler as transformers_get_scheduler
 from transformers import Trainer
 from transformers.trainer_utils import seed_worker as trainer_utils_seed_worker
 from tqdm import tqdm as ProgressBar
-from packaging.version import Version
 import time
 from typing import Any, Optional, List, Dict, Tuple
-from .utils import _get_dtype
+from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
 import os
 import re
