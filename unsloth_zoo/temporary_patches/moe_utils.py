@@ -385,7 +385,7 @@ def forward_triton_grouped_gemm(
     if self.gate_up_proj.shape[-1] == hidden_dim:
          w1 = self.gate_up_proj
     else:
-         w1 = self.gate_up_proj.transpose(-2, -1)
+         w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
 
     # First grouped GEMM: gate_up projection
     first_gemm_output = grouped_gemm(
@@ -411,7 +411,7 @@ def forward_triton_grouped_gemm(
     if self.down_proj.shape[-1] == intermediate.shape[-1]:
          w2 = self.down_proj
     else:
-         w2 = self.down_proj.transpose(-2, -1)
+         w2 = self.down_proj.transpose(-2, -1).contiguous()
 
     second_gemm_output = grouped_gemm(
         X=intermediate,
