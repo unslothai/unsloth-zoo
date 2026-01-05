@@ -22,6 +22,38 @@ import os
 _GROUPED_GEMM_AVAILABLE = None
 _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 
+# Check if GPU supports torch._grouped_mm (requires compute capability >= 9.0)
+_TORCH_GROUPED_MM_SUPPORTED = None
+
+def _check_torch_grouped_mm_supported():
+    """
+    Check if torch._grouped_mm is actually supported on the current GPU.
+    It requires CUDA compute capability >= 9.0 (H100 and newer).
+    """
+    global _TORCH_GROUPED_MM_SUPPORTED
+    if _TORCH_GROUPED_MM_SUPPORTED is not None:
+        return _TORCH_GROUPED_MM_SUPPORTED
+
+    if not _TORCH_GROUPED_MM_AVAILABLE:
+        _TORCH_GROUPED_MM_SUPPORTED = False
+        return False
+
+    if not torch.cuda.is_available():
+        _TORCH_GROUPED_MM_SUPPORTED = False
+        return False
+
+    try:
+        # Get compute capability of current device
+        device = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device)
+        compute_capability = major + minor / 10.0
+        # torch._grouped_mm requires compute capability >= 9.0 (H100)
+        _TORCH_GROUPED_MM_SUPPORTED = compute_capability >= 9.0
+    except Exception:
+        _TORCH_GROUPED_MM_SUPPORTED = False
+
+    return _TORCH_GROUPED_MM_SUPPORTED
+
 _TRITON_ALLOCATOR_INITIALIZED = False
 _PERSISTENT_BUFFER = None
 
@@ -105,7 +137,7 @@ def select_moe_backend():
     # Choices ordered by preference
     # (backend_name, is_available)
     choices = [
-        ("grouped_mm",     hasattr(torch, "_grouped_mm")),
+        ("grouped_mm",     _check_torch_grouped_mm_supported()),
         ("unsloth_triton", _check_grouped_gemm_available()),
         ("native_torch",   True),
     ]
@@ -134,8 +166,10 @@ def select_moe_backend():
     # 2. Automatic selection (first available in preference order)
     for name, available in choices:
         if available:
+            print(f"Unsloth: Using MoE backend '{name}'")
             return name
 
+    print("Unsloth: Using MoE backend 'native_torch' (fallback)")
     return "native_torch"
 
 
@@ -191,7 +225,16 @@ def forward_native_grouped_mm(
     """
     Native Pytorch grouped GEMM MoE forward pass.
     Uses torch._grouped_mm which is significantly faster than loop and works without Triton dependencies.
+    Requires CUDA compute capability >= 9.0 (H100 and newer).
     """
+    # Runtime safety check - defense in depth
+    if not _check_torch_grouped_mm_supported():
+        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+        raise RuntimeError(
+            f"torch._grouped_mm requires CUDA compute capability >= 9.0 (H100), "
+            f"but current device has {major}.{minor}. "
+            f"Set UNSLOTH_MOE_BACKEND='unsloth_triton' or 'native_torch' to use a compatible backend."
+        )
 
 
     if hidden_states.dim() == 2:
