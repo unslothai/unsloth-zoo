@@ -46,7 +46,7 @@ try:
 except:
     from typing_extensions import _TypedDictMeta as t_TypedDictMeta
 
-from packaging.version import Version
+from ..utils import Version
 from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
 
 EMPTY = inspect._empty
