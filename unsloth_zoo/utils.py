@@ -67,7 +67,7 @@ def Version(version):
                 pass
 
         # First try matching from the start, then search anywhere in the string.
-        match = re.match(r"[0-9\.]{1,}", raw)
+        match = re.match(r"[0-9]+(?:\.[0-9]+)*", raw)
         match_at_start = match is not None
         if match is None:
             match = re.search(r"[0-9]+(?:\.[0-9]+)*", raw)
