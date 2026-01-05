@@ -240,4 +240,92 @@ def patch_qwen3_vl_moe():
 
     transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.__UNSLOTH_PATCHED__ = True
 
+    # ====================================================================
+    # Patch Qwen3VLMoeForConditionalGeneration.forward for GRPO training
+    # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
+    # ====================================================================
+    try:
+        from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+            Qwen3VLMoeForConditionalGeneration,
+            Qwen3VLMoeCausalLMOutputWithPast,
+        )
+
+        _original_causal_lm_forward = Qwen3VLMoeForConditionalGeneration.forward
+
+        def _patched_causal_lm_forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            labels=None,
+            pixel_values=None,
+            pixel_values_videos=None,
+            image_grid_thw=None,
+            video_grid_thw=None,
+            cache_position=None,
+            logits_to_keep=0,
+            **kwargs,
+        ):
+            RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+
+            if not RETURN_HIDDEN_STATES:
+                # Normal forward pass
+                return _original_causal_lm_forward(
+                    self,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    labels=labels,
+                    pixel_values=pixel_values,
+                    pixel_values_videos=pixel_values_videos,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    cache_position=cache_position,
+                    logits_to_keep=logits_to_keep,
+                    **kwargs,
+                )
+
+            # RETURN_HIDDEN_STATES mode - return hidden_states instead of logits
+            outputs = self.model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = outputs[0]
+
+            # Apply slice_indices to hidden_states (same indexing as for logits)
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            # Return hidden_states as "logits" for GRPO to use
+            logits = hidden_states[:, slice_indices, :]
+
+            return Qwen3VLMoeCausalLMOutputWithPast(
+                loss=None,
+                aux_loss=None,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                rope_deltas=outputs.rope_deltas,
+            )
+
+        Qwen3VLMoeForConditionalGeneration.forward = _patched_causal_lm_forward
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info("Unsloth: Patched Qwen3VLMoeForConditionalGeneration.forward for GRPO hidden states.")
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Could not patch Qwen3VLMoeForConditionalGeneration.forward: {e}")
+
 TEMPORARY_PATCHES.append(patch_qwen3_vl_moe)
