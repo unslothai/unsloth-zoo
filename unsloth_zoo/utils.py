@@ -24,6 +24,7 @@ __all__ = [
 ]
 
 from packaging.version import Version as TrueVersion
+from importlib.metadata import version as importlib_version, PackageNotFoundError
 import torch
 import torch.distributed as dist
 import os
@@ -37,12 +38,45 @@ from filelock import FileLock
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        new_version = str(version)
-        new_version = re.match(r"[0-9\.]{1,}", new_version)
-        if new_version is None:
-            raise ValueError(f"Invalid version format: {version}")
-        new_version = new_version.group(0).rstrip(".")
-        if new_version != version:
+        if isinstance(version, TrueVersion):
+            return version
+
+        raw = None
+        package_name = None
+
+        if isinstance(version, str):
+            raw = version
+        else:
+            package_name = getattr(version, "__name__", None) or getattr(version, "__package__", None)
+            raw = getattr(version, "__version__", None)
+            if raw in (None, "", "unknown") and package_name:
+                try:
+                    raw = importlib_version(package_name)
+                except PackageNotFoundError:
+                    raw = None
+
+        if raw in (None, ""):
+            raw = str(version)
+
+        raw = str(raw)
+
+        if raw == "unknown" and package_name:
+            try:
+                raw = importlib_version(package_name)
+            except PackageNotFoundError:
+                pass
+
+        # First try matching from the start, then search anywhere in the string.
+        match = re.match(r"[0-9]+(?:\.[0-9]+)*", raw)
+        match_at_start = match is not None
+        if match is None:
+            match = re.search(r"[0-9]+(?:\.[0-9]+)*", raw)
+            match_at_start = False
+        if match is None:
+            raise ValueError(f"Invalid version format: {raw}")
+
+        new_version = match.group(0).rstrip(".")
+        if match_at_start and new_version != raw:
             new_version += ".1" # Add .1 for dev / alpha / beta / rc
         return TrueVersion(new_version)
     except:

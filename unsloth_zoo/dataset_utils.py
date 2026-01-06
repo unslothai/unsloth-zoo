@@ -330,7 +330,7 @@ def train_on_responses_only(
 
     if num_proc is None or type(num_proc) is not int:
         import psutil
-        num_proc = min(max(psutil.cpu_count()+4, 2), 64)
+        num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
         # Check memory left so we can reduce multiprocessing to converse memory
         memory_gb_left = psutil.virtual_memory().available / (1024**3)
         if memory_gb_left <= 2:
@@ -614,7 +614,7 @@ def sft_prepare_dataset(
             dataset_num_proc = getattr(args, "dataset_num_proc", None)
             if dataset_num_proc is None:
                 import psutil
-                dataset_num_proc = max(psutil.cpu_count()+4, 2)
+                dataset_num_proc = max((psutil.cpu_count() or 1)+4, 2)
                 # Check memory left so we can reduce multiprocessing to converse memory
                 memory_gb_left = psutil.virtual_memory().available / (1024**3)
                 if memory_gb_left <= 4:

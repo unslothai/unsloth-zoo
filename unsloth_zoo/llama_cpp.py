@@ -421,10 +421,10 @@ def install_llama_cpp(
     build_errors = []
 
     # Check for Colab / Kaggle, and deduct some CPUs to conserve memory
-    cpu_count = psutil.cpu_count()
+    cpu_count = psutil.cpu_count() or 1
     if IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT:
         cpu_count = cpu_count - 1
-        cpu_count = min(cpu_count, 1)
+        cpu_count = max(cpu_count, 1)
 
     # Try make first
     try:

@@ -724,7 +724,6 @@ def patch_vllm_graph_capture():
     except Exception as e:
         print(f"Unsloth: Could not patch vLLM V1 graph capture: {e}")
 
-    from packaging.utils import Version
     if Version(vllm.__version__) < Version("0.11.0"):
         # Also patch vLLM v0. vLLM v0 is deprecated in vLLM v0.11.0 so only do when appropriate.
         try:
