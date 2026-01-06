@@ -173,11 +173,11 @@ def select_moe_backend():
     return "native_torch"
 
 
-def _get_routing_indices_optimized(selected_experts, num_experts):
+@torch.no_grad()
+def _get_routing_indices(selected_experts, num_experts):
     """
-    Optimized token→expert mapping for grouped GEMM.
+    Compute token→expert mapping for grouped GEMM.
     Uses bincount instead of histc to avoid float conversion overhead.
-    Reuses buffers when possible to reduce memory allocation pressure.
 
     Returns:
         token_counts_by_expert: (num_experts,) token counts per expert
@@ -195,19 +195,6 @@ def _get_routing_indices_optimized(selected_experts, num_experts):
     gather_indices = flat_experts.argsort(stable=True)
 
     return token_counts_by_expert, gather_indices
-
-
-@torch.no_grad()
-def _get_routing_indices(selected_experts, num_experts):
-    """
-    Compute token→expert mapping for grouped GEMM.
-    Wrapper that uses optimized implementation.
-
-    Returns:
-        token_counts_by_expert: (num_experts,) token counts per expert
-        gather_indices: (total_tokens,) indices for gathering tokens in expert order
-    """
-    return _get_routing_indices_optimized(selected_experts, num_experts)
 
 
 def _silu_and_mul(x):
