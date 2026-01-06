@@ -165,8 +165,8 @@ def patch_qwen3_moe():
                 return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
 
         elif backend == "unsloth_triton":
-            # Import grouped GEMM interface (sys.path was set by _check_grouped_gemm_available)
-            from grouped_gemm.interface import grouped_gemm, supports_tma
+            # Import grouped GEMM interface
+            from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
             # Import autotune cache
             # from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
 

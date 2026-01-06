@@ -96,35 +96,19 @@ def _init_triton_allocator():
 
 def _check_grouped_gemm_available():
     """Check if Unsloth grouped GEMM kernels are available."""
-    # Check if user wants to force disable Triton kernels
     if os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1":
         return False
 
     global _GROUPED_GEMM_AVAILABLE
-    if _GROUPED_GEMM_AVAILABLE is None:
-        try:
-            # The grouped_gemm module uses relative imports like `from grouped_gemm.kernels...`
-            # so we need to add its parent directory to sys.path
-            import sys
-            import unsloth
+    if _GROUPED_GEMM_AVAILABLE is not None:
+        return _GROUPED_GEMM_AVAILABLE
 
-            if hasattr(unsloth, "__file__") and unsloth.__file__ is not None:
-                unsloth_path = os.path.dirname(unsloth.__file__)
-            else:
-                 # Fallback for namespace package or editable install
-                 unsloth_path = list(unsloth.__path__)[0]
-                 if os.path.exists(os.path.join(unsloth_path, "unsloth", "kernels")):
-                     unsloth_path = os.path.join(unsloth_path, "unsloth")
-
-            moe_kernels_path = os.path.join(unsloth_path, "kernels", "moe")
-            if moe_kernels_path not in sys.path:
-                sys.path.insert(0, moe_kernels_path)
-            from grouped_gemm.interface import grouped_gemm, supports_tma
-            _GROUPED_GEMM_AVAILABLE = True
-            # Initialize persistent allocator when grouped GEMM is available
-            _init_triton_allocator()
-        except (ImportError, ModuleNotFoundError) as e:
-            _GROUPED_GEMM_AVAILABLE = False
+    try:
+        from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
+        _GROUPED_GEMM_AVAILABLE = True
+        _init_triton_allocator()
+    except (ImportError, ModuleNotFoundError):
+        _GROUPED_GEMM_AVAILABLE = False
     return _GROUPED_GEMM_AVAILABLE
 
 
@@ -312,8 +296,8 @@ def forward_triton_grouped_gemm(
     """
 
 
-    # Import grouped GEMM interface (sys.path was set by _check_grouped_gemm_available)
-    from grouped_gemm.interface import grouped_gemm
+    # Import grouped GEMM interface
+    from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
     # Import autotune cache
     from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
 
