@@ -236,9 +236,9 @@ def forward_native_grouped_mm(
         # Handle different weight shapes (e.g. Qwen3 vs Qwen3VL)
         # If dim 1 matches hidden state dim, no transpose needed.
         if self.gate_up_proj.shape[1] == hidden_dim:
-             w1 = self.gate_up_proj
+            w1 = self.gate_up_proj
         else:
-             w1 = self.gate_up_proj.transpose(-2, -1)
+            w1 = self.gate_up_proj.transpose(-2, -1)
         mm1_out = torch._grouped_mm(permuted_input, w1, offs=offsets)
         gate, up = mm1_out.chunk(2, dim=-1)
     elif hasattr(self, "w1") and hasattr(self, "w3"):
@@ -255,9 +255,9 @@ def forward_native_grouped_mm(
     # Grouped GEMM 2
     if hasattr(self, "down_proj"):
         if self.down_proj.shape[1] == inter.shape[-1]:
-             w2 = self.down_proj
+            w2 = self.down_proj
         else:
-             w2 = self.down_proj.transpose(-2, -1)
+            w2 = self.down_proj.transpose(-2, -1)
     elif hasattr(self, "w2"):
         w2 = self.w2.transpose(-2, -1)
     else:
@@ -354,9 +354,9 @@ def forward_triton_grouped_gemm(
     )
 
     if self.gate_up_proj.shape[-1] == hidden_dim:
-         w1 = self.gate_up_proj
+        w1 = self.gate_up_proj
     else:
-         w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
+        w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
 
     # First grouped GEMM: gate_up projection
     first_gemm_output = grouped_gemm(
@@ -380,9 +380,9 @@ def forward_triton_grouped_gemm(
     # Grouped GEMM 2: down projection
 
     if self.down_proj.shape[-1] == intermediate.shape[-1]:
-         w2 = self.down_proj
+        w2 = self.down_proj
     else:
-         w2 = self.down_proj.transpose(-2, -1).contiguous()
+        w2 = self.down_proj.transpose(-2, -1).contiguous()
 
     second_gemm_output = grouped_gemm(
         X=intermediate,
