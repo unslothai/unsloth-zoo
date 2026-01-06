@@ -67,7 +67,12 @@ def patch_qwen3_vl_moe():
         @torch.compiler.disable
         def old_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             """ """
-            batch_size, sequence_length, hidden_dim = hidden_states.shape
+            if hidden_states.dim() == 3:
+                batch_size, sequence_length, hidden_dim = hidden_states.shape
+            else:
+                total_tokens, hidden_dim = hidden_states.shape
+                batch_size = 1
+                sequence_length = total_tokens
             hidden_states = hidden_states.view(-1, hidden_dim)
             # router_logits: (batch * sequence_length, n_experts)
             router_logits = self.gate(hidden_states)

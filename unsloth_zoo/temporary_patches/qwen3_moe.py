@@ -119,6 +119,15 @@ def patch_qwen3_moe():
 
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             """ """
+            is_3d = hidden_states.dim() == 3
+            if is_3d:
+                batch_size, sequence_length, hidden_dim = hidden_states.shape
+            else:
+                total_tokens, hidden_dim = hidden_states.shape
+                batch_size = 1
+                sequence_length = total_tokens
+
+            hidden_states = hidden_states.view(-1, hidden_dim)
             router_scores, selected_experts, router_logits = router_forward(self, hidden_states)
             final_hidden_states = torch.zeros(
                 (batch_size * sequence_length, hidden_dim), dtype=torch.float32, device=hidden_states.device
@@ -140,7 +149,9 @@ def patch_qwen3_moe():
                 # However `index_add_` only support torch tensors for indexing so we'll use
                 # the `top_x` tensor here.
                 final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(torch.float32))
-            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+            if is_3d:
+                final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
             return final_hidden_states.to(hidden_states.dtype), router_logits
     else:
     # ====================================================================
@@ -239,13 +250,33 @@ def patch_qwen3_moe():
                 return final_hidden_states
 
         # SparseMoeBlock forward is disabled from compilation due to dynamic routing
+        # SparseMoeBlock forward is disabled from compilation due to dynamic routing
         @torch.compiler.disable
         def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            batch_size, sequence_length, hidden_dim = hidden_states.shape
+            if hidden_states.dim() == 3:
+                batch_size, sequence_length, hidden_dim = hidden_states.shape
+            else:
+                total_tokens, hidden_dim = hidden_states.shape
+                batch_size = 1
+                sequence_length = total_tokens
+
             hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-            _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+
+            # self.gate is nn.Linear - so it returns logits!
+            router_logits = self.gate(hidden_states_reshaped)
+
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+            if self.norm_topk_prob:
+                routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+            # we cast back to the input dtype
+            routing_weights = routing_weights.to(hidden_states.dtype)
+
             final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
-            return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+            if hidden_states.dim() == 3:
+                return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+            return final_hidden_states
 
     # For old transformers, patch Qwen3MoeSparseMoeBlock
     # For new transformers, patch Qwen3MoeExperts (which has the expert loop)

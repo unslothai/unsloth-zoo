@@ -308,10 +308,24 @@ def forward_triton_grouped_gemm(
     # For now, let's attach it to self if possible, or use a global usage
     # Attaching to self is cleaner: self._unsloth_moe_configs
 
+    # Create expert mask and find which experts have tokens
     if not hasattr(self, "_unsloth_moe_configs"):
         self._unsloth_moe_configs = None
 
-    num_tokens, hidden_dim = hidden_states.shape
+    # Handle 3D inputs (batch_size, seq_len, hidden_dim)
+    is_3d = hidden_states.dim() == 3
+    if is_3d:
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        num_tokens = batch_size * seq_len
+        # Also flatten top_k inputs if they are 3D
+        if top_k_index.dim() == 3:
+            top_k_index = top_k_index.view(-1, top_k_index.shape[-1])
+        if top_k_weights.dim() == 3:
+            top_k_weights = top_k_weights.view(-1, top_k_weights.shape[-1])
+    else:
+        num_tokens, hidden_dim = hidden_states.shape
+
     top_k = top_k_index.shape[1]
 
     # Cache model dimensions and kernel configs on first call
@@ -406,5 +420,8 @@ def forward_triton_grouped_gemm(
         * top_k_weights[..., None]
     )
     final_hidden_states = final_hidden_states.sum(dim=1)
+
+    if is_3d:
+        final_hidden_states = final_hidden_states.view(batch_size, seq_len, hidden_dim)
 
     return final_hidden_states
