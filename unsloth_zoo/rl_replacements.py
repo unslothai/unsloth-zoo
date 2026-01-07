@@ -838,41 +838,41 @@ def grpo_accumulated_loss(
                 logit_softcapping, temperature
             )
     
-    with autocaster:
-        for (
-            input_ids_chunk,
-            attention_mask_chunk,
-            pixel_values_chunk,
-            image_grid_thw_chunk,
-            pixel_attention_mask_chunk,
-            image_sizes_chunk,
-            completion_ids 
-        ) in zipped_inputs:
-
-            if pixel_values is None:
-                new_hidden_states_chunk = unwrapped_model(
-                    input_ids = input_ids_chunk,
-                    attention_mask = attention_mask_chunk,
-                    pixel_values = pixel_values_chunk,
-                    image_grid_thw = image_grid_thw_chunk,
-                    pixel_attention_mask = pixel_attention_mask_chunk,
-                    image_sizes = image_sizes_chunk,
-                ).logits
-                
-                new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
-                new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
-            else: 
-                new_hidden_states_chunk = unwrapped_model(
-                    input_ids = input_ids_chunk,
-                    attention_mask = attention_mask_chunk,
-                    pixel_values = pixel_values_chunk,
-                    image_grid_thw = image_grid_thw_chunk,
-                    pixel_attention_mask = pixel_attention_mask_chunk,
-                    image_sizes = image_sizes_chunk,
-                    logits_to_keep = logits_to_keep + 1, 
-                ).logits
-                
-                new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
+    
+    for (
+        input_ids_chunk,
+        attention_mask_chunk,
+        pixel_values_chunk,
+        image_grid_thw_chunk,
+        pixel_attention_mask_chunk,
+        image_sizes_chunk,
+        completion_ids 
+    ) in zipped_inputs:
+            with autocaster:
+                if pixel_values is None:
+                    new_hidden_states_chunk = unwrapped_model(
+                        input_ids = input_ids_chunk,
+                        attention_mask = attention_mask_chunk,
+                        pixel_values = pixel_values_chunk,
+                        image_grid_thw = image_grid_thw_chunk,
+                        pixel_attention_mask = pixel_attention_mask_chunk,
+                        image_sizes = image_sizes_chunk,
+                    ).logits
+                    
+                    new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
+                    new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
+                else: 
+                    new_hidden_states_chunk = unwrapped_model(
+                        input_ids = input_ids_chunk,
+                        attention_mask = attention_mask_chunk,
+                        pixel_values = pixel_values_chunk,
+                        image_grid_thw = image_grid_thw_chunk,
+                        pixel_attention_mask = pixel_attention_mask_chunk,
+                        image_sizes = image_sizes_chunk,
+                        logits_to_keep = logits_to_keep + 1, 
+                    ).logits
+                    
+                    new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
 
             logprobs_chunk = efficient_log_softmax(
                 new_hidden_states_chunk, 
@@ -893,21 +893,21 @@ def grpo_accumulated_loss(
 
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
         
-        #with autocaster:
-        loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
-            new_logprobs,
-            old_logps,
-            ref_logps,
-            sampling_per_token_logps,
-            lm_head,
-            completion_input_ids,
-            completion_mask,
-            advantages,
-            trainer.beta,
-            trainer.accelerator.scaler,
-            n_chunks,
-            kwargs 
-        )
+        with autocaster:
+            loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
+                new_logprobs,
+                old_logps,
+                ref_logps,
+                sampling_per_token_logps,
+                lm_head,
+                completion_input_ids,
+                completion_mask,
+                advantages,
+                trainer.beta,
+                trainer.accelerator.scaler,
+                n_chunks,
+                kwargs 
+            )
 
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
