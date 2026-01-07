@@ -887,27 +887,27 @@ def grpo_accumulated_loss(
             )
             #This is needed to avoid race conditions with GPT OSS offload_embbed=True
             #However, it seems that this line does not slow down or disrupt models. 
-            #if "gpt_oss" in  str(type(trainer.model.config)):
-            torch.cuda.synchronize()
+            if "gpt_oss" in  str(type(trainer.model.config)):
+                torch.cuda.synchronize()
             all_logprobs_list.append(logprobs_chunk)
 
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
         
-        with autocaster:
-            loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
-                new_logprobs,
-                old_logps,
-                ref_logps,
-                sampling_per_token_logps,
-                lm_head,
-                completion_input_ids,
-                completion_mask,
-                advantages,
-                trainer.beta,
-                trainer.accelerator.scaler,
-                n_chunks,
-                kwargs 
-            )
+        #with autocaster:
+        loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
+            new_logprobs,
+            old_logps,
+            ref_logps,
+            sampling_per_token_logps,
+            lm_head,
+            completion_input_ids,
+            completion_mask,
+            advantages,
+            trainer.beta,
+            trainer.accelerator.scaler,
+            n_chunks,
+            kwargs 
+        )
 
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
