@@ -887,7 +887,8 @@ def grpo_accumulated_loss(
             )
             #This is needed to avoid race conditions with GPT OSS offload_embbed=True
             #However, it seems that this line does not slow down or disrupt models. 
-            torch.cuda.synchronize()
+            if "gpt_oss" in  str(type(trainer.model.config)):
+                torch.cuda.synchronize()
             all_logprobs_list.append(logprobs_chunk)
 
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
