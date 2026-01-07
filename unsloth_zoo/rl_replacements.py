@@ -870,7 +870,6 @@ def grpo_accumulated_loss(
                     pixel_attention_mask = pixel_attention_mask_chunk,
                     image_sizes = image_sizes_chunk,
                     logits_to_keep = logits_to_keep + 1, 
-                    batch_size = B
                 ).logits
                 
                 new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
@@ -883,7 +882,8 @@ def grpo_accumulated_loss(
                 logit_scale_multiply=logit_scale_multiply,
                 logit_scale_divide=logit_scale_divide,
                 logit_softcapping=logit_softcapping,
-                temperature=temperature
+                temperature=temperature,
+                batch_size = B
             )
             #This is needed to avoid race conditions with GPT OSS offload_embbed=True
             #However, it seems that this line does not slow down or disrupt models. 
