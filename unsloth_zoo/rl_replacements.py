@@ -657,10 +657,13 @@ def grpo_accumulated_loss(
     if pixel_values is None:
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
 
-        max_left_pad = torch.max(left_pad_tokens_per_prompt).item()
-
-        if max_left_pad < torch.max(prev_max_left_pad).item() and (logits_to_keep +max_left_pad) != old_logps.shape[1]:
-            max_left_pad =  torch.max(prev_max_left_pad).item()
+        # Determine max_left_pad from precomputed logprobs shape for consistency
+        if old_logps is not None:
+            max_left_pad = old_logps.shape[1] - logits_to_keep
+        elif ref_logps is not None:
+            max_left_pad = ref_logps.shape[1] - logits_to_keep
+        else:
+            max_left_pad = torch.max(left_pad_tokens_per_prompt).item()
 
         input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
 
@@ -887,8 +890,8 @@ def grpo_accumulated_loss(
                 )
             #This is needed to avoid race conditions with GPT OSS offload_embbed=True
             #However, it seems that this line does not slow down or disrupt models. 
-            if "gpt_oss" in  str(type(trainer.model.config)):
-                torch.cuda.synchronize()
+            #if "gpt_oss" in  str(type(trainer.model.config)):
+            torch.cuda.synchronize()
             all_logprobs_list.append(logprobs_chunk)
 
     new_logprobs = torch.cat(all_logprobs_list, dim=0)
