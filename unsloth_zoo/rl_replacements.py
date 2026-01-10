@@ -796,8 +796,8 @@ def grpo_accumulated_loss(
             hidden_states = hidden_states.to(ctx.dtype)
             hidden_states.requires_grad_(True)
             
-            # lm_head = ctx.lm_head.detach()
-            # lm_head.requires_grad_(True)
+            lm_head = ctx.lm_head.detach()
+            lm_head.requires_grad_(True)
             
             index = ctx.index
             
@@ -810,7 +810,7 @@ def grpo_accumulated_loss(
 
             return (
                 hidden_states.grad,  
-                None, #lm_head.grad,        
+                lm_head.grad,        
                 None,                
                 None,                
                 None,                
