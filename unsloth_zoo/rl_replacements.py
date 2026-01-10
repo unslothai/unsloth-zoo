@@ -780,6 +780,7 @@ def grpo_accumulated_loss(
             ctx.dtype = hidden_states.dtype
             
             ctx.lm_head = lm_head
+            ctx.lm_head_requires_grad = lm_head.requires_grad
             ctx.index = index
             ctx.args = (chunks, logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature)
             
@@ -796,8 +797,12 @@ def grpo_accumulated_loss(
             hidden_states = hidden_states.to(ctx.dtype)
             hidden_states.requires_grad_(True)
             
-            lm_head = ctx.lm_head.detach()
-            lm_head.requires_grad_(True)
+            lm_head = ctx.lm_head
+            # #Possibly redundant lines
+            # if ctx.lm_head_requires_grad:
+            #     hidden_states.requires_grad_(True)
+            # else: 
+            #     lm_head = lm_head.detach()
             
             index = ctx.index
             
@@ -810,7 +815,7 @@ def grpo_accumulated_loss(
 
             return (
                 hidden_states.grad,  
-                lm_head.grad,        
+                lm_head.grad if ctx.lm_head_requires_grad else None,        
                 None,                
                 None,                
                 None,                
