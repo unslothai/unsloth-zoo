@@ -882,17 +882,17 @@ def grpo_accumulated_loss(
                     
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
 
-                logprobs_chunk = efficient_log_softmax(
-                    new_hidden_states_chunk, 
-                    lm_head, 
-                    completion_ids, 
-                    chunks=input_ids_chunk.shape[0]*multiplier, 
-                    logit_scale_multiply=logit_scale_multiply,
-                    logit_scale_divide=logit_scale_divide,
-                    logit_softcapping=logit_softcapping,
-                    temperature=temperature,
-                    batch_size = B
-                )
+            logprobs_chunk = efficient_log_softmax(
+                new_hidden_states_chunk, 
+                lm_head, 
+                completion_ids, 
+                chunks=input_ids_chunk.shape[0]*multiplier, 
+                logit_scale_multiply=logit_scale_multiply,
+                logit_scale_divide=logit_scale_divide,
+                logit_softcapping=logit_softcapping,
+                temperature=temperature,
+                batch_size = B
+            )
             #This is needed to avoid race conditions with GPT OSS offload_embbed=True
             #However, it seems that this line does not slow down or disrupt models. 
             torch.cuda.synchronize()
@@ -900,21 +900,21 @@ def grpo_accumulated_loss(
 
     new_logprobs = torch.cat(all_logprobs_list, dim=0)
     
-    with autocaster:
-        loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
-            new_logprobs,
-            old_logps,
-            ref_logps,
-            sampling_per_token_logps,
-            lm_head,
-            completion_input_ids,
-            completion_mask,
-            advantages,
-            trainer.beta,
-            trainer.accelerator.scaler,
-            n_chunks,
-            kwargs 
-        )
+    #with autocaster:
+    loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
+        new_logprobs,
+        old_logps,
+        ref_logps,
+        sampling_per_token_logps,
+        lm_head,
+        completion_input_ids,
+        completion_mask,
+        advantages,
+        trainer.beta,
+        trainer.accelerator.scaler,
+        n_chunks,
+        kwargs 
+    )
 
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
