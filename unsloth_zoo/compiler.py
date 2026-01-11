@@ -2464,15 +2464,27 @@ def unsloth_compile_transformers(
     remove_causal_masks = []
     if disable_causal_masks:
         for module in other_classes:
-            source = eval(f"{model_location}.{module}")
-            if not hasattr(source, "_update_causal_mask"): continue
-
-            try: source = inspect.getsource(source.__init__)
-            except: continue
-
+            try:
+                mod = eval(model_location)
+                if not hasattr(mod, module):
+                    continue
+                source = getattr(mod, module)
+            except (AttributeError, NameError, SyntaxError) as e:
+                # print debug and skip
+                print(f"Warning: Skip {model_location}.{module} - {e}")
+                continue
+                
+            if not hasattr(source, "_update_causal_mask"): 
+                continue
+    
+            try: 
+                source_code = inspect.getsource(source.__init__)
+            except: 
+                continue
+    
             can_remove = True
             for x in disabled_scaled_dot_product_attention_modules:
-                if x in source:
+                if x in source_code:
                     can_remove = False
                     break
             pass
