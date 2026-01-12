@@ -23,6 +23,7 @@ import inspect
 from .common import (
     TEMPORARY_PATCHES,
     torch_compile,
+    UNSLOTH_ENABLE_LOGGING,
 )
 from .utils import (
     patch_function,
@@ -306,5 +307,89 @@ def patch_qwen3_moe():
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", sparse_moe_block_forward)
 
     transformers.models.qwen3_moe.modeling_qwen3_moe.__UNSLOTH_PATCHED__ = True
+
+    # ====================================================================
+    # Patch Qwen3MoeForCausalLM.forward for GRPO training
+    # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
+    # ====================================================================
+    try:
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+            Qwen3MoeForCausalLM,
+            MoeCausalLMOutputWithPast,
+        )
+
+        _original_causal_lm_forward = Qwen3MoeForCausalLM.forward
+
+        def _patched_causal_lm_forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            labels=None,
+            use_cache=None,
+            output_router_logits=None,
+            cache_position=None,
+            logits_to_keep=0,
+            **kwargs,
+        ):
+            RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+
+            if not RETURN_HIDDEN_STATES:
+                # Normal forward pass
+                return _original_causal_lm_forward(
+                    self,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    labels=labels,
+                    use_cache=use_cache,
+                    output_router_logits=output_router_logits,
+                    cache_position=cache_position,
+                    logits_to_keep=logits_to_keep,
+                    **kwargs,
+                )
+
+            # RETURN_HIDDEN_STATES mode - return hidden_states instead of logits
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_router_logits=output_router_logits,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = outputs.last_hidden_state
+
+            # Apply slice_indices to hidden_states (same indexing as for logits)
+            if logits_to_keep != 0:
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+                hidden_states = hidden_states[:, slice_indices, :]
+
+            # Return hidden_states as "logits" for GRPO to use
+            return MoeCausalLMOutputWithPast(
+                loss=None,
+                aux_loss=None,
+                logits=hidden_states,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                router_logits=outputs.router_logits,
+            )
+
+        Qwen3MoeForCausalLM.forward = _patched_causal_lm_forward
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info("Unsloth: Patched Qwen3MoeForCausalLM.forward for GRPO hidden states.")
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Could not patch Qwen3MoeForCausalLM.forward: {e}")
+
 pass
 TEMPORARY_PATCHES.append(patch_qwen3_moe)
