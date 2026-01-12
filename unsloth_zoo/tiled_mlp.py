@@ -301,19 +301,21 @@ def patch_tiled_mlp(model, patch_options_str = "arctic", padded_length = 128):
     )
 
     for name, module in model.named_modules():
+        should_patch = False
         if custom_modules:
             if is_custom_module(name, custom_modules):
-                patch_mlp(
-                    module,
-                    target_arctic = target_arctic,
-                    target_gb = target_gb,
-                    padded_length = padded_length,
-                )
+                should_patch = True
         elif name.lower().endswith(attr_suffixes):
+            should_patch = True
+        elif name.endswith('.mixer') and type(module).__name__ in ('NemotronHMLP', 'NemotronHMOE'):
+            should_patch = True
+
+        if should_patch:
             patch_mlp(
                 module,
                 target_arctic = target_arctic,
                 target_gb = target_gb,
                 padded_length = padded_length,
             )
+
     return model
