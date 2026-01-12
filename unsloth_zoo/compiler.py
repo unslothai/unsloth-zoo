@@ -972,6 +972,14 @@ if n_items is None:
             break
 pass
 
+# Context parallelism support: check for pre-shifted labels
+_shift_labels_input = None
+_all_locals = locals()
+if 'kwargs' in _all_locals and type(_all_locals['kwargs']) is dict:
+    _shift_labels_input = _all_locals['kwargs'].get("shift_labels", None)
+_has_pre_shift_labels = torch.is_tensor(_shift_labels_input)
+_effective_labels = _shift_labels_input if _has_pre_shift_labels else labels
+
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -984,9 +992,10 @@ elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGIT
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
-        labels             = labels.to(self.lm_head.weight.device),
+        labels             = _effective_labels.to(self.lm_head.weight.device),
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
+        shift             = not _has_pre_shift_labels,
     )
 else:
     lm_head_weight = self.lm_head.weight
@@ -995,18 +1004,19 @@ else:
     # ========= NEW fused =========
     _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
-    torch._dynamo.mark_dynamic(labels, 1)
+    torch._dynamo.mark_dynamic(_effective_labels, 1)
     loss = unsloth_fused_ce_loss(
         trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        labels               = labels,
+        labels               = _effective_labels,
         mask                 = None,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        shift_labels         = not _has_pre_shift_labels,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -1050,6 +1060,14 @@ if n_items is None:
                 break
 pass
 
+# Context parallelism support: check for pre-shifted labels
+_shift_labels_input = None
+_all_locals = locals()
+if 'kwargs' in _all_locals and type(_all_locals['kwargs']) is dict:
+    _shift_labels_input = _all_locals['kwargs'].get("shift_labels", None)
+_has_pre_shift_labels = torch.is_tensor(_shift_labels_input)
+_effective_labels = _shift_labels_input if _has_pre_shift_labels else labels
+
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -1073,18 +1091,19 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
     # ========= NEW fused =========
     _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
-    torch._dynamo.mark_dynamic(labels, 1)
+    torch._dynamo.mark_dynamic(_effective_labels, 1)
     loss = unsloth_fused_ce_loss(
         trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        labels               = labels,
+        labels               = _effective_labels,
         mask                 = None,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        shift_labels         = not _has_pre_shift_labels,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -1146,6 +1165,14 @@ if n_items is None:
             break
 pass
 
+# Context parallelism support: check for pre-shifted labels
+_shift_labels_input = None
+_all_locals = locals()
+if 'kwargs' in _all_locals and type(_all_locals['kwargs']) is dict:
+    _shift_labels_input = _all_locals['kwargs'].get("shift_labels", None)
+_has_pre_shift_labels = torch.is_tensor(_shift_labels_input)
+_effective_labels = _shift_labels_input if _has_pre_shift_labels else labels
+
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -1161,7 +1188,7 @@ else:
     # ========= NEW fused =========
     _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
-    torch._dynamo.mark_dynamic(labels, 1)
+    torch._dynamo.mark_dynamic(_effective_labels, 1)
     if attention_mask is not None:
         torch._dynamo.mark_dynamic(attention_mask, 1)
     loss = unsloth_fused_ce_loss(
@@ -1169,12 +1196,13 @@ else:
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        labels               = labels,
+        labels               = _effective_labels,
         mask                 = \\6,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        shift_labels         = not _has_pre_shift_labels,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
