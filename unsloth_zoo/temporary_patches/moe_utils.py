@@ -22,13 +22,14 @@ import os
 _GROUPED_GEMM_AVAILABLE = None
 _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 
-# Check if GPU supports torch._grouped_mm (requires compute capability >= 9.0)
+# Check if GPU supports torch._grouped_mm (verified via runtime check)
 _TORCH_GROUPED_MM_SUPPORTED = None
 
 def _check_torch_grouped_mm_supported():
     """
     Check if torch._grouped_mm is actually supported on the current GPU.
-    It requires CUDA compute capability >= 9.0 (H100 and newer).
+    We check for existence and verify with a dummy call.
+    A runtime probe is the only reliable check.
     """
     global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None:
@@ -43,12 +44,19 @@ def _check_torch_grouped_mm_supported():
         return False
 
     try:
-        # Get compute capability of current device
+        # Attempt a dummy grouped_mm call to verify support.
+        # This handles cases where the symbol exists but hardware is unsupported (e.g. < H100).
+        # It also allows support on newer hardware or backports without code changes.
         device = torch.cuda.current_device()
-        major, minor = torch.cuda.get_device_capability(device)
-        compute_capability = major + minor / 10.0
-        # torch._grouped_mm requires compute capability >= 9.0 (H100)
-        _TORCH_GROUPED_MM_SUPPORTED = compute_capability >= 9.0
+        dtype = torch.float16
+
+        # Minimal dummy data: 1 expert, 1 token, dim 8 (safe alignment)
+        x = torch.ones((1, 8), device=device, dtype=dtype)
+        w = torch.ones((1, 8, 8), device=device, dtype=dtype)
+        offs = torch.tensor([1], device=device, dtype=torch.int32)
+
+        torch._grouped_mm(x, w, offs=offs)
+        _TORCH_GROUPED_MM_SUPPORTED = True
     except Exception:
         _TORCH_GROUPED_MM_SUPPORTED = False
 
@@ -196,14 +204,13 @@ def forward_native_grouped_mm(
     """
     Native Pytorch grouped GEMM MoE forward pass.
     Uses torch._grouped_mm which is significantly faster than loop and works without Triton dependencies.
-    Requires CUDA compute capability >= 9.0 (H100 and newer).
+    Requires torch._grouped_mm support (verified via runtime check).
     """
     # Runtime safety check - defense in depth
     if not _check_torch_grouped_mm_supported():
         major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
         raise RuntimeError(
-            f"torch._grouped_mm requires CUDA compute capability >= 9.0 (H100), "
-            f"but current device has {major}.{minor}. "
+            f"torch._grouped_mm is not supported on this device (Compute Capability {major}.{minor}). "
             f"Set UNSLOTH_MOE_BACKEND='unsloth_triton' or 'native_torch' to use a compatible backend."
         )
 
