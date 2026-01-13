@@ -43,6 +43,7 @@ from .moe_utils import (
     _TORCH_GROUPED_MM_AVAILABLE,
     forward_native_grouped_mm,
     forward_triton_grouped_gemm,
+    forward_native_moe_loop,
     select_moe_backend,
 )
 
@@ -186,31 +187,7 @@ def patch_qwen3_vl_moe():
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
                 # Same loop fallback logic as Qwen3MoeExperts
-                # For brevity, implementing basic correct loop
-                final_hidden_states = torch.zeros_like(hidden_states)
-                with torch.no_grad():
-                    expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-                    # expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-                # simpler fallback
-                for expert_idx in range(self.num_experts):
-                    top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-
-                    # Skip expert if no tokens routed to it
-                    if token_idx.shape[0] == 0:
-                        continue
-
-                    current_state = hidden_states[token_idx]
-
-                    # Assuming gate_up_proj and down_proj exist as stacked weights in Experts class
-                    gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-                    current_hidden_states = self.act_fn(gate) * up
-                    current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
-
-                    current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-                    final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-                return final_hidden_states
+                return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
         # SparseMoeBlock forward
         # @torch.compiler.disable

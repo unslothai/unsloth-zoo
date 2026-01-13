@@ -41,7 +41,9 @@ from .moe_utils import (
     _TORCH_GROUPED_MM_AVAILABLE,
     forward_native_grouped_mm,
     forward_triton_grouped_gemm,
+    forward_native_moe_loop,
     select_moe_backend,
+    patch_param_wrapper_for_moe,
 )
 
 
@@ -51,6 +53,10 @@ def patch_qwen3_moe():
     # https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L213
     # Transformers >= 5       uses self.gate_up_proj = nn.Parameter(...)
     # whilst old transformers uses self.experts = nn.ModuleList(...)
+
+    # Patch ParamWrapper.forward for MoE separated LoRA
+    patch_param_wrapper_for_moe()
+
     try:
         import transformers.models.qwen3_moe.modeling_qwen3_moe
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock
@@ -213,42 +219,7 @@ def patch_qwen3_moe():
                 Loop-based MoE forward pass. Loops over experts that have tokens routed to them.
                 Uses @torch.compiler.disable because the loop is data-dependent.
                 """
-
-
-                final_hidden_states = torch.zeros_like(hidden_states)
-
-                # Create expert mask and find which experts have tokens
-                with torch.no_grad():
-                    expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-                    expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
-                    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-                # Only loop over experts that actually have tokens routed to them
-                for expert_idx in expert_hit:
-                    expert_idx = expert_idx[0]
-                    if expert_idx == self.num_experts:
-                        continue
-
-                    # Find which tokens are routed to this expert
-                    top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-
-                    # Gather only the tokens for this expert
-                    current_state = hidden_states[token_idx]
-
-                    # Compute gate_up projection for this expert only
-                    gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-                    current_hidden_states = self.act_fn(gate) * up
-
-                    # Compute down projection for this expert only
-                    current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
-
-                    # Apply routing weights
-                    current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-
-                    # Scatter back to final output
-                    final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-                return final_hidden_states
+                return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
         # SparseMoeBlock forward is disabled from compilation due to dynamic routing
         # SparseMoeBlock forward is disabled from compilation due to dynamic routing
