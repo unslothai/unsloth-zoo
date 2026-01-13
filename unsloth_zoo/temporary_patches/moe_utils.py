@@ -56,6 +56,7 @@ def _check_torch_grouped_mm_supported():
         offs = torch.tensor([1], device=device, dtype=torch.int32)
 
         torch._grouped_mm(x, w, offs=offs)
+        del x, w, offs
         _TORCH_GROUPED_MM_SUPPORTED = True
     except Exception:
         _TORCH_GROUPED_MM_SUPPORTED = False
