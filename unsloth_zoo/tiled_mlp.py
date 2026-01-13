@@ -263,12 +263,14 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
     return mlp_module
 
 def is_custom_module(name, custom_modules):
+    name_lower = name.lower()
     for custom_module in custom_modules:
+        custom_module_lower = custom_module.lower()
         if '*' in custom_module or '?' in custom_module:
-            if fnmatch(name, custom_module):
+            if fnmatch(name_lower, custom_module_lower):
                 return True
         else:
-            if name.lower().endswith(custom_module.lower()):
+            if name_lower.endswith(custom_module_lower):
                 return True
     return False
 
