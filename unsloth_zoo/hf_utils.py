@@ -287,7 +287,7 @@ def get_auto_processor(name, **kwargs):
         processor_config = os.path.join(name, filename)
         if os.path.exists(processor_config):
             try:
-                with open(processor_config, "r") as f: f = f.read()
+                with open(processor_config, "r", encoding="utf-8") as f: f = f.read()
                 config = json.loads(f)
                 processor_class = config["processor_class"]
                 model_type = reversal_map[processor_class]
