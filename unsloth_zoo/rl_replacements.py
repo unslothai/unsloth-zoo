@@ -73,10 +73,7 @@ def chunked_hidden_states_selective_log_softmax(
     logit_softcapping: float = 0.0,
     temperature: float = 1.0,
 ) -> torch.Tensor:
-    """
-    More memory efficient by chunking on (bsz+qlen) dimension.
-    Exactly equivalent to the non-chunked version.
-    """
+    # All Unsloth Zoo code licensed under AGPL3 
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1]) 
     flat_index = index.reshape(-1)                                    
 
