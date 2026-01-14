@@ -191,6 +191,40 @@ def _get_routing_indices(selected_experts, num_experts):
     return token_counts_by_expert, gather_indices
 
 
+@torch.compile(dynamic=True)
+def _compiled_moe_routing(
+    top_k_index: torch.Tensor,
+    num_experts: int,
+    num_tokens: int,
+    hidden_dim: int,
+    top_k: int
+):
+    """
+    Compiled routing logic to eliminate Python overhead.
+    """
+    flat_top_k = top_k_index.view(-1)
+    num_tokens_per_expert = torch.bincount(flat_top_k, minlength=num_experts).int()
+    sorted_indices = torch.argsort(flat_top_k, stable=True)
+    token_indices = sorted_indices // top_k
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    return num_tokens_per_expert, sorted_indices, token_indices, offsets
+
+
+@torch.compile(fullgraph=True, dynamic=True)
+def _compiled_moe_scatter(
+    final_hidden_states: torch.Tensor,
+    token_indices: torch.Tensor,
+    mm2_out: torch.Tensor,
+    permuted_weights: torch.Tensor
+):
+    """
+    Compiled scatter logic.
+    """
+    mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+    final_hidden_states.index_add_(0, token_indices, mm2_out.to(final_hidden_states.dtype))
+    return final_hidden_states
+
+
 def _silu_and_mul(x):
     """Fused SiLU activation and element-wise multiply for gate/up projections."""
     gate, up = x.chunk(2, dim=-1)
@@ -380,80 +414,68 @@ def _patched_param_wrapper_forward(self, x: torch.Tensor, *args, **kwargs) -> to
     """
     Patched ParamWrapper.forward for MoE separated LoRA.
 
-    For MoE expert modules:
-    - Bypasses PEFT's _activate_lora parametrization context
-    - Stores LoRA data by parameter_name for forward_native_grouped_mm to use
+    For MoE modules with stored weakref (gate_up_proj, down_proj):
+    - Bypasses PEFT's _activate_lora entirely by calling base_layer directly
+    - forward_native_grouped_mm extracts LoRA weights from the stored weakref
 
     For non-MoE modules:
     - Falls back to original PEFT forward
     """
     base_layer = self.get_base_layer()
-    use_separated = _should_use_separated_lora()
+    param_name = getattr(self, 'parameter_name', None)
 
-    # Check if this is an MoE experts module that should use separated LoRA
-    if use_separated and _is_moe_experts_module(base_layer):
-        # MoE experts: bypass PEFT's _activate_lora, use separated computation
-
-        # Check adapter state
-        if self.disable_adapters:
-            if self.merged:
-                self.unmerge()
-            return base_layer(x, *args, **kwargs)
-
-        if self.merged:
-            return base_layer(x, *args, **kwargs)
-
-        # Extract LoRA for this specific parameter
-        lora_data = _get_moe_lora_weights(self)
-        param_name = getattr(self, 'parameter_name', None)
-
-        if lora_data is not None and param_name:
-            # Store LoRA data keyed by parameter_name
-            # e.g., _unsloth_lora_gate_up_proj or _unsloth_lora_down_proj
-            lora_attr = f'_unsloth_lora_{param_name}'
-            setattr(base_layer, lora_attr, lora_data)
-
-        try:
-            # Call patched forward (forward_native_grouped_mm will use the cached LoRA)
-            result = base_layer(x, *args, **kwargs)
-        finally:
-            # Clean up
-            if param_name:
-                lora_attr = f'_unsloth_lora_{param_name}'
-                if hasattr(base_layer, lora_attr):
-                    delattr(base_layer, lora_attr)
-
-        return result
+    # Check if this module has a stored weakref (set by patch_param_wrapper_for_moe)
+    if param_name in ('gate_up_proj', 'down_proj'):
+        # MoE experts: bypass PEFT's _activate_lora completely
+        # The LoRA is extracted lazily in forward_native_grouped_mm via the weakref
+        return base_layer(x, *args, **kwargs)
 
     # Non-MoE: use original PEFT forward with _activate_lora
     return _original_param_wrapper_forward(self, x, *args, **kwargs)
 
 
-def patch_param_wrapper_for_moe():
+def patch_param_wrapper_for_moe(model=None):
     """
     Patch PEFT's ParamWrapper.forward to use separated LoRA for MoE.
 
-    This should be called after PEFT is imported.
+    If model is provided, also stores weakrefs to ParamWrappers on base layers
+    for efficient LoRA weight extraction during forward.
+
+    This should be called after PEFT is imported and get_peft_model is called.
     """
     global _original_param_wrapper_forward
 
     try:
         from peft.tuners.lora.layer import ParamWrapper
 
-        # Store original forward
+        # Store original forward (only once)
         if _original_param_wrapper_forward is None:
             _original_param_wrapper_forward = ParamWrapper.forward
 
-        # Patch with our version
+        # Patch with our simplified version
         ParamWrapper.forward = _patched_param_wrapper_forward
+
+        # If model provided, store weakrefs for lazy LoRA extraction
+        if model is not None:
+            for module in model.modules():
+                if not isinstance(module, ParamWrapper):
+                    continue
+                param_name = getattr(module, 'parameter_name', None)
+                if param_name not in ('gate_up_proj', 'down_proj'):
+                    continue
+                base_layer = module.get_base_layer()
+                if base_layer is None:
+                    continue
+                # Store reference to ParamWrapper for lazy LoRA extraction
+                # forward_native_grouped_mm will use this to get LoRA weights
+                base_layer.__dict__[f'{param_name}_lora_wrapper'] = module
 
         return True
     except ImportError:
         return False
 
 
-
-
+@torch.compiler.disable
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -461,133 +483,75 @@ def forward_native_grouped_mm(
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Native Pytorch grouped GEMM MoE forward pass.
-    Uses torch._grouped_mm which is significantly faster than loop and works without Triton dependencies.
-    Requires torch._grouped_mm support (verified via runtime check).
+    Optimized Qwen3 MoE forward pass.
+    Removes generic checks and function call overhead.
     """
-    # Runtime safety check - defense in depth
-    if not _check_torch_grouped_mm_supported():
-        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-        raise RuntimeError(
-            f"torch._grouped_mm is not supported on this device (Compute Capability {major}.{minor}). "
-            f"Set UNSLOTH_MOE_BACKEND='unsloth_triton' or 'native_torch' to use a compatible backend."
-        )
-
-
+    # Fast path for Qwen3 dimensionality
     if hidden_states.dim() == 2:
         sequence_length, hidden_dim = hidden_states.shape
         batch_size = 1
     else:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
 
-    hidden_states = hidden_states.view(-1, hidden_dim)
-
-    # 1. Calculate routing
+    # 1. Routing
     flat_top_k = top_k_index.view(-1)
     num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
-
-    # 2. Sort indices to group tokens by expert
     sorted_indices = torch.argsort(flat_top_k, stable=True)
     token_indices = sorted_indices // top_k_index.shape[1]
-
-    # 3. Permute Input
-    # We need to gather inputs. Since we may have expanded top_k, we use token_indices to map back to original input
-    permuted_input = hidden_states[token_indices]
-
-    # 4. Prepare Grouped MM arguments
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
-    # ========================================================================
-    # Gate + Up projection with optional separated LoRA (DEFAULT)
-    # ========================================================================
+    # 2. Permute Input
+    permuted_input = hidden_states[token_indices]
 
-    # 1. Get Weights & LoRA
-    w1_weight = None
-    w3_weight = None
+    # 3. Gate Up Proj (Fused) - INLINE
+    w1 = self.gate_up_proj.transpose(-2, -1)
 
-    gate_up_lora = getattr(self, '_unsloth_lora_gate_up_proj', None) # Combined
+    # Base GEMM
+    mm1_out = torch._grouped_mm(permuted_input, w1, offs=offsets)
 
-    # For models with w1, w3 separate (Llama-MoE, etc.) these will be set separately
-    w1_lora = getattr(self, '_unsloth_lora_w1', None)
-    w3_lora = getattr(self, '_unsloth_lora_w3', None)
-
-    # Check for Fused GateUp (Qwen) vs Separate (Llama)
-    if hasattr(self, "gate_up_proj"):
-        # Fused Case
-        gate_up_base = _get_base_weight(self.gate_up_proj)
-
-        # Transpose if needed: [E, hidden, inter*2] -> [E, inter*2, hidden] for grouped_mm?
-        # torch._grouped_mm(x, w) expects w as (E, in, out)
-        # x is (N, hidden)
-        # So we need w as (E, hidden, inter*2)
-        # Qwen weights are typically (E, inter*2, hidden) -> need transpose (-2, -1) to get (E, hidden, inter*2)
-
-        if gate_up_base.shape[1] == hidden_dim:
-             w1 = gate_up_base
-        else:
-             w1 = gate_up_base.transpose(-2, -1)
-
-        # Apply fused GEMM
-        mm1_out = _apply_grouped_mm_with_lora(permuted_input, w1, offsets, gate_up_lora)
-
-        gate, up = mm1_out.chunk(2, dim=-1)
-
-    elif hasattr(self, "w1") and hasattr(self, "w3"):
-        # Separate Case
-        w1_base = _get_base_weight(self.w1)
-        w3_base = _get_base_weight(self.w3)
-
-        w1 = w1_base.transpose(-2, -1)
-        w3 = w3_base.transpose(-2, -1)
-
-        gate = _apply_grouped_mm_with_lora(permuted_input, w1, offsets, w1_lora)
-        up   = _apply_grouped_mm_with_lora(permuted_input, w3, offsets, w3_lora)
-    else:
-        raise AttributeError("MoE layer must have 'gate_up_proj' or 'w1'/'w3'.")
+    # LoRA (extract fresh each forward - weights change during training)
+    gate_up_wrapper = self.__dict__.get('gate_up_proj_lora_wrapper')
+    if gate_up_wrapper is not None:
+        lora_data = _get_moe_lora_weights(gate_up_wrapper)
+        if lora_data is not None:
+            lora_B, lora_A, scaling = lora_data[:3]
+            lora_out = torch._grouped_mm(permuted_input, lora_B.to(permuted_input.dtype), offs=offsets)
+            lora_delta = torch._grouped_mm(lora_out, lora_A.to(permuted_input.dtype), offs=offsets)
+            mm1_out.add_(lora_delta, alpha=scaling)
 
     # Activation
+    gate, up = mm1_out.chunk(2, dim=-1)
     inter = F.silu(gate) * up
 
-    # ========================================================================
-    # Down projection with optional separated LoRA (DEFAULT)
-    # ========================================================================
-    down_lora = getattr(self, '_unsloth_lora_down_proj', None)
-    w2_lora   = getattr(self, '_unsloth_lora_w2', None)
+    # 4. Down Proj
+    w2 = self.down_proj.transpose(-2, -1)
 
-    if hasattr(self, "down_proj"):
-        # Qwen style
-        down_base = _get_base_weight(self.down_proj)
-        if down_base.shape[1] == inter.shape[-1]:
-            w2 = down_base
-        else:
-            w2 = down_base.transpose(-2, -1)
+    mm2_out = torch._grouped_mm(inter, w2, offs=offsets)
 
-        mm2_out = _apply_grouped_mm_with_lora(inter, w2, offsets, down_lora)
+    # LoRA (extract fresh each forward - weights change during training)
+    down_wrapper = self.__dict__.get('down_proj_lora_wrapper')
+    if down_wrapper is not None:
+        lora_data = _get_moe_lora_weights(down_wrapper)
+        if lora_data is not None:
+            lora_B, lora_A, scaling = lora_data[:3]
+            lora_out = torch._grouped_mm(inter, lora_B.to(inter.dtype), offs=offsets)
+            lora_delta = torch._grouped_mm(lora_out, lora_A.to(inter.dtype), offs=offsets)
+            mm2_out.add_(lora_delta, alpha=scaling)
 
-    elif hasattr(self, "w2"):
-        # Llama style
-        w2_base = _get_base_weight(self.w2)
-        w2 = w2_base.transpose(-2, -1)
-
-        mm2_out = _apply_grouped_mm_with_lora(inter, w2, offsets, w2_lora)
-    else:
-        raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
-
-    # 5. Apply Routing Weights
+    # 5. Scatter
     flat_weights = top_k_weights.view(-1)
     permuted_weights = flat_weights[sorted_indices]
     mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 
-    # 6. Scatter Add (Reduce)
     final_hidden_states = torch.zeros(
         (batch_size * sequence_length, hidden_dim),
         dtype=hidden_states.dtype,
         device=hidden_states.device
     )
-
     final_hidden_states.index_add_(0, token_indices, mm2_out.to(hidden_states.dtype))
 
-    if hidden_states.dim() == 2:
+    if sequence_length == hidden_states.shape[0]: # 2D case
             return final_hidden_states
 
     return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
@@ -775,7 +739,7 @@ def forward_native_moe_loop(
             gate = F.linear(current_state, self.w1[expert_idx])
             up   = F.linear(current_state, self.w3[expert_idx])
 
-        current_hidden_states = self.act_fn(gate) * up
+        current_hidden_states = F.silu(gate) * up
 
         # Compute down projection for this expert only
         if hasattr(self, "down_proj"):
