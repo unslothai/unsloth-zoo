@@ -364,62 +364,6 @@ def _get_moe_lora_weights(
         return None
 
 
-
-class SafeGroupedMMLoRA(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, inputs, weight, offsets):
-        ctx.save_for_backward(inputs, weight, offsets)
-        # out = torch._grouped_mm(inputs, weight, offs=offsets)
-
-        # Manual forward loop to see if grouped_mm is the crasher
-        out = torch.empty(inputs.shape[0], weight.shape[2], device=inputs.device, dtype=inputs.dtype)
-        num_experts = weight.shape[0]
-        offsets_cpu = offsets.cpu()
-        start = 0
-        for i in range(num_experts):
-            end = offsets_cpu[i].item()
-            if end > start:
-                 # inp (N_e, In). W (In, Out). -> (N_e, Out)
-                 torch.mm(inputs[start:end], weight[i], out=out[start:end])
-            start = end
-        return out
-
-    @staticmethod
-    def backward(ctx, dY):
-        inputs, weight, offsets = ctx.saved_tensors
-        dY = dY.contiguous()
-
-        grad_inputs = None
-        grad_weight = None
-
-        num_experts = weight.shape[0]
-        offsets_cpu = offsets.cpu()
-
-        if inputs.requires_grad:
-            grad_inputs = torch.empty_like(inputs)
-
-        if weight.requires_grad:
-            grad_weight = torch.zeros_like(weight)
-
-        start = 0
-        for i in range(num_experts):
-            end = offsets_cpu[i].item()
-            if end > start:
-                inp_slice = inputs[start:end]
-                dy_slice = dY[start:end]
-
-                if grad_inputs is not None:
-                    # print(f"DEBUG: mm inst E={i}")
-                    torch.mm(dy_slice, weight[i].t(), out=grad_inputs[start:end])
-
-                if grad_weight is not None:
-                    # print(f"DEBUG: mm weight E={i}")
-                    torch.mm(inp_slice.t(), dy_slice, out=grad_weight[i])
-
-            start = end
-
-        return grad_inputs, grad_weight, None
-
 def _apply_grouped_mm_with_lora(
     inputs: torch.Tensor,
     weight: torch.Tensor,
@@ -438,7 +382,7 @@ def _apply_grouped_mm_with_lora(
             lora_A: (num_experts, r, out_dim) - Blocked layout
     """
     # 1. Base forward: X @ W
-    out = SafeGroupedMMLoRA.apply(inputs, weight, offsets)
+    out = torch._grouped_mm(inputs, weight, offs=offsets)
 
     # 2. Add Separated LoRA: + ((X @ B) @ A) * scaling
     if lora_data is not None:
@@ -450,11 +394,11 @@ def _apply_grouped_mm_with_lora(
 
         # Step 1: inputs @ B
         # inputs: (N, in), lora_B: (E, in, R) -> lora_out: (N, R)
-        lora_out = SafeGroupedMMLoRA.apply(inputs, lora_B, offsets)
+        lora_out = torch._grouped_mm(inputs, lora_B, offs=offsets)
 
         # Step 2: result @ A
         # lora_out: (N, R), lora_A: (E, R, out) -> lora_delta: (N, out)
-        lora_delta = SafeGroupedMMLoRA.apply(lora_out, lora_A, offsets)
+        lora_delta = torch._grouped_mm(lora_out, lora_A, offs=offsets)
 
         # Add scaled LoRA contribution
         out = out + lora_delta * scaling
@@ -482,23 +426,8 @@ def _patched_param_wrapper_forward(self, x: torch.Tensor, *args, **kwargs) -> to
 
     # Check if this module has a stored weakref (set by patch_param_wrapper_for_moe)
     if param_name in ('gate_up_proj', 'down_proj'):
-        # MoE experts: bypass PEFT's _activate_lora completely.
-        #
-        # IMPORTANT:
-        # For the fast MoE paths (grouped_mm / triton), the expert module's forward
-        # needs access to this ParamWrapper to extract LoRA A/B weights.
-        #
-        # `patch_param_wrapper_for_moe(model=...)` can pre-populate these, but in many
-        # flows (like Unsloth's get_peft_model), we don't have the model object here.
-        # So we also lazily attach the wrapper on first forward to make LoRA usable.
-        try:
-            key = f"{param_name}_lora_wrapper"
-            if key not in base_layer.__dict__:
-                base_layer.__dict__[key] = self
-        except Exception:
-            pass
-
-        # The LoRA is then extracted lazily in forward_native_grouped_mm via base_layer.__dict__.
+        # MoE experts: bypass PEFT's _activate_lora completely
+        # The LoRA is extracted lazily in forward_native_grouped_mm via the weakref
         return base_layer(x, *args, **kwargs)
 
     # Non-MoE: use original PEFT forward with _activate_lora
@@ -579,7 +508,7 @@ def forward_native_grouped_mm(
     w1 = self.gate_up_proj.transpose(-2, -1)
 
     # Base GEMM
-    mm1_out = SafeGroupedMMLoRA.apply(permuted_input, w1, offsets)
+    mm1_out = torch._grouped_mm(permuted_input, w1, offs=offsets)
 
     # LoRA (extract fresh each forward - weights change during training)
     gate_up_wrapper = self.__dict__.get('gate_up_proj_lora_wrapper')
@@ -587,8 +516,8 @@ def forward_native_grouped_mm(
         lora_data = _get_moe_lora_weights(gate_up_wrapper)
         if lora_data is not None:
             lora_B, lora_A, scaling = lora_data[:3]
-            lora_out = SafeGroupedMMLoRA.apply(permuted_input, lora_B.to(permuted_input.dtype), offsets)
-            lora_delta = SafeGroupedMMLoRA.apply(lora_out, lora_A.to(permuted_input.dtype), offsets)
+            lora_out = torch._grouped_mm(permuted_input, lora_B.to(permuted_input.dtype), offs=offsets)
+            lora_delta = torch._grouped_mm(lora_out, lora_A.to(permuted_input.dtype), offs=offsets)
             mm1_out.add_(lora_delta, alpha=scaling)
 
     # Activation
@@ -598,7 +527,7 @@ def forward_native_grouped_mm(
     # 4. Down Proj
     w2 = self.down_proj.transpose(-2, -1)
 
-    mm2_out = SafeGroupedMMLoRA.apply(inter, w2, offsets)
+    mm2_out = torch._grouped_mm(inter, w2, offs=offsets)
 
     # LoRA (extract fresh each forward - weights change during training)
     down_wrapper = self.__dict__.get('down_proj_lora_wrapper')
@@ -606,8 +535,8 @@ def forward_native_grouped_mm(
         lora_data = _get_moe_lora_weights(down_wrapper)
         if lora_data is not None:
             lora_B, lora_A, scaling = lora_data[:3]
-            lora_out = SafeGroupedMMLoRA.apply(inter, lora_B.to(inter.dtype), offsets)
-            lora_delta = SafeGroupedMMLoRA.apply(lora_out, lora_A.to(inter.dtype), offsets)
+            lora_out = torch._grouped_mm(inter, lora_B.to(inter.dtype), offs=offsets)
+            lora_delta = torch._grouped_mm(lora_out, lora_A.to(inter.dtype), offs=offsets)
             mm2_out.add_(lora_delta, alpha=scaling)
 
     # 5. Scatter
