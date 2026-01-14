@@ -343,58 +343,76 @@ def _get_moe_lora_weights(
 
     lora_A_module = wrapper.lora_A[adapter_name]
     lora_B_module = wrapper.lora_B[adapter_name]
-    # PEFT stores: A.weight = (E*R, out_dim), B.weight = (in_dim, E*R)
-    # where delta = B @ A = (in_dim, E*R) @ (E*R, out_dim) = (in_dim, out_dim)
-    weight_A = lora_A_module.weight  # (E*R, out_dim)
-    weight_B = lora_B_module.weight  # (in_dim, E*R)
+
+    # PEFT stores:
+    #   lora_A.weight: (rank, in_features)   -> Input Projection
+    #   lora_B.weight: (out_features, rank)  -> Output Projection
+    #
+    # Unsloth execution order:
+    #   Step 1: X @ Input_Matrix  -> (N, R)
+    #   Step 2: Res @ Output_Matrix -> (N, Out)
+    #
+    # So we map:
+    #   weight_B (Input Matrix)  = lora_A.weight
+    #   weight_A (Output Matrix) = lora_B.weight
+
+    # NOTE: We keep variable names weight_A/weight_B consistent with their usage below
+    # where weight_B is reshaped for "First Step" and weight_A for "Second Step".
+
+    weight_B = lora_A_module.weight  # (rank, in_dim)
+    weight_A = lora_B_module.weight  # (out_dim, rank)
+
     scaling = wrapper.scaling[adapter_name]
     num_experts = getattr(wrapper, 'num_experts', 1)
 
-    if _MOE_LORA_DEBUG:
-        print(f"[MoE LoRA] weight_A.shape={weight_A.shape}, weight_B.shape={weight_B.shape}, "
-              f"num_experts={num_experts}, scaling={scaling}")
-
     if num_experts <= 1:
-        # CRITICAL: num_experts should be > 1 for MoE. If it's 1, something is wrong.
-        # Try to infer from weight shapes
-        # weight_B shape is (in_dim, E*R) where R is the LoRA rank per expert
-        # If we know the LoRA rank, we can compute num_experts
-        if _MOE_LORA_DEBUG:
-            print(f"[MoE LoRA] WARNING: num_experts={num_experts}, this may indicate missing setup")
-        # Return None to avoid incorrect computation - this will fall back to non-LoRA path
-        # The issue is patch_param_wrapper_for_moe wasn't called or didn't set num_experts
         return None
 
-    rank_per_expert = weight_A.shape[0] // num_experts
-    in_dim = weight_B.shape[0]   # input dimension for first step
-    out_dim = weight_A.shape[1]  # output dimension for second step
+    # Logic explanation:
+    # weight_B (Input Proj): (E*R, in_dim) or (R_total, in_dim)
+    #   rank_per_expert is derived from this matrix primarily?
+    #   Actually weight_A (Output Proj) is (out_dim, E*R).
+    #   PEFT usually stores (Rank, In) and (Out, Rank).
 
-    if _MOE_LORA_DEBUG:
-        print(f"[MoE LoRA] rank_per_expert={rank_per_expert}, in_dim={in_dim}, out_dim={out_dim}")
+    # Let's adjust derivation to be robust.
+    # weight_B (from lora_A): (E*R, in_dim)
+    # weight_A (from lora_B): (out_dim, E*R)
+
+    rank_per_expert = weight_B.shape[0] // num_experts
+    in_dim = weight_B.shape[1]   # input dimension
+
+    # Output dim from weight_A
+    out_dim = weight_A.shape[0]
 
     # Verify dimensions are compatible
-    if weight_A.shape[0] != num_experts * rank_per_expert:
-        if _MOE_LORA_DEBUG:
-            print(f"[MoE LoRA] ERROR: weight_A dim mismatch: {weight_A.shape[0]} != {num_experts} * {rank_per_expert}")
-        return None
-    if weight_B.shape[1] != num_experts * rank_per_expert:
-        if _MOE_LORA_DEBUG:
-            print(f"[MoE LoRA] ERROR: weight_B dim mismatch: {weight_B.shape[1]} != {num_experts} * {rank_per_expert}")
+    if weight_B.shape[0] != num_experts * rank_per_expert:
+         return None
+
+    if weight_A.shape[1] != num_experts * rank_per_expert:
         return None
 
-    # Reshape B for first step: X @ B where X is (N, in_dim)
-    # B.weight: (in_dim, E*R) -> reshape to (in_dim, E, R) -> permute to (E, in_dim, R)
-    B_reshaped = weight_B.reshape(in_dim, num_experts, rank_per_expert)
-    B_reshaped = B_reshaped.permute(1, 0, 2).contiguous()  # (E, in_dim, R)
+    # Reshape B (Input Proj) for first step: X @ B
+    # weight_B is (E*R, in_dim).
+    # We want B_reshaped to be (E, in_dim, R) typically for grouped_mm?
+    # Actually native_moe_grouped_mm expects weight as (E, in, out).
+    #
+    # For Step 1: X(N, in) @ B -> (N, R).
+    # So B must be (E, in, R).
+    # weight_B is (E*R, in).
+    # reshape(num_experts, rank_per_expert, in_dim) -> (E, R, in).
+    # permute(0, 2, 1) -> (E, in, R).
 
-    # Reshape A for second step: result @ A where result is (N, R)
-    # A.weight: (E*R, out_dim) -> reshape to (E, R, out_dim)
-    A_reshaped = weight_A.reshape(num_experts, rank_per_expert, out_dim)  # (E, R, out_dim)
+    B_reshaped = weight_B.reshape(num_experts, rank_per_expert, in_dim)
+    B_reshaped = B_reshaped.permute(0, 2, 1).contiguous() # (E, in, R)
 
-    if _MOE_LORA_DEBUG:
-        print(f"[MoE LoRA] B_reshaped.shape={B_reshaped.shape}, A_reshaped.shape={A_reshaped.shape}")
-        print(f"[MoE LoRA] B_reshaped.requires_grad={B_reshaped.requires_grad}, "
-              f"A_reshaped.requires_grad={A_reshaped.requires_grad}")
+    # Reshape A (Output Proj) for second step: Res @ A
+    # weight_A is (out_dim, E*R).
+    # We want A to be (E, R, out).
+    # reshape(out_dim, num_experts, rank_per_expert) -> (out, E, R).
+    # permute(1, 2, 0) -> (E, R, out).
+
+    A_reshaped = weight_A.reshape(out_dim, num_experts, rank_per_expert)
+    A_reshaped = A_reshaped.permute(1, 2, 0).contiguous() # (E, R, out)
 
     # Return (B, A) for application order: (X @ B) @ A
     return B_reshaped, A_reshaped, scaling, num_experts
@@ -478,7 +496,15 @@ def _patched_param_wrapper_forward(self, x: torch.Tensor, *args, **kwargs) -> to
         # In many flows we don't call patch_param_wrapper_for_moe(model=...), so also
         # attach lazily on first forward.
         try:
-            key = f"{param_name}_lora_wrapper"
+            # key = f"{param_name}_lora_wrapper"
+            # Explicitly use the correct key based on param_name
+            if param_name == 'gate_up_proj':
+                 key = 'gate_up_proj_lora_wrapper'
+            elif param_name == 'down_proj':
+                 key = 'down_proj_lora_wrapper'
+            else:
+                 key = f"{param_name}_lora_wrapper"
+
             if key not in base_layer.__dict__:
                 base_layer.__dict__[key] = self
 
@@ -583,8 +609,10 @@ def _apply_lora_grouped_mm(
     if _TORCH_GROUPED_MM_AVAILABLE and _check_torch_grouped_mm_supported():
         # Step 1: X @ B -> (N, R)
         lora_intermediate = native_moe_grouped_mm(inputs, lora_B_cast, offsets)
+
         # Step 2: result @ A -> (N, out_dim)
         lora_delta = native_moe_grouped_mm(lora_intermediate, lora_A_cast, offsets)
+
         return lora_delta * scaling
 
     # Fallback to pure pytorch matmul if grouped_mm not available
@@ -659,6 +687,28 @@ def _get_lora_wrapper_for_param(experts_module, param_name: str):
         wrapper = experts_module.__dict__.get(f'{param_name}_lora_wrapper')
 
     return wrapper
+
+
+# Helper to get wrapper
+def _get_lora_wrapper_for_param(experts_module, param_name):
+    """
+    Get the PEFT ParamWrapper for a specific parameter (gate_up_proj or down_proj).
+    Uses the explicit key stored in __dict__ if available, otherwise searches hierarchy.
+    """
+    # 1. Fast path: check if explicitly stored in __dict__
+    key = f"{param_name}_lora_wrapper"
+    if key in experts_module.__dict__:
+       return experts_module.__dict__[key]
+
+    # 2. Lazy Setup: try to find it in modules if not already done
+    # This handles cases where patch_param_wrapper_for_moe wasn't called on the whole model
+    if not getattr(experts_module, '_moe_lora_lazy_search_done', False):
+         _setup_moe_lora_wrappers_lazy(experts_module)
+         experts_module._moe_lora_lazy_search_done = True
+         if key in experts_module.__dict__:
+             return experts_module.__dict__[key]
+
+    return None
 
 
 @torch.compiler.disable
@@ -749,3 +799,33 @@ def forward_native_grouped_mm(
 
 
 # Removed unused Triton and Loop implementations to prevent accidental usage.
+
+# -----------------------------------------------------------------------------
+# Compatibility shims (kept for imports from temporary_patches/qwen3_moe.py)
+# -----------------------------------------------------------------------------
+
+def forward_triton_grouped_gemm(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Backwards-compatible entrypoint expected by qwen3_moe patch code.
+    We intentionally route to the native grouped_mm path to keep MoE-LoRA training correct.
+    """
+    return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
+
+
+@torch.compiler.disable
+def forward_native_moe_loop(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Backwards-compatible loop entrypoint expected by qwen3_moe patch code.
+    We route to the native grouped_mm path (no Python expert loop).
+    """
+    return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
