@@ -301,7 +301,7 @@ def grpo_compute_loss(
     advantages,
     **kwargs
 ):
-    # All Unsloth Zoo code licensed under LGPLv3
+    # All Unsloth Zoo code licensed under AGPL3 
     # Set defaults for optional arguments
     loss_type = kwargs.get("loss_type", "grpo")
     epsilon_low = kwargs.get("epsilon_low", 0.2)
@@ -433,7 +433,7 @@ RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
 
 # Unsloth's memory efficient GRPO implementation
 class UnslothEfficientGRPO(torch.autograd.Function):
-    # All Unsloth Zoo code licensed under LGPLv3
+    # All Unsloth Zoo code licensed under AGPL3 
     @staticmethod
     def forward(ctx, _new_logps, _old_logps, _ref_logps, _sampling_per_token_logps, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None):
         if extra_kwargs is None:
@@ -587,7 +587,7 @@ def grpo_accumulated_loss(
     n_chunks = -1,
     **kwargs,
 ):
-    # All Unsloth Zoo code licensed under LGPLv3
+    # All Unsloth Zoo code licensed under AGPL3 
     bsz, qlen = input_ids.shape
 
     pixel_values = kwargs.get('pixel_values',None)
