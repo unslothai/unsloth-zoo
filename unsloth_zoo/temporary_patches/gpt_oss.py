@@ -522,6 +522,23 @@ class GptOssTopKRouter(nn.Module):
         self.hidden_dim = config.hidden_size
         self.linear = nn.Linear(self.hidden_dim, self.num_experts, dtype=dtype_from_config(config))
 
+    # Properties for compatibility with transformers' _init_weights which expects .weight and .bias
+    @property
+    def weight(self):
+        return self.linear.weight
+
+    @weight.setter
+    def weight(self, value):
+        self.linear.weight = value
+
+    @property
+    def bias(self):
+        return self.linear.bias
+
+    @bias.setter
+    def bias(self, value):
+        self.linear.bias = value
+
     @torch_compile(dynamic = True, fullgraph = True)
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
@@ -648,6 +665,326 @@ class GptOssMLP(nn.Module):
         routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
         return routed_out, router_scores
 pass
+
+
+# ============================================================================
+# GPT OSS MoE LoRA Support using grouped GEMM kernels
+# ============================================================================
+
+from .moe_utils import (
+    _check_grouped_gemm_available,
+    _TORCH_GROUPED_MM_AVAILABLE,
+    _check_torch_grouped_mm_supported,
+    native_moe_grouped_mm,
+    _get_moe_lora_weights,
+    _apply_lora_grouped_mm,
+    _get_lora_wrapper_for_param,
+    select_moe_backend,
+    patch_param_wrapper_for_moe,
+)
+
+
+def _gpt_oss_swiglu_activation(gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
+    """
+    GPT OSS specific SwiGLU activation function.
+    Uses interleaved gate/up layout: gate = gate_up[..., ::2], up = gate_up[..., 1::2]
+    Activation: gate.clamp(max=limit) * sigmoid(gate * alpha) * (up.clamp(-limit, limit) + 1)
+    """
+    gate = gate_up[..., ::2]
+    up = gate_up[..., 1::2]
+    gate = gate.clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    glu = gate * torch.sigmoid(gate.float() * alpha).to(gate.dtype)
+    return (up + 1) * glu
+
+
+@torch.compiler.disable
+def forward_gpt_oss_native_grouped_mm(
+    self,
+    hidden_states: torch.Tensor,
+    router_indices: torch.Tensor,
+    routing_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    GPT OSS MoE forward pass using native torch._grouped_mm.
+    Supports LoRA via separated computation.
+
+    Args:
+        hidden_states: (batch_size, seq_len, hidden_dim) or (num_tokens, hidden_dim)
+        router_indices: (num_tokens, top_k) expert indices
+        routing_weights: (num_tokens, num_experts) or (num_tokens, top_k) routing weights
+    """
+    # Handle input shape
+    if hidden_states.dim() == 3:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+    else:
+        hidden_dim = hidden_states.shape[-1]
+        batch_size = 1
+        sequence_length = hidden_states.shape[0]
+
+    num_tokens = hidden_states.shape[0]
+    top_k = router_indices.shape[-1]
+
+    # 1. Routing
+    flat_top_k = router_indices.view(-1)
+    num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
+    sorted_indices = torch.argsort(flat_top_k, stable=True)
+    token_indices = sorted_indices // top_k
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+
+    # 2. Permute Input
+    permuted_input = hidden_states[token_indices]
+
+    # 3. Gate Up Proj
+    # GPT OSS weight layout: (E, hidden_size, 2*expert_dim)
+    gate_up_weight = self.gate_up_proj
+    if gate_up_weight.shape[-1] == hidden_dim:
+        # Weight is (E, 2*I, H), need transpose to get (E, H, 2*I)
+        w1 = gate_up_weight.transpose(-2, -1)
+    else:
+        # Weight is already (E, H, 2*I), no transpose needed
+        w1 = gate_up_weight
+
+    # Base GEMM
+    mm1_out = native_moe_grouped_mm(permuted_input, w1, offsets)
+
+    # Add bias if present
+    if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
+        # Need to index bias by expert for each token
+        expert_ids = flat_top_k[sorted_indices]
+        mm1_out = mm1_out + self.gate_up_proj_bias[expert_ids]
+
+    # LoRA for gate_up_proj
+    gate_up_wrapper = _get_lora_wrapper_for_param(self, 'gate_up_proj')
+    if gate_up_wrapper is not None:
+        lora_data = _get_moe_lora_weights(gate_up_wrapper)
+        if lora_data is not None:
+            lora_A, lora_B, scaling = lora_data[:3]
+            lora_delta = _apply_lora_grouped_mm(
+                permuted_input, lora_A, lora_B, offsets, scaling,
+                grouped_mm_func=native_moe_grouped_mm
+            )
+            mm1_out = mm1_out + lora_delta
+
+    # 4. Activation - GPT OSS specific
+    alpha = getattr(self, 'alpha', 1.702)
+    limit = getattr(self, 'limit', 7.0)
+    intermediate = _gpt_oss_swiglu_activation(mm1_out, alpha, limit)
+
+    # 5. Down Proj
+    # GPT OSS weight layout: (E, expert_dim, hidden_size)
+    intermediate_dim = intermediate.shape[-1]
+    down_weight = self.down_proj
+    if down_weight.shape[-1] == intermediate_dim:
+        # Weight is (E, H, I), need transpose to get (E, I, H)
+        w2 = down_weight.transpose(-2, -1)
+    else:
+        # Weight is already (E, I, H), no transpose needed
+        w2 = down_weight
+
+    # Ensure intermediate has same dtype as weight for grouped_mm
+    # (activation may have changed dtype)
+    if intermediate.dtype != w2.dtype:
+        intermediate = intermediate.to(w2.dtype)
+
+    # Base GEMM
+    mm2_out = native_moe_grouped_mm(intermediate, w2, offsets)
+
+    # Add bias if present
+    if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
+        expert_ids = flat_top_k[sorted_indices]
+        mm2_out = mm2_out + self.down_proj_bias[expert_ids]
+
+    # LoRA for down_proj
+    down_wrapper = _get_lora_wrapper_for_param(self, 'down_proj')
+    if down_wrapper is not None:
+        lora_data = _get_moe_lora_weights(down_wrapper)
+        if lora_data is not None:
+            lora_A, lora_B, scaling = lora_data[:3]
+            lora_delta = _apply_lora_grouped_mm(
+                intermediate, lora_A, lora_B, offsets, scaling,
+                grouped_mm_func=native_moe_grouped_mm
+            )
+            mm2_out = mm2_out + lora_delta
+
+    # 6. Scatter back
+    # Handle different routing_weights shapes
+    if routing_weights.shape[-1] == self.num_experts:
+        # routing_weights is (num_tokens, num_experts)
+        flat_weights = routing_weights[token_indices, flat_top_k[sorted_indices]]
+    else:
+        # routing_weights is (num_tokens, top_k)
+        flat_weights = routing_weights.view(-1)[sorted_indices]
+
+    mm2_out = mm2_out * flat_weights.unsqueeze(-1)
+
+    final_hidden_states = torch.zeros(
+        (num_tokens, hidden_dim),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device
+    )
+    final_hidden_states.index_add_(0, token_indices, mm2_out.to(hidden_states.dtype))
+
+    return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+
+
+@torch.compiler.disable
+def forward_gpt_oss_native_loop(
+    self,
+    hidden_states: torch.Tensor,
+    router_indices: torch.Tensor,
+    routing_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Loop-based GPT OSS MoE forward pass with LoRA support.
+    Fallback when grouped_mm is not available.
+    """
+    # Handle input shape
+    if hidden_states.dim() == 3:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+    else:
+        hidden_dim = hidden_states.shape[-1]
+        batch_size = 1
+        sequence_length = hidden_states.shape[0]
+
+    final_hidden_states = torch.zeros_like(hidden_states, dtype=torch.float32)
+
+    # Get wrappers once
+    gate_up_wrapper = _get_lora_wrapper_for_param(self, 'gate_up_proj')
+    down_wrapper = _get_lora_wrapper_for_param(self, 'down_proj')
+
+    gate_up_lora = _get_moe_lora_weights(gate_up_wrapper) if gate_up_wrapper else None
+    down_lora = _get_moe_lora_weights(down_wrapper) if down_wrapper else None
+
+    alpha = getattr(self, 'alpha', 1.702)
+    limit = getattr(self, 'limit', 7.0)
+
+    # Create expert mask
+    with torch.no_grad():
+        expert_mask = F.one_hot(router_indices, num_classes=self.num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, num_tokens)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+    for expert_idx_t in expert_hit:
+        expert_idx = expert_idx_t.item()
+
+        # Find tokens for this expert
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[token_idx]
+
+        # Gate up projection
+        w = self.gate_up_proj[expert_idx]  # (hidden_size, 2*expert_dim) or (2*expert_dim, hidden_size)
+        if w.shape[0] == hidden_dim:
+            gate_up = current_state @ w
+        else:
+            gate_up = current_state @ w.T
+
+        # Add bias
+        if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
+            gate_up = gate_up + self.gate_up_proj_bias[expert_idx]
+
+        # LoRA for gate_up
+        if gate_up_lora is not None:
+            lora_A, lora_B, scaling, _ = gate_up_lora
+            l_A = lora_A[expert_idx]
+            l_B = lora_B[expert_idx]
+            # Dynamic dimension matching
+            if l_A.shape[1] == hidden_dim:
+                gate_up = gate_up + (current_state @ l_A.T @ l_B.T) * scaling
+            elif l_B.shape[0] == hidden_dim:
+                gate_up = gate_up + (current_state @ l_B @ l_A) * scaling
+
+        # Activation
+        current_hidden_states = _gpt_oss_swiglu_activation(gate_up, alpha, limit)
+
+        # Down projection
+        w2 = self.down_proj[expert_idx]
+        intermediate_dim = current_hidden_states.shape[-1]
+        if w2.shape[0] == intermediate_dim:
+            down_out = current_hidden_states @ w2
+        else:
+            down_out = current_hidden_states @ w2.T
+
+        # Add bias
+        if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
+            down_out = down_out + self.down_proj_bias[expert_idx]
+
+        # LoRA for down
+        if down_lora is not None:
+            lora_A, lora_B, scaling, _ = down_lora
+            l_A = lora_A[expert_idx]
+            l_B = lora_B[expert_idx]
+            if l_A.shape[1] == intermediate_dim:
+                down_out = down_out + (current_hidden_states @ l_A.T @ l_B.T) * scaling
+            elif l_B.shape[0] == intermediate_dim:
+                down_out = down_out + (current_hidden_states @ l_B @ l_A) * scaling
+
+        # Apply routing weights
+        if routing_weights.shape[-1] == self.num_experts:
+            weights = routing_weights[token_idx, expert_idx]
+        else:
+            weights = routing_weights[token_idx, top_k_pos]
+
+        weighted_output = down_out * weights.unsqueeze(-1).float()
+        final_hidden_states.index_add_(0, token_idx, weighted_output)
+
+    return final_hidden_states.view(batch_size, sequence_length, hidden_dim).to(hidden_states.dtype)
+
+
+def patch_gpt_oss_moe_for_lora():
+    """
+    Patch GPT OSS MoE experts for LoRA training with grouped GEMM support.
+    This patches the original GptOssExperts class (with 3D parameter tensors)
+    to use optimized grouped GEMM kernels with LoRA support.
+    """
+    # First patch ParamWrapper for MoE separated LoRA
+    patch_param_wrapper_for_moe()
+
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        GptOssExpertsClass = transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Could not patch GPT OSS MoE for LoRA: {e}")
+        return
+
+    # Check if already patched
+    if hasattr(GptOssExpertsClass, '_unsloth_lora_patched'):
+        return
+
+    # Select backend
+    backend = select_moe_backend()
+
+    if backend == "grouped_mm":
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            router_indices=None,
+            routing_weights=None
+        ) -> torch.Tensor:
+            return forward_gpt_oss_native_grouped_mm(self, hidden_states, router_indices, routing_weights)
+    else:
+        # Fallback to loop-based implementation
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            router_indices=None,
+            routing_weights=None
+        ) -> torch.Tensor:
+            return forward_gpt_oss_native_loop(self, hidden_states, router_indices, routing_weights)
+
+    # Store original forward
+    GptOssExpertsClass._original_forward = GptOssExpertsClass.forward
+    GptOssExpertsClass.forward = forward
+    GptOssExpertsClass._unsloth_lora_patched = True
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: Patched GPT OSS MoE for LoRA training (backend: {backend})")
+
+TEMPORARY_PATCHES.append(patch_gpt_oss_moe_for_lora)
+
 
 def patch_gpt_oss_linearized():
     if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
