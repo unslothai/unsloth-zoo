@@ -441,12 +441,25 @@ def install_llama_cpp(
             # Clean up any partial build
             try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
 
-            try_execute(
-                f"cmake . -B build "\
-                f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support} -DLLAMA_CURL=ON",
-                cwd = llama_cpp_folder,
-                **kwargs
-            )
+            try:
+                try_execute(
+                    f"cmake . -B build "\
+                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support} -DLLAMA_CURL=ON",
+                    cwd = llama_cpp_folder,
+                    **kwargs
+                )
+            except Exception as inner_e:
+                inner_e = str(inner_e)
+                if "LLAMA_CURL" in inner_e and "deprecated" in inner_e:
+                    # As of https://github.com/ggml-org/llama.cpp/pull/18791, CURL is deprecated
+                    try_execute(
+                        f"cmake . -B build "\
+                        f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}",
+                        cwd = llama_cpp_folder,
+                        **kwargs
+                    )
+                else:
+                    raise
             try_execute(
                 f"cmake --build build --config Release "\
                 f"-j{cpu_count} --clean-first --target "\
