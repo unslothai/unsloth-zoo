@@ -44,6 +44,27 @@ from .utils import (
 from ..hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
 
+# MXFP4 configuration
+# Set UNSLOTH_MXFP4_NO_DEQUANTIZE=1 to keep MXFP4 weights quantized (requires triton_kernels)
+# Otherwise, MXFP4 weights will be dequantized to bf16 for LoRA training
+UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0") == "1"
+
+def _check_triton_kernels_available():
+    """Check if OpenAI's triton_kernels package is available for MXFP4."""
+    try:
+        from triton_kernels import matmul_ogs, swiglu
+        return True
+    except ImportError:
+        return False
+
+_TRITON_KERNELS_AVAILABLE = None
+def is_triton_kernels_available():
+    """Cached check for triton_kernels availability."""
+    global _TRITON_KERNELS_AVAILABLE
+    if _TRITON_KERNELS_AVAILABLE is None:
+        _TRITON_KERNELS_AVAILABLE = _check_triton_kernels_available()
+    return _TRITON_KERNELS_AVAILABLE
+
 
 @torch_compile(dynamic = True, fullgraph = True)
 def swiglu_torch_forward(a, alpha, limit, dtype = None):
@@ -984,6 +1005,279 @@ def patch_gpt_oss_moe_for_lora():
         logger.info(f"Unsloth: Patched GPT OSS MoE for LoRA training (backend: {backend})")
 
 TEMPORARY_PATCHES.append(patch_gpt_oss_moe_for_lora)
+
+
+# ============================================================================
+# MXFP4 (4-bit) GPT OSS MoE LoRA Support
+# ============================================================================
+
+@torch.compiler.disable
+def forward_mxfp4_gpt_oss_with_lora(
+    self,
+    hidden_states: torch.Tensor,
+    routing_data,
+    gather_idx,
+    scatter_idx,
+) -> torch.Tensor:
+    """
+    MXFP4 GPT OSS MoE forward pass with LoRA support.
+
+    For LoRA training with MXFP4:
+    - Base MXFP4 matmul is computed without gradients (frozen weights)
+    - LoRA delta is computed with gradients
+    - Output = base_output + lora_delta
+
+    This allows finetuning MXFP4 quantized models with LoRA.
+
+    Requires triton_kernels for native MXFP4 matmul.
+    If triton_kernels is not available, model should be loaded with
+    Mxfp4Config(dequantize=True) to convert to bf16.
+    """
+    if not is_triton_kernels_available():
+        raise RuntimeError(
+            "triton_kernels is required for native MXFP4 GPT OSS forward pass. "
+            "Either:\n"
+            "  1. Install triton_kernels from OpenAI, OR\n"
+            "  2. Load model with dequantization: Mxfp4Config(dequantize=True), OR\n"
+            "  3. Use the BF16 model: 'unsloth/gpt-oss-20b-BF16'\n"
+            "Set UNSLOTH_MXFP4_NO_DEQUANTIZE=0 (default) to auto-dequantize."
+        )
+
+    from triton_kernels import matmul_ogs, swiglu
+    matmul_ogs_fn = matmul_ogs.matmul_ogs
+    FnSpecs = matmul_ogs.FnSpecs
+    FusedActivation = matmul_ogs.FusedActivation
+    swiglu_fn = swiglu.swiglu_fn
+
+    # Get LoRA wrappers
+    gate_up_wrapper = _get_lora_wrapper_for_param(self, 'gate_up_proj')
+    down_wrapper = _get_lora_wrapper_for_param(self, 'down_proj')
+
+    has_lora = gate_up_wrapper is not None or down_wrapper is not None
+
+    # If no LoRA, use the original MXFP4 forward (inference path)
+    if not has_lora:
+        with torch_cuda_device(hidden_states.device):
+            if not hasattr(self, "act"):
+                self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
+            intermediate_cache1 = matmul_ogs_fn(
+                hidden_states.to(torch.bfloat16),
+                self.gate_up_proj,
+                self.gate_up_proj_bias,
+                routing_data,
+                gather_indx=gather_idx,
+                precision_config=self.gate_up_proj_precision_config,
+                gammas=None,
+                fused_activation=self.act,
+            )
+            intermediate_cache3 = matmul_ogs_fn(
+                intermediate_cache1,
+                self.down_proj,
+                self.down_proj_bias,
+                routing_data,
+                scatter_indx=scatter_idx,
+                precision_config=self.down_proj_precision_config,
+                gammas=routing_data.gate_scal if routing_data else None,
+            )
+        return intermediate_cache3
+
+    # With LoRA: compute base MXFP4 output (no grad) + LoRA delta (with grad)
+    with torch_cuda_device(hidden_states.device):
+        # 1. Compute MXFP4 base output (detached, no gradients for base weights)
+        with torch.no_grad():
+            if not hasattr(self, "act"):
+                self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
+
+            # Gate-up projection (MXFP4)
+            pre_activation = matmul_ogs_fn(
+                hidden_states.to(torch.bfloat16),
+                self.gate_up_proj,
+                self.gate_up_proj_bias,
+                routing_data,
+                gather_indx=gather_idx,
+                precision_config=self.gate_up_proj_precision_config,
+                gammas=None,
+                fused_activation=None,  # Don't fuse activation so we can add LoRA before
+            )
+
+        # 2. Add LoRA for gate_up_proj
+        if gate_up_wrapper is not None:
+            lora_data = _get_moe_lora_weights(gate_up_wrapper)
+            if lora_data is not None:
+                # Convert routing_data to grouped_mm format
+                # We need to extract indices from triton_kernels format
+                lora_A, lora_B, scaling, num_experts = lora_data
+
+                # For LoRA, we need to compute on the gathered tokens
+                # Use the gather indices to permute input
+                gather_src = gather_idx.src_indx  # source indices
+                permuted_input = hidden_states[gather_src].to(torch.bfloat16)
+
+                # Compute token counts per expert for grouped_mm
+                # This is tricky - we need to infer from routing_data
+                # For now, use a loop-based approach for LoRA which is more robust
+                for expert_idx in range(num_experts):
+                    # Find tokens for this expert
+                    expert_mask = (routing_data.exp_indx == expert_idx)
+                    if not expert_mask.any():
+                        continue
+
+                    expert_tokens = permuted_input[expert_mask]
+                    l_A = lora_A[expert_idx].to(expert_tokens.dtype)
+                    l_B = lora_B[expert_idx].to(expert_tokens.dtype)
+
+                    # Compute LoRA delta: x @ A.T @ B.T * scaling
+                    if l_A.shape[-1] == expert_tokens.shape[-1]:
+                        lora_delta = (expert_tokens @ l_A.T @ l_B.T) * scaling
+                    elif l_B.shape[0] == expert_tokens.shape[-1]:
+                        lora_delta = (expert_tokens @ l_B @ l_A) * scaling
+                    else:
+                        continue
+
+                    # Add to pre_activation (need to match the indexing)
+                    pre_activation[expert_mask] = pre_activation[expert_mask] + lora_delta
+
+        # 3. Apply SwiGLU activation
+        alpha = getattr(self, 'alpha', 1.702)
+        limit = getattr(self, 'limit', 7.0)
+        swiglu_output = swiglu_torch_forward(pre_activation, alpha, limit)
+
+        # 4. Down projection (MXFP4)
+        with torch.no_grad():
+            base_output = matmul_ogs_fn(
+                swiglu_output.detach(),  # Detach to prevent grad through MXFP4
+                self.down_proj,
+                self.down_proj_bias,
+                routing_data,
+                scatter_indx=scatter_idx,
+                precision_config=self.down_proj_precision_config,
+                gammas=routing_data.gate_scal if routing_data else None,
+            )
+
+        # 5. Add LoRA for down_proj
+        if down_wrapper is not None:
+            lora_data = _get_moe_lora_weights(down_wrapper)
+            if lora_data is not None:
+                lora_A, lora_B, scaling, num_experts = lora_data
+
+                # For down_proj LoRA, we work on swiglu_output before scattering
+                for expert_idx in range(num_experts):
+                    expert_mask = (routing_data.exp_indx == expert_idx)
+                    if not expert_mask.any():
+                        continue
+
+                    expert_tokens = swiglu_output[expert_mask]
+                    l_A = lora_A[expert_idx].to(expert_tokens.dtype)
+                    l_B = lora_B[expert_idx].to(expert_tokens.dtype)
+
+                    # Compute LoRA delta
+                    if l_A.shape[-1] == expert_tokens.shape[-1]:
+                        lora_delta = (expert_tokens @ l_A.T @ l_B.T) * scaling
+                    elif l_B.shape[0] == expert_tokens.shape[-1]:
+                        lora_delta = (expert_tokens @ l_B @ l_A) * scaling
+                    else:
+                        continue
+
+                    # Scatter LoRA delta back to output
+                    scatter_mask = scatter_idx.dst_indx[expert_mask]
+                    gamma = routing_data.gate_scal[expert_mask].unsqueeze(-1)
+                    base_output.index_add_(0, scatter_mask, (lora_delta * gamma).to(base_output.dtype))
+
+    return base_output
+
+
+def patch_mxfp4_gpt_oss_for_lora():
+    """
+    Patch MXFP4 GPT OSS experts for LoRA training.
+
+    This enables finetuning the MXFP4 quantized model (unsloth/gpt-oss-20b)
+    with LoRA.
+
+    Behavior controlled by UNSLOTH_MXFP4_NO_DEQUANTIZE env var:
+    - If "0" (default): MXFP4 weights will be dequantized to bf16 (requires more VRAM)
+    - If "1": Keep MXFP4 quantized, use triton_kernels for base matmul (requires triton_kernels)
+
+    When keeping MXFP4 quantized:
+    1. MXFP4 matmul (triton_kernels) for frozen base weights (no gradients)
+    2. bf16 matmul for LoRA delta (with gradients)
+    3. Output = base_output + lora_delta
+    """
+    # First patch ParamWrapper for MoE separated LoRA
+    patch_param_wrapper_for_moe()
+
+    try:
+        import transformers.integrations.mxfp4
+        Mxfp4GptOssExpertsClass = getattr(transformers.integrations.mxfp4, 'Mxfp4GptOssExperts', None)
+        if Mxfp4GptOssExpertsClass is None:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning("Unsloth: Mxfp4GptOssExperts not found in transformers.integrations.mxfp4")
+            return
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Could not patch MXFP4 GPT OSS for LoRA: {e}")
+        return
+
+    # Check if already patched
+    if hasattr(Mxfp4GptOssExpertsClass, '_unsloth_mxfp4_lora_patched'):
+        return
+
+    # Check if user wants to keep MXFP4 quantized
+    if UNSLOTH_MXFP4_NO_DEQUANTIZE:
+        if is_triton_kernels_available():
+            # Use native MXFP4 + LoRA (keeps weights quantized)
+            Mxfp4GptOssExpertsClass._original_forward = Mxfp4GptOssExpertsClass.forward
+            Mxfp4GptOssExpertsClass.forward = forward_mxfp4_gpt_oss_with_lora
+            Mxfp4GptOssExpertsClass._unsloth_mxfp4_lora_patched = True
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.info("Unsloth: Patched MXFP4 GPT OSS MoE for LoRA (native MXFP4, no dequantization)")
+        else:
+            # triton_kernels not available, warn user
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(
+                    "Unsloth: UNSLOTH_MXFP4_NO_DEQUANTIZE=1 but triton_kernels is not installed. "
+                    "Install triton_kernels from OpenAI or set UNSLOTH_MXFP4_NO_DEQUANTIZE=0 to use dequantization. "
+                    "Falling back to dequantized mode."
+                )
+            # Fall through to dequantized mode
+            Mxfp4GptOssExpertsClass._original_forward = Mxfp4GptOssExpertsClass.forward
+            Mxfp4GptOssExpertsClass.forward = forward_mxfp4_gpt_oss_with_lora
+            Mxfp4GptOssExpertsClass._unsloth_mxfp4_lora_patched = True
+    else:
+        # Default: dequantize MXFP4 to bf16 (uses more VRAM but no triton_kernels needed)
+        # The dequantization happens at load time via Mxfp4Config(dequantize=True)
+        # This patch handles the case where model is loaded with dequantization
+        Mxfp4GptOssExpertsClass._original_forward = Mxfp4GptOssExpertsClass.forward
+        Mxfp4GptOssExpertsClass.forward = forward_mxfp4_gpt_oss_with_lora
+        Mxfp4GptOssExpertsClass._unsloth_mxfp4_lora_patched = True
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info("Unsloth: Patched MXFP4 GPT OSS MoE for LoRA training")
+
+TEMPORARY_PATCHES.append(patch_mxfp4_gpt_oss_for_lora)
+
+
+def should_dequantize_mxfp4():
+    """
+    Check if MXFP4 should be dequantized to bf16.
+
+    Returns True if:
+    - UNSLOTH_MXFP4_NO_DEQUANTIZE is not set or "0", OR
+    - UNSLOTH_MXFP4_NO_DEQUANTIZE="1" but triton_kernels is not available
+
+    Returns False if:
+    - UNSLOTH_MXFP4_NO_DEQUANTIZE="1" AND triton_kernels is available
+    """
+    if not UNSLOTH_MXFP4_NO_DEQUANTIZE:
+        return True  # Default: dequantize
+
+    if not is_triton_kernels_available():
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(
+                "Unsloth: UNSLOTH_MXFP4_NO_DEQUANTIZE=1 but triton_kernels not available. "
+                "Will dequantize MXFP4 to bf16."
+            )
+        return True  # triton_kernels required for native MXFP4
+
+    return False  # Keep MXFP4 quantized
 
 
 def patch_gpt_oss_linearized():
