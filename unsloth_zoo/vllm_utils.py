@@ -1682,7 +1682,13 @@ def load_vllm(
     else: standby_target_gpu_util = 0.75
     # Reduce memory usage for newer vLLM versions since it OOMs
     if Version(vllm_version) >= Version("0.11.0"):
-        standby_target_gpu_util *= 0.95
+        # Reduce further for smaller GPUs
+        if   ten_percent >= 4.0: standby_target_gpu_util *= 0.925
+        elif ten_percent >= 2.5: standby_target_gpu_util *= 0.9
+        elif ten_percent >= 2.0: standby_target_gpu_util *= 0.875
+        elif ten_percent >= 1.4: standby_target_gpu_util *= 0.85
+        elif ten_percent >= 1.0: standby_target_gpu_util *= 0.8
+        else: standby_target_gpu_util *= 0.75
 
     if unsloth_vllm_standby and not standby_util_override:
         if gpu_memory_utilization < standby_target_gpu_util:
