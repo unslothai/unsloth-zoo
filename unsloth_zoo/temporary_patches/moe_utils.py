@@ -124,18 +124,30 @@ def _check_grouped_gemm_available():
     return _GROUPED_GEMM_AVAILABLE
 
 
+_MOE_BACKEND_LOGGED = False
+
 def select_moe_backend():
     """
     Selects the MoE backend based on UNSLOTH_MOE_BACKEND environment variable and availability.
     Choices: "grouped_mm", "unsloth_triton", "native_torch".
     Default if unspecified: "grouped_mm".
+
+    Backend performance notes:
+    - grouped_mm: Uses torch._grouped_mm (requires H100+ or recent PyTorch). Fastest for training.
+    - unsloth_triton: Uses Unsloth's Triton kernels. Good fallback.
+    - native_torch: Loop-based fallback. Slowest but always works.
     """
+    global _MOE_BACKEND_LOGGED
+
     # Choices ordered by preference
-    # (backend_name, is_available)
+    # (backend_name, is_available, description)
+    grouped_mm_available = _check_torch_grouped_mm_supported()
+    triton_available = _check_grouped_gemm_available()
+
     choices = [
-        ("grouped_mm",     _check_torch_grouped_mm_supported()),
-        ("unsloth_triton", _check_grouped_gemm_available()),
-        ("native_torch",   True),
+        ("grouped_mm",     grouped_mm_available, "torch._grouped_mm (batched)"),
+        ("unsloth_triton", triton_available,     "Triton kernels"),
+        ("native_torch",   True,                 "loop fallback"),
     ]
 
     # 1. Check environment variable
@@ -146,27 +158,35 @@ def select_moe_backend():
         # Check against available choices
         is_valid = False
         is_available = False
+        desc = ""
 
-        for name, available in choices:
+        for name, available, description in choices:
             if name == requested_backend:
                 is_valid = True
                 is_available = available
+                desc = description
                 break
 
         if is_valid:
             if is_available:
-                logger.info(f"Unsloth: Using MoE backend '{requested_backend}'")
+                if not _MOE_BACKEND_LOGGED:
+                    _MOE_BACKEND_LOGGED = True
+                    logger.info(f"Unsloth: MoE backend '{requested_backend}' ({desc})")
                 return requested_backend
             else:
-                logger.warning(f"Unsloth: '{requested_backend}' backend requested but is not available. Falling back to next available.")
+                logger.warning(f"Unsloth: '{requested_backend}' backend requested but not available. Falling back.")
 
     # 2. Automatic selection (first available in preference order)
-    for name, available in choices:
+    for name, available, desc in choices:
         if available:
-            logger.info(f"Unsloth: Using MoE backend '{name}'")
+            if not _MOE_BACKEND_LOGGED:
+                _MOE_BACKEND_LOGGED = True
+                logger.info(f"Unsloth: MoE backend '{name}' ({desc})")
             return name
 
-    logger.info("Unsloth: Using MoE backend 'native_torch' (fallback)")
+    if not _MOE_BACKEND_LOGGED:
+        _MOE_BACKEND_LOGGED = True
+        logger.info("Unsloth: MoE backend 'native_torch' (loop fallback)")
     return "native_torch"
 
 
@@ -277,12 +297,12 @@ def _is_moe_experts_module(module) -> bool:
     Check if module is an MoE experts layer (generic, not model-specific).
 
     Detects modules with stacked expert weights as 3D nn.Parameter:
-    - gate_up_proj/down_proj pattern (Qwen3-MoE, Qwen3-VL-MoE, etc.)
+    - gate_up_proj/down_proj pattern (Qwen3-MoE, Qwen3-VL-MoE, GPT-OSS, etc.)
     - w1/w2/w3 pattern (older MoE models)
     """
     import torch.nn as nn
 
-    # Check for gate_up_proj pattern
+    # Check for gate_up_proj pattern (Qwen3-MoE, GPT-OSS)
     if hasattr(module, 'gate_up_proj'):
         param = module.gate_up_proj
         if isinstance(param, nn.Parameter) and param.ndim == 3:
@@ -293,6 +313,11 @@ def _is_moe_experts_module(module) -> bool:
         w1 = module.w1
         if isinstance(w1, nn.Parameter) and w1.ndim == 3:
             return True
+
+    # Check class name for known MoE expert classes
+    class_name = module.__class__.__name__
+    if class_name in ('GptOssExperts', 'Qwen3MoeExperts', 'MixtralExperts'):
+        return True
 
     return False
 

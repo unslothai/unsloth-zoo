@@ -264,6 +264,7 @@ def patch_gpt_oss():
             self.intermediate_size = config.intermediate_size
             self.hidden_size = config.hidden_size
 
+            # MXFP4 quantized format (blocks + scales)
             self.gate_up_proj_blocks = nn.Parameter(
                 torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, 16, dtype=torch.uint8),
                 requires_grad=False,
@@ -287,6 +288,7 @@ def patch_gpt_oss():
             self.down_proj_bias = nn.Parameter(
                 torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32), requires_grad=False
             )
+
             self.alpha = 1.702
             self.limit = getattr(config, "swiglu_limit", 7.0)
             self.gate_up_proj_precision_config = None
@@ -381,8 +383,15 @@ def patch_gpt_oss():
                 scales_attr = f"{proj}_scales"
                 blocks = getattr(module, blocks_attr)
                 scales = getattr(module, scales_attr)
-                # Check if both blocks and scales both not on on meta device
-                if blocks.device.type != "meta" and scales.device.type != "meta":
+                # Check if both blocks and scales both not on meta device AND not all zeros
+                # (if blocks are all zeros, they're from initialization, not from checkpoint)
+                blocks_valid = (
+                    blocks.device.type != "meta" and
+                    scales.device.type != "meta" and
+                    blocks.numel() > 0 and
+                    blocks.any()  # At least some non-zero values
+                )
+                if blocks_valid:
                     # need it for ep
                     local_experts = blocks.size(0)
                     if proj == "gate_up_proj":
@@ -464,24 +473,40 @@ TEMPORARY_PATCHES.append(patch_gpt_oss)
 
 
 class GptOssExperts(nn.Module):
+    """
+    GPT OSS MoE Experts layer with 3D stacked parameters.
+    Compatible with transformers' _init_weights and supports grouped_mm with split LoRA.
+
+    Uses the same structure as the original transformers GptOssExperts:
+    - gate_up_proj: (num_experts, hidden_size, 2 * expert_dim)
+    - gate_up_proj_bias: (num_experts, 2 * expert_dim)
+    - down_proj: (num_experts, expert_dim, hidden_size)
+    - down_proj_bias: (num_experts, hidden_size)
+    """
     def __init__(self, config):
         super().__init__()
 
         self.num_experts = config.num_local_experts
         self.hidden_size = config.hidden_size
         self.expert_dim = config.intermediate_size
+        self.intermediate_size = config.intermediate_size  # Alias for compatibility
         self.alpha = 1.702
         self.limit = getattr(config, "swiglu_limit", 7.0)
         self.dtype = dtype_from_config(config)
 
-        self.gate_up_projs = nn.ModuleList([
-            nn.Linear(self.hidden_size, 2 * self.expert_dim, dtype=self.dtype)
-            for _ in range(self.num_experts)
-        ])
-        self.down_projs = nn.ModuleList([
-            nn.Linear(self.expert_dim, self.hidden_size, dtype=self.dtype)
-            for _ in range(self.num_experts)
-        ])
+        # Use 3D stacked parameters like original transformers (compatible with _init_weights)
+        self.gate_up_proj = nn.Parameter(
+            torch.zeros(self.num_experts, self.hidden_size, 2 * self.expert_dim, dtype=self.dtype)
+        )
+        self.gate_up_proj_bias = nn.Parameter(
+            torch.zeros(self.num_experts, 2 * self.expert_dim, dtype=self.dtype)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.expert_dim, self.hidden_size, dtype=self.dtype)
+        )
+        self.down_proj_bias = nn.Parameter(
+            torch.zeros(self.num_experts, self.hidden_size, dtype=self.dtype)
+        )
 
     def forward(
         self,
@@ -489,50 +514,13 @@ class GptOssExperts(nn.Module):
         router_indices = None,
         routing_weights = None
     ) -> torch.Tensor:
+        """Forward using grouped_mm or loop fallback with LoRA support."""
+        # Use optimized grouped_mm if available
+        if _check_torch_grouped_mm_supported():
+            return forward_gpt_oss_native_grouped_mm(self, hidden_states, router_indices, routing_weights)
 
-        batch_size = hidden_states.shape[0]
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
-        num_experts = routing_weights.shape[1]
-        if self.training:
-            next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
-            # with torch.no_grad():
-                # expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                # expert_mask = expert_mask.permute(2, 1, 0)
-                # expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            # for expert_idx in expert_hitted[:]:
-            for expert_idx in range(num_experts):
-                with torch.no_grad():
-                    # _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                    token_idx, _ = torch.where(router_indices == expert_idx)
-                current_state = hidden_states[token_idx]
-                gate_up = self.gate_up_projs[expert_idx](current_state)
-                gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
-                # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                # gate = gate.clamp(min=None, max=self.limit)
-                # up = up.clamp(min=-self.limit, max=self.limit)
-                # glu = gate * torch.sigmoid(gate * self.alpha)
-                # gated_output = (up + 1) * glu
-                out = self.down_projs[expert_idx](gated_output)
-                weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
-                next_states.index_add_(0, token_idx, weighted_output)
-            next_states = next_states.view(batch_size, -1, self.hidden_size)
-            return next_states.to(hidden_states.dtype)
-        else:
-            X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
-            gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
-            gate_up = torch.stack(gate_up_list, dim=0)
-            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = X_rep.dtype)
-            # gate = gate_up[..., ::2]
-            # up_h = gate_up[..., 1::2]
-            # gate = gate.clamp(max=self.limit)
-            # up_h = up_h.clamp(min=-self.limit, max=self.limit)
-            # glu = gate * torch.sigmoid(gate * self.alpha)
-            # fused = (up_h + 1) * glu
-            out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
-            outs = torch.stack(out_list, dim=0)
-            rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-            mixed = (outs.to(torch.float32) * rw.to(torch.float32)).sum(dim=0)
-            return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
+        # Fallback to loop-based implementation
+        return forward_gpt_oss_native_loop(self, hidden_states, router_indices, routing_weights)
 pass
 
 class GptOssTopKRouter(nn.Module):
@@ -560,7 +548,8 @@ class GptOssTopKRouter(nn.Module):
     def bias(self, value):
         self.linear.bias = value
 
-    @torch_compile(dynamic = True, fullgraph = True)
+    # NOTE: Don't use @torch_compile here - it conflicts with bitsandbytes Linear4bit
+    # which has warnings.warn calls that dynamo can't trace
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = self.linear(hidden_states.to(self.linear.weight.dtype)) # (batch_size * seq_len, num_experts)
@@ -615,20 +604,34 @@ def moe_forward_inference(self, hidden_states):
     hidden_states = hidden_states.reshape(-1, moe.hidden_size)
 
     num_experts = routing_weights.shape[1]
-    X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
 
-    # Gate up projection
-    gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(moe.gate_up_projs)]
-    gate_up = torch.stack(gate_up_list, dim = 0)
-    dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
-    fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit, dtype = dtype)
+    # Check if using ModuleList (old style) or 3D parameters (new style)
+    if hasattr(moe, 'gate_up_projs'):
+        # ModuleList style
+        X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+        gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(moe.gate_up_projs)]
+        gate_up = torch.stack(gate_up_list, dim = 0)
+        dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+        fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit, dtype = dtype)
 
-    # Down projection must be done in float32 if not bfloat16 otherwise infinites
-    fused = fused.to(dtype)
-    device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
-    with torch.autocast(device_type=device_type, enabled=False): # Force float32
-        out_list = [down_l(fused[e].to(dtype)) for e, down_l in enumerate(moe.down_projs)]
-    outs = torch.stack(out_list, dim=0)
+        fused = fused.to(dtype)
+        device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            out_list = [down_l(fused[e].to(dtype)) for e, down_l in enumerate(moe.down_projs)]
+        outs = torch.stack(out_list, dim=0)
+    else:
+        # 3D parameter style (compatible with transformers)
+        X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+        # gate_up_proj: (E, hidden_size, 2*expert_dim) - bmm: (E, N, H) @ (E, H, 2I) -> (E, N, 2I)
+        gate_up = torch.bmm(X_rep, moe.gate_up_proj) + moe.gate_up_proj_bias[..., None, :]
+        dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+        fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit, dtype = dtype)
+
+        fused = fused.to(dtype)
+        device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            # down_proj: (E, expert_dim, hidden_size) - bmm: (E, N, I) @ (E, I, H) -> (E, N, H)
+            outs = torch.bmm(fused.to(dtype), moe.down_proj) + moe.down_proj_bias[..., None, :]
 
     rw = routing_weights.to(dtype).transpose(0, 1).unsqueeze(-1)
     mixed = (outs * rw).sum(dim=0)
@@ -1002,7 +1005,12 @@ def patch_gpt_oss_moe_for_lora():
     GptOssExpertsClass._unsloth_lora_patched = True
 
     if UNSLOTH_ENABLE_LOGGING:
-        logger.info(f"Unsloth: Patched GPT OSS MoE for LoRA training (backend: {backend})")
+        backend_desc = {
+            "grouped_mm": "torch._grouped_mm (batched, fastest)",
+            "unsloth_triton": "Triton kernels",
+            "native_torch": "loop fallback (slower)",
+        }.get(backend, backend)
+        logger.info(f"Unsloth: Patched GPT OSS MoE for LoRA training using {backend_desc}")
 
 TEMPORARY_PATCHES.append(patch_gpt_oss_moe_for_lora)
 
@@ -1100,42 +1108,28 @@ def forward_mxfp4_gpt_oss_with_lora(
                 fused_activation=None,  # Don't fuse activation so we can add LoRA before
             )
 
-        # 2. Add LoRA for gate_up_proj
+        # 2. Add LoRA for gate_up_proj using grouped_mm
         if gate_up_wrapper is not None:
             lora_data = _get_moe_lora_weights(gate_up_wrapper)
             if lora_data is not None:
-                # Convert routing_data to grouped_mm format
-                # We need to extract indices from triton_kernels format
                 lora_A, lora_B, scaling, num_experts = lora_data
 
-                # For LoRA, we need to compute on the gathered tokens
-                # Use the gather indices to permute input
-                gather_src = gather_idx.src_indx  # source indices
+                # Convert triton_kernels routing format to grouped_mm offsets
+                # routing_data.exp_indx contains expert index for each token
+                gather_src = gather_idx.src_indx
                 permuted_input = hidden_states[gather_src].to(torch.bfloat16)
 
-                # Compute token counts per expert for grouped_mm
-                # This is tricky - we need to infer from routing_data
-                # For now, use a loop-based approach for LoRA which is more robust
-                for expert_idx in range(num_experts):
-                    # Find tokens for this expert
-                    expert_mask = (routing_data.exp_indx == expert_idx)
-                    if not expert_mask.any():
-                        continue
+                # Compute offsets from expert indices (cumsum of token counts)
+                expert_ids = routing_data.exp_indx
+                num_tokens_per_expert = torch.bincount(expert_ids.int(), minlength=num_experts).int()
+                offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
-                    expert_tokens = permuted_input[expert_mask]
-                    l_A = lora_A[expert_idx].to(expert_tokens.dtype)
-                    l_B = lora_B[expert_idx].to(expert_tokens.dtype)
-
-                    # Compute LoRA delta: x @ A.T @ B.T * scaling
-                    if l_A.shape[-1] == expert_tokens.shape[-1]:
-                        lora_delta = (expert_tokens @ l_A.T @ l_B.T) * scaling
-                    elif l_B.shape[0] == expert_tokens.shape[-1]:
-                        lora_delta = (expert_tokens @ l_B @ l_A) * scaling
-                    else:
-                        continue
-
-                    # Add to pre_activation (need to match the indexing)
-                    pre_activation[expert_mask] = pre_activation[expert_mask] + lora_delta
+                # Use grouped_mm for LoRA computation (much faster than loop!)
+                lora_delta = _apply_lora_grouped_mm(
+                    permuted_input, lora_A, lora_B, offsets, scaling,
+                    grouped_mm_func=native_moe_grouped_mm
+                )
+                pre_activation = pre_activation + lora_delta
 
         # 3. Apply SwiGLU activation
         alpha = getattr(self, 'alpha', 1.702)
@@ -1154,34 +1148,27 @@ def forward_mxfp4_gpt_oss_with_lora(
                 gammas=routing_data.gate_scal if routing_data else None,
             )
 
-        # 5. Add LoRA for down_proj
+        # 5. Add LoRA for down_proj using grouped_mm
         if down_wrapper is not None:
             lora_data = _get_moe_lora_weights(down_wrapper)
             if lora_data is not None:
                 lora_A, lora_B, scaling, num_experts = lora_data
 
-                # For down_proj LoRA, we work on swiglu_output before scattering
-                for expert_idx in range(num_experts):
-                    expert_mask = (routing_data.exp_indx == expert_idx)
-                    if not expert_mask.any():
-                        continue
+                # Compute offsets from expert indices (reuse if available)
+                expert_ids = routing_data.exp_indx
+                num_tokens_per_expert = torch.bincount(expert_ids.int(), minlength=num_experts).int()
+                offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
-                    expert_tokens = swiglu_output[expert_mask]
-                    l_A = lora_A[expert_idx].to(expert_tokens.dtype)
-                    l_B = lora_B[expert_idx].to(expert_tokens.dtype)
+                # Use grouped_mm for LoRA computation
+                lora_delta = _apply_lora_grouped_mm(
+                    swiglu_output, lora_A, lora_B, offsets, scaling,
+                    grouped_mm_func=native_moe_grouped_mm
+                )
 
-                    # Compute LoRA delta
-                    if l_A.shape[-1] == expert_tokens.shape[-1]:
-                        lora_delta = (expert_tokens @ l_A.T @ l_B.T) * scaling
-                    elif l_B.shape[0] == expert_tokens.shape[-1]:
-                        lora_delta = (expert_tokens @ l_B @ l_A) * scaling
-                    else:
-                        continue
-
-                    # Scatter LoRA delta back to output
-                    scatter_mask = scatter_idx.dst_indx[expert_mask]
-                    gamma = routing_data.gate_scal[expert_mask].unsqueeze(-1)
-                    base_output.index_add_(0, scatter_mask, (lora_delta * gamma).to(base_output.dtype))
+                # Scatter LoRA delta back to output (apply routing weights)
+                scatter_dst = scatter_idx.dst_indx
+                gamma = routing_data.gate_scal.unsqueeze(-1)
+                base_output.index_add_(0, scatter_dst, (lora_delta * gamma).to(base_output.dtype))
 
     return base_output
 
@@ -1193,14 +1180,10 @@ def patch_mxfp4_gpt_oss_for_lora():
     This enables finetuning the MXFP4 quantized model (unsloth/gpt-oss-20b)
     with LoRA.
 
-    Behavior controlled by UNSLOTH_MXFP4_NO_DEQUANTIZE env var:
-    - If "0" (default): MXFP4 weights will be dequantized to bf16 (requires more VRAM)
-    - If "1": Keep MXFP4 quantized, use triton_kernels for base matmul (requires triton_kernels)
-
-    When keeping MXFP4 quantized:
-    1. MXFP4 matmul (triton_kernels) for frozen base weights (no gradients)
-    2. bf16 matmul for LoRA delta (with gradients)
-    3. Output = base_output + lora_delta
+    IMPORTANT: Requires triton_kernels for native MXFP4 matmul.
+    If triton_kernels is not available, users must either:
+    - Use Mxfp4Config(dequantize=True) when loading, OR
+    - Use the BF16 model: 'unsloth/gpt-oss-20b-BF16'
     """
     # First patch ParamWrapper for MoE separated LoRA
     patch_param_wrapper_for_moe()
@@ -1221,39 +1204,33 @@ def patch_mxfp4_gpt_oss_for_lora():
     if hasattr(Mxfp4GptOssExpertsClass, '_unsloth_mxfp4_lora_patched'):
         return
 
-    # Check if user wants to keep MXFP4 quantized
-    if UNSLOTH_MXFP4_NO_DEQUANTIZE:
-        if is_triton_kernels_available():
-            # Use native MXFP4 + LoRA (keeps weights quantized)
-            Mxfp4GptOssExpertsClass._original_forward = Mxfp4GptOssExpertsClass.forward
-            Mxfp4GptOssExpertsClass.forward = forward_mxfp4_gpt_oss_with_lora
-            Mxfp4GptOssExpertsClass._unsloth_mxfp4_lora_patched = True
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.info("Unsloth: Patched MXFP4 GPT OSS MoE for LoRA (native MXFP4, no dequantization)")
-        else:
-            # triton_kernels not available, warn user
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.warning(
-                    "Unsloth: UNSLOTH_MXFP4_NO_DEQUANTIZE=1 but triton_kernels is not installed. "
-                    "Install triton_kernels from OpenAI or set UNSLOTH_MXFP4_NO_DEQUANTIZE=0 to use dequantization. "
-                    "Falling back to dequantized mode."
-                )
-            # Fall through to dequantized mode
-            Mxfp4GptOssExpertsClass._original_forward = Mxfp4GptOssExpertsClass.forward
-            Mxfp4GptOssExpertsClass.forward = forward_mxfp4_gpt_oss_with_lora
-            Mxfp4GptOssExpertsClass._unsloth_mxfp4_lora_patched = True
-    else:
-        # Default: dequantize MXFP4 to bf16 (uses more VRAM but no triton_kernels needed)
-        # The dequantization happens at load time via Mxfp4Config(dequantize=True)
-        # This patch handles the case where model is loaded with dequantization
+    # Only patch if triton_kernels is available
+    # Without triton_kernels, MXFP4 weights cannot be used directly
+    # Users must use dequantization or BF16 model
+    if is_triton_kernels_available():
+        # Use native MXFP4 + LoRA (keeps weights quantized)
         Mxfp4GptOssExpertsClass._original_forward = Mxfp4GptOssExpertsClass.forward
         Mxfp4GptOssExpertsClass.forward = forward_mxfp4_gpt_oss_with_lora
         Mxfp4GptOssExpertsClass._unsloth_mxfp4_lora_patched = True
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("Unsloth: Patched MXFP4 GPT OSS MoE for LoRA training")
+    else:
+        # triton_kernels NOT available - do NOT patch
+        # The model will fail with a helpful error if user tries to use MXFP4 without dequantization
+        Mxfp4GptOssExpertsClass._unsloth_mxfp4_lora_patched = True
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(
+                "Unsloth: triton_kernels is not installed. MXFP4 GPT OSS will NOT be patched for LoRA.\n"
+                "To train GPT OSS with LoRA, either:\n"
+                "  1. Install triton_kernels from OpenAI (for native MXFP4), OR\n"
+                "  2. Use Mxfp4Config(dequantize=True) when loading (dequantizes to bf16), OR\n"
+                "  3. Use the BF16 model: 'unsloth/gpt-oss-20b-BF16'"
+            )
 
 TEMPORARY_PATCHES.append(patch_mxfp4_gpt_oss_for_lora)
 
+
+_MXFP4_DEQUANT_WARNED = False
 
 def should_dequantize_mxfp4():
     """
@@ -1265,22 +1242,47 @@ def should_dequantize_mxfp4():
 
     Returns False if:
     - UNSLOTH_MXFP4_NO_DEQUANTIZE="1" AND triton_kernels is available
+
+    MEMORY IMPACT:
+    - MXFP4 quantized: ~10GB for GPT-OSS 20B
+    - MXFP4 dequantized to bf16: ~40GB for GPT-OSS 20B
+
+    To keep MXFP4 quantized (requires triton_kernels):
+        export UNSLOTH_MXFP4_NO_DEQUANTIZE=1
     """
+    global _MXFP4_DEQUANT_WARNED
+
     if not UNSLOTH_MXFP4_NO_DEQUANTIZE:
-        return True  # Default: dequantize
+        # Default: dequantize to bf16
+        if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
+            _MXFP4_DEQUANT_WARNED = True
+            logger.warning(
+                "Unsloth: MXFP4 will be dequantized to bf16 (~4x memory increase). "
+                "To keep 4-bit: set UNSLOTH_MXFP4_NO_DEQUANTIZE=1 and install triton_kernels."
+            )
+        return True
 
     if not is_triton_kernels_available():
-        if UNSLOTH_ENABLE_LOGGING:
+        if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
+            _MXFP4_DEQUANT_WARNED = True
             logger.warning(
                 "Unsloth: UNSLOTH_MXFP4_NO_DEQUANTIZE=1 but triton_kernels not available. "
-                "Will dequantize MXFP4 to bf16."
+                "Will dequantize MXFP4 to bf16 (~4x memory increase). "
+                "Install triton_kernels to keep 4-bit quantized weights."
             )
         return True  # triton_kernels required for native MXFP4
 
+    if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
+        _MXFP4_DEQUANT_WARNED = True
+        logger.info("Unsloth: Keeping MXFP4 quantized (triton_kernels available)")
     return False  # Keep MXFP4 quantized
 
 
 def patch_gpt_oss_linearized():
+    """
+    Patch GPT OSS for 4bit loading with grouped_mm support.
+    Only patches the GptOssExperts forward method - keeps original classes for proper weight loading.
+    """
     if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
     if "_load_in_4bit_" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
     try:
@@ -1288,80 +1290,32 @@ def patch_gpt_oss_linearized():
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
 
-    # We find down_proj overflows in GPT OSS
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
-        def forward(
+    # Don't replace classes - just patch the forward method of GptOssExperts
+    # This keeps the original class structure which properly handles 4-bit weight loading
+    backend = select_moe_backend()
+
+    if backend == "grouped_mm":
+        def experts_forward(
             self,
             hidden_states: torch.Tensor,
-            router_indices = None,
-            routing_weights = None
+            router_indices=None,
+            routing_weights=None
         ) -> torch.Tensor:
+            return forward_gpt_oss_native_grouped_mm(self, hidden_states, router_indices, routing_weights)
+    else:
+        def experts_forward(
+            self,
+            hidden_states: torch.Tensor,
+            router_indices=None,
+            routing_weights=None
+        ) -> torch.Tensor:
+            return forward_gpt_oss_native_loop(self, hidden_states, router_indices, routing_weights)
 
-            batch_size = hidden_states.shape[0]
-            hidden_states = hidden_states.reshape(-1, self.hidden_size)
-            num_experts = routing_weights.shape[1]
-            if self.training:
-                next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
-                # with torch.no_grad():
-                #     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                #     expert_mask = expert_mask.permute(2, 1, 0)
-                #     expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-                # for expert_idx in expert_hitted[:]:
-                for expert_idx in range(num_experts):
-                    with torch.no_grad():
-                        # _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                        token_idx, _ = torch.where(router_indices == expert_idx)
-                    current_state = hidden_states[token_idx]
-                    gate_up = self.gate_up_projs[expert_idx](current_state)
-                    down_proj = self.down_projs[expert_idx]
-                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
-                    # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                    # gate = gate.clamp(min=None, max=self.limit)
-                    # up = up.clamp(min=-self.limit, max=self.limit)
-                    # glu = gate * torch.sigmoid(gate * self.alpha)
-                    # gated_output = (up + 1) * glu
+    # Patch the original transformers class forward method
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts.forward = experts_forward
 
-                    # Force float32 matrix multiply on some down projection modules
-                    gated_output = gated_output.to(torch.float32)
-                    device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
-                    with torch.autocast(device_type=device_type, enabled=False): # Force float32
-                        out = down_proj(gated_output)
-                    weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
-                    next_states.index_add_(0, token_idx, weighted_output)
-                next_states = next_states.view(batch_size, -1, self.hidden_size)
-                return next_states.to(torch.float32)
-            else:
-                X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
-                gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
-                gate_up = torch.stack(gate_up_list, dim=0)
-                dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
-                fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
-                # gate = gate_up[..., ::2]
-                # up_h = gate_up[..., 1::2]
-                # gate = gate.clamp(max=self.limit)
-                # up_h = up_h.clamp(min=-self.limit, max=self.limit)
-                # glu = gate * torch.sigmoid(gate * self.alpha)
-                # fused = (up_h + 1) * glu
-
-                # Force float32 matrix multiply on down projection only
-                device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
-                with torch.autocast(device_type=device_type, enabled=False): # Force float32
-                    out_list = [
-                        down_l(fused[e].to(dtype))
-                        for e, down_l in enumerate(self.down_projs)
-                    ]
-                outs = torch.stack(out_list, dim=0)
-                rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-                mixed = (outs.to(dtype) * rw.to(dtype)).sum(dim=0)
-                return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
-            pass
-        pass
-        GptOssExperts.forward = forward
-    pass
-
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExperts
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP = GptOssMLP
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: Patched GPT OSS MoE for 4bit loading (backend: {backend})")
     return
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)

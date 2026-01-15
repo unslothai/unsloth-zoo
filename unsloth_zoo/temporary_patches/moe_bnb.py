@@ -34,6 +34,9 @@ import torch.nn.functional as F
 from typing import Optional, List, Any, Tuple
 import os
 import warnings
+from ..log import logger
+
+UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 
 # Check bitsandbytes availability
 try:
@@ -66,7 +69,12 @@ class MoeExperts4bit(nn.Module):
 
     The module replaces Qwen3MoeExperts or similar, providing the same interface
     but with quantized weights.
+
+    NOTE: BNB 4-bit MoE uses loop-based forward (each expert processed individually).
+    For maximum throughput, consider using grouped_mm backend with native bf16 weights.
+    Set UNSLOTH_MOE_BACKEND=grouped_mm environment variable.
     """
+    _warned_loop_based = False
 
     def __init__(
         self,
@@ -244,12 +252,21 @@ class MoeExperts4bit(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Forward pass using bnb.matmul_4bit for each expert.
+        Optimized forward pass using bnb.matmul_4bit for each expert.
+        Only iterates over experts that actually have tokens routed to them.
         """
         # Set compute type on first forward (like Linear4bit)
         if not self.compute_type_is_set:
             self.set_compute_type(hidden_states)
             self.compute_type_is_set = True
+
+            # Warn about loop-based forward (only once)
+            if UNSLOTH_ENABLE_LOGGING and not MoeExperts4bit._warned_loop_based:
+                MoeExperts4bit._warned_loop_based = True
+                logger.warning(
+                    "Unsloth: Using BNB 4-bit MoE with loop-based forward. "
+                    "For higher throughput, consider using grouped_mm backend with bf16 model."
+                )
 
         inp_dtype = hidden_states.dtype
         if self.compute_dtype is not None:
@@ -257,17 +274,18 @@ class MoeExperts4bit(nn.Module):
 
         final_hidden_states = torch.zeros_like(hidden_states)
 
-        # Create expert mask
+        # Optimized routing: only process experts that have tokens
+        # This is much faster than iterating over all 128 experts
         with torch.no_grad():
             expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
             expert_mask = expert_mask.permute(2, 1, 0)  # [num_experts, top_k, num_tokens]
+            # Find which experts actually have tokens (sum across top_k and tokens dims)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False)
 
-        # Loop over experts - using bnb.matmul_4bit for each
-        for expert_idx in range(self.num_experts):
+        # Only loop over experts that have tokens routed to them
+        for expert_idx_t in expert_hit:
+            expert_idx = expert_idx_t.item()
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-
-            if token_idx.shape[0] == 0:
-                continue
 
             current_state = hidden_states[token_idx]
 
@@ -413,7 +431,11 @@ def replace_with_bnb_moe_experts(
             module.experts = new_experts
             has_been_replaced = True
 
-            print(f"Unsloth: Prepared {module_name}.experts for 4-bit quantization")
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.info(
+                    f"Unsloth: Prepared {module_name}.experts for BNB 4-bit quantization "
+                    f"({num_experts} experts, hidden={hidden_dim}, intermediate={intermediate_dim})"
+                )
 
     return model, has_been_replaced
 
