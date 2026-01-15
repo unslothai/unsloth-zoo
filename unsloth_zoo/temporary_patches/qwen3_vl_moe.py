@@ -45,9 +45,13 @@ from .moe_utils import (
     forward_triton_grouped_gemm,
     forward_native_moe_loop,
     select_moe_backend,
+    patch_param_wrapper_for_moe,
 )
 
 def patch_qwen3_vl_moe():
+    # Patch ParamWrapper.forward for MoE separated LoRA
+    patch_param_wrapper_for_moe()
+
     try:
         import transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe
         transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextSparseMoeBlock
@@ -189,9 +193,16 @@ def patch_qwen3_vl_moe():
                 # Same loop fallback logic as Qwen3MoeExperts
                 return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
-        # SparseMoeBlock forward
-        # @torch.compiler.disable
+        # SparseMoeBlock forward is disabled from compilation due to dynamic routing
+        @torch.compiler.disable
         def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            """
+            Forward for Qwen3VLMoeTextSparseMoeBlock in new transformers (v5+).
+
+            In v5, self.gate is Qwen3VLMoeTextTopKRouter which returns:
+                (router_logits, router_scores, router_indices)
+            where router_scores are already normalized.
+            """
             if hidden_states.dim() == 3:
                 batch_size, sequence_length, hidden_dim = hidden_states.shape
             else:
@@ -201,12 +212,24 @@ def patch_qwen3_vl_moe():
 
             hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
 
-            # self.gate is nn.Linear - so it returns logits!
-            router_logits = self.gate(hidden_states_reshaped)
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-            routing_weights = routing_weights.to(hidden_states.dtype)
+            # In v5, self.gate is Qwen3VLMoeTextTopKRouter
+            # It returns (router_logits, router_scores, router_indices)
+            gate_output = self.gate(hidden_states_reshaped)
+
+            if isinstance(gate_output, tuple):
+                # New transformers v5: (router_logits, router_scores, router_indices)
+                _, routing_weights, selected_experts = gate_output
+            else:
+                # Fallback: old-style gate that returns just logits
+                router_logits = gate_output
+                top_k = getattr(self.gate, 'top_k', getattr(self, 'top_k', 2))
+                norm_topk_prob = getattr(self.gate, 'norm_topk_prob', getattr(self, 'norm_topk_prob', True))
+
+                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+                routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+                if norm_topk_prob:
+                    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+                routing_weights = routing_weights.to(hidden_states.dtype)
 
             final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 

@@ -856,7 +856,15 @@ def forward_native_grouped_mm(
     permuted_input = hidden_states[token_indices]
 
     # 3. Gate Up Proj (Fused) - INLINE
-    w1 = self.gate_up_proj.transpose(-2, -1)
+    # Weight can be stored as (E, 2*I, H) or (E, H, 2*I) depending on model version.
+    # We need (E, H, 2*I) for grouped_mm: (tokens, H) @ (E, H, 2*I) -> (tokens, 2*I)
+    gate_up_weight = self.gate_up_proj
+    if gate_up_weight.shape[-1] == hidden_dim:
+        # Weight is (E, 2*I, H), need transpose to get (E, H, 2*I)
+        w1 = gate_up_weight.transpose(-2, -1)
+    else:
+        # Weight is already (E, H, 2*I), no transpose needed
+        w1 = gate_up_weight
 
     # Base GEMM
     mm1_out = native_moe_grouped_mm(permuted_input, w1, offsets)
@@ -876,7 +884,17 @@ def forward_native_grouped_mm(
     inter = F.silu(gate) * up
 
     # 4. Down Proj
-    w2 = self.down_proj.transpose(-2, -1)
+    # Weight can be stored as (E, H, I) or (E, I, H) depending on model version.
+    # We need (E, I, H) for grouped_mm: (tokens, I) @ (E, I, H) -> (tokens, H)
+    # inter has shape (tokens, I), so I = inter.shape[-1]
+    intermediate_dim = inter.shape[-1]
+    down_weight = self.down_proj
+    if down_weight.shape[-1] == intermediate_dim:
+        # Weight is (E, H, I), need transpose to get (E, I, H)
+        w2 = down_weight.transpose(-2, -1)
+    else:
+        # Weight is already (E, I, H), no transpose needed
+        w2 = down_weight
 
     # Base GEMM
     mm2_out = native_moe_grouped_mm(inter, w2, offsets)
