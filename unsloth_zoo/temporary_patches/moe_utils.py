@@ -613,10 +613,46 @@ def _apply_lora_grouped_mm(
             raise RuntimeError("torch._grouped_mm is required for MoE LoRA training but is not available.")
         grouped_mm_func = native_moe_grouped_mm
 
+    # ---------------------------------------------------------------------
+    # Rank padding for torch._grouped_mm alignment
+    #
+    # Some torch._grouped_mm builds require 16-byte stride alignment.
+    # For bf16/fp16 this effectively means the "rank" dimension should be a
+    # multiple of 8 elements; for fp32 it's a multiple of 4 elements.
+    #
+    # We only pad when needed, and we do it at call time (NOT at extraction
+    # time) so autograd still flows back to the original PEFT weights.
+    # ---------------------------------------------------------------------
+    def _pad_rank_for_grouped_mm(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # lora_A: (E, R, in_features or out_features)
+        # lora_B: (E, out_features or in_features, R)
+        # Rank dims are a.dim=1 and b.dim=2.
+        if a.dim() != 3 or b.dim() != 3:
+            return a, b
+        # 16-byte alignment expressed in elements for this dtype
+        align_elems = max(1, 16 // a.element_size())
+        r = int(a.shape[1])
+        rem = r % align_elems
+        if rem == 0:
+            return a, b
+        pad = align_elems - rem
+        # Pad along rank dim: a dim=1, b dim=2
+        # F.pad expects pad spec for last dim first: (last_left, last_right, prev_left, prev_right, ...)
+        # a: pad dim=1 => second-to-last dim => pad list: (0,0) for dim=2, (0,pad) for dim=1
+        a_padded = F.pad(a, (0, 0, 0, pad))
+        # b: pad dim=2 => last dim => pad list: (0,pad)
+        b_padded = F.pad(b, (0, pad))
+        return a_padded, b_padded
+
 
     # Cast to input dtype while preserving gradients
     lora_A_cast = lora_A.to(inputs.dtype)
     lora_B_cast = lora_B.to(inputs.dtype)
+
+    # Apply rank padding only for the native torch._grouped_mm backend.
+    # Triton kernels do not have the same strict stride requirements here.
+    if grouped_mm_func == native_moe_grouped_mm:
+        lora_A_cast, lora_B_cast = _pad_rank_for_grouped_mm(lora_A_cast, lora_B_cast)
 
     input_dim = inputs.shape[-1]
 
