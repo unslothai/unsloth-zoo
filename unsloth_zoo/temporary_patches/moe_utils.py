@@ -303,21 +303,25 @@ def _get_moe_lora_weights(
     """
     Extract LoRA weights from PEFT ParamWrapper for MoE separated computation.
 
-    PEFT computes delta = B @ A, so for separated LoRA:
-    Y = X @ W + X @ (B @ A) * s = X @ W + ((X @ B) @ A) * s
+    PEFT stores LoRA weights for 3D MoE parameters as:
+        lora_A.weight: (E*R, in_features)  - first projection
+        lora_B.weight: (out_features, E*R) - second projection
+
+    We reshape them to:
+        lora_A: (E, R, in_features)  - for grouping by expert
+        lora_B: (E, out_features, R) - for grouping by expert
+
+    The actual computation order depends on which dimension matches the input,
+    which is handled dynamically in _apply_lora_grouped_mm.
 
     Args:
         wrapper: ParamWrapper module with lora_A, lora_B, scaling
         adapter_name: Name of the active adapter
 
     Returns:
-        (lora_B_reshaped, lora_A_reshaped, scaling, num_experts) or None
-
-    Note: Returns (B, A) for application order: first X @ B, then result @ A
-
-    Shapes (for MoE with num_experts=E, rank=R):
-        lora_B_reshaped: (E, in_features, R) - for first step: X @ B
-        lora_A_reshaped: (E, R, out_features) - for second step: result @ A
+        (lora_A_reshaped, lora_B_reshaped, scaling, num_experts) or None
+        - lora_A: (E, R, in_features)
+        - lora_B: (E, out_features, R)
     """
     if not hasattr(wrapper, 'lora_A') or not hasattr(wrapper, 'lora_B'):
         if _MOE_LORA_DEBUG:
@@ -345,22 +349,12 @@ def _get_moe_lora_weights(
     lora_B_module = wrapper.lora_B[adapter_name]
 
     # PEFT stores:
-    #   lora_A.weight: (rank, in_features)   -> Input Projection
-    #   lora_B.weight: (out_features, rank)  -> Output Projection
-    #
-    # Unsloth execution order:
-    #   Step 1: X @ Input_Matrix  -> (N, R)
-    #   Step 2: Res @ Output_Matrix -> (N, Out)
-    #
-    # So we map:
-    #   weight_B (Input Matrix)  = lora_A.weight
-    #   weight_A (Output Matrix) = lora_B.weight
+    #   lora_A.weight: (E*R, in_features) - projects from in_features to rank
+    #   lora_B.weight: (out_features, E*R) - projects from rank to out_features
+    #   delta = lora_B @ lora_A has shape (out_features, in_features)
 
-    # NOTE: We keep variable names weight_A/weight_B consistent with their usage below
-    # where weight_B is reshaped for "First Step" and weight_A for "Second Step".
-
-    weight_B = lora_A_module.weight  # (rank, in_dim)
-    weight_A = lora_B_module.weight  # (out_dim, rank)
+    weight_A = lora_A_module.weight  # (E*R, in_features)
+    weight_B = lora_B_module.weight  # (out_features, E*R)
 
     scaling = wrapper.scaling[adapter_name]
     num_experts = getattr(wrapper, 'num_experts', 1)
@@ -368,54 +362,37 @@ def _get_moe_lora_weights(
     if num_experts <= 1:
         return None
 
-    # Logic explanation:
-    # weight_B (Input Proj): (E*R, in_dim) or (R_total, in_dim)
-    #   rank_per_expert is derived from this matrix primarily?
-    #   Actually weight_A (Output Proj) is (out_dim, E*R).
-    #   PEFT usually stores (Rank, In) and (Out, Rank).
-
-    # Let's adjust derivation to be robust.
-    # weight_B (from lora_A): (E*R, in_dim)
-    # weight_A (from lora_B): (out_dim, E*R)
-
-    rank_per_expert = weight_B.shape[0] // num_experts
-    in_dim = weight_B.shape[1]   # input dimension
-
-    # Output dim from weight_A
-    out_dim = weight_A.shape[0]
+    # Derive rank per expert
+    rank_per_expert = weight_A.shape[0] // num_experts
+    in_features = weight_A.shape[1]
+    out_features = weight_B.shape[0]
 
     # Verify dimensions are compatible
-    if weight_B.shape[0] != num_experts * rank_per_expert:
-         return None
-
-    if weight_A.shape[1] != num_experts * rank_per_expert:
+    if weight_A.shape[0] != num_experts * rank_per_expert:
+        if _MOE_LORA_DEBUG:
+            print(f"[MoE LoRA] weight_A shape mismatch: {weight_A.shape[0]} != {num_experts * rank_per_expert}")
         return None
 
-    # Reshape B (Input Proj) for first step: X @ B
-    # weight_B is (E*R, in_dim).
-    # We want B_reshaped to be (E, in_dim, R) typically for grouped_mm?
-    # Actually native_moe_grouped_mm expects weight as (E, in, out).
-    #
-    # For Step 1: X(N, in) @ B -> (N, R).
-    # So B must be (E, in, R).
-    # weight_B is (E*R, in).
-    # reshape(num_experts, rank_per_expert, in_dim) -> (E, R, in).
-    # permute(0, 2, 1) -> (E, in, R).
+    if weight_B.shape[1] != num_experts * rank_per_expert:
+        if _MOE_LORA_DEBUG:
+            print(f"[MoE LoRA] weight_B shape mismatch: {weight_B.shape[1]} != {num_experts * rank_per_expert}")
+        return None
 
-    B_reshaped = weight_B.reshape(num_experts, rank_per_expert, in_dim)
-    B_reshaped = B_reshaped.permute(0, 2, 1).contiguous() # (E, in, R)
+    # Reshape lora_A: (E*R, in_features) -> (E, R, in_features)
+    # NOTE: Do NOT use .contiguous() here - it breaks autograd by creating a copy!
+    lora_A = weight_A.view(num_experts, rank_per_expert, in_features)
 
-    # Reshape A (Output Proj) for second step: Res @ A
-    # weight_A is (out_dim, E*R).
-    # We want A to be (E, R, out).
-    # reshape(out_dim, num_experts, rank_per_expert) -> (out, E, R).
-    # permute(1, 2, 0) -> (E, R, out).
+    # Reshape lora_B: (out_features, E*R) -> (out_features, R, E) -> (E, out_features, R)
+    # Must match reference: weight_B.view(out, r, E).permute(2, 0, 1)
+    # NOTE: Do NOT use .contiguous() here - it breaks autograd by creating a copy!
+    lora_B = weight_B.view(out_features, rank_per_expert, num_experts).permute(2, 0, 1)
 
-    A_reshaped = weight_A.reshape(out_dim, num_experts, rank_per_expert)
-    A_reshaped = A_reshaped.permute(1, 2, 0).contiguous() # (E, R, out)
+    if _MOE_LORA_DEBUG:
+        print(f"[MoE LoRA] lora_A: {weight_A.shape} -> {lora_A.shape} (E, R, in)")
+        print(f"[MoE LoRA] lora_B: {weight_B.shape} -> {lora_B.shape} (E, out, R)")
 
-    # Return (B, A) for application order: (X @ B) @ A
-    return B_reshaped, A_reshaped, scaling, num_experts
+    # Return (lora_A, lora_B, scaling, num_experts)
+    return lora_A, lora_B, scaling, num_experts
 
 
 # Helper to bridge explicit calling convention to Unsloth's Triton kernel
@@ -484,7 +461,16 @@ def _patched_param_wrapper_forward(self, x: torch.Tensor, *args, **kwargs) -> to
     For non-MoE modules:
     - Falls back to original PEFT forward
     """
-    base_layer = self.get_base_layer()
+    # Get IMMEDIATE base_layer for forward call
+    # CRITICAL: Use self.base_layer NOT self.get_base_layer()!
+    # get_base_layer() recursively traverses to deepest layer (Qwen3MoeExperts),
+    # which would skip the gate_up_proj wrapper's forward entirely.
+    immediate_base_layer = self.base_layer
+
+    # For storing wrapper reference, we DO need the actual experts module
+    # Use get_base_layer() to find it (recursive traversal is correct here)
+    experts_module = self.get_base_layer()
+
     param_name = getattr(self, 'parameter_name', None)
 
     # Check if this module has a stored weakref (set by patch_param_wrapper_for_moe)
@@ -505,22 +491,25 @@ def _patched_param_wrapper_forward(self, x: torch.Tensor, *args, **kwargs) -> to
             else:
                  key = f"{param_name}_lora_wrapper"
 
-            if key not in base_layer.__dict__:
-                base_layer.__dict__[key] = self
+            # Store on the actual experts module (Qwen3MoeExperts), not on intermediate wrappers
+            if key not in experts_module.__dict__:
+                experts_module.__dict__[key] = self
 
             # Ensure wrapper.num_experts is set for _get_moe_lora_weights reshaping logic.
             if not hasattr(self, "num_experts"):
-                if hasattr(base_layer, "num_experts"):
-                    self.num_experts = base_layer.num_experts
+                if hasattr(experts_module, "num_experts"):
+                    self.num_experts = experts_module.num_experts
                 else:
-                    p = getattr(base_layer, param_name, None)
+                    p = getattr(experts_module, param_name, None)
                     if hasattr(p, "shape") and len(p.shape) >= 1:
                         self.num_experts = p.shape[0]
         except Exception:
             pass
 
-        # The LoRA is extracted lazily in forward_native_grouped_mm via base_layer.__dict__.
-        return base_layer(x, *args, **kwargs)
+        # Call the IMMEDIATE base_layer to preserve the wrapper chain
+        # (e.g., down_proj calls gate_up_proj which calls Qwen3MoeExperts)
+        return immediate_base_layer(x, *args, **kwargs)
+
 
     # Non-MoE: use original PEFT forward with _activate_lora
     return _original_param_wrapper_forward(self, x, *args, **kwargs)
@@ -555,7 +544,16 @@ def patch_param_wrapper_for_moe(model=None):
                 param_name = getattr(module, 'parameter_name', None)
                 if param_name not in ('gate_up_proj', 'down_proj'):
                     continue
+                # Navigate through nested ParamWrappers to find the actual experts module
                 base_layer = module.get_base_layer()
+                while hasattr(base_layer, 'get_base_layer') and callable(base_layer.get_base_layer):
+                    try:
+                        next_layer = base_layer.get_base_layer()
+                        if next_layer is None:
+                            break
+                        base_layer = next_layer
+                    except:
+                        break
                 if base_layer is None:
                     continue
 
@@ -580,8 +578,8 @@ def patch_param_wrapper_for_moe(model=None):
 
 def _apply_lora_grouped_mm(
     inputs: torch.Tensor,
-    lora_B: torch.Tensor,
     lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
     offsets: torch.Tensor,
     scaling: float,
 ) -> torch.Tensor:
@@ -591,33 +589,59 @@ def _apply_lora_grouped_mm(
     Uses torch._grouped_mm instead of Triton kernels to ensure gradients flow
     correctly to LoRA weights during training.
 
+    The computation order is determined dynamically based on which LoRA weight's
+    dimensions match the input. This handles both gate_up_proj and down_proj
+    correctly regardless of whether the base weight is transposed.
+
     Args:
         inputs: (N, in_dim) - already permuted by expert
-        lora_B: (E, in_dim, R) - first projection
-        lora_A: (E, R, out_dim) - second projection
+        lora_A: (E, R, features_A) - PEFT lora_A reshaped
+        lora_B: (E, features_B, R) - PEFT lora_B reshaped
         offsets: (E,) cumulative token counts per expert
         scaling: LoRA scaling factor
 
     Returns:
         lora_delta: (N, out_dim) scaled LoRA contribution
     """
+    if not (_TORCH_GROUPED_MM_AVAILABLE and _check_torch_grouped_mm_supported()):
+        raise RuntimeError("torch._grouped_mm is required for MoE LoRA training but is not available.")
+
     # Cast to input dtype while preserving gradients
-    lora_B_cast = lora_B.to(inputs.dtype)
     lora_A_cast = lora_A.to(inputs.dtype)
+    lora_B_cast = lora_B.to(inputs.dtype)
 
-    # Use torch._grouped_mm when available/supported; otherwise fall back to a safe loop.
-    if _TORCH_GROUPED_MM_AVAILABLE and _check_torch_grouped_mm_supported():
-        # Step 1: X @ B -> (N, R)
-        lora_intermediate = native_moe_grouped_mm(inputs, lora_B_cast, offsets)
+    input_dim = inputs.shape[-1]
 
-        # Step 2: result @ A -> (N, out_dim)
-        lora_delta = native_moe_grouped_mm(lora_intermediate, lora_A_cast, offsets)
+    # Dynamic dimension matching (like moe_lora_split.py)
+    # lora_A is (E, R, features_A)
+    # lora_B is (E, features_B, R)
+    #
+    # Case 1: lora_A's last dim matches input -> X @ lora_A.T, then result @ lora_B.T
+    # Case 2: lora_B's second dim matches input -> X @ lora_B, then result @ lora_A
 
-        return lora_delta * scaling
+    if lora_A.shape[-1] == input_dim:
+        # lora_A matches: X @ lora_A.T -> (N, R), then result @ lora_B.T -> (N, out)
+        # lora_A.T is (E, features_A, R) -> for grouped_mm: (E, in, out) = (E, features_A, R)
+        # But lora_A is (E, R, features_A), so transpose(-2, -1) gives (E, features_A, R)
+        # NOTE: .contiguous() IS differentiable - gradients flow through it
+        lora_intermediate = native_moe_grouped_mm(inputs, lora_A_cast.transpose(-2, -1).contiguous(), offsets)
+        # lora_B.T is (E, R, features_B) for grouped_mm
+        # lora_B is (E, features_B, R), so transpose(-2, -1) gives (E, R, features_B)
+        lora_delta = native_moe_grouped_mm(lora_intermediate, lora_B_cast.transpose(-2, -1).contiguous(), offsets)
+    elif lora_B.shape[1] == input_dim:
+        # lora_B matches: X @ lora_B -> (N, R), then result @ lora_A -> (N, out)
+        # lora_B is (E, features_B, R), for grouped_mm: (E, in, out) = (E, features_B, R)
+        # NOTE: .contiguous() IS differentiable - gradients flow through it
+        lora_intermediate = native_moe_grouped_mm(inputs, lora_B_cast.contiguous(), offsets)
+        # lora_A is (E, R, features_A), for grouped_mm: (E, in, out) = (E, R, features_A)
+        lora_delta = native_moe_grouped_mm(lora_intermediate, lora_A_cast.contiguous(), offsets)
+    else:
+        raise ValueError(
+            f"LoRA shapes do not match input. input_dim={input_dim}, "
+            f"lora_A={tuple(lora_A.shape)}, lora_B={tuple(lora_B.shape)}"
+        )
 
-    # Fallback to pure pytorch matmul if grouped_mm not available
-    # We avoid iterations on experts as requested.
-    raise RuntimeError("torch._grouped_mm is required for MoE LoRA training but is not available.")
+    return lora_delta * scaling
 
 
 def _setup_moe_lora_wrappers_lazy(experts_module):
@@ -756,8 +780,8 @@ def forward_native_grouped_mm(
     if gate_up_wrapper is not None:
         lora_data = _get_moe_lora_weights(gate_up_wrapper)
         if lora_data is not None:
-            lora_B, lora_A, scaling = lora_data[:3]
-            lora_delta = _apply_lora_grouped_mm(permuted_input, lora_B, lora_A, offsets, scaling)
+            lora_A, lora_B, scaling = lora_data[:3]
+            lora_delta = _apply_lora_grouped_mm(permuted_input, lora_A, lora_B, offsets, scaling)
             mm1_out = mm1_out + lora_delta  # Use + instead of add_ for cleaner gradient flow
 
     # Activation
@@ -776,8 +800,8 @@ def forward_native_grouped_mm(
     if down_wrapper is not None:
         lora_data = _get_moe_lora_weights(down_wrapper)
         if lora_data is not None:
-            lora_B, lora_A, scaling = lora_data[:3]
-            lora_delta = _apply_lora_grouped_mm(inter, lora_B, lora_A, offsets, scaling)
+            lora_A, lora_B, scaling = lora_data[:3]
+            lora_delta = _apply_lora_grouped_mm(inter, lora_A, lora_B, offsets, scaling)
             mm2_out = mm2_out + lora_delta  # Use + instead of add_ for cleaner gradient flow
 
     # 5. Scatter
