@@ -1699,7 +1699,7 @@ def load_vllm(
         elif gpu_memory_utilization > standby_target_gpu_util:
             standby_target_gpu_util = (gpu_memory_utilization + standby_target_gpu_util)
             print(
-                f"Unsloth: Standby mode is enabled. However your setting of `gpu_memory_utilization` will OOM."\
+                f"Unsloth: Standby mode is enabled. However your setting of `gpu_memory_utilization` will OOM.\n"\
                 f"Changing `gpu_memory_utilization` to {standby_target_gpu_util}."
             )
             gpu_memory_utilization = standby_target_gpu_util
