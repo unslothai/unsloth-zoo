@@ -16,7 +16,8 @@
 import torch
 import torch.nn.functional as F
 import os
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
+import math
 
 
 # Global flag to check if grouped GEMM is available
@@ -582,6 +583,8 @@ def _apply_lora_grouped_mm(
     lora_B: torch.Tensor,
     offsets: torch.Tensor,
     scaling: float,
+    grouped_mm_func: Optional[Callable] = None,
+    token_counts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Apply LoRA using native torch._grouped_mm for proper gradient computation.
@@ -599,12 +602,17 @@ def _apply_lora_grouped_mm(
         lora_B: (E, features_B, R) - PEFT lora_B reshaped
         offsets: (E,) cumulative token counts per expert
         scaling: LoRA scaling factor
+        grouped_mm_func: Optional function(inputs, weights, offsets, token_counts) -> output
+        token_counts: (E,) token counts per expert (required for some backends like Triton)
 
     Returns:
         lora_delta: (N, out_dim) scaled LoRA contribution
     """
-    if not (_TORCH_GROUPED_MM_AVAILABLE and _check_torch_grouped_mm_supported()):
-        raise RuntimeError("torch._grouped_mm is required for MoE LoRA training but is not available.")
+    if grouped_mm_func is None:
+        if not (_TORCH_GROUPED_MM_AVAILABLE and _check_torch_grouped_mm_supported()):
+            raise RuntimeError("torch._grouped_mm is required for MoE LoRA training but is not available.")
+        grouped_mm_func = native_moe_grouped_mm
+
 
     # Cast to input dtype while preserving gradients
     lora_A_cast = lora_A.to(inputs.dtype)
@@ -621,20 +629,63 @@ def _apply_lora_grouped_mm(
 
     if lora_A.shape[-1] == input_dim:
         # lora_A matches: X @ lora_A.T -> (N, R), then result @ lora_B.T -> (N, out)
-        # lora_A.T is (E, features_A, R) -> for grouped_mm: (E, in, out) = (E, features_A, R)
-        # But lora_A is (E, R, features_A), so transpose(-2, -1) gives (E, features_A, R)
-        # NOTE: .contiguous() IS differentiable - gradients flow through it
-        lora_intermediate = native_moe_grouped_mm(inputs, lora_A_cast.transpose(-2, -1).contiguous(), offsets)
-        # lora_B.T is (E, R, features_B) for grouped_mm
-        # lora_B is (E, features_B, R), so transpose(-2, -1) gives (E, R, features_B)
-        lora_delta = native_moe_grouped_mm(lora_intermediate, lora_B_cast.transpose(-2, -1).contiguous(), offsets)
+
+        # Native torch._grouped_mm expects (E, In, Out)
+        # Triton grouped_gemm expects (E, Out, In)
+
+        # 1. First Matmul (lora_A)
+        # lora_A is (E, R, In).
+        if grouped_mm_func == native_moe_grouped_mm:
+            # Native needs (E, In, R) -> Transpose
+            lora_intermediate = grouped_mm_func(inputs, lora_A_cast.transpose(-2, -1).contiguous(), offsets)
+        else:
+            # Triton needs (E, R, In) -> No Transpose
+            if token_counts is None:
+                lora_intermediate = grouped_mm_func(inputs, lora_A_cast.contiguous(), offsets)
+            else:
+                lora_intermediate = grouped_mm_func(inputs, lora_A_cast.contiguous(), offsets, token_counts)
+
+        # 2. Second Matmul (lora_B)
+        # lora_B is (E, Out, R).
+        if grouped_mm_func == native_moe_grouped_mm:
+            # Native needs (E, R, Out) -> Transpose
+            lora_delta = grouped_mm_func(lora_intermediate, lora_B_cast.transpose(-2, -1).contiguous(), offsets)
+        else:
+            # Triton needs (E, Out, R) -> No Transpose
+            if token_counts is None:
+                lora_delta = grouped_mm_func(lora_intermediate, lora_B_cast.contiguous(), offsets)
+            else:
+                lora_delta = grouped_mm_func(lora_intermediate, lora_B_cast.contiguous(), offsets, token_counts)
+
     elif lora_B.shape[1] == input_dim:
         # lora_B matches: X @ lora_B -> (N, R), then result @ lora_A -> (N, out)
-        # lora_B is (E, features_B, R), for grouped_mm: (E, in, out) = (E, features_B, R)
-        # NOTE: .contiguous() IS differentiable - gradients flow through it
-        lora_intermediate = native_moe_grouped_mm(inputs, lora_B_cast.contiguous(), offsets)
-        # lora_A is (E, R, features_A), for grouped_mm: (E, in, out) = (E, R, features_A)
-        lora_delta = native_moe_grouped_mm(lora_intermediate, lora_A_cast.contiguous(), offsets)
+
+        # 1. First Matmul (lora_B)
+        # lora_B is (E, In, R) (In this branch input_dim matches dim 1)
+        # Wait, lora_B definition above says (E, Out, R).
+        # If lora_B matches input, then lora_B is (E, In, R).
+
+        if grouped_mm_func == native_moe_grouped_mm:
+             # Native needs (E, In, R) -> No Transpose
+             lora_intermediate = grouped_mm_func(inputs, lora_B_cast.contiguous(), offsets)
+        else:
+             # Triton needs (E, R, In) -> Transpose
+             if token_counts is None:
+                 lora_intermediate = grouped_mm_func(inputs, lora_B_cast.transpose(-2, -1).contiguous(), offsets)
+             else:
+                 lora_intermediate = grouped_mm_func(inputs, lora_B_cast.transpose(-2, -1).contiguous(), offsets, token_counts)
+
+        # 2. Second Matmul (lora_A)
+        # lora_A is (E, R, Out).
+        if grouped_mm_func == native_moe_grouped_mm:
+             # Native needs (E, R, Out) -> No Transpose
+             lora_delta = grouped_mm_func(lora_intermediate, lora_A_cast.contiguous(), offsets)
+        else:
+             # Triton needs (E, Out, R) -> Transpose
+             if token_counts is None:
+                 lora_delta = grouped_mm_func(lora_intermediate, lora_A_cast.transpose(-2, -1).contiguous(), offsets)
+             else:
+                 lora_delta = grouped_mm_func(lora_intermediate, lora_A_cast.transpose(-2, -1).contiguous(), offsets, token_counts)
     else:
         raise ValueError(
             f"LoRA shapes do not match input. input_dim={input_dim}, "
@@ -771,18 +822,18 @@ def forward_native_grouped_mm(
     # 3. Gate Up Proj (Fused) - INLINE
     w1 = self.gate_up_proj.transpose(-2, -1)
 
-    # Base GEMM (frozen weights - can use Triton for speed)
+    # Base GEMM
     mm1_out = native_moe_grouped_mm(permuted_input, w1, offsets)
 
-    # LoRA (extract fresh each forward - weights change during training)
-    # CRITICAL: Use torch._grouped_mm for LoRA to ensure gradient flow
+    # LoRA
     gate_up_wrapper = _get_lora_wrapper_for_param(self, 'gate_up_proj')
     if gate_up_wrapper is not None:
         lora_data = _get_moe_lora_weights(gate_up_wrapper)
         if lora_data is not None:
             lora_A, lora_B, scaling = lora_data[:3]
-            lora_delta = _apply_lora_grouped_mm(permuted_input, lora_A, lora_B, offsets, scaling)
-            mm1_out = mm1_out + lora_delta  # Use + instead of add_ for cleaner gradient flow
+            lora_delta = _apply_lora_grouped_mm(permuted_input, lora_A, lora_B, offsets, scaling,
+                                              grouped_mm_func = native_moe_grouped_mm)
+            mm1_out = mm1_out + lora_delta
 
     # Activation
     gate, up = mm1_out.chunk(2, dim=-1)
@@ -791,18 +842,18 @@ def forward_native_grouped_mm(
     # 4. Down Proj
     w2 = self.down_proj.transpose(-2, -1)
 
-    # Base GEMM (frozen weights - can use Triton for speed)
+    # Base GEMM
     mm2_out = native_moe_grouped_mm(inter, w2, offsets)
 
-    # LoRA (extract fresh each forward - weights change during training)
-    # CRITICAL: Use torch._grouped_mm for LoRA to ensure gradient flow
+    # LoRA
     down_wrapper = _get_lora_wrapper_for_param(self, 'down_proj')
     if down_wrapper is not None:
         lora_data = _get_moe_lora_weights(down_wrapper)
         if lora_data is not None:
             lora_A, lora_B, scaling = lora_data[:3]
-            lora_delta = _apply_lora_grouped_mm(inter, lora_A, lora_B, offsets, scaling)
-            mm2_out = mm2_out + lora_delta  # Use + instead of add_ for cleaner gradient flow
+            lora_delta = _apply_lora_grouped_mm(inter, lora_A, lora_B, offsets, scaling,
+                                              grouped_mm_func = native_moe_grouped_mm)
+            mm2_out = mm2_out + lora_delta
 
     # 5. Scatter
     flat_weights = top_k_weights.view(-1)
@@ -819,14 +870,6 @@ def forward_native_grouped_mm(
     if sequence_length == hidden_states.shape[0]: # 2D case
             return final_hidden_states
 
-    return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
-
-
-# Removed unused Triton and Loop implementations to prevent accidental usage.
-
-# -----------------------------------------------------------------------------
-# Compatibility shims (kept for imports from temporary_patches/qwen3_moe.py)
-# -----------------------------------------------------------------------------
 
 def forward_triton_grouped_gemm(
     self,
@@ -835,10 +878,343 @@ def forward_triton_grouped_gemm(
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Backwards-compatible entrypoint expected by qwen3_moe patch code.
-    We intentionally route to the native grouped_mm path to keep MoE-LoRA training correct.
+    Grouped GEMM MoE forward pass using Triton kernels.
+    Compatible with torch.compile (recommended mode="max-autotune" with cudagraph_mark_step_begin).
     """
-    return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
+    # Import grouped GEMM interface
+    from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
+    # Import autotune cache
+    from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
+
+    # Create expert mask and find which experts have tokens
+    if not hasattr(self, "_unsloth_moe_configs"):
+        self._unsloth_moe_configs = None
+
+    # Handle 3D inputs (batch_size, seq_len, hidden_dim)
+    is_3d = hidden_states.dim() == 3
+    if is_3d:
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        num_tokens = batch_size * seq_len
+        # Also flatten top_k inputs if they are 3D
+        if top_k_index.dim() == 3:
+            top_k_index = top_k_index.view(-1, top_k_index.shape[-1])
+        if top_k_weights.dim() == 3:
+            top_k_weights = top_k_weights.view(-1, top_k_weights.shape[-1])
+    else:
+        num_tokens, hidden_dim = hidden_states.shape
+
+    top_k = top_k_index.shape[1]
+
+    # Cache model dimensions and kernel configs on first call
+    if self._unsloth_moe_configs is None:
+        intermediate_dim = self.gate_up_proj.shape[1] // 2
+
+        # Autotune first GEMM
+        gemm1_configs = get_or_autotune_moe_kernels(
+            num_experts=self.num_experts,
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim * 2,
+            top_k=top_k,
+            dtype=hidden_states.dtype,
+        )
+
+        # Autotune second GEMM
+        gemm2_configs = get_or_autotune_moe_kernels(
+            num_experts=self.num_experts,
+            hidden_dim=intermediate_dim,
+            intermediate_dim=hidden_dim, # Output dim for 2nd GEMM is hidden_dim
+            top_k=top_k,
+            dtype=hidden_states.dtype,
+        )
+
+        self._unsloth_moe_configs = (intermediate_dim, gemm1_configs, gemm2_configs)
+
+        # Clear autotuning memory overhead
+        torch.cuda.empty_cache()
+
+    # Unpack cached configs
+    intermediate_dim, gemm1_configs, gemm2_configs = self._unsloth_moe_configs
+
+    # Unpack specific kernel configs
+    fwd_config_1, bwd_dX_config_1, bwd_dW_config_1 = gemm1_configs
+    fwd_config_2, bwd_dX_config_2, bwd_dW_config_2 = gemm2_configs
+
+    # Compute routing indices for grouped GEMM
+    token_counts_by_expert, gather_indices = _get_routing_indices(
+        top_k_index, self.num_experts
+    )
+
+    if self.gate_up_proj.shape[-1] == hidden_dim:
+        w1 = self.gate_up_proj
+    else:
+        w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
+
+    # Import kernel config classes for LoRA
+    try:
+        from unsloth.kernels.moe.grouped_gemm.kernels.tuning import (
+            KernelConfigForward, KernelConfigBackward_dX, KernelConfigBackward_dW
+        )
+    except ImportError:
+        # Fallback if internal structure changes
+        from unsloth.kernels.moe.autotune_cache import (
+            KernelConfigForward, KernelConfigBackward_dX, KernelConfigBackward_dW
+        )
+
+    # First grouped GEMM: gate_up projection
+    first_gemm_output = grouped_gemm(
+        X=hidden_states,
+        W=w1,
+        m_sizes=token_counts_by_expert,
+        topk=top_k,
+        gather_indices=gather_indices,
+        permute_x=True,
+        permute_y=False,
+        autotune=False, # We use cached configs
+        kernel_config_fwd=fwd_config_1,
+        kernel_config_bwd_dX=bwd_dX_config_1,
+        kernel_config_bwd_dW=bwd_dW_config_1,
+        is_first_gemm=True,
+    )
+
+    # LoRA for gate_up_proj using Triton grouped_gemm
+    gate_up_wrapper = _get_lora_wrapper_for_param(self, 'gate_up_proj')
+    if gate_up_wrapper is not None:
+        lora_data = _get_moe_lora_weights(gate_up_wrapper)
+        if lora_data is not None:
+            lora_A, lora_B, scaling, _ = lora_data
+            # lora_A: (E, R, in_features), lora_B: (E, out_features, R)
+            # Dimension matching: check which weight's dim matches input
+            # Case 1: lora_A[-1] == input_dim -> X @ lora_A.T @ lora_B.T
+            # Case 2: lora_B[1] == input_dim -> X @ lora_B @ lora_A
+
+            lora_rank = lora_A.shape[1]  # R
+            lora_blk = 16 if lora_rank % 16 == 0 else (32 if lora_rank % 32 == 0 else 64)
+
+            if lora_A.shape[-1] == hidden_dim:
+                # Case 1: X @ lora_A.T -> (M, R), then @ lora_B.T -> (M, out)
+                first_W = lora_A  # (E, R, in_features)
+                second_W = lora_B  # (E, out_features, R)
+                second_out = lora_B.shape[1]
+            elif lora_B.shape[1] == hidden_dim:
+                # Case 2: X @ lora_B -> (M, R), then @ lora_A -> (M, out)
+                # lora_B is (E, out_features, R) but we want (E, R, out_features) for first matmul
+                # Actually grouped_gemm expects (E, N, K) where output is (M, N)
+                # So we need to transpose: lora_B.transpose(-2, -1) = (E, R, out_features)
+                first_W = lora_B.transpose(-2, -1).contiguous()  # (E, R, hidden_dim)
+                # For second matmul, lora_A is (E, R, in_features)
+                # We want intermediate (M, R) @ lora_A to give (M, in_features)
+                # lora_A transposed: (E, in_features, R)
+                second_W = lora_A.transpose(-2, -1).contiguous()  # (E, in_features, R)
+                second_out = lora_A.shape[-1]
+            else:
+                raise ValueError(f"LoRA shapes don't match input: hidden_dim={hidden_dim}, "
+                               f"lora_A={lora_A.shape}, lora_B={lora_B.shape}")
+
+            # First matmul configs
+            lora_fwd_config = KernelConfigForward(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=lora_blk, BLOCK_SIZE_K=32,
+                num_warps=4, num_stages=2,
+                use_tma_load_x=False, use_tma_load_w=False, use_tma_store=False
+            )
+            lora_bwd_dX_config = KernelConfigBackward_dX(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=lora_blk, BLOCK_SIZE_K=32,
+                num_warps=4, num_stages=2,
+                use_tma_load_dy=False, use_tma_load_w=False, use_tma_store=False
+            )
+            lora_bwd_dW_config = KernelConfigBackward_dW(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=lora_blk, BLOCK_SIZE_K=32,
+                num_warps=4, num_stages=2,
+                use_tma_load_dy=False, use_tma_load_x=False
+            )
+
+            # First matmul: X -> (M, R)
+            lora_intermediate = grouped_gemm(
+                X=hidden_states,
+                W=first_W.to(hidden_states.dtype),
+                m_sizes=token_counts_by_expert,
+                topk=top_k,
+                gather_indices=gather_indices,
+                permute_x=True,
+                permute_y=False,
+                autotune=False,
+                kernel_config_fwd=lora_fwd_config,
+                kernel_config_bwd_dX=lora_bwd_dX_config,
+                kernel_config_bwd_dW=lora_bwd_dW_config,
+                is_first_gemm=True,
+            )
+
+            # Second matmul configs
+            out_blk = 64 if second_out % 64 == 0 else (32 if second_out % 32 == 0 else 16)
+
+            lora_fwd_config2 = KernelConfigForward(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=out_blk, BLOCK_SIZE_K=lora_blk,
+                num_warps=4, num_stages=2,
+                use_tma_load_x=False, use_tma_load_w=False, use_tma_store=False
+            )
+            lora_bwd_dX_config2 = KernelConfigBackward_dX(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=out_blk, BLOCK_SIZE_K=lora_blk,
+                num_warps=4, num_stages=2,
+                use_tma_load_dy=False, use_tma_load_w=False, use_tma_store=False
+            )
+            lora_bwd_dW_config2 = KernelConfigBackward_dW(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=out_blk, BLOCK_SIZE_K=lora_blk,
+                num_warps=4, num_stages=2,
+                use_tma_load_dy=False, use_tma_load_x=False
+            )
+
+            # Second matmul: intermediate -> (M, out)
+            lora_delta = grouped_gemm(
+                X=lora_intermediate,
+                W=second_W.to(hidden_states.dtype),
+                m_sizes=token_counts_by_expert,
+                topk=top_k,
+                gather_indices=gather_indices,
+                permute_x=False,
+                permute_y=False,
+                autotune=False,
+                kernel_config_fwd=lora_fwd_config2,
+                kernel_config_bwd_dX=lora_bwd_dX_config2,
+                kernel_config_bwd_dW=lora_bwd_dW_config2,
+                is_first_gemm=False,
+            )
+
+            first_gemm_output = first_gemm_output + lora_delta * scaling
+
+    # Apply SiLU activation and multiply gate with up
+    intermediate = _silu_and_mul(first_gemm_output)
+
+    # Grouped GEMM 2: down projection
+
+    if self.down_proj.shape[-1] == intermediate.shape[-1]:
+        w2 = self.down_proj
+    else:
+        w2 = self.down_proj.transpose(-2, -1).contiguous()
+
+    second_gemm_output = grouped_gemm(
+        X=intermediate,
+        W=w2,
+        m_sizes=token_counts_by_expert,
+        topk=top_k,
+        gather_indices=gather_indices,
+        permute_x=False,
+        permute_y=True,
+        autotune=False, # We use cached configs
+        kernel_config_fwd=fwd_config_2,
+        kernel_config_bwd_dX=bwd_dX_config_2,
+        kernel_config_bwd_dW=bwd_dW_config_2,
+        is_first_gemm=False,
+    )
+
+    # LoRA for down_proj using Triton grouped_gemm
+    down_wrapper = _get_lora_wrapper_for_param(self, 'down_proj')
+    if down_wrapper is not None:
+        lora_data = _get_moe_lora_weights(down_wrapper)
+        if lora_data is not None:
+            lora_A, lora_B, scaling, _ = lora_data
+            # lora_A: (E, R, in_features), lora_B: (E, out_features, R)
+            # For down_proj: input is intermediate (after SiLU)
+            input_dim_down = intermediate.shape[-1]
+
+            lora_rank = lora_A.shape[1]
+            lora_blk = 16 if lora_rank % 16 == 0 else (32 if lora_rank % 32 == 0 else 64)
+
+            if lora_A.shape[-1] == input_dim_down:
+                # Case 1: X @ lora_A.T -> (M, R), then @ lora_B.T -> (M, out)
+                first_W = lora_A
+                second_W = lora_B
+                second_out = lora_B.shape[1]
+            elif lora_B.shape[1] == input_dim_down:
+                # Case 2: X @ lora_B -> (M, R), then @ lora_A -> (M, out)
+                first_W = lora_B.transpose(-2, -1).contiguous()
+                second_W = lora_A.transpose(-2, -1).contiguous()
+                second_out = lora_A.shape[-1]
+            else:
+                raise ValueError(f"down_proj LoRA shapes don't match input: input_dim={input_dim_down}, "
+                               f"lora_A={lora_A.shape}, lora_B={lora_B.shape}")
+
+            lora_fwd_config = KernelConfigForward(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=lora_blk, BLOCK_SIZE_K=32,
+                num_warps=4, num_stages=2,
+                use_tma_load_x=False, use_tma_load_w=False, use_tma_store=False
+            )
+            lora_bwd_dX_config = KernelConfigBackward_dX(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=lora_blk, BLOCK_SIZE_K=32,
+                num_warps=4, num_stages=2,
+                use_tma_load_dy=False, use_tma_load_w=False, use_tma_store=False
+            )
+            lora_bwd_dW_config = KernelConfigBackward_dW(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=lora_blk, BLOCK_SIZE_K=32,
+                num_warps=4, num_stages=2,
+                use_tma_load_dy=False, use_tma_load_x=False
+            )
+
+            # First matmul: intermediate -> (M, R)
+            lora_intermediate_down = grouped_gemm(
+                X=intermediate,
+                W=first_W.to(intermediate.dtype),
+                m_sizes=token_counts_by_expert,
+                topk=top_k,
+                gather_indices=gather_indices,
+                permute_x=False,
+                permute_y=False,
+                autotune=False,
+                kernel_config_fwd=lora_fwd_config,
+                kernel_config_bwd_dX=lora_bwd_dX_config,
+                kernel_config_bwd_dW=lora_bwd_dW_config,
+                is_first_gemm=True,
+            )
+
+            out_blk = 64 if second_out % 64 == 0 else (32 if second_out % 32 == 0 else 16)
+
+            lora_fwd_config2 = KernelConfigForward(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=out_blk, BLOCK_SIZE_K=lora_blk,
+                num_warps=4, num_stages=2,
+                use_tma_load_x=False, use_tma_load_w=False, use_tma_store=False
+            )
+            lora_bwd_dX_config2 = KernelConfigBackward_dX(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=out_blk, BLOCK_SIZE_K=lora_blk,
+                num_warps=4, num_stages=2,
+                use_tma_load_dy=False, use_tma_load_w=False, use_tma_store=False
+            )
+            lora_bwd_dW_config2 = KernelConfigBackward_dW(
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=out_blk, BLOCK_SIZE_K=lora_blk,
+                num_warps=4, num_stages=2,
+                use_tma_load_dy=False, use_tma_load_x=False
+            )
+
+            # Second matmul: lora_intermediate_down -> (M, out)
+            lora_delta = grouped_gemm(
+                X=lora_intermediate_down,
+                W=second_W.to(intermediate.dtype),
+                m_sizes=token_counts_by_expert,
+                topk=top_k,
+                gather_indices=gather_indices,
+                permute_x=False,
+                permute_y=False,
+                autotune=False,
+                kernel_config_fwd=lora_fwd_config2,
+                kernel_config_bwd_dX=lora_bwd_dX_config2,
+                kernel_config_bwd_dW=lora_bwd_dW_config2,
+                is_first_gemm=False,
+            )
+
+            second_gemm_output = second_gemm_output + lora_delta * scaling
+
+    # Apply routing weights and sum across top_k experts
+    # Output shape: (num_tokens, top_k, hidden_dim) -> (num_tokens, hidden_dim)
+    # Ensure top_k_weights matches dtype (can be float32 from softmax)
+    top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
+    final_hidden_states = (
+        second_gemm_output.view(num_tokens, top_k, hidden_dim)
+        * top_k_weights_casted[..., None]
+    )
+    final_hidden_states = final_hidden_states.sum(dim=1)
+
+    if is_3d:
+        final_hidden_states = final_hidden_states.view(batch_size, seq_len, hidden_dim)
+
+    return final_hidden_states
 
 
 @torch.compiler.disable
@@ -849,7 +1225,118 @@ def forward_native_moe_loop(
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Backwards-compatible loop entrypoint expected by qwen3_moe patch code.
-    We route to the native grouped_mm path (no Python expert loop).
+    Loop-based MoE forward pass. Loops over experts that have tokens routed to them.
+    Explicitly disabled for torch.compile to prevent graph breaks/recompilation issues with dynamic control flow.
+    Includes LoRA support via PEFT wrapper logic if present.
     """
-    return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
+    final_hidden_states = torch.zeros_like(hidden_states)
+
+    # Create expert mask and find which experts have tokens
+    with torch.no_grad():
+        expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+    # Get wrappers once
+    gate_up_wrapper = _get_lora_wrapper_for_param(self, 'gate_up_proj')
+    down_wrapper = _get_lora_wrapper_for_param(self, 'down_proj')
+
+    gate_up_lora = _get_moe_lora_weights(gate_up_wrapper) if gate_up_wrapper else None
+    down_lora = _get_moe_lora_weights(down_wrapper) if down_wrapper else None
+
+    # Only loop over experts that actually have tokens routed to them
+    for expert_idx_t in expert_hit:
+        expert_idx = expert_idx_t.item()
+
+        # Find which tokens are routed to this expert
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+
+        # Gather only the tokens for this expert
+        current_state = hidden_states[token_idx]
+
+        # Compute gate_up projection for this expert only
+        if hasattr(self, "gate_up_proj"):
+            # Base weight: x @ w.T
+            w = self.gate_up_proj[expert_idx]
+            gate_up = current_state @ w.T
+
+            # Add LoRA
+            if gate_up_lora:
+                lora_A, lora_B, scaling, _ = gate_up_lora
+                l_A = lora_A[expert_idx]
+                l_B = lora_B[expert_idx]
+                gate_up = gate_up + _apply_lora_slice(current_state, l_A, l_B, scaling)
+
+            gate, up = gate_up.chunk(2, dim=-1)
+
+        else:
+            # Fallback for w1/w3
+            gate = current_state @ self.w1[expert_idx].T
+            up   = current_state @ self.w3[expert_idx].T
+
+        current_hidden_states = F.silu(gate) * up
+
+        # Compute down projection for this expert only
+        if hasattr(self, "down_proj"):
+            w2 = self.down_proj[expert_idx]
+            down_out = current_hidden_states @ w2.T
+
+            # Add LoRA
+            if down_lora:
+                lora_A, lora_B, scaling, _ = down_lora
+                l_A = lora_A[expert_idx]
+                l_B = lora_B[expert_idx]
+                delta = _apply_lora_slice(current_hidden_states, l_A, l_B, scaling)
+                down_out = down_out + delta
+
+            current_hidden_states = down_out
+
+        else:
+            current_hidden_states = current_hidden_states @ self.w2[expert_idx].T
+
+        # Apply routing weights
+        current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+
+        # Scatter back to final output
+        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+    return final_hidden_states
+
+
+def _apply_lora_slice(
+    inputs: torch.Tensor,
+    l_A: torch.Tensor,
+    l_B: torch.Tensor,
+    scaling: float
+) -> torch.Tensor:
+    """
+    Apply LoRA slice for a single expert.
+    Handles dynamic shape matching (normal vs transposed).
+    """
+    in_dim = inputs.shape[-1]
+
+    # Cast to input dtype
+    l_A = l_A.to(inputs.dtype)
+    l_B = l_B.to(inputs.dtype)
+
+    if l_A.shape[1] == in_dim:
+        # Case 1: Standard LoRA (A is first)
+        # l_A: (R, in)
+        # l_B: (out, R)
+        # inputs @ l_A.T -> (N, R)
+        # result @ l_B.T -> (N, out)
+        return (inputs @ l_A.T @ l_B.T) * scaling
+
+    elif l_B.shape[0] == in_dim:
+        # Case 2: Transposed LoRA (B is first)
+        # l_B: (in, R) -- derived from (out, R) where out=in
+        # l_A: (R, out) -- derived from (R, in) where in=out
+        # inputs @ l_B -> (N, R)
+        # result @ l_A -> (N, out)
+        return (inputs @ l_B @ l_A) * scaling
+
+    else:
+        raise RuntimeError(
+            f"LoRA shape mismatch for single expert. "
+            f"inputs={inputs.shape}, l_A={l_A.shape}, l_B={l_B.shape}"
+        )

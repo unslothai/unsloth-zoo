@@ -91,8 +91,14 @@ def get_mem_info():
 pass
 
 if importlib.util.find_spec("vllm") is not None:
-    from vllm import __version__ as vllm_version
-    
+    try:
+        from vllm import __version__ as vllm_version
+    except ImportError:
+        try:
+            from vllm.version import __version__ as vllm_version
+        except ImportError:
+            vllm_version = "0.0.0"
+
     # Patch excessive warning messages
     if not UNSLOTH_ENABLE_LOGGING:
         # Disable all not supported messages
