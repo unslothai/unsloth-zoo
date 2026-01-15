@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import os
 from typing import Optional, Tuple, Callable
 import math
+from unsloth_zoo.log import logger
 
 
 # Global flag to check if grouped GEMM is available
@@ -154,18 +155,18 @@ def select_moe_backend():
 
         if is_valid:
             if is_available:
-                print(f"Unsloth: Using MoE backend '{requested_backend}'")
+                logger.info(f"Unsloth: Using MoE backend '{requested_backend}'")
                 return requested_backend
             else:
-                print(f"Unsloth: '{requested_backend}' backend requested but is not available. Falling back to next available.")
+                logger.warning(f"Unsloth: '{requested_backend}' backend requested but is not available. Falling back to next available.")
 
     # 2. Automatic selection (first available in preference order)
     for name, available in choices:
         if available:
-            print(f"Unsloth: Using MoE backend '{name}'")
+            logger.info(f"Unsloth: Using MoE backend '{name}'")
             return name
 
-    print("Unsloth: Using MoE backend 'native_torch' (fallback)")
+    logger.info("Unsloth: Using MoE backend 'native_torch' (fallback)")
     return "native_torch"
 
 
