@@ -154,6 +154,7 @@ def select_moe_backend():
 
         if is_valid:
             if is_available:
+                print(f"Unsloth: Using MoE backend '{requested_backend}'")
                 return requested_backend
             else:
                 print(f"Unsloth: '{requested_backend}' backend requested but is not available. Falling back to next available.")
