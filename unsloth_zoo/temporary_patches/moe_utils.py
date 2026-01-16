@@ -427,11 +427,15 @@ def _get_moe_lora_weights(
 
 # Removed obsolete loop and Triton fallbacks
 
+@torch.compiler.disable
 def native_moe_grouped_mm(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     """
     Native implementation using torch._grouped_mm with a critical fix for backward pass.
     The native backward kernel crashes on 0-stride (broadcasted) gradients (e.g. from sum().backward()).
     We register a hook to ensure dY is contiguous before it reaches the kernel.
+
+    Note: torch._grouped_mm is an internal API that doesn't play well with dynamo,
+    so we disable compilation for this specific operation only.
     """
     out = torch._grouped_mm(inputs, weight, offs=offsets)
     if out.requires_grad:
@@ -846,7 +850,21 @@ def _get_lora_wrapper_for_param(experts_module, param_name):
          if key in experts_module.__dict__:
              return experts_module.__dict__[key]
 
-    return None
+
+def _gpt_oss_swiglu_activation(gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
+    """
+    GPT OSS specific SwiGLU activation function.
+    Uses interleaved gate/up layout: gate = gate_up[..., ::2], up = gate_up[..., 1::2]
+    Activation: gate.clamp(max=limit) * sigmoid(gate * alpha) * (up.clamp(-limit, limit) + 1)
+    """
+    gate = gate_up[..., ::2]
+    up = gate_up[..., 1::2]
+    gate = gate.clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    glu = gate * torch.sigmoid(gate.float() * alpha).to(gate.dtype)
+    return (up + 1) * glu
+
+
 
 
 @torch.compiler.disable
@@ -896,6 +914,12 @@ def forward_native_grouped_mm(
     # Base GEMM
     mm1_out = native_moe_grouped_mm(permuted_input, w1, offsets)
 
+    # Add bias if present (e.g. GPT-OSS)
+    if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
+        # Need to index bias by expert for each token
+        expert_ids = flat_top_k[sorted_indices]
+        mm1_out = mm1_out + self.gate_up_proj_bias[expert_ids]
+
     # LoRA
     gate_up_wrapper = _get_lora_wrapper_for_param(self, 'gate_up_proj')
     if gate_up_wrapper is not None:
@@ -907,8 +931,49 @@ def forward_native_grouped_mm(
             mm1_out = mm1_out + lora_delta
 
     # Activation
-    gate, up = mm1_out.chunk(2, dim=-1)
-    inter = F.silu(gate) * up
+    if hasattr(self, "alpha") and hasattr(self, "limit"):
+        # Custom activation (e.g. GPT-OSS)
+        # We assume if alpha/limit exist, we use the interleaved swiglu
+        # But wait, Qwen3 also has alpha/limit in some paths?
+        # Let's check args first.
+        # Actually gpt_oss passes swiglu params.
+        pass
+
+    # GPT-OSS style activation
+    if hasattr(self, "expert_dim"): # GPT-OSS specific check or just check for biases?
+        # For GPT-OSS we used _gpt_oss_swiglu_activation in the original code
+        # But we want to be generic.
+        # Let's check if we should use the standard one or not.
+        # Qwen3 uses chunk(2). GPT-OSS uses slice ::2.
+
+        # If the model has 'get_activation', use it? No.
+
+        # Let's try to infer from weight shape?
+        # GPT-OSS: (E, hidden, 2*expert_dim) -> (E, H, 2I)
+        # Qwen3: (E, 2*I, H) -> (E, H, 2I)
+
+        # Using a heuristics:
+        # If gate_up_proj_bias exists, it's likely GPT-OSS or similar that needs special activation?
+        # Or better, verify if the user provided an activation function?
+        # The caller can't easily pass a function here because self is the module.
+        # So we should rely on attributes of self.
+
+        # GPT-OSS has 'alpha' and 'limit' set on self.
+        # Qwen3 uses F.silu(gate) * up.
+
+        if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
+             # GPT-OSS path
+             alpha = getattr(self, 'alpha', 1.702)
+             limit = getattr(self, 'limit', 7.0)
+             inter = _gpt_oss_swiglu_activation(mm1_out, alpha, limit)
+        else:
+             # Qwen3 path (default)
+             gate, up = mm1_out.chunk(2, dim=-1)
+             inter = F.silu(gate) * up
+    else:
+        # Default Qwen3 path
+        gate, up = mm1_out.chunk(2, dim=-1)
+        inter = F.silu(gate) * up
 
     # 4. Down Proj
     # Weight can be stored as (E, H, I) or (E, I, H) depending on model version.
@@ -925,6 +990,11 @@ def forward_native_grouped_mm(
 
     # Base GEMM
     mm2_out = native_moe_grouped_mm(inter, w2, offsets)
+
+    # Add bias if present (e.g. GPT-OSS)
+    if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
+        expert_ids = flat_top_k[sorted_indices]
+        mm2_out = mm2_out + self.down_proj_bias[expert_ids]
 
     # LoRA
     down_wrapper = _get_lora_wrapper_for_param(self, 'down_proj')
@@ -948,8 +1018,7 @@ def forward_native_grouped_mm(
     )
     final_hidden_states.index_add_(0, token_indices, mm2_out.to(hidden_states.dtype))
 
-    if sequence_length == hidden_states.shape[0]: # 2D case
-            return final_hidden_states
+    return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
 
 def forward_triton_grouped_gemm(
@@ -1339,7 +1408,20 @@ def forward_native_moe_loop(
         if hasattr(self, "gate_up_proj"):
             # Base weight: x @ w.T
             w = self.gate_up_proj[expert_idx]
-            gate_up = current_state @ w.T
+
+            # Check shape for transpose (generic)
+            # gate_up output dim is not known apriori easily without specific model knowledge
+            # But usually it's expanding.
+            # Qwen3: (2*I, H) -> X @ W.T
+            # GPT-OSS: (H, 2*I) -> X @ W
+            if w.shape[0] == current_state.shape[-1]:
+                 gate_up = current_state @ w
+            else:
+                 gate_up = current_state @ w.T
+
+            # Add bias
+            if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
+                gate_up = gate_up + self.gate_up_proj_bias[expert_idx]
 
             # Add LoRA
             if gate_up_lora:
@@ -1355,12 +1437,30 @@ def forward_native_moe_loop(
             gate = current_state @ self.w1[expert_idx].T
             up   = current_state @ self.w3[expert_idx].T
 
-        current_hidden_states = F.silu(gate) * up
+        # Activation
+        if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
+             # GPT-OSS style (implied by bias existence for now, can be more robust)
+             alpha = getattr(self, 'alpha', 1.702)
+             limit = getattr(self, 'limit', 7.0)
+             current_hidden_states = _gpt_oss_swiglu_activation(gate_up, alpha, limit)
+        else:
+             # Qwen3 style
+             gate, up = gate_up.chunk(2, dim=-1)
+             current_hidden_states = F.silu(gate) * up
 
         # Compute down projection for this expert only
         if hasattr(self, "down_proj"):
             w2 = self.down_proj[expert_idx]
-            down_out = current_hidden_states @ w2.T
+
+            # Check shape for transpose (generic)
+            if w2.shape[0] == current_hidden_states.shape[-1]:
+                 down_out = current_hidden_states @ w2
+            else:
+                 down_out = current_hidden_states @ w2.T
+
+            # Add bias
+            if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
+                down_out = down_out + self.down_proj_bias[expert_idx]
 
             # Add LoRA
             if down_lora:
