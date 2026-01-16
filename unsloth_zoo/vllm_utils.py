@@ -1674,20 +1674,34 @@ def load_vllm(
     # L4 with ~22GB seems to work at 0.89 but not 0.9 due to larget cuda graphs/large max num sequences we impose
     total_gb = total_memory/1024/1024/1024
     ten_percent = total_gb * 0.1 # 1.46GB for T4
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.log(f"10% of your GPU VRAM = {ten_percent}")
     if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
     elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
     elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
     elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
     elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
     else: standby_target_gpu_util = 0.75
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.log(f"standby_target_gpu_util = {standby_target_gpu_util}")
     # Reduce memory usage for newer vLLM versions since it OOMs
     if Version(vllm_version) >= Version("0.11.0"):
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.log(f"Decreasing VRAM further since vLLM version >= 0.11.0 uses more")
         standby_target_gpu_util *= 0.95
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.log(f"Further reduced standby_target_gpu_util = {standby_target_gpu_util}")
 
     if unsloth_vllm_standby and not standby_util_override:
         if gpu_memory_utilization < standby_target_gpu_util:
             gpu_memory_utilization = standby_target_gpu_util
-        print(f"Unsloth: Standby mode is enabled. Changing `gpu_memory_utilization` to {gpu_memory_utilization}.")
+            print(f"Unsloth: Standby mode is enabled. Changing `gpu_memory_utilization` to {gpu_memory_utilization}.")
+        elif gpu_memory_utilization > standby_target_gpu_util:
+            print(
+                f"Unsloth: Standby mode is enabled. However your setting of `gpu_memory_utilization` will OOM.\n"\
+                f"Changing `gpu_memory_utilization` to {standby_target_gpu_util}."
+            )
+            gpu_memory_utilization = standby_target_gpu_util
 
     if DEVICE_TYPE == "cuda":
         major_version, minor_version = torch.cuda.get_device_capability()
@@ -2122,9 +2136,9 @@ def load_vllm(
 
     # Check if sleep mode, and send the model to sleep
     # This is to counteract OOMs before GRPO is launched like pre-inference runs
-    if unsloth_vllm_standby and not standby_util_override:
-        print(f"Unsloth: Standby mode is enabled. Pre-sleeping vLLM model to reduce OOMs.")
-        llm.sleep(os.environ.get('VLLM_SLEEP_MODE', "1"))
+    # if unsloth_vllm_standby and not standby_util_override:
+    #     print(f"Unsloth: Standby mode is enabled. Pre-sleeping vLLM model to reduce OOMs.")
+    #     llm.sleep(os.environ.get('VLLM_SLEEP_MODE', "1"))
 
     # Cleanup
     for _ in range(3):

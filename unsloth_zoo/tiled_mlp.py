@@ -19,6 +19,7 @@ import math
 from collections import OrderedDict
 from types import MethodType
 import functools
+from fnmatch import fnmatch
 import torch
 from torch.utils.checkpoint import (
     _infer_device_type,
@@ -261,6 +262,18 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
         mlp_module.forward = MethodType(tiled_forward_target_gb, mlp_module)
     return mlp_module
 
+def is_custom_module(name, custom_modules):
+    name_lower = name.lower()
+    for custom_module in custom_modules:
+        custom_module_lower = custom_module.lower()
+        if '*' in custom_module or '?' in custom_module:
+            if fnmatch(name_lower, custom_module_lower):
+                return True
+        else:
+            if name_lower.endswith(custom_module_lower):
+                return True
+    return False
+
 def patch_tiled_mlp(model, patch_options_str = "arctic", padded_length = 128):
     patch_options_strs = patch_options_str.split(":")
     if patch_options_strs[0] in ["arctic", "1"]:
@@ -269,12 +282,42 @@ def patch_tiled_mlp(model, patch_options_str = "arctic", padded_length = 128):
         target_arctic = False
     if len(patch_options_strs) > 1:
         try:
-            target_gb = float(patch_options_strs[-1])
+            target_gb = float(patch_options_strs[1])
         except:
             target_gb = None
     else:
         target_gb = None
+
+    if len(patch_options_strs) == 3: # custom modules specified
+        custom_modules = [x for x in patch_options_strs[2].split(",") if x]
+    else:
+        custom_modules = []
+
+    attr_suffixes = (
+        '.mlp',
+        '.ffn',
+        '.feed_forward',
+        '.ff',
+        '.densereludense',
+        '.block_sparse_moe',
+    )
+
     for name, module in model.named_modules():
-        if name.lower().endswith(".mlp") or type(module).__name__.lower().endswith("mlp"):
-            patch_mlp(module, target_arctic = target_arctic, target_gb = target_gb, padded_length = padded_length)
+        should_patch = False
+        if custom_modules:
+            if is_custom_module(name, custom_modules):
+                should_patch = True
+        elif name.lower().endswith(attr_suffixes):
+            should_patch = True
+        elif name.endswith('.mixer') and type(module).__name__ in ('NemotronHMLP', 'NemotronHMOE'):
+            should_patch = True
+
+        if should_patch:
+            patch_mlp(
+                module,
+                target_arctic = target_arctic,
+                target_gb = target_gb,
+                padded_length = padded_length,
+            )
+
     return model

@@ -87,7 +87,6 @@ BAD_OUTCOMES = {
     "fatal "                     : "",
     "Err:"                       : "",
     "Failed "                    : "",
-    "is deprecated"              : "Command is deprecated!",
 }
 
 # Check environments
@@ -260,7 +259,7 @@ def check_pip():
 pass
 
 
-def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None, system_type = "debian"):
+def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None, system_type = "debian", ignore_deprecation = False):
     # All Unsloth Zoo code licensed under LGPLv3
 
     with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, text=True) as sp:
@@ -287,6 +286,10 @@ def try_execute(command, sudo = False, print_output = False, print_outputs = Non
                 if key in line:
                     error_msg = f"[FAIL] Command `{command}` failed with error `{line.strip()}`\n"
                     raise RuntimeError(error_msg + value)
+            key, value = "is deprecated", "Command is deprecated!"
+            if not ignore_deprecation and key in line:
+                error_msg = f"[FAIL] Command `{command}` failed with error `{line.strip()}`\n"
+                raise RuntimeError(error_msg + value)
 
             if print_output:
                 print(line, flush=True, end="")
@@ -295,17 +298,17 @@ def try_execute(command, sudo = False, print_output = False, print_outputs = Non
 pass
 
 
-def try_execute_with_auto_install(command, sudo=False, print_output=False, print_outputs=None, cwd = None, system_type = "debian"):
+def try_execute_with_auto_install(command, sudo=False, print_output=False, print_outputs=None, cwd = None, system_type = "debian", ignore_deprecation = False):
     """Try to execute a command, and if it fails due to missing package, try to install it"""
     try:
-        try_execute(command, sudo, print_output, print_outputs, cwd, system_type)
+        try_execute(command, sudo, print_output, print_outputs, cwd, system_type, ignore_deprecation)
     except RuntimeError as e:
         if "Command not found" in str(e):
             package_name = command.split(" ", 1)[0]
             print(f"Trying to install missing package: {package_name}")
             install_package(package_name, sudo, print_output, print_outputs, system_type)
             # Retry once
-            try_execute(command, sudo, print_output, print_outputs, cwd, system_type)
+            try_execute(command, sudo, print_output, print_outputs, cwd, system_type, ignore_deprecation)
         else:
             raise
 pass
@@ -441,12 +444,26 @@ def install_llama_cpp(
             # Clean up any partial build
             try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
 
-            try_execute(
-                f"cmake . -B build "\
-                f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support} -DLLAMA_CURL=ON",
-                cwd = llama_cpp_folder,
-                **kwargs
-            )
+            try:
+                try_execute(
+                    f"cmake . -B build "\
+                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support} -DLLAMA_CURL=ON",
+                    cwd = llama_cpp_folder,
+                    **kwargs
+                )
+            except Exception as inner_e:
+                inner_e = str(inner_e)
+                if "LLAMA_CURL" in inner_e and "deprecated" in inner_e:
+                    # As of https://github.com/ggml-org/llama.cpp/pull/18791, CURL is deprecated
+                    try_execute(
+                        f"cmake . -B build "\
+                        f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}",
+                        cwd = llama_cpp_folder,
+                        ignore_deprecation = True,
+                        **kwargs
+                    )
+                else:
+                    raise
             try_execute(
                 f"cmake --build build --config Release "\
                 f"-j{cpu_count} --clean-first --target "\
