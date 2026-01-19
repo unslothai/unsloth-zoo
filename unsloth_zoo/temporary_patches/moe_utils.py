@@ -138,10 +138,19 @@ def select_moe_backend():
     Choices: "grouped_mm", "unsloth_triton", "native_torch".
     Default if unspecified: "grouped_mm".
     """
+    # Only allow grouped_mm (torch._grouped_mm) if transformers >= 5.0
+    try:
+        from transformers import __version__ as transformers_version
+        from packaging.version import Version
+
+        is_transformers_v5 = Version(transformers_version) >= Version("5.0.0.dev0")
+    except Exception:
+        is_transformers_v5 = False
+
     # Choices ordered by preference
     # (backend_name, is_available)
     choices = [
-        ("grouped_mm", _check_torch_grouped_mm_supported()),
+        ("grouped_mm", _check_torch_grouped_mm_supported() and is_transformers_v5),
         ("unsloth_triton", _check_grouped_gemm_available()),
         ("native_torch", True),
     ]
@@ -260,14 +269,6 @@ def _extract_lora_weights(
         (lora_B_reshaped, lora_A_reshaped, scaling) - For (X @ B) @ A order
     """
     try:
-        print(f"DEBUG: _extract_lora_weights param type={type(param)}")
-        try:
-            if hasattr(param, "shape"):
-                print(f"DEBUG: param.shape={param.shape}")
-            if hasattr(param, "base_layer"):
-                print(f"DEBUG: param.base_layer type={type(param.base_layer)}")
-        except:
-            pass
         if adapter_name not in param.lora_A:
             # Try default adapter
             adapter_name = list(param.lora_A.keys())[0] if param.lora_A else None
@@ -490,7 +491,6 @@ def _extract_lora_weights(
             return None  # Placeholder
 
         return unsloth_B, unsloth_A, scaling
-        return unsloth_B, unsloth_A, scaling
     except Exception:
         return None
 
@@ -509,10 +509,6 @@ def _get_base_weight(param):
         return param.weight
 
     return param
-
-
-# Aliases for compatibility with gpt_oss.py
-_get_moe_lora_weights = _extract_lora_weights
 
 
 def _get_lora_wrapper_for_param(experts_module, param_name):
@@ -618,7 +614,6 @@ def _extract_lora_from_wrapper(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float, int]]:
     """
     Extract LoRA weights from PEFT ParamWrapper for MoE separated computation.
-    # print(f"DEBUG: _extract_lora_from_wrapper called for {adapter_name}")
 
     PEFT computes delta = B @ A, so for separated LoRA:
     Y = X @ W + X @ (B @ A) * s = X @ W + ((X @ B) @ A) * s
@@ -644,10 +639,7 @@ def _extract_lora_from_wrapper(
         if hasattr(wrapper, "disable_adapters") and wrapper.disable_adapters:
             return None
         if hasattr(wrapper, "merged") and wrapper.merged:
-            # print("DEBUG: extract_lora merged")
             return None
-
-        # print(f"DEBUG: extract_lora extraction attempt for {adapter_name}")
 
         # Delegate to shared extraction logic
         # This ensures consistent shape handling (diagonal extraction for B, reshapes for A)
@@ -675,6 +667,10 @@ def _extract_lora_from_wrapper(
 
     except Exception:
         return None
+
+
+# Aliases for compatibility with gpt_oss.py
+_get_moe_lora_weights = _extract_lora_from_wrapper
 
 
 # Store original ParamWrapper.forward for fallback
@@ -706,21 +702,12 @@ def _patched_param_wrapper_forward(
     use_separated = _should_use_separated_lora()
     param_name = getattr(self, "parameter_name", None)
 
-    # DEBUG: Instrumentation
-    # DEBUG: Instrumentation
-    # if param_name in ('gate_up_proj', 'down_proj'):
-    # print(f"DEBUG: Entered _patched_param_forward. param={param_name}")
-    # print(f"DEBUG: use_separated={use_separated}")
-    # print(f"DEBUG: is_moe={_is_moe_experts_module(experts_module)}")
-    # print(f"DEBUG: experts_module type={type(experts_module)}")
-
     # Check if this is an MoE experts module that should use separated LoRA
     if (
         use_separated
         and param_name in ("gate_up_proj", "down_proj")
         and _is_moe_experts_module(experts_module)
     ):
-        print("DEBUG: Condition MET. Entering MoE logic.")
         # MoE experts: bypass PEFT's _activate_lora, use separated computation
 
         # Check adapter state
@@ -852,15 +839,6 @@ def forward_native_grouped_mm(
             self.gate_up_proj, num_experts=self.num_experts
         )
 
-    elif (
-        use_separated_lora
-        and hasattr(self, "gate_up_proj")
-        and _has_lora_adapters(self.gate_up_proj)
-    ):
-        gate_up_lora = _extract_lora_weights(
-            self.gate_up_proj, num_experts=self.num_experts
-        )
-
     if hasattr(self, "gate_up_proj"):
         # Get base weights (raw, without LoRA)
         gate_up_base = _get_base_weight(self.gate_up_proj)
@@ -885,17 +863,10 @@ def forward_native_grouped_mm(
             lora_A = lora_A.to(permuted_input.dtype).contiguous()
 
             # Step 1: permuted_input @ B
-            # print(f"DEBUG: permuted_input={permuted_input.shape}, lora_B={lora_B.shape}, lora_A={lora_A.shape}")
             try:
                 lora_out = torch._grouped_mm(permuted_input, lora_B, offs=offsets)
                 lora_out = lora_out.contiguous()
             except RuntimeError as e:
-                print(f"ERROR in grouped_mm: {e}")
-                print(f"  permuted_input: {permuted_input.shape}")
-                print(f"  lora_B: {lora_B.shape}")
-                print(f"  lora_A: {lora_A.shape}")
-                print(f"  num_experts: {self.num_experts}")
-                print(f"  offsets: {offsets}")
                 raise e
 
             # Step 2: result @ A

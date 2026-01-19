@@ -1134,9 +1134,6 @@ from .moe_utils import (
 )
 
 
-_GROUPED_MM_PATH_LOGGED = False
-
-
 def patch_gpt_oss_moe_for_lora():
     """
     Patch GPT OSS MoE experts for LoRA training with grouped GEMM support.
@@ -1186,6 +1183,13 @@ def patch_gpt_oss_moe_for_lora():
 
 
 TEMPORARY_PATCHES.append(patch_gpt_oss_moe_for_lora)
+
+
+# ============================================================================
+# MXFP4 (4-bit) GPT OSS MoE LoRA Support
+# ============================================================================
+
+_MXFP4_LORA_PATH_LOGGED = False
 
 
 # ============================================================================
