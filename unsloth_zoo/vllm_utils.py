@@ -1675,7 +1675,7 @@ def load_vllm(
     total_gb = total_memory/1024/1024/1024
     ten_percent = total_gb * 0.1 # 1.46GB for T4
     if UNSLOTH_ENABLE_LOGGING:
-        logger.info(f"10% of your GPU VRAM = {ten_percent}")
+        logger.info(f"10% of your GPU VRAM = {ten_percent:.2f} GB")
     if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
     elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
     elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
