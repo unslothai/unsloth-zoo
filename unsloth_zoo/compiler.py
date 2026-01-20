@@ -48,7 +48,6 @@ import triton
 import regex
 from .peft_utils import get_lora_layer_modules
 from importlib.metadata import version as importlib_version
-from packaging.version import Version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
