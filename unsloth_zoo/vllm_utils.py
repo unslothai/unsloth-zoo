@@ -1690,7 +1690,7 @@ def load_vllm(
             logger.info(f"Decreasing VRAM further since vLLM version >= 0.11.0 uses more")
         standby_target_gpu_util *= 0.95
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Further reduced standby_target_gpu_util = {standby_target_gpu_util}")
+            logger.info(f"Further reduced standby_target_gpu_util = {standby_target_gpu_util:.4f}")
 
     if unsloth_vllm_standby and not standby_util_override:
         if gpu_memory_utilization < standby_target_gpu_util:
