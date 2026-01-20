@@ -1683,7 +1683,7 @@ def load_vllm(
     elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
     else: standby_target_gpu_util = 0.75
     if UNSLOTH_ENABLE_LOGGING:
-        logger.info(f"standby_target_gpu_util = {standby_target_gpu_util}")
+        logger.info(f"standby_target_gpu_util = {standby_target_gpu_util:.3f}")
     # Reduce memory usage for newer vLLM versions since it OOMs
     if Version(vllm_version) >= Version("0.11.0"):
         if UNSLOTH_ENABLE_LOGGING:
