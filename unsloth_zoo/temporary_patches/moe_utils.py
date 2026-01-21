@@ -1088,14 +1088,7 @@ def forward_native_grouped_mm(
     else:
         raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
 
-    # 5. Apply Routing Weights
-    flat_weights = top_k_weights.view(-1)
-    permuted_weights = flat_weights[sorted_indices]
-    mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
-
-    # 6. Scatter Add (Reduce)
-    # GptOss applies routing weights: weighted_output = out * routing_weights
-    # We must permute weights to match the sorted expert assignments
+    # 5. Apply Routing Weights and Scatter Add (Reduce)
     flat_weights = top_k_weights.view(-1)
     permuted_weights = flat_weights[sorted_indices]
     mm2_out = mm2_out * permuted_weights.unsqueeze(-1)

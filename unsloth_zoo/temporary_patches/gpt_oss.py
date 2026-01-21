@@ -1061,26 +1061,26 @@ pass
 @_torch_compile(
     dynamic=None, fullgraph=True, options=no_combo_fused_torch_compile_options
 )
-def moe_forward_inference_bf16(self, hidden_states):
-    router_scores, router_indices = moe_router_forward(self.router, hidden_states)
-    routing_weights = router_scores
-
-    moe = self.experts
+def _moe_forward_inference_bf16_kernel(
+    hidden_states, routing_weights, gate_up_proj, gate_up_proj_bias, down_proj, down_proj_bias, limit, alpha, hidden_size
+):
+    """Inner compiled kernel for BF16 MoE inference - works with raw tensors only."""
     batch_size = hidden_states.shape[0]
-    hidden_states = hidden_states.reshape(-1, moe.hidden_size)
+    hidden_states = hidden_states.reshape(-1, hidden_size)
     num_experts = routing_weights.shape[1]
     hidden_states = hidden_states.repeat(num_experts, 1)
-    hidden_states = hidden_states.view(num_experts, -1, moe.hidden_size)
+    hidden_states = hidden_states.view(num_experts, -1, hidden_size)
+
     gate_up = (
-        torch.bmm(hidden_states, moe.gate_up_proj) + moe.gate_up_proj_bias[..., None, :]
+        torch.bmm(hidden_states, gate_up_proj) + gate_up_proj_bias[..., None, :]
     )
     gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-    gate = gate.clamp(min=None, max=moe.limit)
-    up = up.clamp(min=-moe.limit, max=moe.limit)
-    glu = gate * torch.sigmoid(gate.to(torch.float32) * moe.alpha).to(gate.dtype)
-    next_states = torch.bmm(((up + 1) * glu), moe.down_proj)
-    next_states = next_states + moe.down_proj_bias[..., None, :]
-    next_states = next_states.view(num_experts, batch_size, -1, moe.hidden_size)
+    gate = gate.clamp(min=None, max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    glu = gate * torch.sigmoid(gate.to(torch.float32) * alpha).to(gate.dtype)
+    next_states = torch.bmm(((up + 1) * glu), down_proj)
+    next_states = next_states + down_proj_bias[..., None, :]
+    next_states = next_states.view(num_experts, batch_size, -1, hidden_size)
     next_states = (
         next_states
         * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
@@ -1089,7 +1089,40 @@ def moe_forward_inference_bf16(self, hidden_states):
     return next_states
 
 
-pass
+def moe_forward_inference_bf16(self, hidden_states):
+    """Wrapper that extracts weights from ParameterModule before calling the compiled kernel."""
+    router_scores, router_indices = moe_router_forward(self.router, hidden_states)
+    routing_weights = router_scores
+
+    moe = self.experts
+
+    # Handle ParameterModule (which wraps nn.Linear) vs direct 3D tensor
+    # Extract weights BEFORE the compiled region
+    gate_up_proj = moe.gate_up_proj
+    if hasattr(gate_up_proj, "get_param"):
+        gate_up_proj = gate_up_proj.get_param()
+    elif hasattr(gate_up_proj, "weight"):
+        gate_up_proj = gate_up_proj.weight
+
+    down_proj = moe.down_proj
+    if hasattr(down_proj, "get_param"):
+        down_proj = down_proj.get_param()
+    elif hasattr(down_proj, "weight"):
+        down_proj = down_proj.weight
+
+    return _moe_forward_inference_bf16_kernel(
+        hidden_states,
+        routing_weights,
+        gate_up_proj,
+        moe.gate_up_proj_bias,
+        down_proj,
+        moe.down_proj_bias,
+        moe.limit,
+        moe.alpha,
+        moe.hidden_size,
+    )
+
+
 
 
 class GptOssMLP(nn.Module):
@@ -1139,6 +1172,9 @@ def patch_gpt_oss_moe_for_lora():
     Patch GPT OSS MoE experts for LoRA training with grouped GEMM support.
     This patches the original GptOssExperts class (with 3D parameter tensors)
     to use optimized grouped GEMM kernels with LoRA support.
+
+    IMPORTANT: We only patch the forward method, NOT replace the entire class.
+    This preserves the original class structure so weights load correctly.
     """
     # First patch ParamWrapper for MoE separated LoRA
     patch_param_wrapper_for_moe()
@@ -1146,9 +1182,8 @@ def patch_gpt_oss_moe_for_lora():
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
 
-        # Replace the class entirely to use ParameterModule projections
-        transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExperts
-        GptOssExpertsClass = GptOssExperts
+        # Get the ORIGINAL class - don't replace it!
+        GptOssExpertsClass = transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
     except Exception as e:
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: Could not patch GPT OSS MoE for LoRA: {e}")
@@ -1166,7 +1201,7 @@ def patch_gpt_oss_moe_for_lora():
     else:
         forward = forward_native_moe_loop
 
-    # Store original forward
+    # Store original forward and patch - but DON'T replace the class!
     GptOssExpertsClass._original_forward = GptOssExpertsClass.forward
     GptOssExpertsClass.forward = forward
     GptOssExpertsClass._unsloth_lora_patched = True
@@ -2142,6 +2177,8 @@ def patch_GptOssModel():
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
             torch.compiler.cudagraph_mark_step_begin()
+            # Initialize for common return path
+            all_hidden_states = None
             for decoder_layer in self.layers:
                 hidden_states, residual = inference_forward(
                     decoder_layer,
@@ -2163,9 +2200,11 @@ def patch_GptOssModel():
                 ):
                     if mlp_forward is None:
                         raise RuntimeError("Unsloth: MXFP4 forward is not found")
-                # Always use mlp_forward to ensure LoRA and our patches are applied
-                # moe_forward_inference_bf16 does not support LoRA yet.
-                hidden_states, _ = mlp_forward(decoder_layer.mlp, hidden_states)
+                    hidden_states, _ = mlp_forward(decoder_layer.mlp, hidden_states)
+                else:
+                    hidden_states = moe_forward_inference_bf16(
+                        decoder_layer.mlp, hidden_states
+                    )
                 hidden_states += residual
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
