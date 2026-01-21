@@ -1044,6 +1044,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     packed_modules_mapping = getattr(vllm_internals, "packed_modules_mapping", None)
 
     def _is_fused_module(name: str) -> bool:
+        if packed_modules_mapping is None:
+            return False
         packed = packed_modules_mapping.get(name)
         return isinstance(packed, (list, tuple)) and len(packed) == 1 and packed[0] == name
 
