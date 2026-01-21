@@ -41,12 +41,12 @@ from .utils import (
 from .moe_utils import (
     _check_grouped_gemm_available,
     _TORCH_GROUPED_MM_AVAILABLE,
-    forward_native_grouped_mm,
-    forward_triton_grouped_gemm,
     forward_native_moe_loop,
     select_moe_backend,
     patch_param_wrapper_for_moe,
 )
+
+from . import moe_utils
 
 def patch_qwen3_vl_moe():
     # Patch ParamWrapper.forward for MoE separated LoRA
