@@ -120,15 +120,18 @@ def get_torch_compile_options(
             final_torch_compile_options[key] = value
     return final_torch_compile_options
 pass
+
+IS_TORCH_2_9_OR_NEWER = Version(torch.__version__) >= Version("2.9.0")
+
 torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False,
     shape_padding = True,
     debug = False,
-    cudagraphs = True,
+    cudagraphs = IS_TORCH_2_9_OR_NEWER,
     coordinate_descent_tuning = False,
     logging = UNSLOTH_ENABLE_LOGGING,
-    combo_kernels = True,
+    combo_kernels = IS_TORCH_2_9_OR_NEWER,
     memory_planning = False,
     multi_kernel = False,
     use_block_ptr = False,
