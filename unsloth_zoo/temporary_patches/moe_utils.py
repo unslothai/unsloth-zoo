@@ -662,7 +662,6 @@ def _extract_lora_from_wrapper(
         lora_A_reshaped: (E, R, out_features) - for second step: result @ A
     """
     try:
-        # Check basic PEFT attributes
         if not hasattr(wrapper, "lora_A") or not hasattr(wrapper, "lora_B"):
             return None
 
@@ -671,30 +670,43 @@ def _extract_lora_from_wrapper(
         if hasattr(wrapper, "merged") and wrapper.merged:
             return None
 
-        # Delegate to shared extraction logic
-        # This ensures consistent shape handling (diagonal extraction for B, reshapes for A)
-        # wrapper acts as 'param' here (has lora_A/lora_B/scaling attributes)
-
-        # Determine num_experts from wrapper or try to infer
-        num_experts = getattr(wrapper, "num_experts", None)
-
-        result = _extract_lora_weights(wrapper, adapter_name, num_experts=num_experts)
-
-        if result is None:
+        if not wrapper.lora_A:
             return None
 
-        unsloth_B, unsloth_A, scaling = result
+        if adapter_name not in wrapper.lora_A:
+            adapter_name = list(wrapper.lora_A.keys())[0]
 
-        # We need to return num_experts as 4th element locally used by caller
-        # If num_experts was None, _extract_lora_weights likely found it or defaulted
-        # We can infer it from the shape of unsloth_B (E, In, R)
-        if hasattr(unsloth_B, "shape") and len(unsloth_B.shape) == 3:
-            e = unsloth_B.shape[0]
+        lora_A_module = wrapper.lora_A[adapter_name]
+        lora_B_module = wrapper.lora_B[adapter_name]
+
+        # PEFT stores: A.weight = (E*R, out_dim), B.weight = (in_dim, E*R)
+        # where delta = B @ A = (in_dim, E*R) @ (E*R, out_dim) = (in_dim, out_dim)
+        weight_A = lora_A_module.weight  # (E*R, out_dim)
+        weight_B = lora_B_module.weight  # (in_dim, E*R)
+        scaling = wrapper.scaling[adapter_name]
+        num_experts = getattr(wrapper, "num_experts", 1)
+
+        if num_experts > 1:
+            rank_per_expert = weight_A.shape[0] // num_experts
+            in_dim = weight_B.shape[0]  # input dimension for first step
+            out_dim = weight_A.shape[1]  # output dimension for second step
+
+            # Reshape B for first step: X @ B where X is (N, in_dim)
+            # B.weight: (in_dim, E*R) -> reshape to (in_dim, R, E) -> permute to (E, in_dim, R)
+            B_reshaped = weight_B.reshape(in_dim, rank_per_expert, num_experts)
+            B_reshaped = B_reshaped.permute(2, 0, 1).contiguous()  # (E, in_dim, R)
+
+            # Reshape A for second step: result @ A where result is (N, R)
+            # A.weight: (E*R, out_dim) -> reshape to (E, R, out_dim)
+            A_reshaped = weight_A.reshape(
+                num_experts, rank_per_expert, out_dim
+            )  # (E, R, out_dim)
         else:
-            e = num_experts if num_experts else 1
+            B_reshaped = weight_B.T  # (E*R, in_dim)
+            A_reshaped = weight_A  # (E*R, out_dim)
 
-        return unsloth_B, unsloth_A, scaling, e
-
+        # Return (B, A) for application order: (X @ B) @ A
+        return B_reshaped, A_reshaped, scaling, num_experts
     except Exception:
         return None
 
