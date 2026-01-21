@@ -17,11 +17,10 @@
 import torch
 import numpy as np
 from typing import Union, Optional, List, Any, Callable, Tuple
-from packaging.version import Version
 import os
 import warnings
 import gc
-from .utils import _get_dtype
+from .utils import _get_dtype, Version
 from .device_type import (
     is_hip,
     get_device_type,
