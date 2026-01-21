@@ -16,7 +16,37 @@
 import torch
 import torch.nn.functional as F
 import os
+import shutil
 from typing import Optional, Tuple
+
+# Get compile location
+UNSLOTH_COMPILE_LOCATION = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+
+def _install_to_cache():
+    """
+    Copies this file (moe_utils.py) to the unsloth_compiled_cache directory
+    to ensure it is available for compiled modules.
+    Only runs if the file is part of the unsloth_zoo package execution.
+    """
+    if not os.path.exists(UNSLOTH_COMPILE_LOCATION):
+        try: os.makedirs(UNSLOTH_COMPILE_LOCATION)
+        except: pass
+
+    # Only copy if we are not running somehow FROM the cache (avoid self-overwrite loops if possible)
+    # The simplest check is if __file__ is inside unsloth_zoo
+    # or just copy if destination doesn't match source.
+
+    current_file = os.path.abspath(__file__)
+    destination = os.path.abspath(os.path.join(UNSLOTH_COMPILE_LOCATION, "moe_utils.py"))
+
+    # If source and dest are different, copy.
+    if current_file != destination:
+        try:
+            shutil.copy(current_file, destination)
+        except Exception:
+            pass
+
+_install_to_cache()
 
 
 # Global flag to check if grouped GEMM is available

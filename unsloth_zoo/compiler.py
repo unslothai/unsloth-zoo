@@ -1555,7 +1555,9 @@ def patch_gradient_checkpointing(module, source):
     pass
 
     layer, spaces, args = find[0]
-    span = re.search(finder, forward).span(0)
+    match = re.search(finder, forward)
+    if match is None: return None
+    span = match.span(0)
     replacer = replace_gradient_checkpointing.strip()
 
     # Gradient checkpointing calling must remove arg=arg convention
@@ -2902,7 +2904,11 @@ def unsloth_compile_transformers(
             pass
 
             params = list(parameters.parameters.keys())
-            source = inspect.getsource(function)
+            try:
+                source = inspect.getsource(function)
+            except Exception as e:
+                print(f"Unsloth: Cannot run inspect.getsource on {module} with error = {e}")
+                continue
 
             where = source.find(str(parameters))
             if where == -1: where = source.find("\n") + 1
