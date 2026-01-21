@@ -1,4 +1,3 @@
-
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,24 +19,29 @@ import shutil
 from typing import Optional, Tuple
 
 # Get compile location
-UNSLOTH_COMPILE_LOCATION = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+UNSLOTH_COMPILE_LOCATION = os.environ.get(
+    "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
+)
 
-def _install_to_cache():
+
+def install_to_cache(source_path, destination_filename=None):
     """
-    Copies this file (moe_utils.py) to the unsloth_compiled_cache directory
+    Copies a file to the unsloth_compiled_cache directory
     to ensure it is available for compiled modules.
-    Only runs if the file is part of the unsloth_zoo package execution.
     """
     if not os.path.exists(UNSLOTH_COMPILE_LOCATION):
-        try: os.makedirs(UNSLOTH_COMPILE_LOCATION)
-        except: pass
+        try:
+            os.makedirs(UNSLOTH_COMPILE_LOCATION)
+        except:
+            pass
 
-    # Only copy if we are not running somehow FROM the cache (avoid self-overwrite loops if possible)
-    # The simplest check is if __file__ is inside unsloth_zoo
-    # or just copy if destination doesn't match source.
+    current_file = os.path.abspath(source_path)
+    if destination_filename is None:
+        destination_filename = os.path.basename(current_file)
 
-    current_file = os.path.abspath(__file__)
-    destination = os.path.abspath(os.path.join(UNSLOTH_COMPILE_LOCATION, "moe_utils.py"))
+    destination = os.path.abspath(
+        os.path.join(UNSLOTH_COMPILE_LOCATION, destination_filename)
+    )
 
     # If source and dest are different, copy.
     if current_file != destination:
@@ -46,7 +50,8 @@ def _install_to_cache():
         except Exception:
             pass
 
-_install_to_cache()
+
+install_to_cache(__file__, "moe_utils.py")
 
 
 # Global flag to check if grouped GEMM is available
@@ -55,6 +60,7 @@ _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 
 # Check if GPU supports torch._grouped_mm (verified via runtime check)
 _TORCH_GROUPED_MM_SUPPORTED = None
+
 
 def _check_torch_grouped_mm_supported():
     """
@@ -94,8 +100,10 @@ def _check_torch_grouped_mm_supported():
 
     return _TORCH_GROUPED_MM_SUPPORTED
 
+
 _TRITON_ALLOCATOR_INITIALIZED = False
 _PERSISTENT_BUFFER = None
+
 
 def _init_triton_allocator():
     """
@@ -103,7 +111,8 @@ def _init_triton_allocator():
     This significantly reduces GPU utilization fluctuation.
     """
     global _TRITON_ALLOCATOR_INITIALIZED, _PERSISTENT_BUFFER
-    if _TRITON_ALLOCATOR_INITIALIZED: return
+    if _TRITON_ALLOCATOR_INITIALIZED:
+        return
 
     try:
         import triton
@@ -117,11 +126,15 @@ def _init_triton_allocator():
             # Round to nearest 128 bytes for alignment
             rounded_size = ((size + 128 - 1) // 128) * 128
 
-            if _PERSISTENT_BUFFER is None or _PERSISTENT_BUFFER.numel() * _PERSISTENT_BUFFER.element_size() < rounded_size:
+            if (
+                _PERSISTENT_BUFFER is None
+                or _PERSISTENT_BUFFER.numel() * _PERSISTENT_BUFFER.element_size()
+                < rounded_size
+            ):
                 # Allocate with small headroom (10%) to reduce reallocations
                 # Use ByteTensor (uint8) for raw byte storage
                 _PERSISTENT_BUFFER = torch.empty(
-                    int(rounded_size * 1.1), device = "cuda", dtype = torch.uint8
+                    int(rounded_size * 1.1), device="cuda", dtype=torch.uint8
                 )
                 _PERSISTENT_BUFFER.__hibernate__ = {"type": "ignore"}
             return _PERSISTENT_BUFFER
@@ -131,7 +144,6 @@ def _init_triton_allocator():
         _TRITON_ALLOCATOR_INITIALIZED = True
     except Exception:
         pass
-
 
 
 def _check_grouped_gemm_available():
@@ -144,7 +156,11 @@ def _check_grouped_gemm_available():
         return _GROUPED_GEMM_AVAILABLE
 
     try:
-        from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
+        from unsloth.kernels.moe.grouped_gemm.interface import (
+            grouped_gemm,
+            supports_tma,
+        )
+
         _GROUPED_GEMM_AVAILABLE = True
         _init_triton_allocator()
     except (ImportError, ModuleNotFoundError):
@@ -161,9 +177,9 @@ def select_moe_backend():
     # Choices ordered by preference
     # (backend_name, is_available)
     choices = [
-        ("grouped_mm",     _check_torch_grouped_mm_supported()),
+        ("grouped_mm", _check_torch_grouped_mm_supported()),
         ("unsloth_triton", _check_grouped_gemm_available()),
-        ("native_torch",   True),
+        ("native_torch", True),
     ]
 
     # 1. Check environment variable
@@ -185,7 +201,9 @@ def select_moe_backend():
             if is_available:
                 return requested_backend
             else:
-                print(f"Unsloth: '{requested_backend}' backend requested but is not available. Falling back to next available.")
+                print(
+                    f"Unsloth: '{requested_backend}' backend requested but is not available. Falling back to next available."
+                )
 
     # 2. Automatic selection (first available in preference order)
     for name, available in choices:
@@ -210,10 +228,9 @@ def _get_routing_indices(selected_experts, num_experts):
     flat_experts = selected_experts.view(-1)
 
     # bincount is faster than histc since it doesn't require float conversion
-    token_counts_by_expert = torch.bincount(
-        flat_experts,
-        minlength=num_experts
-    ).to(torch.int32)
+    token_counts_by_expert = torch.bincount(flat_experts, minlength=num_experts).to(
+        torch.int32
+    )
 
     # argsort with stable=True preserves order within each expert
     gather_indices = flat_experts.argsort(stable=True)
@@ -231,104 +248,46 @@ def _silu_and_mul(x):
 # Separated LoRA Helper Functions
 # ============================================================================
 
+
 def _has_lora_adapters(param) -> bool:
     """Check if parameter has active LoRA adapters (PEFT ParamWrapper)."""
     # Check if this is a PEFT LoRA wrapper
-    if not hasattr(param, 'lora_A') or not hasattr(param, 'lora_B'):
+    if not hasattr(param, "lora_A") or not hasattr(param, "lora_B"):
         return False
-    if hasattr(param, 'disable_adapters') and param.disable_adapters:
+    if hasattr(param, "disable_adapters") and param.disable_adapters:
         return False
-    if hasattr(param, 'merged') and param.merged:
+    if hasattr(param, "merged") and param.merged:
         return False
     return len(param.lora_A) > 0
 
 
-def _extract_lora_weights(param, adapter_name: str = 'default') -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
-    """
-    Extract LoRA A and B weights from PEFT ParamWrapper.
+def _get_shape(param):
+    """Recursively search for shape."""
+    if hasattr(param, "shape"):
+        return param.shape
+    if hasattr(param, "weight") and hasattr(param.weight, "shape"):
+        return param.weight.shape
 
-    Returns:
-        (lora_A, lora_B, scaling) or None if not found
-    """
-    try:
-        if adapter_name not in param.lora_A:
-            # Try default adapter
-            adapter_name = list(param.lora_A.keys())[0] if param.lora_A else None
-            if adapter_name is None:
-                return None
+    # Check if we have parameter_name
+    param_name = getattr(param, "parameter_name", None)
+    if param_name and hasattr(param, "base_layer"):
+        # If base_layer is the module, check if it has the param
+        if hasattr(param.base_layer, param_name):
+            p = getattr(param.base_layer, param_name)
+            # Recursively check p (p might be a Tensor or another wrapper)
+            # Avoid infinite loop if p is param
+            if p is not param:
+                s = _get_shape(p)
+                if s is not None:
+                    return s
 
-        lora_A_module = param.lora_A[adapter_name]
-        lora_B_module = param.lora_B[adapter_name]
-        weight_A = lora_A_module.weight
-        weight_B = lora_B_module.weight
-        scaling = param.scaling[adapter_name]
-
-        # For MoE with experts, reshape from PEFT's format
-        num_experts = getattr(param, 'num_experts', 1)
-        if num_experts > 1:
-            # weight_A: (experts * rank, in_features) -> (experts, rank, in_features)
-            rank_per_expert = weight_A.shape[0] // num_experts
-            weight_A = weight_A.reshape(num_experts, rank_per_expert, weight_A.shape[-1])
-            # Ensure contiguous for torch._grouped_mm stride alignment (16-byte requirement)
-            if not weight_A.is_contiguous():
-                weight_A = weight_A.contiguous()
-
-            # weight_B: (out_features, experts * rank) -> (experts, out_features, rank)
-            weight_B = weight_B.reshape(weight_B.shape[0], rank_per_expert, num_experts)
-            weight_B = weight_B.permute(2, 0, 1).contiguous()
-
-        return weight_A, weight_B, scaling
-    except Exception:
-        return None
-
-
-def _get_base_weight(param):
-    """Get base weight from potentially wrapped parameter."""
-    if hasattr(param, 'get_param'):
-        return param.get_param()
-    return param
-
-
-def _should_use_separated_lora() -> bool:
-    """
-    Check if separated LoRA approach should be used (default: True).
-    Set UNSLOTH_MOE_LORA_MERGED=1 to use merged approach instead.
-    """
-    return os.environ.get("UNSLOTH_MOE_LORA_MERGED", "0") != "1"
-
-
-# ============================================================================
-# Generic MoE Detection and ParamWrapper Patching
-# ============================================================================
-
-def _is_moe_experts_module(module) -> bool:
-    """
-    Check if module is an MoE experts layer (generic, not model-specific).
-
-    Detects modules with stacked expert weights as 3D nn.Parameter:
-    - gate_up_proj/down_proj pattern (Qwen3-MoE, Qwen3-VL-MoE, etc.)
-    - w1/w2/w3 pattern (older MoE models)
-    """
-    import torch.nn as nn
-
-    # Check for gate_up_proj pattern
-    if hasattr(module, 'gate_up_proj'):
-        param = module.gate_up_proj
-        if isinstance(param, nn.Parameter) and param.ndim == 3:
-            return True
-
-    # Check for w1/w2 pattern (separate gate/up projections)
-    if hasattr(module, 'w1') and hasattr(module, 'w2'):
-        w1 = module.w1
-        if isinstance(w1, nn.Parameter) and w1.ndim == 3:
-            return True
-
-    return False
+    if hasattr(param, "base_layer"):
+        return _get_shape(param.base_layer)
+    return None
 
 
 def _extract_lora_from_wrapper(
-    wrapper,
-    adapter_name: str = 'default'
+    wrapper, adapter_name: str = "default"
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float, int]]:
     """
     Extract LoRA weights from PEFT ParamWrapper for MoE separated computation.
@@ -350,12 +309,12 @@ def _extract_lora_from_wrapper(
         lora_A_reshaped: (E, R, out_features) - for second step: result @ A
     """
     try:
-        if not hasattr(wrapper, 'lora_A') or not hasattr(wrapper, 'lora_B'):
+        if not hasattr(wrapper, "lora_A") or not hasattr(wrapper, "lora_B"):
             return None
 
-        if hasattr(wrapper, 'disable_adapters') and wrapper.disable_adapters:
+        if hasattr(wrapper, "disable_adapters") and wrapper.disable_adapters:
             return None
-        if hasattr(wrapper, 'merged') and wrapper.merged:
+        if hasattr(wrapper, "merged") and wrapper.merged:
             return None
 
         if not wrapper.lora_A:
@@ -366,41 +325,185 @@ def _extract_lora_from_wrapper(
 
         lora_A_module = wrapper.lora_A[adapter_name]
         lora_B_module = wrapper.lora_B[adapter_name]
-        # PEFT stores: A.weight = (E*R, out_dim), B.weight = (in_dim, E*R)
-        # where delta = B @ A = (in_dim, E*R) @ (E*R, out_dim) = (in_dim, out_dim)
-        weight_A = lora_A_module.weight  # (E*R, out_dim)
-        weight_B = lora_B_module.weight  # (in_dim, E*R)
+
+        # PEFT stores for MoE ParamWrapper:
+        # lora_A.weight: (E*R, in_dim) - first projection
+        # lora_B.weight: (out_dim, E*R) - second projection
+        # delta = lora_B @ lora_A = (out_dim, in_dim)
+        # Forward uses: X @ delta.T = X @ lora_A.T @ lora_B.T
+        weight_A = lora_A_module.weight  # (E*R, in_dim)
+        weight_B = lora_B_module.weight  # (out_dim, E*R)
         scaling = wrapper.scaling[adapter_name]
-        num_experts = getattr(wrapper, 'num_experts', 1)
+        num_experts = getattr(wrapper, "num_experts", 1)
 
         if num_experts > 1:
-            rank_per_expert = weight_A.shape[0] // num_experts
-            in_dim = weight_B.shape[0]   # input dimension for first step
-            out_dim = weight_A.shape[1]  # output dimension for second step
+            total_rank = weight_A.shape[0]
+            rank_per_expert = total_rank // num_experts
+            in_dim = weight_A.shape[1]  # from lora_A: (E*R, in_dim)
+            out_dim = weight_B.shape[0]  # from lora_B: (out_dim, E*R)
 
-            # Reshape B for first step: X @ B where X is (N, in_dim)
-            # B.weight: (in_dim, E*R) -> reshape to (in_dim, R, E) -> permute to (E, in_dim, R)
-            B_reshaped = weight_B.reshape(in_dim, rank_per_expert, num_experts)
-            B_reshaped = B_reshaped.permute(2, 0, 1).contiguous()  # (E, in_dim, R)
+            # For grouped_mm: X @ first_weight @ second_weight
+            # where X is (N, in_dim)
 
-            # Reshape A for second step: result @ A where result is (N, R)
-            # A.weight: (E*R, out_dim) -> reshape to (E, R, out_dim)
-            A_reshaped = weight_A.reshape(num_experts, rank_per_expert, out_dim)  # (E, R, out_dim)
+            # First weight: lora_A.T reshaped for X @ first_weight
+            # lora_A.T: (in_dim, E*R) -> reshape (in_dim, E, R) -> permute (E, in_dim, R)
+            first_weight = weight_A.T.reshape(in_dim, num_experts, rank_per_expert)
+            first_weight = first_weight.permute(1, 0, 2).contiguous()  # (E, in_dim, R)
+
+            # Second weight: lora_B.T reshaped for intermediate @ second_weight
+            # lora_B.T: (E*R, out_dim) -> reshape (E, R, out_dim)
+            second_weight = weight_B.T.reshape(num_experts, rank_per_expert, out_dim)
+            second_weight = second_weight.contiguous()  # (E, R, out_dim)
         else:
-            B_reshaped = weight_B.T  # (E*R, in_dim)
-            A_reshaped = weight_A    # (E*R, out_dim)
+            first_weight = weight_A.T  # (in_dim, R)
+            second_weight = weight_B.T  # (R, out_dim)
 
-        # Return (B, A) for application order: (X @ B) @ A
-        return B_reshaped, A_reshaped, scaling, num_experts
+        # Return (first_weight, second_weight) for application order: (X @ first) @ second
+        return first_weight, second_weight, scaling, num_experts
     except Exception:
         return None
+
+
+def _extract_lora_weights(
+    param, adapter_name: str = "default", num_experts: int = None
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
+    """
+    Extract LoRA A and B weights from PEFT ParamWrapper.
+
+    This is a compatibility wrapper around _extract_lora_from_wrapper.
+    Use _extract_lora_from_wrapper directly for new code.
+
+    Returns:
+        (lora_B_reshaped, lora_A_reshaped, scaling) - For (X @ B) @ A order
+    """
+    # Set num_experts on param if provided, so _extract_lora_from_wrapper can use it
+    if num_experts is not None and not hasattr(param, "num_experts"):
+        param.num_experts = num_experts
+
+    result = _extract_lora_from_wrapper(param, adapter_name)
+    if result is None:
+        return None
+    # Return first 3 elements (B, A, scaling) without num_experts
+    return result[0], result[1], result[2]
+
+
+def _get_base_weight(param):
+    """Get base weight from potentially wrapped parameter."""
+    if hasattr(param, "get_param"):
+        return param.get_param()
+    return param
+
+
+def _should_use_separated_lora() -> bool:
+    """
+    Check if separated LoRA approach should be used (default: True).
+    Set UNSLOTH_MOE_LORA_MERGED=1 to use merged approach instead.
+    """
+    return os.environ.get("UNSLOTH_MOE_LORA_MERGED", "0") != "1"
+
+
+# ============================================================================
+# Model-specific Weight Preprocessing Hooks
+# ============================================================================
+# Each model can register its own preprocessing function for weight transposition.
+# This allows the generic backend to work with different model weight layouts.
+
+_WEIGHT_PREPROCESSORS = {}
+
+
+def register_weight_preprocessor(model_type: str, preprocessor_fn):
+    """
+    Register a weight preprocessor for a specific model type.
+
+    Args:
+        model_type: Model identifier (e.g., "qwen3_moe", "qwen3_vl_moe")
+        preprocessor_fn: Function(weight, proj_type, hidden_dim) -> processed_weight
+                        proj_type is "gate_up" or "down"
+    """
+    _WEIGHT_PREPROCESSORS[model_type] = preprocessor_fn
+
+
+def get_weight_preprocessor(model_type: str):
+    """Get registered weight preprocessor for model type."""
+    return _WEIGHT_PREPROCESSORS.get(model_type)
+
+
+def preprocess_weight(
+    weight: torch.Tensor, proj_type: str, hidden_dim: int, model_type=None
+):
+    """
+    Preprocess weight tensor for grouped_mm compatibility.
+
+    Uses model-specific preprocessor if registered, otherwise uses default logic.
+
+    Args:
+        weight: Weight tensor (E, dim1, dim2) or similar
+        proj_type: "gate_up" or "down"
+        hidden_dim: Hidden dimension for shape inference
+        model_type: Optional model type to use specific preprocessor
+
+    Returns:
+        Weight tensor in (E, in_dim, out_dim) format for grouped_mm
+    """
+    if model_type and model_type in _WEIGHT_PREPROCESSORS:
+        return _WEIGHT_PREPROCESSORS[model_type](weight, proj_type, hidden_dim)
+
+    # Default preprocessing: check if transposition is needed
+    if proj_type == "gate_up":
+        # For gate_up, we need (E, hidden_dim, 2*intermediate)
+        if weight.shape[1] == hidden_dim:
+            return weight
+        else:
+            return weight.transpose(-2, -1)
+    else:  # down
+        # For down, we need (E, intermediate, hidden_dim)
+        if weight.shape[2] == hidden_dim:
+            return weight
+        else:
+            return weight.transpose(-2, -1)
+
+
+# ============================================================================
+# Generic MoE Detection and ParamWrapper Patching
+# ============================================================================
+
+
+def _is_moe_experts_module(module) -> bool:
+    """
+    Check if module is an MoE experts layer (generic, not model-specific).
+
+    Detects modules with stacked expert weights as 3D nn.Parameter:
+    - gate_up_proj/down_proj pattern (Qwen3-MoE, Qwen3-VL-MoE, etc.)
+    - w1/w2/w3 pattern (older MoE models)
+    """
+    import torch.nn as nn
+
+    # Check for gate_up_proj pattern
+    if hasattr(module, "gate_up_proj"):
+        param = module.gate_up_proj
+        if isinstance(param, nn.Parameter) and param.ndim == 3:
+            return True
+
+    # Check for w1/w2 pattern (separate gate/up projections)
+    if hasattr(module, "w1") and hasattr(module, "w2"):
+        w1 = module.w1
+        if isinstance(w1, nn.Parameter) and w1.ndim == 3:
+            return True
+
+    return False
+
+
+# Aliases for compatibility with gpt_oss.py
+_get_moe_lora_weights = _extract_lora_from_wrapper
 
 
 # Store original ParamWrapper.forward for fallback
 _original_param_wrapper_forward = None
 
 
-def _patched_param_wrapper_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+def _patched_param_wrapper_forward(
+    self, x: torch.Tensor, *args, **kwargs
+) -> torch.Tensor:
     """
     Patched ParamWrapper.forward for MoE separated LoRA.
 
@@ -421,10 +524,14 @@ def _patched_param_wrapper_forward(self, x: torch.Tensor, *args, **kwargs) -> to
     experts_module = self.get_base_layer()
 
     use_separated = _should_use_separated_lora()
-    param_name = getattr(self, 'parameter_name', None)
+    param_name = getattr(self, "parameter_name", None)
 
     # Check if this is an MoE experts module that should use separated LoRA
-    if use_separated and param_name in ('gate_up_proj', 'down_proj') and _is_moe_experts_module(experts_module):
+    if (
+        use_separated
+        and param_name in ("gate_up_proj", "down_proj")
+        and _is_moe_experts_module(experts_module)
+    ):
         # MoE experts: bypass PEFT's _activate_lora, use separated computation
 
         # Check adapter state
@@ -451,7 +558,7 @@ def _patched_param_wrapper_forward(self, x: torch.Tensor, *args, **kwargs) -> to
         if lora_data is not None and param_name:
             # Store LoRA data on the EXPERTS MODULE (not base_layer)
             # e.g., _unsloth_lora_gate_up_proj or _unsloth_lora_down_proj
-            lora_attr = f'_unsloth_lora_{param_name}'
+            lora_attr = f"_unsloth_lora_{param_name}"
             setattr(experts_module, lora_attr, lora_data)
 
         try:
@@ -461,7 +568,7 @@ def _patched_param_wrapper_forward(self, x: torch.Tensor, *args, **kwargs) -> to
         finally:
             # Clean up
             if param_name:
-                lora_attr = f'_unsloth_lora_{param_name}'
+                lora_attr = f"_unsloth_lora_{param_name}"
                 if hasattr(experts_module, lora_attr):
                     delattr(experts_module, lora_attr)
 
@@ -494,8 +601,6 @@ def patch_param_wrapper_for_moe():
         return False
 
 
-
-
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -515,8 +620,8 @@ def forward_native_grouped_mm(
             f"Set UNSLOTH_MOE_BACKEND='unsloth_triton' or 'native_torch' to use a compatible backend."
         )
 
-
-    if hidden_states.dim() == 2:
+    is_2d_input = hidden_states.dim() == 2
+    if is_2d_input:
         sequence_length, hidden_dim = hidden_states.shape
         batch_size = 1
     else:
@@ -546,21 +651,27 @@ def forward_native_grouped_mm(
     gate_up_lora = None
 
     # Check for injected LoRA data from patched ParamWrapper (preferred path)
-    if hasattr(self, '_unsloth_lora_gate_up_proj'):
+    if hasattr(self, "_unsloth_lora_gate_up_proj"):
         gate_up_lora = self._unsloth_lora_gate_up_proj[:3]  # (lora_A, lora_B, scaling)
     # Fallback: check parameter directly (for older wrapping patterns)
-    elif use_separated_lora and hasattr(self, "gate_up_proj") and _has_lora_adapters(self.gate_up_proj):
-        gate_up_lora = _extract_lora_weights(self.gate_up_proj)
+    elif (
+        use_separated_lora
+        and hasattr(self, "gate_up_proj")
+        and _has_lora_adapters(self.gate_up_proj)
+    ):
+        gate_up_lora = _extract_lora_weights(
+            self.gate_up_proj, num_experts=self.num_experts
+        )
 
     if hasattr(self, "gate_up_proj"):
         # Get base weights (raw, without LoRA)
         gate_up_base = _get_base_weight(self.gate_up_proj)
 
-        # Handle different weight shapes (e.g. Qwen3 vs Qwen3VL)
-        if gate_up_base.shape[1] == hidden_dim:
-            w1 = gate_up_base
-        else:
-            w1 = gate_up_base.transpose(-2, -1)
+        # Get model type for preprocessing (if registered)
+        model_type = getattr(self, "_unsloth_model_type", None)
+
+        # Handle different weight shapes using preprocessor
+        w1 = preprocess_weight(gate_up_base, "gate_up", hidden_dim, model_type)
 
         # Base forward: X @ W
         mm1_out = torch._grouped_mm(permuted_input, w1, offs=offsets)
@@ -571,14 +682,44 @@ def forward_native_grouped_mm(
             lora_B, lora_A, scaling = gate_up_lora  # B first, A second
 
             # Cast to input dtype (LoRA weights are float32, input may be bfloat16)
-            lora_B = lora_B.to(permuted_input.dtype)
-            lora_A = lora_A.to(permuted_input.dtype)
+            # Ensure contiguous for grouped_mm alignment requirements
+            lora_B = lora_B.to(permuted_input.dtype).contiguous()
+            lora_A = lora_A.to(permuted_input.dtype).contiguous()
 
             # Step 1: permuted_input @ B
-            lora_out = torch._grouped_mm(permuted_input, lora_B, offs=offsets)
+            try:
+                lora_out = torch._grouped_mm(permuted_input, lora_B, offs=offsets)
+                lora_out = lora_out.contiguous()
+            except RuntimeError as e:
+                raise e
 
             # Step 2: result @ A
-            lora_delta = torch._grouped_mm(lora_out, lora_A, offs=offsets)
+            # Handle unaligned O dimension or other grouped_mm failures
+            try:
+                if lora_A.shape[-1] % 8 != 0:
+                    pad_size = 8 - (lora_A.shape[-1] % 8)
+                    lora_A_padded = F.pad(lora_A, (0, pad_size)).contiguous()
+                    lora_delta = torch._grouped_mm(
+                        lora_out, lora_A_padded, offs=offsets
+                    )
+                    lora_delta = lora_delta[:, :-pad_size]
+                else:
+                    lora_delta = torch._grouped_mm(lora_out, lora_A, offs=offsets)
+            except RuntimeError:
+                # Fallback to manual loop if grouped_mm fails (e.g. stride alignment)
+                lora_delta = torch.empty(
+                    (lora_out.shape[0], lora_A.shape[-1]),
+                    dtype=lora_out.dtype,
+                    device=lora_out.device,
+                )
+                cpu_offsets = offsets.cpu().tolist()
+                prev_offset = 0
+                for i, end in enumerate(cpu_offsets):
+                    if prev_offset < end:
+                        lora_delta[prev_offset:end] = torch.matmul(
+                            lora_out[prev_offset:end], lora_A[i]
+                        )
+                    prev_offset = end
 
             # Add scaled LoRA contribution
             mm1_out = mm1_out + lora_delta * scaling
@@ -603,7 +744,9 @@ def forward_native_grouped_mm(
                 if w1_lora is not None:
                     lora_A, lora_B, scaling = w1_lora
                     lora_A_t = lora_A.transpose(-2, -1)
-                    lora_A_out = torch._grouped_mm(permuted_input, lora_A_t, offs=offsets)
+                    lora_A_out = torch._grouped_mm(
+                        permuted_input, lora_A_t, offs=offsets
+                    )
                     lora_B_t = lora_B.transpose(-2, -1)
                     lora_B_out = torch._grouped_mm(lora_A_out, lora_B_t, offs=offsets)
                     gate = gate + lora_B_out * scaling
@@ -613,7 +756,9 @@ def forward_native_grouped_mm(
                 if w3_lora is not None:
                     lora_A, lora_B, scaling = w3_lora
                     lora_A_t = lora_A.transpose(-2, -1)
-                    lora_A_out = torch._grouped_mm(permuted_input, lora_A_t, offs=offsets)
+                    lora_A_out = torch._grouped_mm(
+                        permuted_input, lora_A_t, offs=offsets
+                    )
                     lora_B_t = lora_B.transpose(-2, -1)
                     lora_B_out = torch._grouped_mm(lora_A_out, lora_B_t, offs=offsets)
                     up = up + lora_B_out * scaling
@@ -629,20 +774,25 @@ def forward_native_grouped_mm(
     down_lora = None
 
     # Check for injected LoRA data from patched ParamWrapper (preferred path)
-    if hasattr(self, '_unsloth_lora_down_proj'):
+    if hasattr(self, "_unsloth_lora_down_proj"):
         down_lora = self._unsloth_lora_down_proj[:3]  # (lora_A, lora_B, scaling)
     # Fallback: check parameter directly (for older wrapping patterns)
-    elif use_separated_lora and hasattr(self, "down_proj") and _has_lora_adapters(self.down_proj):
-        down_lora = _extract_lora_weights(self.down_proj)
+    elif (
+        use_separated_lora
+        and hasattr(self, "down_proj")
+        and _has_lora_adapters(self.down_proj)
+    ):
+        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
 
     if hasattr(self, "down_proj"):
         # Get base weights
         down_base = _get_base_weight(self.down_proj)
 
-        if down_base.shape[1] == inter.shape[-1]:
-            w2 = down_base
-        else:
-            w2 = down_base.transpose(-2, -1)
+        # Get model type for preprocessing (if registered)
+        model_type = getattr(self, "_unsloth_model_type", None)
+
+        # Handle different weight shapes using preprocessor
+        w2 = preprocess_weight(down_base, "down", hidden_dim, model_type)
 
         # Base forward
         mm2_out = torch._grouped_mm(inter, w2, offs=offsets)
@@ -653,15 +803,32 @@ def forward_native_grouped_mm(
             lora_B, lora_A, scaling = down_lora  # B first, A second
 
             # Cast to input dtype (LoRA weights are float32, input may be bfloat16)
-            lora_B = lora_B.to(inter.dtype)
-            lora_A = lora_A.to(inter.dtype)
+            lora_B = lora_B.to(inter.dtype).contiguous()
+            lora_A = lora_A.to(inter.dtype).contiguous()
 
             # Step 1: inter @ B where B is (E, in_dim, R)
             lora_out = torch._grouped_mm(inter, lora_B, offs=offsets)
+            lora_out = lora_out.contiguous()
 
             # Step 2: result @ A where A is (E, R, out_dim)
-            # lora_out: (N, 32), A: (128, 32, 2048) -> final: (N, 2048)
-            lora_delta = torch._grouped_mm(lora_out, lora_A, offs=offsets)
+            # lora_out: (N, R), A: (E, R, out_dim) -> final: (N, out_dim)
+            try:
+                lora_delta = torch._grouped_mm(lora_out, lora_A, offs=offsets)
+            except RuntimeError:
+                # Fallback to manual loop
+                lora_delta = torch.empty(
+                    (lora_out.shape[0], lora_A.shape[-1]),
+                    dtype=lora_out.dtype,
+                    device=lora_out.device,
+                )
+                cpu_offsets = offsets.cpu().tolist()
+                prev_offset = 0
+                for i, end in enumerate(cpu_offsets):
+                    if prev_offset < end:
+                        lora_delta[prev_offset:end] = torch.matmul(
+                            lora_out[prev_offset:end], lora_A[i]
+                        )
+                    prev_offset = end
 
             # Add scaled LoRA contribution
             mm2_out = mm2_out + lora_delta * scaling
@@ -695,13 +862,13 @@ def forward_native_grouped_mm(
     final_hidden_states = torch.zeros(
         (batch_size * sequence_length, hidden_dim),
         dtype=hidden_states.dtype,
-        device=hidden_states.device
+        device=hidden_states.device,
     )
 
     final_hidden_states.index_add_(0, token_indices, mm2_out.to(hidden_states.dtype))
 
-    if hidden_states.dim() == 2:
-            return final_hidden_states
+    if is_2d_input:
+        return final_hidden_states
 
     return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
@@ -717,9 +884,9 @@ def forward_triton_grouped_gemm(
     Compatible with torch.compile (recommended mode="max-autotune" with cudagraph_mark_step_begin).
     """
 
-
     # Import grouped GEMM interface
     from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
+
     # Import autotune cache
     from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
 
@@ -767,7 +934,7 @@ def forward_triton_grouped_gemm(
         gemm2_configs = get_or_autotune_moe_kernels(
             num_experts=self.num_experts,
             hidden_dim=intermediate_dim,
-            intermediate_dim=hidden_dim, # Output dim for 2nd GEMM is hidden_dim
+            intermediate_dim=hidden_dim,  # Output dim for 2nd GEMM is hidden_dim
             top_k=top_k,
             dtype=hidden_states.dtype,
         )
@@ -803,7 +970,7 @@ def forward_triton_grouped_gemm(
         gather_indices=gather_indices,
         permute_x=True,
         permute_y=False,
-        autotune=False, # We use cached configs
+        autotune=False,  # We use cached configs
         kernel_config_fwd=fwd_config_1,
         kernel_config_bwd_dX=bwd_dX_config_1,
         kernel_config_bwd_dW=bwd_dW_config_1,
@@ -828,7 +995,7 @@ def forward_triton_grouped_gemm(
         gather_indices=gather_indices,
         permute_x=False,
         permute_y=True,
-        autotune=False, # We use cached configs
+        autotune=False,  # We use cached configs
         kernel_config_fwd=fwd_config_2,
         kernel_config_bwd_dX=bwd_dX_config_2,
         kernel_config_bwd_dW=bwd_dW_config_2,
@@ -883,23 +1050,31 @@ def forward_native_moe_loop(
         # Compute gate_up projection for this expert only
         # Handle 'gate_up_proj' or 'w1'/'w3'
         if hasattr(self, "gate_up_proj"):
-            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(
+                2, dim=-1
+            )
         else:
             gate = F.linear(current_state, self.w1[expert_idx])
-            up   = F.linear(current_state, self.w3[expert_idx])
+            up = F.linear(current_state, self.w3[expert_idx])
 
         current_hidden_states = self.act_fn(gate) * up
 
         # Compute down projection for this expert only
         if hasattr(self, "down_proj"):
-            current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = F.linear(
+                current_hidden_states, self.down_proj[expert_idx]
+            )
         else:
             current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])
 
         # Apply routing weights
-        current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+        current_hidden_states = (
+            current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+        )
 
         # Scatter back to final output
-        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+        final_hidden_states.index_add_(
+            0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
+        )
 
     return final_hidden_states

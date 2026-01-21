@@ -16,14 +16,10 @@
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import os
-import shutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import inspect
-
-# Get compile location
-UNSLOTH_COMPILE_LOCATION = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
 
 from .common import (
     TEMPORARY_PATCHES,

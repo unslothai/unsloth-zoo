@@ -28,6 +28,7 @@ from .common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
 )
+
 from .utils import (
     patch_function,
     patch_function_past_key_values,
@@ -41,6 +42,8 @@ from .utils import (
 from .moe_utils import (
     _check_grouped_gemm_available,
     _TORCH_GROUPED_MM_AVAILABLE,
+    forward_native_grouped_mm,
+    forward_triton_grouped_gemm,
     forward_native_moe_loop,
     select_moe_backend,
     patch_param_wrapper_for_moe,
@@ -240,6 +243,21 @@ def patch_qwen3_vl_moe():
     if old_transformers:
         patch_function(transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextSparseMoeBlock, "forward", forward)
     else:
+        from transformers.activations import ACT2FN
+        # Patch __init__ to fix mismatched sizes issue.
+        # For me it fails both with and without https://github.com/huggingface/transformers/pull/43307
+        def patched_experts_init(self, config):
+            nn.Module.__init__(self)
+            self.num_experts = config.num_experts
+            self.hidden_dim = config.hidden_size
+            self.intermediate_dim = config.moe_intermediate_size
+            # Fixed shapes to match Unsloth checkpoint
+            self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, 2 * self.intermediate_dim))
+            self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim))
+            self.act_fn = ACT2FN[config.hidden_act]
+
+        patch_function(transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts, "__init__", patched_experts_init, force=True)
+
         patch_function(transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts, "forward", forward, force=True)
         patch_function(transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextSparseMoeBlock, "forward", sparse_moe_block_forward, force=True)
 
