@@ -741,11 +741,27 @@ def create_standalone_class(
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
         disable = True
 
-    source = re.sub(
-        "def forward",
-        f"def {module}_forward",
-        forward_source,
-    )
+    # Check if forward was replaced by a temporary patch (already has @torch.compiler.disable)
+    # In this case, keep the patched source as-is without adding another decorator
+    patched_forward_info = None
+    if "@torch.compiler.disable" in forward_source:
+        func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
+        if func_match and func_match.group(1) != "forward":
+            # Find original forward in class to replace it
+            orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
+            if orig_fwd:
+                patched_forward_info = (func_match.group(1), orig_fwd.group(1))
+                disable = None  # Skip adding decorator
+
+    # Replace function name with module-specific name
+    if patched_forward_info:
+        source = forward_source  # Keep patched source as-is
+    else:
+        source = re.sub(
+            "def forward",
+            f"def {module}_forward",
+            forward_source,
+        )
     spaces = re.search(r"[^\s\n]", source).span(0)[0]
     source = source.split("\n")
     source = "\n".join(x[spaces:] for x in source)
@@ -775,7 +791,9 @@ def create_standalone_class(
     parameters = ", ".join(keys)
 
     # Now create the forward function!
-    definition = re.findall(r"[\s\n]{1,}def[^\(]{1,}\([^\)]{1,}\)[^\:]{0,}\:", old_source, flags = re.MULTILINE)[0]
+    # When forward is patched, use the original forward definition from class source
+    definition_source = patched_forward_info[1] if patched_forward_info else old_source
+    definition = re.findall(r"[\s\n]{1,}def[^\(]{1,}\([^\)]{1,}\)[^\:]{0,}\:", definition_source, flags = re.MULTILINE)[0]
     leftover = full_class[full_class.find(definition) + len(definition):]
 
     # Add **loss_kwargs
@@ -787,9 +805,12 @@ def create_standalone_class(
 
     source = f"{compile}\n{source}\n"
     left = re.match(r"[\s\n]{4,}", leftover).span()[1]
+    # Use patched function name if forward was replaced by temporary patch
+    forward_func_name = patched_forward_info[0] if patched_forward_info else f"{module}_forward"
     new_forward = definition + leftover[:left] + \
-        f"return {module}_forward({parameters})\n"
-    full_class = full_class.replace(old_source, new_forward)
+        f"return {forward_func_name}({parameters})\n"
+    source_to_replace = patched_forward_info[1] if patched_forward_info else old_source
+    full_class = full_class.replace(source_to_replace, new_forward)
 
     # New init as well
     if new_init is not None:
