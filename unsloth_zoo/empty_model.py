@@ -523,17 +523,21 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.self_attn.q_proj",
             "model.language_model.layers.{kk}.self_attn.k_proj",
             "model.language_model.layers.{kk}.self_attn.v_proj",
+            "model.language_model.layers.{kk}.self_attn.qkv_proj", # for extracting from vLLM (phi3 architecture)
             "model.language_model.layers.{kk}.self_attn.o_proj",
             "model.language_model.layers.{kk}.mlp.gate_proj",
             "model.language_model.layers.{kk}.mlp.up_proj",
+            "model.language_model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.language_model.layers.{kk}.mlp.down_proj",
 
             "model.layers.{kk}.self_attn.q_proj",
             "model.layers.{kk}.self_attn.k_proj",
             "model.layers.{kk}.self_attn.v_proj",
+            "model.layers.{kk}.self_attn.qkv_proj", # for extracting from vLLM (phi3 architecture)
             "model.layers.{kk}.self_attn.o_proj",
             "model.layers.{kk}.mlp.gate_proj",
             "model.layers.{kk}.mlp.up_proj",
+            "model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.layers.{kk}.mlp.down_proj",
         },
         'layernorms': {
