@@ -2137,6 +2137,7 @@ DISABLE_COMPILE_MODULES = [
     "GptOssMLP",
     "GptOssExperts",
     "Gemma3nTextModel",
+    "Glm4MoeLiteNaiveMoe",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
