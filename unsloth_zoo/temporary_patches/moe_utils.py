@@ -292,21 +292,34 @@ def _extract_lora_from_wrapper(
     """
     Extract LoRA weights from PEFT ParamWrapper for MoE separated computation.
 
-    PEFT computes delta = B @ A, so for separated LoRA:
-    Y = X @ W + X @ (B @ A) * s = X @ W + ((X @ B) @ A) * s
+    PEFT ParamWrapper for 3D parameters (E, dim1, dim2) creates:
+    - lora_A: nn.Linear(dim1, E*R) -> weight: (E*R, dim1)
+    - lora_B: nn.Linear(E*R, dim2) -> weight: (dim2, E*R)
 
-    Args:
-        wrapper: ParamWrapper module with lora_A, lora_B, scaling
-        adapter_name: Name of the active adapter
+    For grouped_mm: X @ first_weight @ second_weight
+
+    STANDARD FORMAT (Qwen3-MoE): weights stored as (E, out_dim, in_dim) for F.linear
+      gate_up_proj: (E, 2*I, H) - input X is (N, H), output is (N, 2*I)
+      down_proj:    (E, H, I)   - input X is (N, I), output is (N, H)
+
+      For gate_up with (E, 2*I, H): dim1=2*I, dim2=H
+        lora_A: (E*R, 2*I), lora_B: (H, E*R)
+        Input X (N, H) needs: X @ (E, H, R) @ (E, R, 2*I) -> (N, 2*I)
+        first_weight from lora_B: (H, E*R) -> (E, H, R)
+        second_weight from lora_A: (E*R, 2*I) -> (E, R, 2*I)
+
+    TRANSPOSED FORMAT (Qwen3-VL-MoE): weights stored as (E, in_dim, out_dim) for grouped_mm
+      gate_up_proj: (E, H, 2*I) - input X is (N, H), output is (N, 2*I)
+      down_proj:    (E, I, H)   - input X is (N, I), output is (N, H)
+
+      For gate_up with (E, H, 2*I): dim1=H, dim2=2*I
+        lora_A: (E*R, H), lora_B: (2*I, E*R)
+        Input X (N, H) needs: X @ (E, H, R) @ (E, R, 2*I) -> (N, 2*I)
+        first_weight from lora_A: (E*R, H) -> (E, H, R)  [SWAPPED!]
+        second_weight from lora_B: (2*I, E*R) -> (E, R, 2*I)  [SWAPPED!]
 
     Returns:
-        (lora_B_reshaped, lora_A_reshaped, scaling, num_experts) or None
-
-    Note: Returns (B, A) for application order: first X @ B, then result @ A
-
-    Shapes (for MoE with num_experts=E, rank=R):
-        lora_B_reshaped: (E, in_features, R) - for first step: X @ B
-        lora_A_reshaped: (E, R, out_features) - for second step: result @ A
+        (first_weight, second_weight, scaling, num_experts) or None
     """
     try:
         if not hasattr(wrapper, "lora_A") or not hasattr(wrapper, "lora_B"):
@@ -326,39 +339,75 @@ def _extract_lora_from_wrapper(
         lora_A_module = wrapper.lora_A[adapter_name]
         lora_B_module = wrapper.lora_B[adapter_name]
 
-        # PEFT stores for MoE ParamWrapper:
-        # lora_A.weight: (E*R, in_dim) - first projection
-        # lora_B.weight: (out_dim, E*R) - second projection
-        # delta = lora_B @ lora_A = (out_dim, in_dim)
-        # Forward uses: X @ delta.T = X @ lora_A.T @ lora_B.T
-        weight_A = lora_A_module.weight  # (E*R, in_dim)
-        weight_B = lora_B_module.weight  # (out_dim, E*R)
+        weight_A = lora_A_module.weight  # (E*R, dim1)
+        weight_B = lora_B_module.weight  # (dim2, E*R)
         scaling = wrapper.scaling[adapter_name]
         num_experts = getattr(wrapper, "num_experts", 1)
+
+        # Check if weights are in transposed (grouped_mm) format
+        # This flag is set by patched __init__ in qwen3_vl_moe.py
+        experts_module = (
+            wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
+        )
+        is_transposed_format = getattr(
+            experts_module, "_unsloth_grouped_mm_format", False
+        )
 
         if num_experts > 1:
             total_rank = weight_A.shape[0]
             rank_per_expert = total_rank // num_experts
-            in_dim = weight_A.shape[1]  # from lora_A: (E*R, in_dim)
-            out_dim = weight_B.shape[0]  # from lora_B: (out_dim, E*R)
+            dim1 = weight_A.shape[1]  # First non-expert dimension of base weight
+            dim2 = weight_B.shape[0]  # Second non-expert dimension of base weight
 
-            # For grouped_mm: X @ first_weight @ second_weight
-            # where X is (N, in_dim)
+            if is_transposed_format:
+                # TRANSPOSED FORMAT (Qwen3-VL-MoE):
+                # Base weights are (E, in_dim, out_dim) ready for grouped_mm
+                # dim1 = in_dim (e.g., H for gate_up, I for down)
+                # dim2 = out_dim (e.g., 2*I for gate_up, H for down)
+                #
+                # For grouped_mm: X @ first @ second where X is (N, in_dim)
+                # first_weight: (E, in_dim, R) - from lora_A
+                # second_weight: (E, R, out_dim) - from lora_B
 
-            # First weight: lora_A.T reshaped for X @ first_weight
-            # lora_A.T: (in_dim, E*R) -> reshape (in_dim, E, R) -> permute (E, in_dim, R)
-            first_weight = weight_A.T.reshape(in_dim, num_experts, rank_per_expert)
-            first_weight = first_weight.permute(1, 0, 2).contiguous()  # (E, in_dim, R)
+                # lora_A.weight: (E*R, dim1) = (E*R, in_dim)
+                # -> view(E, R, in_dim) -> permute(0, 2, 1) -> (E, in_dim, R)
+                first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
+                first_weight = first_weight.permute(
+                    0, 2, 1
+                ).contiguous()  # (E, in_dim, R)
 
-            # Second weight: lora_B.T reshaped for intermediate @ second_weight
-            # lora_B.T: (E*R, out_dim) -> reshape (E, R, out_dim)
-            second_weight = weight_B.T.reshape(num_experts, rank_per_expert, out_dim)
-            second_weight = second_weight.contiguous()  # (E, R, out_dim)
+                # lora_B.weight: (dim2, E*R) = (out_dim, E*R)
+                # -> view(out_dim, E, R) -> permute(1, 2, 0) -> (E, R, out_dim)
+                second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
+                second_weight = second_weight.permute(
+                    1, 2, 0
+                ).contiguous()  # (E, R, out_dim)
+            else:
+                # STANDARD FORMAT (Qwen3-MoE):
+                # Base weights are (E, out_dim, in_dim) for F.linear
+                # dim1 = out_dim, dim2 = in_dim (PEFT's perspective)
+                # But wait - PEFT uses (E, dim1, dim2) where in_features=dim1, out_features=dim2
+                # So for F.linear format:
+                #   gate_up (E, 2*I, H): dim1=2*I, dim2=H
+                #   Input X is (N, H), we need X @ (E, H, R) @ (E, R, 2*I)
+                #
+                # first_weight: (E, dim2, R) = (E, H, R) - from lora_B
+                # second_weight: (E, R, dim1) = (E, R, 2*I) - from lora_A
+
+                # lora_B.weight: (dim2, E*R) -> view(dim2, E, R) -> permute(1, 0, 2)
+                first_weight = weight_B.view(dim2, num_experts, rank_per_expert)
+                first_weight = first_weight.permute(
+                    1, 0, 2
+                ).contiguous()  # (E, dim2, R)
+
+                # lora_A.weight: (E*R, dim1) -> view(E, R, dim1)
+                second_weight = weight_A.view(num_experts, rank_per_expert, dim1)
+                second_weight = second_weight.contiguous()  # (E, R, dim1)
         else:
-            first_weight = weight_A.T  # (in_dim, R)
-            second_weight = weight_B.T  # (R, out_dim)
+            # Non-MoE case: just return transposed weights for matmul
+            first_weight = weight_B.T  # (E*R, dim2) -> (dim2, E*R).T
+            second_weight = weight_A  # (R, dim1)
 
-        # Return (first_weight, second_weight) for application order: (X @ first) @ second
         return first_weight, second_weight, scaling, num_experts
     except Exception:
         return None
@@ -652,7 +701,9 @@ def forward_native_grouped_mm(
 
     # Check for injected LoRA data from patched ParamWrapper (preferred path)
     if hasattr(self, "_unsloth_lora_gate_up_proj"):
-        gate_up_lora = self._unsloth_lora_gate_up_proj[:3]  # (lora_A, lora_B, scaling)
+        gate_up_lora = self._unsloth_lora_gate_up_proj[
+            :3
+        ]  # (first_weight, second_weight, scaling)
     # Fallback: check parameter directly (for older wrapping patterns)
     elif (
         use_separated_lora
@@ -676,39 +727,43 @@ def forward_native_grouped_mm(
         # Base forward: X @ W
         mm1_out = torch._grouped_mm(permuted_input, w1, offs=offsets)
 
-        # Add separated LoRA contribution: + ((X @ B) @ A) * scaling
-        # PEFT computes delta = B @ A
+        # Add separated LoRA contribution: + ((X @ first) @ second) * scaling
+        # _extract_lora_from_wrapper returns (first_weight, second_weight, scaling)
         if gate_up_lora is not None:
-            lora_B, lora_A, scaling = gate_up_lora  # B first, A second
+            first_weight, second_weight, scaling = gate_up_lora
 
             # Cast to input dtype (LoRA weights are float32, input may be bfloat16)
             # Ensure contiguous for grouped_mm alignment requirements
-            lora_B = lora_B.to(permuted_input.dtype).contiguous()
-            lora_A = lora_A.to(permuted_input.dtype).contiguous()
+            first_weight = first_weight.to(permuted_input.dtype).contiguous()
+            second_weight = second_weight.to(permuted_input.dtype).contiguous()
 
-            # Step 1: permuted_input @ B
+            # Step 1: permuted_input @ first_weight
             try:
-                lora_out = torch._grouped_mm(permuted_input, lora_B, offs=offsets)
+                lora_out = torch._grouped_mm(permuted_input, first_weight, offs=offsets)
                 lora_out = lora_out.contiguous()
             except RuntimeError as e:
                 raise e
 
-            # Step 2: result @ A
+            # Step 2: result @ second_weight
             # Handle unaligned O dimension or other grouped_mm failures
             try:
-                if lora_A.shape[-1] % 8 != 0:
-                    pad_size = 8 - (lora_A.shape[-1] % 8)
-                    lora_A_padded = F.pad(lora_A, (0, pad_size)).contiguous()
+                if second_weight.shape[-1] % 8 != 0:
+                    pad_size = 8 - (second_weight.shape[-1] % 8)
+                    second_weight_padded = F.pad(
+                        second_weight, (0, pad_size)
+                    ).contiguous()
                     lora_delta = torch._grouped_mm(
-                        lora_out, lora_A_padded, offs=offsets
+                        lora_out, second_weight_padded, offs=offsets
                     )
                     lora_delta = lora_delta[:, :-pad_size]
                 else:
-                    lora_delta = torch._grouped_mm(lora_out, lora_A, offs=offsets)
+                    lora_delta = torch._grouped_mm(
+                        lora_out, second_weight, offs=offsets
+                    )
             except RuntimeError:
                 # Fallback to manual loop if grouped_mm fails (e.g. stride alignment)
                 lora_delta = torch.empty(
-                    (lora_out.shape[0], lora_A.shape[-1]),
+                    (lora_out.shape[0], second_weight.shape[-1]),
                     dtype=lora_out.dtype,
                     device=lora_out.device,
                 )
@@ -717,7 +772,7 @@ def forward_native_grouped_mm(
                 for i, end in enumerate(cpu_offsets):
                     if prev_offset < end:
                         lora_delta[prev_offset:end] = torch.matmul(
-                            lora_out[prev_offset:end], lora_A[i]
+                            lora_out[prev_offset:end], second_weight[i]
                         )
                     prev_offset = end
 
@@ -775,7 +830,9 @@ def forward_native_grouped_mm(
 
     # Check for injected LoRA data from patched ParamWrapper (preferred path)
     if hasattr(self, "_unsloth_lora_down_proj"):
-        down_lora = self._unsloth_lora_down_proj[:3]  # (lora_A, lora_B, scaling)
+        down_lora = self._unsloth_lora_down_proj[
+            :3
+        ]  # (first_weight, second_weight, scaling)
     # Fallback: check parameter directly (for older wrapping patterns)
     elif (
         use_separated_lora
@@ -798,26 +855,25 @@ def forward_native_grouped_mm(
         mm2_out = torch._grouped_mm(inter, w2, offs=offsets)
 
         # Add separated LoRA contribution if present
-        # PEFT computes delta = B @ A, so: Y += ((X @ B) @ A) * scaling
+        # _extract_lora_from_wrapper returns (first_weight, second_weight, scaling)
         if down_lora is not None:
-            lora_B, lora_A, scaling = down_lora  # B first, A second
+            first_weight, second_weight, scaling = down_lora
 
             # Cast to input dtype (LoRA weights are float32, input may be bfloat16)
-            lora_B = lora_B.to(inter.dtype).contiguous()
-            lora_A = lora_A.to(inter.dtype).contiguous()
+            first_weight = first_weight.to(inter.dtype).contiguous()
+            second_weight = second_weight.to(inter.dtype).contiguous()
 
-            # Step 1: inter @ B where B is (E, in_dim, R)
-            lora_out = torch._grouped_mm(inter, lora_B, offs=offsets)
+            # Step 1: inter @ first_weight
+            lora_out = torch._grouped_mm(inter, first_weight, offs=offsets)
             lora_out = lora_out.contiguous()
 
-            # Step 2: result @ A where A is (E, R, out_dim)
-            # lora_out: (N, R), A: (E, R, out_dim) -> final: (N, out_dim)
+            # Step 2: result @ second_weight
             try:
-                lora_delta = torch._grouped_mm(lora_out, lora_A, offs=offsets)
+                lora_delta = torch._grouped_mm(lora_out, second_weight, offs=offsets)
             except RuntimeError:
                 # Fallback to manual loop
                 lora_delta = torch.empty(
-                    (lora_out.shape[0], lora_A.shape[-1]),
+                    (lora_out.shape[0], second_weight.shape[-1]),
                     dtype=lora_out.dtype,
                     device=lora_out.device,
                 )
@@ -826,7 +882,7 @@ def forward_native_grouped_mm(
                 for i, end in enumerate(cpu_offsets):
                     if prev_offset < end:
                         lora_delta[prev_offset:end] = torch.matmul(
-                            lora_out[prev_offset:end], lora_A[i]
+                            lora_out[prev_offset:end], second_weight[i]
                         )
                     prev_offset = end
 
