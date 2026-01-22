@@ -377,8 +377,6 @@ def patch_qwen3_vl_moe():
             force=True,
         )
 
-    transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.__UNSLOTH_PATCHED__ = True
-
     # ====================================================================
     # Patch Qwen3VLMoeForConditionalGeneration.forward for GRPO training
     # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
