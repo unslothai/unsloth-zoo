@@ -1039,20 +1039,21 @@ def convert_to_gguf(
                         current, total = int(match.group(1)), int(match.group(2))
                         shard_numbers.append((current, total))
                 
-                if shard_numbers:
-                    expected_total = shard_numbers[0][1]
-                    actual_shards = sorted([num[0] for num in shard_numbers])
-                    
-                    if not all(num[1] == expected_total for num in shard_numbers):
-                        raise RuntimeError(f"Shards have mismatched total counts in {description}")
-                    
-                    if len(actual_shards) != expected_total:
-                        raise RuntimeError(f"Shard count mismatch in {description}: found {len(actual_shards)} but expected {expected_total}")
-                    
-                    if actual_shards != list(range(1, expected_total + 1)):
-                        missing = set(range(1, expected_total + 1)) - set(actual_shards)
-                        raise RuntimeError(f"Missing shards for {description}: {missing}")
+                if not shard_numbers or len(shard_numbers) != len(shard_files):
+                    raise RuntimeError(f"Found sharded files, but could not parse shard information from all of them: {shard_files}")
+
+                expected_total = shard_numbers[0][1]
+                actual_shards = sorted([num[0] for num in shard_numbers])
                 
+                if not all(num[1] == expected_total for num in shard_numbers):
+                    raise RuntimeError(f"Shards have mismatched total counts in {description}")
+                
+                if len(actual_shards) != expected_total:
+                    raise RuntimeError(f"Shard count mismatch in {description}: found {len(actual_shards)} but expected {expected_total}")
+                
+                if actual_shards != list(range(1, expected_total + 1)):
+                    missing = set(range(1, expected_total + 1)) - set(actual_shards)
+                    raise RuntimeError(f"Missing shards for {description}: {missing}")
                 print(f"Found sharded output files: {shard_files}")
                 all_output_files.extend(shard_files)
             else:
