@@ -1026,7 +1026,7 @@ def convert_to_gguf(
             all_output_files.append(output_file)
 
         else:
-            basename_without_gguf = output_file.replace(".gguf", "")
+            basename_without_gguf = os.path.splitext(output_file)[0]
             shard_files = glob.glob(f"{basename_without_gguf}-[0-9]*-of-[0-9]*.gguf")
             
             if shard_files:
