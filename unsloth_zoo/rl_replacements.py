@@ -638,6 +638,11 @@ def grpo_accumulated_loss(
     #Delete this from kwargs so less issues 
     _ = kwargs.pop("sampling_per_token_logps", None)
     kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap if sampling_per_token_logps is not None else None
+    kwargs["get_sapo_token_loss"] = trainer.get_sapo_token_loss if hasattr(trainer, "get_sapo_token_loss") else None 
+    kwargs["sapo_temperature_pos"] = trainer.args.sapo_temperature_pos if hasattr(trainer.args, "sapo_temperature_pos") else None  
+    kwargs["sapo_temperature_neg"] = trainer.args.sapo_temperature_neg if hasattr(trainer.args, "sapo_temperature_neg") else None 
+    kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
+    kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
     kwargs["use_vllm"] = trainer.use_vllm
     # Find closest multiple
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
@@ -935,7 +940,7 @@ def grpo_accumulated_loss(
     new_logprobs = torch.cat(all_logprobs_list, dim=0)
     
     with autocaster:
-        loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
+        loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
             new_logprobs,
             old_logps,
             ref_logps,
