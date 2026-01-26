@@ -40,6 +40,7 @@ import logging
 import torch
 from pathlib import Path
 import psutil
+import glob
 
 # Get a logger instance
 logger = logging.getLogger(__name__)
@@ -1019,11 +1020,43 @@ def convert_to_gguf(
                 print(e.stdout)
             raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF: {e}")
 
-        # Simple validation using native Python
-        if not os.path.exists(output_file):
-            raise RuntimeError(f"Unsloth: Failed to convert {description} - output file {output_file} not created")
+        # Simple validation using native Python - check for main file or sharded files
+        
+        if os.path.exists(output_file):
+            all_output_files.append(output_file)
 
-        all_output_files.append(output_file)
+        else:
+            basename_without_gguf = output_file.replace(".gguf", "")
+            shard_files = glob.glob(f"{basename_without_gguf}-[0-9]*-of-[0-9]*.gguf")
+            
+            if shard_files:
+                shard_files.sort()
+
+                shard_numbers = []
+                for file in shard_files:
+                    match = re.search(r'-(\d+)-of-(\d+)\.gguf$', file)
+                    if match:
+                        current, total = int(match.group(1)), int(match.group(2))
+                        shard_numbers.append((current, total))
+                
+                if shard_numbers:
+                    expected_total = shard_numbers[0][1]
+                    actual_shards = sorted([num[0] for num in shard_numbers])
+                    
+                    if not all(num[1] == expected_total for num in shard_numbers):
+                        raise RuntimeError(f"Shards have mismatched total counts in {description}")
+                    
+                    if len(actual_shards) != expected_total:
+                        raise RuntimeError(f"Shard count mismatch in {description}: found {len(actual_shards)} but expected {expected_total}")
+                    
+                    if actual_shards != list(range(1, expected_total + 1)):
+                        missing = set(range(1, expected_total + 1)) - set(actual_shards)
+                        raise RuntimeError(f"Missing shards for {description}: {missing}")
+                
+                print(f"Found sharded output files: {shard_files}")
+                all_output_files.extend(shard_files)
+            else:
+                raise RuntimeError(f"Failed to convert {description} - output file {output_file} not created")
 
         if print_output:
             file_size_bytes = os.path.getsize(output_file)
@@ -1090,8 +1123,8 @@ pass
 def _assert_correct_gguf(model_name, model, tokenizer):
     # All Unsloth Zoo code licensed under LGPLv3
     # Verify if conversion is in fact correct by checking tokenizer and last tensor
-    import gguf.gguf_reader
-    from gguf.gguf_reader import GGUFReader
+    import gguf.gguf_reader  # type: ignore
+    from gguf.gguf_reader import GGUFReader  # type: ignore
 
     # Stop until building tensors
     if not hasattr(GGUFReader, "__init__"):
@@ -1153,13 +1186,14 @@ def _assert_correct_gguf(model_name, model, tokenizer):
         pass
     pass
 
-    reader = Partial_GGUFReader(model_name, "r")
+    Partial_GGUFReader = all_functions.get('Partial_GGUFReader')  # type: ignore
+    reader = Partial_GGUFReader(model_name, "r")  # type: ignore
     check_gguf_last_tensor(model, reader)
     check_gguf_tokenizer(tokenizer, reader)
 
     # Try parsing metadata
     try:
-        from gguf.scripts.gguf_dump import dump_metadata_json
+        from gguf.scripts.gguf_dump import dump_metadata_json  # type: ignore
         class Arguments: pass
         args = Arguments()
 
