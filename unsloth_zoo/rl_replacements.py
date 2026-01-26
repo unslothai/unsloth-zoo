@@ -917,21 +917,6 @@ def grpo_accumulated_loss(
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
     return loss, completion_length, mean_kl, delta, flat_is_ratio
-    # Old non efficient code path
-    new_logits = torch.matmul(new_hidden_states, lm_head.t())
-    new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-    old_logits = torch.matmul(old_hidden_states, lm_head.t())
-    old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-    loss, completion_length, mean_kl = grpo_compute_loss(
-        old_logits,
-        new_logits,
-        completion_input_ids,
-        completion_mask,
-        trainer.beta,
-        advantages,
-    )
-    return loss, completion_length, mean_kl
-    pass
 pass
 RL_REPLACEMENTS["grpo_accumulated_loss"] = grpo_accumulated_loss
 
