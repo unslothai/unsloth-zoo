@@ -311,7 +311,24 @@ def grpo_compute_loss(
     num_processes = kwargs.get("num_processes", 1)
     use_vllm = kwargs.get("use_vllm", False)
     vllm_importance_sampling_cap = kwargs.get("vllm_importance_sampling_cap", 2.0)
+    get_sapo_token_loss = kwargs.get("get_sapo_token_loss", None)
+    sapo_temperature_pos = kwargs.get("sapo_temperature_pos", 1.0)
+    sapo_temperature_neg = kwargs.get("sapo_temperature_neg", 1.05)
+    get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
+    off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
     input_ids = input_ids.unsqueeze(-1)
+
+    if off_policy_mask_threshold is not None:
+        off_policy_mask = get_off_policy_mask(
+            advantages=advantages,
+            per_token_logps=new,
+            old_per_token_logps=old,
+            mask=mask,
+            off_policy_threshold=off_policy_mask_threshold,
+        )
+        
+    if advantages.dim() == 1:
+        advantages = advantages.unsqueeze(1)
 
     with torch.no_grad():
         if use_vllm and sampling_per_token_logps is not None:
@@ -322,22 +339,9 @@ def grpo_compute_loss(
             )
     pass
 
-    # Reverse KL
-    # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
-    if beta != 0.0:
-        kl_i = torch.exp(ref - new) - (ref - new) - 1.0
-
-    else:
-        # set kl_i to a tensor of zeros with the correct shape
-        if importance_sampling_level == "sequence":
-            kl_i = new.new_zeros(new.size(0), 1)
-        else:
-            kl_i = torch.zeros_like(new)
-    # Full correct reverse KL divergence?? Missing term maybe?
-    # kl_i = torch.exp(new) * kl_i
-
-    # Below is forward KL (normal KL)
-    # kl_i = torch.exp(old) * (old - new)
+    # Must detach - otherwise gradients are not propagated correctly!
+    # exp(x - x) == 1
+    # loss_i = torch.exp(new - new.detach()) * advantages.unsqueeze(1)
     if old is not None: 
         log_ratio = new - old
     else:
@@ -356,20 +360,53 @@ def grpo_compute_loss(
 
     coef_1 =  torch.exp(log_importance_weights)
 
-    coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
+    # Reverse KL
+    # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
+    if beta != 0.0:
+        kl_i = torch.exp(ref - new) - (ref - new) - 1.0
 
-    if delta is not None:
-        loss_1 = torch.clamp(coef_1, max=delta) * advantages.unsqueeze(1)
     else:
-        loss_1 = coef_1 * advantages.unsqueeze(1)
-    pass
+        # set kl_i to a tensor of zeros with the correct shape
+        if importance_sampling_level == "sequence":
+            kl_i = new.new_zeros(new.size(0), 1)
+        else:
+            kl_i = torch.zeros_like(new)
+    # Full correct reverse KL divergence?? Missing term maybe?
+    # kl_i = torch.exp(new) * kl_i
 
-    # Must detach - otherwise gradients are not propagated correctly!
-    # exp(x - x) == 1
-    # loss_i = torch.exp(new - new.detach()) * advantages.unsqueeze(1)
+    # Below is forward KL (normal KL)
+    # kl_i = torch.exp(old) * (old - new)
+    if loss_type == "cispo":
+        clamped_ratios = torch.clamp(coef_1, max=epsilon_high).detach()
+        loss_i = -clamped_ratios * advantages * new
+        #breakpoint()
+    elif loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
+        coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
 
-    loss_2 = coef_2 * advantages.unsqueeze(1)
-    loss_i = -torch.min(loss_1, loss_2)
+        if delta is not None:
+            loss_1 = torch.clamp(coef_1, max=delta) * advantages.unsqueeze(1)
+        else:
+            loss_1 = coef_1 * advantages.unsqueeze(1)
+        pass
+        loss_2 = coef_2 * advantages.unsqueeze(1)
+        loss_i = -torch.min(loss_1, loss_2)
+    elif loss_type == "sapo":
+        if get_sapo_token_loss is None:
+            raise Exception(f"sapo is only available in TRL 0.26.0+")
+        loss_i = torch.empty_like(coef_1)
+        positive_advantages_mask = advantages.repeat([1, coef_1.shape[1]]) > 0
+        loss_i[positive_advantages_mask] = get_sapo_token_loss(
+            coef_1[positive_advantages_mask], sapo_temperature_pos
+        )
+        loss_i[~positive_advantages_mask] = get_sapo_token_loss(
+            coef_1[~positive_advantages_mask], sapo_temperature_neg
+        )
+        loss_i = -loss_i * advantages
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}")
+
+    if off_policy_mask_threshold is not None:
+        loss_i = loss_i * off_policy_mask
 
     if use_vllm and sampling_per_token_logps is not None:
         loss_i = loss_i * importance_sampling_ratio
@@ -388,7 +425,7 @@ def grpo_compute_loss(
     n_mask_per_reward = mask.sum(1)
 
     # https://github.com/huggingface/trl/blob/e8b8499f1f8d76838155b515e414ee98f757d6d5/trl/trainer/grpo_trainer.py#L1624
-    if loss_type == "grpo":
+    if loss_type in ["grpo", "sapo"]:
         loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "bnpo":
@@ -397,7 +434,7 @@ def grpo_compute_loss(
     elif loss_type == "dr_grpo":
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
-    elif loss_type == "dapo":
+    elif loss_type in ["cispo", "dapo"]:
         normalizer = num_items_in_batch/ num_processes
         loss = (loss_i * mask).sum() / normalizer
     else:
@@ -416,7 +453,7 @@ def grpo_compute_loss(
                 mean_kl = mean_kl_per_reward.mean()
                 return completion_length, mean_kl
     completion_length, mean_kl = masked_batch_mean(kl_i)
-    return loss, completion_length, mean_kl, delta, flat_is_ratio
+    return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
