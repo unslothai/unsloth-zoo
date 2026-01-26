@@ -181,8 +181,8 @@ class MoeExperts4bit(nn.Module):
 
         for expert_idx in range(num_experts):
             # Extract 2D weight for this expert
-            gate_up_weight = gate_up_proj[expert_idx].data.clone()  # [2*I, H]
-            down_weight = down_proj[expert_idx].data.clone()  # [H, I]
+            gate_up_weight = gate_up_proj[expert_idx].detach().clone()  # [2*I, H]
+            down_weight = down_proj[expert_idx].detach().clone()  # [H, I]
 
             # Create Params4bit - quantization happens here since on CUDA
             gate_up_4bit = Params4bit(
@@ -326,8 +326,8 @@ class MoeExperts4bit(nn.Module):
             down_4bit = self._bnb_down_weights[expert_idx]
 
             # Save weight data
-            gate_up_prefix = f"{prefix}gate_up_projs.{expert_idx}."
-            down_prefix = f"{prefix}down_projs.{expert_idx}."
+            gate_up_prefix = f"{prefix}_bnb_gate_up_weights.{expert_idx}."
+            down_prefix = f"{prefix}_bnb_down_weights.{expert_idx}."
 
             destination[f"{gate_up_prefix}weight"] = (
                 gate_up_4bit.data if keep_vars else gate_up_4bit.data.detach()
@@ -401,15 +401,20 @@ def replace_with_bnb_moe_experts(
             # Get dimensions from the original module
             gate_up_proj = experts.gate_up_proj
             num_experts = gate_up_proj.shape[0]
-            intermediate_dim = gate_up_proj.shape[1] // 2
-            hidden_dim = gate_up_proj.shape[2]
 
             # Determine quantized class based on module type
             module_class_name = type(module).__name__
             if 'Qwen3VL' in module_class_name or 'qwen3_vl' in type(module).__module__:
                 quantized_cls = Qwen3VLMoeExperts4bit
+                # Qwen3-VL has transposed weights in grouped_mm format (E, H, 2*I)
+                # gate_up_proj: (E, H, 2*I)
+                intermediate_dim = gate_up_proj.shape[2] // 2
+                hidden_dim = gate_up_proj.shape[1]
             else:
                 quantized_cls = Qwen3MoeExperts4bit
+                # Qwen3-MoE has weights in F.linear format (E, 2*I, H)
+                intermediate_dim = gate_up_proj.shape[1] // 2
+                hidden_dim = gate_up_proj.shape[2]
 
             # Create quantized version on meta device (like replace_with_bnb_linear does)
             with torch.device("meta"):

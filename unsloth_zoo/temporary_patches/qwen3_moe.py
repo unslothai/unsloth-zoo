@@ -75,9 +75,6 @@ def patch_qwen3_moe():
 
     if old_transformers:
         def old_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            forward_native_grouped_mm = moe_utils.forward_native_grouped_mm
-            forward_triton_grouped_gemm = moe_utils.forward_triton_grouped_gemm
-            forward_native_moe_loop = moe_utils.forward_native_moe_loop
             """ """
             batch_size, sequence_length, hidden_dim = hidden_states.shape
             hidden_states = hidden_states.view(-1, hidden_dim)
@@ -131,9 +128,6 @@ def patch_qwen3_moe():
             return router_scores, selected_experts, router_logits
 
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            forward_native_grouped_mm = moe_utils.forward_native_grouped_mm
-            forward_triton_grouped_gemm = moe_utils.forward_triton_grouped_gemm
-            forward_native_moe_loop = moe_utils.forward_native_moe_loop
             """ """
             is_3d = hidden_states.dim() == 3
             if is_3d:
@@ -185,12 +179,11 @@ def patch_qwen3_moe():
                 top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
-                forward_native_grouped_mm = moe_utils.forward_native_grouped_mm
                 """
                 Native Pytorch grouped GEMM MoE forward pass.
                 Uses torch._grouped_mm which is significantly faster than loop and works without Triton dependencies.
                 """
-                return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
+                return moe_utils.forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
 
         elif backend == "unsloth_triton":
             # Import grouped GEMM interface
@@ -204,7 +197,6 @@ def patch_qwen3_moe():
                 top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
-                forward_triton_grouped_gemm = moe_utils.forward_triton_grouped_gemm
                 """
                 Grouped GEMM MoE forward pass using Triton kernels.
 
@@ -213,7 +205,7 @@ def patch_qwen3_moe():
 
                 Uses cached kernel configs (created once at start) for efficient operation.
                 """
-                return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
+                return moe_utils.forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
 
         else:
             # Fallback: Pure PyTorch loop-based implementation
@@ -226,20 +218,17 @@ def patch_qwen3_moe():
                 top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
-                forward_native_moe_loop = moe_utils.forward_native_moe_loop
                 """
                 Loop-based MoE forward pass. Loops over experts that have tokens routed to them.
                 Uses @torch.compiler.disable because the loop is data-dependent.
                 """
-                return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
+                return moe_utils.forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
         # SparseMoeBlock forward is disabled from compilation due to dynamic routing
         # SparseMoeBlock forward is disabled from compilation due to dynamic routing
         @torch.compiler.disable
         def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            forward_native_grouped_mm = moe_utils.forward_native_grouped_mm
-            forward_triton_grouped_gemm = moe_utils.forward_triton_grouped_gemm
-            forward_native_moe_loop = moe_utils.forward_native_moe_loop
+
             """
             Forward for Qwen3MoeSparseMoeBlock in new transformers (v5+).
 
