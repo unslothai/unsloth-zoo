@@ -526,6 +526,8 @@ def create_new_function(
     items = [x for x in functions if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))]
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source: items += ["SiglipEncoder"]
+    # Patch for Qwen3MoeExperts
+    if "Qwen3MoeExperts" in new_source: items += ["Qwen3MoeExperts"]
     # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
@@ -739,11 +741,27 @@ def create_standalone_class(
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
         disable = True
 
-    source = re.sub(
-        "def forward",
-        f"def {module}_forward",
-        forward_source,
-    )
+    # Check if forward was replaced by a temporary patch (already has @torch.compiler.disable)
+    # In this case, keep the patched source as-is without adding another decorator
+    patched_forward_info = None
+    if "@torch.compiler.disable" in forward_source:
+        func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
+        if func_match and func_match.group(1) != "forward":
+            # Find original forward in class to replace it
+            orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
+            if orig_fwd:
+                patched_forward_info = (func_match.group(1), orig_fwd.group(1))
+                disable = None  # Skip adding decorator
+
+    # Replace function name with module-specific name
+    if patched_forward_info:
+        source = forward_source  # Keep patched source as-is
+    else:
+        source = re.sub(
+            "def forward",
+            f"def {module}_forward",
+            forward_source,
+        )
     spaces = re.search(r"[^\s\n]", source).span(0)[0]
     source = source.split("\n")
     source = "\n".join(x[spaces:] for x in source)
@@ -773,7 +791,9 @@ def create_standalone_class(
     parameters = ", ".join(keys)
 
     # Now create the forward function!
-    definition = re.findall(r"[\s\n]{1,}def[^\(]{1,}\([^\)]{1,}\)[^\:]{0,}\:", old_source, flags = re.MULTILINE)[0]
+    # When forward is patched, use the original forward definition from class source
+    definition_source = patched_forward_info[1] if patched_forward_info else old_source
+    definition = re.findall(r"[\s\n]{1,}def[^\(]{1,}\([^\)]{1,}\)[^\:]{0,}\:", definition_source, flags = re.MULTILINE)[0]
     leftover = full_class[full_class.find(definition) + len(definition):]
 
     # Add **loss_kwargs
@@ -785,9 +805,12 @@ def create_standalone_class(
 
     source = f"{compile}\n{source}\n"
     left = re.match(r"[\s\n]{4,}", leftover).span()[1]
+    # Use patched function name if forward was replaced by temporary patch
+    forward_func_name = patched_forward_info[0] if patched_forward_info else f"{module}_forward"
     new_forward = definition + leftover[:left] + \
-        f"return {module}_forward({parameters})\n"
-    full_class = full_class.replace(old_source, new_forward)
+        f"return {forward_func_name}({parameters})\n"
+    source_to_replace = patched_forward_info[1] if patched_forward_info else old_source
+    full_class = full_class.replace(source_to_replace, new_forward)
 
     # New init as well
     if new_init is not None:
@@ -1027,7 +1050,8 @@ RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1
 
 n_items = None
 if (\\9) != () and type(\\9) is dict:
-    n_items = (\\9).get("num_items_in_batch", None) or (\\9).get("n_items", None)
+    n_items = (\\9).get("num_items_in_batch", None)
+    if n_items is None: n_items = (\\9).get("n_items", None)
 if n_items is None:
     all_locals = locals()
     if 'loss_kwargs' in all_locals:
@@ -1552,7 +1576,9 @@ def patch_gradient_checkpointing(module, source):
     pass
 
     layer, spaces, args = find[0]
-    span = re.search(finder, forward).span(0)
+    match = re.search(finder, forward)
+    if match is None: return None
+    span = match.span(0)
     replacer = replace_gradient_checkpointing.strip()
 
     # Gradient checkpointing calling must remove arg=arg convention
@@ -1692,7 +1718,7 @@ def patch_moe_routing_weights_cast(module_cls: Any, source: str) -> Tuple[str, D
         new_route_source, replaced_count = re.subn(MOE_ROUTING_WEIGHTS_CAST_PATTERN, MOE_ROUTING_WEIGHTS_CAST_REPLACE, new_route_source)
         if replaced_count > 0:
             new_route_sources[method_name] = new_route_source
-    
+
     return re.sub(MOE_ROUTING_WEIGHTS_CAST_PATTERN, MOE_ROUTING_WEIGHTS_CAST_REPLACE, source), new_route_sources
 pass
 
@@ -2900,7 +2926,11 @@ def unsloth_compile_transformers(
             pass
 
             params = list(parameters.parameters.keys())
-            source = inspect.getsource(function)
+            try:
+                source = inspect.getsource(function)
+            except Exception as e:
+                print(f"Unsloth: Cannot run inspect.getsource on {module} with error = {e}")
+                continue
 
             where = source.find(str(parameters))
             if where == -1: where = source.find("\n") + 1
