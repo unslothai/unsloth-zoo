@@ -473,7 +473,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         if extra_kwargs is None:
             extra_kwargs = {}
         def compute_loss(new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages, scaling):
-            loss, completion_length, mean_kl, delta, flat_is_ratio = grpo_compute_loss(
+            loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = grpo_compute_loss(
                 ref_logps,
                 new_logps,
                 old_logps,
@@ -488,7 +488,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             # Scale loss if needed for mixed precision training
             scaled_loss = loss * scaling
             # Must add .loss.detach otherwise autograd uses 2x VRAM
-            return scaled_loss, (loss.detach(), completion_length, mean_kl, delta, flat_is_ratio)
+            return scaled_loss, (loss.detach(), completion_length, mean_kl, delta, flat_is_ratio, coef_1)
         pass
 
         device =_new_logps.device
@@ -498,6 +498,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         accumulated_mean_kl           = torch.zeros(1, device = device)
         accumulated_delta             = []
         accumulated_flat_is_ratio     = []
+        accumulated_coef_1            = []
 
         def accumulate_chunk(
             new_logps_j,
@@ -510,7 +511,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             scaling,
             grad_inputs_j,
         ):
-            (chunk_grad_input,), (chunk_loss, (unscaled_loss, chunk_completion_length, chunk_mean_kl, chunk_delta, chunk_flat_is_ratio)) = torch.func.grad_and_value(
+            (chunk_grad_input,), (chunk_loss, (unscaled_loss, chunk_completion_length, chunk_mean_kl, chunk_delta, chunk_flat_is_ratio, chunk_coef_1)) = torch.func.grad_and_value(
                 compute_loss,
                 argnums = (0,),
                 has_aux = True,
@@ -520,6 +521,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             accumulated_mean_kl          .add_(chunk_mean_kl)
             accumulated_delta            .append(chunk_delta)
             accumulated_flat_is_ratio    .append(chunk_flat_is_ratio)
+            accumulated_coef_1           .append(chunk_coef_1)
             grad_inputs_j[:] = chunk_grad_input
         pass
 
@@ -590,18 +592,20 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         else:
             accumulated_delta = None
             accumulated_flat_is_ratio = None
+        accumulated_coef_1  = torch.cat(accumulated_coef_1, dim=0)
         ctx.save_for_backward(grad_inputs)
         return (
             accumulated_loss,
             accumulated_completion_length,
             accumulated_mean_kl,
             accumulated_delta,
-            accumulated_flat_is_ratio
+            accumulated_flat_is_ratio,
+            accumulated_coef_1
         )
     pass
 
     @staticmethod
-    def backward(ctx, grad_output, dcompletion_length, dmean_kl, ddelta, ddflat_is_ratio):
+    def backward(ctx, grad_output, dcompletion_length, dmean_kl, ddelta, ddflat_is_ratio, dcoef_1):
         (grad_input,) = ctx.saved_tensors
         return (grad_input, None, None, None, None, None, None, None, None, None, None, None)
     pass
