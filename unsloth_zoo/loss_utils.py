@@ -123,6 +123,11 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         shift_labels = torch.empty_like(labels)
         shift_labels[..., :-1] = labels[..., 1:]
         shift_labels[..., -1] = ignore_index
+
+        # Keep the same device when multiple GPUs are used
+        shift_labels = shift_labels.to(shift_logits.device)
+        if torch.is_tensor(num_items_in_batch):
+            num_items_in_batch = num_items_in_batch.to(shift_logits.device)
         loss = unsloth_fixed_cross_entropy(shift_logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
         return loss
     pass
@@ -187,16 +192,16 @@ def fused_linear_cross_entropy(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
-        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+        num_items_in_batch = num_items_in_batch.to(lm_weight.device, non_blocking = True)
 
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
 
     with current_device(lm_weight.device):
         loss = linear_cross_entropy(
-            hidden_states.to(lm_weight.dtype),
+            hidden_states.to(dtype=lm_weight.dtype, device=lm_weight.device),
             lm_weight,
-            targets      = labels,
+            targets      = labels.to(lm_weight.device),
             ignore_index = ignore_index,
             softcap      = logit_softcapping,
             reduction    = reduction,
@@ -222,7 +227,7 @@ def fast_linear_cross_entropy(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
-        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+        num_items_in_batch = num_items_in_batch.to(lm_head.weight.device, non_blocking = True)
 
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
@@ -234,9 +239,9 @@ def fast_linear_cross_entropy(
         logit_scale = None
 
     loss = unsloth_efficient_ce_loss(
-        hidden_states = hidden_states,
+        hidden_states = hidden_states.to(lm_head.weight.device),
         lm_head = lm_head,
-        labels = labels,
+        labels = labels.to(lm_head.weight.device),
         shift = True,
         reduction = reduction,
         logit_scale = logit_scale,
