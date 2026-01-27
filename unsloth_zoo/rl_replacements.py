@@ -318,6 +318,9 @@ def grpo_compute_loss(
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
     input_ids = input_ids.unsqueeze(-1)
 
+    if advantages.dim() == 1:
+        advantages = advantages.unsqueeze(1)
+    
     if off_policy_mask_threshold is not None:
         off_policy_mask = get_off_policy_mask(
             advantages=advantages,
@@ -327,9 +330,6 @@ def grpo_compute_loss(
             off_policy_threshold=off_policy_mask_threshold,
         )
         
-    if advantages.dim() == 1:
-        advantages = advantages.unsqueeze(1)
-
     with torch.no_grad():
         if use_vllm and sampling_per_token_logps is not None:
             #must filter out extra prompt tokens in begining after making input_ids left padded
