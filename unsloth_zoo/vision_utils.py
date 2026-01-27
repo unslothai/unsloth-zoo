@@ -894,7 +894,7 @@ class UnslothVisionDataCollator:
         content = message.get("content")
         if isinstance(content, str):
             message["content"] = [{"type": "text", "text": content}]
-        if isinstance(content, list) and \
+        elif isinstance(content, list) and \
             isinstance(self.processor, jinja_system_prompt_as_content_string_classes) \
             and message.get("role") == "system" \
             and len(content):
