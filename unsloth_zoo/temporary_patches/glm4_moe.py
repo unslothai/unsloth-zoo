@@ -44,6 +44,41 @@ def patch_glm4_moe():
         # If classes aren't available (e.g. older transformers), just return
         return
 
+    # ====================================================================
+    # Define LoRA extraction function for GLM4-MoE (Standard Format)
+    # ====================================================================
+    def _glm4_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+        """
+        Custom LoRA extractor for GLM4.
+
+        Expectation for grouped_mm (Standard):
+        - first (Input):  (E, H, R)
+        - second (Output): (E, R, Out)
+
+        GLM4 Weights (Standard PEFT):
+        - gate_up is (E, Out, In) or (Out, In).
+        - lora_A (In->R) connects to H. Shape (E*R, H).
+          Needs: View(E, R, H) -> Permute(0, 2, 1) -> (E, H, R).
+        - lora_B (R->Out) connects to 2I. Shape (2I, E*R).
+          Needs: View(2I, E, R) -> Permute(1, 2, 0) -> (E, R, 2I).
+        """
+        total_rank = weight_A.shape[0]
+        rank_per_expert = total_rank // num_experts
+        dim1 = weight_A.shape[1]
+        dim2 = weight_B.shape[0]
+
+        # Implement extraction: A -> First, B -> Second
+        first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
+        first_weight = first_weight.permute(0, 2, 1).contiguous() # (E, dim1, R) -> (E, H, R) if dim1=H
+
+        second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
+        second_weight = second_weight.permute(1, 2, 0).contiguous() # (E, R, dim2) -> (E, R, 2I) if dim2=2I
+
+        return first_weight, second_weight, scaling, num_experts
+
+    Glm4MoeLiteNaiveMoe._unsloth_lora_extractor_fn = _glm4_lora_extractor
+
+
     # 1. Patch Glm4MoeLiteNaiveMoe (The Expert Layer)
     # This delegates to moe_utils which handles the Split LoRA logic
 

@@ -169,6 +169,94 @@ def patch_qwen3_moe():
         # Uses Triton grouped GEMM kernels for high performance
         # ====================================================================
 
+        # Robust LoRA Extractor for Qwen3-MoE
+        def _qwen3_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+            """
+            Robust extractor for Qwen3-MoE that detects dimension layouts.
+
+            Expectation for grouped_mm:
+            - first_weight:  (E, H, R)   [Input computation]
+            - second_weight: (E, R, Out) [Output computation]
+
+            Qwen3-MoE models may have different PEFT wrappings:
+            1. Standard: lora_A (in->R) connects to H. Shape (E*R, H).
+               Needs: View(E, R, H) -> Permute(0, 2, 1) -> (E, H, R).
+            2. Swapped:  lora_B (R->in) connects to H. Shape (H, E*R).
+               Needs: View(H, E, R) -> Permute(1, 0, 2) -> (E, H, R).
+
+            This extractor dynamically detects 'H' matching dim to pick the correct path.
+            """
+            total_rank = weight_A.shape[0]
+            rank_per_expert = total_rank // num_experts
+
+            # Get dimensions
+            # weight_A: (E*R, dim_A)
+            # weight_B: (dim_B, E*R)
+            dim_A = weight_A.shape[1]
+            dim_B = weight_B.shape[0]
+
+            # Try to get hidden_dim from the experts module
+            hidden_dim = None
+            experts_module = getattr(wrapper, "base_layer", None)
+            # Traverse base_layer until we find the experts module which might have hidden_dim
+            current = wrapper
+            while hasattr(current, "base_layer"):
+                current = current.base_layer
+                if hasattr(current, "hidden_dim"):
+                    hidden_dim = current.hidden_dim
+                    break
+
+            # If hidden_dim found, use it to disambiguate
+            # gate_up input is hidden_dim.
+            if hidden_dim is not None:
+                # Check which weight connects to hidden_dim
+
+                # Case 1: Standard/GLM4-like (lora_A connects to input/hidden_dim)
+                # lora_A: (R, hidden_dim) -> weight_A: (E*R, hidden_dim)
+                if dim_A == hidden_dim:
+                    # first_weight from A
+                    # weight_A (E*R, H) -> view(E, R, H) -> permute(0, 2, 1) -> (E, H, R)
+                    first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+                    first_weight = first_weight.permute(0, 2, 1).contiguous()
+
+                    # second_weight from B
+                    # weight_B (2I, E*R) -> view(2I, E, R) -> permute(1, 2, 0) -> (E, R, 2I)
+                    second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+                    second_weight = second_weight.permute(1, 2, 0).contiguous()
+
+                    return first_weight, second_weight, scaling, num_experts
+
+                # Case 2: Swapped/Old PEFT (lora_B connects to input/hidden_dim)
+                # lora_B: (hidden_dim, R) -> weight_B: (hidden_dim, E*R)
+                elif dim_B == hidden_dim:
+                     # first_weight from B
+                     # weight_B (H, E*R) -> view(H, E, R) -> permute(1, 0, 2) -> (E, H, R)
+                     first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+                     first_weight = first_weight.permute(1, 0, 2).contiguous()
+
+                     # second_weight from A
+                     # weight_A (E*R, 2I) -> view(E, R, 2I) -> NO PERMUTE needed if strictly (E, R, out)?
+                     # Wait, we need output (E, R, 2I).
+                     # weight_A (E*R, 2I). view(E, R, 2I). This is already correct shape?
+                     # Let's check dims.
+                     second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+                     # Matches (E, R, out) directly without permute?
+                     # Yes, if weight_A is (E*R, out).
+
+                     return first_weight, second_weight, scaling, num_experts
+
+            # Fallback if hidden_dim not found or no match (assume GLM4/Standard logic)
+            # This matches the previous logic in moe_utils which works for GLM4
+            first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+            first_weight = first_weight.permute(0, 2, 1).contiguous() # (E, dim_A, R)
+
+            second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+            second_weight = second_weight.permute(1, 2, 0).contiguous() # (E, R, dim_B)
+
+            return first_weight, second_weight, scaling, num_experts
+
+        transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts._unsloth_lora_extractor_fn = _qwen3_lora_extractor
+
         backend = select_moe_backend()
 
         if backend == "grouped_mm":

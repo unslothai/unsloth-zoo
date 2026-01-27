@@ -243,6 +243,43 @@ def patch_qwen3_vl_moe():
             force=True,
         )
 
+        # ====================================================================
+        # Define LoRA extraction function for Qwen3-VL-MoE (Transposed Format)
+        # ====================================================================
+        def _qwen3_vl_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+            """
+            Custom LoRA extractor for Qwen3-VL-MoE which uses Transposed Grouped MM format.
+            Base weights are (E, in_dim, out_dim).
+
+            Expectation for grouped_mm (Transposed):
+            - first (Input):  (E, H, R)
+            - second (Output): (E, R, Out)
+
+            Qwen3-VL Weights:
+            - weight_A (E*R, H): Input projection. Reshape(E, R, H) -> Permute(0, 2, 1) -> (E, H, R).
+            - weight_B (Out, E*R): Output projection. Reshape(Out, E, R) -> Permute(1, 2, 0) -> (E, R, Out).
+            """
+            total_rank = weight_A.shape[0]
+            rank_per_expert = total_rank // num_experts
+            dim1 = weight_A.shape[1]
+            dim2 = weight_B.shape[0]
+
+            # TRANSPOSED FORMAT logic from old moe_utils.py
+            # first_weight: (E, in_dim, R) - from lora_A
+            # second_weight: (E, R, out_dim) - from lora_B
+
+            first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
+            first_weight = first_weight.permute(0, 2, 1).contiguous()  # (E, in_dim, R)
+
+            second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
+            second_weight = second_weight.permute(1, 2, 0).contiguous()  # (E, R, out_dim)
+
+            return first_weight, second_weight, scaling, num_experts
+
+        # Register the extractor on the Experts class
+        transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts._unsloth_lora_extractor_fn = _qwen3_vl_lora_extractor
+
+
         backend = select_moe_backend()
 
         if backend == "grouped_mm":

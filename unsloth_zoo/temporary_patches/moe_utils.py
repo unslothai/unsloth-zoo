@@ -168,6 +168,9 @@ def _check_grouped_gemm_available():
     return _GROUPED_GEMM_AVAILABLE
 
 
+from functools import lru_cache
+
+@lru_cache(maxsize=1)
 def select_moe_backend():
     """
     Selects the MoE backend based on UNSLOTH_MOE_BACKEND environment variable and availability.
@@ -353,64 +356,40 @@ def _extract_lora_from_wrapper(
         scaling = wrapper.scaling[adapter_name]
         num_experts = getattr(wrapper, "num_experts", 1)
 
-        # Check if weights are in transposed (grouped_mm) format
-        # This flag is set by patched __init__ in qwen3_vl_moe.py
+        # GET EXPERTS MODULE TO CHECK FOR REGISTERED EXTRACTOR
         experts_module = (
             wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
         )
-        is_transposed_format = getattr(
-            experts_module, "_unsloth_grouped_mm_format", False
-        )
 
+        # Check for model-specific LoRA extractor attached to the experts module
+        extractor_fn = getattr(experts_module, "_unsloth_lora_extractor_fn", None)
+
+        if extractor_fn is not None:
+             return extractor_fn(wrapper, weight_A, weight_B, scaling, num_experts)
+
+        # DEFAULT BEHAVIOR (Standard Format / Non-MoE)
         if num_experts > 1:
             total_rank = weight_A.shape[0]
             rank_per_expert = total_rank // num_experts
-            dim1 = weight_A.shape[1]  # First non-expert dimension of base weight
-            dim2 = weight_B.shape[0]  # Second non-expert dimension of base weight
+            dim1 = weight_A.shape[1]
+            dim2 = weight_B.shape[0]
 
-            if is_transposed_format:
-                # TRANSPOSED FORMAT (Qwen3-VL-MoE):
-                # Base weights are (E, in_dim, out_dim) ready for grouped_mm
-                # dim1 = in_dim (e.g., H for gate_up, I for down)
-                # dim2 = out_dim (e.g., 2*I for gate_up, H for down)
-                #
-                # For grouped_mm: X @ first @ second where X is (N, in_dim)
-                # first_weight: (E, in_dim, R) - from lora_A
-                # second_weight: (E, R, out_dim) - from lora_B
+            # STANDARD FORMAT (Qwen3-MoE / GLM4):
+            # Base weights are (E, out_dim, in_dim) for F.linear
+            #   gate_up (E, 2*I, H): dim1=2*I, dim2=H
+            #   Input X is (N, H), we need X @ (E, H, R) @ (E, R, 2*I)
 
-                # lora_A.weight: (E*R, dim1) = (E*R, in_dim)
-                # -> view(E, R, in_dim) -> permute(0, 2, 1) -> (E, in_dim, R)
-                first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
-                first_weight = first_weight.permute(
-                    0, 2, 1
-                ).contiguous()  # (E, in_dim, R)
+            # first_weight: (E, dim2, R) = (E, H, R) - from lora_B
+            # second_weight: (E, R, dim1) = (E, R, 2*I) - from lora_A
 
-                # lora_B.weight: (dim2, E*R) = (out_dim, E*R)
-                # -> view(out_dim, E, R) -> permute(1, 2, 0) -> (E, R, out_dim)
-                second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
-                second_weight = second_weight.permute(
-                    1, 2, 0
-                ).contiguous()  # (E, R, out_dim)
-            else:
-                # STANDARD FORMAT (Qwen3-MoE):
-                # Base weights are (E, out_dim, in_dim) for F.linear
-                # dim1 = out_dim, dim2 = in_dim (PEFT's perspective)
-                # But wait - PEFT uses (E, dim1, dim2) where in_features=dim1, out_features=dim2
-                # So for F.linear format:
-                #   gate_up (E, 2*I, H): dim1=2*I, dim2=H
-                #   Input X is (N, H), we need X @ (E, H, R) @ (E, R, 2*I)
-                #
-                # first_weight: (E, dim2, R) = (E, H, R) - from lora_B
-                # second_weight: (E, R, dim1) = (E, R, 2*I) - from lora_A
+            # lora_B.weight: (dim2, E*R) -> view(dim2, E, R) -> permute(1, 0, 2)
+            # first_weight (A): (E, in_dim, R)
+            first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
+            first_weight = first_weight.permute(0, 2, 1).contiguous() # (E, dim1, R)
 
-                # lora_B.weight: (dim2, E*R) -> view(dim2, E, R) -> permute(1, 0, 2)
-                # first_weight (A): (E, in_dim, R)
-                first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
-                first_weight = first_weight.permute(0, 2, 1).contiguous() # (E, dim1, R)
-
-                # second_weight (B): (E, R, out_dim)
-                second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
-                second_weight = second_weight.permute(1, 2, 0).contiguous() # (E, R, dim2)
+            # second_weight (B): (E, R, out_dim)
+            second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
+            second_weight = second_weight.permute(1, 2, 0).contiguous() # (E, R, dim2)
         else:
             # Non-MoE case: just return transposed weights for matmul
             first_weight = weight_B.T  # (E*R, dim2) -> (dim2, E*R).T
@@ -777,7 +756,7 @@ def forward_native_grouped_mm(
     gate_up_lora = None
 
     # Check for injected LoRA data from patched ParamWrapper (preferred path)
-    if hasattr(self, "_unsloth_lora_gate_up_proj"):
+    if getattr(self, "_unsloth_lora_gate_up_proj", None) is not None:
         gate_up_lora = self._unsloth_lora_gate_up_proj[
             :3
         ]  # (first_weight, second_weight, scaling)
@@ -925,7 +904,7 @@ def forward_native_grouped_mm(
     down_lora = None
 
     # Check for injected LoRA data from patched ParamWrapper (preferred path)
-    if hasattr(self, "_unsloth_lora_down_proj"):
+    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
         down_lora = self._unsloth_lora_down_proj[
             :3
         ]  # (first_weight, second_weight, scaling)
@@ -1113,6 +1092,20 @@ def forward_triton_grouped_gemm(
         top_k_index, self.num_experts
     )
 
+    # First grouped GEMM: gate_up projection
+
+    # Prepare LoRA data
+    use_separated_lora = _should_use_separated_lora()
+    gate_up_lora = None
+    if getattr(self, "_unsloth_lora_gate_up_proj", None) is not None:
+        gate_up_lora = self._unsloth_lora_gate_up_proj[:3]
+    elif (
+        use_separated_lora
+        and hasattr(self, "gate_up_proj")
+        and _has_lora_adapters(self.gate_up_proj)
+    ):
+        gate_up_lora = _extract_lora_weights(self.gate_up_proj, num_experts=self.num_experts)
+
     if self.gate_up_proj.shape[-1] == hidden_dim:
         w1 = self.gate_up_proj
     else:
@@ -1134,10 +1127,66 @@ def forward_triton_grouped_gemm(
         is_first_gemm=True,
     )
 
+    # Add separated LoRA contribution for Gate/Up
+    if gate_up_lora is not None:
+        first_weight, second_weight, scaling = gate_up_lora
+
+        # Calculate LoRA delta using NATIVE grouped_mm (no autotuning needed for small ranks)
+        # Note: We need offsets. Triton gathered/permuted X internally but we need offsets for native call.
+        # Wait, Triton kernel handles permutation internally if permute_x=True.
+        # But native grouped_mm expects X to be PERMUTED already implies by 'permuted_input'.
+        # forward_triton_grouped_gemm passes 'hidden_states' (unpermuted) and sets permute_x=True.
+        # So 'hidden_states' is NOT permuted.
+
+        # We MUST permute input for native grouped_mm manual call.
+        # 1. Calculate permuted input
+        flat_top_k = top_k_index.view(-1)
+        sorted_indices = torch.argsort(flat_top_k, stable=True)
+        token_indices = sorted_indices // top_k_index.shape[1]
+        permuted_input = hidden_states[token_indices]
+
+        # 2. Calculate offsets (already have token_counts_by_expert)
+        offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
+
+        # 3. Apply LoRA
+        # Cast weights to input dtype
+        first_weight = first_weight.to(permuted_input.dtype)
+        second_weight = second_weight.to(permuted_input.dtype)
+
+        # Apply LoRA using native backend
+        lora_delta = _apply_lora_grouped_mm(
+            permuted_input,
+            first_weight,
+            second_weight,
+            offsets,
+            scaling,
+            grouped_mm_func=native_moe_grouped_mm
+        )
+
+        # Add to Triton output (which is permuted output?)
+        # Triton grouped_gemm returns Permuted output if is_first_gemm=True?
+        # Let's check Triton kernel. Typically it returns permuted output for intermediate.
+        # Yes, standard Unsloth/Triton grouped gemm returns permuted layout.
+
+        first_gemm_output = first_gemm_output + lora_delta
+
     # Apply SiLU activation and multiply gate with up
     intermediate = _silu_and_mul(first_gemm_output)
 
     # Grouped GEMM 2: down projection
+
+    # Grouped GEMM 2: down projection
+
+    # Prepare LoRA data
+    down_lora = None
+    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
+        down_lora = self._unsloth_lora_down_proj[:3]
+    elif (
+        use_separated_lora
+        and hasattr(self, "down_proj")
+        and _has_lora_adapters(self.down_proj)
+    ):
+        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
 
     if self.down_proj.shape[-1] == intermediate.shape[-1]:
         w2 = self.down_proj
@@ -1158,6 +1207,27 @@ def forward_triton_grouped_gemm(
         kernel_config_bwd_dW=bwd_dW_config_2,
         is_first_gemm=False,
     )
+
+    # Add separated LoRA contribution for Down
+    if down_lora is not None:
+        first_weight, second_weight, scaling = down_lora
+
+        # Intermediate is already permuted from step 1.
+        # Offsets are same.
+
+        first_weight = first_weight.to(intermediate.dtype)
+        second_weight = second_weight.to(intermediate.dtype)
+
+        lora_delta = _apply_lora_grouped_mm(
+            intermediate,
+            first_weight,
+            second_weight,
+            offsets,
+            scaling,
+            grouped_mm_func=native_moe_grouped_mm
+        )
+
+        second_gemm_output = second_gemm_output + lora_delta
 
     # Apply routing weights and sum across top_k experts
     # Output shape: (num_tokens, top_k, hidden_dim) -> (num_tokens, hidden_dim)
