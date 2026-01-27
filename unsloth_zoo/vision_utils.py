@@ -66,6 +66,7 @@ from functools import lru_cache
 
 
 import requests
+from transformers import Lfm2VlProcessor
 import torchvision
 from packaging import version
 from typing import Union, Tuple, List, Dict, Sequence
@@ -879,6 +880,8 @@ class UnslothVisionDataCollator:
             return example
 
     def _validate_and_normalize_first_message(self, messages):
+        jinja_system_prompt_as_content_string_classes = (Lfm2VlProcessor,)
+
         if len(messages) == 0:
             return
         message = messages[0]
@@ -891,6 +894,11 @@ class UnslothVisionDataCollator:
         content = message.get("content")
         if isinstance(content, str):
             message["content"] = [{"type": "text", "text": content}]
+        if isinstance(content, list) and \
+            isinstance(self.processor, jinja_system_prompt_as_content_string_classes) \
+            and message.get("role") == "system" \
+            and len(content):
+            message["content"] = content[0]["text"]
         elif isinstance(content, (list, tuple)):
             part = content[0]
             assert "type" in part
