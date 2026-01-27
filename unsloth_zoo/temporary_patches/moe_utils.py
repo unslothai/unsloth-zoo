@@ -404,14 +404,13 @@ def _extract_lora_from_wrapper(
                 # second_weight: (E, R, dim1) = (E, R, 2*I) - from lora_A
 
                 # lora_B.weight: (dim2, E*R) -> view(dim2, E, R) -> permute(1, 0, 2)
-                first_weight = weight_B.view(dim2, num_experts, rank_per_expert)
-                first_weight = first_weight.permute(
-                    1, 0, 2
-                ).contiguous()  # (E, dim2, R)
+                # first_weight (A): (E, in_dim, R)
+                first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
+                first_weight = first_weight.permute(0, 2, 1).contiguous() # (E, dim1, R)
 
-                # lora_A.weight: (E*R, dim1) -> view(E, R, dim1)
-                second_weight = weight_A.view(num_experts, rank_per_expert, dim1)
-                second_weight = second_weight.contiguous()  # (E, R, dim1)
+                # second_weight (B): (E, R, out_dim)
+                second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
+                second_weight = second_weight.permute(1, 2, 0).contiguous() # (E, R, dim2)
         else:
             # Non-MoE case: just return transposed weights for matmul
             first_weight = weight_B.T  # (E*R, dim2) -> (dim2, E*R).T
