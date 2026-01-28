@@ -395,12 +395,15 @@ def grpo_compute_loss(
             raise Exception(f"sapo is only available in TRL 0.26.0+")
         loss_i = torch.empty_like(coef_1)
         positive_advantages_mask = advantages.repeat([1, coef_1.shape[1]]) > 0
-        loss_i[positive_advantages_mask] = get_sapo_token_loss(
-            coef_1[positive_advantages_mask], sapo_temperature_pos
-        )
-        loss_i[~positive_advantages_mask] = get_sapo_token_loss(
-            coef_1[~positive_advantages_mask], sapo_temperature_neg
-        )
+        #since we have n_chunks some tensors may error if they dont have elements in them
+        if coef_1[positive_advantages_mask].numel() != 0:
+            loss_i[positive_advantages_mask] = get_sapo_token_loss(
+                coef_1[positive_advantages_mask], sapo_temperature_pos
+            )
+        if coef_1[~positive_advantages_mask].numel() != 0:
+            loss_i[~positive_advantages_mask] = get_sapo_token_loss(
+                coef_1[~positive_advantages_mask], sapo_temperature_neg
+            )
         loss_i = -loss_i * advantages
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
