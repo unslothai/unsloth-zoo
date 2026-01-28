@@ -955,7 +955,7 @@ def grpo_accumulated_loss(
             advantages,
             trainer.beta,
             trainer.accelerator.scaler,
-            n_chunks,
+            1,
             kwargs 
         )
 
