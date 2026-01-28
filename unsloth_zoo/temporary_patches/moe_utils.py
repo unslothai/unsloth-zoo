@@ -170,6 +170,7 @@ def _check_grouped_gemm_available():
 
 from functools import lru_cache
 
+
 @lru_cache(maxsize=1)
 def select_moe_backend():
     """
@@ -365,7 +366,7 @@ def _extract_lora_from_wrapper(
         extractor_fn = getattr(experts_module, "_unsloth_lora_extractor_fn", None)
 
         if extractor_fn is not None:
-             return extractor_fn(wrapper, weight_A, weight_B, scaling, num_experts)
+            return extractor_fn(wrapper, weight_A, weight_B, scaling, num_experts)
 
         # DEFAULT BEHAVIOR (Standard Format / Non-MoE)
         if num_experts > 1:
@@ -385,11 +386,11 @@ def _extract_lora_from_wrapper(
             # lora_B.weight: (dim2, E*R) -> view(dim2, E, R) -> permute(1, 0, 2)
             # first_weight (A): (E, in_dim, R)
             first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
-            first_weight = first_weight.permute(0, 2, 1).contiguous() # (E, dim1, R)
+            first_weight = first_weight.permute(0, 2, 1).contiguous()  # (E, dim1, R)
 
             # second_weight (B): (E, R, out_dim)
             second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
-            second_weight = second_weight.permute(1, 2, 0).contiguous() # (E, R, dim2)
+            second_weight = second_weight.permute(1, 2, 0).contiguous()  # (E, R, dim2)
         else:
             # Non-MoE case: just return transposed weights for matmul
             first_weight = weight_B.T  # (E*R, dim2) -> (dim2, E*R).T
@@ -740,7 +741,7 @@ def forward_native_grouped_mm(
 
     # 2. Sort indices to group tokens by expert
     sorted_indices = torch.argsort(flat_top_k, stable=True)
-    token_indices = sorted_indices // top_k_index.shape[1]
+    token_indices = sorted_indices // top_k_index.shape[-1]
 
     # 3. Permute Input
     # We need to gather inputs. Since we may have expanded top_k, we use token_indices to map back to original input
@@ -1104,7 +1105,9 @@ def forward_triton_grouped_gemm(
         and hasattr(self, "gate_up_proj")
         and _has_lora_adapters(self.gate_up_proj)
     ):
-        gate_up_lora = _extract_lora_weights(self.gate_up_proj, num_experts=self.num_experts)
+        gate_up_lora = _extract_lora_weights(
+            self.gate_up_proj, num_experts=self.num_experts
+        )
 
     if self.gate_up_proj.shape[-1] == hidden_dim:
         w1 = self.gate_up_proj
@@ -1160,7 +1163,7 @@ def forward_triton_grouped_gemm(
             second_weight,
             offsets,
             scaling,
-            grouped_mm_func=native_moe_grouped_mm
+            grouped_mm_func=native_moe_grouped_mm,
         )
 
         # Add to Triton output (which is permuted output?)
@@ -1224,7 +1227,7 @@ def forward_triton_grouped_gemm(
             second_weight,
             offsets,
             scaling,
-            grouped_mm_func=native_moe_grouped_mm
+            grouped_mm_func=native_moe_grouped_mm,
         )
 
         second_gemm_output = second_gemm_output + lora_delta
