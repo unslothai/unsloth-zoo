@@ -2118,6 +2118,7 @@ def load_vllm(
 
             if "gpu_memory_utilization" in error or "memory" in error:
                 approx_max_num_seqs = int(approx_max_num_seqs * 0.75)
+                approx_max_num_seqs = max(approx_max_num_seqs, 1)
                 engine_args["max_num_seqs"] = approx_max_num_seqs
                 engine_args["gpu_memory_utilization"] *= 0.85
                 print(
