@@ -39,6 +39,7 @@ import tempfile
 import logging
 import torch
 from pathlib import Path
+import psutil
 
 # Get a logger instance
 logger = logging.getLogger(__name__)
@@ -58,11 +59,12 @@ COMMANDS_NOT_FOUND = (
 # llama.cpp specific targets - all takes 90s. Below takes 60s
 LLAMA_CPP_TARGETS = [
     "llama-quantize",
-    "llama-export-lora",
+    # "llama-export-lora",
     "llama-cli",
-    "llama-llava-cli",
+    # "llama-llava-cli",
     "llama-mtmd-cli",
     "llama-gguf-split",
+    "llama-server",
 ]
 
 PIP_OPTIONS = [
@@ -85,7 +87,6 @@ BAD_OUTCOMES = {
     "fatal "                     : "",
     "Err:"                       : "",
     "Failed "                    : "",
-    "is deprecated"              : "Command is deprecated!",
 }
 
 # Check environments
@@ -258,7 +259,7 @@ def check_pip():
 pass
 
 
-def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None, system_type = "debian"):
+def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None, system_type = "debian", ignore_deprecation = False):
     # All Unsloth Zoo code licensed under LGPLv3
 
     with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, text=True) as sp:
@@ -285,6 +286,10 @@ def try_execute(command, sudo = False, print_output = False, print_outputs = Non
                 if key in line:
                     error_msg = f"[FAIL] Command `{command}` failed with error `{line.strip()}`\n"
                     raise RuntimeError(error_msg + value)
+            key, value = "is deprecated", "Command is deprecated!"
+            if not ignore_deprecation and key in line:
+                error_msg = f"[FAIL] Command `{command}` failed with error `{line.strip()}`\n"
+                raise RuntimeError(error_msg + value)
 
             if print_output:
                 print(line, flush=True, end="")
@@ -293,17 +298,17 @@ def try_execute(command, sudo = False, print_output = False, print_outputs = Non
 pass
 
 
-def try_execute_with_auto_install(command, sudo=False, print_output=False, print_outputs=None, cwd = None, system_type = "debian"):
+def try_execute_with_auto_install(command, sudo=False, print_output=False, print_outputs=None, cwd = None, system_type = "debian", ignore_deprecation = False):
     """Try to execute a command, and if it fails due to missing package, try to install it"""
     try:
-        try_execute(command, sudo, print_output, print_outputs, cwd, system_type)
+        try_execute(command, sudo, print_output, print_outputs, cwd, system_type, ignore_deprecation)
     except RuntimeError as e:
         if "Command not found" in str(e):
             package_name = command.split(" ", 1)[0]
             print(f"Trying to install missing package: {package_name}")
             install_package(package_name, sudo, print_output, print_outputs, system_type)
             # Retry once
-            try_execute(command, sudo, print_output, print_outputs, cwd, system_type)
+            try_execute(command, sudo, print_output, print_outputs, cwd, system_type, ignore_deprecation)
         else:
             raise
 pass
@@ -418,11 +423,17 @@ def install_llama_cpp(
     build_success = False
     build_errors = []
 
+    # Check for Colab / Kaggle, and deduct some CPUs to conserve memory
+    cpu_count = psutil.cpu_count() or 1
+    if IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT:
+        cpu_count = cpu_count - 1
+        cpu_count = max(cpu_count, 1)
+
     # Try make first
     try:
         if print_output: print("Trying to build with make...")
-        try_execute(f"make clean", cwd=llama_cpp_folder, **kwargs)
-        try_execute(f"make all -j", cwd=llama_cpp_folder, **kwargs)
+        try_execute(f"make clean", cwd = llama_cpp_folder, **kwargs)
+        try_execute(f"make all -j{cpu_count}", cwd = llama_cpp_folder, **kwargs)
         build_success = True
         print("Successfully built with make")
     except Exception as e:
@@ -431,17 +442,31 @@ def install_llama_cpp(
         # Use cmake instead
         try:
             # Clean up any partial build
-            try_execute(f"rm -rf build", cwd=llama_cpp_folder, **kwargs)
+            try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
 
-            try_execute(
-                f"cmake . -B build "\
-                f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support} -DLLAMA_CURL=ON",
-                cwd = llama_cpp_folder,
-                **kwargs
-            )
+            try:
+                try_execute(
+                    f"cmake . -B build "\
+                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support} -DLLAMA_CURL=ON",
+                    cwd = llama_cpp_folder,
+                    **kwargs
+                )
+            except Exception as inner_e:
+                inner_e = str(inner_e)
+                if "LLAMA_CURL" in inner_e and "deprecated" in inner_e:
+                    # As of https://github.com/ggml-org/llama.cpp/pull/18791, CURL is deprecated
+                    try_execute(
+                        f"cmake . -B build "\
+                        f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}",
+                        cwd = llama_cpp_folder,
+                        ignore_deprecation = True,
+                        **kwargs
+                    )
+                else:
+                    raise
             try_execute(
                 f"cmake --build build --config Release "\
-                f"-j --clean-first --target "\
+                f"-j{cpu_count} --clean-first --target "\
                 f"{' '.join(llama_cpp_targets)}",
                 cwd = llama_cpp_folder,
                 **kwargs
@@ -1026,7 +1051,6 @@ def quantize_gguf(
     # Use llama-quantize for fast quantization of GGUF files.
 
     if n_threads is None:
-        import psutil
         n_threads = psutil.cpu_count()
         if n_threads is None:
             n_threads = 1
@@ -1244,6 +1268,48 @@ def check_linux_type():
 
     return 'unknown'
 pass
+
+
+@lru_cache(1)
+def _check_llama_cpp_appended_system_message():
+    # See https://github.com/ggml-org/llama.cpp/issues/18323
+    # See https://docs.unsloth.ai/basics/inference-and-deployment/llama-server-and-openai-endpoint#llama-server-quirks
+    llama_cpp_chat_file = "https://raw.githubusercontent.com/ggml-org/llama.cpp/refs/heads/master/common/chat.cpp"
+    llama_cpp_appended = '''Respond in JSON format, either with `tool_call` (a request to call tools) or with `response` reply to the user's request'''
+    check = requests.get(llama_cpp_chat_file, timeout = 5)
+    try:
+        check.raise_for_status()
+        check = check.content.decode("utf-8")
+        if llama_cpp_appended in check:
+            logger.info("llama.cpp appends an extra system message for tools. You should consider this.")
+            return llama_cpp_appended
+    except:
+        pass
+    return ""
+
+
+def add_llama_cpp_system_message(messages, tools, inplace = False):
+    # See https://github.com/ggml-org/llama.cpp/issues/18323
+    # See https://docs.unsloth.ai/basics/inference-and-deployment/llama-server-and-openai-endpoint#llama-server-quirks
+    extra = _check_llama_cpp_appended_system_message()
+    if len(messages) == 0 or messages is None:
+        return messages
+    if tools is None or len(tools) == 0:
+        # Does not affect non tools
+        return messages
+    if extra == "":
+        return messages
+    if messages[0]["role"] == "system":
+        if inplace:
+            messages[0]["content"] = messages[0]["content"] + "\n\n" + extra
+        else:
+            messages = [{"role" : "system", "content" : messages[0]["content"]}] + messages[1:]
+    else:
+        if inplace:
+            messages.insert(0, {"role" : "system", "content" : extra})
+        else:
+            messages = [{"role" : "system", "content" : extra}] + messages
+    return messages
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

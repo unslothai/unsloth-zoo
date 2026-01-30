@@ -48,7 +48,6 @@ import triton
 import regex
 from .peft_utils import get_lora_layer_modules
 from importlib.metadata import version as importlib_version
-from packaging.version import Version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
@@ -1801,11 +1800,11 @@ def patch_lora_forwards(torch_compile_options):
 
         # Remove variant_kwargs = {k: kwargs.pop(k, None) for k in VARIANT_KWARG_KEYS}
         # No need for alora for now
-        variant_kwarg_keys = "variant_kwargs = {k: kwargs.pop(k, None) for k in VARIANT_KWARG_KEYS}"
-        variant_found = source.find(variant_kwarg_keys)
-        if variant_found != -1:
-            variant_end = source.find("\n", variant_found + len(variant_kwarg_keys))
-            source = source.replace(source[variant_found : variant_end], "")
+        # variant_kwarg_keys = "variant_kwargs = {k: kwargs.pop(k, None) for k in VARIANT_KWARG_KEYS}"
+        # variant_found = source.find(variant_kwarg_keys)
+        # if variant_found != -1:
+        #     variant_end = source.find("\n", variant_found + len(variant_kwarg_keys))
+        #     source = source.replace(source[variant_found : variant_end], "")
 
         # Check failed upcasting
         replacements = [
@@ -1836,13 +1835,40 @@ def patch_lora_forwards(torch_compile_options):
                 if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0" \
                 else COMPILED_LORA_FORWARD_forced_float32
 
+            # Fix for 8-bit layers: use torch._dynamo.disable decorator
+            # to prevent bitsandbytes 8-bit ops from being compiled (causes dimension errors)
+            extra_prepend = ""
+            if "8bit" in child.lower():
+                # Replace base_layer calls with a dynamo-disabled helper function
+                source = source.replace(
+                    "result = self.base_layer(x, *args, **kwargs)",
+                    "result = _call_8bit_base_layer(self.base_layer, x, *args, **kwargs)"
+                )
+                extra_prepend = (
+                    "\nimport torch._dynamo\n"
+                    "@torch._dynamo.disable\n"
+                    "def _call_8bit_base_layer(base_layer, x, *args, **kwargs):\n"
+                    "    return base_layer(x, *args, **kwargs)\n"
+                )
+
+            # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
+            # if used in source but not available in parent module.
+            # Use try/except with fallback in case peft moves the constant in future versions.
+            variant_kwarg_import = ""
+            if re.search(r'\bVARIANT_KWARG_KEYS\b', source):
+                variant_kwarg_import = (
+                    "try:\n"
+                    "    from peft.tuners.lora.layer import VARIANT_KWARG_KEYS\n"
+                    "except ImportError:\n"
+                    "    VARIANT_KWARG_KEYS = ['alora_offsets']\n"
+                )
+
             forward = create_new_function(
                 f"{child}_peft_forward",
                 compiled_lora_forward + source,
                 parent,
                 dir(eval(parent)),
-                prepend = \
-                    f"\ntorch_compile_options = {torch_compile_options}\n"
+                prepend = f"\n{variant_kwarg_import}torch_compile_options = {torch_compile_options}\n" + extra_prepend
             ).unsloth_forward
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
@@ -2111,6 +2137,7 @@ DISABLE_COMPILE_MODULES = [
     "GptOssMLP",
     "GptOssExperts",
     "Gemma3nTextModel",
+    "Glm4MoeLiteNaiveMoe",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -2646,8 +2673,8 @@ def unsloth_compile_transformers(
             if OLD_CUDA_ARCH_VERSION or OLD_TORCH_VERSION or OLD_TRITON_VERSION:
                 continue
 
-            module_class = eval(f"modeling_file.{module}")
-            if hasattr(module_class, "forward") and issubclass(module_class, GenerationMixin):
+            module_class = getattr(modeling_file, module)
+            if isinstance(module_class, type) and hasattr(module_class, "forward") and issubclass(module_class, GenerationMixin):
                 try:
                     source = inspect.getsource(module_class.forward)
                 except:

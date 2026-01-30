@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import torch
-from packaging.version import Version
+from .utils import Version
 import os
 import math
 import functools
@@ -66,7 +66,7 @@ elif DEVICE_TYPE == "xpu":
     except:
         HAS_CUT_CROSS_ENTROPY = False
 else:
-    pass
+    HAS_CUT_CROSS_ENTROPY = False
 pass
 
 __all__ = [

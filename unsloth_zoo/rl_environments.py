@@ -16,6 +16,7 @@
 
 __all__ = [
     "check_python_modules",
+    "check_signal_escape_patterns",
     "create_locked_down_function",
     "execute_with_time_limit",
     "Benchmarker",
@@ -24,6 +25,7 @@ __all__ = [
 ]
 
 import ast
+import inspect
 import sys
 import sysconfig
 from pathlib import Path
@@ -38,7 +40,6 @@ from contextlib import contextmanager
 from functools import wraps
 import threading
 import errno
-import time
 from typing import Callable, TypeVar, Any, Tuple
 T = TypeVar("T")
 
@@ -120,6 +121,270 @@ def check_python_modules(code: str):
         "stdlib": stdlib_found,
         "non_stdlib": non_stdlib,
         "relative_imports": relative_count,
+    }
+pass
+
+
+def check_signal_escape_patterns(code: str):
+    """
+    Check if code contains patterns that could escape signal-based timeouts.
+
+    This performs static analysis (no execution) to detect code patterns that
+    could bypass SIGALRM-based timeout enforcement. Use this to decide whether
+    to use backend="process" instead of backend="signal".
+
+    Returns (safe: bool, details: dict)
+
+    safe == True  -> no escape patterns detected (signal backend should work).
+    safe == False -> escape patterns found (recommend backend="process").
+
+    details includes:
+      - signal_tampering: list of signal manipulation patterns found
+      - exception_catching: list of exception catching patterns found
+      - warnings: list of warning messages
+
+    Signal Tampering Patterns (code can disable/ignore the timeout signal):
+    -----------------------------------------------------------------------
+    1. signal.signal(SIGALRM, SIG_IGN) - Ignores the alarm signal entirely
+       Example that escapes:
+           import signal
+           signal.signal(signal.SIGALRM, signal.SIG_IGN)
+           while True: pass  # Runs forever, timeout never fires
+
+    2. signal.setitimer(ITIMER_REAL, 0) - Disables the timer completely
+       Example that escapes:
+           import signal
+           signal.setitimer(signal.ITIMER_REAL, 0)
+           while True: pass  # Timer disabled, runs forever
+
+    3. signal.alarm(0) - Cancels any pending alarm
+       Example that escapes:
+           import signal
+           signal.alarm(0)
+           while True: pass  # Alarm cancelled, runs forever
+
+    4. signal.pthread_sigmask(SIG_BLOCK, [SIGALRM]) - Blocks signal delivery
+       Example that escapes:
+           import signal
+           signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGALRM])
+           while True: pass  # Signal blocked, runs forever
+
+    Exception Catching Patterns (only dangerous INSIDE A LOOP):
+    -----------------------------------------------------------
+    The signal backend raises TimeoutError when time expires. If code catches
+    this exception INSIDE A LOOP, it can suppress the timeout and continue.
+
+    NOTE: Exception catching OUTSIDE a loop is safe because control returns
+    to the caller after the handler. These patterns are only flagged when
+    detected inside a while/for loop.
+
+    5. except TimeoutError in loop - Catches and continues looping
+       ESCAPES (inside loop):
+           while True:
+               try:
+                   do_work()
+               except TimeoutError:
+                   pass  # Caught! Loop continues, runs forever
+
+       SAFE (outside loop):
+           try:
+               do_work()
+           except TimeoutError:
+               return "default"  # Returns to caller, does NOT escape
+
+    6. except Exception in loop - Catches TimeoutError (inherits from Exception)
+       ESCAPES (inside loop):
+           while True:
+               try:
+                   do_work()
+               except Exception:
+                   pass  # TimeoutError caught, runs forever
+
+    7. except BaseException in loop - Catches everything including TimeoutError
+
+    8. Bare except: in loop - Catches all exceptions
+       ESCAPES (inside loop):
+           while True:
+               try:
+                   do_work()
+               except:
+                   pass  # All exceptions caught, runs forever
+
+    Why use backend="process" instead:
+    ----------------------------------
+    The process backend runs code in a subprocess and uses SIGKILL to terminate
+    it on timeout. SIGKILL cannot be caught, ignored, or blocked by any code,
+    making it immune to all escape patterns above.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return False, {
+            "error": f"SyntaxError: {e}",
+            "signal_tampering": [],
+            "exception_catching": [],
+            "warnings": [],
+        }
+
+    signal_tampering = []
+    exception_catching = []
+    warnings = []
+
+    class SignalEscapeVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.imports_signal = False
+            self.signal_aliases = {"signal"}
+            self.loop_depth = 0  # Track if we're inside a loop
+
+        def visit_Import(self, node: ast.Import):
+            for alias in node.names:
+                if alias.name == "signal":
+                    self.imports_signal = True
+                    if alias.asname:
+                        self.signal_aliases.add(alias.asname)
+            self.generic_visit(node)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom):
+            if node.module == "signal":
+                self.imports_signal = True
+                for alias in node.names:
+                    if alias.name in ("signal", "SIGALRM", "SIG_IGN", "setitimer",
+                                      "ITIMER_REAL", "pthread_sigmask", "SIG_BLOCK", "alarm"):
+                        self.signal_aliases.add(alias.asname or alias.name)
+            self.generic_visit(node)
+
+        def visit_While(self, node: ast.While):
+            self.loop_depth += 1
+            self.generic_visit(node)
+            self.loop_depth -= 1
+
+        def visit_For(self, node: ast.For):
+            self.loop_depth += 1
+            self.generic_visit(node)
+            self.loop_depth -= 1
+
+        def visit_Call(self, node: ast.Call):
+            func = node.func
+            func_name = None
+
+            # Get the function name for pattern matching
+            if isinstance(func, ast.Attribute):
+                # signal.signal(...), signal.setitimer(...), etc.
+                if isinstance(func.value, ast.Name):
+                    if func.value.id in self.signal_aliases:
+                        func_name = f"signal.{func.attr}"
+                elif isinstance(func.value, ast.Attribute):
+                    # Handle chained attributes
+                    pass
+            elif isinstance(func, ast.Name):
+                # Direct call like setitimer(...) after from signal import setitimer
+                if func.id in ("signal", "setitimer", "alarm", "pthread_sigmask"):
+                    func_name = func.id
+
+            # Check for signal tampering patterns
+            if func_name:
+                if func_name in ("signal.signal", "signal"):
+                    # Check if setting SIGALRM handler
+                    if len(node.args) >= 1:
+                        arg0 = node.args[0]
+                        if _ast_name_matches(arg0, ("SIGALRM", "signal.SIGALRM")):
+                            signal_tampering.append({
+                                "type": "signal_handler_override",
+                                "line": node.lineno,
+                                "description": "Overrides SIGALRM handler",
+                            })
+
+                elif func_name in ("signal.setitimer", "setitimer"):
+                    # Check if disabling ITIMER_REAL
+                    if len(node.args) >= 1:
+                        arg0 = node.args[0]
+                        if _ast_name_matches(arg0, ("ITIMER_REAL", "signal.ITIMER_REAL")):
+                            signal_tampering.append({
+                                "type": "timer_manipulation",
+                                "line": node.lineno,
+                                "description": "Manipulates ITIMER_REAL timer",
+                            })
+
+                elif func_name in ("signal.alarm", "alarm"):
+                    signal_tampering.append({
+                        "type": "alarm_manipulation",
+                        "line": node.lineno,
+                        "description": "Manipulates alarm timer",
+                    })
+
+                elif func_name in ("signal.pthread_sigmask", "pthread_sigmask"):
+                    signal_tampering.append({
+                        "type": "signal_mask",
+                        "line": node.lineno,
+                        "description": "Modifies signal mask (may block SIGALRM)",
+                    })
+
+            self.generic_visit(node)
+
+        def visit_ExceptHandler(self, node: ast.ExceptHandler):
+            # Only flag exception catching if inside a loop (where it can suppress timeout)
+            # Exception catching outside loops will naturally propagate after the handler
+            if self.loop_depth == 0:
+                self.generic_visit(node)
+                return
+
+            # Check for bare except or catching TimeoutError/BaseException inside a loop
+            if node.type is None:
+                # Bare except:
+                exception_catching.append({
+                    "type": "bare_except_in_loop",
+                    "line": node.lineno,
+                    "description": "Bare except in loop catches TimeoutError and continues looping",
+                })
+            elif isinstance(node.type, ast.Name):
+                if node.type.id in ("TimeoutError", "BaseException", "Exception"):
+                    exception_catching.append({
+                        "type": f"catches_{node.type.id}_in_loop",
+                        "line": node.lineno,
+                        "description": f"Catches {node.type.id} in loop - may suppress timeout and continue",
+                    })
+            elif isinstance(node.type, ast.Tuple):
+                # except (TimeoutError, ValueError):
+                for elt in node.type.elts:
+                    if isinstance(elt, ast.Name):
+                        if elt.id in ("TimeoutError", "BaseException", "Exception"):
+                            exception_catching.append({
+                                "type": f"catches_{elt.id}_in_loop",
+                                "line": node.lineno,
+                                "description": f"Catches {elt.id} in loop - may suppress timeout and continue",
+                            })
+            self.generic_visit(node)
+
+    def _ast_name_matches(node, names):
+        """Check if an AST node matches any of the given names."""
+        if isinstance(node, ast.Name):
+            return node.id in names
+        elif isinstance(node, ast.Attribute):
+            full_name = []
+            current = node
+            while isinstance(current, ast.Attribute):
+                full_name.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                full_name.append(current.id)
+            full_name = ".".join(reversed(full_name))
+            return full_name in names
+        return False
+
+    visitor = SignalEscapeVisitor()
+    visitor.visit(tree)
+
+    # Add warning if signal is imported but no specific tampering found
+    if visitor.imports_signal and not signal_tampering:
+        warnings.append("Code imports 'signal' module - review manually for safety")
+
+    # Determine if code is safe
+    is_safe = len(signal_tampering) == 0 and len(exception_catching) == 0
+
+    return is_safe, {
+        "signal_tampering": signal_tampering,
+        "exception_catching": exception_catching,
+        "warnings": warnings,
     }
 pass
 
@@ -291,10 +556,8 @@ pass
 
 def create_locked_down_function(function):
     """
-    Creates a singular Python function which disallows the following:
-    1. No globals or
+    Creates a singular Python function which disallows globals.
     """
-    output_function = {}
     f = load_single_function(function)
     # Locks down function so it can see global variables of nothingness
     f = types.FunctionType(f.__code__, {})
@@ -454,11 +717,13 @@ def _run_in_subprocess(func, seconds, args, kwargs, *, start_method="spawn", kil
             pass
 pass
 
+_VALID_START_METHODS = frozenset({"fork", "spawn", "forkserver"})
+
 def execute_with_time_limit(
     seconds: float,
     *,
     backend: str = "signal",
-    start_method: str = "process",
+    start_method: str = "fork",
     kill_grace: float = 1.0,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
@@ -467,21 +732,50 @@ def execute_with_time_limit(
     backend:
       - "signal": uses SIGALRM (fast, in-process; only cooperative C code).
       - "process": runs function in a child and kills it on timeout (robust).
+      - "auto": uses signal backend if function source is safe, otherwise process.
+
+    If backend="signal" but the function contains patterns that could escape
+    signal-based timeouts (detected via check_signal_escape_patterns), or if
+    the function source cannot be inspected, automatically falls back to
+    the process backend.
+
+    start_method (only used when backend="process" or auto fallback):
+      - "fork": copies parent process memory (fast, works in notebooks/Colab).
+      - "spawn": starts fresh Python interpreter (slower, safer for CUDA).
+      - "forkserver": reuses a server process for forking (balance of both).
     """
     if seconds <= 0:
         raise ValueError("seconds must be > 0")
+    if start_method not in _VALID_START_METHODS:
+        raise ValueError(
+            f"Unsloth: start_method must be one of {sorted(_VALID_START_METHODS)}, got {start_method!r}"
+        )
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        # Determine effective backend based on function safety
+        effective_backend = backend
+        if backend in ("signal", "auto"):
+            try:
+                source = inspect.getsource(func)
+                safe, _ = check_signal_escape_patterns(source)
+                if not safe:
+                    effective_backend = "process"
+                elif backend == "auto":
+                    effective_backend = "signal"
+            except (OSError, TypeError):
+                # Cannot inspect source (built-in, lambda, etc.) - use process
+                effective_backend = "process"
+
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
-            if backend == "signal":
+            if effective_backend == "signal":
                 with time_limit(seconds):
                     return func(*args, **kwargs)
-            elif backend == "process":
+            elif effective_backend == "process":
                 return _run_in_subprocess(func, seconds, args, kwargs,
                                           start_method=start_method, kill_grace=kill_grace)
             else:
-                raise ValueError("backend must be 'signal' or 'process'")
+                raise ValueError("backend must be 'signal', 'process', or 'auto'")
         return wrapper
     return decorator
 pass
@@ -537,9 +831,7 @@ pass
 ####################
 import socket
 import requests
-import time
 import random
-import sys
 import subprocess
 
 def is_port_open(host, port):
@@ -560,6 +852,29 @@ def is_port_open(host, port):
 pass
 
 
+def _get_openenv_pythonpath(working_directory: str) -> str:
+    """
+    Auto-detect OpenEnv version and return correct PYTHONPATH.
+
+    OpenEnv structure changed at commit 83dda10 ("move envs to root"):
+    - New structure (commit 151+): envs/ at root, openenv in src/
+    - Old structure (commits 514-152): envs/ in src/
+    """
+    root_client = os.path.join(working_directory, "envs", "openspiel_env", "client.py")
+    src_client = os.path.join(working_directory, "src", "envs", "openspiel_env", "client.py")
+    src_path = os.path.join(working_directory, "src")
+
+    if os.path.exists(root_client):
+        # New structure: envs at root + openenv in src
+        return f"{working_directory}{os.pathsep}{src_path}"
+    elif os.path.exists(src_client):
+        # Old structure: everything in src
+        return src_path
+    else:
+        # Fallback: try both paths
+        return f"{working_directory}{os.pathsep}{src_path}"
+
+
 def launch_openenv(
     port : int = 8111,
     openenv_process = None,
@@ -575,6 +890,13 @@ def launch_openenv(
     assert type(working_directory) is str
     assert openenv_class is not None
     assert type(server) is str
+
+    # Auto-fix PYTHONPATH for OpenEnv compatibility
+    correct_pythonpath = _get_openenv_pythonpath(working_directory)
+    if environment.get("PYTHONPATH") != correct_pythonpath:
+        environment = dict(environment)  # Don't mutate original
+        environment["PYTHONPATH"] = correct_pythonpath
+
     localhost = f"http://localhost:{port}"
 
     def check_openenv_works(process):
