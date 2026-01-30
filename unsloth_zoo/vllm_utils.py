@@ -66,6 +66,21 @@ from .log import logger
 from .device_type import DEVICE_TYPE
 global LORA_REQUEST_ID
 
+# Align FlashInfer workspace with Unsloth compiled cache to avoid stale JIT paths.
+def _maybe_set_flashinfer_workspace_base():
+    if os.environ.get("FLASHINFER_WORKSPACE_BASE"):
+        return
+    try:
+        from .compiler import get_compile_folder, UNSLOTH_COMPILE_LOCATION
+        compile_folder, _ = get_compile_folder(use_tempfile = False)
+        os.environ["FLASHINFER_WORKSPACE_BASE"] = compile_folder
+    except Exception:
+        os.environ["FLASHINFER_WORKSPACE_BASE"] = os.environ.get(
+            "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
+        )
+pass
+_maybe_set_flashinfer_workspace_base()
+
 # Ignore logging messages
 import logging
 class HideLoggingMessage(logging.Filter):
