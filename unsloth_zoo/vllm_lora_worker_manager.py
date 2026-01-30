@@ -46,6 +46,13 @@ def dummy_lora_has_scaling_factor(create_dummy_lora):
     return "scaling_factor" in keys
 pass
 
+def _call_create_lora_manager(model, vllm_config, **kwargs):
+    sig = inspect.signature(create_lora_manager)
+    if "vllm_config" in sig.parameters:
+        return create_lora_manager(model, vllm_config = vllm_config, **kwargs)
+    return create_lora_manager(model, **kwargs)
+pass
+
 class WorkerLoRAManager(AbstractWorkerManager):
     """WorkerLoRAManager that manages LoRA models on the worker side.
 
@@ -69,10 +76,13 @@ class WorkerLoRAManager(AbstractWorkerManager):
     def create_lora_manager(
         self,
         model: torch.nn.Module,
-        vllm_config: Any = None,
+        vllm_config = None,
+        *args,
+        **kwargs,
     ) -> Any:
-        lora_manager = create_lora_manager(
+        lora_manager = _call_create_lora_manager(
             model,
+            vllm_config,
             max_num_seqs=self.max_num_seqs,
             max_num_batched_tokens=self.max_num_batched_tokens,
             vocab_size=self.vocab_size,
@@ -341,10 +351,13 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
     def create_lora_manager(
         self,
         model: torch.nn.Module,
-        vllm_config: Any = None,
+        vllm_config = None,
+        *args,
+        **kwargs,
     ) -> Any:
-        lora_manager = create_lora_manager(
+        lora_manager = _call_create_lora_manager(
             model,
+            vllm_config,
             lora_manager_cls=self._manager_cls,
             max_num_seqs=self.max_num_seqs,
             vocab_size=self.vocab_size,
