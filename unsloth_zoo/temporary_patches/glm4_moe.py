@@ -15,7 +15,6 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import torch
-import torch.nn.functional as F
 from .common import TEMPORARY_PATCHES, torch_compile, UNSLOTH_ENABLE_LOGGING
 from .utils import patch_function, raise_error, logger
 from .moe_utils import (

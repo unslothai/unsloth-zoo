@@ -39,9 +39,7 @@ def install_to_cache(source_path, destination_filename=None):
     if destination_filename is None:
         destination_filename = os.path.basename(current_file)
 
-    destination = os.path.abspath(
-        os.path.join(UNSLOTH_COMPILE_LOCATION, destination_filename)
-    )
+    destination = os.path.abspath(os.path.join(UNSLOTH_COMPILE_LOCATION, destination_filename))
 
     # If source and dest are different, copy.
     if current_file != destination:
@@ -69,8 +67,7 @@ def _check_torch_grouped_mm_supported():
     A runtime probe is the only reliable check.
     """
     global _TORCH_GROUPED_MM_SUPPORTED
-    if _TORCH_GROUPED_MM_SUPPORTED is not None:
-        return _TORCH_GROUPED_MM_SUPPORTED
+    if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
     if not _TORCH_GROUPED_MM_AVAILABLE:
         _TORCH_GROUPED_MM_SUPPORTED = False
@@ -111,8 +108,7 @@ def _init_triton_allocator():
     This significantly reduces GPU utilization fluctuation.
     """
     global _TRITON_ALLOCATOR_INITIALIZED, _PERSISTENT_BUFFER
-    if _TRITON_ALLOCATOR_INITIALIZED:
-        return
+    if _TRITON_ALLOCATOR_INITIALIZED: return
 
     try:
         import triton
@@ -148,19 +144,13 @@ def _init_triton_allocator():
 
 def _check_grouped_gemm_available():
     """Check if Unsloth grouped GEMM kernels are available."""
-    if os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1":
-        return False
+    if os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1": return False
 
     global _GROUPED_GEMM_AVAILABLE
-    if _GROUPED_GEMM_AVAILABLE is not None:
-        return _GROUPED_GEMM_AVAILABLE
+    if _GROUPED_GEMM_AVAILABLE is not None: return _GROUPED_GEMM_AVAILABLE
 
     try:
-        from unsloth.kernels.moe.grouped_gemm.interface import (
-            grouped_gemm,
-            supports_tma,
-        )
-
+        from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
         _GROUPED_GEMM_AVAILABLE = True
         _init_triton_allocator()
     except (ImportError, ModuleNotFoundError):
@@ -178,53 +168,26 @@ def select_moe_backend():
     Choices: "grouped_mm", "unsloth_triton", "native_torch".
     Default if unspecified: "grouped_mm".
     """
-    # Only allow grouped_mm (torch._grouped_mm) if transformers >= 5.0
-    try:
-        from transformers import __version__ as transformers_version
-        from packaging.version import Version
-
-        is_transformers_v5 = Version(transformers_version) >= Version("5.0.0.dev0")
-    except Exception:
-        is_transformers_v5 = False
-
     # Choices ordered by preference
-    # (backend_name, is_available)
-    choices = [
-        ("grouped_mm", _check_torch_grouped_mm_supported()),
-        ("unsloth_triton", _check_grouped_gemm_available()),
-        ("native_torch", True),
-    ]
+    choices = {
+        "grouped_mm"     : _check_torch_grouped_mm_supported(),
+        "unsloth_triton" : _check_grouped_gemm_available(),
+        "native_torch"   : True,
+    }
 
     # 1. Check environment variable
-    requested_backend = os.environ.get("UNSLOTH_MOE_BACKEND")
-
-    # User explicitly requested a backend
-    if requested_backend:
-        # Check against available choices
-        is_valid = False
-        is_available = False
-
-        for name, available in choices:
-            if name == requested_backend:
-                is_valid = True
-                is_available = available
-                break
-
-        if is_valid:
-            if is_available:
-                return requested_backend
-            else:
-                print(
-                    f"Unsloth: '{requested_backend}' backend requested but is not available. Falling back to next available."
-                )
+    requested = os.environ.get("UNSLOTH_MOE_BACKEND")
+    if requested and requested in choices:
+        if choices[requested]:
+            return requested
+        print(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
     # 2. Automatic selection (first available in preference order)
-    for name, available in choices:
+    for name, available in choices.items():
         if available:
             print(f"Unsloth: Using MoE backend '{name}'")
             return name
 
-    print("Unsloth: Using MoE backend 'native_torch' (fallback)")
     return "native_torch"
 
 
@@ -241,9 +204,7 @@ def _get_routing_indices(selected_experts, num_experts):
     flat_experts = selected_experts.view(-1)
 
     # bincount is faster than histc since it doesn't require float conversion
-    token_counts_by_expert = torch.bincount(flat_experts, minlength=num_experts).to(
-        torch.int32
-    )
+    token_counts_by_expert = torch.bincount(flat_experts, minlength=num_experts).to(torch.int32)
 
     # argsort with stable=True preserves order within each expert
     gather_indices = flat_experts.argsort(stable=True)
@@ -358,9 +319,7 @@ def _extract_lora_from_wrapper(
         num_experts = getattr(wrapper, "num_experts", 1)
 
         # GET EXPERTS MODULE TO CHECK FOR REGISTERED EXTRACTOR
-        experts_module = (
-            wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
-        )
+        experts_module = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
 
         # Check for model-specific LoRA extractor attached to the experts module
         extractor_fn = getattr(experts_module, "_unsloth_lora_extractor_fn", None)
