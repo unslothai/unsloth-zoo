@@ -23,7 +23,7 @@ import inspect
 import os
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
-from .device_type import DEVICE_TYPE
+from .device_type import DEVICE_TYPE, device_synchronize
 from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()
 
@@ -901,7 +901,7 @@ def grpo_accumulated_loss(
                 )
                 #This is needed to avoid race conditions with GPT OSS offload_embbed=True
                 #However, it seems that this line does not slow down or disrupt models. 
-                torch.cuda.synchronize()
+                device_synchronize()
             all_logprobs_list.append(logprobs_chunk)
 
     new_logprobs = torch.cat(all_logprobs_list, dim=0)
