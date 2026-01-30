@@ -1447,8 +1447,9 @@ def merge_and_overwrite_lora(
     has_embed = any(key.endswith("embed_tokens") for key in lora_weights)
     has_head  = any(key.endswith("lm_head") for key in lora_weights)
     if has_embed and has_head:
-        has_embed_tensor = any("embed_tokens" in key for key in safetensor_keys_seen)
-        has_head_tensor  = any("lm_head"      in key for key in safetensor_keys_seen)
+        # Only count actual weight tensors; lm_head.bias alone should not mask tied-embedding cases.
+        has_embed_tensor = any(key.endswith("embed_tokens.weight") for key in safetensor_keys_seen)
+        has_head_tensor  = any(key.endswith("lm_head.weight")      for key in safetensor_keys_seen)
         if has_embed_tensor ^ has_head_tensor:  # exactly one side present on disk
             effective_loras -= 1
 
