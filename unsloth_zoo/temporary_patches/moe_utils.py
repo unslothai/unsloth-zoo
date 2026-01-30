@@ -168,26 +168,22 @@ def select_moe_backend():
     Choices: "grouped_mm", "unsloth_triton", "native_torch".
     Default if unspecified: "grouped_mm".
     """
-    # Choices ordered by preference
-    choices = {
-        "grouped_mm"     : _check_torch_grouped_mm_supported(),
-        "unsloth_triton" : _check_grouped_gemm_available(),
-        "native_torch"   : True,
-    }
-
-    # 1. Check environment variable
     requested = os.environ.get("UNSLOTH_MOE_BACKEND")
-    if requested and requested in choices:
-        if choices[requested]:
-            return requested
+    if requested:
+        if requested == "grouped_mm" and _check_torch_grouped_mm_supported():
+            return "grouped_mm"
+        if requested == "unsloth_triton" and _check_grouped_gemm_available():
+            return "unsloth_triton"
+        if requested == "native_torch":
+            return "native_torch"
         print(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
-    # 2. Automatic selection (first available in preference order)
-    for name, available in choices.items():
-        if available:
-            print(f"Unsloth: Using MoE backend '{name}'")
-            return name
-
+    if _check_torch_grouped_mm_supported():
+        print("Unsloth: Using MoE backend 'grouped_mm'")
+        return "grouped_mm"
+    if _check_grouped_gemm_available():
+        print("Unsloth: Using MoE backend 'unsloth_triton'")
+        return "unsloth_triton"
     return "native_torch"
 
 
@@ -235,40 +231,15 @@ def _has_lora_adapters(param) -> bool:
     return len(param.lora_A) > 0
 
 
-def _get_shape(param):
-    """Recursively search for shape."""
-    if hasattr(param, "shape"):
-        return param.shape
-    if hasattr(param, "weight") and hasattr(param.weight, "shape"):
-        return param.weight.shape
-
-    # Check if we have parameter_name
-    param_name = getattr(param, "parameter_name", None)
-    if param_name and hasattr(param, "base_layer"):
-        # If base_layer is the module, check if it has the param
-        if hasattr(param.base_layer, param_name):
-            p = getattr(param.base_layer, param_name)
-            # Recursively check p (p might be a Tensor or another wrapper)
-            # Avoid infinite loop if p is param
-            if p is not param:
-                s = _get_shape(p)
-                if s is not None:
-                    return s
-
-    if hasattr(param, "base_layer"):
-        return _get_shape(param.base_layer)
-    return None
-
-
 def _extract_lora_from_wrapper(
     wrapper, adapter_name: str = "default"
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float, int]]:
     """
     Extract LoRA weights from PEFT ParamWrapper for MoE separated computation.
 
-    PEFT ParamWrapper for 3D parameters (E, dim1, dim2) creates:
-    - lora_A: nn.Linear(dim1, E*R) -> weight: (E*R, dim1)
-    - lora_B: nn.Linear(E*R, dim2) -> weight: (dim2, E*R)
+    PEFT ParamWrapper for 3D parameters creates:
+    - lora_A: nn.Linear(in_dim, E*R) -> weight: (E*R, in_dim)
+    - lora_B: nn.Linear(E*R, out_dim) -> weight: (out_dim, E*R)
 
     For grouped_mm: X @ first_weight @ second_weight
 
@@ -276,21 +247,21 @@ def _extract_lora_from_wrapper(
       gate_up_proj: (E, 2*I, H) - input X is (N, H), output is (N, 2*I)
       down_proj:    (E, H, I)   - input X is (N, I), output is (N, H)
 
-      For gate_up with (E, 2*I, H): dim1=2*I, dim2=H
-        lora_A: (E*R, 2*I), lora_B: (H, E*R)
+      For gate_up with (E, 2*I, H):
+        lora_A: (E*R, H), lora_B: (2*I, E*R)
         Input X (N, H) needs: X @ (E, H, R) @ (E, R, 2*I) -> (N, 2*I)
-        first_weight from lora_B: (H, E*R) -> (E, H, R)
-        second_weight from lora_A: (E*R, 2*I) -> (E, R, 2*I)
+        first_weight from lora_A: (E*R, H) -> (E, H, R) after view/permute
+        second_weight from lora_B: (2*I, E*R) -> (E, R, 2*I) after view/permute
 
     TRANSPOSED FORMAT (Qwen3-VL-MoE): weights stored as (E, in_dim, out_dim) for grouped_mm
       gate_up_proj: (E, H, 2*I) - input X is (N, H), output is (N, 2*I)
       down_proj:    (E, I, H)   - input X is (N, I), output is (N, H)
 
-      For gate_up with (E, H, 2*I): dim1=H, dim2=2*I
+      For gate_up with (E, H, 2*I):
         lora_A: (E*R, H), lora_B: (2*I, E*R)
         Input X (N, H) needs: X @ (E, H, R) @ (E, R, 2*I) -> (N, 2*I)
-        first_weight from lora_A: (E*R, H) -> (E, H, R)  [SWAPPED!]
-        second_weight from lora_B: (2*I, E*R) -> (E, R, 2*I)  [SWAPPED!]
+        first_weight from lora_A: (E*R, H) -> (E, H, R)
+        second_weight from lora_B: (2*I, E*R) -> (E, R, 2*I)
 
     Returns:
         (first_weight, second_weight, scaling, num_experts) or None
@@ -335,15 +306,12 @@ def _extract_lora_from_wrapper(
             dim2 = weight_B.shape[0]
 
             # STANDARD FORMAT (Qwen3-MoE / GLM4):
-            # Base weights are (E, out_dim, in_dim) for F.linear
-            #   gate_up (E, 2*I, H): dim1=2*I, dim2=H
-            #   Input X is (N, H), we need X @ (E, H, R) @ (E, R, 2*I)
+            # Base weights are (E, out_dim, in_dim) for F.linear.
+            # LoRA weights follow PEFT: weight_A is (E*R, in_dim), weight_B is (out_dim, E*R).
+            # We need X @ (E, in_dim, R) @ (E, R, out_dim).
 
-            # first_weight: (E, dim2, R) = (E, H, R) - from lora_B
-            # second_weight: (E, R, dim1) = (E, R, 2*I) - from lora_A
-
-            # lora_B.weight: (dim2, E*R) -> view(dim2, E, R) -> permute(1, 0, 2)
-            # first_weight (A): (E, in_dim, R)
+            # first_weight: (E, in_dim, R) - from lora_A
+            # second_weight: (E, R, out_dim) - from lora_B
             first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
             first_weight = first_weight.permute(0, 2, 1).contiguous()  # (E, dim1, R)
 
@@ -351,9 +319,9 @@ def _extract_lora_from_wrapper(
             second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
             second_weight = second_weight.permute(1, 2, 0).contiguous()  # (E, R, dim2)
         else:
-            # Non-MoE case: just return transposed weights for matmul
-            first_weight = weight_B.T  # (E*R, dim2) -> (dim2, E*R).T
-            second_weight = weight_A  # (R, dim1)
+            # Non-MoE case: return weights for X @ A.T @ B.T
+            first_weight = weight_A.T  # (dim1, R)
+            second_weight = weight_B.T  # (R, dim2)
 
         return first_weight, second_weight, scaling, num_experts
     except Exception:
@@ -370,7 +338,7 @@ def _extract_lora_weights(
     Use _extract_lora_from_wrapper directly for new code.
 
     Returns:
-        (lora_B_reshaped, lora_A_reshaped, scaling) - For (X @ B) @ A order
+        (first_weight, second_weight, scaling) for (X @ first) @ second
     """
     # Set num_experts on param if provided, so _extract_lora_from_wrapper can use it
     if num_experts is not None and not hasattr(param, "num_experts"):
@@ -379,7 +347,7 @@ def _extract_lora_weights(
     result = _extract_lora_from_wrapper(param, adapter_name)
     if result is None:
         return None
-    # Return first 3 elements (B, A, scaling) without num_experts
+    # Return first 3 elements (first_weight, second_weight, scaling) without num_experts
     return result[0], result[1], result[2]
 
 
@@ -1050,6 +1018,7 @@ def forward_triton_grouped_gemm(
     token_counts_by_expert, gather_indices = _get_routing_indices(
         top_k_index, self.num_experts
     )
+    offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
 
     # First grouped GEMM: gate_up projection
 
@@ -1101,15 +1070,10 @@ def forward_triton_grouped_gemm(
 
         # We MUST permute input for native grouped_mm manual call.
         # 1. Calculate permuted input
-        flat_top_k = top_k_index.view(-1)
-        sorted_indices = torch.argsort(flat_top_k, stable=True)
-        token_indices = sorted_indices // top_k_index.shape[1]
+        token_indices = gather_indices // top_k_index.shape[1]
         permuted_input = hidden_states[token_indices]
 
-        # 2. Calculate offsets (already have token_counts_by_expert)
-        offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
-
-        # 3. Apply LoRA
+        # 2. Apply LoRA
         # Cast weights to input dtype
         first_weight = first_weight.to(permuted_input.dtype)
         second_weight = second_weight.to(permuted_input.dtype)

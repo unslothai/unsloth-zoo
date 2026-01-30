@@ -73,7 +73,7 @@ def is_triton_kernels_available():
     return _TRITON_KERNELS_AVAILABLE
 
 
-@torch_compile(dynamic = True, fullgraph= = True)
+@torch_compile(dynamic = True, fullgraph = True)
 def swiglu_torch_forward(a, alpha, limit, dtype = None):
     a_gelu = a[..., ::2].to(torch.float32)
     if limit is not None:
