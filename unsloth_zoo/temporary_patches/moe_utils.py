@@ -426,12 +426,19 @@ def _extract_lora_weights(
 
 def _get_base_weight(param):
     """Get base weight from potentially wrapped parameter or module."""
+    if hasattr(param, "get_param"):
+        return param.get_param()
+    if hasattr(param, "parameter_name") and hasattr(param, "base_layer"):
+        base = param.base_layer
+        name = param.parameter_name
+        if hasattr(base, name):
+            return _get_base_weight(getattr(base, name))
+
     # Recursively unwrap PEFT layers
     while hasattr(param, "base_layer"):
         param = param.base_layer
-
-    if hasattr(param, "get_param"):
-        return param.get_param()
+        if hasattr(param, "get_param"):
+            return param.get_param()
 
     # Handle Modules (Linear, etc.)
     if hasattr(param, "weight"):
@@ -551,21 +558,21 @@ def preprocess_weight(
         Weight tensor in (E, in_dim, out_dim) format for grouped_mm
     """
     if model_type and model_type in _WEIGHT_PREPROCESSORS:
-        return _WEIGHT_PREPROCESSORS[model_type](weight, proj_type, hidden_dim)
+        return _WEIGHT_PREPROCESSORS[model_type](weight, proj_type, hidden_dim).contiguous()
 
     # Default preprocessing: check if transposition is needed
     if proj_type == "gate_up":
         # For gate_up, we need (E, hidden_dim, 2*intermediate)
         if weight.shape[1] == hidden_dim:
-            return weight
+            return weight.contiguous()
         else:
-            return weight.transpose(-2, -1)
+            return weight.transpose(-2, -1).contiguous()
     else:  # down
         # For down, we need (E, intermediate, hidden_dim)
         if weight.shape[2] == hidden_dim:
-            return weight
+            return weight.contiguous()
         else:
-            return weight.transpose(-2, -1)
+            return weight.transpose(-2, -1).contiguous()
 
 
 # ============================================================================
@@ -583,16 +590,26 @@ def _is_moe_experts_module(module) -> bool:
     """
     import torch.nn as nn
 
+    def _unwrap_param(p):
+        if hasattr(p, "get_param"):
+            return p.get_param()
+        if hasattr(p, "parameter_name") and hasattr(p, "base_layer"):
+            base = p.base_layer
+            name = p.parameter_name
+            if hasattr(base, name):
+                return getattr(base, name)
+        return p
+
     # Check for gate_up_proj pattern
     if hasattr(module, "gate_up_proj"):
-        param = module.gate_up_proj
-        if isinstance(param, nn.Parameter) and param.ndim == 3:
+        param = _unwrap_param(module.gate_up_proj)
+        if hasattr(param, "ndim") and param.ndim == 3:
             return True
 
     # Check for w1/w2 pattern (separate gate/up projections)
     if hasattr(module, "w1") and hasattr(module, "w2"):
-        w1 = module.w1
-        if isinstance(w1, nn.Parameter) and w1.ndim == 3:
+        w1 = _unwrap_param(module.w1)
+        if hasattr(w1, "ndim") and w1.ndim == 3:
             return True
 
     return False
@@ -851,8 +868,8 @@ def forward_native_grouped_mm(
         w1_base = _get_base_weight(self.w1)
         w3_base = _get_base_weight(self.w3)
 
-        w1 = w1_base.transpose(-2, -1)
-        w3 = w3_base.transpose(-2, -1)
+        w1 = w1_base.transpose(-2, -1).contiguous()
+        w3 = w3_base.transpose(-2, -1).contiguous()
 
         gate = torch._grouped_mm(permuted_input, w1, offs=offsets)
         up = torch._grouped_mm(permuted_input, w3, offs=offsets)
@@ -863,11 +880,11 @@ def forward_native_grouped_mm(
                 w1_lora = _extract_lora_weights(self.w1)
                 if w1_lora is not None:
                     lora_A, lora_B, scaling = w1_lora
-                    lora_A_t = lora_A.transpose(-2, -1)
+                    lora_A_t = lora_A.transpose(-2, -1).contiguous()
                     lora_A_out = torch._grouped_mm(
                         permuted_input, lora_A_t, offs=offsets
                     )
-                    lora_B_t = lora_B.transpose(-2, -1)
+                    lora_B_t = lora_B.transpose(-2, -1).contiguous()
                     lora_B_out = torch._grouped_mm(lora_A_out, lora_B_t, offs=offsets)
                     gate = gate + lora_B_out * scaling
 
@@ -875,11 +892,11 @@ def forward_native_grouped_mm(
                 w3_lora = _extract_lora_weights(self.w3)
                 if w3_lora is not None:
                     lora_A, lora_B, scaling = w3_lora
-                    lora_A_t = lora_A.transpose(-2, -1)
+                    lora_A_t = lora_A.transpose(-2, -1).contiguous()
                     lora_A_out = torch._grouped_mm(
                         permuted_input, lora_A_t, offs=offsets
                     )
-                    lora_B_t = lora_B.transpose(-2, -1)
+                    lora_B_t = lora_B.transpose(-2, -1).contiguous()
                     lora_B_out = torch._grouped_mm(lora_A_out, lora_B_t, offs=offsets)
                     up = up + lora_B_out * scaling
     else:
@@ -972,7 +989,7 @@ def forward_native_grouped_mm(
 
     elif hasattr(self, "w2"):
         w2_base = _get_base_weight(self.w2)
-        w2 = w2_base.transpose(-2, -1)
+        w2 = w2_base.transpose(-2, -1).contiguous()
 
         # Base forward
         mm2_out = torch._grouped_mm(inter, w2, offs=offsets)
@@ -982,9 +999,9 @@ def forward_native_grouped_mm(
             w2_lora = _extract_lora_weights(self.w2)
             if w2_lora is not None:
                 lora_A, lora_B, scaling = w2_lora
-                lora_A_t = lora_A.transpose(-2, -1)
+                lora_A_t = lora_A.transpose(-2, -1).contiguous()
                 lora_A_out = torch._grouped_mm(inter, lora_A_t, offs=offsets)
-                lora_B_t = lora_B.transpose(-2, -1)
+                lora_B_t = lora_B.transpose(-2, -1).contiguous()
                 lora_B_out = torch._grouped_mm(lora_A_out, lora_B_t, offs=offsets)
                 mm2_out = mm2_out + lora_B_out * scaling
     else:
@@ -1091,6 +1108,7 @@ def forward_triton_grouped_gemm(
     token_counts_by_expert, gather_indices = _get_routing_indices(
         top_k_index, self.num_experts
     )
+    offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
 
     # First grouped GEMM: gate_up projection
 
@@ -1108,10 +1126,12 @@ def forward_triton_grouped_gemm(
             self.gate_up_proj, num_experts=self.num_experts
         )
 
-    if self.gate_up_proj.shape[-1] == hidden_dim:
-        w1 = self.gate_up_proj
+    gate_up_base = _get_base_weight(self.gate_up_proj)
+    if gate_up_base.shape[-1] == hidden_dim:
+        w1 = gate_up_base
     else:
-        w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
+        w1 = gate_up_base.transpose(-2, -1)
+    w1 = w1.contiguous()
 
     # First grouped GEMM: gate_up projection
     first_gemm_output = grouped_gemm(
@@ -1147,10 +1167,7 @@ def forward_triton_grouped_gemm(
         token_indices = sorted_indices // top_k_index.shape[1]
         permuted_input = hidden_states[token_indices]
 
-        # 2. Calculate offsets (already have token_counts_by_expert)
-        offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
-
-        # 3. Apply LoRA
+        # 2. Apply LoRA
         # Cast weights to input dtype
         first_weight = first_weight.to(permuted_input.dtype)
         second_weight = second_weight.to(permuted_input.dtype)
@@ -1190,10 +1207,12 @@ def forward_triton_grouped_gemm(
     ):
         down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
 
-    if self.down_proj.shape[-1] == intermediate.shape[-1]:
-        w2 = self.down_proj
+    down_base = _get_base_weight(self.down_proj)
+    if down_base.shape[-1] == intermediate.shape[-1]:
+        w2 = down_base
     else:
-        w2 = self.down_proj.transpose(-2, -1).contiguous()
+        w2 = down_base.transpose(-2, -1)
+    w2 = w2.contiguous()
 
     second_gemm_output = grouped_gemm(
         X=intermediate,
