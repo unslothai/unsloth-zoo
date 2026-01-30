@@ -240,6 +240,15 @@ def autotune_batch_and_chunks(
     if torch.cuda.is_available():
         free_bytes, _ = torch.cuda.mem_get_info()
         limit_gb = (free_bytes / (1024**3))*.80
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        # For XPU: estimate free memory from total - reserved
+        total_mem = torch.xpu.get_device_properties(0).total_memory
+        reserved_mem = torch.xpu.memory_reserved()
+        free_bytes = total_mem - reserved_mem
+        limit_gb = (free_bytes / (1024**3)) * 0.80
+    else:
+        # Fallback: assume 8GB available
+        limit_gb = 8.0
 
     bytes_to_gb = 1024**3
 

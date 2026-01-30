@@ -20,6 +20,7 @@ __all__ = [
     "DEVICE_COUNT",
     "ALLOW_PREQUANTIZED_MODELS",
     "ALLOW_BITSANDBYTES",
+    "device_synchronize",
 ]
 
 import torch
@@ -84,4 +85,17 @@ if DEVICE_TYPE == "hip":
         ALLOW_BITSANDBYTES = Version(bitsandbytes.__version__) > Version("0.48.2.dev0")
     except:
         pass
+pass
+
+def device_synchronize():
+    """
+    Synchronize the current device (CUDA, XPU, or HIP).
+    This is a cross-platform replacement for torch.cuda.synchronize().
+    """
+    if DEVICE_TYPE in ("cuda", "hip"):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    elif DEVICE_TYPE == "xpu":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.synchronize()
 pass
