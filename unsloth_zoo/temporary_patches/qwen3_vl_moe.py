@@ -48,8 +48,6 @@ from .moe_utils import (
     patch_param_wrapper_for_moe,
 )
 
-from . import moe_utils
-
 
 def patch_qwen3_vl_moe():
     # Patch ParamWrapper.forward for MoE separated LoRA

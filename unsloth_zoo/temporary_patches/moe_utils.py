@@ -458,7 +458,6 @@ def _get_lora_wrapper_for_param(experts_module, param_name):
     return None
 
 
-# Restored from HEAD for compatibility
 def native_moe_grouped_mm(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:

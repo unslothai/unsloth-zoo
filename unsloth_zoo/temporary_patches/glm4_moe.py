@@ -25,7 +25,6 @@ from .moe_utils import (
     forward_native_moe_loop,
     patch_param_wrapper_for_moe
 )
-from . import moe_utils
 
 def patch_glm4_moe():
     """
@@ -95,11 +94,11 @@ def patch_glm4_moe():
         backend = select_moe_backend()
 
         if backend == "grouped_mm":
-            return moe_utils.forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
+            return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
         elif backend == "unsloth_triton":
-            return moe_utils.forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
+            return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
         else:
-            return moe_utils.forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
+            return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
     # 2. Patch Glm4MoeLiteMoE (The MoE Block)
     # This must be patched to delegate expert computation to naive_moe_forward instead of inlining it
