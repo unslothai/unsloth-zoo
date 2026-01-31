@@ -187,6 +187,24 @@ def select_moe_backend():
     return "native_torch"
 
 
+def forward_moe_backend(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Dispatch MoE forward to the selected backend.
+    Centralizes backend selection to keep model-specific patches minimal.
+    """
+    backend = select_moe_backend()
+    if backend == "grouped_mm":
+        return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
+    if backend == "unsloth_triton":
+        return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
+    return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
+
+
 @torch.no_grad()
 def _get_routing_indices(selected_experts, num_experts):
     """
