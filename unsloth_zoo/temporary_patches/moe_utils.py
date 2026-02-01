@@ -168,6 +168,8 @@ def select_moe_backend():
     Choices: "grouped_mm", "unsloth_triton", "native_torch".
     Default if unspecified: "grouped_mm".
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     requested = os.environ.get("UNSLOTH_MOE_BACKEND")
     if requested:
         if requested == "grouped_mm" and _check_torch_grouped_mm_supported():
@@ -197,6 +199,8 @@ def forward_moe_backend(
     Dispatch MoE forward to the selected backend.
     Centralizes backend selection to keep model-specific patches minimal.
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     backend = select_moe_backend()
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
@@ -215,6 +219,8 @@ def _get_routing_indices(selected_experts, num_experts):
         token_counts_by_expert: (num_experts,) token counts per expert
         gather_indices: (total_tokens,) indices for gathering tokens in expert order
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     flat_experts = selected_experts.view(-1)
 
     # bincount is faster than histc since it doesn't require float conversion
@@ -284,6 +290,8 @@ def _extract_lora_from_wrapper(
     Returns:
         (first_weight, second_weight, scaling, num_experts) or None
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     try:
         if not hasattr(wrapper, "lora_A") or not hasattr(wrapper, "lora_B"):
             return None
@@ -358,6 +366,8 @@ def _extract_lora_weights(
     Returns:
         (first_weight, second_weight, scaling) for (X @ first) @ second
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     # Set num_experts on param if provided, so _extract_lora_from_wrapper can use it
     if num_experts is not None and not hasattr(param, "num_experts"):
         param.num_experts = num_experts
@@ -371,6 +381,8 @@ def _extract_lora_weights(
 
 def _get_base_weight(param):
     """Get base weight from potentially wrapped parameter or module."""
+    # All Unsloth Zoo code licensed under AGPL3
+
     # Recursively unwrap PEFT layers
     while hasattr(param, "base_layer"):
         param = param.base_layer
@@ -391,6 +403,8 @@ def _get_lora_wrapper_for_param(experts_module, param_name):
     Uses the explicit key stored in __dict__ if available.
     Does NOT lazily setup wrappers as that requires traversing logic not present here.
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     if hasattr(experts_module, f"{param_name}_lora_wrapper"):
         return getattr(experts_module, f"{param_name}_lora_wrapper")
 
@@ -409,6 +423,8 @@ def native_moe_grouped_mm(
     """
     Native implementation using torch._grouped_mm.
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     return torch._grouped_mm(inputs, weight, offs=offsets)
 
 
@@ -431,6 +447,8 @@ def _apply_lora_grouped_mm(
         scaling: LoRA scaling factor
         grouped_mm_func: Function to use for grouped GEMM (default: native_moe_grouped_mm)
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     # 1. First Matmul (X @ B)
     # lora_B is (E, in_dim, R)
     # Native needs (E, in_dim, R) -> No Transpose
@@ -449,6 +467,7 @@ def _should_use_separated_lora() -> bool:
     Check if separated LoRA approach should be used (default: True).
     Set UNSLOTH_MOE_LORA_MERGED=1 to use merged approach instead.
     """
+    # All Unsloth Zoo code licensed under AGPL3
     return os.environ.get("UNSLOTH_MOE_LORA_MERGED", "0") != "1"
 
 
@@ -470,11 +489,14 @@ def register_weight_preprocessor(model_type: str, preprocessor_fn):
         preprocessor_fn: Function(weight, proj_type, hidden_dim) -> processed_weight
                         proj_type is "gate_up" or "down"
     """
+    # All Unsloth Zoo code licensed under AGPL3
     _WEIGHT_PREPROCESSORS[model_type] = preprocessor_fn
 
 
 def get_weight_preprocessor(model_type: str):
     """Get registered weight preprocessor for model type."""
+    # All Unsloth Zoo code licensed under AGPL3
+
     return _WEIGHT_PREPROCESSORS.get(model_type)
 
 
@@ -495,6 +517,8 @@ def preprocess_weight(
     Returns:
         Weight tensor in (E, in_dim, out_dim) format for grouped_mm
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     if model_type and model_type in _WEIGHT_PREPROCESSORS:
         return _WEIGHT_PREPROCESSORS[model_type](weight, proj_type, hidden_dim)
 
@@ -526,6 +550,8 @@ def _is_moe_experts_module(module) -> bool:
     - gate_up_proj/down_proj pattern (Qwen3-MoE, Qwen3-VL-MoE, etc.)
     - w1/w2/w3 pattern (older MoE models)
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     import torch.nn as nn
 
     # Check for gate_up_proj pattern
@@ -564,6 +590,8 @@ def _patched_param_wrapper_forward(
     For non-MoE modules:
     - Falls back to original PEFT forward
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     # CRITICAL: Use self.base_layer for forward call (immediate parent)
     # NOT self.get_base_layer() which recursively traverses to deepest layer!
     # The wrapper chain must be preserved: down_proj -> gate_up_proj -> Qwen3MoeExperts
@@ -634,6 +662,8 @@ def patch_param_wrapper_for_moe():
 
     This should be called after PEFT is imported.
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     global _original_param_wrapper_forward
 
     try:
@@ -662,6 +692,8 @@ def forward_native_grouped_mm(
     Uses torch._grouped_mm which is significantly faster than loop and works without Triton dependencies.
     Requires torch._grouped_mm support (verified via runtime check).
     """
+    # All Unsloth Zoo code licensed under AGPL3
+
     # Runtime safety check - defense in depth
     if not _check_torch_grouped_mm_supported():
         major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
@@ -964,6 +996,7 @@ def forward_triton_grouped_gemm(
     Grouped GEMM MoE forward pass using Triton kernels.
     Compatible with torch.compile (recommended mode="max-autotune" with cudagraph_mark_step_begin).
     """
+    # All Unsloth Zoo code licensed under AGPL3
 
     # Import grouped GEMM interface
     from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
@@ -1199,6 +1232,7 @@ def forward_native_moe_loop(
     Loop-based MoE forward pass. Loops over experts that have tokens routed to them.
     Explicitly disabled for torch.compile to prevent graph breaks/recompilation issues with dynamic control flow.
     """
+    # All Unsloth Zoo code licensed under AGPL3
     final_hidden_states = torch.zeros_like(hidden_states)
 
     # Create expert mask and find which experts have tokens

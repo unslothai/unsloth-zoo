@@ -126,7 +126,8 @@ def patch_qwen3_moe():
             return router_scores, selected_experts, router_logits
 
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            """ """
+            # All Unsloth Zoo code licensed under AGPL3
+
             is_3d = hidden_states.dim() == 3
             if is_3d:
                 batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -184,6 +185,8 @@ def patch_qwen3_moe():
 
             This extractor dynamically detects 'H' matching dim to pick the correct path.
             """
+            # All Unsloth Zoo code licensed under AGPL3
+
             total_rank = weight_A.shape[0]
             rank_per_expert = total_rank // num_experts
 
@@ -322,6 +325,8 @@ def patch_qwen3_moe():
 
             Returns only the hidden states (router_logits are recorded separately).
             """
+            # All Unsloth Zoo code licensed under AGPL3
+
             if hidden_states.dim() == 3:
                 batch_size, sequence_length, hidden_dim = hidden_states.shape
             else:
@@ -391,6 +396,8 @@ def patch_qwen3_moe():
             logits_to_keep=0,
             **kwargs,
         ):
+            # All Unsloth Zoo code licensed under AGPL3
+
             RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
             if not RETURN_HIDDEN_STATES:
