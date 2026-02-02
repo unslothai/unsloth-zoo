@@ -55,7 +55,7 @@ def _do_patch_deepseek_v3():
     Internal function that actually applies the patches.
     Returns True if successful, False otherwise.
     """
-    # All Unsloth Zoo code licensed under AGPL3
+    # This Unsloth Zoo code section is licensed under AGPL3
 
     global _patch_attempted, _patch_successful
 
@@ -199,7 +199,7 @@ def patch_deepseek_v3():
     This function attempts to patch immediately if DeepSeekV3 is available.
     If not, it sets up sys.meta_path hooks to patch when DeepSeekV3 is imported.
     """
-    # All Unsloth Zoo code licensed under AGPL3
+    # This Unsloth Zoo code section is licensed under AGPL3
 
     global _patch_attempted
 
@@ -219,7 +219,7 @@ class DeepSeekV3Finder:
     """
     Import finder that patches DeepSeekV3 when it's first imported.
     """
-    # All Unsloth Zoo code licensed under AGPL3
+    # This Unsloth Zoo code section is licensed under AGPL3
 
     def find_module(self, fullname, path=None):
         # We only care about transformers.models.deepseek_v3

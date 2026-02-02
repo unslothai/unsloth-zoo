@@ -50,7 +50,7 @@ from .moe_utils import (
 
 
 def patch_qwen3_vl_moe():
-    # All Unsloth Zoo code licensed under AGPL3
+    # This Unsloth Zoo code section is licensed under AGPL3
 
     # Patch ParamWrapper.forward for MoE separated LoRA
     patch_param_wrapper_for_moe()
@@ -210,7 +210,7 @@ def patch_qwen3_vl_moe():
             This ensures checkpoint loading works correctly, and the forward
             can use weights directly with torch._grouped_mm without transposition.
             """
-            # All Unsloth Zoo code licensed under AGPL3
+            # This Unsloth Zoo code section is licensed under AGPL3
 
             super(
                 transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts,
@@ -261,7 +261,7 @@ def patch_qwen3_vl_moe():
             - weight_A (E*R, H): Input projection. Reshape(E, R, H) -> Permute(0, 2, 1) -> (E, H, R).
             - weight_B (Out, E*R): Output projection. Reshape(Out, E, R) -> Permute(1, 2, 0) -> (E, R, Out).
             """
-            # All Unsloth Zoo code licensed under AGPL3
+            # This Unsloth Zoo code section is licensed under AGPL3
 
             total_rank = weight_A.shape[0]
             rank_per_expert = total_rank // num_experts
@@ -346,7 +346,7 @@ def patch_qwen3_vl_moe():
                 (router_logits, router_scores, router_indices)
             where router_scores are already normalized.
             """
-            # All Unsloth Zoo code licensed under AGPL3
+            # This Unsloth Zoo code section is licensed under AGPL3
 
             if hidden_states.dim() == 3:
                 batch_size, sequence_length, hidden_dim = hidden_states.shape
