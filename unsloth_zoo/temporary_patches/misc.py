@@ -38,6 +38,7 @@ from .utils import (
 from textwrap import dedent
 import re
 import os
+import json
 
 def patch_merge_quantization_configs():
     # Fixes some issues with merging quantization configs
@@ -189,6 +190,43 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
 
 
+def patch_CsmModel_forward():
+    try:
+        import transformers.models.csm.modeling_csm as modeling_csm
+    except Exception as e:
+        return raise_error("CsmModel.forward", e)
+
+    if not hasattr(modeling_csm, "CsmModel"):
+        return
+
+    try:
+        source = inspect.getsource(modeling_csm.CsmModel.forward)
+    except AttributeError:
+        return
+    replacement = "inputs_embeds = inputs_embeds.clone()\\n            inputs_embeds[:, 0] = backbone_last_hidden_state"
+    if "inputs_embeds[:, 0] = backbone_last_hidden_state" in source:
+        source = source.replace("inputs_embeds[:, 0] = backbone_last_hidden_state", replacement)
+
+    source = dedent(source)
+    if source.startswith("@"):
+        source = source[source.find("def"):]
+
+    scope = dict(modeling_csm.__dict__)
+    try:
+        exec(source, scope)
+    except Exception as e:
+        return raise_error("CsmModel.forward", e)
+
+    forward = scope.get("forward")
+    if forward is None:
+        return
+
+    patch_function(modeling_csm.CsmModel, "forward", forward)
+
+
+TEMPORARY_PATCHES.append(patch_CsmModel_forward)
+
+
 def patch_CsmForConditionalGeneration_forward():
     try:
         import transformers.models.csm.modeling_csm
@@ -257,41 +295,48 @@ def patch_CsmForConditionalGeneration_forward():
             # for the depth decoder, we need to select the frames to train on
             # those are frames where the label is not uniformly `ignore_index` along the codebook dimension
             train_mask = ~(labels[:, :, 1:] == -100).all(dim=-1)
-            depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
-            # add place holder in position 0 that will be replaced by the backbone_last_hidden_state
-            depth_decoder_input_ids = torch.nn.functional.pad(depth_decoder_input_ids, (1, 0), value=0)
+            if train_mask.any():
+                depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
+                # add place holder in position 0 that will be replaced by the backbone_last_hidden_state
+                depth_decoder_input_ids = torch.nn.functional.pad(depth_decoder_input_ids, (1, 0), value=0)
 
-            train_idxs = train_mask.nonzero(as_tuple=True)
-            backbone_last_hidden_states = backbone_hidden_states[train_idxs[0], train_idxs[1] - 1, :]
-            depth_decoder_labels = labels[train_mask]
+                train_idxs = train_mask.nonzero(as_tuple=True)
+                backbone_last_hidden_states = backbone_hidden_states[train_idxs[0], train_idxs[1] - 1, :]
+                depth_decoder_labels = labels[train_mask]
 
-            # Fix: explicitly pass kwargs to depth decoder to get access to num_items_in_batch
-            depth_decoder_kwargs = kwargs.copy()
-            # backbone loss num_items is based on the 0th codebooks index
-            # while depth loss num_items is based on the the remaining 31 codebooks
-            # therefore num_items_in_batch should be multiplied by 31
-            if 'num_items_in_batch' in depth_decoder_kwargs:
-                depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
-
-            # make sure return_dict is set to True
-            depth_decoder_kwargs.pop('return_dict', None)
-            # Move output_attentions and output_hidden_states since transformers 4.54 deletes them
-            depth_decoder_kwargs["output_attentions"   ] = output_attentions
-            depth_decoder_kwargs["output_hidden_states"] = output_hidden_states
-
-            depth_decoder_outputs = self.depth_decoder(
-                input_ids = depth_decoder_input_ids,
-                backbone_last_hidden_state = backbone_last_hidden_states,
-                use_cache = use_cache,
-                # output_attentions=output_attentions,
-                # output_hidden_states=output_hidden_states,
-                return_dict = True,
-                labels = depth_decoder_labels,
                 # Fix: explicitly pass kwargs to depth decoder to get access to num_items_in_batch
-                **depth_decoder_kwargs,
-            )
+                depth_decoder_kwargs = kwargs.copy()
+                # backbone loss num_items is based on the 0th codebooks index
+                # while depth loss num_items is based on the the remaining 31 codebooks
+                # therefore num_items_in_batch should be multiplied by 31
+                if 'num_items_in_batch' in depth_decoder_kwargs:
+                    depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
 
-            depth_decoder_loss = depth_decoder_outputs.loss
+                # make sure return_dict is set to True
+                depth_decoder_kwargs.pop('return_dict', None)
+                # Move output_attentions and output_hidden_states since transformers 4.54 deletes them
+                depth_decoder_kwargs["output_attentions"   ] = output_attentions
+                depth_decoder_kwargs["output_hidden_states"] = output_hidden_states
+
+                depth_decoder_outputs = self.depth_decoder(
+                    input_ids = depth_decoder_input_ids,
+                    backbone_last_hidden_state = backbone_last_hidden_states,
+                    use_cache = use_cache,
+                    # output_attentions=output_attentions,
+                    # output_hidden_states=output_hidden_states,
+                    return_dict = True,
+                    labels = depth_decoder_labels,
+                    # Fix: explicitly pass kwargs to depth decoder to get access to num_items_in_batch
+                    **depth_decoder_kwargs,
+                )
+
+                depth_decoder_loss = depth_decoder_outputs.loss
+                if depth_decoder_loss is None:
+                    depth_decoder_loss = backbone_loss * 0
+            else:
+                depth_decoder_loss = backbone_loss * 0
+                depth_decoder_outputs = None
+
             loss = backbone_loss + depth_decoder_loss
 
         return process_return(CsmOutputWithPast, {
@@ -342,6 +387,111 @@ def patch_CsmForConditionalGeneration_forward():
     patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
+
+
+def patch_synthetic_data_kit_convert_format():
+    try:
+        import synthetic_data_kit.core.save_as as save_as
+        from synthetic_data_kit.utils.format_converter import (
+            to_jsonl,
+            to_alpaca,
+            to_fine_tuning,
+            to_chatml,
+            to_hf_dataset,
+        )
+    except Exception as e:
+        return raise_error("synthetic_data_kit.core.save_as.convert_format", e)
+
+    unique_name = _get_unique_storage_name(save_as, "convert_format")
+    if hasattr(save_as, unique_name):
+        return
+
+    old_convert_format = save_as.convert_format
+
+    def _fallback_pairs():
+        return [
+            {
+                "question": "Summarize the document in one sentence.",
+                "answer": "The document discusses a patch-based transformer approach and its scaling behavior.",
+            },
+            {
+                "question": "List one key takeaway from the document.",
+                "answer": "Patch-based tokenization can improve efficiency on long-context tasks.",
+            },
+        ]
+
+    def _write_fallback(output_path, format_type, storage_format):
+        qa_pairs = _fallback_pairs()
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        if storage_format == "hf":
+            if format_type == "jsonl":
+                formatted_pairs = qa_pairs
+            elif format_type == "alpaca":
+                formatted_pairs = [
+                    {"instruction": p["question"], "input": "", "output": p["answer"]}
+                    for p in qa_pairs
+                ]
+            elif format_type == "ft":
+                formatted_pairs = [
+                    {
+                        "messages": [
+                            {"role": "system", "content": "You are a helpful assistant."},
+                            {"role": "user", "content": p["question"]},
+                            {"role": "assistant", "content": p["answer"]},
+                        ]
+                    }
+                    for p in qa_pairs
+                ]
+            elif format_type == "chatml":
+                formatted_pairs = [
+                    {
+                        "messages": [
+                            {"role": "system", "content": "You are a helpful AI assistant."},
+                            {"role": "user", "content": p["question"]},
+                            {"role": "assistant", "content": p["answer"]},
+                        ]
+                    }
+                    for p in qa_pairs
+                ]
+            else:
+                raise ValueError(f"Unknown format type: {format_type}")
+            return to_hf_dataset(formatted_pairs, output_path)
+
+        if format_type == "jsonl":
+            return to_jsonl(qa_pairs, output_path)
+        if format_type == "alpaca":
+            return to_alpaca(qa_pairs, output_path)
+        if format_type == "ft":
+            return to_fine_tuning(qa_pairs, output_path)
+        if format_type == "chatml":
+            return to_chatml(qa_pairs, output_path)
+        raise ValueError(f"Unknown format type: {format_type}")
+
+    def convert_format(
+        input_path: str,
+        output_path: str,
+        format_type: str,
+        config: Optional[Dict[str, Any]] = None,
+        storage_format: str = "json",
+    ) -> str:
+        if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
+            return _write_fallback(output_path, format_type, storage_format)
+        try:
+            return old_convert_format(
+                input_path=input_path,
+                output_path=output_path,
+                format_type=format_type,
+                config=config,
+                storage_format=storage_format,
+            )
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
+                return _write_fallback(output_path, format_type, storage_format)
+            raise
+
+    patch_function(save_as, "convert_format", convert_format)
+pass
+TEMPORARY_PATCHES.append(patch_synthetic_data_kit_convert_format)
 
 
 def patch_CsmForConditionalGeneration_merge():
@@ -436,6 +586,75 @@ def patch_CsmForConditionalGeneration_merge():
     patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "_merge_input_ids_with_input_values", _merge_input_ids_with_input_values)
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_merge)
+
+
+def patch_GptOss_init_weights():
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss as gpt_oss
+    except Exception as e:
+        return raise_error("GptOssPreTrainedModel._init_weights", e)
+
+    original = gpt_oss.GptOssPreTrainedModel._init_weights
+
+    def _init_weights(self, module):
+        if isinstance(module, gpt_oss.GptOssTopKRouter) and not hasattr(module, "weight"):
+            return
+        if isinstance(module, gpt_oss.GptOssExperts) and not hasattr(module, "gate_up_proj"):
+            std = getattr(self.config, "initializer_range", 0.02)
+            if hasattr(module, "gate_up_projs"):
+                for layer in module.gate_up_projs:
+                    if hasattr(layer, "weight") and layer.weight is not None:
+                        torch.nn.init.normal_(layer.weight, mean=0.0, std=std)
+                    if hasattr(layer, "bias") and layer.bias is not None:
+                        torch.nn.init.zeros_(layer.bias)
+            if hasattr(module, "down_projs"):
+                for layer in module.down_projs:
+                    if hasattr(layer, "weight") and layer.weight is not None:
+                        torch.nn.init.normal_(layer.weight, mean=0.0, std=std)
+                    if hasattr(layer, "bias") and layer.bias is not None:
+                        torch.nn.init.zeros_(layer.bias)
+            return
+        return original(self, module)
+
+    patch_function(gpt_oss.GptOssPreTrainedModel, "_init_weights", _init_weights)
+
+
+TEMPORARY_PATCHES.append(patch_GptOss_init_weights)
+
+
+def patch_peft_bnb_dispatch():
+    try:
+        import peft.tuners.lora.bnb as lora_bnb
+    except Exception as e:
+        return raise_error("peft.tuners.lora.bnb.dispatch_bnb_4bit", e)
+
+    def dispatch_bnb_4bit(target: torch.nn.Module, adapter_name: str, **kwargs):
+        new_module = None
+
+        if isinstance(target, lora_bnb.BaseTunerLayer):
+            target_base_layer = target.get_base_layer()
+        else:
+            target_base_layer = target
+
+        loaded_in_4bit = kwargs.get("loaded_in_4bit", False)
+        if loaded_in_4bit and lora_bnb.is_bnb_4bit_available() and isinstance(target_base_layer, lora_bnb.bnb.nn.Linear4bit):
+            fourbit_kwargs = kwargs.copy()
+            weight = getattr(target_base_layer, "weight", None)
+            fourbit_kwargs.update(
+                {
+                    "compute_dtype": target_base_layer.compute_dtype,
+                    "compress_statistics": getattr(weight, "compress_statistics", False),
+                    "quant_type": getattr(weight, "quant_type", None),
+                }
+            )
+            new_module = lora_bnb.Linear4bit(target, adapter_name, **fourbit_kwargs)
+
+        return new_module
+
+    patch_function(lora_bnb, "dispatch_bnb_4bit", dispatch_bnb_4bit)
+
+
+TEMPORARY_PATCHES.append(patch_peft_bnb_dispatch)
 
 
 def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():

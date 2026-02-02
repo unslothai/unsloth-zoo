@@ -522,6 +522,25 @@ def create_new_function(
             f"{new_source}"
     pass
 
+    # Fix invalid signatures like: def fn(..., kwargs, **kwargs): -> rename param + alias
+    if "**kwargs" in new_source:
+        sig_match = re.search(r"(def\\s+[^\\(]+\\([^\\)]*)", new_source, flags=re.DOTALL)
+        if sig_match:
+            sig_text = sig_match.group(1)
+            replaced_sig = re.sub(
+                r"(?<!\\*)\\bkwargs\\b(\\s*=\\s*[^,\\n\\)]*)?(?=\\s*,\\s*\\*\\*kwargs)",
+                "kwargs_",
+                sig_text,
+                count=1,
+            )
+            if replaced_sig != sig_text:
+                new_source = new_source.replace(sig_text, replaced_sig, 1)
+                def_match = re.search(r"def\\s+[^\\(]+\\([^\\)]*\\):", new_source, flags=re.DOTALL)
+                if def_match:
+                    insert_at = def_match.end()
+                    new_source = new_source[:insert_at] + "\\n    kwargs = kwargs_\\n" + new_source[insert_at:]
+    pass
+
     # Import items to make the function executable
     items = [x for x in functions if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))]
     # Patch for SiglipEncoder and others
