@@ -524,7 +524,8 @@ def create_new_function(
 
     # Fix invalid signatures like: def fn(..., kwargs, **kwargs): -> rename param + alias
     if "**kwargs" in new_source:
-        sig_match = re.search(r"(def\s+[^(]+\([^)]*)", new_source, flags=re.DOTALL)
+        sig_pattern = r"(def\s+[^(]+\((?:[^()]++|(?P<par>\((?:[^()]++|(?P>par))*\)))*\))"
+        sig_match = regex.search(sig_pattern, new_source, flags=regex.DOTALL)
         if sig_match:
             sig_text = sig_match.group(1)
             replaced_sig = re.sub(
@@ -535,7 +536,8 @@ def create_new_function(
             )
             if replaced_sig != sig_text:
                 new_source = new_source.replace(sig_text, replaced_sig, 1)
-                def_match = re.search(r"def\s+[^(]+\([^)]*\):", new_source, flags=re.DOTALL)
+                def_pattern = r"def\s+[^(]+\((?:[^()]++|(?P<par>\((?:[^()]++|(?P>par))*\)))*\)\s*:"
+                def_match = regex.search(def_pattern, new_source, flags=regex.DOTALL)
                 if def_match:
                     insert_at = def_match.end()
                     new_source = new_source[:insert_at] + "\n    kwargs = kwargs_\n" + new_source[insert_at:]
