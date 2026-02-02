@@ -26,6 +26,10 @@ import time
 from typing import Any, Optional, List, Dict, Tuple
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
+from .gradient_checkpointing import (
+    unpatch_unsloth_gradient_checkpointing,
+    unpatch_unsloth_smart_gradient_checkpointing,
+)
 import os
 import re
 
@@ -192,6 +196,10 @@ def prepare_model_for_training(
     pass
 
     # Gradient checkpointing
+    # If the user requested vanilla GC (True/False), ensure any prior Unsloth patch is undone.
+    if use_gradient_checkpointing != "unsloth":
+        unpatch_unsloth_gradient_checkpointing()
+        unpatch_unsloth_smart_gradient_checkpointing()
     m = model
     while hasattr(m, "model"):
         if use_gradient_checkpointing == "unsloth":
