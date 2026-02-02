@@ -589,101 +589,6 @@ def _process_param_tokens(param_tokens):
 
     return new_tokens, replacement
 
-def _consume_type_params(tokens, i, out_tokens):
-    if i >= len(tokens) or tokens[i].string != "[":
-        return i
-    depth = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        out_tokens.append(tok)
-        if tok.string == "[":
-            depth += 1
-        elif tok.string == "]":
-            depth -= 1
-            if depth == 0:
-                i += 1
-                break
-        i += 1
-    return i
-
-def _find_def_colon_token(tokens, func_name):
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok.type == tokenize.NAME and tok.string == "def":
-            j = i + 1
-            while j < len(tokens) and tokens[j].type in _SKIP_TOKENS:
-                j += 1
-            if j < len(tokens) and tokens[j].type == tokenize.NAME and tokens[j].string == func_name:
-                def_tok = tok
-                k = j + 1
-                while k < len(tokens) and tokens[k].type in _SKIP_TOKENS:
-                    k += 1
-                k = _consume_type_params(tokens, k, [])
-                while k < len(tokens) and tokens[k].type in _SKIP_TOKENS:
-                    k += 1
-                if k >= len(tokens) or tokens[k].string != "(":
-                    i = k
-                    continue
-                paren_depth = 0
-                while k < len(tokens):
-                    t = tokens[k]
-                    if t.string == "(":
-                        paren_depth += 1
-                    elif t.string == ")":
-                        paren_depth -= 1
-                        if paren_depth == 0:
-                            k += 1
-                            break
-                    k += 1
-                while k < len(tokens):
-                    t = tokens[k]
-                    if t.string == ":":
-                        return def_tok, t
-                    if t.type in (tokenize.NEWLINE, tokenize.NL, tokenize.ENDMARKER):
-                        break
-                    k += 1
-        i += 1
-    return None, None
-
-def _insert_inline_kwargs_alias(source: str, func_name: str, replacement: str):
-    try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
-    except Exception:
-        return source
-    def_tok, colon_tok = _find_def_colon_token(tokens, func_name)
-    if colon_tok is None or def_tok is None:
-        return source
-
-    lines = source.splitlines(True)
-    def_line_index = def_tok.start[0] - 1
-    if def_line_index < 0 or def_line_index >= len(lines):
-        return source
-    def_line = lines[def_line_index]
-    indent_prefix = def_line[:len(def_line) - len(def_line.lstrip())]
-    body_indent = indent_prefix + "    "
-
-    line_index = colon_tok.end[0] - 1
-    if line_index < 0 or line_index >= len(lines):
-        return source
-    line = lines[line_index]
-
-    suffix = line[colon_tok.end[1]:]
-    stripped = suffix.lstrip()
-    if stripped == "" or stripped.startswith("#"):
-        return source
-
-    header = line[:colon_tok.end[1]].rstrip()
-    suite = stripped.rstrip("\r\n")
-
-    new_block = (
-        header + "\n" +
-        body_indent + f"kwargs = {replacement}\n" +
-        body_indent + suite + "\n"
-    )
-    lines[line_index] = new_block
-    return "".join(lines)
-
 def _rewrite_kwargs_param(source: str, func_name: str):
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
@@ -702,10 +607,6 @@ def _rewrite_kwargs_param(source: str, func_name: str):
             if j < len(tokens) and tokens[j].type == tokenize.NAME and tokens[j].string == func_name:
                 out_tokens.extend(tokens[i : j + 1])
                 i = j + 1
-                while i < len(tokens) and tokens[i].type in _SKIP_TOKENS:
-                    out_tokens.append(tokens[i])
-                    i += 1
-                i = _consume_type_params(tokens, i, out_tokens)
                 while i < len(tokens) and tokens[i].type in _SKIP_TOKENS:
                     out_tokens.append(tokens[i])
                     i += 1
@@ -751,10 +652,6 @@ def _insert_kwargs_alias(source: str, func_name: str, replacement: str):
     if any(line.strip() == alias_line for line in lines):
         return source
 
-    inline_source = _insert_inline_kwargs_alias(source, func_name, replacement)
-    if inline_source != source:
-        return inline_source
-
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -768,6 +665,8 @@ def _insert_kwargs_alias(source: str, func_name: str, replacement: str):
         return source
 
     first_stmt = target.body[0]
+    if first_stmt.lineno == target.lineno:
+        return source
     if (
         isinstance(first_stmt, ast.Expr)
         and isinstance(getattr(first_stmt, "value", None), ast.Constant)
