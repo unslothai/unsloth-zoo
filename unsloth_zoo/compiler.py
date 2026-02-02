@@ -528,6 +528,7 @@ def _process_param_tokens(param_tokens):
     chunks = []
     current = []
     depth_paren = depth_brack = depth_brace = 0
+    lambda_params = 0
     for idx, tok in enumerate(param_tokens):
         if tok.string == "(":
             depth_paren += 1
@@ -541,7 +542,23 @@ def _process_param_tokens(param_tokens):
             depth_brace += 1
         elif tok.string == "}":
             depth_brace -= 1
-        if tok.string == "," and depth_paren == depth_brack == depth_brace == 0:
+        if (
+            tok.type == tokenize.NAME
+            and tok.string == "lambda"
+            and depth_paren == depth_brack == depth_brace == 0
+        ):
+            lambda_params += 1
+        elif (
+            tok.string == ":"
+            and lambda_params > 0
+            and depth_paren == depth_brack == depth_brace == 0
+        ):
+            lambda_params = max(lambda_params - 1, 0)
+        if (
+            tok.string == ","
+            and depth_paren == depth_brack == depth_brace == 0
+            and lambda_params == 0
+        ):
             chunks.append(current)
             current = []
             continue
