@@ -528,12 +528,24 @@ def create_new_function(
         sig_match = regex.search(sig_pattern, new_source, flags=regex.DOTALL)
         if sig_match:
             sig_text = sig_match.group(1)
-            replaced_sig = re.sub(
-                r"(?<!\*)\bkwargs\b(\s*=\s*[^,\n\)]*)?(?=\s*,\s*\*\*kwargs)",
-                "kwargs_",
-                sig_text,
-                count=1,
-            )
+            kw_default_pattern = r"""
+                (?P<default>
+                    \s*=\s*
+                    (?:
+                        [^()\[\]{},\n]+
+                        | (?P<par>\((?:[^()]++|(?P>par))*\))
+                        | (?P<brack>\[(?:[^\[\]]++|(?P>brack))*\])
+                        | (?P<brace>\{(?:[^{}]++|(?P>brace))*\})
+                    )*
+                )?
+            """
+            kw_pattern = rf"(?<!\*)\bkwargs\b{kw_default_pattern}(?=\s*,\s*\*\*kwargs)"
+            kw_match = regex.search(kw_pattern, sig_text, flags=regex.DOTALL | regex.VERBOSE)
+            if kw_match:
+                default = kw_match.group("default") or ""
+                replaced_sig = sig_text[:kw_match.start()] + "kwargs_" + default + sig_text[kw_match.end():]
+            else:
+                replaced_sig = sig_text
             if replaced_sig != sig_text:
                 new_source = new_source.replace(sig_text, replaced_sig, 1)
                 def_pattern = r"def\s+[^(]+\((?:[^()]++|(?P<par>\((?:[^()]++|(?P>par))*\)))*\)\s*:"
