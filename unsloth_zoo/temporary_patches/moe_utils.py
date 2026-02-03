@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import os
 import shutil
 from typing import Optional, Tuple
+from torch.autograd import Function
 
 # Get compile location
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
@@ -52,6 +53,51 @@ def install_to_cache(source_path, destination_filename=None):
 
 install_to_cache(__file__, "moe_utils.py")
 
+# ============================================================================
+# Custom grouped_mm with working backward pass
+# ============================================================================
+_ORIGINAL_TORCH_GROUPED_MM = torch._grouped_mm if hasattr(torch, "_grouped_mm") else None
+
+
+class _GroupedMMFunction(Function):
+    @staticmethod
+    def forward(ctx, x, w, offsets):
+        x = x.contiguous()
+        w = w.contiguous()
+        impl = _ORIGINAL_TORCH_GROUPED_MM or torch._grouped_mm
+        out = impl(x, w, offs=offsets)
+        ctx.save_for_backward(x, w, offsets)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, w, offsets = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        offsets_list = offsets.cpu().tolist()
+
+        grad_x = grad_w = None
+
+        if ctx.needs_input_grad[0]:
+            grad_x = torch.empty_like(x)
+            prev = 0
+            for i, end in enumerate(offsets_list):
+                if prev < end:
+                    grad_x[prev:end] = torch.mm(grad_output[prev:end], w[i].t())
+                prev = end
+
+        if ctx.needs_input_grad[1]:
+            grad_w = torch.zeros_like(w)
+            prev = 0
+            for i, end in enumerate(offsets_list):
+                if prev < end:
+                    grad_w[i] = torch.mm(x[prev:end].t(), grad_output[prev:end])
+                prev = end
+
+        return grad_x, grad_w, None
+
+
+def _grouped_mm_with_backward_fix(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    return _GroupedMMFunction.apply(inputs, weight, offsets)
 
 # Global flag to check if grouped GEMM is available
 _GROUPED_GEMM_AVAILABLE = None
@@ -257,7 +303,7 @@ def _has_lora_adapters(param) -> bool:
 
 
 def _extract_lora_from_wrapper(
-    wrapper, adapter_name: str = "default"
+    wrapper, adapter_name: str = "default", experts_module=None
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float, int]]:
     """
     Extract LoRA weights from PEFT ParamWrapper for MoE separated computation.
@@ -317,7 +363,8 @@ def _extract_lora_from_wrapper(
         num_experts = getattr(wrapper, "num_experts", 1)
 
         # GET EXPERTS MODULE TO CHECK FOR REGISTERED EXTRACTOR
-        experts_module = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
+        if experts_module is None:
+             experts_module = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
 
         # Check for model-specific LoRA extractor attached to the experts module
         extractor_fn = getattr(experts_module, "_unsloth_lora_extractor_fn", None)
@@ -356,7 +403,7 @@ def _extract_lora_from_wrapper(
 
 
 def _extract_lora_weights(
-    param, adapter_name: str = "default", num_experts: int = None
+    param, adapter_name: str = "default", num_experts: int = None, experts_module=None
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
     """
     Extract LoRA A and B weights from PEFT ParamWrapper.
@@ -373,7 +420,7 @@ def _extract_lora_weights(
     if num_experts is not None and not hasattr(param, "num_experts"):
         param.num_experts = num_experts
 
-    result = _extract_lora_from_wrapper(param, adapter_name)
+    result = _extract_lora_from_wrapper(param, adapter_name, experts_module=experts_module)
     if result is None:
         return None
     # Return first 3 elements (first_weight, second_weight, scaling) without num_experts
@@ -422,9 +469,11 @@ def native_moe_grouped_mm(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
     """
-    Native implementation using torch._grouped_mm.
+    Native implementation using grouped_mm with backward fix.
+
+    Uses custom autograd function to avoid PyTorch's grouped_mm backward stride bug.
     """
-    return torch._grouped_mm(inputs, weight, offs=offsets)
+    return _grouped_mm_with_backward_fix(inputs, weight, offsets)
 
 
 def _apply_lora_grouped_mm(
@@ -739,7 +788,7 @@ def forward_native_grouped_mm(
         and _has_lora_adapters(self.gate_up_proj)
     ):
         gate_up_lora = _extract_lora_weights(
-            self.gate_up_proj, num_experts=self.num_experts
+            self.gate_up_proj, num_experts=self.num_experts, experts_module=self
         )
 
     if hasattr(self, "gate_up_proj"):
@@ -750,10 +799,11 @@ def forward_native_grouped_mm(
         model_type = getattr(self, "_unsloth_model_type", None)
 
         # Handle different weight shapes using preprocessor
-        w1 = preprocess_weight(gate_up_base, "gate_up", hidden_dim, model_type)
+        # torch._grouped_mm backward requires weights to be contiguous; preprocessing may return a transposed view.
+        w1 = preprocess_weight(gate_up_base, "gate_up", hidden_dim, model_type).contiguous()
 
         # Base forward: X @ W
-        mm1_out = torch._grouped_mm(permuted_input, w1, offs=offsets)
+        mm1_out = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
 
         # Add separated LoRA contribution: + ((X @ first) @ second) * scaling
         # _extract_lora_from_wrapper returns (first_weight, second_weight, scaling)
@@ -767,7 +817,7 @@ def forward_native_grouped_mm(
 
             # Step 1: permuted_input @ first_weight
             try:
-                lora_out = torch._grouped_mm(permuted_input, first_weight, offs=offsets)
+                lora_out = _grouped_mm_with_backward_fix(permuted_input, first_weight, offsets)
                 lora_out = lora_out.contiguous()
             except RuntimeError as e:
                 raise e
@@ -780,13 +830,13 @@ def forward_native_grouped_mm(
                     second_weight_padded = F.pad(
                         second_weight, (0, pad_size)
                     ).contiguous()
-                    lora_delta = torch._grouped_mm(
-                        lora_out, second_weight_padded, offs=offsets
+                    lora_delta = _grouped_mm_with_backward_fix(
+                        lora_out, second_weight_padded, offsets
                     )
                     lora_delta = lora_delta[:, :-pad_size]
                 else:
-                    lora_delta = torch._grouped_mm(
-                        lora_out, second_weight, offs=offsets
+                    lora_delta = _grouped_mm_with_backward_fix(
+                        lora_out, second_weight, offsets
                     )
             except RuntimeError:
                 # Fallback to manual loop if grouped_mm fails (e.g. stride alignment)
@@ -823,36 +873,36 @@ def forward_native_grouped_mm(
         w1_base = _get_base_weight(self.w1)
         w3_base = _get_base_weight(self.w3)
 
-        w1 = w1_base.transpose(-2, -1)
-        w3 = w3_base.transpose(-2, -1)
+        w1 = w1_base.transpose(-2, -1).contiguous()
+        w3 = w3_base.transpose(-2, -1).contiguous()
 
-        gate = torch._grouped_mm(permuted_input, w1, offs=offsets)
-        up = torch._grouped_mm(permuted_input, w3, offs=offsets)
+        gate = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
+        up = _grouped_mm_with_backward_fix(permuted_input, w3, offsets)
 
         # Add LoRA for w1 and w3 separately if present
         if use_separated_lora:
             if _has_lora_adapters(self.w1):
-                w1_lora = _extract_lora_weights(self.w1)
+                w1_lora = _extract_lora_weights(self.w1, experts_module=self)
                 if w1_lora is not None:
                     lora_A, lora_B, scaling = w1_lora
-                    lora_A_t = lora_A.transpose(-2, -1)
-                    lora_A_out = torch._grouped_mm(
-                        permuted_input, lora_A_t, offs=offsets
+                    lora_A_t = lora_A.transpose(-2, -1).contiguous()
+                    lora_A_out = _grouped_mm_with_backward_fix(
+                        permuted_input, lora_A_t, offsets
                     )
-                    lora_B_t = lora_B.transpose(-2, -1)
-                    lora_B_out = torch._grouped_mm(lora_A_out, lora_B_t, offs=offsets)
+                    lora_B_t = lora_B.transpose(-2, -1).contiguous()
+                    lora_B_out = _grouped_mm_with_backward_fix(lora_A_out, lora_B_t, offsets)
                     gate = gate + lora_B_out * scaling
 
             if _has_lora_adapters(self.w3):
-                w3_lora = _extract_lora_weights(self.w3)
+                w3_lora = _extract_lora_weights(self.w3, experts_module=self)
                 if w3_lora is not None:
                     lora_A, lora_B, scaling = w3_lora
-                    lora_A_t = lora_A.transpose(-2, -1)
-                    lora_A_out = torch._grouped_mm(
-                        permuted_input, lora_A_t, offs=offsets
+                    lora_A_t = lora_A.transpose(-2, -1).contiguous()
+                    lora_A_out = _grouped_mm_with_backward_fix(
+                        permuted_input, lora_A_t, offsets
                     )
-                    lora_B_t = lora_B.transpose(-2, -1)
-                    lora_B_out = torch._grouped_mm(lora_A_out, lora_B_t, offs=offsets)
+                    lora_B_t = lora_B.transpose(-2, -1).contiguous()
+                    lora_B_out = _grouped_mm_with_backward_fix(lora_A_out, lora_B_t, offsets)
                     up = up + lora_B_out * scaling
     else:
         raise AttributeError("MoE layer must have 'gate_up_proj' or 'w1'/'w3'.")
@@ -886,7 +936,7 @@ def forward_native_grouped_mm(
         and hasattr(self, "down_proj")
         and _has_lora_adapters(self.down_proj)
     ):
-        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
+        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts, experts_module=self)
 
     if hasattr(self, "down_proj"):
         # Get base weights
@@ -896,10 +946,10 @@ def forward_native_grouped_mm(
         model_type = getattr(self, "_unsloth_model_type", None)
 
         # Handle different weight shapes using preprocessor
-        w2 = preprocess_weight(down_base, "down", hidden_dim, model_type)
+        w2 = preprocess_weight(down_base, "down", hidden_dim, model_type).contiguous()
 
         # Base forward
-        mm2_out = torch._grouped_mm(inter, w2, offs=offsets)
+        mm2_out = _grouped_mm_with_backward_fix(inter, w2, offsets)
 
         # Add separated LoRA contribution if present
         # _extract_lora_from_wrapper returns (first_weight, second_weight, scaling)
@@ -911,12 +961,12 @@ def forward_native_grouped_mm(
             second_weight = second_weight.to(inter.dtype).contiguous()
 
             # Step 1: inter @ first_weight
-            lora_out = torch._grouped_mm(inter, first_weight, offs=offsets)
+            lora_out = _grouped_mm_with_backward_fix(inter, first_weight, offsets)
             lora_out = lora_out.contiguous()
 
             # Step 2: result @ second_weight
             try:
-                lora_delta = torch._grouped_mm(lora_out, second_weight, offs=offsets)
+                lora_delta = _grouped_mm_with_backward_fix(lora_out, second_weight, offsets)
             except RuntimeError:
                 # Fallback to manual loop
                 lora_delta = torch.empty(
@@ -944,20 +994,20 @@ def forward_native_grouped_mm(
 
     elif hasattr(self, "w2"):
         w2_base = _get_base_weight(self.w2)
-        w2 = w2_base.transpose(-2, -1)
+        w2 = w2_base.transpose(-2, -1).contiguous()
 
         # Base forward
-        mm2_out = torch._grouped_mm(inter, w2, offs=offsets)
+        mm2_out = _grouped_mm_with_backward_fix(inter, w2, offsets)
 
         # Add LoRA if present
         if use_separated_lora and _has_lora_adapters(self.w2):
-            w2_lora = _extract_lora_weights(self.w2)
+            w2_lora = _extract_lora_weights(self.w2, experts_module=self)
             if w2_lora is not None:
                 lora_A, lora_B, scaling = w2_lora
-                lora_A_t = lora_A.transpose(-2, -1)
-                lora_A_out = torch._grouped_mm(inter, lora_A_t, offs=offsets)
-                lora_B_t = lora_B.transpose(-2, -1)
-                lora_B_out = torch._grouped_mm(lora_A_out, lora_B_t, offs=offsets)
+                lora_A_t = lora_A.transpose(-2, -1).contiguous()
+                lora_A_out = _grouped_mm_with_backward_fix(inter, lora_A_t, offsets)
+                lora_B_t = lora_B.transpose(-2, -1).contiguous()
+                lora_B_out = _grouped_mm_with_backward_fix(lora_A_out, lora_B_t, offsets)
                 mm2_out = mm2_out + lora_B_out * scaling
     else:
         raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
@@ -1079,7 +1129,7 @@ def forward_triton_grouped_gemm(
         and _has_lora_adapters(self.gate_up_proj)
     ):
         gate_up_lora = _extract_lora_weights(
-            self.gate_up_proj, num_experts=self.num_experts
+            self.gate_up_proj, num_experts=self.num_experts, experts_module=self
         )
 
     if self.gate_up_proj.shape[-1] == hidden_dim:
@@ -1157,7 +1207,7 @@ def forward_triton_grouped_gemm(
         and hasattr(self, "down_proj")
         and _has_lora_adapters(self.down_proj)
     ):
-        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
+        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts, experts_module=self)
 
     if self.down_proj.shape[-1] == intermediate.shape[-1]:
         w2 = self.down_proj

@@ -169,90 +169,117 @@ def patch_qwen3_moe():
         # ====================================================================
 
         # Robust LoRA Extractor for Qwen3-MoE
-        def _qwen3_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+        def _qwen3_lora_extractor(self, wrapper, weight_A, weight_B, scaling, num_experts):
             """
-            Robust extractor for Qwen3-MoE that detects dimension layouts.
+            Robust extractor for Qwen3-MoE that handles PEFT's dimension layout.
 
             Expectation for grouped_mm:
-            - first_weight:  (E, H, R)   [Input computation]
-            - second_weight: (E, R, Out) [Output computation]
+            - first_weight:  (E, in_dim, R)   [Input projection to rank]
+            - second_weight: (E, R, out_dim)  [Rank projection to output]
 
-            Qwen3-MoE models may have different PEFT wrappings:
-            1. Standard: lora_A (in->R) connects to H. Shape (E*R, H).
-               Needs: View(E, R, H) -> Permute(0, 2, 1) -> (E, H, R).
-            2. Swapped:  lora_B (R->in) connects to H. Shape (H, E*R).
-               Needs: View(H, E, R) -> Permute(1, 0, 2) -> (E, H, R).
+            PEFT wraps 3D parameters (E, out_dim, in_dim) with swapped in_features/out_features.
+            This means the LoRA A/B weights have dimensions that don't match the actual
+            computation flow. We need to detect the parameter type and reshape accordingly.
 
-            This extractor dynamically detects 'H' matching dim to pick the correct path.
+            For gate_up_proj: input=hidden_dim, output=2*intermediate_dim
+            For down_proj: input=intermediate_dim, output=hidden_dim
             """
             # This Unsloth Zoo code section is licensed under AGPL3
 
             total_rank = weight_A.shape[0]
             rank_per_expert = total_rank // num_experts
 
-            # Get dimensions
-            # weight_A: (E*R, dim_A)
-            # weight_B: (dim_B, E*R)
+            # Get dimensions from weights
+            # weight_A: (E*R, dim_A) - PEFT's lora_A.weight
+            # weight_B: (dim_B, E*R) - PEFT's lora_B.weight
             dim_A = weight_A.shape[1]
             dim_B = weight_B.shape[0]
 
-            # Try to get hidden_dim from the experts module
+            # Get model dimensions from the experts module
             hidden_dim = None
-            experts_module = getattr(wrapper, "base_layer", None)
-            # Traverse base_layer until we find the experts module which might have hidden_dim
+            intermediate_dim = None
             current = wrapper
             while hasattr(current, "base_layer"):
                 current = current.base_layer
                 if hasattr(current, "hidden_dim"):
                     hidden_dim = current.hidden_dim
-                    break
+                if hasattr(current, "intermediate_dim"):
+                    intermediate_dim = current.intermediate_dim
 
-            # If hidden_dim found, use it to disambiguate
-            # gate_up input is hidden_dim.
+            # Get parameter name to determine which projection we're handling
+            param_name = getattr(wrapper, "parameter_name", None)
+
+            # Handle based on parameter type
+            if param_name == "down_proj" and intermediate_dim is not None and hidden_dim is not None:
+                # down_proj: input=intermediate_dim (768), output=hidden_dim (2048)
+                # But PEFT set up LoRA backwards:
+                #   lora_A: (E*R, hidden_dim)     - actually connects to output
+                #   lora_B: (intermediate_dim, E*R) - actually connects to input
+                # We need to SWAP A and B!
+
+                # first_weight should be (E, intermediate_dim, R) for input
+                # Use weight_B which has intermediate_dim
+                # weight_B: (intermediate_dim, E*R) -> view(I, E, R) -> permute(1,0,2) -> (E, I, R)
+                first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+                first_weight = first_weight.permute(1, 0, 2).contiguous()
+
+                # second_weight should be (E, R, hidden_dim) for output
+                # Use weight_A which has hidden_dim
+                # weight_A: (E*R, hidden_dim) -> view(E, R, H) -> (E, R, H)
+                second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+                # Already in correct shape (E, R, out)
+
+                return first_weight, second_weight, scaling, num_experts
+
+            elif param_name == "gate_up_proj" and hidden_dim is not None:
+                # gate_up_proj: input=hidden_dim (2048), output=2*intermediate_dim (1536)
+                # PEFT set up:
+                #   lora_A: (E*R, 2*intermediate_dim) - connects to output
+                #   lora_B: (hidden_dim, E*R)         - connects to input
+                # Also swapped! Use B for first_weight, A for second_weight
+
+                # first_weight should be (E, hidden_dim, R) for input
+                # weight_B: (hidden_dim, E*R) -> view(H, E, R) -> permute(1,0,2) -> (E, H, R)
+                first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+                first_weight = first_weight.permute(1, 0, 2).contiguous()
+
+                # second_weight should be (E, R, 2*intermediate_dim) for output
+                # weight_A: (E*R, 2*I) -> view(E, R, 2*I) -> (E, R, 2*I)
+                second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+
+                return first_weight, second_weight, scaling, num_experts
+
+            # Fallback: try dimension-based detection
             if hidden_dim is not None:
-                # Check which weight connects to hidden_dim
+                # Check if B connects to hidden_dim (swapped case)
+                if dim_B == hidden_dim:
+                    # first_weight from B
+                    first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+                    first_weight = first_weight.permute(1, 0, 2).contiguous()
 
-                # Case 1: Standard/GLM4-like (lora_A connects to input/hidden_dim)
-                # lora_A: (R, hidden_dim) -> weight_A: (E*R, hidden_dim)
-                if dim_A == hidden_dim:
+                    # second_weight from A
+                    second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+
+                    return first_weight, second_weight, scaling, num_experts
+
+                # Check if A connects to hidden_dim (standard case)
+                elif dim_A == hidden_dim:
                     # first_weight from A
-                    # weight_A (E*R, H) -> view(E, R, H) -> permute(0, 2, 1) -> (E, H, R)
                     first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
                     first_weight = first_weight.permute(0, 2, 1).contiguous()
 
                     # second_weight from B
-                    # weight_B (2I, E*R) -> view(2I, E, R) -> permute(1, 2, 0) -> (E, R, 2I)
                     second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
                     second_weight = second_weight.permute(1, 2, 0).contiguous()
 
                     return first_weight, second_weight, scaling, num_experts
 
-                # Case 2: Swapped/Old PEFT (lora_B connects to input/hidden_dim)
-                # lora_B: (hidden_dim, R) -> weight_B: (hidden_dim, E*R)
-                elif dim_B == hidden_dim:
-                     # first_weight from B
-                     # weight_B (H, E*R) -> view(H, E, R) -> permute(1, 0, 2) -> (E, H, R)
-                     first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-                     first_weight = first_weight.permute(1, 0, 2).contiguous()
-
-                     # second_weight from A
-                     # weight_A (E*R, 2I) -> view(E, R, 2I) -> NO PERMUTE needed if strictly (E, R, out)?
-                     # Wait, we need output (E, R, 2I).
-                     # weight_A (E*R, 2I). view(E, R, 2I). This is already correct shape?
-                     # Let's check dims.
-                     second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-                     # Matches (E, R, out) directly without permute?
-                     # Yes, if weight_A is (E*R, out).
-
-                     return first_weight, second_weight, scaling, num_experts
-
-            # Fallback if hidden_dim not found or no match (assume GLM4/Standard logic)
-            # This matches the previous logic in moe_utils which works for GLM4
+            # Final fallback: assume standard layout
             first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-            first_weight = first_weight.permute(0, 2, 1).contiguous() # (E, dim_A, R)
+            first_weight = first_weight.permute(0, 2, 1).contiguous()
 
             second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-            second_weight = second_weight.permute(1, 2, 0).contiguous() # (E, R, dim_B)
+            second_weight = second_weight.permute(1, 2, 0).contiguous()
 
             return first_weight, second_weight, scaling, num_experts
 
