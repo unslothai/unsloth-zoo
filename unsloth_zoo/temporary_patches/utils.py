@@ -292,6 +292,7 @@ def _canonicalize_annotation(annotation: Any) -> Any:
         if origin is not None:
             args = t.get_args(annotation)
             args = tuple(canonicalize_annotation(arg) for arg in args)
+            origin = TYPE_MAPPINGS.get(origin, origin)
             return (origin, args)
     return TYPE_MAPPINGS.get(annotation, annotation)
 pass
