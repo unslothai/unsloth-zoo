@@ -54,50 +54,23 @@ def install_to_cache(source_path, destination_filename=None):
 install_to_cache(__file__, "moe_utils.py")
 
 # ============================================================================
-# Custom grouped_mm with working backward pass
+# Grouped MM wrapper
 # ============================================================================
-_ORIGINAL_TORCH_GROUPED_MM = torch._grouped_mm if hasattr(torch, "_grouped_mm") else None
+# Simple wrapper around torch._grouped_mm that ensures contiguous inputs.
+# Native backward works correctly - no custom autograd needed.
+# ============================================================================
 
 
-class _GroupedMMFunction(Function):
-    @staticmethod
-    def forward(ctx, x, w, offsets):
-        x = x.contiguous()
-        w = w.contiguous()
-        impl = _ORIGINAL_TORCH_GROUPED_MM or torch._grouped_mm
-        out = impl(x, w, offs=offsets)
-        ctx.save_for_backward(x, w, offsets)
-        return out
+def _grouped_mm_with_backward_fix(
+    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    """
+    Grouped matmul with working backward pass.
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, w, offsets = ctx.saved_tensors
-        grad_output = grad_output.contiguous()
-        offsets_list = offsets.cpu().tolist()
+    Uses native torch._grouped_mm with contiguous inputs for correct gradients.
+    """
+    return torch._grouped_mm(inputs.contiguous(), weight.contiguous(), offs=offsets)
 
-        grad_x = grad_w = None
-
-        if ctx.needs_input_grad[0]:
-            grad_x = torch.empty_like(x)
-            prev = 0
-            for i, end in enumerate(offsets_list):
-                if prev < end:
-                    grad_x[prev:end] = torch.mm(grad_output[prev:end], w[i].t())
-                prev = end
-
-        if ctx.needs_input_grad[1]:
-            grad_w = torch.zeros_like(w)
-            prev = 0
-            for i, end in enumerate(offsets_list):
-                if prev < end:
-                    grad_w[i] = torch.mm(x[prev:end].t(), grad_output[prev:end])
-                prev = end
-
-        return grad_x, grad_w, None
-
-
-def _grouped_mm_with_backward_fix(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-    return _GroupedMMFunction.apply(inputs, weight, offsets)
 
 # Global flag to check if grouped GEMM is available
 _GROUPED_GEMM_AVAILABLE = None
