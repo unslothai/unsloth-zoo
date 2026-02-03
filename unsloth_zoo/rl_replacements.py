@@ -23,7 +23,7 @@ import inspect
 import os
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
-from .device_type import DEVICE_TYPE
+from .device_type import DEVICE_TYPE, device_synchronize
 from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()
 
@@ -240,6 +240,15 @@ def autotune_batch_and_chunks(
     if torch.cuda.is_available():
         free_bytes, _ = torch.cuda.mem_get_info()
         limit_gb = (free_bytes / (1024**3))*.80
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        # For XPU: estimate free memory from total - reserved
+        total_mem = torch.xpu.get_device_properties(0).total_memory
+        reserved_mem = torch.xpu.memory_reserved()
+        free_bytes = total_mem - reserved_mem
+        limit_gb = (free_bytes / (1024**3)) * 0.80
+    else:
+        # Fallback: assume 8GB available
+        limit_gb = 8.0
 
     bytes_to_gb = 1024**3
 
@@ -892,7 +901,7 @@ def grpo_accumulated_loss(
                 )
                 #This is needed to avoid race conditions with GPT OSS offload_embbed=True
                 #However, it seems that this line does not slow down or disrupt models. 
-                torch.cuda.synchronize()
+                device_synchronize()
             all_logprobs_list.append(logprobs_chunk)
 
     new_logprobs = torch.cat(all_logprobs_list, dim=0)
