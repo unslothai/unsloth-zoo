@@ -424,8 +424,6 @@ def native_moe_grouped_mm(
     """
     Native implementation using torch._grouped_mm.
     """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
     return torch._grouped_mm(inputs, weight, offs=offsets)
 
 
@@ -468,7 +466,6 @@ def _should_use_separated_lora() -> bool:
     Check if separated LoRA approach should be used (default: True).
     Set UNSLOTH_MOE_LORA_MERGED=1 to use merged approach instead.
     """
-    # This Unsloth Zoo code section is licensed under AGPL3
     return os.environ.get("UNSLOTH_MOE_LORA_MERGED", "0") != "1"
 
 
@@ -490,14 +487,11 @@ def register_weight_preprocessor(model_type: str, preprocessor_fn):
         preprocessor_fn: Function(weight, proj_type, hidden_dim) -> processed_weight
                         proj_type is "gate_up" or "down"
     """
-    # This Unsloth Zoo code section is licensed under AGPL3
     _WEIGHT_PREPROCESSORS[model_type] = preprocessor_fn
 
 
 def get_weight_preprocessor(model_type: str):
     """Get registered weight preprocessor for model type."""
-    # This Unsloth Zoo code section is licensed under AGPL3
-
     return _WEIGHT_PREPROCESSORS.get(model_type)
 
 
