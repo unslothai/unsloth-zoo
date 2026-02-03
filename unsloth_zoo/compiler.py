@@ -599,6 +599,9 @@ def create_new_function(
     # Patch for Qwen3MoeExperts
     if "Qwen3MoeExperts" in new_source:
         items += ["Qwen3MoeExperts"]
+    # Patch for Qwen3VLMoeTextExperts
+    if "Qwen3VLMoeTextExperts" in new_source:
+        items += ["Qwen3VLMoeTextExperts"]
     # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
