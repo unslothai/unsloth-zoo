@@ -1227,11 +1227,21 @@ def forward_triton_grouped_gemm(
     # Output shape: (num_tokens, top_k, hidden_dim) -> (num_tokens, hidden_dim)
     # Ensure top_k_weights matches dtype (can be float32 from softmax)
     top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
-    final_hidden_states = (
-        second_gemm_output.view(num_tokens, top_k, hidden_dim)
-        * top_k_weights_casted[..., None]
+    # Permute routing weights to match the token permutation used for grouped_mm
+    flat_weights = top_k_weights_casted.view(-1)
+    # We already built `sorted_indices` when we permuted tokens; reuse it here to keep weights aligned
+    permuted_weights = flat_weights[sorted_indices]
+    weighted = second_gemm_output * permuted_weights.unsqueeze(-1)
+    # Scatter back to original token order
+    final_hidden_states = torch.zeros(
+        (batch_size * sequence_length, hidden_dim),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
     )
-    final_hidden_states = final_hidden_states.sum(dim=1)
+    final_hidden_states.index_add_(0, token_indices, weighted)
+
+    if is_3d:
+        final_hidden_states = final_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
     if is_3d:
         final_hidden_states = final_hidden_states.view(batch_size, seq_len, hidden_dim)
