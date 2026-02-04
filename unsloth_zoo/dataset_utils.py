@@ -18,6 +18,7 @@ __all__ = [
     "train_on_responses_only",
     "sft_prepare_dataset",
     "standardize_data_formats",
+    "patch_torchcodec_audio_decoder",
 ]
 
 from typing import Union, Callable, Optional, List, Dict
@@ -659,6 +660,30 @@ def sft_prepare_dataset(
     pass
     return dataset
 pass
+
+
+def patch_torchcodec_audio_decoder():
+    """Make datasets AudioDecoder dict-compatible for backwards compat.
+
+    The datasets library with torchcodec backend returns AudioDecoder objects
+    that support __getitem__ but not __contains__, breaking code like
+    '"array" in audio'. This adds dict-like protocol methods.
+    """
+    try:
+        from datasets.features._torchcodec import AudioDecoder
+        if hasattr(AudioDecoder, '__contains__'):
+            return  # Already patched or newer version
+
+        AudioDecoder.__contains__ = lambda self, key: key in ("array", "sampling_rate")
+        AudioDecoder.__iter__ = lambda self: iter(("array", "sampling_rate"))
+        AudioDecoder.keys = lambda self: ("array", "sampling_rate")
+        AudioDecoder.get = lambda self, key, default=None: (
+            self[key] if key in ("array", "sampling_rate") else default
+        )
+    except (ImportError, AttributeError):
+        pass  # torchcodec not available or different datasets version
+pass
+
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
