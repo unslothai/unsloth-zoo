@@ -1089,22 +1089,6 @@ def forward_triton_grouped_gemm(
     )
     offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
 
-    # First grouped GEMM: gate_up projection
-
-    # Prepare LoRA data
-    use_separated_lora = _should_use_separated_lora()
-    gate_up_lora = None
-    if getattr(self, "_unsloth_lora_gate_up_proj", None) is not None:
-        gate_up_lora = self._unsloth_lora_gate_up_proj[:3]
-    elif (
-        use_separated_lora
-        and hasattr(self, "gate_up_proj")
-        and _has_lora_adapters(self.gate_up_proj)
-    ):
-        gate_up_lora = _extract_lora_weights(
-            self.gate_up_proj, num_experts=self.num_experts, experts_module=self
-        )
-
     if self.gate_up_proj.shape[-1] == hidden_dim:
         w1 = self.gate_up_proj
     else:
@@ -1126,61 +1110,10 @@ def forward_triton_grouped_gemm(
         is_first_gemm=True,
     )
 
-    # Add separated LoRA contribution for Gate/Up
-    if gate_up_lora is not None:
-        first_weight, second_weight, scaling = gate_up_lora
-
-        # Calculate LoRA delta using NATIVE grouped_mm (no autotuning needed for small ranks)
-        # Note: We need offsets. Triton gathered/permuted X internally but we need offsets for native call.
-        # Wait, Triton kernel handles permutation internally if permute_x=True.
-        # But native grouped_mm expects X to be PERMUTED already implies by 'permuted_input'.
-        # forward_triton_grouped_gemm passes 'hidden_states' (unpermuted) and sets permute_x=True.
-        # So 'hidden_states' is NOT permuted.
-
-        # We MUST permute input for native grouped_mm manual call.
-        # 1. Calculate permuted input
-        token_indices = gather_indices // top_k_index.shape[1]
-        permuted_input = hidden_states[token_indices]
-
-        # 2. Apply LoRA
-        # Cast weights to input dtype
-        first_weight = first_weight.to(permuted_input.dtype)
-        second_weight = second_weight.to(permuted_input.dtype)
-
-        # Apply LoRA using native backend
-        lora_delta = _apply_lora_grouped_mm(
-            permuted_input,
-            first_weight,
-            second_weight,
-            offsets,
-            scaling,
-            grouped_mm_func=native_moe_grouped_mm,
-        )
-
-        # Add to Triton output (which is permuted output?)
-        # Triton grouped_gemm returns Permuted output if is_first_gemm=True?
-        # Let's check Triton kernel. Typically it returns permuted output for intermediate.
-        # Yes, standard Unsloth/Triton grouped gemm returns permuted layout.
-
-        first_gemm_output = first_gemm_output + lora_delta
-
     # Apply SiLU activation and multiply gate with up
     intermediate = _silu_and_mul(first_gemm_output)
 
     # Grouped GEMM 2: down projection
-
-    # Grouped GEMM 2: down projection
-
-    # Prepare LoRA data
-    down_lora = None
-    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
-        down_lora = self._unsloth_lora_down_proj[:3]
-    elif (
-        use_separated_lora
-        and hasattr(self, "down_proj")
-        and _has_lora_adapters(self.down_proj)
-    ):
-        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts, experts_module=self)
 
     if self.down_proj.shape[-1] == intermediate.shape[-1]:
         w2 = self.down_proj
