@@ -69,7 +69,7 @@ def _grouped_mm_with_backward_fix(
 
     Uses native torch._grouped_mm with contiguous inputs for correct gradients.
     """
-    return torch._grouped_mm(inputs.contiguous(), weight.contiguous(), offs=offsets)
+    return torch._grouped_mm(inputs, weight, offs=offsets)
 
 
 # Global flag to check if grouped GEMM is available
@@ -773,8 +773,7 @@ def forward_native_grouped_mm(
 
         # Handle different weight shapes using preprocessor
         # torch._grouped_mm backward requires weights to be contiguous; preprocessing may return a transposed view.
-        w1 = preprocess_weight(gate_up_base, "gate_up", hidden_dim, model_type).contiguous()
-
+        w1 = preprocess_weight(gate_up_base, "gate_up", hidden_dim, model_type)
         # Base forward: X @ W
         mm1_out = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
 
@@ -846,8 +845,8 @@ def forward_native_grouped_mm(
         w1_base = _get_base_weight(self.w1)
         w3_base = _get_base_weight(self.w3)
 
-        w1 = w1_base.transpose(-2, -1).contiguous()
-        w3 = w3_base.transpose(-2, -1).contiguous()
+        w1 = w1_base.transpose(-2, -1)
+        w3 = w3_base.transpose(-2, -1)
 
         gate = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
         up = _grouped_mm_with_backward_fix(permuted_input, w3, offsets)
@@ -858,11 +857,11 @@ def forward_native_grouped_mm(
                 w1_lora = _extract_lora_weights(self.w1, experts_module=self)
                 if w1_lora is not None:
                     lora_A, lora_B, scaling = w1_lora
-                    lora_A_t = lora_A.transpose(-2, -1).contiguous()
+                    lora_A_t = lora_A.transpose(-2, -1)
                     lora_A_out = _grouped_mm_with_backward_fix(
                         permuted_input, lora_A_t, offsets
                     )
-                    lora_B_t = lora_B.transpose(-2, -1).contiguous()
+                    lora_B_t = lora_B.transpose(-2, -1)
                     lora_B_out = _grouped_mm_with_backward_fix(lora_A_out, lora_B_t, offsets)
                     gate = gate + lora_B_out * scaling
 
@@ -870,11 +869,11 @@ def forward_native_grouped_mm(
                 w3_lora = _extract_lora_weights(self.w3, experts_module=self)
                 if w3_lora is not None:
                     lora_A, lora_B, scaling = w3_lora
-                    lora_A_t = lora_A.transpose(-2, -1).contiguous()
+                    lora_A_t = lora_A.transpose(-2, -1)
                     lora_A_out = _grouped_mm_with_backward_fix(
                         permuted_input, lora_A_t, offsets
                     )
-                    lora_B_t = lora_B.transpose(-2, -1).contiguous()
+                    lora_B_t = lora_B.transpose(-2, -1)
                     lora_B_out = _grouped_mm_with_backward_fix(lora_A_out, lora_B_t, offsets)
                     up = up + lora_B_out * scaling
     else:
@@ -919,7 +918,7 @@ def forward_native_grouped_mm(
         model_type = getattr(self, "_unsloth_model_type", None)
 
         # Handle different weight shapes using preprocessor
-        w2 = preprocess_weight(down_base, "down", hidden_dim, model_type).contiguous()
+        w2 = preprocess_weight(down_base, "down", hidden_dim, model_type)
 
         # Base forward
         mm2_out = _grouped_mm_with_backward_fix(inter, w2, offsets)
@@ -967,7 +966,7 @@ def forward_native_grouped_mm(
 
     elif hasattr(self, "w2"):
         w2_base = _get_base_weight(self.w2)
-        w2 = w2_base.transpose(-2, -1).contiguous()
+        w2 = w2_base.transpose(-2, -1)
 
         # Base forward
         mm2_out = _grouped_mm_with_backward_fix(inter, w2, offsets)
@@ -1030,8 +1029,12 @@ def forward_triton_grouped_gemm(
     # Attaching to self is cleaner: self._unsloth_moe_configs
 
     # Create expert mask and find which experts have tokens
+
     if not hasattr(self, "_unsloth_moe_configs"):
         self._unsloth_moe_configs = None
+
+    use_separated_lora = _should_use_separated_lora()
+
 
     # Handle 3D inputs (batch_size, seq_len, hidden_dim)
     is_3d = hidden_states.dim() == 3
@@ -1115,6 +1118,18 @@ def forward_triton_grouped_gemm(
 
     # Grouped GEMM 2: down projection
 
+    # Grouped GEMM 2: down projection
+    # Prepare LoRA data
+    down_lora = None
+    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
+        down_lora = self._unsloth_lora_down_proj[:3]
+    elif (
+        use_separated_lora
+        and hasattr(self, "down_proj")
+        and _has_lora_adapters(self.down_proj)
+    ):
+        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
+
     if self.down_proj.shape[-1] == intermediate.shape[-1]:
         w2 = self.down_proj
     else:
@@ -1151,7 +1166,7 @@ def forward_triton_grouped_gemm(
             second_weight,
             offsets,
             scaling,
-            grouped_mm_func=native_moe_grouped_mm,
+            grouped_mm_func=native_moe_grouped_mm
         )
 
         second_gemm_output = second_gemm_output + lora_delta
@@ -1160,21 +1175,11 @@ def forward_triton_grouped_gemm(
     # Output shape: (num_tokens, top_k, hidden_dim) -> (num_tokens, hidden_dim)
     # Ensure top_k_weights matches dtype (can be float32 from softmax)
     top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
-    # Permute routing weights to match the token permutation used for grouped_mm
-    flat_weights = top_k_weights_casted.view(-1)
-    # We already built `sorted_indices` when we permuted tokens; reuse it here to keep weights aligned
-    permuted_weights = flat_weights[sorted_indices]
-    weighted = second_gemm_output * permuted_weights.unsqueeze(-1)
-    # Scatter back to original token order
-    final_hidden_states = torch.zeros(
-        (batch_size * sequence_length, hidden_dim),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
+    final_hidden_states = (
+        second_gemm_output.view(num_tokens, top_k, hidden_dim)
+        * top_k_weights_casted[..., None]
     )
-    final_hidden_states.index_add_(0, token_indices, weighted)
-
-    if is_3d:
-        final_hidden_states = final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+    final_hidden_states = final_hidden_states.sum(dim=1)
 
     if is_3d:
         final_hidden_states = final_hidden_states.view(batch_size, seq_len, hidden_dim)
