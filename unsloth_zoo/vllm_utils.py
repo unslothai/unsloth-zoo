@@ -106,7 +106,13 @@ def get_mem_info():
 pass
 
 if importlib.util.find_spec("vllm") is not None:
-    from vllm import __version__ as vllm_version
+    try:
+        from vllm import __version__ as vllm_version
+    except ImportError:
+        try:
+            from vllm.version import __version__ as vllm_version
+        except ImportError:
+            vllm_version = "0.0.0"
 
     # Patch excessive warning messages
     if not UNSLOTH_ENABLE_LOGGING:
@@ -2361,7 +2367,7 @@ pass
 
 
 @torch.inference_mode
-def load_lora(model, save_directory, load_tensors = False):
+def load_lora(model, save_directory, load_tensors = False, lora_request_id = None):
     # vllm_lora_already_loaded(model)
     # Check internally if model has hot loaded LoRAs
     # if load_tensors and hasattr(model, "saved_vllm_lora_request"):# vllm_lora_already_loaded(model):
@@ -2377,8 +2383,11 @@ def load_lora(model, save_directory, load_tensors = False):
     global LORA_REQUEST_ID
     if LORA_REQUEST_ID is None: LORA_REQUEST_ID = 1
 
+    if lora_request_id is None:
+        lora_request_id = LORA_REQUEST_ID
+
     # Check if path exists
-    if not os.path.exists(save_directory) or LORA_REQUEST_ID == 1:
+    if not os.path.exists(save_directory) or lora_request_id == 1:
         if load_tensors:
             # We need to save and load the config file once!
             model.peft_config["default"].save_pretrained(save_directory)
@@ -2395,17 +2404,17 @@ def load_lora(model, save_directory, load_tensors = False):
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
 
         # vllm_lora_already_loaded(model)
-        lora_request = LoRARequest(str(LORA_REQUEST_ID), LORA_REQUEST_ID, lora_tensors = state_dict, lora_config = peft_config)
+        lora_request = LoRARequest(str(lora_request_id), lora_request_id, lora_tensors = state_dict, lora_config = peft_config)
         # Warm up LoRA
         # vllm_lora_already_loaded(model)
         # outputs = model.vllm_engine.generate(["Hi!"], use_tqdm = False, lora_request = lora_request)
         # del outputs
         # vllm_lora_already_loaded(model)
-        # print("###", LORA_REQUEST_ID)
+        # print("###", lora_request_id)
         # vllm_lora_already_loaded(model)
             # model.saved_vllm_lora_request = lora_request
     else:
-        lora_request = LoRARequest(str(LORA_REQUEST_ID), LORA_REQUEST_ID, save_directory)
+        lora_request = LoRARequest(str(lora_request_id), lora_request_id, save_directory)
     pass
     # vllm_lora_already_loaded(model)
 
