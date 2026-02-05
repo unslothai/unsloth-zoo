@@ -121,6 +121,7 @@ DISABLED_KEYWORDS = [
     "causal_mask[start:end, start:end] = 0",  # Pixtral Dynamic slicing on data-dependent value is not supported
     "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING",  # Gemma3 create_masks_for_generate
     "create_causal_mask(**mask_kwargs)",  # Gemma3 create_masks_for_generate
+    "return inner_mask",  # Gemma3 token_type_ids_mask_function returns closure, can't trace generator
     "compute_mup_vector",  # used in falcon h1 init and not needed to compile + inductor complains
     "segment_sum",  # falcon h1
     "apply_mask_to_padding_states",  # falcon h1
