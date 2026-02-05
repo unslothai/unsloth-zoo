@@ -65,12 +65,23 @@ def patch_glm4_moe():
         dim1 = weight_A.shape[1]
         dim2 = weight_B.shape[0]
 
-        # Implement extraction: A -> First, B -> Second
-        first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
-        first_weight = first_weight.permute(0, 2, 1).contiguous() # (E, dim1, R) -> (E, H, R) if dim1=H
+        # GLM4 MoE sometimes stores weights transposed (E, in_dim, out_dim),
+        # which flips LoRA A/B's input/output dimensions. Detect and handle both.
+        if dim1 > dim2:
+            # Transposed: weight_A is (E*R, out_dim), weight_B is (in_dim, E*R)
+            # first_weight from B: (E, in_dim, R)
+            first_weight = weight_B.view(dim2, num_experts, rank_per_expert)
+            first_weight = first_weight.permute(1, 0, 2).contiguous()
 
-        second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
-        second_weight = second_weight.permute(1, 2, 0).contiguous() # (E, R, dim2) -> (E, R, 2I) if dim2=2I
+            # second_weight from A: (E, R, out_dim)
+            second_weight = weight_A.view(num_experts, rank_per_expert, dim1).contiguous()
+        else:
+            # Standard: weight_A is (E*R, in_dim), weight_B is (out_dim, E*R)
+            first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
+            first_weight = first_weight.permute(0, 2, 1).contiguous()  # (E, in_dim, R)
+
+            second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
+            second_weight = second_weight.permute(1, 2, 0).contiguous()  # (E, R, out_dim)
 
         return first_weight, second_weight, scaling, num_experts
 
