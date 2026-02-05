@@ -39,6 +39,76 @@ from textwrap import dedent
 import re
 import os
 
+def patch_ministral3_config_mapping():
+    # Fix for Ministral-3 VL models which have text_config.model_type = "ministral3"
+    # but transformers CONFIG_MAPPING doesn't have "ministral3" as a key
+    # The correct text config is MinistralConfig (model_type = "ministral")
+    try:
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        from transformers import MinistralConfig
+    except Exception as e:
+        return raise_error("CONFIG_MAPPING or MinistralConfig", e)
+
+    if "ministral3" not in CONFIG_MAPPING:
+        CONFIG_MAPPING.register("ministral3", MinistralConfig)
+pass
+TEMPORARY_PATCHES.append(patch_ministral3_config_mapping)
+
+
+def patch_tokenizer_convert_added_tokens():
+    # Fix for tokenizer_config.json files that have additional_special_tokens as dicts
+    # without the "__type": "AddedToken" field. These dicts have a "content" key instead.
+    # transformers expects either strings or AddedToken objects, so we need to convert them.
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase, AddedToken
+    except Exception as e:
+        return raise_error("PreTrainedTokenizerBase", e)
+
+    original_convert_added_tokens = PreTrainedTokenizerBase.convert_added_tokens
+    if hasattr(original_convert_added_tokens, "_unsloth_patched"):
+        return
+
+    @classmethod
+    def patched_convert_added_tokens(cls, obj, save=False, add_type_field=True):
+        # Handle dicts with "content" key that don't have "__type" field
+        if isinstance(obj, dict) and "content" in obj and "__type" not in obj:
+            return AddedToken(**obj)
+        return original_convert_added_tokens.__func__(cls, obj, save=save, add_type_field=add_type_field)
+
+    patched_convert_added_tokens._unsloth_patched = True
+    PreTrainedTokenizerBase.convert_added_tokens = patched_convert_added_tokens
+pass
+TEMPORARY_PATCHES.append(patch_tokenizer_convert_added_tokens)
+
+
+def patch_tokenizer_extra_special_tokens():
+    # Fix for tokenizer_config.json files that have extra_special_tokens as a list
+    # instead of a dict. transformers expects extra_special_tokens to be a dict.
+    # This is a bug in some Mistral model tokenizer configs.
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+    except Exception as e:
+        return raise_error("PreTrainedTokenizerBase", e)
+
+    original_init = PreTrainedTokenizerBase.__init__
+    if hasattr(original_init, "_unsloth_extra_special_tokens_patched"):
+        return
+
+    def patched_init(self, **kwargs):
+        # Convert extra_special_tokens from list to empty dict if needed
+        extra_special_tokens = kwargs.get("extra_special_tokens", {})
+        if isinstance(extra_special_tokens, list):
+            # extra_special_tokens should be a dict, but some models have it as a list
+            # Convert to empty dict to avoid errors, the tokens are still in added_tokens_decoder
+            kwargs["extra_special_tokens"] = {}
+        return original_init(self, **kwargs)
+
+    patched_init._unsloth_extra_special_tokens_patched = True
+    PreTrainedTokenizerBase.__init__ = patched_init
+pass
+TEMPORARY_PATCHES.append(patch_tokenizer_extra_special_tokens)
+
+
 def patch_merge_quantization_configs():
     # Fixes some issues with merging quantization configs
     try:
