@@ -171,7 +171,8 @@ else:
         for key in ("PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
             val = os.environ.get(key, "")
             if "expandable_segments" in val:
-                val = re.sub(r",?expandable_segments:True,?", "", val).strip(",")
+                parts = [p.strip() for p in val.split(",") if p.strip() != "expandable_segments:True"]
+                val = ",".join(parts)
                 if val:
                     os.environ[key] = val
                 else:
