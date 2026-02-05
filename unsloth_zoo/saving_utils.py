@@ -573,8 +573,6 @@ def _merge_and_overwrite_lora(
                     processed_mxfp4_keys = processed_mxfp4_keys,
                 )
 
-            processed_mxfp4_keys = set()
-
             for key in safetensor_keys:
                 if key in processed_mxfp4_keys:
                     continue
@@ -594,43 +592,49 @@ def _merge_and_overwrite_lora(
 
                 # ---------- Special handling for MoE stacked expert params ----------
                 # gate_up_proj is stored fused in the model but sharded as gate_proj & up_proj per expert on disk.
+                # Gate / Up projection
                 m_gate = re.match(r"^(.*mlp\.experts)\.(\d+)\.(gate_proj|up_proj)\.weight$", key)
                 if m_gate:
                     if UNSLOTH_ENABLE_LOGGING and len(processed_moe_gate) < 2:
                         logger.info(f"[merge_debug] Matched gate/up key {key}")
-                    base_prefix, expert_idx, _ = m_gate.groups()
+                    base_prefix, expert_idx, proj_type = m_gate.groups()
                     expert_idx = int(expert_idx)
-                    if UNSLOTH_ENABLE_LOGGING and len(processed_moe_gate) < 2:
-                        logger.info(f"[merge_debug] lookup keys: {base_prefix+'.base_layer'} present={base_prefix + '.base_layer' in converted_lora_weights} ; base={base_prefix in converted_lora_weights}")
+
+                    # Skip experts that aren't present in this shard (defensive)
+                    available_experts = moe_num_experts.get(base_prefix, None)
+                    if available_experts is not None and expert_idx >= available_experts:
+                        continue
+
                     # LoRA keys for gate_up_proj are stored on experts.base_layer in PEFT
-                    lora_stats = converted_lora_weights.get(base_prefix + ".base_layer")
+                    # Usually: model.layers.X.mlp.experts.base_layer
                     fused_key = base_prefix + ".base_layer"
+                    lora_stats = converted_lora_weights.get(fused_key)
                     if lora_stats is None:
-                        lora_stats = converted_lora_weights.get(base_prefix + ".gate_up_proj")
+                        # Fallback
                         fused_key = base_prefix + ".gate_up_proj"
-                    if lora_stats is None and len(processed_moe_gate) < 3:
-                        if UNSLOTH_ENABLE_LOGGING:
-                            logger.info(f"[merge_debug] No LoRA found for gate_up_proj prefix {base_prefix}")
+                        lora_stats = converted_lora_weights.get(fused_key)
+
                     if lora_stats is not None and lora_stats.lora_A is not None and lora_stats.lora_B is not None:
-                        unique_id = (fused_key, expert_idx)
-                        if unique_id in processed_moe_gate:
-                            continue
-                        processed_moe_gate.add(unique_id)
-                        if UNSLOTH_ENABLE_LOGGING:
-                            logger.info(f"[merge_debug] Applying gate_up_proj LoRA for {fused_key} expert {expert_idx}")
+                        # Track processed (fused_key, expert_idx, proj_type) to avoid double counting if needed
+                        # But here we process per-file key, so we just process what we see.
 
                         num_experts = moe_num_experts.get(base_prefix, None)
-                        gate_key = f"{base_prefix}.{expert_idx}.gate_proj.weight"
-                        up_key   = f"{base_prefix}.{expert_idx}.up_proj.weight"
-                        gate_W = file.get_tensor(gate_key)
-                        up_W   = file.get_tensor(up_key)
 
-                        merged_gate, merged_up = _merge_moe_gate_up_expert(
-                            gate_W, up_W, lora_stats, expert_idx, num_experts, output_dtype or gate_W.dtype
-                        )
-                        _write_tensor_direct_torch(mm, header_metadata, length_of_header, gate_key, merged_gate, gate_W.dtype)
-                        _write_tensor_direct_torch(mm, header_metadata, length_of_header, up_key, merged_up, up_W.dtype)
-                        processed_mxfp4_keys.update({gate_key, up_key})
+                        W = file.get_tensor(key)
+
+                        if proj_type == "gate_proj":
+                             merged_W = _merge_moe_gate_expert(
+                                W, lora_stats, expert_idx, num_experts, output_dtype or W.dtype
+                            )
+                        else:
+                             merged_W = _merge_moe_up_expert(
+                                W, lora_stats, expert_idx, num_experts, output_dtype or W.dtype
+                            )
+
+                        _write_tensor_direct_torch(mm, header_metadata, length_of_header, key, merged_W, W.dtype)
+                        processed_mxfp4_keys.add(key)
+
+                        # We count the module as "saved" if we process at least one part of it.
                         if fused_key not in counted_lora_modules:
                             count += 1
                             counted_lora_modules.add(fused_key)
@@ -640,6 +644,9 @@ def _merge_and_overwrite_lora(
                 if m_down:
                     base_prefix, expert_idx = m_down.groups()
                     expert_idx = int(expert_idx)
+                    available_experts = moe_num_experts.get(base_prefix, None)
+                    if available_experts is not None and expert_idx >= available_experts:
+                        continue
                     fused_key = base_prefix  # down_proj LoRA stored directly on experts module
                     lora_stats = converted_lora_weights.get(fused_key)
                     if lora_stats is None and len(processed_moe_gate) < 3:
@@ -733,52 +740,90 @@ def _merge_and_overwrite_lora(
     return count, safetensor_keys_seen
 pass
 
-def _merge_moe_gate_up_expert(gate_W, up_W, lora_stats, expert_idx, num_experts, output_dtype):
+def _merge_moe_gate_expert(gate_W, lora_stats, expert_idx, num_experts, output_dtype):
     """
-    Merge LoRA for a single expert of gate_up_proj split into gate_proj & up_proj.
-    LoRA weights for MoE experts are stored stacked per expert with shapes:
-      lora_A: (E*R, 2*I)   (swapped, connects to output)
-      lora_B: (H, E*R)     (swapped, connects to input)
-    We compute delta = (lora_B @ lora_A)^T and split it.
+    Merge LoRA for a single expert of gate_proj part of gate_up_proj.
     """
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
-            return gate_W, up_W
+            return gate_W
 
         total_rank, two_inter = lora_stats.lora_A.shape
         in_dim, total_rank_B = lora_stats.lora_B.shape
+
+        # Validation checks
         if total_rank_B != total_rank or two_inter % 2 != 0:
-            return gate_W, up_W
+            return gate_W
 
         if num_experts is None or num_experts <= 0:
             num_experts = total_rank // max(1, getattr(lora_stats, "rank", 0) or 1)
         if num_experts <= 0 or total_rank % num_experts != 0:
-            return gate_W, up_W
+            return gate_W
 
         rank = total_rank // num_experts
         start, end = expert_idx * rank, (expert_idx + 1) * rank
         if end > total_rank:
-            return gate_W, up_W
+            return gate_W
 
         a_slice = lora_stats.lora_A[start:end, :]          # (r, 2I)
         b_slice = lora_stats.lora_B[:, start:end]          # (H, r)
         inter_dim = two_inter // 2
+
+        # gate_proj corresponds to first half of A
         gate_a = a_slice[:, :inter_dim]                    # (r, I)
-        up_a   = a_slice[:, inter_dim:]                    # (r, I)
 
         device = gate_W.device if gate_W.is_cuda else ("cuda" if torch.cuda.is_available() else "cpu")
         gate_delta = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ gate_a.to(device, dtype = torch.float32, non_blocking = True)
-        up_delta   = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ up_a.to(device, dtype = torch.float32, non_blocking = True)
 
         gate_merged = gate_W.to(device, dtype = torch.float32, non_blocking = True)
         gate_merged = gate_merged.add(gate_delta.transpose(0, 1), alpha = lora_stats.alpha)
 
+        return gate_merged.to(output_dtype)
+    except Exception:
+        return gate_W
+
+
+def _merge_moe_up_expert(up_W, lora_stats, expert_idx, num_experts, output_dtype):
+    """
+    Merge LoRA for a single expert of up_proj part of gate_up_proj.
+    """
+    try:
+        if lora_stats.lora_A is None or lora_stats.lora_B is None:
+            return up_W
+
+        total_rank, two_inter = lora_stats.lora_A.shape
+        in_dim, total_rank_B = lora_stats.lora_B.shape
+
+        # Validation checks
+        if total_rank_B != total_rank or two_inter % 2 != 0:
+            return up_W
+
+        if num_experts is None or num_experts <= 0:
+            num_experts = total_rank // max(1, getattr(lora_stats, "rank", 0) or 1)
+        if num_experts <= 0 or total_rank % num_experts != 0:
+            return up_W
+
+        rank = total_rank // num_experts
+        start, end = expert_idx * rank, (expert_idx + 1) * rank
+        if end > total_rank:
+            return up_W
+
+        a_slice = lora_stats.lora_A[start:end, :]          # (r, 2I)
+        b_slice = lora_stats.lora_B[:, start:end]          # (H, r)
+        inter_dim = two_inter // 2
+
+        # up_proj corresponds to second half of A
+        up_a   = a_slice[:, inter_dim:]                    # (r, I)
+
+        device = up_W.device if up_W.is_cuda else ("cuda" if torch.cuda.is_available() else "cpu")
+        up_delta   = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ up_a.to(device, dtype = torch.float32, non_blocking = True)
+
         up_merged = up_W.to(device, dtype = torch.float32, non_blocking = True)
         up_merged = up_merged.add(up_delta.transpose(0, 1), alpha = lora_stats.alpha)
 
-        return gate_merged.to(output_dtype), up_merged.to(output_dtype)
+        return up_merged.to(output_dtype)
     except Exception:
-        return gate_W, up_W
+        return up_W
 pass
 
 def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, output_dtype):
@@ -1018,17 +1063,26 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
             if is_gate:
                 gate_key = f"{prefix}.{expert_idx}.gate_proj.weight"
                 up_key   = f"{prefix}.{expert_idx}.up_proj.weight"
-                if gate_key not in header_metadata or up_key not in header_metadata:
-                    continue
-                gate_W = file.get_tensor(gate_key)
-                up_W   = file.get_tensor(up_key)
-                merged_gate, merged_up = _merge_moe_gate_up_expert(
-                    gate_W, up_W, lora_stats, expert_idx, num_experts, output_dtype or gate_W.dtype
-                )
-                _write_tensor_direct_torch(mm, header_metadata, length_of_header, gate_key, merged_gate, gate_W.dtype)
-                _write_tensor_direct_torch(mm, header_metadata, length_of_header, up_key, merged_up, up_W.dtype)
-                processed_mxfp4_keys.update({gate_key, up_key})
-                module_updated = True
+
+                # Check for gate_proj
+                if gate_key in header_metadata:
+                    gate_W = file.get_tensor(gate_key)
+                    merged_gate = _merge_moe_gate_expert(
+                        gate_W, lora_stats, expert_idx, num_experts, output_dtype or gate_W.dtype
+                    )
+                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, gate_key, merged_gate, gate_W.dtype)
+                    processed_mxfp4_keys.add(gate_key)
+                    module_updated = True
+
+                # Check for up_proj
+                if up_key in header_metadata:
+                    up_W = file.get_tensor(up_key)
+                    merged_up = _merge_moe_up_expert(
+                        up_W, lora_stats, expert_idx, num_experts, output_dtype or up_W.dtype
+                    )
+                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, up_key, merged_up, up_W.dtype)
+                    processed_mxfp4_keys.add(up_key)
+                    module_updated = True
             else:
                 down_key = f"{prefix}.{expert_idx}.down_proj.weight"
                 if down_key not in header_metadata:
