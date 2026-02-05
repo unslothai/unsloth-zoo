@@ -36,6 +36,8 @@ from .utils import (
 )
 import inspect
 
+_UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
+
 
 def patch_Gemma3Processor():
     import re
@@ -369,7 +371,7 @@ def patch_Gemma3Attention():
 
         # 6. Core Attention mechanism (SDPA) in fp32
         attn_mask_for_sdpa = attention_mask
-        if attn_mask_for_sdpa is not None and attn_mask_for_sdpa.dtype != torch.bool:
+        if isinstance(attn_mask_for_sdpa, torch.Tensor) and attn_mask_for_sdpa.dtype != torch.bool:
             attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
         return (
             query_states_fp32.contiguous(),
@@ -473,21 +475,38 @@ def patch_Gemma3Attention():
             attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
         """
         # output_attentions = kwargs.get("output_attentions", False)
-        is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
-        # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
-        # We convert it to a bool for the SDPA kernel that only accepts bools.
-        if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
-        attn_output_fp32 = scaled_dot_product_attention(
-            query_states_fp32.contiguous(),
-            key_states_fp32.contiguous(),
-            value_states_fp32.contiguous(),
-            attn_mask = attn_mask_for_sdpa,
-            dropout_p = self.attention_dropout if self.training else 0.0,
-            is_causal = is_causal,
-            scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
-            enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
-        )
-        attn_weights = None # Defaulting to None
+        attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
+        if _UNSLOTH_FLEX_ATTENTION_DISABLED:
+            attn_impl = "sdpa"
+        if attn_impl == "flex_attention":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
+            attn_output_fp32, attn_weights = attention_interface(
+                self,
+                query_states_fp32,
+                key_states_fp32,
+                value_states_fp32,
+                attn_mask_for_sdpa,
+                dropout = self.attention_dropout if self.training else 0.0,
+                scaling = getattr(self, "scaling", None),
+                sliding_window = getattr(self, "sliding_window", None),
+                **kwargs,
+            )
+        else:
+            is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
+            # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
+            # We convert it to a bool for the SDPA kernel that only accepts bools.
+            if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
+            attn_output_fp32 = scaled_dot_product_attention(
+                query_states_fp32.contiguous(),
+                key_states_fp32.contiguous(),
+                value_states_fp32.contiguous(),
+                attn_mask = attn_mask_for_sdpa,
+                dropout_p = self.attention_dropout if self.training else 0.0,
+                is_causal = is_causal,
+                scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
+                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+            )
+            attn_weights = None # Defaulting to None
 
         # 7. Reshape and Downcast for Output Projection
         # attn_output_fp32 from SDPA is (bsz, num_heads, q_len, head_dim)
@@ -603,7 +622,7 @@ def patch_Gemma3Attention_generic():
 
         # 6. Core Attention mechanism (SDPA) in fp32
         attn_mask_for_sdpa = attention_mask
-        if attn_mask_for_sdpa is not None and attn_mask_for_sdpa.dtype != torch.bool:
+        if isinstance(attn_mask_for_sdpa, torch.Tensor) and attn_mask_for_sdpa.dtype != torch.bool:
             attn_mask_for_sdpa = attn_mask_for_sdpa#.to(torch.float32)
             attn_mask_for_sdpa = attn_mask_for_sdpa.to(query_states_fp32.dtype)
         return (
@@ -709,21 +728,38 @@ def patch_Gemma3Attention_generic():
             attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
         """
         # output_attentions = kwargs.get("output_attentions", False)
-        is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
-        # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
-        # We convert it to a bool for the SDPA kernel that only accepts bools.
-        if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
-        attn_output_fp32 = scaled_dot_product_attention(
-            query_states_fp32.contiguous(),
-            key_states_fp32.contiguous(),
-            value_states_fp32.contiguous(),
-            attn_mask = attn_mask_for_sdpa,
-            dropout_p = self.attention_dropout if self.training else 0.0,
-            is_causal = is_causal,
-            scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
-            enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
-        )
-        attn_weights = None # Defaulting to None
+        attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
+        if _UNSLOTH_FLEX_ATTENTION_DISABLED:
+            attn_impl = "sdpa"
+        if attn_impl == "flex_attention":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
+            attn_output_fp32, attn_weights = attention_interface(
+                self,
+                query_states_fp32,
+                key_states_fp32,
+                value_states_fp32,
+                attn_mask_for_sdpa,
+                dropout = self.attention_dropout if self.training else 0.0,
+                scaling = getattr(self, "scaling", None),
+                sliding_window = getattr(self, "sliding_window", None),
+                **kwargs,
+            )
+        else:
+            is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
+            # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
+            # We convert it to a bool for the SDPA kernel that only accepts bools.
+            if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
+            attn_output_fp32 = scaled_dot_product_attention(
+                query_states_fp32.contiguous(),
+                key_states_fp32.contiguous(),
+                value_states_fp32.contiguous(),
+                attn_mask = attn_mask_for_sdpa,
+                dropout_p = self.attention_dropout if self.training else 0.0,
+                is_causal = is_causal,
+                scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
+                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+            )
+            attn_weights = None # Defaulting to None
 
         # 7. Reshape and Downcast for Output Projection
         # attn_output_fp32 from SDPA is (bsz, num_heads, q_len, head_dim)

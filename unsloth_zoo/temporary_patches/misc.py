@@ -19,7 +19,7 @@ import torch.nn as nn
 import inspect
 import importlib
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from .common import TEMPORARY_PATCHES, torch_compile
+from .common import TEMPORARY_PATCHES, torch_compile, _torch_compile
 from .utils import (
     patch_function,
     process_output_options,
@@ -342,6 +342,81 @@ def patch_CsmForConditionalGeneration_forward():
     patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
+
+
+def patch_transformers_masks():
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+        return
+    try:
+        import transformers.masking_utils as masking_utils
+        import transformers.generation.utils as generation_utils
+    except Exception as e:
+        return raise_error("transformers.masking_utils", e)
+
+    if hasattr(masking_utils, "__unsloth_mask_patch__"):
+        return
+
+    try:
+        from torch.nn.attention.flex_attention import BlockMask
+    except Exception:
+        BlockMask = ()
+
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask as torch_create_block_mask
+    except Exception:
+        torch_create_block_mask = None
+
+    if torch_create_block_mask is not None:
+        try:
+            supports_compile = "_compile" in inspect.signature(torch_create_block_mask).parameters
+        except Exception:
+            supports_compile = True
+        if not supports_compile:
+            def create_block_mask_wrapper(*args, **kwargs):
+                kwargs.pop("_compile", None)
+                return torch_create_block_mask(*args, **kwargs)
+            masking_utils.create_block_mask = create_block_mask_wrapper
+
+    original_create_causal_mask = getattr(
+        masking_utils,
+        "_unsloth_original_create_causal_mask",
+        masking_utils.create_causal_mask,
+    )
+    original_create_sliding_window_causal_mask = getattr(
+        masking_utils,
+        "_unsloth_original_create_sliding_window_causal_mask",
+        masking_utils.create_sliding_window_causal_mask,
+    )
+
+    compiled_create_causal_mask = _torch_compile(
+        original_create_causal_mask, fullgraph = False, dynamic = True
+    )
+    compiled_create_sliding_window_causal_mask = _torch_compile(
+        original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
+    )
+
+    def wrap(f):
+        def return_attention_mask(*args, **kwargs):
+            input_embeds = kwargs.get("input_embeds", None)
+            if input_embeds is not None and getattr(input_embeds, "requires_grad", False):
+                attention_mask = kwargs.get("attention_mask", None)
+                if isinstance(attention_mask, BlockMask) or (
+                    isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4
+                ):
+                    return attention_mask
+            return f(*args, **kwargs)
+        return return_attention_mask
+    pass
+
+    masking_utils._unsloth_original_create_causal_mask = original_create_causal_mask
+    masking_utils._unsloth_original_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
+    masking_utils.create_causal_mask = wrap(compiled_create_causal_mask)
+    masking_utils.create_sliding_window_causal_mask = wrap(compiled_create_sliding_window_causal_mask)
+    masking_utils.create_masks_for_generate = wrap(masking_utils.create_masks_for_generate)
+    generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
+    masking_utils.__unsloth_mask_patch__ = True
+pass
+TEMPORARY_PATCHES.append(patch_transformers_masks)
 
 
 def patch_CsmForConditionalGeneration_merge():
