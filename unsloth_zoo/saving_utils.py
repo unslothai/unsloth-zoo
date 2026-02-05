@@ -505,7 +505,7 @@ def _merge_and_overwrite_lora(
     # Collect keys for this shard so the caller can aggregate without re-reading the file (avoids
     # an extra safetensors pass purely for tied-embedding bookkeeping).
     safetensor_keys_seen = set()
-    processed_qwen3_gate = set()   # track (fused_key, expert_idx) processed for gate_up_proj
+    processed_moe_gate = set()  # track (fused_key, expert_idx) processed for gate_up_proj
     if counted_lora_modules is None:
         counted_lora_modules = set()   # fused lora keys counted toward n_saved_modules
 
@@ -559,9 +559,9 @@ def _merge_and_overwrite_lora(
                 except Exception:
                     pass
 
-            # Fast path for Qwen3-MoE: merge by iterating LoRA modules instead of per-weight scan
+            # Fast path for MoE models with stacked experts: merge by iterating LoRA modules instead of per-weight scan
             if any(".mlp.experts" in k for k in converted_lora_weights.keys()):
-                count = _merge_qwen3_moe_file(
+                count = _merge_moe_experts_file(
                     mm = mm,
                     header_metadata = header_metadata,
                     length_of_header = length_of_header,
@@ -582,7 +582,12 @@ def _merge_and_overwrite_lora(
                 if key in processed_mxfp4_keys:
                     continue
 
-                if UNSLOTH_ENABLE_LOGGING and count == 0 and len(processed_qwen3_gate) == 0 and len(processed_mxfp4_keys)==0:
+                if (
+                    UNSLOTH_ENABLE_LOGGING
+                    and count == 0
+                    and len(processed_moe_gate) == 0
+                    and len(processed_mxfp4_keys) == 0
+                ):
                     logger.info(f"[merge_debug] First shard key example: {key}")
 
                 # FORCE memory cleanup before processing each tensor
@@ -590,15 +595,15 @@ def _merge_and_overwrite_lora(
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
-                # ---------- Special handling for Qwen3-MoE stacked expert params ----------
+                # ---------- Special handling for MoE stacked expert params ----------
                 # gate_up_proj is stored fused in the model but sharded as gate_proj & up_proj per expert on disk.
                 m_gate = re.match(r"^(.*mlp\.experts)\.(\d+)\.(gate_proj|up_proj)\.weight$", key)
                 if m_gate:
-                    if UNSLOTH_ENABLE_LOGGING and len(processed_qwen3_gate) < 2:
+                    if UNSLOTH_ENABLE_LOGGING and len(processed_moe_gate) < 2:
                         logger.info(f"[merge_debug] Matched gate/up key {key}")
                     base_prefix, expert_idx, _ = m_gate.groups()
                     expert_idx = int(expert_idx)
-                    if UNSLOTH_ENABLE_LOGGING and len(processed_qwen3_gate) < 2:
+                    if UNSLOTH_ENABLE_LOGGING and len(processed_moe_gate) < 2:
                         logger.info(f"[merge_debug] lookup keys: {base_prefix+'.base_layer'} present={base_prefix + '.base_layer' in converted_lora_weights} ; base={base_prefix in converted_lora_weights}")
                     # LoRA keys for gate_up_proj are stored on experts.base_layer in PEFT
                     lora_stats = converted_lora_weights.get(base_prefix + ".base_layer")
@@ -606,14 +611,14 @@ def _merge_and_overwrite_lora(
                     if lora_stats is None:
                         lora_stats = converted_lora_weights.get(base_prefix + ".gate_up_proj")
                         fused_key = base_prefix + ".gate_up_proj"
-                    if lora_stats is None and len(processed_qwen3_gate) < 3:
+                    if lora_stats is None and len(processed_moe_gate) < 3:
                         if UNSLOTH_ENABLE_LOGGING:
                             logger.info(f"[merge_debug] No LoRA found for gate_up_proj prefix {base_prefix}")
                     if lora_stats is not None and lora_stats.lora_A is not None and lora_stats.lora_B is not None:
                         unique_id = (fused_key, expert_idx)
-                        if unique_id in processed_qwen3_gate:
+                        if unique_id in processed_moe_gate:
                             continue
-                        processed_qwen3_gate.add(unique_id)
+                        processed_moe_gate.add(unique_id)
                         if UNSLOTH_ENABLE_LOGGING:
                             logger.info(f"[merge_debug] Applying gate_up_proj LoRA for {fused_key} expert {expert_idx}")
 
@@ -623,7 +628,7 @@ def _merge_and_overwrite_lora(
                         gate_W = file.get_tensor(gate_key)
                         up_W   = file.get_tensor(up_key)
 
-                        merged_gate, merged_up = _merge_qwen3_gate_up_expert(
+                        merged_gate, merged_up = _merge_moe_gate_up_expert(
                             gate_W, up_W, lora_stats, expert_idx, num_experts, output_dtype or gate_W.dtype
                         )
                         _write_tensor_direct_torch(mm, header_metadata, length_of_header, gate_key, merged_gate, gate_W.dtype)
@@ -640,7 +645,7 @@ def _merge_and_overwrite_lora(
                     expert_idx = int(expert_idx)
                     fused_key = base_prefix  # down_proj LoRA stored directly on experts module
                     lora_stats = converted_lora_weights.get(fused_key)
-                    if lora_stats is None and len(processed_qwen3_gate) < 3:
+                    if lora_stats is None and len(processed_moe_gate) < 3:
                         if UNSLOTH_ENABLE_LOGGING:
                             logger.info(f"[merge_debug] No LoRA found for down_proj prefix {base_prefix}")
                     if lora_stats is not None and lora_stats.lora_A is not None and lora_stats.lora_B is not None:
@@ -648,7 +653,7 @@ def _merge_and_overwrite_lora(
                         if UNSLOTH_ENABLE_LOGGING:
                             logger.info(f"[merge_debug] Applying down_proj LoRA for {fused_key} expert {expert_idx}")
                         down_W = file.get_tensor(key)
-                        merged_down = _merge_qwen3_down_proj_expert(
+                        merged_down = _merge_moe_down_proj_expert(
                             down_W, lora_stats, expert_idx, num_experts, output_dtype or down_W.dtype
                         )
                         _write_tensor_direct_torch(mm, header_metadata, length_of_header, key, merged_down, down_W.dtype)
@@ -731,10 +736,10 @@ def _merge_and_overwrite_lora(
     return count, safetensor_keys_seen
 pass
 
-def _merge_qwen3_gate_up_expert(gate_W, up_W, lora_stats, expert_idx, num_experts, output_dtype):
+def _merge_moe_gate_up_expert(gate_W, up_W, lora_stats, expert_idx, num_experts, output_dtype):
     """
     Merge LoRA for a single expert of gate_up_proj split into gate_proj & up_proj.
-    LoRA weights for Qwen3-MoE are stored stacked per expert with shapes:
+    LoRA weights for MoE experts are stored stacked per expert with shapes:
       lora_A: (E*R, 2*I)   (swapped, connects to output)
       lora_B: (H, E*R)     (swapped, connects to input)
     We compute delta = (lora_B @ lora_A)^T and split it.
@@ -779,7 +784,7 @@ def _merge_qwen3_gate_up_expert(gate_W, up_W, lora_stats, expert_idx, num_expert
         return gate_W, up_W
 pass
 
-def _merge_qwen3_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, output_dtype):
+def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, output_dtype):
     """
     Merge LoRA for a single expert of down_proj.
     LoRA weights are stacked per expert:
@@ -818,7 +823,44 @@ def _merge_qwen3_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, o
         return down_W
 pass
 
-def _merge_qwen3_moe_file(mm, header_metadata, length_of_header, file, converted_lora_weights, moe_num_experts, output_dtype, counted_lora_modules, processed_mxfp4_keys):
+
+def _resolve_moe_num_experts(prefix, lora_stats, moe_num_experts):
+    if prefix in moe_num_experts and moe_num_experts[prefix] > 0:
+        return moe_num_experts[prefix]
+
+    if lora_stats is None:
+        return None
+
+    lora_A = getattr(lora_stats, "lora_A", None)
+    if lora_A is None:
+        return None
+
+    total_rank = lora_A.shape[0]
+    rank = getattr(lora_stats, "rank", None)
+    if not rank:
+        lora_B = getattr(lora_stats, "lora_B", None)
+        rank = lora_B.shape[-1] if lora_B is not None else None
+
+    if not rank or rank == 0:
+        return None
+    if total_rank % rank != 0:
+        return None
+
+    candidate = total_rank // rank
+    moe_num_experts[prefix] = candidate
+    if UNSLOTH_ENABLE_LOGGING:
+        try:
+            logger.info(
+                f"[merge_debug] Derived num_experts={candidate} for {prefix} from LoRA stats"
+            )
+        except Exception:
+            pass
+
+    return candidate
+
+
+
+def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, converted_lora_weights, moe_num_experts, output_dtype, counted_lora_modules, processed_mxfp4_keys):
     count = 0
     debug_logged = 0
     for lora_key, lora_stats in converted_lora_weights.items():
@@ -826,7 +868,19 @@ def _merge_qwen3_moe_file(mm, header_metadata, length_of_header, file, converted
             continue
         is_gate = lora_key.endswith(".base_layer")
         prefix = lora_key.replace(".base_layer", "")
-        num_experts = moe_num_experts.get(prefix, None)
+        num_experts = _resolve_moe_num_experts(prefix, lora_stats, moe_num_experts)
+        if (
+            UNSLOTH_ENABLE_LOGGING
+            and num_experts is not None
+            and debug_logged < 2
+        ):
+            try:
+                logger.info(
+                    f"[merge_debug] {lora_key}: merging {num_experts} experts via MoE merge path"
+                )
+                debug_logged += 1
+            except Exception:
+                pass
         if num_experts is None or num_experts == 0:
             if UNSLOTH_ENABLE_LOGGING and debug_logged < 4:
                 try:
@@ -852,7 +906,7 @@ def _merge_qwen3_moe_file(mm, header_metadata, length_of_header, file, converted
                     continue
                 gate_W = file.get_tensor(gate_key)
                 up_W   = file.get_tensor(up_key)
-                merged_gate, merged_up = _merge_qwen3_gate_up_expert(
+                merged_gate, merged_up = _merge_moe_gate_up_expert(
                     gate_W, up_W, lora_stats, expert_idx, num_experts, output_dtype or gate_W.dtype
                 )
                 _write_tensor_direct_torch(mm, header_metadata, length_of_header, gate_key, merged_gate, gate_W.dtype)
@@ -864,7 +918,7 @@ def _merge_qwen3_moe_file(mm, header_metadata, length_of_header, file, converted
                 if down_key not in header_metadata:
                     continue
                 down_W = file.get_tensor(down_key)
-                merged_down = _merge_qwen3_down_proj_expert(
+                merged_down = _merge_moe_down_proj_expert(
                     down_W, lora_stats, expert_idx, num_experts, output_dtype or down_W.dtype
                 )
                 _write_tensor_direct_torch(mm, header_metadata, length_of_header, down_key, merged_down, down_W.dtype)
@@ -1290,19 +1344,19 @@ pass
 def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     """Check if filenames follow HF sharded naming: model-00001-of-00005.safetensors"""
     pattern = re.compile(r'^(.+?)-(\d+)-of-(\d+)\.safetensors$')
-    
+
     matches = [pattern.match(f) for f in filenames]
     if not all(matches):
         return False
-    
+
     # Keep strings to check padding
     parsed = [(m.group(1), m.group(2), m.group(3)) for m in matches]
-    
+
     # shard and total have same padding: turned off as deepseekocr padding is different
     # for prefix, shard_str, total_str in parsed:
     #     if len(shard_str) != len(total_str):
     #         return False
-    
+
     # same prefix and total
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
