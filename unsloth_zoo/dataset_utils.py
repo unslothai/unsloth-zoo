@@ -680,7 +680,7 @@ def patch_torchcodec_audio_decoder():
         AudioDecoder.get = lambda self, key, default=None: (
             self[key] if key in ("array", "sampling_rate") else default
         )
-    except (ImportError, AttributeError):
+    except (ImportError, AttributeError, RuntimeError):
         pass  # torchcodec not available or different datasets version
 pass
 
