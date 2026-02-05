@@ -45,7 +45,16 @@ def Version(version):
         package_name = None
 
         if isinstance(version, str):
-            raw = version
+            # Check if it looks like a package name (e.g. "trl", "transformers", "unsloth-zoo")
+            # Package names start with a letter and contain only letters, digits, hyphens, underscores
+            if re.match(r'^[A-Za-z][A-Za-z0-9_-]*$', version):
+                try:
+                    raw = importlib_version(version)
+                    package_name = version
+                except PackageNotFoundError:
+                    raw = version  # Fall back to treating as version string
+            else:
+                raw = version
         else:
             package_name = getattr(version, "__name__", None) or getattr(version, "__package__", None)
             raw = getattr(version, "__version__", None)
