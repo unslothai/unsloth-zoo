@@ -339,13 +339,8 @@ def _extract_lora_from_wrapper(
         if experts_module is None:
             experts_module = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
 
-        # Check for model-specific LoRA extractor attached to the experts module.
-        # Prefer class attribute to avoid bound-method argument mismatches.
-        extractor_fn = None
-        if experts_module is not None:
-            extractor_fn = getattr(experts_module.__class__, "_unsloth_lora_extractor_fn", None)
-            if extractor_fn is None:
-                extractor_fn = getattr(experts_module, "_unsloth_lora_extractor_fn", None)
+        # Check for model-specific LoRA extractor attached to the experts module
+        extractor_fn = getattr(experts_module, "_unsloth_lora_extractor_fn", None)
 
         if extractor_fn is not None:
             return extractor_fn(wrapper, weight_A, weight_B, scaling, num_experts)
