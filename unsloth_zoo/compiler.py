@@ -22,6 +22,8 @@ __all__ = [
 ]
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+import ast
+import io
 import inspect
 import re
 import importlib
@@ -36,6 +38,7 @@ import logging
 import tempfile
 import sys
 import textwrap
+import tokenize
 from .utils import (
     Version,
     is_main_process,
@@ -493,6 +496,194 @@ if hasattr(logger, "addFilter"):
     logger.addFilter(HideLoggingMessage("`use_cache=True`"))
 """
 
+_SKIP_TOKENS = {
+    tokenize.NL,
+    tokenize.NEWLINE,
+    tokenize.INDENT,
+    tokenize.DEDENT,
+    tokenize.COMMENT,
+}
+
+def _chunk_param_name(chunk):
+    filtered = [(idx, tok) for idx, tok in chunk if tok.type not in _SKIP_TOKENS]
+    if not filtered:
+        return None, None, None
+    first_idx, first = filtered[0]
+    if first.string == "*":
+        if len(filtered) == 1:
+            return None, "kwonly_sep", None
+        second_idx, second = filtered[1]
+        if second.type == tokenize.NAME:
+            return second.string, "vararg", second_idx
+        return None, None, None
+    if first.string == "**":
+        if len(filtered) > 1 and filtered[1][1].type == tokenize.NAME:
+            return filtered[1][1].string, "kwarg", filtered[1][0]
+        return None, None, None
+    if first.type == tokenize.NAME:
+        return first.string, "arg", first_idx
+    return None, None, None
+
+def _process_param_tokens(param_tokens):
+    chunks = []
+    current = []
+    depth_paren = depth_brack = depth_brace = 0
+    lambda_params = 0
+    for idx, tok in enumerate(param_tokens):
+        if tok.string == "(":
+            depth_paren += 1
+        elif tok.string == ")":
+            depth_paren -= 1
+        elif tok.string == "[":
+            depth_brack += 1
+        elif tok.string == "]":
+            depth_brack -= 1
+        elif tok.string == "{":
+            depth_brace += 1
+        elif tok.string == "}":
+            depth_brace -= 1
+        if (
+            tok.type == tokenize.NAME
+            and tok.string == "lambda"
+            and depth_paren == depth_brack == depth_brace == 0
+        ):
+            lambda_params += 1
+        elif (
+            tok.string == ":"
+            and lambda_params > 0
+            and depth_paren == depth_brack == depth_brace == 0
+        ):
+            lambda_params = max(lambda_params - 1, 0)
+        if (
+            tok.string == ","
+            and depth_paren == depth_brack == depth_brace == 0
+            and lambda_params == 0
+        ):
+            chunks.append(current)
+            current = []
+            continue
+        current.append((idx, tok))
+    chunks.append(current)
+
+    param_info = []
+    param_names = set()
+    for chunk in chunks:
+        name, kind, name_idx = _chunk_param_name(chunk)
+        if name is not None:
+            param_names.add(name)
+        param_info.append((chunk, name, kind, name_idx))
+
+    has_kwargs_kwarg = any(kind == "kwarg" and name == "kwargs" for _, name, kind, _ in param_info)
+    has_other_kwargs = any(kind != "kwarg" and name == "kwargs" for _, name, kind, _ in param_info)
+    if not (has_kwargs_kwarg and has_other_kwargs):
+        return param_tokens, None
+
+    replacement = "kwargs_"
+    while replacement in param_names:
+        replacement += "_"
+
+    new_tokens = list(param_tokens)
+    for _, name, kind, name_idx in param_info:
+        if name == "kwargs" and kind != "kwarg" and name_idx is not None:
+            new_tokens[name_idx] = new_tokens[name_idx]._replace(string=replacement)
+
+    return new_tokens, replacement
+
+def _rewrite_kwargs_param(source: str, func_name: str):
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except Exception:
+        return source, None
+
+    out_tokens = []
+    i = 0
+    renamed_to = None
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.type == tokenize.NAME and tok.string == "def":
+            j = i + 1
+            while j < len(tokens) and tokens[j].type in _SKIP_TOKENS:
+                j += 1
+            if j < len(tokens) and tokens[j].type == tokenize.NAME and tokens[j].string == func_name:
+                out_tokens.extend(tokens[i : j + 1])
+                i = j + 1
+                while i < len(tokens) and tokens[i].type in _SKIP_TOKENS:
+                    out_tokens.append(tokens[i])
+                    i += 1
+                if i >= len(tokens) or tokens[i].string != "(":
+                    if i < len(tokens):
+                        out_tokens.append(tokens[i])
+                        i += 1
+                    continue
+                out_tokens.append(tokens[i])
+                i += 1
+
+                param_tokens = []
+                paren_depth = 1
+                while i < len(tokens):
+                    t = tokens[i]
+                    if t.string == "(":
+                        paren_depth += 1
+                    elif t.string == ")":
+                        paren_depth -= 1
+                        if paren_depth == 0:
+                            break
+                    param_tokens.append(t)
+                    i += 1
+
+                new_param_tokens, renamed_to = _process_param_tokens(param_tokens)
+                out_tokens.extend(new_param_tokens)
+                if i < len(tokens):
+                    out_tokens.append(tokens[i])
+                    i += 1
+                continue
+        out_tokens.append(tok)
+        i += 1
+
+    try:
+        new_source = tokenize.untokenize(out_tokens)
+    except Exception:
+        return source, None
+    return new_source, renamed_to
+
+def _insert_kwargs_alias(source: str, func_name: str, replacement: str):
+    alias_line = f"kwargs = {replacement}"
+    lines = source.splitlines(True)
+    if any(line.strip() == alias_line for line in lines):
+        return source
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    target = None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+            target = node
+            break
+    if target is None or not target.body:
+        return source
+
+    first_stmt = target.body[0]
+    if first_stmt.lineno == target.lineno:
+        return source
+    if (
+        isinstance(first_stmt, ast.Expr)
+        and isinstance(getattr(first_stmt, "value", None), ast.Constant)
+        and isinstance(first_stmt.value.value, str)
+    ):
+        insert_at = getattr(first_stmt, "end_lineno", first_stmt.lineno)
+    else:
+        insert_at = max(first_stmt.lineno - 1, 0)
+
+    line_index = max(first_stmt.lineno - 1, 0)
+    indent_line = lines[line_index] if line_index < len(lines) else "    "
+    indent = indent_line[:len(indent_line) - len(indent_line.lstrip())]
+    alias_text = indent + alias_line + "\n"
+    insert_at = min(max(insert_at, 0), len(lines))
+    lines.insert(insert_at, alias_text)
+    return "".join(lines)
+
 def create_new_function(
     name,
     new_source,
@@ -520,6 +711,13 @@ def create_new_function(
         new_source = \
             "@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)\n"\
             f"{new_source}"
+    pass
+
+    # Fix invalid signatures like: def fn(..., kwargs, **kwargs): -> rename param + alias
+    if "**kwargs" in new_source:
+        new_source, kwargs_alias = _rewrite_kwargs_param(new_source, name)
+        if kwargs_alias is not None:
+            new_source = _insert_kwargs_alias(new_source, name, kwargs_alias)
     pass
 
     # Import items to make the function executable
