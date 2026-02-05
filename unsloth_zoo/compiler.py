@@ -564,6 +564,12 @@ def create_new_function(
         write_new_source = versioning + _full_license_header + new_source
     else:
         write_new_source = versioning + new_source
+    if name == "UnslothSFTTrainer":
+        write_new_source = write_new_source.replace(
+            "self._is_vlm = False",
+            "self._is_vlm = hasattr(processing_class, \"image_processor\")",
+            1,
+        )
 
     # Write function
     global UNSLOTH_COMPILE_USE_TEMP
@@ -978,7 +984,13 @@ if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
     __DYNAMO__RECOMPILING__
-    logits = self.lm_head(hidden_states\\1)
+    _lm_head_input = hidden_states\\1
+    if torch.is_floating_point(_lm_head_input):
+        _lm_head_weight = self.lm_head.weight
+        _lm_head_dtype = getattr(_lm_head_weight, "dtype", None)
+        if _lm_head_dtype is not None and _lm_head_input.dtype != _lm_head_dtype:
+            _lm_head_input = _lm_head_input.to(_lm_head_dtype)
+    logits = self.lm_head(_lm_head_input)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -1056,7 +1068,13 @@ if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
     __DYNAMO__RECOMPILING__
-    logits = self.lm_head(hidden_states\\1)
+    _lm_head_input = hidden_states\\1
+    if torch.is_floating_point(_lm_head_input):
+        _lm_head_weight = self.lm_head.weight
+        _lm_head_dtype = getattr(_lm_head_weight, "dtype", None)
+        if _lm_head_dtype is not None and _lm_head_input.dtype != _lm_head_dtype:
+            _lm_head_input = _lm_head_input.to(_lm_head_dtype)
+    logits = self.lm_head(_lm_head_input)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -1089,7 +1107,13 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
 else:
-    logits = self.lm_head(hidden_states\\1)
+    _lm_head_input = hidden_states\\1
+    if torch.is_floating_point(_lm_head_input):
+        _lm_head_weight = self.lm_head.weight
+        _lm_head_dtype = getattr(_lm_head_weight, "dtype", None)
+        if _lm_head_dtype is not None and _lm_head_input.dtype != _lm_head_dtype:
+            _lm_head_input = _lm_head_input.to(_lm_head_dtype)
+    logits = self.lm_head(_lm_head_input)
     if (\\2) != ():
         logits = logits * (\\2)
     if (\\3) != ():
