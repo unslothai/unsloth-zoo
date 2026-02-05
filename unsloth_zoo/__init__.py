@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2026.1.4"
+__version__ = "2026.2.1"
 
 import os
 import warnings
@@ -167,6 +167,17 @@ else:
         if "PYTORCH_HIP_ALLOC_CONF" not in os.environ and "PYTORCH_ALLOC_CONF" in os.environ:
             os.environ["PYTORCH_HIP_ALLOC_CONF"] = os.environ["PYTORCH_ALLOC_CONF"]
             delete_key("PYTORCH_ALLOC_CONF")
+        # expandable_segments is not supported on ROCm/HIP
+        for key in ("PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+            val = os.environ.get(key, "")
+            if "expandable_segments" in val:
+                parts = [p.strip() for p in val.split(",") if p.strip() != "expandable_segments:True"]
+                val = ",".join(parts)
+                if val:
+                    os.environ[key] = val
+                else:
+                    delete_key(key)
+        delete_key("PYTORCH_CUDA_ALLOC_CONF")
     elif DEVICE_TYPE == "cuda":
         delete_key("PYTORCH_HIP_ALLOC_CONF")
         delete_key("PYTORCH_ALLOC_CONF")
