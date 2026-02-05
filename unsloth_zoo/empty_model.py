@@ -409,6 +409,16 @@ def set_additional_modules(new_model, quant_state_dict, config):
 
     # Embeddings
     embed_tokens_key = f"{language_model_prefix}.embed_tokens.weight"
+    if embed_tokens_key not in quant_state_dict:
+        for alt_key in (
+            "model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+            "model.text_model.embed_tokens.weight",
+            "model.language_model.model.embed_tokens.weight",
+        ):
+            if alt_key in quant_state_dict:
+                embed_tokens_key = alt_key
+                break
     # Use explicit None check since pad_token_id=0 is valid (0 is falsy in Python)
     pad_token_id = getattr(config, "pad_token_id", None)
     if pad_token_id is None:

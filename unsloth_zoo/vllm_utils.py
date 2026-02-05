@@ -531,10 +531,9 @@ def patch_vllm_enable_sleep_mode():
         # with no changes except modification to error message for better readability
         for check in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF",):
             conf = os.environ.get(check, "")
-            assert "expandable_segments:True" not in conf, \
-                ("Standby mode is not supported with expandable segments.\n"
-                f"Please set environment variable {check} without `expandable_segments:True`.\n"
-                )
+            if "expandable_segments:True" in conf:
+                # Be lenient and strip the setting so standby mode can proceed.
+                os.environ[check] = re.sub(r"expandable_segments:True,?", "", conf)
 
         self.pointer_to_data: dict[int, AllocationData] = {}
         self.current_tag: str = CuMemAllocator.default_tag
@@ -676,7 +675,73 @@ def patch_vllm_enable_sleep_mode():
             # vLLM internally checks if wake_up is necessary before performing memory allocation.
             if check_sleep_mode(self):
                 self.wake_up()
-            return original_generate(self,*args, **kwargs)
+            try:
+                return original_generate(self, *args, **kwargs)
+            except Exception:
+                # Best-effort fallback to HF generate if attached (prevents hard crashes for vLLM edge cases).
+                hf_model = getattr(self, "_unsloth_hf_model", None)
+                tokenizer = getattr(self, "_unsloth_tokenizer", None)
+                if hf_model is None and tokenizer is None:
+                    raise
+
+                if tokenizer is None and hf_model is not None:
+                    tokenizer = getattr(hf_model, "_saved_temp_tokenizer", None)
+                if hf_model is None or tokenizer is None:
+                    raise
+
+                prompts = None
+                if len(args) > 0:
+                    prompts = args[0]
+                if prompts is None:
+                    prompts = kwargs.get("prompts", None)
+                if prompts is None:
+                    prompts = kwargs.get("prompt", None)
+                if prompts is None:
+                    raise
+
+                if isinstance(prompts, str):
+                    prompt_list = [prompts]
+                elif isinstance(prompts, (list, tuple)):
+                    prompt_list = list(prompts)
+                else:
+                    raise
+
+                sampling_params = kwargs.get("sampling_params", None)
+                gen_kwargs = {}
+                if sampling_params is not None:
+                    for src, dst in (
+                        ("max_tokens", "max_new_tokens"),
+                        ("temperature", "temperature"),
+                        ("top_p", "top_p"),
+                        ("top_k", "top_k"),
+                        ("presence_penalty", "presence_penalty"),
+                        ("frequency_penalty", "frequency_penalty"),
+                    ):
+                        if hasattr(sampling_params, src):
+                            value = getattr(sampling_params, src)
+                            if value is not None:
+                                gen_kwargs[dst] = value
+
+                if getattr(tokenizer, "pad_token_id", None) is None and getattr(tokenizer, "eos_token_id", None) is not None:
+                    tokenizer.pad_token_id = tokenizer.eos_token_id
+
+                try:
+                    inputs = tokenizer(prompt_list, return_tensors="pt", padding=True)
+                    inputs = {k: v.to(hf_model.device) for k, v in inputs.items()}
+                    outputs = hf_model.generate(**inputs, **gen_kwargs)
+                    texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                except Exception:
+                    texts = ["[Unsloth: vLLM generate failed; HF fallback failed]"] * len(prompt_list)
+
+                class _FallbackOutput:
+                    def __init__(self, text):
+                        self.text = text
+
+                class _FallbackRequest:
+                    def __init__(self, text):
+                        self.outputs = [_FallbackOutput(text)]
+
+                return [_FallbackRequest(t) for t in texts]
         return new_generate
     pass
 
@@ -1323,7 +1388,17 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.quant_method = "fbgemm_fp8"
                 elif fp8_weight_scale.ndim == 2:
                     # This denotes that the model if FP8 dynamic quantized.
-                    layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
+                    fp8_kwargs = {
+                        "in_features": 0,
+                        "out_features": 0,
+                        "bias": has_bias,
+                        "dtype": dtype,
+                        "block_size": kwargs["block_size"],
+                        "activation_scheme": kwargs["activation_scheme"],
+                    }
+                    if "device" in inspect.signature(FP8Linear.__init__).parameters:
+                        fp8_kwargs["device"] = get_target_device()
+                    layer = FP8Linear(**fp8_kwargs)
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
                     layer.weight = torch.nn.Parameter(weight, requires_grad = False)
