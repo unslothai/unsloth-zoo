@@ -183,7 +183,6 @@ def patch_gpt_oss():
 
     def swizzle_mxfp4(w, w_scale, *args, **kwargs):
         from triton_kernels import tensor, tensor_details
-
         FP4, convert_layout, wrap_torch_tensor = (
             tensor.FP4,
             tensor.convert_layout,
@@ -192,12 +191,8 @@ def patch_gpt_oss():
         layout = tensor_details.layout
         StridedLayout = tensor_details.layout.StridedLayout
 
-        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-            mx_axis=1
-        )
-        w = convert_layout(
-            wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts
-        )
+        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
+        w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
         # TODO : add that when we are actually sure that it works on B200
         # if torch.cuda.get_device_capability()[0] == 10:
         #     constraints = {
@@ -231,9 +226,7 @@ def patch_gpt_oss():
             scatter_idx,
         ):
             pre_activation = matmul_ogs(
-                hidden_states.to(
-                    torch.bfloat16
-                ),  # tl.dot_scaled upcasts to BF16 for old hardware
+                hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
                 self_class.gate_up_proj,
                 self_class.gate_up_proj_bias,
                 routing_data,
@@ -272,7 +265,6 @@ def patch_gpt_oss():
             ctx.scatter_idx  = scatter_idx
             ctx.routing_data = routing_data
             return out
-
         pass
 
         @staticmethod
@@ -305,7 +297,6 @@ def patch_gpt_oss():
             dx_token = torch.zeros_like(grad_token)
             dx_token.index_add_(0, gather_dst, dx_exp)
             return (dx_token, None, None, None, None,)
-
         pass
 
     pass
@@ -893,12 +884,8 @@ class GptOssTopKRouter(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = self.linear(
-            hidden_states.to(self.linear.weight.dtype)
-        )  # (batch_size * seq_len, num_experts)
-        router_top_value, router_indices = torch.topk(
-            router_logits, self.top_k, dim=-1
-        )  # (seq_len, top_k)
+        router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
         router_top_value = torch.nn.functional.softmax(
             router_top_value, dim=1, dtype=router_top_value.dtype
         )
@@ -1173,30 +1160,30 @@ if DEVICE_TYPE == "xpu":
     device_memory = torch.xpu.memory.mem_get_info(0)[-1]
 else:
     device_memory = torch.cuda.memory.mem_get_info(0)[-1]
-use_combo_kernels = False if device_memory / 1024 / 1024 / 1024 <= 40 else True
+use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
 fused_torch_compile_options = get_torch_compile_options(
-    epilogue_fusion=True,
-    max_autotune=False,  # Too slow
-    shape_padding=True,
-    cudagraphs=True,
-    coordinate_descent_tuning=use_combo_kernels,  # Very slow!
-    combo_kernels=use_combo_kernels,
-    memory_planning=True,
-    multi_kernel=False,  # Fails on torch 2.10 nightly
-    use_block_ptr=True,
-    logging=UNSLOTH_ENABLE_LOGGING,
+    epilogue_fusion = True,
+    max_autotune = False, # Too slow
+    shape_padding = True,
+    cudagraphs = True,
+    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    combo_kernels = use_combo_kernels,
+    memory_planning = True,
+    multi_kernel = False, # Fails on torch 2.10 nightly
+    use_block_ptr = True,
+    logging = UNSLOTH_ENABLE_LOGGING,
 )
 no_combo_fused_torch_compile_options = get_torch_compile_options(
-    epilogue_fusion=True,
-    max_autotune=False,  # Too slow
-    shape_padding=True,
-    cudagraphs=True,
-    coordinate_descent_tuning=use_combo_kernels,  # Very slow!
-    combo_kernels=False,  # Breaks on attention
-    memory_planning=True,
-    multi_kernel=False,  # Fails on torch 2.10 nightly
-    use_block_ptr=True,
-    logging=UNSLOTH_ENABLE_LOGGING,
+    epilogue_fusion = True,
+    max_autotune = False, # Too slow
+    shape_padding = True,
+    cudagraphs = True,
+    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    combo_kernels = False, # Breaks on attention
+    memory_planning = True,
+    multi_kernel = False, # Fails on torch 2.10 nightly
+    use_block_ptr = True,
+    logging = UNSLOTH_ENABLE_LOGGING,
 )
 
 
@@ -1278,21 +1265,13 @@ pass
 @torch_compile(dynamic=True, fullgraph=True)
 def moe_router_forward(self, hidden_states):
     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-    router_logits = F.linear(
-        hidden_states.to(self.weight.dtype), self.weight, self.bias
-    )  # (seq_len, num_experts)
-    router_top_value, router_indices = torch.topk(
-        router_logits, self.top_k, dim=-1
-    )  # (seq_len, top_k)
+    router_logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)  # (seq_len, num_experts)
+    router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
     dtype = (
         torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
     )
-    router_top_value = torch.nn.functional.softmax(
-        router_top_value, dim=1, dtype=torch.float32
-    ).to(dtype)
-    router_scores = torch.zeros_like(router_logits, dtype=dtype).scatter_(
-        1, router_indices, router_top_value
-    )
+    router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
+    router_scores = torch.zeros_like(router_logits, dtype = dtype).scatter_(1, router_indices, router_top_value)
     return router_scores, router_indices
 
 
@@ -1912,7 +1891,7 @@ def patch_GptOssAttention():
             dtype=out_dtype,
         )
 
-        attn_weights = matmul(query, key_states.transpose(2, 3), out=combined_logits[:, :, :, :kvlen])
+        attn_weights = matmul(query, key_states.transpose(2, 3), out = combined_logits[:,:,:,:kvlen])
         attn_weights *= scaling
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
@@ -1928,7 +1907,7 @@ def patch_GptOssAttention():
         scores = probs[..., :-1]  # we drop the sink here
         attn_weights = F_dropout(scores, p=dropout, training=module.training)
         attn_weights = attn_weights.to(value_states.dtype)
-        attn_output = matmul(attn_weights, value_states, out=query)
+        attn_output = matmul(attn_weights, value_states, out = query)
         attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output, None
 
@@ -1961,7 +1940,7 @@ def patch_GptOssAttention():
         scores = probs[..., :-1]  # we drop the sink here
         attn_weights = F_dropout(scores, p=dropout, training=module.training)
         attn_weights = attn_weights.to(value_states.dtype)
-        attn_output = matmul(attn_weights, value_states, out=query)
+        attn_output = matmul(attn_weights, value_states, out = query)
         attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output, None
 
@@ -1983,7 +1962,7 @@ def patch_GptOssAttention():
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_shape  = hidden_states.shape[:-1]
+        input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -2134,7 +2113,6 @@ def patch_GptOssModel():
                 # Eager
                 return f(*args, **kwargs)
             pass
-
         return return_attention_mask
 
     pass
@@ -2185,7 +2163,7 @@ def patch_GptOssModel():
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ):
-        input_shape  = hidden_states.shape[:-1]
+        input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -2254,16 +2232,16 @@ def patch_GptOssModel():
 
     pass
     fused_torch_compile_options = get_torch_compile_options(
-        epilogue_fusion=True,
-        max_autotune=False,  # Too slow
-        shape_padding=True,
-        cudagraphs=True,
-        coordinate_descent_tuning=False,
-        combo_kernels=False,
-        memory_planning=True,
-        multi_kernel=False,  # Fails on torch 2.10 nightly
-        use_block_ptr=True,
-        logging=UNSLOTH_ENABLE_LOGGING,
+        epilogue_fusion = True,
+        max_autotune = False, # Too slow
+        shape_padding = True,
+        cudagraphs = True,
+        coordinate_descent_tuning = False,
+        combo_kernels = False,
+        memory_planning = True,
+        multi_kernel = False, # Fails on torch 2.10 nightly
+        use_block_ptr = True,
+        logging = UNSLOTH_ENABLE_LOGGING,
     )
 
     @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
@@ -2274,9 +2252,7 @@ def patch_GptOssModel():
         logsumexp: torch.Tensor,
         input_shape,
     ):
-        hidden_states = post_attention_decoding(
-            self.self_attn, attn_output, logsumexp, input_shape
-        )
+        hidden_states = post_attention_decoding(self.self_attn, attn_output, logsumexp, input_shape)
         hidden_states += residual
 
         # Fully Connected
@@ -2865,3 +2841,4 @@ def patch_gpt_oss_init_weights_modulelist_fix():
 
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_init_weights_modulelist_fix)
+
