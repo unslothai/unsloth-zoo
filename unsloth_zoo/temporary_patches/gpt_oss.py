@@ -18,6 +18,7 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import os
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 import torch.nn.functional as F
 import inspect
 from .common import (
@@ -43,6 +44,32 @@ from .utils import (
 )
 from ..hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
+
+# MXFP4 configuration
+# Set UNSLOTH_MXFP4_NO_DEQUANTIZE=1 to keep MXFP4 weights quantized (requires triton_kernels)
+# Otherwise, MXFP4 weights will be dequantized to bf16 for LoRA training
+UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0") == "1"
+
+
+def _check_triton_kernels_available():
+    """Check if OpenAI's triton_kernels package is available for MXFP4."""
+    try:
+        from triton_kernels import matmul_ogs, swiglu
+
+        return True
+    except ImportError:
+        return False
+
+
+_TRITON_KERNELS_AVAILABLE = None
+
+
+def is_triton_kernels_available():
+    """Cached check for triton_kernels availability."""
+    global _TRITON_KERNELS_AVAILABLE
+    if _TRITON_KERNELS_AVAILABLE is None:
+        _TRITON_KERNELS_AVAILABLE = _check_triton_kernels_available()
+    return _TRITON_KERNELS_AVAILABLE
 
 
 @torch_compile(dynamic = True, fullgraph = True)
@@ -87,14 +114,24 @@ pass
 def patch_gpt_oss():
     try:
         import triton_kernels
+
+        HAS_TRITON_KERNELS = True
     except Exception as e:
-        return raise_error("Please install triton_kernels", e)
+        HAS_TRITON_KERNELS = False
+        # return raise_error("Please install triton_kernels", e)
 
     try:
         import transformers.quantizers.quantizer_mxfp4
-        def is_kernels_available(): return True
-        transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
+
+        def is_kernels_available():
+            return True
+
+        transformers.quantizers.quantizer_mxfp4.is_kernels_available = (
+            is_kernels_available
+        )
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = (
+            lambda *args, **kwargs: True
+        )
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
 
@@ -106,16 +143,21 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
-    try:
-        from triton_kernels import matmul_ogs, swiglu
-        FnSpecs, FusedActivation, matmul_ogs = (
-            matmul_ogs.FnSpecs,
-            matmul_ogs.FusedActivation,
-            matmul_ogs.matmul_ogs,
-        )
-        swiglu_fn = swiglu.swiglu_fn
-    except Exception as e:
-        return raise_error("triton_kernels", e)
+    if HAS_TRITON_KERNELS:
+        try:
+            from triton_kernels import matmul_ogs, swiglu
+
+            FnSpecs, FusedActivation, matmul_ogs = (
+                matmul_ogs.FnSpecs,
+                matmul_ogs.FusedActivation,
+                matmul_ogs.matmul_ogs,
+            )
+            swiglu_fn = swiglu.swiglu_fn
+        except Exception as e:
+            return raise_error("triton_kernels", e)
+    else:
+        # Skip MXFP4 patches when triton_kernels not available
+        return
 
     try:
         import transformers.integrations.mxfp4
@@ -205,8 +247,8 @@ def patch_gpt_oss():
         @staticmethod
         def backward(ctx, grad_token):
             raise NotImplementedError(
-                "Backwards pass using MXFP4 is still under construction!\n"\
-                "Instead, use `unsloth/gpt-oss-20b-BF16` for bfloat16 training which will work for LoRA.\n"\
+                "Backwards pass using MXFP4 is still under construction!\n"
+                "Instead, use `unsloth/gpt-oss-20b-BF16` for bfloat16 training which will work for LoRA.\n"
                 "Or, use `load_in_4bit = True` which allows finetuning."
             )
             (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
@@ -243,12 +285,13 @@ def patch_gpt_oss():
             self.intermediate_size = config.intermediate_size
             self.hidden_size = config.hidden_size
 
+            # MXFP4 quantized format (blocks + scales)
             self.gate_up_proj_blocks = nn.Parameter(
                 torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, 16, dtype=torch.uint8),
                 requires_grad=False,
             )
             self.gate_up_proj_scales = nn.Parameter(
-                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, dtype=torch.uint8),
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, 16, dtype=torch.uint8),
                 requires_grad=False,
             )
             self.gate_up_proj_bias = nn.Parameter(
@@ -256,11 +299,11 @@ def patch_gpt_oss():
             )
 
             self.down_proj_blocks = nn.Parameter(
-                torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16), dtype=torch.uint8),
+                torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16,), dtype=torch.uint8),
                 requires_grad=False,
             )
             self.down_proj_scales = nn.Parameter(
-                torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8),
+                torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, 16, dtype=torch.uint8),
                 requires_grad=False,
             )
             self.down_proj_bias = nn.Parameter(
@@ -271,7 +314,10 @@ def patch_gpt_oss():
             self.gate_up_proj_precision_config = None
             self.down_proj_precision_config = None
 
-        def forward(self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx) -> torch.Tensor:
+        @property
+        def gate_up_proj(selforward(
+            self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx
+        ) -> torch.Tensor:
             with torch_cuda_device(hidden_states.device):
                 if not hasattr(self, "act"):
                     self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
@@ -520,7 +566,12 @@ class GptOssTopKRouter(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_local_experts
         self.hidden_dim = config.hidden_size
-        self.linear = nn.Linear(self.hidden_dim, self.num_experts, dtype=dtype_from_config(config))
+        self.linear = nn.Linear(
+            self.hidden_dim, self.num_experts, dtype=dtype_from_config(config)
+        )
+        # Expose weight/bias for HF init compatibility
+        self.weight = self.linear.weight
+        self.bias = self.linear.bias
 
     @torch_compile(dynamic = True, fullgraph = True)
     def forward(self, hidden_states):
@@ -657,6 +708,10 @@ def patch_gpt_oss_linearized():
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
 
+    _patch_gpt_oss_init_weights_for_modulelist(
+        transformers.models.gpt_oss.modeling_gpt_oss
+    )
+
     # We find down_proj overflows in GPT OSS
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
         def forward(
@@ -734,6 +789,338 @@ def patch_gpt_oss_linearized():
     return
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
+
+
+def _patch_gpt_oss_init_weights_for_modulelist(transformers_module):
+    GptOssPreTrainedModel = transformers_module.GptOssPreTrainedModel
+    GptOssExperts = transformers_module.GptOssExperts
+    if getattr(GptOssPreTrainedModel, "_unsloth_init_weights_patched", False):
+        return
+    _original_init_weights = GptOssPreTrainedModel._init_weights
+
+    def _patched_init_weights(self, module):
+        _original_init_weights(self, module)
+        if isinstance(module, GptOssExperts) and not hasattr(module, "gate_up_proj"):
+            std = self.config.initializer_range
+            for up in getattr(module, "gate_up_projs", []):
+                init.normal_(up.weight, mean=0.0, std=std)
+                if up.bias is not None:
+                    init.zeros_(up.bias)
+            for down in getattr(module, "down_projs", []):
+                init.normal_(down.weight, mean=0.0, std=std)
+                if down.bias is not None:
+                    init.zeros_(down.bias)
+
+    patch_function(GptOssPreTrainedModel, "_init_weights", _patched_init_weights)
+    GptOssPreTrainedModel._unsloth_init_weights_patched = True
+
+
+def patch_gpt_oss_bf16_split_lora():
+    """
+    Patch GPT-OSS BF16 model to use split LoRA with grouped GEMM.
+
+    This patch applies to BF16 models loaded via unsloth/gpt-oss-20b-BF16 or similar.
+    It creates stacked expert weights and uses moe_utils.py's forward_native_grouped_mm
+    for efficient training with split LoRA.
+
+    Key differences from Qwen3 MoE:
+    1. GPT-OSS uses TRANSPOSED weight layout:
+       - gate_up_proj: (num_experts, hidden_size, 2 * intermediate_size)
+       - down_proj: (num_experts, intermediate_size, hidden_size)
+    2. GPT-OSS gate_up has interleaved layout (::2 for gate, 1::2 for up)
+    3. GPT-OSS has biases: gate_up_proj_bias, down_proj_bias
+
+    4-bit BNB models use gate_up_projs/down_projs ModuleList and are NOT affected.
+    """
+    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+        return
+    # Skip 4-bit models - they use ModuleList and are handled by patch_gpt_oss_linearized
+    if "_load_in_4bit_" in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+        return
+
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
+
+    from .moe_utils import (
+        forward_native_grouped_mm,
+        select_moe_backend,
+        patch_param_wrapper_for_moe,
+        _has_lora_adapters,
+        _extract_lora_from_wrapper,
+        _should_use_separated_lora,
+        _is_moe_experts_module,
+    )
+
+    # Patch ParamWrapper.forward for MoE separated LoRA
+    patch_param_wrapper_for_moe()
+
+    # LoRA Extractor function for GPT-OSS
+    # GPT-OSS weight layout is TRANSPOSED: (E, hidden, output) instead of (E, output, hidden)
+    def _gpt_oss_lora_extractor(
+        self, wrapper, weight_A, weight_B, scaling, num_experts
+    ):
+        """
+        GPT-OSS LoRA extractor for transposed weight layout.
+
+        GPT-OSS weights:
+          gate_up_proj: (E, H, 2*I)  - transposed layout (in_dim, out_dim)
+          down_proj:    (E, I, H)    - transposed layout (in_dim, out_dim)
+
+        For grouped_mm: X @ W where W is (E, in_dim, out_dim)
+
+        PEFT creates:
+          lora_A: (E*R, in_dim)  - projects input to rank space
+          lora_B: (out_dim, E*R) - projects rank to output
+
+        For transposed format, the LoRA dimensions are already correct:
+          - We want X @ (E, in, R) @ (E, R, out)
+        """
+        # This Unsloth Zoo code section is licensed under AGPL3
+
+        total_rank = weight_A.shape[0]
+        rank_per_expert = total_rank // num_experts
+        dim_A = weight_A.shape[
+            1
+        ]  # in_dim (hidden_dim for gate_up, intermediate for down)
+        dim_B = weight_B.shape[
+            0
+        ]  # out_dim (2*intermediate for gate_up, hidden_dim for down)
+
+        # Get model dimensions from the experts module
+        hidden_dim = None
+        intermediate_dim = None
+        current = wrapper
+        while hasattr(current, "base_layer"):
+            current = current.base_layer
+            if hasattr(current, "hidden_size"):
+                hidden_dim = current.hidden_size
+            if hasattr(current, "intermediate_size"):
+                intermediate_dim = current.intermediate_size
+
+        # Get parameter name
+        param_name = getattr(wrapper, "parameter_name", None)
+
+        # GPT-OSS uses TRANSPOSED layout, so LoRA dimensions map directly:
+        # Input projection: X @ (E, in_dim, R)
+        # Output projection: result @ (E, R, out_dim)
+
+        if (
+            param_name == "down_proj"
+            and intermediate_dim is not None
+            and hidden_dim is not None
+        ):
+            # down_proj: input=intermediate_dim, output=hidden_dim
+            # Weight shape: (E, I, H) - transposed
+            # lora_A: (E*R, H) from PEFT (swapped due to 3D param handling)
+            # lora_B: (I, E*R) from PEFT (swapped)
+            # For X @ first @ second: first is (E, I, R), second is (E, R, H)
+
+            # first_weight from B (has intermediate_dim)
+            first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+            first_weight = first_weight.permute(1, 0, 2).contiguous()  # (E, I, R)
+
+            # second_weight from A (has hidden_dim)
+            second_weight = weight_A.view(
+                num_experts, rank_per_expert, dim_A
+            )  # (E, R, H)
+
+            return first_weight, second_weight, scaling, num_experts
+
+        elif param_name == "gate_up_proj" and hidden_dim is not None:
+            # gate_up_proj: input=hidden_dim, output=2*intermediate_dim
+            # Weight shape: (E, H, 2*I) - transposed
+            # lora_A: (E*R, 2*I) from PEFT
+            # lora_B: (H, E*R) from PEFT
+            # For X @ first @ second: first is (E, H, R), second is (E, R, 2*I)
+
+            # first_weight from B (has hidden_dim)
+            first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+            first_weight = first_weight.permute(1, 0, 2).contiguous()  # (E, H, R)
+
+            # second_weight from A (has 2*intermediate_dim)
+            second_weight = weight_A.view(
+                num_experts, rank_per_expert, dim_A
+            )  # (E, R, 2*I)
+
+            return first_weight, second_weight, scaling, num_experts
+
+        # Fallback: dimension-based detection
+        if hidden_dim is not None:
+            if dim_B == hidden_dim:
+                # B connects to hidden_dim (transposed case)
+                first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+                first_weight = first_weight.permute(1, 0, 2).contiguous()
+                second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+                return first_weight, second_weight, scaling, num_experts
+            elif dim_A == hidden_dim:
+                # A connects to hidden_dim
+                first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+                first_weight = first_weight.permute(0, 2, 1).contiguous()
+                second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+                second_weight = second_weight.permute(1, 2, 0).contiguous()
+                return first_weight, second_weight, scaling, num_experts
+
+        # Final fallback
+        first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+        first_weight = first_weight.permute(0, 2, 1).contiguous()
+        second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+        second_weight = second_weight.permute(1, 2, 0).contiguous()
+        return first_weight, second_weight, scaling, num_experts
+
+    # Patch GptOssExperts.forward to use grouped GEMM + split LoRA (BF16 only)
+    GptOssExperts = transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
+    _original_gpt_oss_experts_forward = GptOssExperts.forward
+
+    def _bf16_split_lora_forward(
+        self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
+    ) -> torch.Tensor:
+        # Fallback to original for 4-bit ModuleList or missing routing data
+        if (
+            router_indices is None
+            or routing_weights is None
+            or hasattr(self, "gate_up_projs")
+            or not hasattr(self, "gate_up_proj")
+            or not hasattr(self, "down_proj")
+        ):
+            return _original_gpt_oss_experts_forward(
+                self, hidden_states, router_indices, routing_weights
+            )
+
+        gate_up_param = getattr(self, "gate_up_proj", None)
+        down_param = getattr(self, "down_proj", None)
+        if (
+            not isinstance(gate_up_param, nn.Parameter)
+            or gate_up_param.ndim != 3
+            or not isinstance(down_param, nn.Parameter)
+            or down_param.ndim != 3
+        ):
+            return _original_gpt_oss_experts_forward(
+                self, hidden_states, router_indices, routing_weights
+            )
+
+        if not hasattr(self, "_unsloth_model_type"):
+            self._unsloth_model_type = "gpt_oss"
+
+        return forward_native_grouped_mm(
+            self,
+            hidden_states,
+            router_indices,  # top_k_index
+            routing_weights,  # top_k_weights
+        )
+
+    patch_function(GptOssExperts, "forward", _bf16_split_lora_forward)
+
+    _patch_gpt_oss_init_weights_for_modulelist(
+        transformers.models.gpt_oss.modeling_gpt_oss
+    )
+
+    # BF16 Experts class with stacked weights (for split LoRA via moe_utils)
+    class GptOssExpertsBF16Stacked(nn.Module):
+        """
+        GPT-OSS BF16 Experts with stacked weights for grouped GEMM.
+
+        Uses moe_utils.forward_native_grouped_mm for efficient MoE computation
+        with separated LoRA support.
+        """
+
+        def __init__(self, config):
+            super().__init__()
+            self.num_experts = config.num_local_experts
+            self.hidden_size = config.hidden_size
+            self.intermediate_size = config.intermediate_size
+            self.alpha = 1.702
+            self.limit = getattr(config, "swiglu_limit", 7.0)
+            self.dtype = dtype_from_config(config)
+
+            # Stacked weights in transposed format (E, in_dim, out_dim) for grouped_mm
+            self.gate_up_proj = nn.Parameter(
+                torch.empty(
+                    self.num_experts,
+                    self.hidden_size,
+                    2 * self.intermediate_size,
+                    dtype=self.dtype,
+                )
+            )
+            self.gate_up_proj_bias = nn.Parameter(
+                torch.empty(
+                    self.num_experts, 2 * self.intermediate_size, dtype=self.dtype
+                )
+            )
+            self.down_proj = nn.Parameter(
+                torch.empty(
+                    self.num_experts,
+                    self.intermediate_size,
+                    self.hidden_size,
+                    dtype=self.dtype,
+                )
+            )
+            self.down_proj_bias = nn.Parameter(
+                torch.empty(self.num_experts, self.hidden_size, dtype=self.dtype)
+            )
+
+            # Register LoRA extractor
+            self._unsloth_lora_extractor_fn = _gpt_oss_lora_extractor
+
+        @property
+        def hidden_dim(self):
+            return self.hidden_size
+
+        @property
+        def intermediate_dim(self):
+            return self.intermediate_size
+
+        def forward(
+            self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
+        ) -> torch.Tensor:
+            """
+            Forward pass using grouped GEMM from moe_utils.
+            Uses forward_native_grouped_mm which handles split LoRA automatically.
+            """
+            # Call moe_utils grouped MM forward which handles everything
+            return forward_native_grouped_mm(
+                self,
+                hidden_states,
+                router_indices,  # top_k_index
+                routing_weights,  # top_k_weights
+            )
+
+    # MLP wrapper that works with stacked experts
+    class GptOssMLP_BF16(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.router = GptOssTopKRouter(config)
+            self.experts = GptOssExpertsBF16Stacked(config)
+
+        def forward(self, hidden_states):
+            bsz, qlen, hd = hidden_states.shape
+            hidden_states_flat = hidden_states.view(-1, hd)
+
+            # Get router scores
+            router_scores, router_indices = self.router(hidden_states_flat)
+
+            # Run experts with stacked weights
+            routed_out = self.experts(
+                hidden_states_flat,
+                router_indices=router_indices,
+                routing_weights=router_scores,
+            )
+
+            routed_out = routed_out.view(bsz, qlen, hd)
+            return routed_out, router_scores
+
+    # Patch transformers module
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts._unsloth_lora_extractor_fn = _gpt_oss_lora_extractor
+
+    # Check if model has stacked weights (BF16) vs ModuleList (4-bit)
+    # This is done at load time by checking the model structure
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: Patched GPT-OSS for BF16 split LoRA with grouped GEMM")
+
+
+pass
+TEMPORARY_PATCHES.append(patch_gpt_oss_bf16_split_lora)
 
 
 def patch_GptOssAttention():
