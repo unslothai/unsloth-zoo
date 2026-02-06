@@ -905,8 +905,10 @@ class GptOssTopKRouter(nn.Module):
         router_scores = torch.zeros_like(router_logits, dtype=router_logits.dtype).scatter_(
             1, router_indices, router_top_value
         )
-        return router_logits, router_scores, router_indices
-
+        if _is_transformers_v5():
+            return router_logits, router_scores, router_indices
+        else:
+            return router_scores, router_indices
 
 pass
 
@@ -1073,7 +1075,10 @@ class GptOssTopKRouterBnb4bit(nn.Module):
         dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
         router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
         router_scores = torch.zeros_like(router_logits, dtype=dtype).scatter_(1, router_indices, router_top_value)
-        return router_logits, router_scores, router_indices
+        if _is_transformers_v5():
+            return router_logits, router_scores, router_indices
+        else:
+            return router_scores, router_indices
 
 
 pass
