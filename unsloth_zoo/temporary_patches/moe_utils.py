@@ -19,6 +19,7 @@ import os
 import shutil
 from typing import Optional, Tuple
 from torch.autograd import Function
+from .utils import logger
 
 # Get compile location
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
@@ -710,6 +711,8 @@ def forward_native_grouped_mm(
     Requires torch._grouped_mm support (verified via runtime check).
     """
     # This Unsloth Zoo code section is licensed under AGPL3
+
+    logger.info(f"[DEBUG]Using torch._grouped_mm for MoE forward pass")
 
     # Runtime safety check - defense in depth
     if not _check_torch_grouped_mm_supported():
