@@ -391,7 +391,7 @@ def install_llama_cpp(
 
     print_outputs = []
     missing_packages, system_type = check_build_requirements()
-    sudo = do_we_need_sudo()
+    sudo = do_we_need_sudo(system_type)
     kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs, "system_type": system_type}
 
     if not missing_packages:
