@@ -489,6 +489,43 @@ pass
 TEMPORARY_PATCHES.append(patch_transformers_masks)
 
 
+def patch_modernbert_attention_mask():
+    """Fix ModernBERT attn_bias stride alignment for SDPA backward pass.
+
+    The attention mask created by _prepare_4d_attention_mask uses .expand()
+    which creates non-contiguous strides. The SDPA compiled backward kernel
+    requires strides to be multiples of 4. Fix: patch _update_attention_mask
+    on ModernBertModel to return contiguous masks BEFORE they enter
+    torch.compile regions, so the inductor backward graph uses aligned strides.
+    """
+    try:
+        import transformers.models.modernbert.modeling_modernbert as modernbert_module
+    except Exception:
+        return  # ModernBERT not available, skip
+
+    ModernBertModel = getattr(modernbert_module, "ModernBertModel", None)
+    if ModernBertModel is None:
+        return
+
+    original_update = getattr(ModernBertModel, "_update_attention_mask", None)
+    if original_update is None:
+        return
+
+    def _update_attention_mask_contiguous(self, attention_mask, output_attentions=False):
+        global_attention_mask, sliding_window_mask = original_update(self, attention_mask, output_attentions=output_attentions)
+        # Make masks contiguous so SDPA backward (including compiled graphs)
+        # gets strides that are multiples of 4
+        if global_attention_mask is not None and not global_attention_mask.is_contiguous():
+            global_attention_mask = global_attention_mask.contiguous()
+        if sliding_window_mask is not None and not sliding_window_mask.is_contiguous():
+            sliding_window_mask = sliding_window_mask.contiguous()
+        return global_attention_mask, sliding_window_mask
+
+    ModernBertModel._update_attention_mask = _update_attention_mask_contiguous
+pass
+TEMPORARY_PATCHES.append(patch_modernbert_attention_mask)
+
+
 def patch_CsmForConditionalGeneration_merge():
     try:
         import transformers.models.csm.modeling_csm

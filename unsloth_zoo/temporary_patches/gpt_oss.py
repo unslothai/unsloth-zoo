@@ -641,6 +641,15 @@ class GptOssMLP(nn.Module):
         self.experts = GptOssExperts(config)
 
     def forward(self, hidden_states):
+        # Unwrap ParamWrapper from experts if needed (PEFT LoRA wraps modules)
+        if not hasattr(self.experts, "hidden_size"):
+            _e = self.experts
+            for _attr in ("base_layer", "module", "_module"):
+                while not hasattr(_e, "hidden_size") and hasattr(_e, _attr):
+                    _e = getattr(_e, _attr)
+            if _e is not self.experts:
+                self.experts = _e
+
         bsz, qlen, hd = hidden_states.shape
         if qlen == 1 and not self.training:
             return moe_forward_inference(self, hidden_states), None
@@ -1233,6 +1242,14 @@ def patch_GptOssModel():
                     position_embeddings,
                     **kwargs,
                 )
+                # Unwrap ParamWrapper from experts if needed (PEFT LoRA wraps modules)
+                _experts = decoder_layer.mlp.experts
+                for _attr in ("base_layer", "module", "_module"):
+                    while not hasattr(_experts, "hidden_size") and hasattr(_experts, _attr):
+                        _experts = getattr(_experts, _attr)
+                if _experts is not decoder_layer.mlp.experts:
+                    decoder_layer.mlp.experts = _experts
+
                 if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
                     hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
                 elif decoder_layer.mlp.experts.__class__.__name__ == "Mxfp4GptOssExperts":
