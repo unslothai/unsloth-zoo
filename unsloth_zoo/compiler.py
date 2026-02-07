@@ -811,6 +811,10 @@ def create_new_function(
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
     imports += "from torch.nn import functional as F\n"
+    if "torch_compile" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
+    if "KWARGS_TYPE" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )
