@@ -329,7 +329,10 @@ def train_on_responses_only(
     if return_function:
         return _train_on_responses_only
 
-    if num_proc is None or type(num_proc) is not int:
+    import multiprocessing as _mp
+    if _mp.get_start_method() != 'fork':
+        num_proc = None
+    elif num_proc is None or type(num_proc) is not int:
         import psutil
         num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
         # Check memory left so we can reduce multiprocessing to converse memory
@@ -485,11 +488,17 @@ def standardize_data_formats(
     }
 
     if not isinstance(dataset, IterableDataset):
-        from multiprocessing import cpu_count
-        
-        if num_proc is None or type(num_proc) is not int: 
-          num_proc = cpu_count()
-
+        import multiprocessing as _mp
+        if _mp.get_start_method() != 'fork':
+            num_proc = None
+        elif num_proc is None or type(num_proc) is not int:
+            import psutil
+            num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
+            memory_gb_left = psutil.virtual_memory().available / (1024**3)
+            if memory_gb_left <= 2:
+                num_proc = 1
+            else:
+                num_proc = min(num_proc, int(memory_gb_left))
         dataset_map_kwargs['num_proc'] = num_proc
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
@@ -612,20 +621,19 @@ def sft_prepare_dataset(
         pass
 
         if not isinstance(dataset, IterableDataset):
-            dataset_num_proc = getattr(args, "dataset_num_proc", None)
-            if dataset_num_proc is None:
-                import psutil
-                dataset_num_proc = max((psutil.cpu_count() or 1)+4, 2)
-                # Check memory left so we can reduce multiprocessing to converse memory
-                memory_gb_left = psutil.virtual_memory().available / (1024**3)
-                if memory_gb_left <= 4:
-                    dataset_num_proc = 1 # Too risky, so set to 1
-                elif memory_gb_left <= 6:
-                    dataset_num_proc = min(2, dataset_num_proc)
-                elif memory_gb_left <= 8:
-                    dataset_num_proc = min(4, dataset_num_proc)
-                elif memory_gb_left <= 12:
-                    dataset_num_proc = min(6, dataset_num_proc)
+            import multiprocessing as _mp
+            if _mp.get_start_method() != 'fork':
+                dataset_num_proc = None
+            else:
+                dataset_num_proc = getattr(args, "dataset_num_proc", None)
+                if dataset_num_proc is None:
+                    import psutil
+                    dataset_num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
+                    memory_gb_left = psutil.virtual_memory().available / (1024**3)
+                    if memory_gb_left <= 2:
+                        dataset_num_proc = 1
+                    else:
+                        dataset_num_proc = min(dataset_num_proc, int(memory_gb_left))
             map_kwargs["num_proc"] = dataset_num_proc
         else:
             map_kwargs["batch_size"] = dataset._ex_iterable.batch_size
