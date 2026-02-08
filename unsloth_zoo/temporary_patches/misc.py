@@ -620,6 +620,106 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_merge)
 
 
+def patch_causal_conv1d_cuda_probe():
+    """Probe causal_conv1d CUDA kernels and force slow path if broken.
+
+    On GPUs whose compute capability is not supported by pre-built causal_conv1d
+    CUDA kernels (e.g. sm_100 on B200), `import causal_conv1d` succeeds but calling
+    `causal_conv1d_fn(...)` fails at runtime with "no kernel image is available".
+    This probe runs a tiny forward pass at startup to detect the failure, then
+    nullifies causal_conv1d_fn/causal_conv1d_update everywhere so all Mamba-family
+    models fall back to their pure-PyTorch slow paths.
+    """
+    try:
+        import causal_conv1d
+        from causal_conv1d import causal_conv1d_fn
+        from causal_conv1d import causal_conv1d_update
+    except ImportError:
+        return  # Package not installed, transformers already handles this
+    pass
+
+    if causal_conv1d_fn is None:
+        return  # Already nullified
+    pass
+
+    if not torch.cuda.is_available():
+        return
+    pass
+
+    # Probe: try a tiny CUDA forward pass
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        x = torch.randn(1, 4, 8, device=device, dtype=torch.float16)
+        w = torch.randn(4, 4, device=device, dtype=torch.float16)
+        b = torch.zeros(4, device=device, dtype=torch.float16)
+        _ = causal_conv1d_fn(x, w, b, activation="silu")
+        del x, w, b
+        return  # CUDA kernels work fine
+    except Exception:
+        pass  # Fall through to disable
+    pass
+
+    print(
+        "Unsloth: causal_conv1d CUDA kernels not compatible with this GPU. "
+        "Using PyTorch slow path for Mamba models."
+    )
+
+    import sys
+
+    # 1. Nullify the package exports themselves
+    for mod_name in ("causal_conv1d", "causal_conv1d.causal_conv1d_interface"):
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            if hasattr(mod, "causal_conv1d_fn"):
+                mod.causal_conv1d_fn = None
+            if hasattr(mod, "causal_conv1d_update"):
+                mod.causal_conv1d_update = None
+        pass
+    pass
+
+    # 2. Patch is_causal_conv1d_available to return False
+    try:
+        import transformers.utils.import_utils
+        transformers.utils.import_utils.is_causal_conv1d_available = lambda: False
+    except Exception:
+        pass
+    pass
+
+    # 3. Dynamically scan all loaded modules and nullify broken causal_conv1d
+    #    references. Uses identity checks (is) against the original function objects
+    #    to avoid clobbering vllm's independent Triton-based causal_conv1d_fn/update.
+    _original_fn = causal_conv1d_fn
+    _original_update = causal_conv1d_update
+
+    def _disabled_lazy_load():
+        return (None, None)
+    pass
+
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
+        # Only nullify references that point to the causal_conv1d package's functions
+        touched = False
+        if getattr(mod, "causal_conv1d_fn", None) is _original_fn:
+            mod.causal_conv1d_fn = None
+            touched = True
+        if getattr(mod, "causal_conv1d_update", None) is _original_update:
+            mod.causal_conv1d_update = None
+            touched = True
+        # is_fast_path_available = all((causal_conv1d_fn, ...)) -- must be False
+        # Only touch it on modules where we just nullified causal_conv1d refs
+        if touched and getattr(mod, "is_fast_path_available", False):
+            mod.is_fast_path_available = False
+        # Replace lazy load stubs (Pattern B: mamba, falcon_mamba)
+        if hasattr(mod, "_lazy_load_causal_conv1d"):
+            mod._lazy_load_causal_conv1d = _disabled_lazy_load
+        if hasattr(mod, "_causal_conv1d_cache"):
+            mod._causal_conv1d_cache = (None, None)
+    pass
+pass
+TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
+
+
 def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     try:
         import transformers.models.granitemoehybrid.modeling_granitemoehybrid
@@ -976,3 +1076,51 @@ def patch_SiglipEncoderLayer():
     patch_function(transformers.models.siglip.modeling_siglip.SiglipEncoderLayer, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_SiglipEncoderLayer)
+
+
+def patch_Lfm2VlMultiModalProjector():
+    """Fix Lfm2VlMultiModalProjector unconditionally creating LayerNorm.
+
+    transformers 4.57.6 ignores config.projector_use_layernorm and always
+    creates nn.LayerNorm + applies it in forward. The model checkpoint for
+    LFM2.5-VL-1.6B has projector_use_layernorm=False and ships no layer_norm
+    weights, so the LayerNorm gets randomly initialized and corrupts features.
+    Fixed in transformers 5.0.0. This patch backports the fix.
+    """
+    try:
+        import transformers.models.lfm2_vl.modeling_lfm2_vl as lfm2_vl_module
+    except Exception:
+        return
+
+    Projector = getattr(lfm2_vl_module, "Lfm2VlMultiModalProjector", None)
+    if Projector is None:
+        return
+
+    # Already patched or already has conditional logic (transformers >= 5.0.0)
+    if hasattr(Projector, "_unsloth_patched") or "use_layer_norm" in (getattr(Projector.__init__, "__code__", None) and Projector.__init__.__code__.co_varnames or ()):
+        return
+
+    import torch.nn as nn
+    original_init = Projector.__init__
+    original_forward = Projector.forward
+
+    def patched_init(self, config, *args, **kwargs):
+        original_init(self, config, *args, **kwargs)
+        self.use_layer_norm = getattr(config, "projector_use_layernorm", True)
+        if not self.use_layer_norm:
+            self.layer_norm = None
+
+    def patched_forward(self, image_features):
+        image_features = self.pixel_unshuffle(image_features)
+        if getattr(self, "use_layer_norm", True) and self.layer_norm is not None:
+            image_features = self.layer_norm(image_features)
+        hidden_states = self.linear_1(image_features)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
+
+    Projector.__init__ = patched_init
+    Projector.forward = patched_forward
+    Projector._unsloth_patched = True
+pass
+TEMPORARY_PATCHES.append(patch_Lfm2VlMultiModalProjector)
