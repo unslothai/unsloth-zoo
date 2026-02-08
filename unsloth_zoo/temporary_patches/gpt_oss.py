@@ -1985,7 +1985,7 @@ def patch_GptOssAttention():
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
-            if key_states.dtype != query_states.dtype:
+            if key_states.dtype != query_states.dtype or value_states.dtype != query_states.dtype:
                 key_states = key_states.to(query_states.dtype)
                 value_states = value_states.to(query_states.dtype)
 
@@ -2841,4 +2841,3 @@ def patch_gpt_oss_init_weights_modulelist_fix():
 
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_init_weights_modulelist_fix)
-
