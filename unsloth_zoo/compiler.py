@@ -889,7 +889,7 @@ def create_new_function(
             # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
             cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
             if cached_tf_version != transformers_version:
-                logger.warning_once(
+                print(
                     f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but transformers version changed "
                     f"({cached_tf_version} -> {transformers_version}). Forcing recompile of {name}."
                 )

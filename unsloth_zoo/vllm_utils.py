@@ -1331,8 +1331,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     # This denotes that the model if FP8 dynamic quantized.
                     fp8_kwargs = dict(in_features=0, out_features=0, bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'])
                     # transformers 5.0+ removed device param from FP8Linear.__init__
-                    import transformers as _tfm
-                    if Version(_tfm.__version__) < Version("5.0.0"):
+                    if Version("transformers") < Version("5.0.0"):
                         fp8_kwargs["device"] = get_target_device()
                     layer = FP8Linear(**fp8_kwargs)
                     layer.in_features = weight.shape[1]
