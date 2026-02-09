@@ -100,8 +100,8 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
         mask_g = mask_l = torch.ones_like(g, dtype=bool)
         ḡ, l̄ = g, l
 
-    σ  = torch.sigmoid(alpha * ḡ)
-    dg = (σ + alpha * ḡ * σ * (1 - σ)) * (l̄ + 1)
+    σ  = torch.sigmoid(alpha * ḡ)
+    dg = (σ + alpha * ḡ * σ * (1 - σ)) * (l̄ + 1)
     dl = ḡ * σ
     dg = torch.where(mask_g, dg, 0.0)  # clamp-grad
     dl = torch.where(mask_l, dl, 0.0)
@@ -115,11 +115,12 @@ pass
 def patch_gpt_oss():
     try:
         import triton_kernels
-
-        HAS_TRITON_KERNELS = True
     except Exception as e:
-        HAS_TRITON_KERNELS = False
-        # return raise_error("Please install triton_kernels", e)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning_once(
+                "Unsloth: `triton_kernels` is not installed, skipping GPT-OSS MXFP4 patches."
+            )
+        return
     try:
         import transformers.quantizers.quantizer_mxfp4
 
@@ -138,21 +139,17 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
-    if HAS_TRITON_KERNELS:
-        try:
-            from triton_kernels import matmul_ogs, swiglu
+    try:
+        from triton_kernels import matmul_ogs, swiglu
 
-            FnSpecs, FusedActivation, matmul_ogs = (
-                matmul_ogs.FnSpecs,
-                matmul_ogs.FusedActivation,
-                matmul_ogs.matmul_ogs,
-            )
-            swiglu_fn = swiglu.swiglu_fn
-        except Exception as e:
-            return raise_error("triton_kernels", e)
-    else:
-        # Skip MXFP4 patches when triton_kernels not available
-        return
+        FnSpecs, FusedActivation, matmul_ogs = (
+            matmul_ogs.FnSpecs,
+            matmul_ogs.FusedActivation,
+            matmul_ogs.matmul_ogs,
+        )
+        swiglu_fn = swiglu.swiglu_fn
+    except Exception as e:
+        return raise_error("triton_kernels", e)
 
     try:
         import transformers.integrations.mxfp4
@@ -185,7 +182,7 @@ def patch_gpt_oss():
         # w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout, **scale_layout_opts)
         w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
         return w, w_scale
-    patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level="relaxed")
+    patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level = "relaxed")
 
     class Mxfp4GptOssExperts_Training(torch.autograd.Function):
         @staticmethod
@@ -297,17 +294,17 @@ def patch_gpt_oss():
                 requires_grad=False,
             )
             self.gate_up_proj_bias = nn.Parameter(
-                torch.zeros(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32),requires_grad=False,
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32), requires_grad=False,
             )
 
             self.down_proj_blocks = nn.Parameter(
-                torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16), dtype=torch.uint8),requires_grad=False
+                torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16), dtype=torch.uint8), requires_grad=False
             )
             self.down_proj_scales = nn.Parameter(
-                torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8),requires_grad=False
+                torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8), requires_grad=False
             )
             self.down_proj_bias = nn.Parameter(
-                torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32),requires_grad=False
+                torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32), requires_grad=False
             )
 
             self.alpha = 1.702
@@ -2395,7 +2392,7 @@ def patch_GptOssModel():
                 "hidden_states": all_hidden_states,
             })
 
-    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level="relaxed")
+    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_GptOssModel)
 
