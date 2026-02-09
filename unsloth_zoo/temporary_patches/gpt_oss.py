@@ -96,21 +96,20 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
         mask_l = l.abs() <= limit
         ḡ = torch.where(mask_g, g, limit)
         l̄ = torch.where(mask_l, l, l.sign() * limit)
-    else:  # no clipping
+    else:                                            # no clipping
         mask_g = mask_l = torch.ones_like(g, dtype=bool)
         ḡ, l̄ = g, l
 
-    σ  = torch.sigmoid(alpha * ḡ)
-    dg = (σ + alpha * ḡ * σ * (1 - σ)) * (l̄ + 1)
-    dl = ḡ * σ
-    dg = torch.where(mask_g, dg, 0.0)  # clamp-grad
-    dl = torch.where(mask_l, dl, 0.0)
+    σ   = torch.sigmoid(alpha * ḡ)
+    dg  = (σ + alpha * ḡ * σ * (1 - σ)) * (l̄ + 1)
+    dl  = ḡ * σ
+    dg  = torch.where(mask_g, dg, 0.)                # clamp-grad
+    dl  = torch.where(mask_l, dl, 0.)
 
     grad = torch.empty_like(pre_act)
     grad[..., ::2], grad[..., 1::2] = dg, dl
     return g1 * grad.to(g1.dtype)
 pass
-
 
 def patch_gpt_oss():
     try:
