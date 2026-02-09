@@ -367,7 +367,10 @@ def train_on_responses_only(
         _map_kwargs = {"batched": True, "num_proc": num_proc}
         if isinstance(dataset, IterableDataset):
             _map_kwargs = {"batched": True}
-        return dataset.map(_tokenize_fn, **_map_kwargs)
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
+            return dataset.map(_tokenize_fn, **_map_kwargs)
     pass
 
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
@@ -669,7 +672,10 @@ def sft_prepare_dataset(
             map_kwargs["batch_size"] = dataset._ex_iterable.batch_size
             
         if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
-        dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
+            dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
 
         # If VLM, switch data collator since .pad is needed!
         if is_vlm and not hasattr(processing_class, "pad"):
