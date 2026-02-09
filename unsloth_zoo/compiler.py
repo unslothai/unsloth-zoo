@@ -3165,15 +3165,26 @@ def unsloth_compile_transformers(
             bad_torch_modules.add(module)
         pass
 
-        # Check if creating arrays in inside the function
-        # Error: DataDependentOutputException: aten._local_scalar_dense.default
+        # Check for data-dependent control flow that breaks torch.compile(fullgraph=True)
+        # Tier 1: Direct data escapes from tensor to Python
+        #   .nonzero() -> data-dependent output shape (variable-length)
+        #   .tolist()  -> materializes tensor values into Python list
+        #   .item()    -> materializes tensor scalar into Python
+        # Tier 2: MoE expert dispatch via torch.where + index_add
+        #   1-arg torch.where returns data-dependent indices; combined with
+        #   index_add this is the standard MoE routing loop pattern
         if (
-            "torch.arange(" in source
-            or "torch.zeros(" in source
-            or "torch.ones(" in source
+            ".nonzero()" in source
+            or ".tolist()" in source
+            or ".item()" in source
         ):
             print(
-                f"Unsloth: Failed compiling function {module} since array creations are done."
+                f"Unsloth: Will not compile {module} since data-dependent operations are done."
+            )
+            bad_torch_modules.add(module)
+        elif "torch.where(" in source and ".index_add" in source:
+            print(
+                f"Unsloth: Will not compile {module} since data-dependent routing is done."
             )
             bad_torch_modules.add(module)
         pass
