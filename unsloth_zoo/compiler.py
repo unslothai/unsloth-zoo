@@ -3182,7 +3182,7 @@ def unsloth_compile_transformers(
                 f"Unsloth: Will not compile {module} since data-dependent operations are done."
             )
             bad_torch_modules.add(module)
-        elif "torch.where(" in source and "index_add" in source:
+        elif "torch.where(" in source and ".index_add" in source:
             print(
                 f"Unsloth: Will not compile {module} since data-dependent routing is done."
             )
