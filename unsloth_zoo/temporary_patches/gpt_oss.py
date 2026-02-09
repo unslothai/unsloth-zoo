@@ -1151,7 +1151,7 @@ def patch_gpt_oss_bnb4bit_auto():
         pass
 
 
-TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
+# TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
 
 
 # Combo kernels uses too much VRAM for low memory GPUs
