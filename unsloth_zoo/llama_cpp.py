@@ -40,7 +40,6 @@ import logging
 import torch
 from pathlib import Path
 import psutil
-import glob
 
 # Get a logger instance
 logger = logging.getLogger(__name__)
@@ -1021,53 +1020,60 @@ def convert_to_gguf(
             raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF: {e}")
 
         # Simple validation using native Python - check for main file or sharded files
-        
         if os.path.exists(output_file):
             all_output_files.append(output_file)
-
+            found_files = [output_file]
         else:
+            # llama.cpp uses SHARD_NAME_FORMAT = "{:s}-{:05d}-of-{:05d}.gguf"
             basename_without_gguf = os.path.splitext(output_file)[0]
-            shard_files = glob.glob(f"{basename_without_gguf}-[0-9]*-of-[0-9]*.gguf")
-            
-            if shard_files:
-                shard_files.sort()
+            shard_pattern = re.compile(
+                re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf$'
+            )
+            parent_dir = os.path.dirname(output_file) or '.'
+            shard_files = sorted(
+                os.path.join(parent_dir, f)
+                for f in os.listdir(parent_dir)
+                if shard_pattern.search(f)
+            )
 
-                shard_numbers = []
-                for file in shard_files:
-                    match = re.search(r'-(\d+)-of-(\d+)\.gguf$', file)
-                    if match:
-                        current, total = int(match.group(1)), int(match.group(2))
-                        shard_numbers.append((current, total))
-                
-                if not shard_numbers or len(shard_numbers) != len(shard_files):
-                    raise RuntimeError(f"Found sharded files, but could not parse shard information from all of them: {shard_files}")
+            if not shard_files:
+                raise RuntimeError(
+                    f"Unsloth: Failed to convert {description} - "
+                    f"output file {output_file} not created"
+                )
 
-                expected_total = shard_numbers[0][1]
-                actual_shards = sorted([num[0] for num in shard_numbers])
-                
-                if not all(num[1] == expected_total for num in shard_numbers):
-                    raise RuntimeError(f"Shards have mismatched total counts in {description}")
-                
-                if len(actual_shards) != expected_total:
-                    raise RuntimeError(f"Shard count mismatch in {description}: found {len(actual_shards)} but expected {expected_total}")
-                
-                if actual_shards != list(range(1, expected_total + 1)):
-                    missing = set(range(1, expected_total + 1)) - set(actual_shards)
-                    raise RuntimeError(f"Missing shards for {description}: {missing}")
-                print(f"Found sharded output files: {shard_files}")
-                all_output_files.extend(shard_files)
-            else:
-                raise RuntimeError(f"Failed to convert {description} - output file {output_file} not created")
+            # Validate shard completeness
+            shard_numbers = []
+            for f in shard_files:
+                m = shard_pattern.search(os.path.basename(f))
+                shard_numbers.append((int(m.group(1)), int(m.group(2))))
+
+            expected_total = shard_numbers[0][1]
+            if not all(n[1] == expected_total for n in shard_numbers):
+                raise RuntimeError(f"Shards have mismatched total counts in {description}")
+
+            actual = sorted(n[0] for n in shard_numbers)
+            if actual != list(range(1, expected_total + 1)):
+                missing = set(range(1, expected_total + 1)) - set(actual)
+                raise RuntimeError(f"Missing shards for {description}: {missing}")
+
+            print(f"Found {len(shard_files)} sharded output files for {description}")
+            all_output_files.extend(shard_files)
+            found_files = shard_files
+        pass
 
         if print_output:
-            file_size_bytes = os.path.getsize(output_file)
+            file_size_bytes = sum(os.path.getsize(f) for f in found_files)
             if file_size_bytes >= 1024**3:  # GB
                 size_str = f"{file_size_bytes / (1024**3):.1f}G"
             elif file_size_bytes >= 1024**2:  # MB
                 size_str = f"{file_size_bytes / (1024**2):.1f}M"
             else:
                 size_str = f"{file_size_bytes / 1024:.1f}K"
-            print(f"Unsloth: Successfully saved {description} GGUF to: {output_file} (size: {size_str})")
+            if len(found_files) == 1:
+                print(f"Unsloth: Successfully saved {description} GGUF to: {found_files[0]} (size: {size_str})")
+            else:
+                print(f"Unsloth: Successfully saved {description} GGUF as {len(found_files)} shards (total size: {size_str})")
 
     return all_output_files, is_vlm
 pass
@@ -1187,8 +1193,8 @@ def _assert_correct_gguf(model_name, model, tokenizer):
         pass
     pass
 
-    Partial_GGUFReader = all_functions.get('Partial_GGUFReader')  # type: ignore
-    reader = Partial_GGUFReader(model_name, "r")  # type: ignore
+    Partial_GGUFReader = all_functions['Partial_GGUFReader']
+    reader = Partial_GGUFReader(model_name, "r")
     check_gguf_last_tensor(model, reader)
     check_gguf_tokenizer(tokenizer, reader)
 
