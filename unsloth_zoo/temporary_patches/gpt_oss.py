@@ -1395,7 +1395,7 @@ from .moe_utils import (
     select_moe_backend,
     patch_param_wrapper_for_moe,
     forward_native_grouped_mm,
-    torch_native_forward,
+    # torch_native_forward,
 )
 
 
