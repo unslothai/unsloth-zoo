@@ -2391,6 +2391,19 @@ def patch_lora_forwards(torch_compile_options):
                     "    return base_layer(x, *args, **kwargs)\n"
                 )
 
+            # Fix for fp16 + non-quantized base layers (e.g. SiGLIP vision encoder):
+            # When autocast is disabled and base_layer has float32 weights,
+            # cast x to match the weight dtype to prevent dtype mismatch.
+            # For 8-bit layers, the base_layer call was already replaced above.
+            source = source.replace(
+                "result = self.base_layer(x, *args, **kwargs)",
+                "if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
+                "and self.base_layer.weight is not None "
+                "and x.dtype != self.base_layer.weight.dtype:\n"
+                "            x = x.to(self.base_layer.weight.dtype)\n"
+                "        result = self.base_layer(x, *args, **kwargs)",
+            )
+
             # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
             # if used in source but not available in parent module.
             # Use try/except with fallback in case peft moves the constant in future versions.
