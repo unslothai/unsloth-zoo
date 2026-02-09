@@ -1229,3 +1229,43 @@ def patch_trl_vision_model_mapping():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_trl_vision_model_mapping)
+
+
+def patch_vllm_safe_apply_chat_template():
+    """Fix vLLM safe_apply_chat_template for transformers 5.0+.
+
+    transformers 5.0.0 changed apply_chat_template(tokenize=True) to default
+    return_dict=True, returning BatchEncoding instead of list[int]. vLLM's
+    safe_apply_chat_template doesn't pass return_dict=False, causing TypeError
+    in _validate_model_input when max(BatchEncoding) returns a string key.
+
+    Fix: wrap the original function to inject return_dict=False when tokenize=True.
+    """
+    try:
+        from unsloth_zoo.utils import Version
+        import transformers
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return
+
+        import vllm.renderers.hf as hf_mod
+        _original_safe_apply = getattr(hf_mod, "safe_apply_chat_template", None)
+        if _original_safe_apply is None:
+            return
+        if getattr(_original_safe_apply, "_unsloth_patched", False):
+            return
+
+        def _patched_safe_apply(model_config, tokenizer, conversation, *,
+                                tools=None, chat_template=None, tokenize=True, **kwargs):
+            if tokenize:
+                kwargs["return_dict"] = False
+            return _original_safe_apply(
+                model_config, tokenizer, conversation,
+                tools=tools, chat_template=chat_template, tokenize=tokenize,
+                **kwargs,
+            )
+        _patched_safe_apply._unsloth_patched = True
+        hf_mod.safe_apply_chat_template = _patched_safe_apply
+    except Exception:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_vllm_safe_apply_chat_template)
