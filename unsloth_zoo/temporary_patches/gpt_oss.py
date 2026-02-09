@@ -950,10 +950,10 @@ class GptOssExpertsBnb4bit(nn.Module):
 
         if self.training:
             next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
-            with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            # with torch.no_grad():
+            #     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
+            #     expert_mask = expert_mask.permute(2, 1, 0)
+            #     expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
             for expert_idx in expert_hitted[:]:
                 with torch.no_grad():
                     _, token_idx = torch.where(expert_mask[expert_idx[0]])
@@ -965,7 +965,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                 glu = gate * torch.sigmoid(gate * self.alpha)
                 gated_output = (up + 1) * glu
                 out = self.down_projs[expert_idx](gated_output)
-                weighted_output = out * routing_weights[token_idx, expert_idx, None]
+                weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                 next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
             next_states = next_states.view(batch_size, -1, self.hidden_size)
             return next_states
@@ -982,8 +982,8 @@ class GptOssExpertsBnb4bit(nn.Module):
             out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
             outs = torch.stack(out_list, dim=0)
             rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-            mixed = (outs * rw).sum(dim=0)
-            return mixed.view(batch_size, -1, self.hidden_size)
+            mixed = (outs.to(torch.float32) * rw.to(torch.float32)).sum(dim=0)
+            return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
 
 
 pass
@@ -1151,7 +1151,7 @@ def patch_gpt_oss_bnb4bit_auto():
         pass
 
 
-# TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
+TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
 
 
 # Combo kernels uses too much VRAM for low memory GPUs
@@ -1939,7 +1939,7 @@ def patch_GptOssAttention():
         combined_logits[:] = F_softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
         probs = combined_logits
         scores = probs[..., :-1]  # we drop the sink here
-        attn_weights = F_dropout(scores, p=dropout, training=module.training)
+        attn_weights = F_dropout(scores, p=dropout, training=module.training, inplace=True)
         attn_weights = attn_weights.to(value_states.dtype)
         attn_output = matmul(attn_weights, value_states, out = query)
         attn_output = attn_output.transpose(1, 2).contiguous()
