@@ -109,8 +109,6 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
     grad = torch.empty_like(pre_act)
     grad[..., ::2], grad[..., 1::2] = dg, dl
     return g1 * grad.to(g1.dtype)
-
-
 pass
 
 
@@ -125,23 +123,18 @@ def patch_gpt_oss():
     try:
         import transformers.quantizers.quantizer_mxfp4
 
-        def is_kernels_available():
-            return True
+        def is_kernels_available(): return True
 
         transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = (lambda *args, **kwargs: True)
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
 
-    if hasattr(
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"
-    ):
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = (
-            lambda *args, **kwargs: triton_kernels
-        )
+    if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
 
     try:
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = (lambda *args, **kwargs: True)
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
@@ -192,7 +185,6 @@ def patch_gpt_oss():
         # w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout, **scale_layout_opts)
         w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
         return w, w_scale
-
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level="relaxed")
 
     class Mxfp4GptOssExperts_Training(torch.autograd.Function):
@@ -305,21 +297,17 @@ def patch_gpt_oss():
                 requires_grad=False,
             )
             self.gate_up_proj_bias = nn.Parameter(
-                torch.zeros(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32),
-                requires_grad=False,
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32),requires_grad=False,
             )
 
             self.down_proj_blocks = nn.Parameter(
-                torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16,), dtype=torch.uint8),
-                requires_grad=False,
+                torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16), dtype=torch.uint8),requires_grad=False
             )
             self.down_proj_scales = nn.Parameter(
-                torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8),
-                requires_grad=False,
+                torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8),requires_grad=False
             )
             self.down_proj_bias = nn.Parameter(
-                torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32),
-                requires_grad=False,
+                torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32),requires_grad=False
             )
 
             self.alpha = 1.702
@@ -478,9 +466,7 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
 
-    def load_and_swizzle_mxfp4(
-        module, param_name, param_value, target_device, *args, **kwargs
-    ):
+    def load_and_swizzle_mxfp4(module, param_name, param_value, target_device, *args, **kwargs):
         model = kwargs.get("model", None)
         empty_param = kwargs.get("empty_param", None)
         casting_dtype = kwargs.get("casting_dtype", None)
@@ -554,9 +540,7 @@ def patch_gpt_oss():
     try:
         from transformers.integrations.mxfp4 import _replace_with_mxfp4_linear
     except Exception as e:
-        return raise_error(
-            "transformers.integrations.mxfp4._replace_with_mxfp4_linear", e
-        )
+        return raise_error("transformers.integrations.mxfp4._replace_with_mxfp4_linear", e)
 
     def replace_with_mxfp4_linear(
         model,
@@ -581,8 +565,6 @@ def patch_gpt_oss():
         return model
 
     patch_function(transformers.integrations.mxfp4, "replace_with_mxfp4_linear", replace_with_mxfp4_linear)
-
-
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss)
 
@@ -1920,7 +1902,6 @@ def patch_GptOssAttention():
         # when training with bsz>1 we clamp max values.
         # combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
         combined_logits[:] = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
-        combined_logits[:] = F_softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
         probs = combined_logits
         scores = probs[..., :-1]  # we drop the sink here
         attn_weights = F_dropout(scores, p=dropout, training=module.training, inplace=True)
@@ -1967,9 +1948,7 @@ def patch_GptOssAttention():
                 key_states = key_states.to(cache_dtype)
                 value_states = value_states.to(cache_dtype)
             cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         if key_states.dtype != query_states.dtype or value_states.dtype != query_states.dtype:
             key_states = key_states.to(query_states.dtype)
             value_states = value_states.to(query_states.dtype)
@@ -2024,7 +2003,6 @@ def patch_GptOssAttention():
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
-
     pass
 
     functions = []
@@ -2057,8 +2035,6 @@ def patch_GptOssAttention():
     patch_function_past_key_values(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", functions)
     # Set env variable for padding purposes
     os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
-
-
 pass
 TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
@@ -2156,7 +2132,6 @@ def patch_GptOssModel():
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
         return query_states, key_states, value_states, input_shape
-
     pass
 
     # Do flex_attention_with_sink_decoding with cannot be compiled
@@ -2183,7 +2158,6 @@ def patch_GptOssModel():
         hidden_states *= torch.rsqrt_(variance)
         hidden_states *= self.weight.to(hidden_states.device).to(torch.float32)
         return hidden_states.to(input_dtype)  # main diff with Llama
-
     pass
 
     # Re-compiling for each new sequence length which is NOT ideal
@@ -2211,7 +2185,6 @@ def patch_GptOssModel():
             position_embeddings=position_embeddings,
         )
         return query_states, key_states, value_states, input_shape
-
     pass
     fused_torch_compile_options = get_torch_compile_options(
         epilogue_fusion = True,
@@ -2241,7 +2214,6 @@ def patch_GptOssModel():
         residual = hidden_states.clone()
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         return hidden_states, residual
-
     pass
 
     def inference_forward(
@@ -2274,7 +2246,6 @@ def patch_GptOssModel():
         residual = hidden_states.clone()
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         return hidden_states, residual
-
     pass
     # if has_static_cache and Version(torch.__version__) >= Version("2.10.0"):
     #     # torch 2.9.0 has excessive compilations
@@ -2425,8 +2396,6 @@ def patch_GptOssModel():
             })
 
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level="relaxed")
-
-
 pass
 TEMPORARY_PATCHES.append(patch_GptOssModel)
 
@@ -2531,8 +2500,6 @@ def encode_conversations_with_harmony(
         harmony_input_ids = encoding.render_conversation(convos)
     harmony_decoded_text = encoding.decode(harmony_input_ids)
     return harmony_decoded_text, harmony_input_ids
-
-
 pass
 
 
@@ -2802,8 +2769,6 @@ def patch_gpt_oss_init_weights_modulelist_fix():
 
     patch_function(GptOssPreTrainedModel, "_init_weights", _patched_init_weights)
     GptOssPreTrainedModel._unsloth_init_weights_fixed = True
-
-
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_init_weights_modulelist_fix)
 
@@ -2906,7 +2871,5 @@ def patch_gpt_oss_for_grpo():
     except Exception as e:
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: Could not patch GptOssForCausalLM.forward: {e}")
-
-
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_for_grpo)
