@@ -507,6 +507,9 @@ def patch_qwen3_vl_moe():
                 rope_deltas=outputs.rope_deltas,
             )
 
+        # Preserve __qualname__ so _unsloth_get_batch_samples can detect
+        # this is a ForConditionalGeneration forward and compute num_items_in_batch properly.
+        _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
         Qwen3VLMoeForConditionalGeneration.forward = _patched_causal_lm_forward
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(

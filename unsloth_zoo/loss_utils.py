@@ -306,9 +306,14 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                         forward = __wrapped__
             pass
             name = forward.__qualname__
-            if "ForConditionalGeneration" in name or "VisionText2Text" in name:
+            # Also check the class name as a fallback - patched forward methods
+            # (e.g. from temporary_patches) may have qualnames that don't contain
+            # the original class identifiers like "CausalLM".
+            class_name = type(m).__name__
+            if "ForConditionalGeneration" in name or "ForConditionalGeneration" in class_name \
+                or "VisionText2Text" in name:
                 is_vlm = True
-            if is_vlm or "CausalLM" in name or "_fast_forward" in name:
+            if is_vlm or "CausalLM" in name or "CausalLM" in class_name or "_fast_forward" in name:
                 signature = inspect.signature(forward).parameters.values()
                 has_kwargs = tuple(signature)[-1].kind == inspect._VAR_KEYWORD
                 break
