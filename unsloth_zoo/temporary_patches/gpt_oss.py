@@ -1098,17 +1098,18 @@ def patch_gpt_oss_bnb4bit():
     # Preserve original symbol names for compiler-generated modules.
     GptOssExpertsBnb4bit.__name__ = "GptOssExperts"
     GptOssExpertsBnb4bit.__qualname__ = "GptOssExperts"
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExpertsBnb4bit
-    # Use the unsloth GptOssTopKRouter (with self.linear = nn.Linear) for the router.
-    # The BnB 4-bit checkpoint stores router weights as router.linear.weight/bias.
-    # GptOssTopKRouterBnb4bit had self.weight/bias directly with a _load_from_state_dict
-    # override to remap keys, but transformers v5 bypasses _load_from_state_dict
-    # (uses accelerate's set_module_tensor_to_device), so the remapping never ran
-    # and router weights were randomly initialized - causing high loss (~4-5).
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
+    if _is_transformers_v5():
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExpertsBnb4bit
+        # Use the unsloth GptOssTopKRouter (with self.linear = nn.Linear) for the router.
+        # The BnB 4-bit checkpoint stores router weights as router.linear.weight/bias.
+        # GptOssTopKRouterBnb4bit had self.weight/bias directly with a _load_from_state_dict
+        # override to remap keys, but transformers v5 bypasses _load_from_state_dict
+        # (uses accelerate's set_module_tensor_to_device), so the remapping never ran
+        # and router weights were randomly initialized - causing high loss (~4-5).
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
 
-    logger.info("Unsloth: Patched GPT OSS with BitsAndBytes 4bit compatible classes")
-    os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "1"
+        logger.info("Unsloth: Patched GPT OSS with BitsAndBytes 4bit compatible classes")
+        os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "1"
     return True
 
 
