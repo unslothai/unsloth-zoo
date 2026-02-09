@@ -1124,3 +1124,96 @@ def patch_Lfm2VlMultiModalProjector():
     Projector._unsloth_patched = True
 pass
 TEMPORARY_PATCHES.append(patch_Lfm2VlMultiModalProjector)
+
+
+def patch_peft_dispatch_bnb_4bit():
+    """Fix PEFT dispatch_bnb_4bit accessing compress_statistics on non-Params4bit weights.
+
+    In transformers 5.0+, BNB quantization loading order changed so weights may still be
+    nn.Parameter (not Params4bit) when PEFT tries to access .compress_statistics and .quant_type.
+    This wraps the original dispatch to catch AttributeError and provide defaults.
+    """
+    try:
+        import peft.tuners.lora.bnb as peft_bnb
+        original_dispatch = peft_bnb.dispatch_bnb_4bit
+    except (ImportError, AttributeError):
+        return
+
+    if hasattr(original_dispatch, "_unsloth_patched"):
+        return
+
+    def safe_dispatch_bnb_4bit(target, adapter_name, **kwargs):
+        try:
+            return original_dispatch(target, adapter_name, **kwargs)
+        except AttributeError as e:
+            if "compress_statistics" in str(e) or "quant_type" in str(e):
+                # Transformers 5.0+: weight not yet quantized as Params4bit
+                # Retry after ensuring weight has needed attributes
+                w = target.weight
+                if not hasattr(w, "compress_statistics"):
+                    w.compress_statistics = getattr(
+                        target, "_bnb_compress_statistics", True
+                    )
+                if not hasattr(w, "quant_type"):
+                    w.quant_type = getattr(target, "_bnb_quant_type", "nf4")
+                return original_dispatch(target, adapter_name, **kwargs)
+            raise
+
+    safe_dispatch_bnb_4bit._unsloth_patched = True
+    peft_bnb.dispatch_bnb_4bit = safe_dispatch_bnb_4bit
+pass
+TEMPORARY_PATCHES.append(patch_peft_dispatch_bnb_4bit)
+
+
+def patch_trl_push_to_hub_token():
+    """Ensure to_dict() always includes push_to_hub_token for TRL compat.
+
+    TRL 0.22.x through 0.27.1 do bare dict_args.pop("push_to_hub_token") in
+    SFTTrainer.__init__ and IterativeSFTTrainer.__init__. On transformers 5.0+,
+    TrainingArguments.to_dict() no longer includes push_to_hub_token, so the
+    bare pop raises KeyError. Fix: monkey-patch to_dict() to always include it.
+    """
+    try:
+        from unsloth_zoo.utils import Version
+        import transformers
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return  # Not needed pre-5.0, to_dict() already includes it
+        from transformers import TrainingArguments
+        _original_to_dict = TrainingArguments.to_dict
+        if getattr(_original_to_dict, "_unsloth_patched", False):
+            return
+        def _patched_to_dict(self):
+            d = _original_to_dict(self)
+            if "push_to_hub_token" not in d:
+                d["push_to_hub_token"] = None
+            return d
+        _patched_to_dict._unsloth_patched = True
+        TrainingArguments.to_dict = _patched_to_dict
+    except Exception:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_trl_push_to_hub_token)
+
+
+def patch_trl_vision_model_mapping():
+    """Fix DPO vision model detection for TRL 0.22.x + transformers 5.0+.
+
+    TRL 0.22.x uses MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES which was removed in
+    transformers 5.0.0, replaced by MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.
+    When the import fails, the fallback {} makes is_vision_model always False,
+    silently breaking DPO with vision models. This patch injects the new mapping.
+    """
+    try:
+        import trl.trainer.dpo_trainer as dpo_mod
+    except ImportError:
+        return
+    current = getattr(dpo_mod, "MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES", None)
+    if current is not None and len(current) > 0:
+        return  # Already has valid mapping (transformers < 5.0 or TRL >= 0.23)
+    try:
+        from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
+        dpo_mod.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES = MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
+    except ImportError:
+        pass  # Neither mapping available
+pass
+TEMPORARY_PATCHES.append(patch_trl_vision_model_mapping)

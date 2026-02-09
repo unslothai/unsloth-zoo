@@ -340,21 +340,50 @@ def train_on_responses_only(
             # Set it to int(memory_gb_left) so 16Gb = 16
             num_proc = min(num_proc, int(memory_gb_left))
 
+    # In transformers 5.0+, VLM models skip dataset preparation in SFTTrainer.__init__
+    # (skip_prepare_dataset=True when _is_vlm=True). This means the dataset may not be
+    # tokenized yet. We need to tokenize it before applying _train_on_responses_only.
+    def _maybe_tokenize_dataset(dataset):
+        if dataset is None:
+            return dataset
+        sample = next(iter(dataset))
+        if "input_ids" in sample:
+            return dataset  # Already tokenized
+        # Need to tokenize - get the processing class from trainer
+        _tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
+        # Get the actual tokenizer (not processor) for tokenization
+        if hasattr(_tokenizer, "tokenizer"):
+            _tok = _tokenizer.tokenizer
+        else:
+            _tok = _tokenizer
+        max_length = getattr(trainer.args, "max_length", None) or getattr(trainer.args, "max_seq_length", 2048)
+        text_field = getattr(trainer.args, "dataset_text_field", "text")
+        def _tokenize_fn(examples):
+            texts = examples.get(text_field) or examples.get("text", [])
+            return _tok(texts, truncation=True, max_length=max_length, padding=False)
+        _map_kwargs = {"batched": True, "num_proc": num_proc}
+        if isinstance(dataset, IterableDataset):
+            _map_kwargs = {"batched": True}
+        return dataset.map(_tokenize_fn, **_map_kwargs)
+    pass
+
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
+        trainer.train_dataset = _maybe_tokenize_dataset(trainer.train_dataset)
         if isinstance(trainer.train_dataset, IterableDataset):
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batch_size = trainer.train_dataset._ex_iterable.batch_size, batched = True)
         else:
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
     pass
-    
+
     if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
         # Eval datasets could be a dict!
         if type(trainer.eval_dataset) is dict:
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
+                value = _maybe_tokenize_dataset(value)
                 if isinstance(value, IterableDataset):
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = value._ex_iterable.batch_size, batched = True)
                 else:
@@ -362,6 +391,7 @@ def train_on_responses_only(
         else:
             if not hasattr(trainer.eval_dataset, "map"):
                 raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
+            trainer.eval_dataset = _maybe_tokenize_dataset(trainer.eval_dataset)
             if isinstance(trainer.eval_dataset, IterableDataset):
                 trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batch_size = trainer.eval_dataset._ex_iterable.batch_size, batched = True)
             else:

@@ -49,7 +49,9 @@ def patch_bitsandbytes_linear4bit_forward():
         return raise_error("bitsandbytes.Linear4bit", e)
 
     def forward(self, x: torch.Tensor):
-        fix_4bit_weight_quant_state_from_module(self)
+        # In transformers 5.0+, weights may not be in packed format yet during init
+        if self.weight.shape[-1] == 1:
+            fix_4bit_weight_quant_state_from_module(self)
 
         # weights are cast automatically as Int8Params, but the bias has to be cast manually
         

@@ -602,7 +602,7 @@ def patch_tokenizer(model, tokenizer):
                 model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
     else:
         if model is not None:
-            if model.config.pad_token_id is None:
+            if getattr(model.config, "pad_token_id", None) is None:
                 model.config.update({"pad_token_id" : tokenizer.pad_token_id})
                 if getattr(model, "generation_config", None) is not None:
                     model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
