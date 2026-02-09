@@ -669,7 +669,7 @@ def sft_prepare_dataset(
             map_kwargs["batch_size"] = dataset._ex_iterable.batch_size
             
         if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
-        dataset = dataset.map(_tokenize, batched = True, **map_kwargs)
+        dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
 
         # If VLM, switch data collator since .pad is needed!
         if is_vlm and not hasattr(processing_class, "pad"):
