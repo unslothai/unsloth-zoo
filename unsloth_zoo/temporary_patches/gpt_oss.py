@@ -949,42 +949,45 @@ class GptOssExpertsBnb4bit(nn.Module):
         num_experts = routing_weights.shape[1]
 
         if self.training:
-            next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
+            next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
             # with torch.no_grad():
-            #     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-            #     expert_mask = expert_mask.permute(2, 1, 0)
-            #     expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            for expert_idx in expert_hitted[:]:
+                # expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
+                # expert_mask = expert_mask.permute(2, 1, 0)
+                # expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            # for expert_idx in expert_hitted[:]:
+            for expert_idx in range(num_experts):
                 with torch.no_grad():
-                    _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                    # _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                    token_idx, _ = torch.where(router_indices == expert_idx)
                 current_state = hidden_states[token_idx]
                 gate_up = self.gate_up_projs[expert_idx](current_state)
-                gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                gate = gate.clamp(min=None, max=self.limit)
-                up = up.clamp(min=-self.limit, max=self.limit)
-                glu = gate * torch.sigmoid(gate * self.alpha)
-                gated_output = (up + 1) * glu
+                gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+                # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                # gate = gate.clamp(min=None, max=self.limit)
+                # up = up.clamp(min=-self.limit, max=self.limit)
+                # glu = gate * torch.sigmoid(gate * self.alpha)
+                # gated_output = (up + 1) * glu
                 out = self.down_projs[expert_idx](gated_output)
                 weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
-                next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
+                next_states.index_add_(0, token_idx, weighted_output)
             next_states = next_states.view(batch_size, -1, self.hidden_size)
-            return next_states
+            return next_states.to(hidden_states.dtype)
         else:
             X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
             gate_up = torch.stack(gate_up_list, dim=0)
-            gate = gate_up[..., ::2]
-            up_h = gate_up[..., 1::2]
-            gate = gate.clamp(max=self.limit)
-            up_h = up_h.clamp(min=-self.limit, max=self.limit)
-            glu = gate * torch.sigmoid(gate * self.alpha)
-            fused = (up_h + 1) * glu
+            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = X_rep.dtype)
+            # gate = gate_up[..., ::2]
+            # up_h = gate_up[..., 1::2]
+            # gate = gate.clamp(max=self.limit)
+            # up_h = up_h.clamp(min=-self.limit, max=self.limit)
+            # glu = gate * torch.sigmoid(gate * self.alpha)
+            # fused = (up_h + 1) * glu
             out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
             outs = torch.stack(out_list, dim=0)
             rw = routing_weights.transpose(0, 1).unsqueeze(-1)
             mixed = (outs.to(torch.float32) * rw.to(torch.float32)).sum(dim=0)
             return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
-
 
 pass
 
@@ -1098,17 +1101,18 @@ def patch_gpt_oss_bnb4bit():
     # Preserve original symbol names for compiler-generated modules.
     GptOssExpertsBnb4bit.__name__ = "GptOssExperts"
     GptOssExpertsBnb4bit.__qualname__ = "GptOssExperts"
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExpertsBnb4bit
-    # Use the unsloth GptOssTopKRouter (with self.linear = nn.Linear) for the router.
-    # The BnB 4-bit checkpoint stores router weights as router.linear.weight/bias.
-    # GptOssTopKRouterBnb4bit had self.weight/bias directly with a _load_from_state_dict
-    # override to remap keys, but transformers v5 bypasses _load_from_state_dict
-    # (uses accelerate's set_module_tensor_to_device), so the remapping never ran
-    # and router weights were randomly initialized - causing high loss (~4-5).
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
+    if _is_transformers_v5():
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExpertsBnb4bit
+        # Use the unsloth GptOssTopKRouter (with self.linear = nn.Linear) for the router.
+        # The BnB 4-bit checkpoint stores router weights as router.linear.weight/bias.
+        # GptOssTopKRouterBnb4bit had self.weight/bias directly with a _load_from_state_dict
+        # override to remap keys, but transformers v5 bypasses _load_from_state_dict
+        # (uses accelerate's set_module_tensor_to_device), so the remapping never ran
+        # and router weights were randomly initialized - causing high loss (~4-5).
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
 
-    logger.info("Unsloth: Patched GPT OSS with BitsAndBytes 4bit compatible classes")
-    os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "1"
+        logger.info("Unsloth: Patched GPT OSS with BitsAndBytes 4bit compatible classes")
+        os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "1"
     return True
 
 
