@@ -1198,22 +1198,34 @@ TEMPORARY_PATCHES.append(patch_trl_push_to_hub_token)
 def patch_trl_vision_model_mapping():
     """Fix DPO vision model detection for TRL 0.22.x + transformers 5.0+.
 
-    TRL 0.22.x uses MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES which was removed in
-    transformers 5.0.0, replaced by MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.
-    When the import fails, the fallback {} makes is_vision_model always False,
-    silently breaking DPO with vision models. This patch injects the new mapping.
+    TRL 0.22.x does a bare import of MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES from
+    transformers.models.auto.modeling_auto. This name was removed in transformers
+    5.0.0, replaced by MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES. The import
+    failure prevents DPO trainer from loading at all.
+
+    Fix: inject the old name as an alias of the new name into the transformers
+    auto modeling module BEFORE TRL imports it, so the bare import succeeds.
+    Also patch already-loaded DPO module if it fell back to empty dict.
     """
     try:
-        import trl.trainer.dpo_trainer as dpo_mod
+        import transformers.models.auto.modeling_auto as auto_mod
     except ImportError:
         return
-    current = getattr(dpo_mod, "MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES", None)
-    if current is not None and len(current) > 0:
-        return  # Already has valid mapping (transformers < 5.0 or TRL >= 0.23)
+    # If the old name already exists and is populated, nothing to do
+    existing = getattr(auto_mod, "MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES", None)
+    if existing is not None and len(existing) > 0:
+        return
+    # Inject the old name as alias of the new name
+    new_mapping = getattr(auto_mod, "MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES", None)
+    if new_mapping is not None:
+        auto_mod.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES = new_mapping
+    # Also patch already-loaded DPO module if present
     try:
-        from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
-        dpo_mod.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES = MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
+        import trl.trainer.dpo_trainer as dpo_mod
+        dpo_current = getattr(dpo_mod, "MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES", None)
+        if (dpo_current is None or len(dpo_current) == 0) and new_mapping is not None:
+            dpo_mod.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES = new_mapping
     except ImportError:
-        pass  # Neither mapping available
+        pass
 pass
 TEMPORARY_PATCHES.append(patch_trl_vision_model_mapping)
