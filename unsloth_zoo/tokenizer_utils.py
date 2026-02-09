@@ -482,6 +482,11 @@ def patch_tokenizer(model, tokenizer):
         Fixes https://github.com/unslothai/unsloth/issues/5
     """
     # All Unsloth Zoo code licensed under LGPLv3
+
+    # Guard against None tokenizer (e.g., some VLM processors without tokenizer)
+    if tokenizer is None:
+        return model, tokenizer
+
     joiner = "\1\0=+=\0\1"
     number_repetitions = 3 - 1 # Number of reserved tokens needed
 
@@ -492,7 +497,12 @@ def patch_tokenizer(model, tokenizer):
     if hasattr(tokenizer, "image_processor") and hasattr(tokenizer, "apply_chat_template"):
         patch_processor_call(tokenizer)
 
-    if hasattr(tokenizer, "tokenizer"): tokenizer = tokenizer.tokenizer
+    if hasattr(tokenizer, "tokenizer"):
+        inner = tokenizer.tokenizer
+        if inner is None:
+            # Processor exists but inner tokenizer is None - return as-is
+            return model, original_tokenizer
+        tokenizer = inner
 
     bad_pad_token = False
     if hasattr(tokenizer, "pad_token") and tokenizer.pad_token is not None:
@@ -592,7 +602,7 @@ def patch_tokenizer(model, tokenizer):
                 model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
     else:
         if model is not None:
-            if model.config.pad_token_id is None:
+            if getattr(model.config, "pad_token_id", None) is None:
                 model.config.update({"pad_token_id" : tokenizer.pad_token_id})
                 if getattr(model, "generation_config", None) is not None:
                     model.generation_config.update(pad_token_id = tokenizer.pad_token_id)

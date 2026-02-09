@@ -49,10 +49,18 @@ def patch_bitsandbytes_linear4bit_forward():
         return raise_error("bitsandbytes.Linear4bit", e)
 
     def forward(self, x: torch.Tensor):
-        fix_4bit_weight_quant_state_from_module(self)
+        # In transformers 5.0+, weights may not be in packed format yet during init
+        if self.weight.shape[-1] == 1:
+            fix_4bit_weight_quant_state_from_module(self)
+
+        # Some layers may not be quantized (no quant_state) - fall back to regular matmul
+        quant_state = getattr(self.weight, "quant_state", None)
+        if quant_state is None:
+            bias = None if self.bias is None else self.bias
+            return torch.nn.functional.linear(x, self.weight, bias)
 
         # weights are cast automatically as Int8Params, but the bias has to be cast manually
-        
+
         # ** Errors out in torch.compile so remove it
         # if self.bias is not None and self.bias.dtype != x.dtype:
         #     self.bias.data = self.bias.data.to(x.dtype)
@@ -72,7 +80,7 @@ def patch_bitsandbytes_linear4bit_forward():
         # Cannot do .t() on Params4bit, instead do it on torch.Tensor
         weight = self.weight.data.t()
 
-        return bitsandbytes.matmul_4bit(x, weight, bias=bias, quant_state=self.weight.quant_state).to(inp_dtype)
+        return bitsandbytes.matmul_4bit(x, weight, bias=bias, quant_state=quant_state).to(inp_dtype)
 
     patch_function(bitsandbytes.nn.modules.Linear4bit, "forward", forward)
     try:

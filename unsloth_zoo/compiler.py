@@ -878,7 +878,22 @@ def create_new_function(
                     overwrite = True
     pass
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
-        overwrite = False
+        # Even with OVERWRITE disabled, force recompile on transformers version mismatch
+        if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
+            cached_versions = file_source[:file_source.find("__UNSLOTH_VERSIONING__")]
+            cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
+            # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
+            cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
+            if cached_tf_version != transformers_version:
+                logger.warning_once(
+                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but transformers version changed "
+                    f"({cached_tf_version} -> {transformers_version}). Forcing recompile of {name}."
+                )
+                # Don't set overwrite = False; keep overwrite = True from version mismatch detection
+            else:
+                overwrite = False
+        else:
+            overwrite = False
 
     # Check location
     def write_file(function_location, write_new_source):
