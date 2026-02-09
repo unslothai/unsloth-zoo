@@ -828,7 +828,7 @@ class GptOssExperts(nn.Module):
             )
 
         # Fallback to loop-based implementation
-        return forward_native_moe_loop(
+        return torch_native_forward(
             self, hidden_states, router_indices, routing_weights
         )
 
@@ -1395,7 +1395,7 @@ from .moe_utils import (
     select_moe_backend,
     patch_param_wrapper_for_moe,
     forward_native_grouped_mm,
-    forward_native_moe_loop,
+    torch_native_forward,
 )
 
 
@@ -1460,7 +1460,7 @@ def patch_gpt_oss_moe_for_lora():
     if backend == "grouped_mm":
         forward = forward_native_grouped_mm
     else:
-        forward = forward_native_moe_loop
+        forward = torch_native_forward
 
     # Store original forward and patch - but DON'T replace the class!
     GptOssExpertsClass._original_forward = GptOssExpertsClass.forward
