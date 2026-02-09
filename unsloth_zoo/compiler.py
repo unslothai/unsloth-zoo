@@ -811,10 +811,6 @@ def create_new_function(
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
     imports += "from torch.nn import functional as F\n"
-    if "torch_compile" in new_source:
-        imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
-    if "KWARGS_TYPE" in new_source:
-        imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )
@@ -889,7 +885,7 @@ def create_new_function(
             # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
             cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
             if cached_tf_version != transformers_version:
-                print(
+                logger.warning_once(
                     f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but transformers version changed "
                     f"({cached_tf_version} -> {transformers_version}). Forcing recompile of {name}."
                 )
@@ -3184,15 +3180,26 @@ def unsloth_compile_transformers(
             bad_torch_modules.add(module)
         pass
 
-        # Check if creating arrays in inside the function
-        # Error: DataDependentOutputException: aten._local_scalar_dense.default
+        # Check for data-dependent control flow that breaks torch.compile(fullgraph=True)
+        # Tier 1: Direct data escapes from tensor to Python
+        #   .nonzero() -> data-dependent output shape (variable-length)
+        #   .tolist()  -> materializes tensor values into Python list
+        #   .item()    -> materializes tensor scalar into Python
+        # Tier 2: MoE expert dispatch via torch.where + index_add
+        #   1-arg torch.where returns data-dependent indices; combined with
+        #   index_add this is the standard MoE routing loop pattern
         if (
-            "torch.arange(" in source
-            or "torch.zeros(" in source
-            or "torch.ones(" in source
+            ".nonzero()" in source
+            or ".tolist()" in source
+            or ".item()" in source
         ):
             print(
-                f"Unsloth: Failed compiling function {module} since array creations are done."
+                f"Unsloth: Will not compile {module} since data-dependent operations are done."
+            )
+            bad_torch_modules.add(module)
+        elif "torch.where(" in source and ".index_add" in source:
+            print(
+                f"Unsloth: Will not compile {module} since data-dependent routing is done."
             )
             bad_torch_modules.add(module)
         pass
