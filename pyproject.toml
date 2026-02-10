@@ -25,7 +25,6 @@ dependencies = [
     "torch>=2.4.0",
     "torchao>=0.13.0",
     "triton>=3.0.0 ; ('linux' in sys_platform)",
-    "triton-windows ; (sys_platform == 'win32') and (platform_machine == 'AMD64' or platform_machine == 'x86_64')",
     "packaging>=24.1",
     "tyro",
     "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,<=4.57.6",
@@ -59,7 +58,7 @@ include-package-data = false
 exclude = ["images*"]
 
 [project.optional-dependencies]
-huggingface = [
+core = [
     "packaging>=24.1",
     "tyro",
     "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,<=4.57.6",
@@ -82,13 +81,17 @@ huggingface = [
     "typing_extensions",
     "filelock",
 ]
+huggingface = [
+    "unsloth_zoo[core]",
+    "triton-windows ; (sys_platform == 'win32') and (platform_machine == 'AMD64' or platform_machine == 'x86_64')",
+]
 base = [
     "unsloth_zoo[huggingface]",
 ]
 intelgpu = [
     "torch>=2.4.0",
     "triton>=3.0.0 ; ('linux' in sys_platform)",
-    "unsloth_zoo[huggingface]",
+    "unsloth_zoo[core]",
 ]
 
 [project.urls]
