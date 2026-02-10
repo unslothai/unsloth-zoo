@@ -685,7 +685,7 @@ def grpo_accumulated_loss(
             B, multiplier = autotune_batch_and_chunks(
                 total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
             )
-            trainer.args.unsloth_grpo_mini_batch = total_rows//B
+            trainer.args.unsloth_grpo_mini_batch = max(1, total_rows//B)
             trainer.args.unsloth_logit_chunk_multiplier = multiplier
             B = trainer.args.unsloth_grpo_mini_batch
             multiplier = trainer.args.unsloth_logit_chunk_multiplier
