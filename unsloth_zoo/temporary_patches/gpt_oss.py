@@ -1040,6 +1040,16 @@ def patch_gpt_oss_bnb4bit():
 
     logger.info("Unsloth: Patched GPT OSS with BitsAndBytes 4bit compatible classes")
     os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "1"
+
+    # Inject BnB helpers so compiler-generated modules can import them
+    # from transformers.models.gpt_oss.modeling_gpt_oss
+    m = transformers.models.gpt_oss.modeling_gpt_oss
+    m._RouterLinearParams  = _RouterLinearParams
+    m.swiglu_torch_forward = swiglu_torch_forward
+    m.dtype_from_config    = dtype_from_config
+    m.transformers_version = transformers_version
+    m.Version              = Version
+
     return True
 
 
@@ -1070,8 +1080,8 @@ def patch_gpt_oss_bnb4bit_auto():
     """
     if not _should_use_gpt_oss_bnb4bit():
         return
-    # Avoid compiler-generated modules missing BnB helpers
-    os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+    # BnB helpers are now injected into the transformers module by
+    # patch_gpt_oss_bnb4bit(), so the compiler can resolve all symbols.
     patch_gpt_oss_bnb4bit()
     # Ensure inference path avoids torch.compile for 4-bit
     try:
