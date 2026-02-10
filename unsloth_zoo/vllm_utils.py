@@ -790,6 +790,12 @@ def patch_vllm(debug = True):
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
     if os.getenv("UNSLOTH_VLLM_STANDBY", "0") == "1":
+        if Version("0.10.0") <= Version(vllm_version) < Version("0.11.0"):
+            raise RuntimeError(
+                "Unsloth: vLLM 0.10.x crashes with std::bad_alloc when standby mode is "
+                "enabled due to insufficient memory headroom in CuMemAllocator.\n"
+                "Please update vLLM: pip install --upgrade vllm>=0.11.2"
+            )
         if Version("0.14.0") <= Version(vllm_version) < Version("0.15.0"):
             raise RuntimeError(
                 "Unsloth: vLLM 0.14.x has a known bug (cudaErrorIllegalAddress) in "
