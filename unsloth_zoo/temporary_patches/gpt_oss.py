@@ -1755,6 +1755,10 @@ def torch_native_forward(
     pass
 pass
 
+# Use torch_native_forward which has full float32 protection (swiglu in float32,
+# autocast disabled around down_proj) to prevent NaN in fp16 training.
+GptOssExpertsBnb4bit.forward = torch_native_forward
+
 def patch_gpt_oss_linearized():
     """
     Patch GPT OSS for 4bit loading with grouped_mm support.
