@@ -571,6 +571,34 @@ def sft_prepare_dataset(
     tokenizer = processing_class
     if is_vlm: tokenizer = processing_class.tokenizer
 
+    # Dynamic detection: check if model's module defines a function
+    # that requires token_type_ids when is_training=True
+    import sys as _sys
+    _needs_token_type_ids = False
+    # Split to avoid compiler substring match on masking_utils names
+    _ccm = 'create_' + 'causal_mask_mapping'
+    _model = getattr(self, '_unsloth_model_ref', None) or getattr(self, 'model', None)
+    if _model is not None:
+        for _m in (_model, getattr(_model, 'model', None)):
+            if _m is None: continue
+            _mod = _sys.modules.get(type(_m).__module__)
+            if _mod is not None and hasattr(_mod, _ccm):
+                _needs_token_type_ids = True
+                break
+
+    if not _needs_token_type_ids:
+        # Fallback: model not yet available, check processor class MRO
+        for _base in type(processing_class).__mro__:
+            _base_mod = getattr(_base, '__module__', '')
+            if 'transformers.models.' in _base_mod:
+                _modeling_mod = _base_mod.replace('.processing_', '.modeling_')
+                _mod = _sys.modules.get(_modeling_mod)
+                if _mod is not None and hasattr(_mod, _ccm):
+                    _needs_token_type_ids = True
+                    break
+    if _needs_token_type_ids and hasattr(args, 'remove_unused_columns'):
+        args.remove_unused_columns = False
+
     # Get max length
     max_seq_length = getattr(args, "max_length", 0)
     if max_seq_length == 0: max_seq_length = getattr(args, "max_seq_length", 0)
@@ -587,6 +615,8 @@ def sft_prepare_dataset(
     used_column_names = ["input_ids"]
     if "attention_mask" in column_names:
         used_column_names.append("attention_mask")
+    if _needs_token_type_ids:
+        used_column_names.append("token_type_ids")
 
     # Check if already tokenized so skip
     from transformers import DataCollatorForSeq2Seq, DataCollatorForLanguageModeling
@@ -648,7 +678,7 @@ def sft_prepare_dataset(
                 example[dataset_text_field] if not do_formatting_func else formatting_func(example),
                 truncation = do_truncation,
                 max_length = max_seq_length,
-                return_token_type_ids = False,
+                return_token_type_ids = _needs_token_type_ids,
                 add_special_tokens = add_special_tokens,
             )
         pass
