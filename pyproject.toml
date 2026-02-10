@@ -90,6 +90,10 @@ intelgpu = [
     "triton>=3.0.0 ; ('linux' in sys_platform)",
     "unsloth_zoo[huggingface]",
 ]
+mlx = [
+    "mlx-cce>=0.30.7 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "mlx-lm>=0.22.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+]
 
 [project.urls]
 homepage = "http://www.unsloth.ai"

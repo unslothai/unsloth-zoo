@@ -80,6 +80,17 @@ if find_spec("torch") is None:
         "We also have some installation instructions on our Github page."
     )
 
+# Inject triton & bitsandbytes stubs on Apple Silicon / MLX
+# Must happen BEFORE any module imports triton or bitsandbytes
+import platform as _platform
+if _platform.system() == "Darwin" and _platform.machine() == "arm64" and find_spec("mlx"):
+    from unsloth_zoo.stubs import triton_stub as _triton_stub
+    from unsloth_zoo.stubs import bitsandbytes_stub as _bnb_stub
+    _triton_stub.inject_into_sys_modules()
+    _bnb_stub.inject_into_sys_modules()
+    del _triton_stub, _bnb_stub
+del _platform
+
 # Reduce VRAM usage by reducing fragmentation
 # And optimize pinning of memory
 if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0":
@@ -150,6 +161,7 @@ from .device_type import (
     DEVICE_TYPE_TORCH,
     DEVICE_COUNT,
     ALLOW_PREQUANTIZED_MODELS,
+    IS_MLX,
 )
 
 # Torch 2.9 removed PYTORCH_HIP_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF
