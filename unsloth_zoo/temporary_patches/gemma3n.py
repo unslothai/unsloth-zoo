@@ -201,3 +201,38 @@ def patch_Gemma3nModel_get_placeholder_mask():
     patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel, "get_placeholder_mask", get_placeholder_mask, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3nModel_get_placeholder_mask)
+
+def patch_Gemma3nModel_get_audio_features():
+    # Fix upstream transformers bug: Gemma3nModel.forward does
+    #   audio_features = audio_features.pooler_output  (overwrites dataclass with tensor)
+    #   audio_mask = audio_features.audio_mel_mask      (crashes - tensor has no audio_mel_mask)
+    # We patch get_audio_features to attach audio_mel_mask onto the pooler_output tensor.
+    try:
+        import transformers.models.gemma3n.modeling_gemma3n
+        from transformers.models.gemma3n.modeling_gemma3n import Gemma3nModel
+    except Exception as e:
+        return raise_error("Gemma3nModel.get_audio_features", e)
+
+    if not hasattr(Gemma3nModel, "get_audio_features"):
+        return
+
+    def get_audio_features(
+        self,
+        input_features: torch.Tensor,
+        input_features_mask: torch.Tensor,
+        **kwargs,
+    ):
+        audio_outputs = self.audio_tower(
+            input_features, input_features_mask, return_dict=True, **kwargs
+        )
+        audio_embeds = self.embed_audio(inputs_embeds=audio_outputs.last_hidden_state)
+        audio_outputs.pooler_output = audio_embeds
+        # Attach audio_mel_mask to pooler_output tensor so it survives
+        # the variable reassignment in Gemma3nModel.forward
+        if hasattr(audio_outputs, "audio_mel_mask") and audio_outputs.audio_mel_mask is not None:
+            audio_outputs.pooler_output.audio_mel_mask = audio_outputs.audio_mel_mask
+        return audio_outputs
+    pass
+    patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel, "get_audio_features", get_audio_features, match_level="relaxed")
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3nModel_get_audio_features)
