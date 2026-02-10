@@ -19,6 +19,7 @@ import os
 import shutil
 from typing import Optional, Tuple
 from torch.autograd import Function
+from .utils import logger
 
 # Get compile location
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
@@ -198,13 +199,13 @@ def select_moe_backend():
             return "unsloth_triton"
         if requested == "native_torch":
             return "native_torch"
-        print(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
+        logger.info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
     if _check_torch_grouped_mm_supported():
-        print("Unsloth: Using MoE backend 'grouped_mm'")
+        logger.info("Unsloth: Using MoE backend 'grouped_mm'")
         return "grouped_mm"
     if _check_grouped_gemm_available():
-        print("Unsloth: Using MoE backend 'unsloth_triton'")
+        logger.info("Unsloth: Using MoE backend 'unsloth_triton'")
         return "unsloth_triton"
     return "native_torch"
 
