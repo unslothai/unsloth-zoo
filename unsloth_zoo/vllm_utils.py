@@ -1476,6 +1476,7 @@ def approximate_vllm_memory_usage(
     float8_kv_cache = False,
     account_for_gradients = True,
     parallel_sequences = 64,
+    cuda_graph_overhead = True,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
@@ -1549,6 +1550,19 @@ def approximate_vllm_memory_usage(
     float_bytes = 1.25 if float8_kv_cache else 2
     kv_elements = (kv_size * 2 * n_layers) * float_bytes
     memory_left_for_kv_cache = free_memory - bytes_for_model
+
+    # Account for CUDA graph capture overhead.
+    # Each graph stores activations for one batch size. Overhead scales with
+    # model hidden_size and num_layers. Empirically 0.15-0.5 GiB for 1B-8B models.
+    # With FULL_AND_PIECEWISE mode + LoRA: ~172 graphs (51 sizes x 2 lora + 35 x 2 decode).
+    if cuda_graph_overhead:
+        num_cuda_graphs = 172
+        per_graph_estimate = hd * n_layers * 4  # bytes, rough per-graph activation estimate
+        _cuda_graph_overhead = num_cuda_graphs * per_graph_estimate
+        _cuda_graph_overhead = max(_cuda_graph_overhead, int(0.15 * 1024**3))  # floor at 0.15 GiB
+        _cuda_graph_overhead = min(_cuda_graph_overhead, int(1.0 * 1024**3))   # cap at 1.0 GiB
+        memory_left_for_kv_cache -= _cuda_graph_overhead
+
     if memory_left_for_kv_cache <= 0: memory_left_for_kv_cache = 0
 
     # Approx maximum # of KV cache elements
@@ -1723,12 +1737,13 @@ def load_vllm(
     ten_percent = total_gb * 0.1 # 1.46GB for T4
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"10% of your GPU VRAM = {ten_percent:.2f} GB")
-    if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
-    elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
-    elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
-    elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
-    elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
-    else: standby_target_gpu_util = 0.75
+    if   ten_percent >= 9.0: standby_target_gpu_util = 0.9    # 90GB+ GPUs
+    elif ten_percent >= 4.0: standby_target_gpu_util = 0.875  # 40-89GB GPUs
+    elif ten_percent >= 2.5: standby_target_gpu_util = 0.85   # 25-39GB GPUs
+    elif ten_percent >= 2.0: standby_target_gpu_util = 0.825  # 20-24GB GPUs
+    elif ten_percent >= 1.4: standby_target_gpu_util = 0.8    # 14-19GB GPUs
+    elif ten_percent >= 1.0: standby_target_gpu_util = 0.75   # 10-13GB GPUs
+    else: standby_target_gpu_util = 0.7
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"standby_target_gpu_util = {standby_target_gpu_util:.3f}")
     # Reduce memory usage for newer vLLM versions since it OOMs
@@ -1791,6 +1806,14 @@ def load_vllm(
         float8_kv_cache = float8_kv_cache,
         account_for_gradients = training,
     )
+
+    # Pre-flight warning: if KV cache headroom is very low with standby mode,
+    # warn before LLM() is called (which may crash unrecoverably).
+    if memory_left_for_kv_cache_gb < 1.0 and unsloth_vllm_standby:
+        print(
+            f"Unsloth: WARNING - Only {memory_left_for_kv_cache_gb:.2f} GB estimated for KV cache on your {total_gb:.1f} GB GPU.\n"
+            f"This may cause an out-of-memory crash with standby mode. Consider lowering gpu_memory_utilization."
+        )
 
     enable_chunked_prefill = True
     is_mllama = "mllama" in config.model_type
@@ -2161,6 +2184,16 @@ def load_vllm(
             if trials >= 2 or unsloth_vllm_standby:
                 # Sleep mode uses CuMemAllocator which can't run multiple instances in single process.
                 # We can't do retry because vLLM will fail to load with said error.
+                if unsloth_vllm_standby and ("memory" in error.lower() or "alloc" in error.lower()):
+                    raise RuntimeError(
+                        f"Unsloth: Your GPU ran out of memory loading vLLM with standby mode enabled.\n"
+                        f"Your GPU has {total_gb:.1f} GB VRAM with gpu_memory_utilization={gpu_memory_utilization:.3f}.\n"
+                        f"Try one of these fixes:\n"
+                        f"  1. Lower gpu_memory_utilization: model, tokenizer = FastLanguageModel.from_pretrained(..., gpu_memory_utilization=0.6)\n"
+                        f"  2. Disable standby mode: remove os.environ['UNSLOTH_VLLM_STANDBY'] = '1'\n"
+                        f"  3. Use a smaller model or quantization (load_in_4bit=True)\n"
+                        f"Original error: {error}"
+                    )
                 raise RuntimeError(error)
 
             if "gpu_memory_utilization" in error or "memory" in error:
