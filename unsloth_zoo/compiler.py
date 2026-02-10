@@ -472,6 +472,31 @@ def higher_precision_sqrt_mean(source):
 pass
 
 
+def fix_apply_rotary_pos_emb_mixed_dtype(source):
+    # When FORCE_FLOAT32 is set, the model is bfloat16 but inference uses float16 autocast.
+    # RoPE forward returns cos/sin in bfloat16 (hidden_states dtype), but q/k are float16
+    # (from autocast). apply_rotary_pos_emb does float16 * bfloat16 = float32, breaking
+    # flex_attention's strict dtype validation and causing cache dtype mismatches.
+    # Fix: cast cos/sin to match q dtype inside apply_rotary_pos_emb.
+    if "apply_rotary_pos_emb" not in source:
+        return source
+    # Use regex to handle any indentation level
+    source = re.sub(
+        r"([ \t]*)(cos = cos\.unsqueeze\(unsqueeze_dim\)\n)"
+        r"(\1sin = sin\.unsqueeze\(unsqueeze_dim\)\n)"
+        r"(\1)(q_embed)",
+        r"\1cos = cos.unsqueeze(unsqueeze_dim)\n"
+        r"\1sin = sin.unsqueeze(unsqueeze_dim)\n"
+        r"\1if cos.dtype != q.dtype:\n"
+        r"\1    cos = cos.to(q.dtype)\n"
+        r"\1    sin = sin.to(q.dtype)\n"
+        r"\4\5",
+        source,
+    )
+    return source
+pass
+
+
 def fix_rotary_embedding_dtype(source):
     # Rotary Embeddings might be left in float32 since we upcast it
     # We downcast it to float16 if we see float32 for X's dtype
@@ -765,6 +790,9 @@ def create_new_function(
 
     # Fix all softmax low precisions to float32
     new_source = higher_precision_softmax(new_source)
+
+    # Fix apply_rotary_pos_emb mixed dtype (bfloat16 cos/sin * float16 q/k = float32)
+    new_source = fix_apply_rotary_pos_emb_mixed_dtype(new_source)
 
     if new_source[0] == " ":
         spaces = new_source.find("def")
@@ -1199,6 +1227,9 @@ def create_standalone_class(
 
     # Fix RotaryEmbeddings being in the wrong precision
     source = fix_rotary_embedding_dtype(source)
+
+    # Fix apply_rotary_pos_emb mixed dtype (bfloat16 cos/sin * float16 q/k = float32)
+    source = fix_apply_rotary_pos_emb_mixed_dtype(source)
 
     return source
 
