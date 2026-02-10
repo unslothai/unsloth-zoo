@@ -373,6 +373,34 @@ def train_on_responses_only(
             return dataset.map(_tokenize_fn, **_map_kwargs)
     pass
 
+    # Filter out samples where all labels are -100 (no valid training signal).
+    # This can happen when truncation cuts off the response_part entirely,
+    # e.g. long reasoning/analysis channels in GPT-OSS that exceed max_seq_length.
+    # Such samples cause NaN loss since cross_entropy(mean) computes 0/0.
+    def _has_valid_labels(example):
+        labels = example.get("labels")
+        if labels is None: return True
+        if type(labels) is torch_Tensor:
+            return (labels != -100).any().item()
+        return any(l != -100 for l in labels)
+    pass
+
+    def _filter_fully_masked(dataset, dataset_name="dataset"):
+        if isinstance(dataset, IterableDataset):
+            return dataset  # Cannot filter IterableDataset efficiently
+        n_before = len(dataset)
+        dataset = dataset.filter(_has_valid_labels, num_proc=num_proc)
+        n_after = len(dataset)
+        n_removed = n_before - n_after
+        if n_removed > 0:
+            print(
+                f"Unsloth: Removed {n_removed} out of {n_before} samples from {dataset_name} "
+                f"where all labels were -100 (no response found after truncation). "
+                f"This prevents NaN loss during training."
+            )
+        return dataset
+    pass
+
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
@@ -381,6 +409,7 @@ def train_on_responses_only(
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batch_size = trainer.train_dataset._ex_iterable.batch_size, batched = True)
         else:
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+        trainer.train_dataset = _filter_fully_masked(trainer.train_dataset, "train_dataset")
     pass
 
     if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
@@ -394,6 +423,7 @@ def train_on_responses_only(
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = value._ex_iterable.batch_size, batched = True)
                 else:
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+                trainer.eval_dataset[key] = _filter_fully_masked(trainer.eval_dataset[key], f"eval_dataset[{key}]")
         else:
             if not hasattr(trainer.eval_dataset, "map"):
                 raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
@@ -402,6 +432,7 @@ def train_on_responses_only(
                 trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batch_size = trainer.eval_dataset._ex_iterable.batch_size, batched = True)
             else:
                 trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+            trainer.eval_dataset = _filter_fully_masked(trainer.eval_dataset, "eval_dataset")
         pass
     pass
 

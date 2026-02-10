@@ -668,6 +668,28 @@ def _download_convert_hf_to_gguf(
         except Exception as e: logger.error(f"Unsloth: Error applying metadata branding patch: {e}", exc_info=True); raise
 
 
+        # Patch 3: Qwen2MoE/Qwen3MoE num_experts fix
+        try:
+            # Use a single regex to handle both quote styles
+            num_experts_pattern = rb'n_experts = self\.hparams\[(["\'])num_experts\1\]'
+            replacement = (
+                b"# Qwen3MoE seems to use num_local_experts instead of num_experts\n"
+                b"            n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')"
+            )
+
+            new_patched_content = re.sub(num_experts_pattern, replacement, patched_content)
+            num_experts_patch_applied = (new_patched_content != patched_content)
+
+            if num_experts_patch_applied:
+                patched_content = new_patched_content
+            else:
+                logger.warning("Unsloth: Qwen2MoE num_experts patch target not found.")
+
+        except Exception as e:
+            logger.error(f"Unsloth: Error applying Qwen2MoE num_experts patch: {e}", exc_info=True)
+            raise
+
+
         # 4. Write Patched File
         patched_filename = f"llama.cpp/{name}.py"
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")

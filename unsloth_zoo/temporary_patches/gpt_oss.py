@@ -2851,6 +2851,9 @@ def patch_gpt_oss_for_grpo():
                 router_logits=getattr(outputs, 'router_logits', None),
             )
 
+        # Preserve __qualname__ so _unsloth_get_batch_samples can detect
+        # this is a CausalLM forward and compute num_items_in_batch properly.
+        _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
         GptOssForCausalLM.forward = _patched_causal_lm_forward
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("Unsloth: Patched GptOssForCausalLM.forward for GRPO hidden states.")
