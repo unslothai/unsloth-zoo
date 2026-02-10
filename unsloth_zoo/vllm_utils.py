@@ -790,6 +790,12 @@ def patch_vllm(debug = True):
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
     if os.getenv("UNSLOTH_VLLM_STANDBY", "0") == "1":
+        if Version(vllm_version) < Version("0.11.0"):
+            raise RuntimeError(
+                "Unsloth: vLLM < 0.11 crashes with std::bad_alloc when standby mode is "
+                "enabled due to insufficient memory headroom in CuMemAllocator.\n"
+                "Please update vLLM: pip install --upgrade vllm>=0.11.2"
+            )
         if Version("0.14.0") <= Version(vllm_version) < Version("0.15.0"):
             raise RuntimeError(
                 "Unsloth: vLLM 0.14.x has a known bug (cudaErrorIllegalAddress) in "
@@ -1743,29 +1749,20 @@ def load_vllm(
     ten_percent = total_gb * 0.1 # 1.46GB for T4
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"10% of your GPU VRAM = {ten_percent:.2f} GB")
-    if Version(vllm_version) < Version("0.11.0"):
-        # vllm < 0.11 does not get the 0.95x headroom multiplier below,
-        # so use lower targets to prevent std::bad_alloc on L4/A100 with standby mode.
-        if   ten_percent >= 9.0: standby_target_gpu_util = 0.9
-        elif ten_percent >= 4.0: standby_target_gpu_util = 0.875
-        elif ten_percent >= 2.5: standby_target_gpu_util = 0.85
-        elif ten_percent >= 2.0: standby_target_gpu_util = 0.825
-        elif ten_percent >= 1.4: standby_target_gpu_util = 0.8
-        elif ten_percent >= 1.0: standby_target_gpu_util = 0.75
-        else: standby_target_gpu_util = 0.7
-    else:
-        if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
-        elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
-        elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
-        elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
-        elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
-        else: standby_target_gpu_util = 0.75
-        # Reduce memory usage for newer vLLM versions since it OOMs
-        if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Decreasing VRAM further since vLLM version >= 0.11.0 uses more")
-        standby_target_gpu_util *= 0.95
-        if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Further reduced standby_target_gpu_util = {standby_target_gpu_util:.4f}")
+    # Standby mode is blocked for vllm < 0.11 and 0.14.x (RuntimeError above),
+    # so this path only runs for vllm 0.11-0.13 and >= 0.15.
+    if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
+    elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
+    elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
+    elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
+    elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
+    else: standby_target_gpu_util = 0.75
+    # Reduce memory usage for newer vLLM versions since it OOMs
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Decreasing VRAM further since vLLM version >= 0.11.0 uses more")
+    standby_target_gpu_util *= 0.95
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Further reduced standby_target_gpu_util = {standby_target_gpu_util:.4f}")
     pass
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"standby_target_gpu_util = {standby_target_gpu_util:.4f}")
