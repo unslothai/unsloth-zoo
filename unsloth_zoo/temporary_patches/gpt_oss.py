@@ -2340,24 +2340,12 @@ def patch_GptOssModel():
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         else:
-            # Fix 2D attention_mask being passed to eager_attention_forward which expects 4D
-            if (
-                self.training
-                and attention_mask is not None
-                and attention_mask.dim() == 2
-            ):
-                bsz, seq_len = attention_mask.shape
-                min_dtype = torch.finfo(inputs_embeds.dtype).min
-                # 1. Expand padding mask to (B, 1, 1, S)
-                expanded_mask = attention_mask[:, None, None, :].to(
-                    dtype=inputs_embeds.dtype
-                )
-                expanded_mask = (1.0 - expanded_mask) * min_dtype
-
-                # 2. Causal mask (1, 1, S, S)
-                causal_mask = torch.full((seq_len, seq_len), min_dtype, device=attention_mask.device, dtype=inputs_embeds.dtype)
-                causal_mask = torch.triu(causal_mask, diagonal=1)
-                attention_mask = causal_mask[None, None, :, :] + expanded_mask
+            # During training, flex_attention_with_sink creates its own sparse
+            # BlockMask and ignores the attention_mask argument entirely.
+            # Skip dense 4D mask creation to avoid O(seq_len^2) memory allocation
+            # which causes OOM at long context lengths (e.g. 500K tokens).
+            if self.training:
+                attention_mask = None
 
             # Accumulate hidden states if requested
             output_hidden_states = kwargs.get(
