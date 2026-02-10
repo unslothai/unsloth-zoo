@@ -259,6 +259,30 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
 
 
+def patch_rocm_disable_generate_cache():
+    try:
+        import transformers.generation.utils as generation_utils
+    except Exception as e:
+        return raise_error("GenerationMixin.generate", e)
+
+    if not getattr(getattr(torch, "version", None), "hip", None):
+        return
+
+    if getattr(generation_utils.GenerationMixin, "_unsloth_rocm_generate_patched", False):
+        return
+
+    original_generate = generation_utils.GenerationMixin.generate
+
+    def generate(self, *args, **kwargs):
+        kwargs["use_cache"] = False
+        return original_generate(self, *args, **kwargs)
+
+    generation_utils.GenerationMixin.generate = generate
+    generation_utils.GenerationMixin._unsloth_rocm_generate_patched = True
+pass
+TEMPORARY_PATCHES.append(patch_rocm_disable_generate_cache)
+
+
 def patch_CsmForConditionalGeneration_forward():
     try:
         import transformers.models.csm.modeling_csm

@@ -24,6 +24,7 @@ __all__ = [
 ]
 
 import torch
+import os
 import functools
 from .utils import Version
 import inspect
@@ -77,6 +78,10 @@ ALLOW_PREQUANTIZED_MODELS : bool = True
 # HSA_STATUS_ERROR_EXCEPTION checks - sometimes AMD fails for BnB
 ALLOW_BITSANDBYTES : bool = True
 if DEVICE_TYPE == "hip":
+    # Disable AITER by default on ROCm to avoid JIT build locks and runtime faults.
+    # Users can override by explicitly setting env vars.
+    os.environ.setdefault("AITER_DISABLE", "1")
+    os.environ.setdefault("USE_ROCM_AITER_ROPE_BACKEND", "0")
     try:
         from bitsandbytes.nn.modules import Params4bit
         if "blocksize = 64 if not HIP_ENVIRONMENT else 128" in inspect.getsource(Params4bit):

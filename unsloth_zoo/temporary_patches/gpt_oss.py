@@ -760,6 +760,13 @@ class GptOssExperts(nn.Module):
         self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
     ) -> torch.Tensor:
         """Forward using grouped_mm or loop fallback with LoRA support."""
+        # ROCm: ensure hidden_states matches expert weight dtype to avoid matmul type errors
+        if getattr(getattr(torch, "version", None), "hip", None):
+            target_dtype = getattr(getattr(self.down_proj, "weight", None), "dtype", None)
+            if target_dtype is None:
+                target_dtype = self.dtype
+            if hidden_states is not None and hidden_states.dtype != target_dtype:
+                hidden_states = hidden_states.to(target_dtype)
         # Use optimized grouped_mm if available
         if _check_torch_grouped_mm_supported():
             return forward_native_grouped_mm(self, hidden_states, router_indices, routing_weights)
