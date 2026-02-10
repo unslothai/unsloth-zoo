@@ -57,7 +57,12 @@ def patch_bitsandbytes_linear4bit_forward():
         quant_state = getattr(self.weight, "quant_state", None)
         if quant_state is None:
             bias = None if self.bias is None else self.bias
-            return torch.nn.functional.linear(x, self.weight, bias)
+            weight = self.weight
+            if weight.dtype != x.dtype:
+                weight = weight.to(x.dtype)
+            if bias is not None and bias.dtype != x.dtype:
+                bias = bias.to(x.dtype)
+            return torch.nn.functional.linear(x, weight, bias)
 
         # weights are cast automatically as Int8Params, but the bias has to be cast manually
 

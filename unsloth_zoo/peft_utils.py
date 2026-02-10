@@ -40,6 +40,7 @@ SKIP_QUANTIZATION_MODULES = [
     "mlp.gate",                 # MoE Router
     "block_sparse_moe.gate",    # MoE Router
     'mamba',
+    "audio_tower",              # Gemma3N audio encoder conformer
 ]
 
 def get_peft_regex(
