@@ -130,15 +130,6 @@ if importlib.util.find_spec("vllm") is not None:
             del vllm_logger
         except:
             pass
-        # Suppress repetitive sleep/wake log messages from vLLM executor
-        try:
-            from vllm.v1.executor.abstract import logger as vllm_executor_logger
-            vllm_executor_logger.addFilter(HideLoggingMessage("seconds to fall asleep"))
-            vllm_executor_logger.addFilter(HideLoggingMessage("seconds to wake up"))
-            vllm_executor_logger.addFilter(HideLoggingMessage("Executor is not sleeping"))
-            del vllm_executor_logger
-        except:
-            pass
     pass
 
     # Allow unsloth dynamic quants to work
@@ -1746,9 +1737,15 @@ def load_vllm(
     ten_percent = total_gb * 0.1 # 1.46GB for T4
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"10% of your GPU VRAM = {ten_percent:.2f} GB")
-    if Version(vllm_version) < Version("0.11.0"):
+    _needs_lower_standby = (
+        Version(vllm_version) < Version("0.11.0") or
+        (Version("0.14.0") <= Version(vllm_version) < Version("0.15.0"))
+    )
+    if _needs_lower_standby:
         # vllm < 0.11 does not get the 0.95x headroom multiplier below,
         # so use lower targets to prevent std::bad_alloc on L4/A100 with standby mode.
+        # vllm 0.14.x has a CuMemAllocator bug (cudaErrorIllegalAddress during
+        # sleep/wake), so lower targets reduce VRAM pressure and help avoid it.
         if   ten_percent >= 9.0: standby_target_gpu_util = 0.9
         elif ten_percent >= 4.0: standby_target_gpu_util = 0.875
         elif ten_percent >= 2.5: standby_target_gpu_util = 0.85
