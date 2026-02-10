@@ -2185,7 +2185,7 @@ def load_vllm(
                 # Sleep mode uses CuMemAllocator which can't run multiple instances in single process.
                 # We can't do retry because vLLM will fail to load with said error.
                 if unsloth_vllm_standby and ("memory" in error.lower() or "alloc" in error.lower()):
-                    raise RuntimeError(
+                    raise MemoryError(
                         f"Unsloth: Your GPU ran out of memory loading vLLM with standby mode enabled.\n"
                         f"Your GPU has {total_gb:.1f} GB VRAM with gpu_memory_utilization={gpu_memory_utilization:.3f}.\n"
                         f"Try one of these fixes:\n"
