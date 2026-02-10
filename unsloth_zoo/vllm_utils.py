@@ -790,6 +790,12 @@ def patch_vllm(debug = True):
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
     if os.getenv("UNSLOTH_VLLM_STANDBY", "0") == "1":
+        if Version("0.14.0") <= Version(vllm_version) < Version("0.15.0"):
+            raise RuntimeError(
+                "Unsloth: vLLM 0.14.x has a known bug (cudaErrorIllegalAddress) in "
+                "CuMemAllocator during sleep/wake cycles which crashes standby mode.\n"
+                "Please update vLLM: pip install --upgrade vllm>=0.15.1"
+            )
         logger.info(f'Unsloth: Patching vLLM to enable standby.')
         patch_vllm_enable_sleep_mode()
     patch_vllm_graph_capture()
@@ -1737,15 +1743,9 @@ def load_vllm(
     ten_percent = total_gb * 0.1 # 1.46GB for T4
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"10% of your GPU VRAM = {ten_percent:.2f} GB")
-    _needs_lower_standby = (
-        Version(vllm_version) < Version("0.11.0") or
-        (Version("0.14.0") <= Version(vllm_version) < Version("0.15.0"))
-    )
-    if _needs_lower_standby:
+    if Version(vllm_version) < Version("0.11.0"):
         # vllm < 0.11 does not get the 0.95x headroom multiplier below,
         # so use lower targets to prevent std::bad_alloc on L4/A100 with standby mode.
-        # vllm 0.14.x has a CuMemAllocator bug (cudaErrorIllegalAddress during
-        # sleep/wake), so lower targets reduce VRAM pressure and help avoid it.
         if   ten_percent >= 9.0: standby_target_gpu_util = 0.9
         elif ten_percent >= 4.0: standby_target_gpu_util = 0.875
         elif ten_percent >= 2.5: standby_target_gpu_util = 0.85
