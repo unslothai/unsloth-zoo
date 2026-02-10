@@ -751,6 +751,38 @@ if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") a
     transformers.integrations.bitsandbytes._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
 pass
 
+# Patch for transformers 5.x: should_convert_module uses re.match (prefix-anchored)
+# and endswith, but does not do substring component matching. This means entries like
+# "vision_tower" in llm_int8_skip_modules fail to match module names like
+# "model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj".
+# On 4.x, Unsloth patches _replace_with_bnb_linear with check_conversion_mappings
+# (substring matching). On 5.x, _replace_with_bnb_linear doesn't exist, so we
+# patch should_convert_module instead.
+import transformers.quantizers.quantizers_utils as _quantizers_utils
+if not hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") and \
+    hasattr(_quantizers_utils, "should_convert_module") and \
+    getattr(_quantizers_utils.should_convert_module, "__name__", "") != "_unsloth_should_convert_module":
+
+    _original_should_convert_module = _quantizers_utils.should_convert_module
+
+    def _unsloth_should_convert_module(full_name, patterns=None):
+        if patterns is None:
+            return True
+        should_not_convert = any(
+            re.match(f"{key}\\.", full_name) or
+            re.match(f"{key}", full_name) or
+            full_name.endswith(key) or
+            f".{key}." in f".{full_name}."
+            for key in patterns
+        )
+        return not should_not_convert
+
+    _quantizers_utils.should_convert_module = _unsloth_should_convert_module
+    # Also patch the imported reference in bitsandbytes module
+    if hasattr(transformers.integrations.bitsandbytes, "should_convert_module"):
+        transformers.integrations.bitsandbytes.should_convert_module = _unsloth_should_convert_module
+pass
+
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
