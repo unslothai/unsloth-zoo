@@ -26,6 +26,7 @@ __all__ = [
     "add_new_tokens",
     "fix_untrained_tokens",
     "patch_tokenizer",
+    "patch_processor_call",
 ]
 
 
@@ -481,11 +482,27 @@ def patch_tokenizer(model, tokenizer):
         Fixes https://github.com/unslothai/unsloth/issues/5
     """
     # All Unsloth Zoo code licensed under LGPLv3
+
+    # Guard against None tokenizer (e.g., some VLM processors without tokenizer)
+    if tokenizer is None:
+        return model, tokenizer
+
     joiner = "\1\0=+=\0\1"
     number_repetitions = 3 - 1 # Number of reserved tokens needed
 
     original_tokenizer = tokenizer
-    if hasattr(tokenizer, "tokenizer"): tokenizer = tokenizer.tokenizer
+
+    # Patch processor's __call__ for vision models to auto-apply chat template
+    # when conversation format is passed instead of a string
+    if hasattr(tokenizer, "image_processor") and hasattr(tokenizer, "apply_chat_template"):
+        patch_processor_call(tokenizer)
+
+    if hasattr(tokenizer, "tokenizer"):
+        inner = tokenizer.tokenizer
+        if inner is None:
+            # Processor exists but inner tokenizer is None - return as-is
+            return model, original_tokenizer
+        tokenizer = inner
 
     bad_pad_token = False
     if hasattr(tokenizer, "pad_token") and tokenizer.pad_token is not None:
@@ -585,7 +602,7 @@ def patch_tokenizer(model, tokenizer):
                 model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
     else:
         if model is not None:
-            if model.config.pad_token_id is None:
+            if getattr(model.config, "pad_token_id", None) is None:
                 model.config.update({"pad_token_id" : tokenizer.pad_token_id})
                 if getattr(model, "generation_config", None) is not None:
                     model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
@@ -600,6 +617,84 @@ def patch_tokenizer(model, tokenizer):
 
     return model, original_tokenizer
 pass
+
+
+def _is_conversation_format(text):
+    """
+    Check if text looks like a conversation format (list of dicts with 'role' keys).
+    This handles the case where users pass conversation format directly to processor.__call__
+    instead of first applying apply_chat_template.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not isinstance(text, list):
+        return False
+    if len(text) == 0:
+        return False
+    # Check first element - if it's a dict with 'role' key, it's conversation format
+    first = text[0]
+    if isinstance(first, dict) and "role" in first:
+        return True
+    return False
+pass
+
+
+def patch_processor_call(processor):
+    """
+    Patch processor's __call__ to auto-detect conversation format and apply chat template.
+
+    This fixes the issue where users call:
+        tokenizer(image, prompt, ...)
+    where prompt is a list of dicts (conversation format) instead of a string.
+
+    The Qwen3VL (and other VLM) processors expect text to be a string, not conversation format.
+    Without this patch, users get:
+        AttributeError: 'dict' object has no attribute 'replace'
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not hasattr(processor, "apply_chat_template"):
+        return processor
+
+    # Only patch if not already patched
+    if hasattr(processor, "_unsloth_patched_call"):
+        return processor
+
+    # Store the original __call__ from the class
+    original_call = processor.__class__.__call__
+
+    # Create a wrapper that handles conversation format
+    def patched_call(self, images=None, text=None, videos=None, **kwargs):
+        # Auto-apply chat template if text looks like conversation format
+        if text is not None and _is_conversation_format(text):
+            # Text is conversation format - apply chat template first
+            add_generation_prompt = kwargs.pop("add_generation_prompt", True)
+            text = self.apply_chat_template(
+                text,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        return original_call(self, images=images, text=text, videos=videos, **kwargs)
+
+    # Patch at the class level to ensure it's used
+    # Create a dynamic subclass just for this instance
+    original_class = processor.__class__
+    patched_class_name = f"_Unsloth_Patched_{original_class.__name__}"
+
+    # Check if we already created a patched class
+    if not patched_class_name.startswith("_Unsloth_Patched_") or \
+       not processor.__class__.__name__.startswith("_Unsloth_Patched_"):
+        # Create new class that inherits from original
+        patched_class = type(
+            patched_class_name,
+            (original_class,),
+            {"__call__": patched_call}
+        )
+        # Change the instance's class to the patched one
+        processor.__class__ = patched_class
+
+    processor._unsloth_patched_call = True
+    return processor
+pass
+
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

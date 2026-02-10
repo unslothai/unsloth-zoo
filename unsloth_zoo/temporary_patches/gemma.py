@@ -509,8 +509,10 @@ def patch_Gemma3Attention():
             attn_weights = None # Defaulting to None
 
         # 7. Reshape and Downcast for Output Projection
-        # attn_output_fp32 from SDPA is (bsz, num_heads, q_len, head_dim)
-        attn_output_fp32 = attn_output_fp32.transpose(1, 2).contiguous()
+        # SDPA returns (bsz, num_heads, q_len, head_dim) and needs transposing
+        # flex_attention returns (bsz, q_len, num_heads, head_dim) already transposed
+        if attn_impl != "flex_attention":
+            attn_output_fp32 = attn_output_fp32.transpose(1, 2).contiguous()
 
         # Reshape to (bsz, q_len, num_query_heads * head_dim) which is (bsz, q_len, model_hidden_size)
         # Using -1 for the last dimension is robust and aligns with your original example.
@@ -762,8 +764,10 @@ def patch_Gemma3Attention_generic():
             attn_weights = None # Defaulting to None
 
         # 7. Reshape and Downcast for Output Projection
-        # attn_output_fp32 from SDPA is (bsz, num_heads, q_len, head_dim)
-        attn_output_fp32 = attn_output_fp32.transpose(1, 2).contiguous()
+        # SDPA returns (bsz, num_heads, q_len, head_dim) and needs transposing
+        # flex_attention returns (bsz, q_len, num_heads, head_dim) already transposed
+        if attn_impl != "flex_attention":
+            attn_output_fp32 = attn_output_fp32.transpose(1, 2).contiguous()
 
         # Reshape to (bsz, q_len, num_query_heads * head_dim) which is (bsz, q_len, model_hidden_size)
         # Using -1 for the last dimension is robust and aligns with your original example.

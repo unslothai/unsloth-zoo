@@ -668,6 +668,28 @@ def _download_convert_hf_to_gguf(
         except Exception as e: logger.error(f"Unsloth: Error applying metadata branding patch: {e}", exc_info=True); raise
 
 
+        # Patch 3: Qwen2MoE/Qwen3MoE num_experts fix
+        try:
+            # Use a single regex to handle both quote styles
+            num_experts_pattern = rb'n_experts = self\.hparams\[(["\'])num_experts\1\]'
+            replacement = (
+                b"# Qwen3MoE seems to use num_local_experts instead of num_experts\n"
+                b"            n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')"
+            )
+
+            new_patched_content = re.sub(num_experts_pattern, replacement, patched_content)
+            num_experts_patch_applied = (new_patched_content != patched_content)
+
+            if num_experts_patch_applied:
+                patched_content = new_patched_content
+            else:
+                logger.warning("Unsloth: Qwen2MoE num_experts patch target not found.")
+
+        except Exception as e:
+            logger.error(f"Unsloth: Error applying Qwen2MoE num_experts patch: {e}", exc_info=True)
+            raise
+
+
         # 4. Write Patched File
         patched_filename = f"llama.cpp/{name}.py"
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
@@ -1019,21 +1041,61 @@ def convert_to_gguf(
                 print(e.stdout)
             raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF: {e}")
 
-        # Simple validation using native Python
-        if not os.path.exists(output_file):
-            raise RuntimeError(f"Unsloth: Failed to convert {description} - output file {output_file} not created")
+        # Simple validation using native Python - check for main file or sharded files
+        if os.path.exists(output_file):
+            all_output_files.append(output_file)
+            found_files = [output_file]
+        else:
+            # llama.cpp uses SHARD_NAME_FORMAT = "{:s}-{:05d}-of-{:05d}.gguf"
+            basename_without_gguf = os.path.splitext(output_file)[0]
+            shard_pattern = re.compile(
+                re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf$'
+            )
+            parent_dir = os.path.dirname(output_file) or '.'
+            shard_files = sorted(
+                os.path.join(parent_dir, f)
+                for f in os.listdir(parent_dir)
+                if shard_pattern.search(f)
+            )
 
-        all_output_files.append(output_file)
+            if not shard_files:
+                raise RuntimeError(
+                    f"Unsloth: Failed to convert {description} - "
+                    f"output file {output_file} not created"
+                )
+
+            # Validate shard completeness
+            shard_numbers = []
+            for f in shard_files:
+                m = shard_pattern.search(os.path.basename(f))
+                shard_numbers.append((int(m.group(1)), int(m.group(2))))
+
+            expected_total = shard_numbers[0][1]
+            if not all(n[1] == expected_total for n in shard_numbers):
+                raise RuntimeError(f"Shards have mismatched total counts in {description}")
+
+            actual = sorted(n[0] for n in shard_numbers)
+            if actual != list(range(1, expected_total + 1)):
+                missing = set(range(1, expected_total + 1)) - set(actual)
+                raise RuntimeError(f"Missing shards for {description}: {missing}")
+
+            print(f"Found {len(shard_files)} sharded output files for {description}")
+            all_output_files.extend(shard_files)
+            found_files = shard_files
+        pass
 
         if print_output:
-            file_size_bytes = os.path.getsize(output_file)
+            file_size_bytes = sum(os.path.getsize(f) for f in found_files)
             if file_size_bytes >= 1024**3:  # GB
                 size_str = f"{file_size_bytes / (1024**3):.1f}G"
             elif file_size_bytes >= 1024**2:  # MB
                 size_str = f"{file_size_bytes / (1024**2):.1f}M"
             else:
                 size_str = f"{file_size_bytes / 1024:.1f}K"
-            print(f"Unsloth: Successfully saved {description} GGUF to: {output_file} (size: {size_str})")
+            if len(found_files) == 1:
+                print(f"Unsloth: Successfully saved {description} GGUF to: {found_files[0]} (size: {size_str})")
+            else:
+                print(f"Unsloth: Successfully saved {description} GGUF as {len(found_files)} shards (total size: {size_str})")
 
     return all_output_files, is_vlm
 pass
@@ -1090,8 +1152,8 @@ pass
 def _assert_correct_gguf(model_name, model, tokenizer):
     # All Unsloth Zoo code licensed under LGPLv3
     # Verify if conversion is in fact correct by checking tokenizer and last tensor
-    import gguf.gguf_reader
-    from gguf.gguf_reader import GGUFReader
+    import gguf.gguf_reader  # type: ignore
+    from gguf.gguf_reader import GGUFReader  # type: ignore
 
     # Stop until building tensors
     if not hasattr(GGUFReader, "__init__"):
@@ -1153,13 +1215,14 @@ def _assert_correct_gguf(model_name, model, tokenizer):
         pass
     pass
 
+    Partial_GGUFReader = all_functions['Partial_GGUFReader']
     reader = Partial_GGUFReader(model_name, "r")
     check_gguf_last_tensor(model, reader)
     check_gguf_tokenizer(tokenizer, reader)
 
     # Try parsing metadata
     try:
-        from gguf.scripts.gguf_dump import dump_metadata_json
+        from gguf.scripts.gguf_dump import dump_metadata_json  # type: ignore
         class Arguments: pass
         args = Arguments()
 

@@ -19,6 +19,7 @@ import os
 import shutil
 from typing import Optional, Tuple
 from torch.autograd import Function
+from .utils import logger
 
 # Get compile location
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
@@ -198,13 +199,13 @@ def select_moe_backend():
             return "unsloth_triton"
         if requested == "native_torch":
             return "native_torch"
-        print(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
+        logger.info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
     if _check_torch_grouped_mm_supported():
-        print("Unsloth: Using MoE backend 'grouped_mm'")
+        logger.info("Unsloth: Using MoE backend 'grouped_mm'")
         return "grouped_mm"
     if _check_grouped_gemm_available():
-        print("Unsloth: Using MoE backend 'unsloth_triton'")
+        logger.info("Unsloth: Using MoE backend 'unsloth_triton'")
         return "unsloth_triton"
     return "native_torch"
 
@@ -339,13 +340,8 @@ def _extract_lora_from_wrapper(
         if experts_module is None:
             experts_module = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
 
-        # Check for model-specific LoRA extractor attached to the experts module.
-        # Prefer class attribute to avoid bound-method argument mismatches.
-        extractor_fn = None
-        if experts_module is not None:
-            extractor_fn = getattr(experts_module.__class__, "_unsloth_lora_extractor_fn", None)
-            if extractor_fn is None:
-                extractor_fn = getattr(experts_module, "_unsloth_lora_extractor_fn", None)
+        # Check for model-specific LoRA extractor attached to the experts module
+        extractor_fn = getattr(experts_module, "_unsloth_lora_extractor_fn", None)
 
         if extractor_fn is not None:
             return extractor_fn(wrapper, weight_A, weight_B, scaling, num_experts)

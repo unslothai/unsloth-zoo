@@ -121,6 +121,8 @@ DISABLED_KEYWORDS = [
     "causal_mask[start:end, start:end] = 0",  # Pixtral Dynamic slicing on data-dependent value is not supported
     "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING",  # Gemma3 create_masks_for_generate
     "create_causal_mask(**mask_kwargs)",  # Gemma3 create_masks_for_generate
+    "create_causal_mask_mapping",        # Gemma3 5.x (raises ValueError, can't be compiled)
+    "return inner_mask",  # Gemma3 token_type_ids_mask_function returns closure, can't trace generator
     "compute_mup_vector",  # used in falcon h1 init and not needed to compile + inductor complains
     "segment_sum",  # falcon h1
     "apply_mask_to_padding_states",  # falcon h1
@@ -810,6 +812,10 @@ def create_new_function(
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
     imports += "from torch.nn import functional as F\n"
+    if "torch_compile" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
+    if "KWARGS_TYPE" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )
@@ -877,7 +883,22 @@ def create_new_function(
                     overwrite = True
     pass
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
-        overwrite = False
+        # Even with OVERWRITE disabled, force recompile on transformers version mismatch
+        if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
+            cached_versions = file_source[:file_source.find("__UNSLOTH_VERSIONING__")]
+            cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
+            # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
+            cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
+            if cached_tf_version != transformers_version:
+                logger.warning_once(
+                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but transformers version changed "
+                    f"({cached_tf_version} -> {transformers_version}). Forcing recompile of {name}."
+                )
+                # Don't set overwrite = False; keep overwrite = True from version mismatch detection
+            else:
+                overwrite = False
+        else:
+            overwrite = False
 
     # Check location
     def write_file(function_location, write_new_source):
@@ -2371,6 +2392,26 @@ def patch_lora_forwards(torch_compile_options):
                     "    return base_layer(x, *args, **kwargs)\n"
                 )
 
+            # Fix for fp16 + non-quantized base layers (e.g. SiGLIP vision encoder):
+            # When autocast is disabled and base_layer has float32 weights,
+            # cast x to match the weight dtype to prevent dtype mismatch.
+            # For 8-bit layers, the base_layer call was already replaced above.
+            # For 4-bit layers, weight.dtype is uint8 (packed quantized bytes),
+            # so we must skip the cast to avoid corrupting input values.
+            _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
+            _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
+            if _m:
+                _ind = _m.group(1)
+                source = source.replace(
+                    _base_layer_call,
+                    f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
+                    f"and self.base_layer.weight is not None "
+                    f"and not hasattr(self.base_layer.weight, 'quant_state') "
+                    f"and x.dtype != self.base_layer.weight.dtype:\n"
+                    f"{_ind}    x = x.to(self.base_layer.weight.dtype)\n"
+                    f"{_ind}{_base_layer_call}",
+                )
+
             # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
             # if used in source but not available in parent module.
             # Use try/except with fallback in case peft moves the constant in future versions.
@@ -3164,15 +3205,26 @@ def unsloth_compile_transformers(
             bad_torch_modules.add(module)
         pass
 
-        # Check if creating arrays in inside the function
-        # Error: DataDependentOutputException: aten._local_scalar_dense.default
+        # Check for data-dependent control flow that breaks torch.compile(fullgraph=True)
+        # Tier 1: Direct data escapes from tensor to Python
+        #   .nonzero() -> data-dependent output shape (variable-length)
+        #   .tolist()  -> materializes tensor values into Python list
+        #   .item()    -> materializes tensor scalar into Python
+        # Tier 2: MoE expert dispatch via torch.where + index_add
+        #   1-arg torch.where returns data-dependent indices; combined with
+        #   index_add this is the standard MoE routing loop pattern
         if (
-            "torch.arange(" in source
-            or "torch.zeros(" in source
-            or "torch.ones(" in source
+            ".nonzero()" in source
+            or ".tolist()" in source
+            or ".item()" in source
         ):
             print(
-                f"Unsloth: Failed compiling function {module} since array creations are done."
+                f"Unsloth: Will not compile {module} since data-dependent operations are done."
+            )
+            bad_torch_modules.add(module)
+        elif "torch.where(" in source and ".index_add" in source:
+            print(
+                f"Unsloth: Will not compile {module} since data-dependent routing is done."
             )
             bad_torch_modules.add(module)
         pass

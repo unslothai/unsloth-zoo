@@ -85,7 +85,7 @@ def patch_glm4_moe():
 
         return first_weight, second_weight, scaling, num_experts
 
-    Glm4MoeLiteNaiveMoe._unsloth_lora_extractor_fn = _glm4_lora_extractor
+    Glm4MoeLiteNaiveMoe._unsloth_lora_extractor_fn = staticmethod(_glm4_lora_extractor)
 
 
     # 1. Patch Glm4MoeLiteNaiveMoe (The Expert Layer)

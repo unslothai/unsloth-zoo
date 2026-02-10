@@ -790,6 +790,18 @@ def patch_vllm(debug = True):
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
     if os.getenv("UNSLOTH_VLLM_STANDBY", "0") == "1":
+        if Version("0.10.0") <= Version(vllm_version) < Version("0.11.0"):
+            raise RuntimeError(
+                "Unsloth: vLLM 0.10.x crashes with std::bad_alloc when standby mode is "
+                "enabled due to insufficient memory headroom in CuMemAllocator.\n"
+                "Please update vLLM: pip install --upgrade vllm>=0.11.2"
+            )
+        if Version("0.14.0") <= Version(vllm_version) < Version("0.15.0"):
+            raise RuntimeError(
+                "Unsloth: vLLM 0.14.x has a known bug (cudaErrorIllegalAddress) in "
+                "CuMemAllocator during sleep/wake cycles which crashes standby mode.\n"
+                "Please update vLLM: pip install --upgrade vllm>=0.15.1"
+            )
         logger.info(f'Unsloth: Patching vLLM to enable standby.')
         patch_vllm_enable_sleep_mode()
     patch_vllm_graph_capture()
@@ -833,7 +845,13 @@ def vllm_dynamic_quant_supported(
 pass
 
 
-def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
+def get_vllm_state_dict(
+    llm,
+    return_state_dict = False,
+    config = None,
+    is_vision_model = False,
+    load_in_fp8 = False,
+):
     # If the vllm state dict was quantized using torchao, we will run into
     # the following error when calling ops like aten.t() in inference mode.
     # This is a bug in PyTorch that affects all tensor subclasses.
@@ -842,7 +860,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     #
     # For now, we work around this issue by using torch.no_grad in this case.
     # See https://github.com/pytorch/pytorch/issues/164872 for more details
-    if get_quant_type(config) == "torchao":
+    if get_quant_type(config) == "torchao" or load_in_fp8:
         ctx_manager = torch.no_grad()
     else:
         ctx_manager = torch.inference_mode()
@@ -1062,6 +1080,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     # Get layer configuration for this model type
     layer_config = get_model_layer_config()
 
+    packed_modules_mapping = getattr(vllm_internals, "packed_modules_mapping", None)
+
+    def _is_fused_module(name: str) -> bool:
+        if packed_modules_mapping is None:
+            return False
+        packed = packed_modules_mapping.get(name)
+        return isinstance(packed, (list, tuple)) and len(packed) == 1 and packed[0] == name
+
     # All layers
     skipped_layernorms = []
     for kk in range(len(vllm_text_model.layers)):
@@ -1071,9 +1097,16 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             qkv_proj = layer.self_attn.qkv_proj
             o_proj = layer.self_attn.o_proj
 
-            get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
-            get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
-            get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
+            use_fused_qkv = _is_fused_module("qkv_proj")
+            if use_fused_qkv:
+                # For some model types like phi3 vllm will expect fused qkv (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
+                # so we should not split them here otherwise there will be a size mismatch when activating the adapter
+                # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
+                get_state_dict(f"{prefix}.qkv_proj", 0, state_dict, qkv_proj, slice_weights=False)
+            else:
+                get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
+                get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
+                get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
         elif hasattr(layer, "cross_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
             qkv_proj = layer.cross_attn.qkv_proj
@@ -1089,8 +1122,15 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
         proj = layer.mlp.gate_up_proj
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+        use_fused_gate_up = _is_fused_module("gate_up_proj")
+        if use_fused_gate_up:
+            # For some model types like phi3 vllm will expect fused gate_up_proj (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
+            # so we should not split them here otherwise there will be a size mismatch when activating the adapter
+            # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_up_proj", 0, state_dict, proj, slice_weights=False)
+        else:
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
 
         proj = layer.mlp.down_proj
         get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
@@ -1329,7 +1369,11 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.quant_method = "fbgemm_fp8"
                 elif fp8_weight_scale.ndim == 2:
                     # This denotes that the model if FP8 dynamic quantized.
-                    layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
+                    fp8_kwargs = dict(in_features=0, out_features=0, bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'])
+                    # transformers 5.0+ removed device param from FP8Linear.__init__
+                    if Version("transformers") < Version("5.0.0"):
+                        fp8_kwargs["device"] = get_target_device()
+                    layer = FP8Linear(**fp8_kwargs)
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
                     layer.weight = torch.nn.Parameter(weight, requires_grad = False)
@@ -1450,6 +1494,7 @@ def approximate_vllm_memory_usage(
     float8_kv_cache = False,
     account_for_gradients = True,
     parallel_sequences = 64,
+    cuda_graph_overhead = True,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
@@ -1523,6 +1568,19 @@ def approximate_vllm_memory_usage(
     float_bytes = 1.25 if float8_kv_cache else 2
     kv_elements = (kv_size * 2 * n_layers) * float_bytes
     memory_left_for_kv_cache = free_memory - bytes_for_model
+
+    # Account for CUDA graph capture overhead.
+    # Each graph stores activations for one batch size. Overhead scales with
+    # model hidden_size and num_layers. Empirically 0.15-0.5 GiB for 1B-8B models.
+    # With FULL_AND_PIECEWISE mode + LoRA: ~172 graphs (51 sizes x 2 lora + 35 x 2 decode).
+    if cuda_graph_overhead:
+        num_cuda_graphs = 172
+        per_graph_estimate = hd * n_layers * 4  # bytes, rough per-graph activation estimate
+        _cuda_graph_overhead = num_cuda_graphs * per_graph_estimate
+        _cuda_graph_overhead = max(_cuda_graph_overhead, int(0.15 * 1024**3))  # floor at 0.15 GiB
+        _cuda_graph_overhead = min(_cuda_graph_overhead, int(1.0 * 1024**3))   # cap at 1.0 GiB
+        memory_left_for_kv_cache -= _cuda_graph_overhead
+
     if memory_left_for_kv_cache <= 0: memory_left_for_kv_cache = 0
 
     # Approx maximum # of KV cache elements
@@ -1654,6 +1712,30 @@ def vllm_supports_flashinfer(config) -> bool:
 pass
 
 
+def _get_torchao_fp8_config(fp8_mode: str):
+    """
+    Return a `torchao.quantization.Float8DynamicActivationFloat8WeightConfig`
+    to be used for `load_in_fp8=True`.
+    """
+    from torchao.quantization import (
+        Float8DynamicActivationFloat8WeightConfig,
+        PerBlock,
+        PerRow,
+    )
+
+    if fp8_mode == "row":
+        granularity = PerRow()
+    elif fp8_mode == "block":
+        granularity = (PerBlock([1, 128]), PerBlock([128, 128]))
+    else:
+        raise ValueError("Unsloth: `load_in_fp8` supports only 'row' or 'block'")
+
+    return Float8DynamicActivationFloat8WeightConfig(
+        granularity = granularity,
+        activation_value_lb = 1e-12,
+    )
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -1679,6 +1761,7 @@ def load_vllm(
     is_vision_model        : bool = False,
     return_args            : bool = False, # Just return args
     max_num_seqs           : int = 256, # how many seqs to process in parallel. Default vLLM 256
+    fp8_mode               : Optional[str] = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
@@ -1697,21 +1780,32 @@ def load_vllm(
     ten_percent = total_gb * 0.1 # 1.46GB for T4
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"10% of your GPU VRAM = {ten_percent:.2f} GB")
-    if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
-    elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
-    elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
-    elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
-    elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
-    else: standby_target_gpu_util = 0.75
-    if UNSLOTH_ENABLE_LOGGING:
-        logger.info(f"standby_target_gpu_util = {standby_target_gpu_util:.3f}")
-    # Reduce memory usage for newer vLLM versions since it OOMs
-    if Version(vllm_version) >= Version("0.11.0"):
+    if Version(vllm_version) < Version("0.11.0"):
+        # vllm < 0.11 does not get the 0.95x headroom multiplier below,
+        # so use lower targets to prevent std::bad_alloc on L4/A100 with standby mode.
+        if   ten_percent >= 9.0: standby_target_gpu_util = 0.9
+        elif ten_percent >= 4.0: standby_target_gpu_util = 0.875
+        elif ten_percent >= 2.5: standby_target_gpu_util = 0.85
+        elif ten_percent >= 2.0: standby_target_gpu_util = 0.825
+        elif ten_percent >= 1.4: standby_target_gpu_util = 0.8
+        elif ten_percent >= 1.0: standby_target_gpu_util = 0.75
+        else: standby_target_gpu_util = 0.7
+    else:
+        if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
+        elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
+        elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
+        elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
+        elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
+        else: standby_target_gpu_util = 0.75
+        # Reduce memory usage for newer vLLM versions since it OOMs
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Decreasing VRAM further since vLLM version >= 0.11.0 uses more")
         standby_target_gpu_util *= 0.95
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Further reduced standby_target_gpu_util = {standby_target_gpu_util:.4f}")
+    pass
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"standby_target_gpu_util = {standby_target_gpu_util:.4f}")
 
     if unsloth_vllm_standby and not standby_util_override:
         if gpu_memory_utilization < standby_target_gpu_util:
@@ -1766,6 +1860,14 @@ def load_vllm(
         account_for_gradients = training,
     )
 
+    # Pre-flight warning: if KV cache headroom is very low with standby mode,
+    # warn before LLM() is called (which may crash unrecoverably).
+    if memory_left_for_kv_cache_gb < 1.0 and unsloth_vllm_standby:
+        print(
+            f"Unsloth: WARNING - Only {memory_left_for_kv_cache_gb:.2f} GB estimated for KV cache on your {total_gb:.1f} GB GPU.\n"
+            f"This may cause an out-of-memory crash with standby mode. Consider lowering gpu_memory_utilization."
+        )
+
     enable_chunked_prefill = True
     is_mllama = "mllama" in config.model_type
     if is_mllama:
@@ -1818,7 +1920,7 @@ def load_vllm(
     # Also seems to process 2x less sequences in 1 go so less throughput?
     # Maybe FP8 Flashinfer is much better
     # See https://docs.vllm.ai/en/latest/serving/env_vars.html
-    if importlib.util.find_spec("flashinfer"):
+    if importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
         # Check if FLASHINFER is supported - for eg Qwen3-VL and Qwen2-VL do not work
         if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
             del os.environ["VLLM_ATTENTION_BACKEND"]
@@ -2100,6 +2202,18 @@ def load_vllm(
             engine_args["disable_cascade_attn"] = disable_cascade_attn
     pass
 
+    # On-the-fly quantization is added in https://github.com/vllm-project/vllm/pull/23014
+    # This is only available in vllm >= 0.12.0. Older versions will do offline quantization
+    # by creating an FP8 checkpoint and loading it back in
+    if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
+        from torchao.core.config import config_to_dict
+        torchao_config = _get_torchao_fp8_config(fp8_mode)
+        hf_overrides = {
+            "quantization_config_dict_json": json.dumps(config_to_dict(torchao_config)),
+        }
+        engine_args["quantization"] = "torchao"
+        engine_args["hf_overrides"] = hf_overrides
+
     good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
     old_keys = list(engine_args.keys())
     for key in old_keys:
@@ -2135,6 +2249,16 @@ def load_vllm(
             if trials >= 2 or unsloth_vllm_standby:
                 # Sleep mode uses CuMemAllocator which can't run multiple instances in single process.
                 # We can't do retry because vLLM will fail to load with said error.
+                if unsloth_vllm_standby and ("memory" in error.lower() or "alloc" in error.lower()):
+                    raise MemoryError(
+                        f"Unsloth: Your GPU ran out of memory loading vLLM with standby mode enabled.\n"
+                        f"Your GPU has {total_gb:.1f} GB VRAM with gpu_memory_utilization={gpu_memory_utilization:.3f}.\n"
+                        f"Try one of these fixes:\n"
+                        f"  1. Lower gpu_memory_utilization: model, tokenizer = FastLanguageModel.from_pretrained(..., gpu_memory_utilization=0.6)\n"
+                        f"  2. Disable standby mode: remove os.environ['UNSLOTH_VLLM_STANDBY'] = '1'\n"
+                        f"  3. Use a smaller model or quantization (load_in_4bit=True)\n"
+                        f"Original error: {error}"
+                    )
                 raise RuntimeError(error)
 
             if "gpu_memory_utilization" in error or "memory" in error:

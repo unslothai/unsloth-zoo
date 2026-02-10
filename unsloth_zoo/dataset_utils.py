@@ -329,7 +329,10 @@ def train_on_responses_only(
     if return_function:
         return _train_on_responses_only
 
-    if num_proc is None or type(num_proc) is not int:
+    import multiprocessing as _mp
+    if _mp.get_start_method() != 'fork':
+        num_proc = None
+    elif num_proc is None or type(num_proc) is not int:
         import psutil
         num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
         # Check memory left so we can reduce multiprocessing to converse memory
@@ -340,32 +343,96 @@ def train_on_responses_only(
             # Set it to int(memory_gb_left) so 16Gb = 16
             num_proc = min(num_proc, int(memory_gb_left))
 
+    # In transformers 5.0+, VLM models skip dataset preparation in SFTTrainer.__init__
+    # (skip_prepare_dataset=True when _is_vlm=True). This means the dataset may not be
+    # tokenized yet. We need to tokenize it before applying _train_on_responses_only.
+    def _maybe_tokenize_dataset(dataset):
+        if dataset is None:
+            return dataset
+        sample = next(iter(dataset))
+        if "input_ids" in sample:
+            return dataset  # Already tokenized
+        # Need to tokenize - get the processing class from trainer
+        _tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
+        # Get the actual tokenizer (not processor) for tokenization
+        if hasattr(_tokenizer, "tokenizer"):
+            _tok = _tokenizer.tokenizer
+        else:
+            _tok = _tokenizer
+        max_length = getattr(trainer.args, "max_length", None) or getattr(trainer.args, "max_seq_length", 2048)
+        text_field = getattr(trainer.args, "dataset_text_field", "text")
+        def _tokenize_fn(examples):
+            texts = examples.get(text_field) or examples.get("text", [])
+            return _tok(texts, truncation=True, max_length=max_length, padding=False)
+        _map_kwargs = {"batched": True, "num_proc": num_proc}
+        if isinstance(dataset, IterableDataset):
+            _map_kwargs = {"batched": True}
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
+            return dataset.map(_tokenize_fn, **_map_kwargs)
+    pass
+
+    # Filter out samples where all labels are -100 (no valid training signal).
+    # This can happen when truncation cuts off the response_part entirely,
+    # e.g. long reasoning/analysis channels in GPT-OSS that exceed max_seq_length.
+    # Such samples cause NaN loss since cross_entropy(mean) computes 0/0.
+    def _has_valid_labels(example):
+        labels = example.get("labels")
+        if labels is None: return True
+        if type(labels) is torch_Tensor:
+            return (labels != -100).any().item()
+        return any(l != -100 for l in labels)
+    pass
+
+    def _filter_fully_masked(dataset, dataset_name="dataset"):
+        if isinstance(dataset, IterableDataset):
+            return dataset  # Cannot filter IterableDataset efficiently
+        n_before = len(dataset)
+        dataset = dataset.filter(_has_valid_labels, num_proc=num_proc)
+        n_after = len(dataset)
+        n_removed = n_before - n_after
+        if n_removed > 0:
+            print(
+                f"Unsloth: Removed {n_removed} out of {n_before} samples from {dataset_name} "
+                f"where all labels were -100 (no response found after truncation). "
+                f"This prevents NaN loss during training."
+            )
+        return dataset
+    pass
+
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
+        trainer.train_dataset = _maybe_tokenize_dataset(trainer.train_dataset)
         if isinstance(trainer.train_dataset, IterableDataset):
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batch_size = trainer.train_dataset._ex_iterable.batch_size, batched = True)
         else:
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+        trainer.train_dataset = _filter_fully_masked(trainer.train_dataset, "train_dataset")
     pass
-    
+
     if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
         # Eval datasets could be a dict!
         if type(trainer.eval_dataset) is dict:
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
+                value = _maybe_tokenize_dataset(value)
                 if isinstance(value, IterableDataset):
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = value._ex_iterable.batch_size, batched = True)
                 else:
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+                trainer.eval_dataset[key] = _filter_fully_masked(trainer.eval_dataset[key], f"eval_dataset[{key}]")
         else:
             if not hasattr(trainer.eval_dataset, "map"):
                 raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
+            trainer.eval_dataset = _maybe_tokenize_dataset(trainer.eval_dataset)
             if isinstance(trainer.eval_dataset, IterableDataset):
                 trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batch_size = trainer.eval_dataset._ex_iterable.batch_size, batched = True)
             else:
                 trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+            trainer.eval_dataset = _filter_fully_masked(trainer.eval_dataset, "eval_dataset")
         pass
     pass
 
@@ -485,11 +552,17 @@ def standardize_data_formats(
     }
 
     if not isinstance(dataset, IterableDataset):
-        from multiprocessing import cpu_count
-        
-        if num_proc is None or type(num_proc) is not int: 
-          num_proc = cpu_count()
-
+        import multiprocessing as _mp
+        if _mp.get_start_method() != 'fork':
+            num_proc = None
+        elif num_proc is None or type(num_proc) is not int:
+            import psutil
+            num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
+            memory_gb_left = psutil.virtual_memory().available / (1024**3)
+            if memory_gb_left <= 2:
+                num_proc = 1
+            else:
+                num_proc = min(num_proc, int(memory_gb_left))
         dataset_map_kwargs['num_proc'] = num_proc
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
@@ -529,6 +602,34 @@ def sft_prepare_dataset(
     tokenizer = processing_class
     if is_vlm: tokenizer = processing_class.tokenizer
 
+    # Dynamic detection: check if model's module defines a function
+    # that requires token_type_ids when is_training=True
+    import sys as _sys
+    _needs_token_type_ids = False
+    # Split to avoid compiler substring match on masking_utils names
+    _ccm = 'create_' + 'causal_mask_mapping'
+    _model = getattr(self, '_unsloth_model_ref', None) or getattr(self, 'model', None)
+    if _model is not None:
+        for _m in (_model, getattr(_model, 'model', None)):
+            if _m is None: continue
+            _mod = _sys.modules.get(type(_m).__module__)
+            if _mod is not None and hasattr(_mod, _ccm):
+                _needs_token_type_ids = True
+                break
+
+    if not _needs_token_type_ids:
+        # Fallback: model not yet available, check processor class MRO
+        for _base in type(processing_class).__mro__:
+            _base_mod = getattr(_base, '__module__', '')
+            if 'transformers.models.' in _base_mod:
+                _modeling_mod = _base_mod.replace('.processing_', '.modeling_')
+                _mod = _sys.modules.get(_modeling_mod)
+                if _mod is not None and hasattr(_mod, _ccm):
+                    _needs_token_type_ids = True
+                    break
+    if _needs_token_type_ids and hasattr(args, 'remove_unused_columns'):
+        args.remove_unused_columns = False
+
     # Get max length
     max_seq_length = getattr(args, "max_length", 0)
     if max_seq_length == 0: max_seq_length = getattr(args, "max_seq_length", 0)
@@ -545,6 +646,8 @@ def sft_prepare_dataset(
     used_column_names = ["input_ids"]
     if "attention_mask" in column_names:
         used_column_names.append("attention_mask")
+    if _needs_token_type_ids:
+        used_column_names.append("token_type_ids")
 
     # Check if already tokenized so skip
     from transformers import DataCollatorForSeq2Seq, DataCollatorForLanguageModeling
@@ -606,32 +709,34 @@ def sft_prepare_dataset(
                 example[dataset_text_field] if not do_formatting_func else formatting_func(example),
                 truncation = do_truncation,
                 max_length = max_seq_length,
-                return_token_type_ids = False,
+                return_token_type_ids = _needs_token_type_ids,
                 add_special_tokens = add_special_tokens,
             )
         pass
 
         if not isinstance(dataset, IterableDataset):
-            dataset_num_proc = getattr(args, "dataset_num_proc", None)
-            if dataset_num_proc is None:
-                import psutil
-                dataset_num_proc = max((psutil.cpu_count() or 1)+4, 2)
-                # Check memory left so we can reduce multiprocessing to converse memory
-                memory_gb_left = psutil.virtual_memory().available / (1024**3)
-                if memory_gb_left <= 4:
-                    dataset_num_proc = 1 # Too risky, so set to 1
-                elif memory_gb_left <= 6:
-                    dataset_num_proc = min(2, dataset_num_proc)
-                elif memory_gb_left <= 8:
-                    dataset_num_proc = min(4, dataset_num_proc)
-                elif memory_gb_left <= 12:
-                    dataset_num_proc = min(6, dataset_num_proc)
+            import multiprocessing as _mp
+            if _mp.get_start_method() != 'fork':
+                dataset_num_proc = None
+            else:
+                dataset_num_proc = getattr(args, "dataset_num_proc", None)
+                if dataset_num_proc is None:
+                    import psutil
+                    dataset_num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
+                    memory_gb_left = psutil.virtual_memory().available / (1024**3)
+                    if memory_gb_left <= 2:
+                        dataset_num_proc = 1
+                    else:
+                        dataset_num_proc = min(dataset_num_proc, int(memory_gb_left))
             map_kwargs["num_proc"] = dataset_num_proc
         else:
             map_kwargs["batch_size"] = dataset._ex_iterable.batch_size
             
         if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
-        dataset = dataset.map(_tokenize, batched = True, **map_kwargs)
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
+            dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
 
         # If VLM, switch data collator since .pad is needed!
         if is_vlm and not hasattr(processing_class, "pad"):
@@ -680,7 +785,7 @@ def patch_torchcodec_audio_decoder():
         AudioDecoder.get = lambda self, key, default=None: (
             self[key] if key in ("array", "sampling_rate") else default
         )
-    except (ImportError, AttributeError):
+    except (ImportError, AttributeError, RuntimeError):
         pass  # torchcodec not available or different datasets version
 pass
 

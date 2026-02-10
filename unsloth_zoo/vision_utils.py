@@ -33,7 +33,6 @@ __all__ = [
     "UnslothVisionDataCollator",
 ]
 
-global IMAGE_TOKENS
 IMAGE_TOKENS = [
     "<|image|>",          # Llama 3.2 Vision, Phi 3.5
     "<|vision_start|>",   # Qwen
@@ -74,7 +73,7 @@ try:
     from torchvision import io, transforms
     from torchvision.transforms import InterpolationMode
     HAS_TORCHVISION = True
-except:
+except Exception:
     HAS_TORCHVISION = False
 
 from .log import logger
@@ -102,17 +101,14 @@ FPS_MAX_FRAMES = 768
 def round_by_factor(number: int, factor: int) -> int:
     """Returns the closest integer to 'number' that is divisible by 'factor'."""
     return round(number / factor) * factor
-pass
 
 def ceil_by_factor(number: int, factor: int) -> int:
     """Returns the smallest integer greater than or equal to 'number' that is divisible by 'factor'."""
     return math.ceil(number / factor) * factor
-pass
 
 def floor_by_factor(number: int, factor: int) -> int:
     """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
     return math.floor(number / factor) * factor
-pass
 
 
 def smart_resize(
@@ -127,6 +123,10 @@ def smart_resize(
 
     3. The aspect ratio of the image is maintained as closely as possible.
     """
+    if height <= 0 or width <= 0:
+        raise ValueError(
+            f"height and width must be positive integers, got height={height}, width={width}"
+        )
     if max(height, width) / min(height, width) > MAX_RATIO:
         raise ValueError(
             f"absolute aspect ratio must be smaller than {MAX_RATIO}, got {max(height, width) / min(height, width)}"
@@ -142,7 +142,6 @@ def smart_resize(
         h_bar = ceil_by_factor(height * beta, factor)
         w_bar = ceil_by_factor(width * beta, factor)
     return h_bar, w_bar
-pass
 
 
 def fetch_image(
@@ -155,13 +154,12 @@ def fetch_image(
         image = ele["image_url"]
         if isinstance(image, dict) and "url" in image:
             image = image["url"]
-    pass
     image_obj = None
     if isinstance(image, Image.Image):
         image_obj = image
     elif isinstance(image, str):
         if image.startswith("http://") or image.startswith("https://"):
-            image_obj = Image.open(requests.get(image, stream=True).raw)
+            image_obj = Image.open(requests.get(image, stream=True, timeout=30).raw)
         elif image.startswith("file://"):
             image_obj = Image.open(image[7:])
         elif image.startswith("data:image"):
@@ -179,11 +177,14 @@ def fetch_image(
         elif "path" in image and image["path"]:
             image_obj = Image.open(image["path"])
         elif "url" in image and image["url"]:
-            image_obj = Image.open(requests.get(image["url"], stream=True).raw)
+            image_obj = Image.open(requests.get(image["url"], stream=True, timeout=30).raw)
 
     if image_obj is None:
         raise ValueError(f"Unrecognized image input. We support local path, http url, base64 and PIL.Image, bytes and dict formats. Instead we got `{type(image).__name__}`")
-    image = image_obj.convert("RGB")
+    if image_obj.mode != "RGB":
+        image = image_obj.convert("RGB")
+    else:
+        image = image_obj
     ## resize
     if "resized_height" in ele and "resized_width" in ele:
         resized_height, resized_width = smart_resize(
@@ -205,7 +206,6 @@ def fetch_image(
     image = image.resize((resized_width, resized_height))
 
     return image
-pass
 
 def smart_nframes(
     ele: dict,
@@ -549,6 +549,8 @@ def collapse_fps(fps, tol=1e-4):
 
 def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> List[Dict]:
     vision_infos = []
+    if len(conversations) == 0:
+        return vision_infos
     if isinstance(conversations[0], dict):
         conversations = [conversations]
     for conversation in conversations:
@@ -558,7 +560,6 @@ def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> L
                     if ele["type"] in ("image", "image_url", "video"):
                         vision_infos.append(ele)
     return vision_infos
-pass
 
 
 def process_vision_info(
@@ -590,7 +591,6 @@ def process_vision_info(
     if return_video_kwargs:
         return image_inputs, video_inputs, {'fps': video_sample_fps_list}
     return image_inputs, video_inputs
-pass
 
 
 def get_padding_tokens_ids(tokenizer):
@@ -600,18 +600,15 @@ def get_padding_tokens_ids(tokenizer):
     image_tokens = IMAGE_TOKENS
     if hasattr(tokenizer, "image_token"):
         image_tokens = IMAGE_TOKENS + [tokenizer.image_token]
-    pass
 
     padding_token_ids = tokenizer.convert_tokens_to_ids(image_tokens)
     if hasattr(tokenizer, "pad_token_id"):
         padding_token_ids.append(tokenizer.pad_token_id)
-    pass
 
     padding_token_ids = list(x for x in padding_token_ids if x is not None)
     padding_token_ids = list(set(padding_token_ids))
     padding_token_ids = torch.IntTensor(padding_token_ids)
     return padding_token_ids
-pass
 
 
 def _get_dtype(dtype):
@@ -623,13 +620,11 @@ def _get_dtype(dtype):
         "bfloat16": torch.bfloat16,
         torch.bfloat16: torch.bfloat16,
     }
-    if   dtype is None or dtype == None: return None
+    if   dtype is None: return None
     elif dtype in __DTYPE_MAP: return __DTYPE_MAP[dtype]
     else:
         print(f"Unsloth: {dtype} is not recognized, so we'll default to None")
         return None
-    pass
-pass
 
 import PIL.Image
 LANCZOS = PIL.Image.Resampling.LANCZOS
@@ -683,7 +678,7 @@ class UnslothVisionDataCollator:
         self.snap_to_patch_size = snap_to_patch_size
         try:
             self.patch_size = model.config.vision_config.patch_size
-        except:
+        except Exception:
             if hasattr(model.config, 'vision_config') and hasattr(model.config.vision_config, 'model_type'):
                 lower_name = model.config.vision_config.model_type.lower()
                 if 'gemma3n' in lower_name or 'pixtral' in lower_name:
@@ -697,7 +692,7 @@ class UnslothVisionDataCollator:
         if resize == "min":
             try:
                 self.image_size = model.config.vision_config.image_size
-            except:
+            except Exception:
                 print("Unsloth: Model does not have a default image size - using 512")
                 self.image_size = 512
 
@@ -714,7 +709,6 @@ class UnslothVisionDataCollator:
                 "Unsloth: resize accepts 'min', 'max', a tuple of 2 numbers or 1 number\n"\
                 "For example (224, 224) or just 224. The default is 'min' which auto resizes images!"
             )
-        pass
         if resize_dimension not in [0, 1, 'max', 'min']:
             raise TypeError(
                 "Unsloth: resize_dimension accepts 0, 1, 'max' or 'min'\n"\
@@ -726,11 +720,6 @@ class UnslothVisionDataCollator:
             self.size_func = lambda x: max(x.size[0], x.size[1])
         elif resize_dimension == 'min':
             self.size_func = lambda x: min(x.size[0], x.size[1])
-        else:
-            raise TypeError(
-                "Unsloth: resize_dimension accepts 0, 1, 'max' or 'min'\n"\
-                "For example 0 resizes the first dimension, 1 the second, 'max' resizes based on the max of height width, 'min' the min size"
-            )
         self.resize_dimension = resize_dimension
 
         # Sequence lengths
@@ -780,16 +769,17 @@ class UnslothVisionDataCollator:
                     "We will auto fix the data collator to support it!"
                 )
             except Exception as e:
-                raise RuntimeError(e)
+                raise RuntimeError(e) from e
         except Exception as e:
-            raise RuntimeError(e)
+            raise RuntimeError(e) from e
         return
-    pass
+
+    def _get_padding_token_ids_on_device(self, device):
+        if self.padding_token_ids.device != device:
+            self.padding_token_ids = self.padding_token_ids.to(device)
+        return self.padding_token_ids
 
     def __call__(self, examples):
-        # [TODO] Support non image inputs as well
-        # The issue is batch = self.processor( forces tensors to be returned and not None.
-
         if self.formatting_func is not None:
             examples = [self.formatting_func(example) for example in examples]
         
@@ -812,7 +802,6 @@ class UnslothVisionDataCollator:
                 if self.assistant_single_content:
                     messages = self._collapse_assistant_content(messages)
                 messages = self._clean_none_keys(messages)
-            pass
 
             message = self.processor.apply_chat_template(
                 messages,
@@ -831,7 +820,6 @@ class UnslothVisionDataCollator:
                 if video_kwarg is None:
                     video_kwarg = {"fps": []}
                 video_kwargs['fps'].extend(video_kwarg['fps'])
-        pass
 
         # Tokenize the texts and process the images
         proc_kwargs = dict(
@@ -842,9 +830,9 @@ class UnslothVisionDataCollator:
             return_tensors="pt",
             add_special_tokens=False,
         )
-        if images and len(images) > 0:
+        if images:
             proc_kwargs["images"] = images
-        if videos and len(videos) > 0:
+        if videos:
             proc_kwargs["videos"] = videos
             video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
             for k, v in video_kwargs.items():
@@ -862,12 +850,12 @@ class UnslothVisionDataCollator:
 
         # Mask image tokens and pad tokens
         labels = batch["input_ids"].clone()
-        labels[torch.isin(labels, self.padding_token_ids)] = self.ignore_index
+        padding_ids = self._get_padding_token_ids_on_device(labels.device)
+        labels[torch.isin(labels, padding_ids)] = self.ignore_index
         batch["labels"] = labels
         if self.train_on_responses_only:
             batch["labels"] = self.train_on_responses_only(batch)["labels"]
         return batch
-    pass
 
     def _select_messages_or_raw(self, example):
         if "messages" in example:
@@ -880,7 +868,7 @@ class UnslothVisionDataCollator:
 
     def _validate_and_normalize_first_message(self, messages):
         if len(messages) == 0:
-            return
+            return messages
         message = messages[0]
         assert isinstance(message, dict)
         if "role" not in message and "content" not in message:
@@ -906,7 +894,12 @@ class UnslothVisionDataCollator:
         for message in messages:
             if message["role"] == "assistant":
                 if isinstance(content := message["content"], list):
-                    message["content"] = content[0]["text"]
+                    # Only extract text from items that have type "text"
+                    text_parts = [item["text"] for item in content if isinstance(item, dict) and item.get("type") == "text"]
+                    if text_parts:
+                        message["content"] = text_parts[0]
+                    elif len(content) > 0 and isinstance(content[0], dict) and "text" in content[0]:
+                        message["content"] = content[0]["text"]
         return messages
 
     def _render_chat(self, prompt_messages, completion_messages=None, add_generation_prompt=False, continue_final_message=False):
@@ -926,8 +919,7 @@ class UnslothVisionDataCollator:
                 return_video_kwargs=True,
             )
             if image is None: image = []
-            if video is None: video = [] 
-        pass
+            if video is None: video = []
         return image, video, video_kwarg
 
     def _extract_images_for_pc(self, example, p_msgs, c_msgs):
@@ -955,7 +947,8 @@ class UnslothVisionDataCollator:
                     )
                     if imgs is None: imgs = []
                     if vids is None: vids = []
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Unsloth: _extract_images_for_pc failed to extract images/videos: {e}")
             imgs = []
             vids = []
         
@@ -973,20 +966,19 @@ class UnslothVisionDataCollator:
         # Resize images
         image_size = self.image_size
 
-        if image_size is not None:
-            for i, img in enumerate(image):
-                if type(image_size) is tuple:
-                    image[i] = img.resize(image_size, LANCZOS)
-                elif self.size_func(img) > image_size and hasattr(img, "resize"):
-                    w, h = img.size
-                    # integer math rounding
-                    new_w = (w * image_size + self.size_func(img) // 2) // self.size_func(img)
-                    new_h = (h * image_size + self.size_func(img) // 2) // self.size_func(img)
-                    if self.snap_to_patch_size:
-                        factor = self.patch_size * 2
-                        new_w, new_h = quantize_to_factor(new_w), quantize_to_factor(new_h)
+        for i, img in enumerate(image):
+            if type(image_size) is tuple:
+                image[i] = img.resize(image_size, LANCZOS)
+            elif self.size_func(img) > image_size and hasattr(img, "resize"):
+                w, h = img.size
+                # integer math rounding
+                new_w = (w * image_size + self.size_func(img) // 2) // self.size_func(img)
+                new_h = (h * image_size + self.size_func(img) // 2) // self.size_func(img)
+                if self.snap_to_patch_size:
+                    factor = self.patch_size * 2
+                    new_w, new_h = quantize_to_factor(new_w), quantize_to_factor(new_h)
 
-                    image[i] = img.resize((new_w, new_h), LANCZOS)
+                image[i] = img.resize((new_w, new_h), LANCZOS)
 
         return image
 
@@ -997,14 +989,15 @@ class UnslothVisionDataCollator:
             for j, pixel_value_j in enumerate(pixel_values):
                 if type(pixel_value_j) is list:
                     for k, pixel_value_k in enumerate(pixel_value_j):
-                        pixel_value_j[k] = pixel_value_k.to(self.dtype)
+                        if pixel_value_k.dtype != self.dtype:
+                            pixel_value_j[k] = pixel_value_k.to(self.dtype)
                 else:
-                    pixel_values[j] = pixel_value_j.to(self.dtype)
-            pass
+                    if pixel_value_j.dtype != self.dtype:
+                        pixel_values[j] = pixel_value_j.to(self.dtype)
             batch[key] = pixel_values
         else:
-            batch[key] = batch[key].to(self.dtype)
-        pass
+            if batch[key].dtype != self.dtype:
+                batch[key] = batch[key].to(self.dtype)
         return batch
 
     def _tokenizer_padding_side(self) -> str:
@@ -1031,6 +1024,12 @@ class UnslothVisionDataCollator:
     ) -> Tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
         B, L = input_ids.shape
         device = input_ids.device
+
+        # Early exit if no padding exists
+        if attention_mask.all():
+            if extra_tensors:
+                return attention_mask, input_ids, tuple(extra_tensors)
+            return attention_mask, input_ids, ()
 
         keep = attention_mask.to(device=device, dtype=torch.bool)
         k    = keep.sum(dim=1)
@@ -1123,6 +1122,7 @@ class UnslothVisionDataCollator:
 
     def _collate_prompt_completion(self, examples):
         prompt_texts, completion_texts, images, videos = [], [], [], []
+        video_kwargs = {'fps': []}
 
         for ex in examples:
             p, c = ex["prompt"], ex["completion"]
@@ -1159,14 +1159,14 @@ class UnslothVisionDataCollator:
 
             prompt_texts.append(p_txt)
             completion_texts.append(c_txt)
-            if imgs and len(imgs) > 0:
+            if imgs:
                 images.append(imgs)
 
-            if vids and len(vids) > 0:  # Works for list, tuple or tensor
+            if vids:  # Works for list, tuple or tensor
                 videos.append(vids)
                 if vids_kwarg is None:
                     vids_kwarg = {"fps": []}
-                vids_kwarg['fps'].extend(vids_kwarg['fps'])
+                video_kwargs['fps'].extend(vids_kwarg['fps'])
 
         prompt_kwargs = dict(
             padding=True,
@@ -1184,8 +1184,8 @@ class UnslothVisionDataCollator:
             prompt_kwargs["images"] = images
         if len(videos) > 0:
             prompt_kwargs["videos"] = videos
-            vids_kwarg["fps"] = collapse_fps(vids_kwarg['fps'])
-            for k, v in vids_kwarg.items():
+            video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
+            for k, v in video_kwargs.items():
                 prompt_kwargs[k] = v
 
         proc_prompts = self.processor(text=prompt_texts, **prompt_kwargs)
@@ -1242,7 +1242,8 @@ class UnslothVisionDataCollator:
         # Labels: mask attention pads + image/pad tokens; completion-only if requested
         labels = input_ids.clone()
         labels[attention_mask == 0] = self.ignore_index
-        labels[torch.isin(labels, self.padding_token_ids)] = self.ignore_index
+        padding_ids = self._get_padding_token_ids_on_device(labels.device)
+        labels[torch.isin(labels, padding_ids)] = self.ignore_index
         if self.completion_only_loss:
             labels[completion_mask == 0] = self.ignore_index
 
@@ -1271,4 +1272,3 @@ class UnslothVisionDataCollator:
                         for k in keys_to_remove:
                             del item[k]
         return messages
-pass

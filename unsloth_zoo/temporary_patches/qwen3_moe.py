@@ -475,6 +475,9 @@ def patch_qwen3_moe():
                 router_logits=outputs.router_logits,
             )
 
+        # Preserve __qualname__ so _unsloth_get_batch_samples can detect
+        # this is a CausalLM forward and compute num_items_in_batch properly.
+        _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
         Qwen3MoeForCausalLM.forward = _patched_causal_lm_forward
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("Unsloth: Patched Qwen3MoeForCausalLM.forward for GRPO hidden states.")
