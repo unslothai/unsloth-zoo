@@ -361,8 +361,13 @@ def patch_CsmForConditionalGeneration_forward():
                 **depth_decoder_kwargs,
             )
 
-            depth_decoder_loss = depth_decoder_outputs.loss
-            loss = backbone_loss + depth_decoder_loss
+            depth_decoder_loss = depth_decoder_outputs.loss if depth_decoder_outputs is not None else None
+            if backbone_loss is None:
+                loss = depth_decoder_loss
+            elif depth_decoder_loss is None:
+                loss = backbone_loss
+            else:
+                loss = backbone_loss + depth_decoder_loss
 
         return process_return(CsmOutputWithPast, {
             "loss" : loss,
