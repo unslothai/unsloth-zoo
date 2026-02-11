@@ -79,11 +79,22 @@ def chunked_hidden_states_selective_log_softmax(
 
     chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
     chunked_index = torch.chunk(flat_index, chunks=chunks, dim=0)
+    hidden_dim = lm_head.shape[1]
+    vocab_dim = lm_head.shape[0]
 
     all_per_token_logps = []
 
     for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index):
-        chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
+        # VLM GRPO paths can already pass logits here (shape [..., vocab]).
+        # In that case avoid projecting by lm_head again.
+        if chunk_hidden_states.shape[-1] == vocab_dim:
+            chunk_logits = chunk_hidden_states
+        elif chunk_hidden_states.shape[-1] == hidden_dim:
+            chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
+        else:
+            # Fallback: try projection path and let the underlying matmul raise a
+            # precise error if the dimensions are genuinely incompatible.
+            chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
 
         if logit_scale_multiply != 0.0:
             chunk_logits = chunk_logits * logit_scale_multiply

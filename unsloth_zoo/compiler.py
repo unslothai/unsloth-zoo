@@ -1200,6 +1200,18 @@ def create_standalone_class(
     # Fix RotaryEmbeddings being in the wrong precision
     source = fix_rotary_embedding_dtype(source)
 
+    # ROCm: keep router linear inputs aligned with router weight dtype.
+    # Some compiled GPT-OSS router paths otherwise hit Float vs BF16 matmul.
+    if getattr(torch.version, "hip", None):
+        source = source.replace(
+            "router_logits = F.linear(hidden_states, self.weight, self.bias)",
+            "router_logits = F.linear(hidden_states if hidden_states.dtype == self.weight.dtype else hidden_states.to(self.weight.dtype), self.weight, self.bias)",
+        )
+        source = source.replace(
+            "router_logits = torch.nn.functional.linear(hidden_states, self.weight, self.bias)",
+            "router_logits = torch.nn.functional.linear(hidden_states if hidden_states.dtype == self.weight.dtype else hidden_states.to(self.weight.dtype), self.weight, self.bias)",
+        )
+
     return source
 
 
@@ -2766,7 +2778,6 @@ DISABLE_COMPILE_MODULES = [
     "Gemma3nTextModel",
     "Glm4MoeLiteNaiveMoe",
 ]
-
 FIX_GC_LAYER_CALLER_MODULES = [
     "WhisperDecoder",
 ]
