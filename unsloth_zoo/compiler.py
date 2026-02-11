@@ -1205,11 +1205,11 @@ def create_standalone_class(
     if getattr(torch.version, "hip", None):
         source = source.replace(
             "router_logits = F.linear(hidden_states, self.weight, self.bias)",
-            "router_logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)",
+            "router_logits = F.linear(hidden_states if hidden_states.dtype == self.weight.dtype else hidden_states.to(self.weight.dtype), self.weight, self.bias)",
         )
         source = source.replace(
             "router_logits = torch.nn.functional.linear(hidden_states, self.weight, self.bias)",
-            "router_logits = torch.nn.functional.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)",
+            "router_logits = torch.nn.functional.linear(hidden_states if hidden_states.dtype == self.weight.dtype else hidden_states.to(self.weight.dtype), self.weight, self.bias)",
         )
 
     return source
