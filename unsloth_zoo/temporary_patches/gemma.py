@@ -50,12 +50,18 @@ def patch_Gemma3Processor():
     except Exception as e:
         return raise_error("Gemma3Processor.__call__", e)
 
-    def __call__(
+    # Check if the target __call__ has `videos` or `audio` arguments
+    target_call = transformers.models.gemma3.processing_gemma3.Gemma3Processor.__call__
+    target_params = inspect.signature(target_call).parameters
+    has_videos = "videos" in target_params
+    has_audio = "audio" in target_params
+
+    def _gemma3_call_impl(
         self,
         images: ImageInput = None,
         text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
-        videos = None,
-        audio = None,
+        videos: ImageInput = None,
+        audio: Any = None,
         **kwargs: Unpack[Gemma3ProcessorKwargs],
     ) -> BatchFeature:
         if text is None and images is None:
@@ -153,7 +159,21 @@ def patch_Gemma3Processor():
             text_inputs["token_type_ids"] = mm_token_type_ids#.tolist()
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
     pass
-    patch_function(transformers.models.gemma3.processing_gemma3.Gemma3Processor, "__call__", __call__)
+
+    if has_videos or has_audio:
+        __call__ = _gemma3_call_impl
+    else:
+        def __call__(
+            self,
+            images: ImageInput = None,
+            text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
+            **kwargs: Unpack[Gemma3ProcessorKwargs],
+        ) -> BatchFeature:
+            videos = kwargs.pop("videos", None)
+            audio = kwargs.pop("audio", None)
+            return _gemma3_call_impl(self, images=images, text=text, videos=videos, audio=audio, **kwargs)
+
+    patch_function(transformers.models.gemma3.processing_gemma3.Gemma3Processor, "__call__", __call__, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
@@ -387,8 +407,8 @@ def patch_Gemma3Attention():
     def forward_function(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
+        position_embeddings: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
@@ -530,8 +550,8 @@ def patch_Gemma3Attention():
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
+        position_embeddings: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
@@ -541,15 +561,15 @@ def patch_Gemma3Attention():
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
+        position_embeddings: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
     functions.append(forward)
-    patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions)
+    patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention)
 
@@ -642,8 +662,8 @@ def patch_Gemma3Attention_generic():
     def forward_function(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
+        position_embeddings: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
@@ -785,8 +805,8 @@ def patch_Gemma3Attention_generic():
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
+        position_embeddings: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
@@ -796,14 +816,14 @@ def patch_Gemma3Attention_generic():
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
+        position_embeddings: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
     functions.append(forward)
-    patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions)
+    patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention_generic)
