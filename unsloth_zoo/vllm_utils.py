@@ -2076,7 +2076,7 @@ def load_vllm(
     # Get device as well
     device = get_target_device()
 
-    if compilation_config == 3:
+    if not enforce_eager and compilation_config == 3:
         try:
             from vllm.config import CompilationConfig
 
@@ -2171,7 +2171,7 @@ def load_vllm(
         enable_chunked_prefill = enable_chunked_prefill, # LoRA fails with chunked prefill as at Feb 2025
         # max_seq_len_to_capture fails for V1
         # max_seq_len_to_capture = min(8192, max_seq_length + 256), # Default is 8192 for CUDAGraphs
-        compilation_config     = compilation_config, # 0, 1, 2, 3
+        compilation_config     = compilation_config if not enforce_eager else 0, # 0, 1, 2, 3
         enforce_eager          = enforce_eager,
         swap_space             = swap_space, # Low memory devices like Colab (13GB) default 4GB
         device                 = device,
