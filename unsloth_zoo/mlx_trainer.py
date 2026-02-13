@@ -36,7 +36,7 @@ Usage mirrors TRL notebooks:
     trainer.train()
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import time
 import gc
 
@@ -51,6 +51,7 @@ from .mlx_utils import (
     create_batches,
     save_lora_adapters,
     save_merged_model,
+    apply_gradient_checkpointing,
 )
 
 
@@ -70,7 +71,7 @@ class MLXTrainingConfig:
     # Optimization
     optim: str = "adafactor"  # "adafactor", "adamw", "adam", "sgd"
     weight_decay: float = 0.01
-    max_grad_norm: float = 0.0  # 0 = no clipping
+    max_grad_norm: float = 1.0  # gradient clipping (matches HF Trainer default)
     seed: int = 3407
 
     # Logging & output
@@ -89,6 +90,7 @@ class MLXTrainingConfig:
     # MLX-specific
     use_cce: bool = True   # Use CCE from mlx-cce (key feature)
     compile: bool = False  # mx.compile for graph fusion
+    gradient_checkpointing: bool = False  # Recompute activations to save memory
 
 
 class MLXTrainer:
@@ -128,6 +130,7 @@ class MLXTrainer:
         # Training state
         self._global_step = 0
         self._train_loss_history = []
+        self._step_times = []  # Per-step wall-clock times
         self._batches = None  # Pre-created batches (skips internal batch creation)
 
     def _build_optimizer(self):
@@ -165,6 +168,11 @@ class MLXTrainer:
         args = self.args
         model = self.model
 
+        # Apply gradient checkpointing if requested
+        if args.gradient_checkpointing:
+            apply_gradient_checkpointing(model)
+            print("Unsloth: Using gradient checkpointing to reduce memory.")
+
         # Pick loss function
         use_cce = args.use_cce and has_cce_kernel()
         if args.use_cce and not has_cce_kernel():
@@ -182,12 +190,39 @@ class MLXTrainer:
             print("Unsloth: Using standard cross-entropy loss.")
 
         # Build loss+grad function
-        # Weight is read from model inside loss_fn, so autograd traces it —
-        # CCE's VJP computes gradients for both hidden and weight automatically.
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
         # Build optimizer
         optimizer = self._build_optimizer()
+
+        # Build step function (optionally compiled)
+        max_grad_norm = args.max_grad_norm
+        if args.compile:
+            from functools import partial as _partial
+            state = [model.state, optimizer.state]
+
+            @_partial(mx.compile, inputs=state, outputs=state)
+            def _step(batch, lengths):
+                loss, grads = loss_and_grad_fn(model, batch, lengths)
+                if max_grad_norm > 0:
+                    grads, _ = optim.clip_grad_norm(grads, max_norm=max_grad_norm)
+                optimizer.update(model, grads)
+                return loss
+
+            def train_step(batch, lengths):
+                loss = _step(batch, lengths)
+                mx.eval(state)
+                return loss
+
+            print("Unsloth: Using mx.compile for graph fusion.")
+        else:
+            def train_step(batch, lengths):
+                loss, grads = loss_and_grad_fn(model, batch, lengths)
+                if max_grad_norm > 0:
+                    grads, _ = optim.clip_grad_norm(grads, max_norm=max_grad_norm)
+                optimizer.update(model, grads)
+                mx.eval(model.parameters(), optimizer.state, loss)
+                return loss
 
         # Prepare data — use pre-created batches if available
         if self._batches is not None:
@@ -225,20 +260,19 @@ class MLXTrainer:
         for step in range(1, total_steps + 1):
             self._global_step = step
             step_loss = 0.0
+            step_start = time.time()
 
             for _micro in range(grad_accum):
-                batch = batches[batch_idx % len(batches)]
+                batch, lengths = batches[batch_idx % len(batches)]
                 batch_idx += 1
 
-                loss, grads = loss_and_grad_fn(model, batch)
-                optimizer.update(model, grads)
-                mx.eval(model.parameters(), optimizer.state, loss)
-
+                loss = train_step(batch, lengths)
                 step_loss += loss.item()
 
             step_loss /= grad_accum
             accumulated_loss += step_loss
             self._train_loss_history.append(step_loss)
+            self._step_times.append(time.time() - step_start)
 
             # Logging
             if step % args.logging_steps == 0:

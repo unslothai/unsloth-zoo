@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-Unsloth MLX Benchmark: Baseline CE vs CCE
-==========================================
-Simple sequential benchmark. Runs CCE then baseline for each model.
+Unsloth MLX Benchmark: Baseline+compile vs CCE+compile
+=======================================================
+Each (model, config) runs in its own subprocess for isolation.
+Timing excludes warmup/compile steps (first 5 steps skipped).
+All configs use gradient checkpointing + mx.compile.
+Config order alternates per model to avoid systematic bias.
 """
 
-import gc
-import time
-
-import mlx.core as mx
-from mlx.utils import tree_map
-from datasets import load_dataset
-
-from unsloth import FastLanguageModel
-from unsloth_zoo.mlx_trainer import MLXTrainer, MLXTrainingConfig
-from unsloth_zoo.mlx_utils import create_batches
+import json
+import subprocess
+import sys
+import os
 
 # =============================================================================
 # CONFIG
@@ -22,42 +19,81 @@ from unsloth_zoo.mlx_utils import create_batches
 
 MODELS = [
     # (model_name, display_name, use_lora)
+    # --- Tiny (<1B) ---
+    ("mlx-community/Qwen3-0.6B-4bit", "Qwen3-0.6B-4bit", True),
+    # --- Small (1-2B) ---
     ("mlx-community/Llama-3.2-1B-Instruct-bf16", "Llama-1B-full", False),
     ("mlx-community/gemma-2-2b-it-4bit", "Gemma2-2B-4bit", True),
+    # --- Medium (3-4B) ---
     ("mlx-community/Llama-3.2-3B-Instruct-4bit", "Llama-3B-4bit", True),
     ("mlx-community/Qwen2.5-3B-Instruct-4bit", "Qwen2.5-3B-4bit", True),
+    ("mlx-community/Phi-3.5-mini-instruct-4bit", "Phi-3.5-mini-4bit", True),
+    ("mlx-community/Qwen2.5-3B-Instruct-8bit", "Qwen2.5-3B-8bit", True),
     ("mlx-community/Llama-3.2-3B-Instruct-bf16", "Llama-3B-LoRA", True),
-    ("Qwen/Qwen2.5-7B-Instruct", "Qwen2.5-7B-full", False),
+    # --- Large (7-9B) ---
+    ("mlx-community/Mistral-7B-Instruct-v0.3-4bit", "Mistral-7B-4bit", True),
+    ("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit", "Llama-3.1-8B-4bit", True),
+]
+
+# (label, use_cce)  — all use compile=True, gradient_checkpointing=True
+CONFIGS = [
+    ("Baseline+compile", False),
+    ("CCE+compile",      True),
 ]
 
 BATCH_SIZE = 8
 SEQ_LEN = 1024
-WARMUP_STEPS = 10
-MEASURE_STEPS = 20
+WARMUP_STEPS = 5
+MEASURE_STEPS = 15
 SEED = 42
 LR = 1e-5
-
 LORA_RANK = 8
 LORA_ALPHA = 16
 
 
-def run_one(model, tokenizer, batches, use_cce, dataset):
-    """Train and return (losses, peak_memory_gb, time_ms)."""
+# =============================================================================
+# WORKER — runs a single (model, config) in isolation
+# =============================================================================
+
+def run_worker(model_name, use_lora, use_cce):
+    """Run in a subprocess. Prints training progress to stderr, JSON result to stdout."""
+    import gc
+    import mlx.core as mx
+    from datasets import load_dataset
+    from unsloth import FastLanguageModel
+    from unsloth_zoo.mlx_trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx_utils import create_batches
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name, max_seq_length=SEQ_LEN,
+    )
+    if use_lora:
+        model = FastLanguageModel.get_peft_model(
+            model, r=LORA_RANK, lora_alpha=LORA_ALPHA,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+        )
+
+    dataset = load_dataset("emozilla/pg19-test", split="test")
+    batches = create_batches(
+        dataset, tokenizer,
+        batch_size=BATCH_SIZE, max_seq_length=SEQ_LEN,
+        num_batches=WARMUP_STEPS + MEASURE_STEPS + 5, seed=SEED,
+    )
+
     trainer = MLXTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=dataset,
+        model=model, tokenizer=tokenizer, train_dataset=dataset,
         args=MLXTrainingConfig(
             per_device_train_batch_size=BATCH_SIZE,
             max_steps=WARMUP_STEPS + MEASURE_STEPS,
             gradient_accumulation_steps=1,
-            warmup_steps=0,
             learning_rate=LR,
             optim="adafactor",
-            logging_steps=1,
+            logging_steps=WARMUP_STEPS + MEASURE_STEPS,
             max_seq_length=SEQ_LEN,
-            output_dir=f"./tmp_bench_{'cce' if use_cce else 'baseline'}",
             use_cce=use_cce,
+            compile=True,
+            gradient_checkpointing=True,
         ),
     )
     trainer._batches = batches
@@ -66,105 +102,154 @@ def run_one(model, tokenizer, batches, use_cce, dataset):
     mx.synchronize()
     mx.reset_peak_memory()
 
-    stats = trainer.train()
+    trainer.train()
 
     mx.synchronize()
     peak_gb = mx.get_peak_memory() / 1e9
-    total_time = stats["train_runtime"]
-    time_per_step = total_time / (WARMUP_STEPS + MEASURE_STEPS)
-    measure_ms = time_per_step * MEASURE_STEPS * 1000
 
-    losses = trainer._train_loss_history[WARMUP_STEPS:]
-    return losses, peak_gb, measure_ms
+    measure_times = trainer._step_times[WARMUP_STEPS:]
+    ms_per_step = sum(measure_times) / len(measure_times) * 1000
+    losses = trainer._train_loss_history
+    final_loss = losses[-1]
+    nan_count = sum(1 for l in losses if l != l)
+
+    result = {
+        "ms_per_step": ms_per_step,
+        "peak_gb": peak_gb,
+        "final_loss": final_loss,
+        "nan_count": nan_count,
+    }
+    # Print JSON on a marker line so orchestrator can parse it
+    print(f"__RESULT__{json.dumps(result)}", flush=True)
+
+
+# =============================================================================
+# ORCHESTRATOR — spawns subprocesses and collects results
+# =============================================================================
+
+def run_subprocess(cmd):
+    """Run a subprocess, streaming stdout line by line. Returns (stdout_lines, returncode)."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    lines = []
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        lines.append(line)
+        if not line.startswith("__RESULT__"):
+            print(f"    {line}", flush=True)
+    proc.wait()
+    return lines, proc.returncode
 
 
 def main():
-    dataset = load_dataset("tatsu-lab/alpaca", split="train")
-
-    print("=" * 70)
-    print("Unsloth MLX Benchmark: Baseline CE vs CCE")
-    print("=" * 70)
+    print("=" * 80)
+    print("Unsloth MLX Benchmark: Baseline+compile vs CCE+compile")
+    print("  Gradient Checkpointing: ON | Compile: ON | Isolation: subprocess")
+    print("=" * 80)
     print(f"Batch: {BATCH_SIZE}, Seq: {SEQ_LEN}, Warmup: {WARMUP_STEPS}, Measure: {MEASURE_STEPS}")
     print(f"Optimizer: Adafactor (lr={LR})")
-    print(f"Models: {len(MODELS)}")
-    print("=" * 70)
+    print(f"Models: {len(MODELS)}, Configs: {len(CONFIGS)}")
+    print("=" * 80)
 
-    results = []
+    script_path = os.path.abspath(__file__)
+    python = sys.executable
+    all_results = []
 
-    for i, (model_name, display_name, use_lora) in enumerate(MODELS):
-        print(f"\n{'='*70}")
-        print(f"[{i+1}/{len(MODELS)}] {display_name}")
+    for mi, (model_name, display_name, use_lora) in enumerate(MODELS):
+        print(f"\n{'='*80}")
+        print(f"[{mi+1}/{len(MODELS)}] {display_name}")
         print(f"  Repo: {model_name}, LoRA: {use_lora}")
-        print("=" * 70)
+        print("=" * 80)
 
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name, max_seq_length=SEQ_LEN,
+        # Alternate config order per model to avoid systematic bias
+        configs = CONFIGS if mi % 2 == 0 else list(reversed(CONFIGS))
+        model_results = {}
+
+        for label, use_cce in configs:
+            print(f"\n  --- {label} ---")
+
+            cmd = [
+                python, script_path, "--worker",
+                "--model", model_name,
+                "--use_cce", str(int(use_cce)),
+                "--use_lora", str(int(use_lora)),
+            ]
+
+            lines, returncode = run_subprocess(cmd)
+
+            # Parse result from stdout
+            result = None
+            for line in lines:
+                if line.startswith("__RESULT__"):
+                    result = json.loads(line[len("__RESULT__"):])
+
+            if result and returncode == 0:
+                ms = result["ms_per_step"]
+                mem = result["peak_gb"]
+                loss = result["final_loss"]
+                nans = result["nan_count"]
+                model_results[label] = (ms, mem, loss, nans)
+                status = "OK" if nans == 0 else f"{nans} NaN"
+                print(f"  >> {label}: {ms:.0f} ms/step | {mem:.2f} GB | loss={loss:.4f} | {status}")
+            else:
+                model_results[label] = None
+                print(f"  >> {label}: FAILED (exit={returncode})")
+
+        # Per-model summary
+        bl = model_results.get("Baseline+compile")
+        cce = model_results.get("CCE+compile")
+        if bl and cce:
+            speedup = bl[0] / cce[0] if cce[0] > 0 else 0
+            mem_save = (bl[1] - cce[1]) / bl[1] * 100 if bl[1] > 0 else 0
+            print(f"\n  >> {display_name}: CCE+compile is {speedup:.2f}x speed, {mem_save:.1f}% mem saved")
+
+        all_results.append((display_name, model_results))
+
+    # =========================================================================
+    # FINAL SUMMARY
+    # =========================================================================
+    print(f"\n\n{'='*80}")
+    print("FINAL SUMMARY — Baseline+compile vs CCE+compile (GC=ON, compile=ON)")
+    print("=" * 80)
+    print(f"{'Model':<22} {'BL+compile':>14} {'CCE+compile':>14} {'Speedup':>8} {'MemSave':>8}")
+    print("-" * 80)
+
+    for display_name, model_results in all_results:
+        bl = model_results.get("Baseline+compile")
+        cce = model_results.get("CCE+compile")
+
+        if not bl:
+            print(f"{display_name:<22} {'FAILED':>14}")
+            continue
+        if not cce:
+            print(f"{display_name:<22} {bl[0]:>7.0f}ms {bl[1]:>5.1f}GB {'FAILED':>14}")
+            continue
+
+        speedup = bl[0] / cce[0] if cce[0] > 0 else 0
+        mem_save = (bl[1] - cce[1]) / bl[1] * 100 if bl[1] > 0 else 0
+        print(
+            f"{display_name:<22} "
+            f"{bl[0]:>7.0f}ms {bl[1]:>5.1f}GB "
+            f"{cce[0]:>7.0f}ms {cce[1]:>5.1f}GB "
+            f"{speedup:>7.2f}x {mem_save:>7.1f}%"
         )
 
-        if use_lora:
-            model = FastLanguageModel.get_peft_model(
-                model, r=LORA_RANK, lora_alpha=LORA_ALPHA,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                                "gate_proj", "up_proj", "down_proj"],
-            )
-
-        total_batches = WARMUP_STEPS + MEASURE_STEPS + 5
-        batches = create_batches(
-            dataset, tokenizer,
-            batch_size=BATCH_SIZE,
-            max_seq_length=SEQ_LEN,
-            num_batches=total_batches,
-            seed=SEED,
-        )
-
-        # Save initial weights to restore between runs
-        init_w = tree_map(
-            lambda x: mx.array(x) if isinstance(x, mx.array) else x,
-            model.parameters(),
-        )
-        mx.eval(init_w)
-
-        # --- CCE ---
-        print("\n--- CCE ---")
-        model.update(init_w); mx.eval(model.parameters())
-        cce_losses, cce_mem, cce_ms = run_one(model, tokenizer, batches, True, dataset)
-
-        # --- BASELINE ---
-        print("\n--- BASELINE ---")
-        model.update(init_w); mx.eval(model.parameters())
-        bl_losses, bl_mem, bl_ms = run_one(model, tokenizer, batches, False, dataset)
-
-        # Compare
-        loss_diffs = [abs(b - c) for b, c in zip(bl_losses, cce_losses)]
-        max_diff = max(loss_diffs)
-        speedup = bl_ms / cce_ms if cce_ms > 0 else 0
-        mem_save = (bl_mem - cce_mem) / bl_mem * 100 if bl_mem > 0 else 0
-        status = "PASS" if max_diff < 0.1 else "FAIL"
-
-        print(f"\n  {'='*60}")
-        print(f"  {display_name}")
-        print(f"  Baseline: {bl_ms:.0f}ms | {bl_mem:.2f}GB | loss={bl_losses[-1]:.4f}")
-        print(f"  CCE:      {cce_ms:.0f}ms | {cce_mem:.2f}GB | loss={cce_losses[-1]:.4f}")
-        print(f"  Speedup: {speedup:.2f}x | Mem Saved: {mem_save:.1f}% | Max Diff: {max_diff:.4f} | {status}")
-        print(f"  {'='*60}")
-
-        results.append((display_name, speedup, mem_save, max_diff, status))
-
-        # Cleanup before next model
-        del model, tokenizer, batches, init_w
-        gc.collect()
-
-    # Summary
-    print(f"\n\n{'='*70}")
-    print("FINAL SUMMARY")
-    print(f"{'='*70}")
-    print(f"{'Model':<22} {'Speedup':>8} {'MemSave':>8} {'MaxDiff':>8} {'Status':>7}")
-    print("-" * 70)
-    for name, spd, mem, diff, st in results:
-        print(f"{name:<22} {spd:>7.2f}x {mem:>7.1f}% {diff:>8.4f} {st:>7}")
-    print("=" * 70)
+    print("=" * 80)
     print("Done!")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--model", type=str)
+    parser.add_argument("--use_cce", type=int, default=0)
+    parser.add_argument("--use_lora", type=int, default=1)
+    args = parser.parse_args()
+
+    if args.worker:
+        run_worker(args.model, bool(args.use_lora), bool(args.use_cce))
+    else:
+        main()

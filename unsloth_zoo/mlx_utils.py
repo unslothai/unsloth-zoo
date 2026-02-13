@@ -25,40 +25,65 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils
 import json
-import os
 from pathlib import Path
 
 
-def _dequantize_weight(layer):
-    """Dequantize a QuantizedLinear or QuantizedEmbedding layer's weight."""
-    return mx.dequantize(
-        layer.weight, layer.scales,
-        getattr(layer, "biases", None),
-        group_size=getattr(layer, "group_size", 64),
-        bits=getattr(layer, "bits", 4),
-    )
+def apply_gradient_checkpointing(model):
+    """Apply gradient checkpointing to all transformer layers.
+
+    Patches the layer class's __call__ to use mx.checkpoint, which
+    recomputes activations during backward instead of storing them.
+    Trades ~30% more compute for significant memory savings.
+
+    Follows the same pattern as mlx_lm.tuner.trainer.grad_checkpoint.
+    """
+    layers = getattr(model, 'layers', None)
+    if layers is None or len(layers) == 0:
+        return
+    layer_cls = type(layers[0])
+    if getattr(layer_cls, '_orig_call', None) is not None:
+        return  # already applied
+    layer_cls._orig_call = layer_cls.__call__
+    fn = layer_cls.__call__
+
+    def checkpointed_fn(self, *args, **kwargs):
+        def inner_fn(params, *args, **kwargs):
+            self.update(params)
+            return fn(self, *args, **kwargs)
+        return mx.checkpoint(inner_fn)(self.trainable_parameters(), *args, **kwargs)
+
+    layer_cls.__call__ = checkpointed_fn
 
 
-def get_lm_weight(model):
-    """Extract the language model head weight matrix.
+def remove_gradient_checkpointing(model):
+    """Remove gradient checkpointing, restoring original layer __call__."""
+    layers = getattr(model, 'layers', None)
+    if layers is None or len(layers) == 0:
+        return
+    layer_cls = type(layers[0])
+    orig = getattr(layer_cls, '_orig_call', None)
+    if orig is not None:
+        layer_cls.__call__ = orig
+        del layer_cls._orig_call
+
+
+def _get_lm_head_layer(model):
+    """Get the raw LM head layer (QuantizedLinear or Linear/Embedding).
 
     Checks for a separate lm_head first (untied models like Qwen), then
     falls back to embed_tokens (tied models like Gemma/Llama).
-    Handles both quantized and unquantized layers.
-    """
-    # Check for separate lm_head (untied embeddings — e.g. Qwen2.5-7B+)
-    if hasattr(model, "lm_head") and model.lm_head is not None:
-        lm_head = model.lm_head
-        if hasattr(lm_head, "scales"):
-            return _dequantize_weight(lm_head)
-        if hasattr(lm_head, "weight"):
-            return lm_head.weight
 
-    # Fall back to embed_tokens (tied embeddings — e.g. Gemma, Llama)
-    embed = model.model.embed_tokens
-    if hasattr(embed, "scales"):
-        return _dequantize_weight(embed)
-    return embed.weight
+    Returns the layer object (not its weight), so callers can access
+    .weight, .scales, .biases, .group_size, .bits for quantized layers.
+    """
+    if hasattr(model, "lm_head") and model.lm_head is not None:
+        return model.lm_head
+    return model.model.embed_tokens
+
+
+def _is_quantized_layer(layer):
+    """Check if a layer has quantized weights (has .scales attribute)."""
+    return hasattr(layer, "scales")
 
 
 def has_cce_kernel():
@@ -80,17 +105,18 @@ def make_cce_loss_fn(model):
     CCE computes cross-entropy directly from hidden states and the LM head weight,
     avoiding full logit materialization. This saves significant memory.
 
-    Weight is read from the model inside the loss function so that autograd
-    traces it — the CCE kernel's VJP computes gradients for both hidden and
-    weight automatically. No separate gradient computation needed.
+    If the LM head is quantized, passes raw uint32 weight + scales + biases
+    directly to cce_loss, using fused quantized matmul kernels. This saves
+    ~1.4GB for a 3B model (no dequantization, no grad_weight).
 
+    Weight is captured once at setup time for efficiency.
     Supports logit softcapping (Gemma-2) and untied lm_head (Qwen-7B+).
 
     Args:
         model: MLX language model (used to detect softcap at setup time).
 
     Returns:
-        A function (model, batch) -> scalar loss.
+        A function (model, batch, lengths) -> scalar loss.
     """
     if not has_cce_kernel():
         raise RuntimeError(
@@ -101,19 +127,71 @@ def make_cce_loss_fn(model):
     if softcap > 0:
         print(f"Unsloth: CCE using logit_softcap={softcap} for this model.")
 
-    def loss_fn(model, batch):
-        inputs, targets = batch[:, :-1], batch[:, 1:]
-        hidden = model.model(inputs)
-        # Read weight from model so autograd traces it —
-        # CCE backward computes both d(loss)/d(hidden) and d(loss)/d(weight).
-        weight = get_lm_weight(model)
-        loss = mx.fast.cce_loss(
-            hidden,
-            weight,
-            targets,
-            logit_softcap=softcap,
-        )
-        return loss.astype(mx.float32).mean()
+    lm_layer = _get_lm_head_layer(model)
+    use_quantized = _is_quantized_layer(lm_layer)
+
+    if use_quantized:
+        # Quantized weights are frozen (no gradient needed).
+        # Access weight/scales/biases through the model parameter tree
+        # instead of closure-capturing bare arrays — required for mx.compile
+        # compatibility (compile rejects uncaptured array inputs).
+        group_size = getattr(lm_layer, "group_size", 64)
+        bits = getattr(lm_layer, "bits", 4)
+        print(f"Unsloth: CCE using quantized matmul (group_size={group_size}, bits={bits})")
+        _has_lm_head_q = (hasattr(model, "lm_head")
+                          and model.lm_head is not None
+                          and hasattr(model.lm_head, "scales"))
+        _has_biases = hasattr(lm_layer, "biases")
+
+        def loss_fn(model, batch, lengths):
+            inputs, targets = batch[:, :-1], batch[:, 1:]
+            hidden = model.model(inputs)
+            layer = model.lm_head if _has_lm_head_q else model.model.embed_tokens
+            w = layer.weight
+            sc = layer.scales
+            bi = layer.biases if _has_biases else layer.scales
+            # Mask padding targets to -100 so CCE kernel skips them
+            # in both forward (zero loss) and backward (zero gradient).
+            steps = mx.arange(1, targets.shape[1] + 1)
+            mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            masked_targets = mx.where(mask, targets, -100)
+            ntoks = mask.sum()
+            loss = mx.fast.cce_loss(
+                hidden, w, masked_targets,
+                scales=sc, biases=bi,
+                group_size=group_size, bits=bits,
+                ignore_index=-100,
+                logit_softcap=softcap,
+            )
+            loss = loss.astype(mx.float32).sum() / ntoks
+            return loss
+    else:
+        # For full-precision models, access weight through the model parameter
+        # tree so nn.value_and_grad can trace gradients through it.
+        # Closure-capturing the weight would make autograd treat it as a
+        # constant, producing zero gradient for the LM head — causing NaN
+        # divergence during full fine-tuning.
+        _has_lm_head = (hasattr(model, "lm_head")
+                        and model.lm_head is not None
+                        and hasattr(model.lm_head, "weight"))
+
+        def loss_fn(model, batch, lengths):
+            inputs, targets = batch[:, :-1], batch[:, 1:]
+            hidden = model.model(inputs)
+            w = model.lm_head.weight if _has_lm_head else model.model.embed_tokens.weight
+            # Mask padding targets to -100 so CCE kernel skips them
+            # in both forward (zero loss) and backward (zero gradient).
+            steps = mx.arange(1, targets.shape[1] + 1)
+            mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            masked_targets = mx.where(mask, targets, -100)
+            ntoks = mask.sum()
+            loss = mx.fast.cce_loss(
+                hidden, w, masked_targets,
+                ignore_index=-100,
+                logit_softcap=softcap,
+            )
+            loss = loss.astype(mx.float32).sum() / ntoks
+            return loss
 
     return loss_fn
 
@@ -125,15 +203,68 @@ def make_baseline_loss_fn():
     nn.losses.cross_entropy. This is the fallback when CCE is not available.
 
     Returns:
-        A function (model, batch) -> scalar loss.
+        A function (model, batch, lengths) -> scalar loss.
     """
-    def loss_fn(model, batch):
+    def loss_fn(model, batch, lengths):
         inputs, targets = batch[:, :-1], batch[:, 1:]
         logits = model(inputs)
-        loss = nn.losses.cross_entropy(logits, targets)
-        return loss.astype(mx.float32).mean()
+        # Mask padding tokens using lengths from iterate_batches
+        steps = mx.arange(1, targets.shape[1] + 1)
+        mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+        ce = nn.losses.cross_entropy(logits, targets) * mask
+        ntoks = mask.sum()
+        loss = ce.astype(mx.float32).sum() / ntoks
+        return loss
 
     return loss_fn
+
+
+def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
+                     formatting_func=None):
+    """Wrap a HuggingFace dataset into mlx-lm's dataset classes.
+
+    Uses TextDataset + CacheDataset from mlx_lm so that tokenization
+    (including EOS appending) matches mlx-lm's own training pipeline exactly.
+
+    If a formatting_func is provided, each item is pre-formatted into a
+    ``{"text": ...}`` dict before wrapping.
+
+    Returns:
+        A CacheDataset ready for ``iterate_batches``.
+    """
+    from mlx_lm.tuner.datasets import TextDataset, CacheDataset
+
+    # Pre-format items into [{"text": str}, ...] so TextDataset can consume them.
+    formatted = []
+    for item in dataset:
+        if formatting_func is not None:
+            result = formatting_func(item)
+            texts = result if isinstance(result, list) else [result]
+        elif isinstance(item, dict):
+            texts = []
+            if dataset_text_field in item:
+                texts = [item[dataset_text_field]]
+            else:
+                for key in ("text", "content", "instruction"):
+                    if key in item:
+                        texts = [item[key]]
+                        break
+        elif isinstance(item, str):
+            texts = [item]
+        else:
+            continue
+
+        for text in texts:
+            if text:
+                formatted.append({"text": text})
+
+    if not formatted:
+        raise ValueError(
+            f"No text data found. Provide a dataset with a "
+            f"'{dataset_text_field}' column."
+        )
+
+    return CacheDataset(TextDataset(formatted, tokenizer, text_key="text"))
 
 
 def create_batches(dataset, tokenizer, batch_size, max_seq_length,
@@ -141,77 +272,47 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                    formatting_func=None):
     """Pre-tokenize and batch a HuggingFace dataset for MLX training.
 
-    Each batch is a single mx.array of shape (batch_size, max_seq_length).
-    Sequences shorter than max_seq_length are padded with eos_token_id.
+    Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
+    samples are sorted by length, grouped into batches, and padded to the
+    max length within each batch (rounded up to the nearest multiple of 32),
+    capped at max_seq_length.
+
+    Tokenization is delegated to mlx_lm's TextDataset (appends EOS, etc.)
+    so behaviour matches ``mlx_lm.lora`` exactly.
 
     Args:
         dataset: HuggingFace dataset or list of strings.
         tokenizer: Tokenizer compatible with the model.
         batch_size: Number of sequences per batch.
-        max_seq_length: Sequence length (pad/truncate to this).
+        max_seq_length: Maximum sequence length (truncate to this).
         num_batches: If set, only create this many batches.
         seed: Random seed for shuffling.
         dataset_text_field: Column name for text data.
         formatting_func: Optional function to format dataset items to text.
 
     Returns:
-        List of mx.array, each of shape (batch_size, max_seq_length).
+        List of (batch, lengths) tuples, where batch has shape
+        (batch_size, padded_length) and lengths has shape (batch_size, 2)
+        with [offset, length] per sequence (from iterate_batches).
     """
-    # Collect texts
-    texts = []
-    for item in dataset:
-        if formatting_func is not None:
-            result = formatting_func(item)
-            if isinstance(result, list):
-                texts.extend(result)
-            else:
-                texts.append(result)
-        elif isinstance(item, dict):
-            if dataset_text_field in item:
-                texts.append(item[dataset_text_field])
-            else:
-                # Try common column names
-                for key in ("text", "content", "instruction"):
-                    if key in item:
-                        texts.append(item[key])
-                        break
-        elif isinstance(item, str):
-            texts.append(item)
+    from mlx_lm.tuner.trainer import iterate_batches
 
-    if not texts:
-        raise ValueError(
-            f"No text data found. Provide a dataset with a '{dataset_text_field}' column."
-        )
+    ds = _prepare_dataset(
+        dataset, tokenizer, dataset_text_field, formatting_func
+    )
 
-    # Shuffle deterministically
-    mx.random.seed(seed)
-    indices = mx.random.permutation(len(texts)).tolist()
-
-    pad_id = tokenizer.eos_token_id or 0
-
-    batches = []
-    for b_start in range(0, len(indices), batch_size):
-        if num_batches is not None and len(batches) >= num_batches:
+    batch_pairs = []
+    for batch, lengths_info in iterate_batches(
+        ds, batch_size, max_seq_length,
+        loop=(num_batches is not None),
+        seed=seed,
+    ):
+        batch_pairs.append((batch, lengths_info))
+        if num_batches is not None and len(batch_pairs) >= num_batches:
             break
 
-        batch_indices = indices[b_start:b_start + batch_size]
-        if len(batch_indices) < batch_size:
-            # Wrap around to fill incomplete batch
-            batch_indices += indices[:batch_size - len(batch_indices)]
-
-        batch_tokens = []
-        for idx in batch_indices:
-            tokens = tokenizer.encode(texts[idx])
-            if len(tokens) >= max_seq_length:
-                tokens = tokens[:max_seq_length]
-            else:
-                tokens = tokens + [pad_id] * (max_seq_length - len(tokens))
-            batch_tokens.append(tokens)
-
-        batches.append(mx.array(batch_tokens, dtype=mx.int32))
-
-    mx.eval(batches)
-    return batches
+    mx.eval([b for b, _ in batch_pairs] + [l for _, l in batch_pairs])
+    return batch_pairs
 
 
 def save_lora_adapters(model, path, adapter_config=None):
