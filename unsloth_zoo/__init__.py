@@ -171,6 +171,7 @@ from .device_type import (
     DEVICE_COUNT,
     ALLOW_PREQUANTIZED_MODELS,
 )
+IS_HIP_RUNTIME = (DEVICE_TYPE == "hip") or bool(is_hip())
 
 # Torch 2.9 removed PYTORCH_HIP_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF
 if major_torch == 2 and minor_torch >= 9:
@@ -180,7 +181,7 @@ if major_torch == 2 and minor_torch >= 9:
             delete_key(key)
 
 # Specify PYTORCH_CUDA_ALLOC_CONF or PYTORCH_HIP_ALLOC_CONF
-if DEVICE_TYPE == "hip":
+if IS_HIP_RUNTIME:
     if major_torch == 2 and minor_torch >= 9:
         # PyTorch >= 2.9 uses PYTORCH_ALLOC_CONF. expandable_segments is unsupported on HIP.
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
@@ -197,7 +198,7 @@ if DEVICE_TYPE == "hip":
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
         delete_key("PYTORCH_CUDA_ALLOC_CONF")
-elif DEVICE_TYPE == "cuda" and not (major_torch == 2 and minor_torch >= 9):
+elif DEVICE_TYPE == "cuda" and not IS_HIP_RUNTIME and not (major_torch == 2 and minor_torch >= 9):
     delete_key("PYTORCH_HIP_ALLOC_CONF")
     delete_key("PYTORCH_ALLOC_CONF")
 
@@ -208,7 +209,7 @@ if (major_torch >= 2 and minor_torch >= 8) or (major_torch > 2):
 elif DEVICE_TYPE == "hip":
     # CCE also fails in HIP / AMD
     os.environ["UNSLOTH_ENABLE_CCE"] = "0"
-del delete_key, major_torch, minor_torch, torch_version, importlib_version, find_spec
+del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, major_torch, minor_torch, torch_version, importlib_version, find_spec
 
 if not ("UNSLOTH_IS_PRESENT" in os.environ):
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
