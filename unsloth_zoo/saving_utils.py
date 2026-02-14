@@ -390,6 +390,18 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             remove_keys.add(name)
         pass
     pass
+    # MoE target_parameters (ParamWrapper) entries have lora_A/B/scaling but
+    # may lack a corresponding .base_layer module, leaving module_count short.
+    # Count these so the diagnostic check below stays accurate (#3405, #3701).
+    for key, stats in lora_weights.items():
+        if (
+            stats.lora_A is not None
+            and stats.lora_B is not None
+            and stats.module is None
+            and ".mlp.experts" in key
+        ):
+            module_count += 1
+
     if not (module_count == lora_A_count == lora_B_count == scaling_count):
         print(
             f"[Unsloth merge debug] LoRA count mismatch: modules={module_count}, "
@@ -405,9 +417,6 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 print(f"  key={k} param={param_name} A={a_shape} B={b_shape}")
         except Exception:
             pass
-        # Allow merge to continue; downstream checks will still fail loudly if tensors are missing
-        # but this avoids silent assertion without context.
-        # TODO: handle MoE target_parameters to align counts.
 
     # Also return state_dict if needed
     if return_state_dict:
