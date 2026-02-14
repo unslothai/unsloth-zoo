@@ -390,15 +390,15 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             remove_keys.add(name)
         pass
     pass
-    # MoE target_parameters (ParamWrapper) entries have lora_A/B/scaling but
-    # may lack a corresponding .base_layer module, leaving module_count short.
-    # Count these so the diagnostic check below stays accurate (#3405, #3701).
-    for key, stats in lora_weights.items():
+    # PEFT target_parameters (ParamWrapper for nn.Parameter, not nn.Linear)
+    # have lora_A/B/scaling but no .base_layer, leaving module_count short.
+    # nn.Linear targets always get .base_layer set, so module=None reliably
+    # identifies nn.Parameter targets. Count them to align (#3405, #3701).
+    for _key, _stats in lora_weights.items():
         if (
-            stats.lora_A is not None
-            and stats.lora_B is not None
-            and stats.module is None
-            and ".mlp.experts" in key
+            _stats.lora_A is not None
+            and _stats.lora_B is not None
+            and _stats.module is None
         ):
             module_count += 1
 
