@@ -137,6 +137,20 @@ def remove_expandable_segments(key):
         delete_key(key)
 
 
+def clean_expandable_segments_value(value):
+    if value is None or "expandable_segments" not in value:
+        return value
+    parts = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("expandable_segments:"):
+            continue
+        parts.append(part)
+    return ",".join(parts) if len(parts) else None
+
+
 if (major_torch < 2):
     raise ImportError("Unsloth only supports Pytorch 2 for now. Please update your Pytorch to 2.1.\n"\
                       "We have some installation instructions on our Github page.")
@@ -192,11 +206,15 @@ IS_HIP_RUNTIME = (DEVICE_TYPE == "hip") or bool(is_hip())
 # Torch 2.9 removed PYTORCH_HIP_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF
 if major_torch == 2 and minor_torch >= 9:
     # Preserve explicit legacy allocator settings when user did not directly set PYTORCH_ALLOC_CONF.
-    if (not IS_TORCH_ROCM_BUILD) and (not _HAS_ORIGINAL_PYTORCH_ALLOC_CONF):
-        if _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF is not None:
-            os.environ["PYTORCH_ALLOC_CONF"] = _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF
-        elif _ORIGINAL_PYTORCH_HIP_ALLOC_CONF is not None:
-            os.environ["PYTORCH_ALLOC_CONF"] = _ORIGINAL_PYTORCH_HIP_ALLOC_CONF
+    if not _HAS_ORIGINAL_PYTORCH_ALLOC_CONF:
+        promoted = _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF
+        if promoted is None:
+            promoted = _ORIGINAL_PYTORCH_HIP_ALLOC_CONF
+        # Keep standby + ROCm protections when promoting legacy values.
+        if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1" or IS_TORCH_ROCM_BUILD:
+            promoted = clean_expandable_segments_value(promoted)
+        if promoted is not None:
+            os.environ["PYTORCH_ALLOC_CONF"] = promoted
     delete_key("PYTORCH_CUDA_ALLOC_CONF")
     delete_key("PYTORCH_HIP_ALLOC_CONF")
 
@@ -230,6 +248,7 @@ elif DEVICE_TYPE == "hip":
     # CCE also fails in HIP / AMD
     os.environ["UNSLOTH_ENABLE_CCE"] = "0"
 del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
+del clean_expandable_segments_value
 del _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF, _ORIGINAL_PYTORCH_HIP_ALLOC_CONF, _HAS_ORIGINAL_PYTORCH_ALLOC_CONF
 
 if not ("UNSLOTH_IS_PRESENT" in os.environ):
