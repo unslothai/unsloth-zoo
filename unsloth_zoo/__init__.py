@@ -110,6 +110,26 @@ major_torch, minor_torch = torch_version[0], torch_version[1]
 major_torch, minor_torch = int(major_torch), int(minor_torch)
 def delete_key(key):
     if key in os.environ: del os.environ[key]
+
+
+def remove_expandable_segments(key):
+    value = os.environ.get(key, "")
+    if "expandable_segments" not in value:
+        return
+    parts = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("expandable_segments:"):
+            continue
+        parts.append(part)
+    if parts:
+        os.environ[key] = ",".join(parts)
+    else:
+        delete_key(key)
+
+
 if (major_torch < 2):
     raise ImportError("Unsloth only supports Pytorch 2 for now. Please update your Pytorch to 2.1.\n"\
                       "We have some installation instructions on our Github page.")
@@ -151,6 +171,7 @@ from .device_type import (
     DEVICE_COUNT,
     ALLOW_PREQUANTIZED_MODELS,
 )
+IS_HIP_RUNTIME = (DEVICE_TYPE == "hip") or bool(is_hip())
 
 # Torch 2.9 removed PYTORCH_HIP_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF
 if major_torch == 2 and minor_torch >= 9:
@@ -158,9 +179,15 @@ if major_torch == 2 and minor_torch >= 9:
         if key in os.environ and "PYTORCH_ALLOC_CONF" not in os.environ:
             os.environ["PYTORCH_ALLOC_CONF"] = os.environ[key]
             delete_key(key)
-else:
-    # Specify PYTORCH_CUDA_ALLOC_CONF or PYTORCH_HIP_ALLOC_CONF
-    if DEVICE_TYPE == "hip":
+
+# Specify PYTORCH_CUDA_ALLOC_CONF or PYTORCH_HIP_ALLOC_CONF
+if IS_HIP_RUNTIME:
+    if major_torch == 2 and minor_torch >= 9:
+        # PyTorch >= 2.9 uses PYTORCH_ALLOC_CONF. expandable_segments is unsupported on HIP.
+        remove_expandable_segments("PYTORCH_ALLOC_CONF")
+        delete_key("PYTORCH_CUDA_ALLOC_CONF")
+        delete_key("PYTORCH_HIP_ALLOC_CONF")
+    else:
         if "PYTORCH_HIP_ALLOC_CONF" not in os.environ and "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
             os.environ["PYTORCH_HIP_ALLOC_CONF"] = os.environ["PYTORCH_CUDA_ALLOC_CONF"]
             delete_key("PYTORCH_CUDA_ALLOC_CONF")
@@ -168,19 +195,12 @@ else:
             os.environ["PYTORCH_HIP_ALLOC_CONF"] = os.environ["PYTORCH_ALLOC_CONF"]
             delete_key("PYTORCH_ALLOC_CONF")
         # expandable_segments is not supported on ROCm/HIP
-        for key in ("PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
-            val = os.environ.get(key, "")
-            if "expandable_segments" in val:
-                parts = [p.strip() for p in val.split(",") if p.strip() != "expandable_segments:True"]
-                val = ",".join(parts)
-                if val:
-                    os.environ[key] = val
-                else:
-                    delete_key(key)
+        remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
+        remove_expandable_segments("PYTORCH_ALLOC_CONF")
         delete_key("PYTORCH_CUDA_ALLOC_CONF")
-    elif DEVICE_TYPE == "cuda":
-        delete_key("PYTORCH_HIP_ALLOC_CONF")
-        delete_key("PYTORCH_ALLOC_CONF")
+elif DEVICE_TYPE == "cuda" and not IS_HIP_RUNTIME and not (major_torch == 2 and minor_torch >= 9):
+    delete_key("PYTORCH_HIP_ALLOC_CONF")
+    delete_key("PYTORCH_ALLOC_CONF")
 
 # CCE fails on Torch 2.8 and above
 # OutOfResources: out of resource: shared memory, Required: 98304, Hardware limit: 65536. Reducing block sizes or `num_stages`
@@ -189,7 +209,7 @@ if (major_torch >= 2 and minor_torch >= 8) or (major_torch > 2):
 elif DEVICE_TYPE == "hip":
     # CCE also fails in HIP / AMD
     os.environ["UNSLOTH_ENABLE_CCE"] = "0"
-del delete_key, major_torch, minor_torch, torch_version, importlib_version, find_spec
+del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, major_torch, minor_torch, torch_version, importlib_version, find_spec
 
 if not ("UNSLOTH_IS_PRESENT" in os.environ):
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
