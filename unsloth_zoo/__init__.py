@@ -80,6 +80,11 @@ if find_spec("torch") is None:
         "We also have some installation instructions on our Github page."
     )
 
+# Keep original allocator settings to preserve explicit user config precedence.
+_ORIGINAL_PYTORCH_CUDA_ALLOC_CONF = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+_ORIGINAL_PYTORCH_HIP_ALLOC_CONF = os.environ.get("PYTORCH_HIP_ALLOC_CONF")
+_HAS_ORIGINAL_PYTORCH_ALLOC_CONF = "PYTORCH_ALLOC_CONF" in os.environ
+
 # Reduce VRAM usage by reducing fragmentation
 # And optimize pinning of memory
 if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0":
@@ -130,6 +135,20 @@ def remove_expandable_segments(key):
         os.environ[key] = ",".join(parts)
     else:
         delete_key(key)
+
+
+def clean_expandable_segments_value(value):
+    if value is None or "expandable_segments" not in value:
+        return value
+    parts = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("expandable_segments:"):
+            continue
+        parts.append(part)
+    return ",".join(parts) if len(parts) else None
 
 
 if (major_torch < 2):
@@ -186,10 +205,18 @@ IS_HIP_RUNTIME = (DEVICE_TYPE == "hip") or bool(is_hip())
 
 # Torch 2.9 removed PYTORCH_HIP_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF
 if major_torch == 2 and minor_torch >= 9:
-    for key in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF",):
-        if key in os.environ and "PYTORCH_ALLOC_CONF" not in os.environ:
-            os.environ["PYTORCH_ALLOC_CONF"] = os.environ[key]
-            delete_key(key)
+    # Preserve explicit legacy allocator settings when user did not directly set PYTORCH_ALLOC_CONF.
+    if not _HAS_ORIGINAL_PYTORCH_ALLOC_CONF:
+        promoted = _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF
+        if promoted is None:
+            promoted = _ORIGINAL_PYTORCH_HIP_ALLOC_CONF
+        # Keep standby + ROCm protections when promoting legacy values.
+        if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1" or IS_TORCH_ROCM_BUILD:
+            promoted = clean_expandable_segments_value(promoted)
+        if promoted is not None:
+            os.environ["PYTORCH_ALLOC_CONF"] = promoted
+    delete_key("PYTORCH_CUDA_ALLOC_CONF")
+    delete_key("PYTORCH_HIP_ALLOC_CONF")
 
 # Specify PYTORCH_CUDA_ALLOC_CONF or PYTORCH_HIP_ALLOC_CONF
 if IS_HIP_RUNTIME:
@@ -221,6 +248,8 @@ elif DEVICE_TYPE == "hip":
     # CCE also fails in HIP / AMD
     os.environ["UNSLOTH_ENABLE_CCE"] = "0"
 del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
+del clean_expandable_segments_value
+del _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF, _ORIGINAL_PYTORCH_HIP_ALLOC_CONF, _HAS_ORIGINAL_PYTORCH_ALLOC_CONF
 
 if not ("UNSLOTH_IS_PRESENT" in os.environ):
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
