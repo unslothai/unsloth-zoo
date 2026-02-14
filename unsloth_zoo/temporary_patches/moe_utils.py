@@ -573,15 +573,17 @@ def _is_moe_experts_module(module) -> bool:
     import torch.nn as nn
 
     # Check for gate_up_proj pattern
+    # After PEFT's nn.utils.parametrize wrapping, accessing gate_up_proj
+    # returns torch.Tensor (not nn.Parameter), so we must accept both.
     if hasattr(module, "gate_up_proj"):
         param = module.gate_up_proj
-        if isinstance(param, nn.Parameter) and param.ndim == 3:
+        if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim == 3:
             return True
 
     # Check for w1/w2 pattern (separate gate/up projections)
     if hasattr(module, "w1") and hasattr(module, "w2"):
         w1 = module.w1
-        if isinstance(w1, nn.Parameter) and w1.ndim == 3:
+        if isinstance(w1, (nn.Parameter, torch.Tensor)) and w1.ndim == 3:
             return True
 
     return False
