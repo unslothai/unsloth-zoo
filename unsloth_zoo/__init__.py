@@ -105,9 +105,11 @@ elif os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1":
 # We support Pytorch 2
 # Fixes https://github.com/unslothai/unsloth/issues/38
 from importlib.metadata import version as importlib_version
-torch_version = str(re.match(r"[0-9\.]{3,}", str(importlib_version("torch"))).group(0)).split(".")
+torch_version_raw = str(importlib_version("torch"))
+torch_version = str(re.match(r"[0-9\.]{3,}", torch_version_raw).group(0)).split(".")
 major_torch, minor_torch = torch_version[0], torch_version[1]
 major_torch, minor_torch = int(major_torch), int(minor_torch)
+IS_TORCH_ROCM_BUILD = "+rocm" in torch_version_raw.lower()
 def delete_key(key):
     if key in os.environ: del os.environ[key]
 
@@ -148,6 +150,15 @@ elif os.name == 'nt':
     delete_key("PYTORCH_CUDA_ALLOC_CONF")
     delete_key("PYTORCH_HIP_ALLOC_CONF")
     delete_key("PYTORCH_ALLOC_CONF")
+
+# IMPORTANT: run ROCm cleanup before importing device_type (which imports torch).
+# HIP allocator settings can be read during torch initialization.
+if IS_TORCH_ROCM_BUILD:
+    remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
+    remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
+    remove_expandable_segments("PYTORCH_ALLOC_CONF")
+    delete_key("PYTORCH_CUDA_ALLOC_CONF")
+    delete_key("PYTORCH_HIP_ALLOC_CONF")
 
 # Suppress WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.7.0+cu126 for torchao version 0.14.1
 # Please see https://github.com/pytorch/ao/issues/2919 for more info
@@ -209,7 +220,7 @@ if (major_torch >= 2 and minor_torch >= 8) or (major_torch > 2):
 elif DEVICE_TYPE == "hip":
     # CCE also fails in HIP / AMD
     os.environ["UNSLOTH_ENABLE_CCE"] = "0"
-del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, major_torch, minor_torch, torch_version, importlib_version, find_spec
+del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
 
 if not ("UNSLOTH_IS_PRESENT" in os.environ):
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
