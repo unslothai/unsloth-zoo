@@ -412,6 +412,21 @@ def _get_base_weight(param):
     if hasattr(param, "get_param"):
         return param.get_param()
 
+    # Auto-dequantize BitsAndBytes 4-bit packed MoE parameters for grouped_mm/LoRA forward
+    # (packed tensor shape is not the logical expert tensor shape).
+    quant_state = getattr(param, "quant_state", None)
+    if quant_state is not None:
+        param_cls_name = type(param).__name__
+        if param_cls_name == "Params4bit":
+            try:
+                from bitsandbytes.functional import dequantize_4bit
+                dequantized = dequantize_4bit(param.data, quant_state=quant_state)
+                if hasattr(quant_state, "dtype") and quant_state.dtype is not None:
+                    dequantized = dequantized.to(quant_state.dtype)
+                return dequantized
+            except Exception:
+                pass
+
     # Handle Modules (Linear, etc.)
     if hasattr(param, "weight"):
         return param.weight
@@ -573,15 +588,17 @@ def _is_moe_experts_module(module) -> bool:
     import torch.nn as nn
 
     # Check for gate_up_proj pattern
+    # After PEFT's nn.utils.parametrize wrapping, accessing gate_up_proj
+    # returns torch.Tensor (not nn.Parameter), so we must accept both.
     if hasattr(module, "gate_up_proj"):
         param = module.gate_up_proj
-        if isinstance(param, nn.Parameter) and param.ndim == 3:
+        if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim == 3:
             return True
 
     # Check for w1/w2 pattern (separate gate/up projections)
     if hasattr(module, "w1") and hasattr(module, "w2"):
         w1 = module.w1
-        if isinstance(w1, nn.Parameter) and w1.ndim == 3:
+        if isinstance(w1, (nn.Parameter, torch.Tensor)) and w1.ndim == 3:
             return True
 
     return False

@@ -113,7 +113,7 @@ def patch_glm4_moe():
     # 2. Patch Glm4MoeLiteMoE (The MoE Block)
     # This must be patched to delegate expert computation to naive_moe_forward instead of inlining it
 
-    def moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def moe_block_forward(self, hidden_states) -> torch.Tensor:
         """
         Patched forward for MoE Block.
         Computes routing using GLM4 logic, then calls experts (NaiveMoe), then adds shared experts.
