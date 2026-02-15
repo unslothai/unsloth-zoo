@@ -412,6 +412,21 @@ def _get_base_weight(param):
     if hasattr(param, "get_param"):
         return param.get_param()
 
+    # Auto-dequantize BitsAndBytes 4-bit packed MoE parameters for grouped_mm/LoRA forward
+    # (packed tensor shape is not the logical expert tensor shape).
+    quant_state = getattr(param, "quant_state", None)
+    if quant_state is not None:
+        param_cls_name = type(param).__name__
+        if param_cls_name == "Params4bit":
+            try:
+                from bitsandbytes.functional import dequantize_4bit
+                dequantized = dequantize_4bit(param.data, quant_state=quant_state)
+                if hasattr(quant_state, "dtype") and quant_state.dtype is not None:
+                    dequantized = dequantized.to(quant_state.dtype)
+                return dequantized
+            except Exception:
+                pass
+
     # Handle Modules (Linear, etc.)
     if hasattr(param, "weight"):
         return param.weight
