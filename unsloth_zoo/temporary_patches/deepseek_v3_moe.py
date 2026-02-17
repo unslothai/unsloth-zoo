@@ -184,7 +184,7 @@ def patch_deepseek_v3():
     try:
         from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
             DeepseekV3ForCausalLM,
-            DeepseekV3CausalLMOutputWithPast,
+            CausalLMOutputWithPast,
         )
 
         _original_causal_lm_forward = DeepseekV3ForCausalLM.forward
@@ -247,7 +247,7 @@ def patch_deepseek_v3():
                 hidden_states = hidden_states[:, slice_indices, :]
 
             # Return hidden_states as "logits" for GRPO to use
-            return DeepseekV3CausalLMOutputWithPast(
+            return CausalLMOutputWithPast(
                 loss=None,
                 logits=hidden_states, # Return hidden states here!
                 past_key_values=outputs.past_key_values,
