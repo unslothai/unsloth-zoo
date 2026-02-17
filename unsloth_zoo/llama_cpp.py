@@ -68,6 +68,7 @@ LLAMA_CPP_TARGETS = [
 ]
 
 PIP_OPTIONS = [
+    f"{sys.executable} -m pip",  # Always prefer the running interpreter's pip
     "uv pip", # Astral's uv
     "pip",
     "pip3",
@@ -1027,7 +1028,7 @@ def convert_to_gguf(
     for args, output_file, description in runs_to_do:
         if print_output: print(f"\nUnsloth: Converting {description}...")
         args_str = " ".join(f"{k} {v}" for k, v in args.items())
-        command = f"python {converter_location} {args_str} {input_folder}"
+        command = f"{sys.executable} {converter_location} {args_str} {input_folder}"
 
         try:
             if print_output:
