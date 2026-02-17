@@ -37,6 +37,7 @@ import contextlib
 import importlib.util
 import tempfile
 import logging
+import shlex
 import torch
 from pathlib import Path
 import psutil
@@ -55,6 +56,12 @@ COMMANDS_NOT_FOUND = (
     "not found",
     "No such file or directory",
 )
+PIP_MODULE_NOT_FOUND = (
+    "no module named pip",
+    "no module named 'pip'",
+    "no module named pip.__main__",
+    "modulenotfounderror: no module named 'pip'",
+)
 
 # llama.cpp specific targets - all takes 90s. Below takes 60s
 LLAMA_CPP_TARGETS = [
@@ -68,7 +75,7 @@ LLAMA_CPP_TARGETS = [
 ]
 
 PIP_OPTIONS = [
-    f"{sys.executable} -m pip",  # Always prefer the running interpreter's pip
+    f'"{sys.executable}" -m pip',  # Always prefer the running interpreter's pip
     "uv pip", # Astral's uv
     "pip",
     "pip3",
@@ -244,17 +251,54 @@ pass
 
 def check_pip():
     # All Unsloth Zoo code licensed under LGPLv3
+    def _is_safe_candidate(pip):
+        # Guard against malformed or shell-injected candidates.
+        if any(char in pip for char in (";", "|", "&", ">", "<", "`", "$", "\n", "\r")):
+            return False
+        try:
+            tokens = shlex.split(pip)
+        except ValueError:
+            return False
+        if tokens in (["pip"], ["pip3"], ["uv", "pip"], ["poetry"]):
+            return True
+        if len(tokens) == 3 and tokens[1] == "-m" and tokens[2] == "pip":
+            return True
+        return False
+
+    def _is_missing_command(output):
+        markers = tuple(marker.lower() for marker in COMMANDS_NOT_FOUND)
+        for line in output.splitlines():
+            lowered = line.rstrip().lower()
+            if lowered.endswith(markers):
+                return True
+        return False
+
+    def _is_missing_pip_module(output):
+        lowered = output.lower()
+        return any(marker in lowered for marker in PIP_MODULE_NOT_FOUND)
+
     for pip in PIP_OPTIONS:
-        final_pip = pip
-        with subprocess.Popen(pip, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
-            for line in sp.stdout:
-                if line.decode("utf-8", errors = "replace").rstrip().endswith(COMMANDS_NOT_FOUND):
-                    final_pip = None
-                    sp.terminate()
-                    break
-            pass
-        pass
-        if final_pip is not None: return final_pip
+        if not _is_safe_candidate(pip):
+            continue
+        # Probe each candidate in a way that reflects real usage and avoids false positives.
+        # uv pip expects a subcommand, so --help is the stable probe there.
+        probe_command = f"{pip} --help" if pip.startswith("uv pip") else f"{pip} --version"
+        probe = subprocess.run(
+            probe_command,
+            shell = True,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.STDOUT,
+            text = True,
+        )
+        output = probe.stdout or ""
+
+        if _is_missing_command(output): continue
+        if _is_missing_pip_module(output): continue
+        if probe.returncode != 0: continue
+        # For non-uv candidates, require pip-like output to avoid selecting arbitrary commands.
+        if not pip.startswith("uv pip") and "pip" not in output.lower():
+            continue
+        return pip
     pass
     raise RuntimeError(f"[FAIL] Unsloth: Tried all of `{', '.join(PIP_OPTIONS)}` but failed.")
 pass
@@ -938,8 +982,8 @@ def convert_to_gguf(
     pass
 
     # Check if arch is supported
-    supported_types = supported_vision_archs | supported_text_archs
-    if supported_types is not None:
+    supported_types = (supported_vision_archs or set()) | (supported_text_archs or set())
+    if supported_types:
         assert("architectures" in config_file)
         arch = config_file["architectures"][0]
         if arch not in supported_types:
@@ -1027,20 +1071,27 @@ def convert_to_gguf(
     # Execute conversions
     for args, output_file, description in runs_to_do:
         if print_output: print(f"\nUnsloth: Converting {description}...")
-        args_str = " ".join(f"{k} {v}" for k, v in args.items())
-        command = f'"{sys.executable}" {converter_location} {args_str} {input_folder}'
+        command = [sys.executable, converter_location]
+        for key, value in args.items():
+            # Keep flag-only options (eg `--mmproj`) as standalone args.
+            if value in (None, ""):
+                command.append(str(key))
+            else:
+                command.extend([str(key), str(value)])
+        command.append(str(input_folder))
 
         try:
             if print_output:
-                result = subprocess.run(command, shell=True, check=True, text=True,
+                result = subprocess.run(command, shell=False, check=True, text=True,
                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                 print(result.stdout)
             else:
-                subprocess.run(command, shell=True, check=True, capture_output=True)
+                subprocess.run(command, shell=False, check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
             if print_output and hasattr(e, 'stdout') and e.stdout:
                 print(e.stdout)
-            raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF: {e}")
+            cmd = " ".join(str(x) for x in command)
+            raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}")
 
         # Simple validation using native Python - check for main file or sharded files
         if os.path.exists(output_file):
