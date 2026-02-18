@@ -37,10 +37,7 @@ def patch_qwen3_next_moe():
         import transformers.models.qwen3_next.modeling_qwen3_next
         transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextSparseMoeBlock
     except Exception as e:
-        return raise_error(
-            "transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextSparseMoeBlock",
-            e,
-        )
+        return
 
     patch_param_wrapper_for_moe()
     _qwen3_next_lora_extractor = _make_qwen_moe_lora_extractor()
@@ -52,24 +49,29 @@ def patch_qwen3_next_moe():
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: Could not register Qwen3NextExperts LoRA extractor: {e}")
 
-    forward = _make_qwen_moe_experts_forward(
-        module_name="unsloth_zoo.temporary_patches.qwen3_next_moe"
-    )
-    patch_function(
-        transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextExperts,
-        "forward",
-        forward,
-    )
 
-    sparse_moe_block_forward = _make_qwen_moe_sparse_moe_block_forward(
-        use_shared_expert=True,
-        module_name="unsloth_zoo.temporary_patches.qwen3_next_moe",
-    )
-    patch_function(
-        transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextSparseMoeBlock,
-        "forward",
-        sparse_moe_block_forward,
-    )
+    try:
+        forward = _make_qwen_moe_experts_forward(
+            module_name="unsloth_zoo.temporary_patches.qwen3_next_moe"
+        )
+        patch_function(
+            transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextExperts,
+            "forward",
+            forward,
+        )
+
+        sparse_moe_block_forward = _make_qwen_moe_sparse_moe_block_forward(
+            use_shared_expert=True,
+            module_name="unsloth_zoo.temporary_patches.qwen3_next_moe",
+        )
+        patch_function(
+            transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextSparseMoeBlock,
+            "forward",
+            sparse_moe_block_forward,
+        )
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Could not patch Qwen3NextExperts or Qwen3NextSparseMoeBlock: {e}")
 
     try:
         from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextForCausalLM
