@@ -1269,3 +1269,72 @@ def patch_vllm_safe_apply_chat_template():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_vllm_safe_apply_chat_template)
+
+
+def patch_static_cache_dtype_mismatch():
+    """Fix StaticLayer/StaticSlidingWindowLayer index_copy_ dtype mismatch.
+
+    When using float16 autocast on a bfloat16 model (FORCE_FLOAT32 path for Gemma3),
+    RoPE produces float32 keys (float16 * bfloat16) while values stay float16.
+    The cache is allocated with key_states.dtype (float32), causing index_copy_ to
+    fail when storing float16 values. Fix: eagerly initialize with consistent dtype
+    in update wrappers, then cast all incoming states before delegating.
+    """
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        return
+    try:
+        from transformers.cache_utils import StaticLayer, StaticSlidingWindowLayer
+    except Exception:
+        return
+
+    if hasattr(StaticLayer.update, "_unsloth_patched"):
+        return
+
+    def _resolve_dtype(key_states, value_states):
+        """Pick lower-precision dtype when key/value dtypes differ."""
+        if key_states.dtype == value_states.dtype:
+            return key_states.dtype
+        return (
+            value_states.dtype
+            if value_states.element_size() <= key_states.element_size()
+            else key_states.dtype
+        )
+
+    # Patch StaticLayer.update
+    _orig_update = StaticLayer.update
+    def patched_update(self, key_states, value_states, cache_kwargs=None):
+        if not self.is_initialized:
+            # Eagerly initialize with consistent dtype so the original update
+            # sees is_initialized=True and uses our casted states
+            if key_states.dtype != value_states.dtype:
+                target = _resolve_dtype(key_states, value_states)
+                self.lazy_initialization(key_states.to(target), value_states.to(target))
+            else:
+                self.lazy_initialization(key_states, value_states)
+        # Cast incoming states to match the cache dtype
+        if key_states.dtype != self.keys.dtype:
+            key_states = key_states.to(self.keys.dtype)
+        if value_states.dtype != self.values.dtype:
+            value_states = value_states.to(self.values.dtype)
+        return _orig_update(self, key_states, value_states, cache_kwargs)
+    patched_update._unsloth_patched = True
+    StaticLayer.update = patched_update
+
+    # StaticSlidingWindowLayer has its own update method (not inherited)
+    _orig_sw_update = StaticSlidingWindowLayer.update
+    def patched_sw_update(self, key_states, value_states, cache_kwargs=None):
+        if not self.is_initialized:
+            if key_states.dtype != value_states.dtype:
+                target = _resolve_dtype(key_states, value_states)
+                self.lazy_initialization(key_states.to(target), value_states.to(target))
+            else:
+                self.lazy_initialization(key_states, value_states)
+        if key_states.dtype != self.keys.dtype:
+            key_states = key_states.to(self.keys.dtype)
+        if value_states.dtype != self.values.dtype:
+            value_states = value_states.to(self.values.dtype)
+        return _orig_sw_update(self, key_states, value_states, cache_kwargs)
+    patched_sw_update._unsloth_patched = True
+    StaticSlidingWindowLayer.update = patched_sw_update
+pass
+TEMPORARY_PATCHES.append(patch_static_cache_dtype_mismatch)
