@@ -83,7 +83,8 @@ def chunked_hidden_states_selective_log_softmax(
     all_per_token_logps = []
 
     for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index):
-        chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
+        # Fix for multi-GPU: ensure all tensors are on the same device
+        chunk_logits = chunk_hidden_states.to(lm_head.device).to(lm_head.dtype) @ lm_head.t()
 
         if logit_scale_multiply != 0.0:
             chunk_logits = chunk_logits * logit_scale_multiply
