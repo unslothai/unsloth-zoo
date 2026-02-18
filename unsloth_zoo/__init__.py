@@ -32,6 +32,7 @@ if os.environ.get("UNSLOTH_STABLE_DOWNLOADS", "0") == "1":
     os.environ["HF_HUB_ETAG_TIMEOUT"] = "30" # Default is 10 seconds
     os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30" # Default is 10 seconds
     os.environ["HF_HUB_DISABLE_XET"] = "1" # Disable XET
+    os.environ["HF_XET_HIGH_PERFORMANCE"] = "0" # This causes "429 Too Many Requests"
 
 # Check offline mode as well
 if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
@@ -39,11 +40,28 @@ if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
 if os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1":
     os.environ["HF_HUB_OFFLINE"] = "1"
 
-# Disable XET Cache for now
-os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
-os.environ["HF_XET_CHUNK_CACHE_SIZE_BYTES"] = "0"
-os.environ["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] = "0"
-os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = "64"
+# Check "429 Too Many Requests" and set HF_XET_HIGH_PERFORMANCE
+from pathlib import Path
+def has_429_exact_full_read(log_dir: str | Path) -> str:
+    log_dir = Path(log_dir).expanduser()
+    if not log_dir.is_dir():
+        return "1"
+    for log_file in log_dir.glob("*.log"):
+        try:
+            if b"429 Too Many Requests" in log_file.read_bytes():
+                return "0"
+        except OSError:
+            continue
+    return "1"
+
+hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")).expanduser()
+xet_cache = Path(os.environ.get("HF_XET_CACHE", hf_home / "xet")).expanduser()
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", has_429_exact_full_read(xet_cache / "logs"))
+os.environ.setdefault("HF_XET_CHUNK_CACHE_SIZE_BYTES", "0")
+os.environ.setdefault("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", "0")
+os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "64")
+del has_429_exact_full_read, hf_home, xet_cache
+
 # More verbose HF Hub info
 if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
     os.environ["HF_HUB_VERBOSITY"] = "info"
