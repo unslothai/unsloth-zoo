@@ -423,7 +423,7 @@ def _get_base_weight(param):
                 dequantized = dequantize_4bit(param.data, quant_state=quant_state)
                 if hasattr(quant_state, "dtype") and quant_state.dtype is not None:
                     dequantized = dequantized.to(quant_state.dtype)
-                return dequantized
+                return dequantized.contiguous()
             except Exception:
                 pass
 
@@ -592,13 +592,15 @@ def _is_moe_experts_module(module) -> bool:
     # returns torch.Tensor (not nn.Parameter), so we must accept both.
     if hasattr(module, "gate_up_proj"):
         param = module.gate_up_proj
-        if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim == 3:
+        # 4-bit parameters are packed into 2D tensors (n_params, 1) or similar.
+        # Standard MoE weights are 3D (num_experts, in, out).
+        if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim in (2, 3):
             return True
 
     # Check for w1/w2 pattern (separate gate/up projections)
     if hasattr(module, "w1") and hasattr(module, "w2"):
         w1 = module.w1
-        if isinstance(w1, (nn.Parameter, torch.Tensor)) and w1.ndim == 3:
+        if isinstance(w1, (nn.Parameter, torch.Tensor)) and w1.ndim in (2, 3):
             return True
 
     return False
