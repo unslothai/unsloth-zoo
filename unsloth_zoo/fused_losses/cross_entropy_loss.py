@@ -172,6 +172,15 @@ class UnslothFusedLoss(torch.autograd.Function):
         device = lm_head_weight.device
         if extra_kwargs is None: extra_kwargs = {}
 
+        # Fix for multi-GPU: ensure all tensors are on the same device for computation
+        # torch.func.grad_and_value fails when tensors are on different devices
+        # BUT we must return gradients on the ORIGINAL device of hidden_states
+        original_hidden_states_device = hidden_states.device
+        if hidden_states.device != device:
+            hidden_states = hidden_states.to(device)
+        if labels.device != device:
+            labels = labels.to(device)
+
         # Get shifted labels first
         if shift_labels:
             _labels = torch.empty_like(labels, device = device)
@@ -328,6 +337,7 @@ class UnslothFusedLoss(torch.autograd.Function):
         pass
         ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
         ctx.scaling = scaling
+        ctx.original_hidden_states_device = original_hidden_states_device
         return accumulated_loss
     pass
 
@@ -338,6 +348,10 @@ class UnslothFusedLoss(torch.autograd.Function):
             scaling = ctx.scaling if ctx.scaling is not None else 1.0
             torch._assert(torch.all(grad_output == scaling), f"Fused losses expect grad_output to be all {scaling}, but got {grad_output.ravel()[:10]}")
         (grad_inputs, grad_lm_head, grad_lm_head_bias, ) = ctx.saved_tensors
+        # Fix for multi-GPU: return gradients on the ORIGINAL device of hidden_states
+        original_device = ctx.original_hidden_states_device
+        if grad_inputs.device != original_device:
+            grad_inputs = grad_inputs.to(original_device)
         return (None, grad_inputs, grad_lm_head, grad_lm_head_bias, None, None, None, None, None, None, None, None, None,)
     pass
 pass
