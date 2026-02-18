@@ -795,18 +795,6 @@ def create_new_function(
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
         items += ["SiglipEncoder"]
-    # Patch for Qwen3MoeExperts
-    if "Qwen3MoeExperts" in new_source:
-        items += ["Qwen3MoeExperts"]
-    # Patch for Qwen3VLMoeTextExperts
-    if "Qwen3VLMoeTextExperts" in new_source:
-        items += ["Qwen3VLMoeTextExperts"]
-    # Patch for Qwen3NextExperts
-    if "Qwen3NextExperts" in new_source:
-        items += ["Qwen3NextExperts"]
-    # Patch for Qwen3_5MoeExperts
-    if "Qwen3_5MoeExperts" in new_source:
-        items += ["Qwen3_5MoeExperts"]
     # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
@@ -1074,6 +1062,34 @@ def create_standalone_class(
     # We disable this for nn.Embedding modules if torch is older than 2.5 since
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
         disable = True
+
+    # Strip decorators from class source if present
+    # This fixes issues with classes like Qwen3NextExperts which have decorators that cause compilation failures
+    if full_class.lstrip().startswith("@"):
+        start = re.search(r"^class ", full_class, flags=re.MULTILINE)
+        if start:
+            # Found class definition - now check decorators
+            class_start = start.start()
+            preamble = full_class[:class_start]
+            class_def = full_class[class_start:]
+
+            # Split preamble into lines
+            lines = preamble.split('\n')
+            new_lines = []
+
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("@"):
+                    if "use_experts_implementation" in stripped:
+                        logger.info(f'Unsloth: stripped use_experts_implementation decorator from {module}')
+                        continue # Strip it
+                    else:
+                        logger.warning(f"Unsloth: Warning: Unknown decorator {stripped} found for {module}.")
+                        new_lines.append(line) # Keep it
+                else:
+                    new_lines.append(line)
+
+            full_class = '\n'.join(new_lines) + class_def
 
     # Check if forward was replaced by a temporary patch (already has @torch.compiler.disable)
     # In this case, keep the patched source as-is without adding another decorator
