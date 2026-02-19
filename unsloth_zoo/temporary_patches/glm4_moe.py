@@ -18,7 +18,8 @@ import torch
 from .common import TEMPORARY_PATCHES, torch_compile, UNSLOTH_ENABLE_LOGGING
 from .utils import patch_function, raise_error, logger
 from .moe_utils import (
-    patch_param_wrapper_for_moe
+    patch_param_wrapper_for_moe,
+    forward_moe_backend,
 )
 
 def patch_glm4_moe():
@@ -98,7 +99,6 @@ def patch_glm4_moe():
         Patched forward for Expert layer.
         Dispatches to appropriate backend (native torch grouped_mm, triton, or loop).
         """
-        from moe_utils import forward_moe_backend
         return forward_moe_backend(self, hidden_states, top_k_index, top_k_weights)
 
     # 2. Patch Glm4MoeLiteMoE (The MoE Block)

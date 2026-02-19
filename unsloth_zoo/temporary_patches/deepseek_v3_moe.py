@@ -41,6 +41,7 @@ from .utils import (
 from ..hf_utils import dtype_from_config
 from .moe_utils import (
     patch_param_wrapper_for_moe,
+    forward_moe_backend,
 )
 
 
@@ -141,7 +142,6 @@ def patch_deepseek_v3():
         Patched forward for Expert layer.
         Dispatches to moe_utils backend selection.
         """
-        from moe_utils import forward_moe_backend
         return forward_moe_backend(self, hidden_states, top_k_index, top_k_weights)
 
     # Apply patch to DeepseekV3NaiveMoe

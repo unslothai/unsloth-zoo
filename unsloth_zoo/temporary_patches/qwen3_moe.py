@@ -38,6 +38,7 @@ from .utils import (
 
 from .moe_utils import (
     patch_param_wrapper_for_moe,
+    forward_moe_backend,
 )
 
 
@@ -110,7 +111,6 @@ def _make_qwen_moe_lora_extractor():
 def _make_qwen_moe_experts_forward(module_name: Optional[str] = None):
     @torch.compiler.disable
     def qwen_moe_experts_forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
-        from moe_utils import forward_moe_backend
         return forward_moe_backend(self, hidden_states, top_k_index, top_k_weights)
     forward = qwen_moe_experts_forward
 
