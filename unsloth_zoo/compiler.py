@@ -154,6 +154,7 @@ _license_header = (
     _full_license_header
     + """
 import os
+import sys
 import torch
 import importlib.util
 import math
@@ -168,6 +169,9 @@ import math
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_CCE = os.environ.get("UNSLOTH_ENABLE_CCE", "1") == "1"
 UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial",)
+UNSLOTH_COMPILE_LOCATION = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+if UNSLOTH_COMPILE_LOCATION not in sys.path:
+    sys.path.insert(0, UNSLOTH_COMPILE_LOCATION)
 
 import logging
 logger_compiler = logging.getLogger(__name__)
@@ -795,12 +799,6 @@ def create_new_function(
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
         items += ["SiglipEncoder"]
-    # Patch for Qwen3MoeExperts
-    if "Qwen3MoeExperts" in new_source:
-        items += ["Qwen3MoeExperts"]
-    # Patch for Qwen3VLMoeTextExperts
-    if "Qwen3VLMoeTextExperts" in new_source:
-        items += ["Qwen3VLMoeTextExperts"]
     # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
@@ -816,6 +814,25 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
+    if (
+        "forward_moe_backend" in new_source
+        or "select_moe_backend" in new_source
+        or "forward_native_grouped_mm" in new_source
+        or "forward_triton_grouped_gemm" in new_source
+        or "forward_native_moe_loop" in new_source
+    ):
+        imports += (
+            "try:\n"
+            "    from moe_utils import (\n"
+            "        forward_moe_backend,\n"
+            "        select_moe_backend,\n"
+            "        forward_native_grouped_mm,\n"
+            "        forward_triton_grouped_gemm,\n"
+            "        forward_native_moe_loop,\n"
+            "    )\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )
@@ -1069,17 +1086,44 @@ def create_standalone_class(
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
         disable = True
 
-    # Check if forward was replaced by a temporary patch (already has @torch.compiler.disable)
-    # In this case, keep the patched source as-is without adding another decorator
+    # Strip decorators from class source if present
+    # This fixes issues with classes like Qwen3NextExperts which have decorators that cause compilation failures
+    if full_class.lstrip().startswith("@"):
+        start = re.search(r"^class ", full_class, flags=re.MULTILINE)
+        if start:
+            # Found class definition - now check decorators
+            class_start = start.start()
+            preamble = full_class[:class_start]
+            class_def = full_class[class_start:]
+
+            # Split preamble into lines
+            lines = preamble.split('\n')
+            new_lines = []
+
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("@"):
+                    if "use_experts_implementation" in stripped:
+                        logger.info(f'Unsloth: stripped use_experts_implementation decorator from {module}')
+                        continue # Strip it
+                    else:
+                        logger.warning(f"Unsloth: Warning: Unknown decorator {stripped} found for {module}.")
+                        new_lines.append(line) # Keep it
+                else:
+                    new_lines.append(line)
+
+            full_class = '\n'.join(new_lines) + class_def
+
+    # Check if forward was replaced by a temporary patch (renamed function)
+    # In this case, keep the patched source as-is and replace the class forward body.
     patched_forward_info = None
-    if "@torch.compiler.disable" in forward_source:
-        func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
-        if func_match and func_match.group(1) != "forward":
-            # Find original forward in class to replace it
-            orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
-            if orig_fwd:
-                patched_forward_info = (func_match.group(1), orig_fwd.group(1))
-                disable = None  # Skip adding decorator
+    func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
+    if func_match and func_match.group(1) != "forward":
+        # Find original forward in class to replace it
+        orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
+        if orig_fwd:
+            patched_forward_info = (func_match.group(1), orig_fwd.group(1))
+            disable = None  # Keep patched source as-is for renamed forward replacements
 
     # Replace function name with module-specific name
     if patched_forward_info:
@@ -2765,6 +2809,8 @@ DISABLE_COMPILE_MODULES = [
     "GptOssExperts",
     "Gemma3nTextModel",
     "Glm4MoeLiteNaiveMoe",
+    "Qwen3NextGatedDeltaNet",
+    "GatedDeltaNet",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -2824,6 +2870,7 @@ def unsloth_compile_transformers(
     except ModuleNotFoundError:
         return
     modeling_file = eval(model_location)
+
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
         if hasattr(modeling_file, "__UNSLOTH_SUPPORTS_SDPA__"):

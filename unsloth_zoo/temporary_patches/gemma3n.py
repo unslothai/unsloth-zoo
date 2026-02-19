@@ -94,7 +94,7 @@ def patch_Gemma3nTextAltUp_predict():
         from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
     except Exception as e:
         return raise_error("Gemma3nTextAltUp.predict", e)
-    
+
     def predict(self, hidden_states: torch.Tensor) -> torch.Tensor:
         new_dtype = self.router_input_scale.dtype
         hidden_states = hidden_states.to(new_dtype)
@@ -158,8 +158,8 @@ def patch_Gemma3nModel_get_placeholder_mask():
 
     def get_placeholder_mask(
         self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
         image_features: Optional[torch.FloatTensor] = None,
         audio_features: Optional[torch.FloatTensor] = None,
     ):
