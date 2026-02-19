@@ -74,7 +74,6 @@ _CACHED_MOE_UTILS_MODULE = None
 def _load_cached_moe_utils_module():
     global _CACHED_MOE_UTILS_MODULE
 
-    install_to_cache(__file__, "moe_utils.py")
     cache_file = os.path.abspath(os.path.join(_get_compile_location(), "moe_utils.py"))
     current_file = os.path.abspath(__file__)
     if not os.path.isfile(cache_file) or cache_file == current_file:

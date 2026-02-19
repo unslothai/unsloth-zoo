@@ -157,7 +157,6 @@ def patch_deepseek_v3():
         return hidden_states
 
     # Apply patch to DeepseekV3MoE
-    DeepseekV3MoE.forward = patched_moe_forward
     patch_function(DeepseekV3MoE, "forward", patched_moe_forward)
 
     if UNSLOTH_ENABLE_LOGGING:
@@ -235,7 +234,7 @@ def patch_deepseek_v3():
             # Return hidden_states as "logits" for GRPO to use
             return CausalLMOutputWithPast(
                 loss=None,
-                logits=hidden_states, # Return hidden states here!
+                logits=hidden_states,
                 past_key_values=outputs.past_key_values,
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,

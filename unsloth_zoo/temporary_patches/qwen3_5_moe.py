@@ -90,6 +90,4 @@ def patch_qwen3_5_moe():
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: Could not patch Qwen3_5MoeForCausalLM.forward: {e}")
 
-
-pass
 TEMPORARY_PATCHES.append(patch_qwen3_5_moe)

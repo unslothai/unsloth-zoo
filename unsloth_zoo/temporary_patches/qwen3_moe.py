@@ -43,7 +43,7 @@ from .moe_utils import (
 
 
 def _make_qwen_moe_lora_extractor():
-    def _qwen_moe_lora_extractor(self, wrapper, weight_A, weight_B, scaling, num_experts):
+    def _qwen_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
         """
         Robust extractor for Qwen-family MoE that handles PEFT's dimension layout.
 
@@ -232,8 +232,6 @@ def _patch_causal_lm_forward_for_hidden_states(
     causal_lm_cls.forward = _patched_causal_lm_forward
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: Patched {model_label}.forward for GRPO hidden states.")
-
-
 
 
 def patch_qwen3_moe():
