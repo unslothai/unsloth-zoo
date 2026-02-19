@@ -390,6 +390,18 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             remove_keys.add(name)
         pass
     pass
+    # PEFT target_parameters (ParamWrapper for nn.Parameter, not nn.Linear)
+    # have lora_A/B/scaling but no .base_layer, leaving module_count short.
+    # nn.Linear targets always get .base_layer set, so module=None reliably
+    # identifies nn.Parameter targets. Count them to align (#3405, #3701).
+    for _key, _stats in lora_weights.items():
+        if (
+            _stats.lora_A is not None
+            and _stats.lora_B is not None
+            and _stats.module is None
+        ):
+            module_count += 1
+
     if not (module_count == lora_A_count == lora_B_count == scaling_count):
         print(
             f"[Unsloth merge debug] LoRA count mismatch: modules={module_count}, "
@@ -405,9 +417,6 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 print(f"  key={k} param={param_name} A={a_shape} B={b_shape}")
         except Exception:
             pass
-        # Allow merge to continue; downstream checks will still fail loudly if tensors are missing
-        # but this avoids silent assertion without context.
-        # TODO: handle MoE target_parameters to align counts.
 
     # Also return state_dict if needed
     if return_state_dict:
