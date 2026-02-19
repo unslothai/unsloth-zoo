@@ -1165,6 +1165,41 @@ pass
 TEMPORARY_PATCHES.append(patch_peft_dispatch_bnb_4bit)
 
 
+def patch_peft_param_wrapper_4bit_expert_shape():
+    """Ensure ParamWrapper._get_in_out_features handles 4bit BNB MoE expert params.
+
+    When using quantized MoE expert params (Params4bit), the tensor is 2D flattened;
+    _original_shape holds (num_experts, in_features, out_features). This patch adds
+    or ensures that logic so PEFT sets num_experts and in/out features correctly for
+    LoRA on gate_up_proj/down_proj.
+    """
+    try:
+        from peft.tuners.lora.layer import ParamWrapper
+        from peft.utils.integrations import get_bnb_param_type
+    except (ImportError, AttributeError):
+        return
+
+    if hasattr(ParamWrapper._get_in_out_features, "_unsloth_4bit_expert_patched"):
+        return
+
+    _original_get_in_out_features = ParamWrapper._get_in_out_features
+
+    def _patched_get_in_out_features(self, module: nn.Module):
+        param = self.get_param()
+        if get_bnb_param_type(param) == "4bit":
+            shape = getattr(param, "_original_shape", None)
+            if shape is not None and len(shape) == 3:
+                num_experts, in_features, out_features = shape
+                self.num_experts = num_experts
+                return in_features, out_features
+        return _original_get_in_out_features(self, module)
+
+    _patched_get_in_out_features._unsloth_4bit_expert_patched = True
+    ParamWrapper._get_in_out_features = _patched_get_in_out_features
+pass
+TEMPORARY_PATCHES.append(patch_peft_param_wrapper_4bit_expert_shape)
+
+
 def patch_trl_push_to_hub_token():
     """Ensure to_dict() always includes push_to_hub_token for TRL compat.
 

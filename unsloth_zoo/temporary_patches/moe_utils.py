@@ -408,6 +408,11 @@ def _get_base_weight(param):
     # Recursively unwrap PEFT layers
     while hasattr(param, "base_layer"):
         param = param.base_layer
+    
+    if param.__class__.__name__ == "Params4bit":
+        import bitsandbytes as bnb
+        # Dequantize the parameter
+        return bnb.functional.dequantize_4bit(param.data, param.quant_state)
 
     if hasattr(param, "get_param"):
         return param.get_param()
@@ -575,6 +580,11 @@ def _is_moe_experts_module(module) -> bool:
     # Check for gate_up_proj pattern
     if hasattr(module, "gate_up_proj"):
         param = module.gate_up_proj
+        
+        # If the param is quantized (4bit in this case), return True
+        if param.__class__.__name__ == "Params4bit" and param.ndim == 2:
+            return True
+
         if isinstance(param, nn.Parameter) and param.ndim == 3:
             return True
 
