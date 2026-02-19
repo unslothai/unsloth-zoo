@@ -760,6 +760,12 @@ class GptOssExperts(nn.Module):
         self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
     ) -> torch.Tensor:
         """Forward using grouped_mm or loop fallback with LoRA support."""
+        # Keep activations aligned with expert weights to avoid mixed-dtype matmul errors.
+        target_dtype = getattr(getattr(self.down_proj, "weight", None), "dtype", None)
+        if target_dtype is None:
+            target_dtype = self.dtype
+        if hidden_states is not None and hidden_states.dtype != target_dtype:
+            hidden_states = hidden_states.to(target_dtype)
         # Use optimized grouped_mm if available
         if _check_torch_grouped_mm_supported():
             return forward_native_grouped_mm(self, hidden_states, router_indices, routing_weights)
@@ -1252,6 +1258,12 @@ def moe_forward_inference_bf16(self, hidden_states):
         down_proj = down_proj.get_param()
     elif hasattr(down_proj, "weight"):
         down_proj = down_proj.weight
+
+    # Keep activations aligned with expert weights to avoid mixed-dtype
+    # bmm mismatches in inference kernels.
+    target_dtype = gate_up_proj.dtype if gate_up_proj is not None else down_proj.dtype
+    if hidden_states is not None and hidden_states.dtype != target_dtype:
+        hidden_states = hidden_states.to(target_dtype)
 
     return _moe_forward_inference_bf16_kernel(
         hidden_states,
