@@ -2849,6 +2849,31 @@ def unsloth_compile_transformers(
     except ModuleNotFoundError:
         return
     modeling_file = eval(model_location)
+
+    disable_compile_modules = list(DISABLE_COMPILE_MODULES)
+    disable_compile_functions = set()
+    if (
+        model_type == "qwen3_next"
+        and not bool(getattr(modeling_file, "is_fast_path_available", True))
+    ):
+        # qwen3_next fallback path is loop-heavy and causes compile churn.
+        disable_compile_modules.append("Qwen3NextGatedDeltaNet")
+        disable_compile_functions.update(
+            {
+                "torch_chunk_gated_delta_rule",
+                "torch_recurrent_gated_delta_rule",
+                "torch_causal_conv1d_update",
+            }
+        )
+        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+            print(
+                "Unsloth: qwen3_next fast path is unavailable "
+                "(requires flash-linear-attention and causal-conv1d). "
+                "Disabling compile for fallback kernels. "
+                "Install: https://github.com/fla-org/flash-linear-attention#installation "
+                "and https://github.com/Dao-AILab/causal-conv1d"
+            )
+
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
         if hasattr(modeling_file, "__UNSLOTH_SUPPORTS_SDPA__"):
@@ -3271,7 +3296,7 @@ def unsloth_compile_transformers(
         pass
 
         # if more modules need to be disabled consider adding to a global list
-        if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+        if any([module.endswith(x) for x in disable_compile_modules]):
             print(
                 f"Unsloth: Disabling compile for {module} since it's marked for disabling."
             )
@@ -3307,7 +3332,7 @@ def unsloth_compile_transformers(
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
-            if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+            if any([module.endswith(x) for x in disable_compile_modules]):
                 print(
                     f"Unsloth: Disabling compile for {module} since it's marked for disabling."
                 )
@@ -3763,6 +3788,13 @@ def unsloth_compile_transformers(
 
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
+
+            if module in disable_compile_functions:
+                print(
+                    f"Unsloth: Will not compile function {module} since it's marked for disabling."
+                )
+                all_standalone_classes[module] = source
+                continue
 
             # Check erroring out
             bad = False
