@@ -1095,7 +1095,6 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         if hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
             qkv_proj = layer.self_attn.qkv_proj
-            o_proj = layer.self_attn.o_proj
 
             use_fused_qkv = _is_fused_module("qkv_proj")
             if use_fused_qkv:
@@ -1107,6 +1106,16 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
                 get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
                 get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
+
+            # Extract o_proj or out_proj depending on model architecture
+            # LFM2 uses out_proj, most other models use o_proj
+            if hasattr(layer.self_attn, "o_proj"):
+                o_proj = layer.self_attn.o_proj
+                get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+            elif hasattr(layer.self_attn, "out_proj"):
+                out_proj = layer.self_attn.out_proj
+                get_state_dict(f"{prefix}.out_proj", 0, state_dict, out_proj)
+
         elif hasattr(layer, "cross_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
             qkv_proj = layer.cross_attn.qkv_proj
@@ -1118,22 +1127,72 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
             get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
             get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
+            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
-        get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+        elif hasattr(layer, "short_conv"):
+            # LFM2 hybrid short convolution layers (non-attention layers)
+            # vLLM ShortConv: in_proj (MergedColumnParallelLinear, splits into B, C, x),
+            #                 out_proj (RowParallelLinear),
+            #                 conv (ColumnParallelLinear, weight unsqueezed for conv1d)
+            # HF Lfm2ShortConv: in_proj (nn.Linear, hidden -> 3*hidden),
+            #                   out_proj (nn.Linear, hidden -> hidden),
+            #                   conv (nn.Conv1d, depthwise with groups=hidden_size)
+            conv_prefix = f"{vllm_text_model_prefix}.layers.{kk}.conv"
+            short_conv = layer.short_conv
 
-        proj = layer.mlp.gate_up_proj
-        use_fused_gate_up = _is_fused_module("gate_up_proj")
-        if use_fused_gate_up:
-            # For some model types like phi3 vllm will expect fused gate_up_proj (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
-            # so we should not split them here otherwise there will be a size mismatch when activating the adapter
-            # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
-            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_up_proj", 0, state_dict, proj, slice_weights=False)
-        else:
-            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
-            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+            # in_proj: vLLM splits into 3 shards via MergedColumnParallelLinear,
+            # but HF stores as a single nn.Linear(hidden, 3*hidden)
+            get_state_dict(f"{conv_prefix}.in_proj", 0, state_dict, short_conv.in_proj, slice_weights=False)
 
-        proj = layer.mlp.down_proj
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
+            # out_proj: direct mapping
+            get_state_dict(f"{conv_prefix}.out_proj", 0, state_dict, short_conv.out_proj)
+
+            # conv: vLLM stores as ColumnParallelLinear with weight shape (out, 1, kernel)
+            # HF expects nn.Conv1d weight with same shape (hidden, 1, kernel) for depthwise conv
+            conv_module = short_conv.conv
+            conv_weight = getattr(conv_module, "base_layer", conv_module).weight
+            conv_weight.requires_grad_(False)
+            state_dict[f"{conv_prefix}.conv.weight"] = conv_weight
+            quant_state_dict[f"{conv_prefix}.conv.weight"] = conv_weight
+            # Handle conv bias if present
+            conv_bias = getattr(conv_module, "bias", None)
+            if conv_bias is None and hasattr(conv_module, "base_layer"):
+                conv_bias = getattr(conv_module.base_layer, "bias", None)
+            if conv_bias is not None:
+                conv_bias.requires_grad_(False)
+                state_dict[f"{conv_prefix}.conv.bias"] = conv_bias
+                quant_state_dict[f"{conv_prefix}.conv.bias"] = conv_bias
+        pass
+
+        # MLP / Feed Forward extraction
+        # LFM2 uses feed_forward with w1 (gate), w2 (down), w3 (up) — SwiGLU style
+        # Standard models use mlp with gate_up_proj (merged), down_proj
+        if hasattr(layer, "mlp"):
+            proj = layer.mlp.gate_up_proj
+            use_fused_gate_up = _is_fused_module("gate_up_proj")
+            if use_fused_gate_up:
+                # For some model types like phi3 vllm will expect fused gate_up_proj (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
+                # so we should not split them here otherwise there will be a size mismatch when activating the adapter
+                # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
+                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_up_proj", 0, state_dict, proj, slice_weights=False)
+            else:
+                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
+                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+
+            proj = layer.mlp.down_proj
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
+
+        elif hasattr(layer, "feed_forward"):
+            # LFM2 uses feed_forward with w1 (gate), w3 (up), w2 (down)
+            # In vLLM, w1 and w3 are merged into a single MergedColumnParallelLinear
+            ff_prefix = f"{vllm_text_model_prefix}.layers.{kk}.feed_forward"
+            w1_proj = layer.feed_forward.w1  # MergedColumnParallelLinear (w1 at index 0, w3 at index 1)
+            get_state_dict(f"{ff_prefix}.w1", 0, state_dict, w1_proj)
+            get_state_dict(f"{ff_prefix}.w3", 1, state_dict, w1_proj)
+
+            w2_proj = layer.feed_forward.w2  # RowParallelLinear
+            get_state_dict(f"{ff_prefix}.w2", 0, state_dict, w2_proj)
+        pass
 
         # Use layernorms from the layer configuration
         layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
@@ -1160,9 +1219,15 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     # Norm
     # For Gemma3 and similar multimodal models, norm should be under model.norm
     # For standard models, also under model.norm
-    norm_prefix = f"{vllm_text_model_prefix}.norm.weight"
-    state_dict[norm_prefix] = vllm_text_model.norm.weight.data
-    quant_state_dict[norm_prefix] = state_dict[norm_prefix]
+    # LFM2 uses embedding_norm instead of norm
+    if hasattr(vllm_text_model, "norm"):
+        norm_prefix = f"{vllm_text_model_prefix}.norm.weight"
+        state_dict[norm_prefix] = vllm_text_model.norm.weight.data
+        quant_state_dict[norm_prefix] = state_dict[norm_prefix]
+    elif hasattr(vllm_text_model, "embedding_norm"):
+        norm_prefix = f"{vllm_text_model_prefix}.embedding_norm.weight"
+        state_dict[norm_prefix] = vllm_text_model.embedding_norm.weight.data
+        quant_state_dict[norm_prefix] = state_dict[norm_prefix]
 
     # LM Head - Use get_state_dict for consistency
     if not getattr(text_config, "tie_word_embeddings", False):
