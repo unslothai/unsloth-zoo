@@ -19,7 +19,6 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import inspect
 
 from .common import (
     TEMPORARY_PATCHES,
@@ -38,12 +37,6 @@ from .utils import (
 # ============================================================================
 
 from .moe_utils import (
-    _check_grouped_gemm_available,
-    _TORCH_GROUPED_MM_AVAILABLE,
-    forward_native_grouped_mm,
-    forward_triton_grouped_gemm,
-    forward_native_moe_loop,
-    select_moe_backend,
     patch_param_wrapper_for_moe,
 )
 
@@ -115,18 +108,10 @@ def _make_qwen_moe_lora_extractor():
 
 
 def _make_qwen_moe_experts_forward(module_name: Optional[str] = None):
-    backend = select_moe_backend()
-
-    if backend == "grouped_mm":
-        def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
-            return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
-    elif backend == "unsloth_triton":
-        def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
-            return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
-    else:
-        @torch.compiler.disable
-        def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
-            return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
+    def qwen_moe_experts_forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
+        from unsloth_zoo.temporary_patches.moe_utils import forward_moe_backend
+        return forward_moe_backend(self, hidden_states, top_k_index, top_k_weights)
+    forward = qwen_moe_experts_forward
 
     if module_name is not None:
         forward.__module__ = module_name

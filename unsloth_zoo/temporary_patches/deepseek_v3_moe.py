@@ -40,7 +40,6 @@ from .utils import (
 )
 from ..hf_utils import dtype_from_config
 from .moe_utils import (
-    forward_moe_backend,
     patch_param_wrapper_for_moe,
 )
 
@@ -131,6 +130,7 @@ def patch_deepseek_v3():
     # Patch DeepseekV3NaiveMoe.forward to use backend dispatch in moe_utils
     # ====================================================================
 
+    @torch.compiler.disable
     def naive_moe_forward(
         self,
         hidden_states: torch.Tensor,
@@ -141,6 +141,7 @@ def patch_deepseek_v3():
         Patched forward for Expert layer.
         Dispatches to moe_utils backend selection.
         """
+        from unsloth_zoo.temporary_patches.moe_utils import forward_moe_backend
         return forward_moe_backend(self, hidden_states, top_k_index, top_k_weights)
 
     # Apply patch to DeepseekV3NaiveMoe

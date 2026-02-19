@@ -18,10 +18,6 @@ import torch
 from .common import TEMPORARY_PATCHES, torch_compile, UNSLOTH_ENABLE_LOGGING
 from .utils import patch_function, raise_error, logger
 from .moe_utils import (
-    select_moe_backend,
-    forward_native_grouped_mm,
-    forward_triton_grouped_gemm,
-    forward_native_moe_loop,
     patch_param_wrapper_for_moe
 )
 
@@ -91,6 +87,7 @@ def patch_glm4_moe():
     # 1. Patch Glm4MoeLiteNaiveMoe (The Expert Layer)
     # This delegates to moe_utils which handles the Split LoRA logic
 
+    @torch.compiler.disable
     def naive_moe_forward(
         self,
         hidden_states: torch.Tensor,
@@ -101,14 +98,8 @@ def patch_glm4_moe():
         Patched forward for Expert layer.
         Dispatches to appropriate backend (native torch grouped_mm, triton, or loop).
         """
-        backend = select_moe_backend()
-
-        if backend == "grouped_mm":
-            return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
-        elif backend == "unsloth_triton":
-            return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
-        else:
-            return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
+        from unsloth_zoo.temporary_patches.moe_utils import forward_moe_backend
+        return forward_moe_backend(self, hidden_states, top_k_index, top_k_weights)
 
     # 2. Patch Glm4MoeLiteMoE (The MoE Block)
     # This must be patched to delegate expert computation to naive_moe_forward instead of inlining it
