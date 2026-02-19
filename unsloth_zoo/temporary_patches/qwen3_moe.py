@@ -38,7 +38,7 @@ from .utils import (
 
 from .moe_utils import (
     patch_param_wrapper_for_moe,
-    forward_moe_backend,
+    get_forward_moe_backend,
 )
 
 
@@ -109,14 +109,7 @@ def _make_qwen_moe_lora_extractor():
 
 
 def _make_qwen_moe_experts_forward(module_name: Optional[str] = None):
-    @torch.compiler.disable
-    def qwen_moe_experts_forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
-        return forward_moe_backend(self, hidden_states, top_k_index, top_k_weights)
-    forward = qwen_moe_experts_forward
-
-    if module_name is not None:
-        forward.__module__ = module_name
-    return forward
+    return get_forward_moe_backend()
 
 
 def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name: Optional[str] = None):
@@ -365,7 +358,7 @@ def patch_qwen3_moe():
 
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts._unsloth_lora_extractor_fn = _qwen3_lora_extractor
 
-        forward = _make_qwen_moe_experts_forward(module_name=__name__)
+        forward = _make_qwen_moe_experts_forward()
         sparse_moe_block_forward = _make_qwen_moe_sparse_moe_block_forward(
             use_shared_expert=False,
             module_name=__name__,

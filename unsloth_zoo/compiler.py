@@ -814,6 +814,25 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
+    if (
+        "forward_moe_backend" in new_source
+        or "select_moe_backend" in new_source
+        or "forward_native_grouped_mm" in new_source
+        or "forward_triton_grouped_gemm" in new_source
+        or "forward_native_moe_loop" in new_source
+    ):
+        imports += (
+            "try:\n"
+            "    from moe_utils import (\n"
+            "        forward_moe_backend,\n"
+            "        select_moe_backend,\n"
+            "        forward_native_grouped_mm,\n"
+            "        forward_triton_grouped_gemm,\n"
+            "        forward_native_moe_loop,\n"
+            "    )\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )

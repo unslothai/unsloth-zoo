@@ -17,6 +17,8 @@ import torch
 import torch.nn.functional as F
 import os
 import shutil
+import sys
+import importlib.util
 from typing import Optional, Tuple
 from torch.autograd import Function
 
@@ -24,6 +26,12 @@ from torch.autograd import Function
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
     "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
 )
+
+
+def _get_compile_location() -> str:
+    return os.path.abspath(
+        os.environ.get("UNSLOTH_COMPILE_LOCATION", UNSLOTH_COMPILE_LOCATION)
+    )
 
 
 def _log_info(message: str):
@@ -36,9 +44,10 @@ def install_to_cache(source_path, destination_filename=None):
     Copies a file to the unsloth_compiled_cache directory
     to ensure it is available for compiled modules.
     """
-    if not os.path.exists(UNSLOTH_COMPILE_LOCATION):
+    compile_location = _get_compile_location()
+    if not os.path.exists(compile_location):
         try:
-            os.makedirs(UNSLOTH_COMPILE_LOCATION)
+            os.makedirs(compile_location)
         except:
             pass
 
@@ -46,7 +55,7 @@ def install_to_cache(source_path, destination_filename=None):
     if destination_filename is None:
         destination_filename = os.path.basename(current_file)
 
-    destination = os.path.abspath(os.path.join(UNSLOTH_COMPILE_LOCATION, destination_filename))
+    destination = os.path.abspath(os.path.join(compile_location, destination_filename))
 
     # If source and dest are different, copy.
     if current_file != destination:
@@ -57,6 +66,52 @@ def install_to_cache(source_path, destination_filename=None):
 
 
 install_to_cache(__file__, "moe_utils.py")
+
+_CACHED_FORWARD_MOE_BACKEND = None
+_CACHED_MOE_UTILS_MODULE = None
+
+
+def _load_cached_moe_utils_module():
+    global _CACHED_MOE_UTILS_MODULE
+
+    install_to_cache(__file__, "moe_utils.py")
+    cache_file = os.path.abspath(os.path.join(_get_compile_location(), "moe_utils.py"))
+    current_file = os.path.abspath(__file__)
+    if not os.path.isfile(cache_file) or cache_file == current_file:
+        return None
+
+    try:
+        module_name = "unsloth_cached_moe_utils"
+        module = sys.modules.get(module_name, None)
+        if module is not None and os.path.abspath(getattr(module, "__file__", "")) == cache_file:
+            _CACHED_MOE_UTILS_MODULE = module
+            return module
+
+        spec = importlib.util.spec_from_file_location(module_name, cache_file)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        _CACHED_MOE_UTILS_MODULE = module
+        return module
+    except Exception:
+        return None
+
+
+def get_forward_moe_backend():
+    """
+    Resolve forward_moe_backend from the compiled cache copy when available.
+    Falls back to the local module definition.
+    """
+    global _CACHED_FORWARD_MOE_BACKEND
+    module = _load_cached_moe_utils_module()
+    if module is not None and hasattr(module, "forward_moe_backend"):
+        _CACHED_FORWARD_MOE_BACKEND = module.forward_moe_backend
+        return _CACHED_FORWARD_MOE_BACKEND
+
+    _CACHED_FORWARD_MOE_BACKEND = forward_moe_backend
+    return _CACHED_FORWARD_MOE_BACKEND
 
 # ============================================================================
 # Grouped MM wrapper
@@ -706,6 +761,13 @@ def patch_param_wrapper_for_moe():
     # This Unsloth Zoo code section is licensed under AGPL3
 
     global _original_param_wrapper_forward
+
+    module = _load_cached_moe_utils_module()
+    if module is not None and hasattr(module, "patch_param_wrapper_for_moe"):
+        try:
+            return module.patch_param_wrapper_for_moe()
+        except Exception:
+            pass
 
     try:
         from peft.tuners.lora.layer import ParamWrapper

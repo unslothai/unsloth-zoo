@@ -19,9 +19,8 @@ from .common import TEMPORARY_PATCHES, torch_compile, UNSLOTH_ENABLE_LOGGING
 from .utils import patch_function, raise_error, logger
 from .moe_utils import (
     patch_param_wrapper_for_moe,
-    forward_moe_backend,
+    get_forward_moe_backend,
 )
-
 def patch_glm4_moe():
     """
     Patches GLM4 MoE to support Split LoRA using grouped GEMM.
@@ -88,19 +87,6 @@ def patch_glm4_moe():
     # 1. Patch Glm4MoeLiteNaiveMoe (The Expert Layer)
     # This delegates to moe_utils which handles the Split LoRA logic
 
-    @torch.compiler.disable
-    def naive_moe_forward(
-        self,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Patched forward for Expert layer.
-        Dispatches to appropriate backend (native torch grouped_mm, triton, or loop).
-        """
-        return forward_moe_backend(self, hidden_states, top_k_index, top_k_weights)
-
     # 2. Patch Glm4MoeLiteMoE (The MoE Block)
     # This must be patched to delegate expert computation to naive_moe_forward instead of inlining it
 
@@ -135,7 +121,7 @@ def patch_glm4_moe():
         return hidden_states + shared_output
 
     # Apply patches
-    patch_function(Glm4MoeLiteNaiveMoe, "forward", naive_moe_forward)
+    patch_function(Glm4MoeLiteNaiveMoe, "forward", get_forward_moe_backend())
     patch_function(Glm4MoeLiteMoE,      "forward", moe_block_forward)
 
     if UNSLOTH_ENABLE_LOGGING:
