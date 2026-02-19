@@ -108,8 +108,9 @@ def _make_qwen_moe_lora_extractor():
 
 
 def _make_qwen_moe_experts_forward(module_name: Optional[str] = None):
+    @torch.compiler.disable
     def qwen_moe_experts_forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
-        from unsloth_zoo.temporary_patches.moe_utils import forward_moe_backend
+        from moe_utils import forward_moe_backend
         return forward_moe_backend(self, hidden_states, top_k_index, top_k_weights)
     forward = qwen_moe_experts_forward
 
@@ -121,6 +122,7 @@ def _make_qwen_moe_experts_forward(module_name: Optional[str] = None):
 def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name: Optional[str] = None):
     @torch.compiler.disable
     def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        use_shared_expert = hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate")
         if hidden_states.dim() == 3:
             batch_size, sequence_length, hidden_dim = hidden_states.shape
         else:

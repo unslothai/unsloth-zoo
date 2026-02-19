@@ -98,7 +98,7 @@ def patch_glm4_moe():
         Patched forward for Expert layer.
         Dispatches to appropriate backend (native torch grouped_mm, triton, or loop).
         """
-        from unsloth_zoo.temporary_patches.moe_utils import forward_moe_backend
+        from moe_utils import forward_moe_backend
         return forward_moe_backend(self, hidden_states, top_k_index, top_k_weights)
 
     # 2. Patch Glm4MoeLiteMoE (The MoE Block)

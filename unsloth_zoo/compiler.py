@@ -154,6 +154,7 @@ _license_header = (
     _full_license_header
     + """
 import os
+import sys
 import torch
 import importlib.util
 import math
@@ -168,6 +169,9 @@ import math
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_CCE = os.environ.get("UNSLOTH_ENABLE_CCE", "1") == "1"
 UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial",)
+UNSLOTH_COMPILE_LOCATION = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+if UNSLOTH_COMPILE_LOCATION not in sys.path:
+    sys.path.insert(0, UNSLOTH_COMPILE_LOCATION)
 
 import logging
 logger_compiler = logging.getLogger(__name__)
@@ -1091,17 +1095,16 @@ def create_standalone_class(
 
             full_class = '\n'.join(new_lines) + class_def
 
-    # Check if forward was replaced by a temporary patch (already has @torch.compiler.disable)
-    # In this case, keep the patched source as-is without adding another decorator
+    # Check if forward was replaced by a temporary patch (renamed function)
+    # In this case, keep the patched source as-is and replace the class forward body.
     patched_forward_info = None
-    if "@torch.compiler.disable" in forward_source:
-        func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
-        if func_match and func_match.group(1) != "forward":
-            # Find original forward in class to replace it
-            orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
-            if orig_fwd:
-                patched_forward_info = (func_match.group(1), orig_fwd.group(1))
-                disable = None  # Skip adding decorator
+    func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
+    if func_match and func_match.group(1) != "forward":
+        # Find original forward in class to replace it
+        orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
+        if orig_fwd:
+            patched_forward_info = (func_match.group(1), orig_fwd.group(1))
+            disable = None  # Keep patched source as-is for renamed forward replacements
 
     # Replace function name with module-specific name
     if patched_forward_info:

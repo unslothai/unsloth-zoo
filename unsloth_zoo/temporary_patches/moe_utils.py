@@ -19,12 +19,16 @@ import os
 import shutil
 from typing import Optional, Tuple
 from torch.autograd import Function
-from .utils import logger
 
 # Get compile location
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
     "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
 )
+
+
+def _log_info(message: str):
+    if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+        print(message)
 
 
 def install_to_cache(source_path, destination_filename=None):
@@ -199,13 +203,13 @@ def select_moe_backend():
             return "unsloth_triton"
         if requested == "native_torch":
             return "native_torch"
-        logger.info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
+        _log_info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
     if _check_torch_grouped_mm_supported():
-        logger.info("Unsloth: Using MoE backend 'grouped_mm'")
+        _log_info("Unsloth: Using MoE backend 'grouped_mm'")
         return "grouped_mm"
     if _check_grouped_gemm_available():
-        logger.info("Unsloth: Using MoE backend 'unsloth_triton'")
+        _log_info("Unsloth: Using MoE backend 'unsloth_triton'")
         return "unsloth_triton"
     return "native_torch"
 
