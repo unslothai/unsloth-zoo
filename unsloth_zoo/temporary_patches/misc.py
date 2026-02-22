@@ -1200,6 +1200,68 @@ pass
 TEMPORARY_PATCHES.append(patch_peft_param_wrapper_4bit_expert_shape)
 
 
+class _ParamShapeProxy:
+    """Thin wrapper so .shape is _original_shape for 4bit MoE params; everything else delegates."""
+
+    __slots__ = ("_param", "_shape", "_ndim")
+
+    def __init__(self, param, shape):
+        self._param = param
+        self._shape = shape
+        self._ndim = len(shape)
+
+    @property
+    def shape(self):
+        return self._shape
+    
+    @property
+    def ndim(self) -> int:
+        return self._ndim
+
+    def __getattr__(self, name):
+        return getattr(self._param, name)
+
+
+def patch_peft_param_wrapper_4bit_expert_shape():
+    """Make ParamWrapper.get_param() report 3D shape for 4bit MoE params so init sets num_experts etc.
+
+    When using quantized MoE expert params (Params4bit), the tensor is 2D flattened;
+    _original_shape holds (num_experts, in_features, out_features). The original
+    __init__ calls self.get_param() and derives num_experts, in_features, out_features
+    from param.shape, then calls update_layer; if we don't fix shape, it overwrites our
+    values. So we patch get_param() to return a proxy that exposes .shape = _original_shape
+    for 4bit params with _original_shape; the rest of init then computes and sets the
+    right attributes.
+    """
+    try:
+        from peft.tuners.lora.layer import ParamWrapper
+        from peft.utils.integrations import get_bnb_param_type
+    except (ImportError, AttributeError):
+        return
+
+    if getattr(ParamWrapper.get_param, "_unsloth_4bit_expert_patched", False):
+        return
+
+    _original_get_param = ParamWrapper.get_param
+
+    def _patched_get_param(self):
+        param = _original_get_param(self)
+        if get_bnb_param_type(param) == "4bit":
+            shape = getattr(param, "_original_shape", None)
+            if shape is not None and len(shape) == 3:
+                num_experts, in_features, out_features = shape
+                self.num_experts = num_experts
+                self.in_features = in_features
+                self.out_features = out_features
+                return _ParamShapeProxy(param, shape)
+        return param
+
+    _patched_get_param._unsloth_4bit_expert_patched = True
+    patch_function(ParamWrapper, "get_param", _patched_get_param)
+
+TEMPORARY_PATCHES.append(patch_peft_param_wrapper_4bit_expert_shape)
+
+
 def patch_trl_push_to_hub_token():
     """Ensure to_dict() always includes push_to_hub_token for TRL compat.
 
