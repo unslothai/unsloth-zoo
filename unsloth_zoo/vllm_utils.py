@@ -1118,6 +1118,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
             get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
             get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
+        else:
+            # Skip layers that don't have self_attn or cross_attn (e.g. Mamba/SSM layers
+            # like LFM2's mixer layers). Full Mamba state dict extraction can be added later.
+            logger.info(f"Unsloth: Skipping layer {kk} — no self_attn or cross_attn found.")
+            continue
 
         get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
