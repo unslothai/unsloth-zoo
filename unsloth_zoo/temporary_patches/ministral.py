@@ -142,9 +142,13 @@ def patch_MinistralModel_forward():
         )
         if sw is None and not has_sliding_layers:
             # All layers are full_attention and no sliding_window is set.
-            # Set a dummy sliding_window on the config so create_sliding_window_causal_mask
-            # does not raise. The mask will not actually be used.
-            self.config.sliding_window = 4096  # dummy value, unused
+            # Set sliding_window to max_position_embeddings so
+            # create_sliding_window_causal_mask does not raise. The mask will
+            # not actually be used by full_attention layers, but the value must
+            # be large enough to avoid unintended attention truncation.
+            self.config.sliding_window = getattr(
+                self.config, "max_position_embeddings", 32768
+            )
             try:
                 return original_forward(
                     self,
