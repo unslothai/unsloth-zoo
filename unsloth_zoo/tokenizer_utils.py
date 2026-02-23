@@ -674,22 +674,22 @@ def patch_processor_call(processor):
             )
         return original_call(self, images=images, text=text, videos=videos, **kwargs)
 
-    # Patch at the class level to ensure it's used
-    # Create a dynamic subclass just for this instance
+    # Patch at the class level to ensure it's used.
+    # Create a dynamic subclass just for this instance.
+    # Use the original class name so save_pretrained writes the correct
+    # processor_class into config files (fixes GitHub issue #4085).
+    # Double-patching is already prevented by _unsloth_patched_call check above.
     original_class = processor.__class__
-    patched_class_name = f"_Unsloth_Patched_{original_class.__name__}"
-
-    # Check if we already created a patched class
-    if not patched_class_name.startswith("_Unsloth_Patched_") or \
-       not processor.__class__.__name__.startswith("_Unsloth_Patched_"):
-        # Create new class that inherits from original
-        patched_class = type(
-            patched_class_name,
-            (original_class,),
-            {"__call__": patched_call}
-        )
-        # Change the instance's class to the patched one
-        processor.__class__ = patched_class
+    patched_class = type(
+        original_class.__name__,
+        (original_class,),
+        {
+            "__call__": patched_call,
+            "__module__": original_class.__module__,
+            "__qualname__": original_class.__qualname__,
+        }
+    )
+    processor.__class__ = patched_class
 
     processor._unsloth_patched_call = True
     return processor
