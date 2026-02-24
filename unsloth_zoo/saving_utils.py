@@ -486,6 +486,7 @@ def _merge_and_overwrite_lora(
     quant_type = None,
     save_method = "merged_16bit",
     counted_lora_modules = None,
+    tie_word_embeddings = False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -689,6 +690,17 @@ def _merge_and_overwrite_lora(
                 # Check for LoRA merge
                 lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
                 lora_stats = converted_lora_weights.get(lora_key, None)
+                # Tied embeddings can omit lm_head.weight from safetensors. If lm_head has LoRA
+                # adapters, apply them onto embed_tokens.weight since both share one base tensor.
+                if (
+                    lora_stats is None
+                    and tie_word_embeddings
+                    and lora_key.endswith("embed_tokens")
+                ):
+                    lm_head_key = lora_key[:-len("embed_tokens")] + "lm_head"
+                    lora_stats = converted_lora_weights.get(lm_head_key, None)
+                    if lora_stats is None and lm_head_key.startswith("model."):
+                        lora_stats = converted_lora_weights.get(lm_head_key[len("model."):], None)
 
                 if lora_stats is not None:
                     # Prefer modules_to_save weights if present
@@ -2039,6 +2051,7 @@ def merge_and_overwrite_lora(
             quant_type = quant_type,
             save_method = save_method,
             counted_lora_modules = counted_lora_modules_global,
+            tie_word_embeddings = bool(getattr(find_lora_base_model(model).config, "tie_word_embeddings", False)),
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
