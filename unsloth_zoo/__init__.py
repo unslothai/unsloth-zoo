@@ -32,6 +32,7 @@ if os.environ.get("UNSLOTH_STABLE_DOWNLOADS", "0") == "1":
     os.environ["HF_HUB_ETAG_TIMEOUT"] = "30" # Default is 10 seconds
     os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30" # Default is 10 seconds
     os.environ["HF_HUB_DISABLE_XET"] = "1" # Disable XET
+    os.environ["HF_XET_HIGH_PERFORMANCE"] = "0" # This causes "429 Too Many Requests"
 
 # Check offline mode as well
 if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
@@ -39,11 +40,28 @@ if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
 if os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1":
     os.environ["HF_HUB_OFFLINE"] = "1"
 
-# Disable XET Cache for now
-os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
-os.environ["HF_XET_CHUNK_CACHE_SIZE_BYTES"] = "0"
-os.environ["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] = "0"
-os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = "64"
+# Check "429 Too Many Requests" and set HF_XET_HIGH_PERFORMANCE
+from pathlib import Path
+def has_429_exact_full_read(log_dir: str | Path) -> str:
+    log_dir = Path(log_dir).expanduser()
+    if not log_dir.is_dir():
+        return "1"
+    for log_file in log_dir.glob("*.log"):
+        try:
+            if b"429 Too Many Requests" in log_file.read_bytes():
+                return "0"
+        except OSError:
+            continue
+    return "1"
+
+hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")).expanduser()
+xet_cache = Path(os.environ.get("HF_XET_CACHE", hf_home / "xet")).expanduser()
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", has_429_exact_full_read(xet_cache / "logs"))
+os.environ.setdefault("HF_XET_CHUNK_CACHE_SIZE_BYTES", "0")
+os.environ.setdefault("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", "0")
+os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "64")
+del has_429_exact_full_read, hf_home, xet_cache
+
 # More verbose HF Hub info
 if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
     os.environ["HF_HUB_VERBOSITY"] = "info"
@@ -85,18 +103,32 @@ _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
 _ORIGINAL_PYTORCH_HIP_ALLOC_CONF = os.environ.get("PYTORCH_HIP_ALLOC_CONF")
 _HAS_ORIGINAL_PYTORCH_ALLOC_CONF = "PYTORCH_ALLOC_CONF" in os.environ
 
+# We support Pytorch 2
+# Fixes https://github.com/unslothai/unsloth/issues/38
+from importlib.metadata import version as importlib_version
+torch_version_raw = str(importlib_version("torch"))
+torch_version = str(re.match(r"[0-9\.]{3,}", torch_version_raw).group(0)).split(".")
+major_torch, minor_torch = torch_version[0], torch_version[1]
+major_torch, minor_torch = int(major_torch), int(minor_torch)
+IS_TORCH_2_9_OR_NEWER = (major_torch > 2) or (major_torch == 2 and minor_torch >= 9)
+IS_TORCH_ROCM_BUILD = "+rocm" in torch_version_raw.lower()
+
 # Reduce VRAM usage by reducing fragmentation
 # And optimize pinning of memory
 if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0":
-    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = \
-            "expandable_segments:True,"\
-            "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
-    if "PYTORCH_HIP_ALLOC_CONF" not in os.environ:
-        # [TODO] Check if AMD works with roundup_power2_divisions
-        os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
-    if "PYTORCH_ALLOC_CONF" not in os.environ:
-        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+    if IS_TORCH_2_9_OR_NEWER:
+        if "PYTORCH_ALLOC_CONF" not in os.environ:
+            os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+    else:
+        if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = \
+                "expandable_segments:True,"\
+                "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
+        if "PYTORCH_HIP_ALLOC_CONF" not in os.environ:
+            # [TODO] Check if AMD works with roundup_power2_divisions
+            os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
+        if "PYTORCH_ALLOC_CONF" not in os.environ:
+            os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 elif os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1":
     for key in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF",):
         if "expandable_segments:True" in os.environ.get(key, ""):
@@ -107,14 +139,6 @@ elif os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1":
             )
             os.environ[key] = re.sub(r"expandable\_segments\:True\,?", "", os.environ[key])
 
-# We support Pytorch 2
-# Fixes https://github.com/unslothai/unsloth/issues/38
-from importlib.metadata import version as importlib_version
-torch_version_raw = str(importlib_version("torch"))
-torch_version = str(re.match(r"[0-9\.]{3,}", torch_version_raw).group(0)).split(".")
-major_torch, minor_torch = torch_version[0], torch_version[1]
-major_torch, minor_torch = int(major_torch), int(minor_torch)
-IS_TORCH_ROCM_BUILD = "+rocm" in torch_version_raw.lower()
 def delete_key(key):
     if key in os.environ: del os.environ[key]
 
@@ -203,8 +227,8 @@ from .device_type import (
 )
 IS_HIP_RUNTIME = (DEVICE_TYPE == "hip") or bool(is_hip())
 
-# Torch 2.9 removed PYTORCH_HIP_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF
-if major_torch == 2 and minor_torch >= 9:
+# Torch >= 2.9 uses PYTORCH_ALLOC_CONF and treats legacy per-backend vars as deprecated.
+if IS_TORCH_2_9_OR_NEWER:
     # Preserve explicit legacy allocator settings when user did not directly set PYTORCH_ALLOC_CONF.
     if not _HAS_ORIGINAL_PYTORCH_ALLOC_CONF:
         promoted = _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF
@@ -220,7 +244,7 @@ if major_torch == 2 and minor_torch >= 9:
 
 # Specify PYTORCH_CUDA_ALLOC_CONF or PYTORCH_HIP_ALLOC_CONF
 if IS_HIP_RUNTIME:
-    if major_torch == 2 and minor_torch >= 9:
+    if IS_TORCH_2_9_OR_NEWER:
         # PyTorch >= 2.9 uses PYTORCH_ALLOC_CONF. expandable_segments is unsupported on HIP.
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
         delete_key("PYTORCH_CUDA_ALLOC_CONF")
@@ -236,7 +260,7 @@ if IS_HIP_RUNTIME:
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
         delete_key("PYTORCH_CUDA_ALLOC_CONF")
-elif DEVICE_TYPE == "cuda" and not IS_HIP_RUNTIME and not (major_torch == 2 and minor_torch >= 9):
+elif DEVICE_TYPE == "cuda" and not IS_HIP_RUNTIME and not IS_TORCH_2_9_OR_NEWER:
     delete_key("PYTORCH_HIP_ALLOC_CONF")
     delete_key("PYTORCH_ALLOC_CONF")
 
@@ -247,7 +271,7 @@ if (major_torch >= 2 and minor_torch >= 8) or (major_torch > 2):
 elif DEVICE_TYPE == "hip":
     # CCE also fails in HIP / AMD
     os.environ["UNSLOTH_ENABLE_CCE"] = "0"
-del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
+del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_2_9_OR_NEWER, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
 del clean_expandable_segments_value
 del _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF, _ORIGINAL_PYTORCH_HIP_ALLOC_CONF, _HAS_ORIGINAL_PYTORCH_ALLOC_CONF
 
