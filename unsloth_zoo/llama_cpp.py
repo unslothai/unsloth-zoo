@@ -429,6 +429,26 @@ def install_llama_cpp(
         cpu_count = cpu_count - 1
         cpu_count = max(cpu_count, 1)
 
+    # Detect GPU backend for CMake
+    gpu_cmake_flags = ""
+    if gpu_support:  # Accept both True and "ON"
+        try:
+            import torch
+            if hasattr(torch.version, 'hip') and torch.version.hip is not None and torch.cuda.is_available():
+                # ROCm detected
+                if torch.cuda.device_count() > 0:
+                    gpu_arch = torch.cuda.get_device_properties(0).gcnArchName
+                    # Use ROCm from PATH or standard location
+                    rocm_path = os.environ.get('ROCM_PATH', '/opt/rocm')
+                    gpu_cmake_flags = f"-DGGML_HIP=ON -DCMAKE_C_COMPILER={rocm_path}/llvm/bin/clang -DCMAKE_CXX_COMPILER={rocm_path}/llvm/bin/clang++ -DCMAKE_HIP_ARCHITECTURES={gpu_arch}"
+                    if print_output: print(f"Unsloth: Detected ROCm GPU ({gpu_arch})")
+            elif torch.cuda.is_available():
+                gpu_cmake_flags = "-DGGML_CUDA=ON"
+                if print_output: print("Unsloth: Detected CUDA GPU")
+        except Exception as e:
+            if print_output: print(f"Unsloth: GPU detection failed ({e}), falling back to CUDA flags")
+            gpu_cmake_flags = "-DGGML_CUDA=ON"
+
     # Try make first
     try:
         if print_output: print("Trying to build with make...")
@@ -447,7 +467,7 @@ def install_llama_cpp(
             try:
                 try_execute(
                     f"cmake . -B build "\
-                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support} -DLLAMA_CURL=ON",
+                    f"-DBUILD_SHARED_LIBS=OFF {gpu_cmake_flags} -DLLAMA_CURL=ON",
                     cwd = llama_cpp_folder,
                     **kwargs
                 )
@@ -457,7 +477,7 @@ def install_llama_cpp(
                     # As of https://github.com/ggml-org/llama.cpp/pull/18791, CURL is deprecated
                     try_execute(
                         f"cmake . -B build "\
-                        f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}",
+                        f"-DBUILD_SHARED_LIBS=OFF {gpu_cmake_flags}",
                         cwd = llama_cpp_folder,
                         ignore_deprecation = True,
                         **kwargs
