@@ -507,6 +507,40 @@ def fix_rotary_embedding_dtype(source):
 pass
 
 
+def fix_attention_dtype_consistency(source):
+    """
+    Fix dtype mismatch between Q/K and V in attention modules.
+    After apply_rotary_pos_emb, Q and K may be promoted to a different dtype
+    (e.g. float32) while V stays in the original dtype (e.g. float16/bfloat16).
+    This happens in 4-bit BNB mode when cos/sin from RoPE are in float32.
+    We insert a cast to align V's dtype with Q's dtype.
+    """
+    pattern = re.compile(
+        r"([ \t]*)(query_states\s*,\s*key_states\s*=\s*apply_rotary_pos_emb\([^\)]+\))"
+    )
+    matches = list(pattern.finditer(source))
+    if not matches:
+        return source
+
+    for match in reversed(matches):
+        indent = match.group(1)
+        end_pos = match.end()
+        next_chunk = source[end_pos:end_pos + 200]
+        if "value_states = value_states.to(query_states.dtype)" in next_chunk:
+            continue
+        insert_code = (
+            f"\n{indent}# Unsloth: align V dtype with Q after RoPE (fixes 4-bit dtype mismatch)\n"
+            f"{indent}if value_states.dtype != query_states.dtype:\n"
+            f"{indent}    value_states = value_states.to(query_states.dtype)"
+        )
+        source = source[:end_pos] + insert_code + source[end_pos:]
+
+    return source
+
+
+pass
+
+
 # Use float32 for layernorms if we find evidence for it
 def higher_precision_layernorms(modeling_file):
     norm_modules = list(
@@ -1199,6 +1233,9 @@ def create_standalone_class(
 
     # Fix RotaryEmbeddings being in the wrong precision
     source = fix_rotary_embedding_dtype(source)
+
+    # Fix Q/K/V dtype consistency after RoPE (for 4-bit BNB mode)
+    source = fix_attention_dtype_consistency(source)
 
     return source
 

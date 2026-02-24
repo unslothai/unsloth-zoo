@@ -25,5 +25,6 @@ from .qwen3_vl_moe import *
 from .glm4_moe import *
 from .deepseek_v3_moe import *
 from .pixtral import *
+from .ministral import *
 from .mxfp4 import *
 from .bitsandbytes import *
