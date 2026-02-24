@@ -2075,14 +2075,22 @@ def patch_GptOssModel():
     import transformers.generation.utils
     def wrap(f):
         def return_attention_mask(*args, **kwargs):
-            if kwargs["input_embeds"].requires_grad:
+            embeds = kwargs.get("input_embeds", kwargs.get("inputs_embeds", None))
+            if embeds is not None and embeds.requires_grad:
                 if "attention_mask" in kwargs:
                     return kwargs["attention_mask"]
                 for arg in args:
                     if type(arg) is torch.Tensor and arg.dtype == torch.int32:
                         return arg
             else:
-                # Eager
+                # During generation, avoid returning BlockMask when attn_implementation is flex_attention
+                # since Unsloth uses eager attention for inference
+                config = kwargs.get("config", None)
+                if config is None and len(args) > 0:
+                    config = args[0]
+                attn_impl = getattr(config, "_attn_implementation", None) if config is not None else None
+                if attn_impl == "flex_attention":
+                    return kwargs.get("attention_mask", None)
                 return f(*args, **kwargs)
             pass
         return return_attention_mask
@@ -2305,17 +2313,28 @@ def patch_GptOssModel():
 
         # It may already have been prepared by e.g. `generate`
         if not self.training and not isinstance(attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-            }
-            attention_mask = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
+            # During inference Unsloth uses eager attention, but config may still
+            # have _attn_implementation="flex_attention" (set for training).
+            # flex_attention masking returns BlockMask which eager cannot handle,
+            # so we skip dense mask creation and pass None (eager handles it).
+            _attn_impl = getattr(self.config, "_attn_implementation", None)
+            if _attn_impl == "flex_attention":
+                attention_mask = {
+                    "full_attention": None,
+                    "sliding_attention": None,
+                }
+            else:
+                mask_kwargs = {
+                    "config": self.config,
+                    "inputs_embeds": inputs_embeds,
+                    "attention_mask": attention_mask,
+                    "cache_position": cache_position,
+                    "past_key_values": past_key_values,
+                }
+                attention_mask = {
+                    "full_attention": create_causal_mask(**mask_kwargs),
+                    "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+                }
 
         # is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         bsz, qlen, hd = hidden_states.shape
