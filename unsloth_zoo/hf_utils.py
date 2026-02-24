@@ -215,9 +215,14 @@ def get_transformers_model_type(config, trust_remote_code=False):
     # Gemma-3 270M has `gemma3_text` which is wrong
     import transformers.models
     all_model_types = dir(transformers.models)
+    # Models with trust_remote_code that are NOT in transformers.models
+    # but should be kept as-is (not truncated).
+    _REMOTE_CODE_MODEL_TYPES = {"nemotron_h", "nemotronh_nano_vl_v2",}
     found_type = False
     for j, model_type in enumerate(final_model_types):
-        if model_type not in all_model_types:
+        if model_type in _REMOTE_CODE_MODEL_TYPES:
+            found_type = True
+        elif model_type not in all_model_types:
             # Try splitting on _ gemma3_text -> gemma3
             model_types = list(model_type)
             model_types = ["".join(model_types[:i]) for i in range(len(model_types), 0, -1)]
