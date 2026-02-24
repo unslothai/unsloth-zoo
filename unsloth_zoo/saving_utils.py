@@ -2596,6 +2596,33 @@ def _convert_lora_keys_to_safetensor_format(
     forward_mapping = _get_checkpoint_conversion_mapping(model_class_name)
 
     if not forward_mapping:
+        # No explicit mapping. Some composite models (e.g. Qwen3.5) store
+        # safetensors with an extra prefix like "model.language_model." that
+        # differs from the runtime key namespace "model.". Try to detect
+        # this by matching a LoRA key against the safetensor keys and, if a
+        # consistent prefix is found, remap all LoRA keys accordingly.
+        if safetensor_keys:
+            inferred_prefix = None
+            for lora_key in lora_weights:
+                if not isinstance(lora_key, str):
+                    continue
+                suffix = lora_key + ".weight"
+                for sf_key in safetensor_keys:
+                    if sf_key.endswith(suffix):
+                        candidate = sf_key[: -len(suffix)]
+                        if candidate:  # non-empty extra prefix
+                            inferred_prefix = candidate
+                        break
+                if inferred_prefix is not None:
+                    break
+
+            if inferred_prefix is not None:
+                remapped = defaultdict(lora_weights.default_factory)
+                for k, v in lora_weights.items():
+                    new_key = inferred_prefix + k if isinstance(k, str) else k
+                    remapped[new_key] = v
+                return remapped
+
         return defaultdict(lora_weights.default_factory, lora_weights)
 
     # Create reverse mapping
