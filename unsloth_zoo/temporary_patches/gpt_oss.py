@@ -1050,6 +1050,40 @@ def patch_gpt_oss_bnb4bit():
     m.transformers_version = transformers_version
     m.Version              = Version
 
+    # Fix compiled module namespaces: the compiler creates combined_module
+    # files that import GptOssExperts into their own namespace. If compilation
+    # ran before this patch, the compiled GptOssMLP.__init__ still references
+    # the original GptOssExperts (with 3D Parameter down_proj instead of
+    # ModuleList down_projs). Fix by patching compiled module symbols and
+    # replacing GptOssMLP.__init__ with a closure that captures the correct
+    # BnB4bit class via default argument binding.
+    import sys as _sys
+    for _mod_name, _mod in list(_sys.modules.items()):
+        if _mod is None:
+            continue
+        if "unsloth_compiled" not in _mod_name and "combined_module" not in _mod_name:
+            continue
+        if hasattr(_mod, "GptOssExperts"):
+            if getattr(_mod, "GptOssExperts") is not GptOssExpertsBnb4bit:
+                setattr(_mod, "GptOssExperts", GptOssExpertsBnb4bit)
+        if hasattr(_mod, "GptOssTopKRouter"):
+            if getattr(_mod, "GptOssTopKRouter") is not GptOssTopKRouter:
+                setattr(_mod, "GptOssTopKRouter", GptOssTopKRouter)
+
+    _MLP_cls = getattr(m, "GptOssMLP", None)
+    if _MLP_cls is not None and not getattr(_MLP_cls, "_unsloth_bnb4bit_init_patched", False):
+        import torch.nn as _nn
+        _ExpertsCls = GptOssExpertsBnb4bit
+        _RouterCls  = GptOssTopKRouter
+
+        def _patched_init(self, config, _Experts=_ExpertsCls, _Router=_RouterCls):
+            _nn.Module.__init__(self)
+            self.router = _Router(config)
+            self.experts = _Experts(config)
+
+        _MLP_cls.__init__ = _patched_init
+        _MLP_cls._unsloth_bnb4bit_init_patched = True
+
     return True
 
 
