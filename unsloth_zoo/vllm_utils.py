@@ -910,7 +910,8 @@ def _extract_lfm2_layer(layer, kk, prefix, state_dict, quant_state_dict, get_sta
     """Extracts all components of a single LFM2 hybrid layer."""
     layer_prefix = f"{prefix}.layers.{kk}"
 
-    # Attention or short_conv
+    # Attention or conv (short convolution)
+    # vLLM's Lfm2ShortConvDecoderLayer names the module "conv", not "short_conv"
     if hasattr(layer, "self_attn"):
         attn_prefix = f"{layer_prefix}.self_attn"
         qkv_proj = layer.self_attn.qkv_proj
@@ -918,8 +919,8 @@ def _extract_lfm2_layer(layer, kk, prefix, state_dict, quant_state_dict, get_sta
         get_state_dict(f"{attn_prefix}.k_proj", 1, state_dict, qkv_proj)
         get_state_dict(f"{attn_prefix}.v_proj", 2, state_dict, qkv_proj)
         get_state_dict(f"{attn_prefix}.out_proj", 0, state_dict, layer.self_attn.out_proj)
-    elif hasattr(layer, "short_conv"):
-        _extract_short_conv_layer(layer.short_conv, f"{layer_prefix}.conv",
+    elif hasattr(layer, "conv"):
+        _extract_short_conv_layer(layer.conv, f"{layer_prefix}.conv",
                                   state_dict, quant_state_dict, get_state_dict)
 
     # Feed-forward (w1/w3 merged in vLLM, w2 separate)
@@ -1962,6 +1963,12 @@ def load_vllm(
             f"Unsloth: WARNING - Only {memory_left_for_kv_cache_gb:.2f} GB estimated for KV cache on your {total_gb:.1f} GB GPU.\n"
             f"This may cause an out-of-memory crash with standby mode. Consider lowering gpu_memory_utilization."
         )
+
+    # LFM2 conv modules are not BaseLayerWithLoRA — disable LoRA to avoid
+    # AssertionError during LoRA registration in vLLM's create_lora_manager.
+    if getattr(config, "model_type", "") == "lfm2":
+        enable_lora = False
+    pass
 
     enable_chunked_prefill = True
     is_mllama = "mllama" in config.model_type

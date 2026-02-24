@@ -462,13 +462,16 @@ def set_additional_modules(new_model, quant_state_dict, config):
         conv_weight_key = f"{language_model_prefix}.layers.{kk}.conv.conv.weight"
         if conv_weight_key in quant_state_dict:
             conv_layer = language_model.layers[kk].conv.conv
+            # vLLM wraps weights as ModelWeightParameter; unwrap via .data
+            w = quant_state_dict[conv_weight_key]
             conv_layer.weight = torch.nn.Parameter(
-                quant_state_dict[conv_weight_key], requires_grad=False
+                getattr(w, 'data', w), requires_grad=False
             )
             conv_bias_key = f"{language_model_prefix}.layers.{kk}.conv.conv.bias"
             if conv_bias_key in quant_state_dict:
+                b = quant_state_dict[conv_bias_key]
                 conv_layer.bias = torch.nn.Parameter(
-                    quant_state_dict[conv_bias_key], requires_grad=False
+                    getattr(b, 'data', b), requires_grad=False
                 )
 
     # LM Head. Do note that for some models, like Mistral3ForConditionalGeneration,
