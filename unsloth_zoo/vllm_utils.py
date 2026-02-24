@@ -871,44 +871,31 @@ def get_vllm_state_dict(
 
 def _extract_short_conv_layer(short_conv, conv_prefix, state_dict, quant_state_dict, get_state_dict):
     """
-    Extracts LFM2 hybrid short convolution layers (non-attention layers).
-
-    vLLM ShortConv: in_proj (MergedColumnParallelLinear, splits into B, C, x),
-                    out_proj (RowParallelLinear),
-                    conv (ColumnParallelLinear, weight unsqueezed for conv1d)
-
-    HF Lfm2ShortConv: in_proj (nn.Linear, hidden -> 3*hidden),
-                      out_proj (nn.Linear, hidden -> hidden),
-                      conv (nn.Conv1d, depthwise with groups=hidden_size)
+    Extracts LFM2 short convolution layer weights from vLLM to HF format.
+    in_proj is extracted directly from base layer since get_state_dict
+    incorrectly handles MergedColumnParallelLinear's 3-way split.
     """
-    # in_proj: vLLM uses MergedColumnParallelLinear with 3 output parts (B, C, x).
-    # HF stores as a single nn.Linear(hidden, 3*hidden). We must extract the full
-    # merged weight directly instead of going through get_state_dict which may
-    # incorrectly slice or return only one shard.
+    # in_proj: extract full merged weight directly
     in_proj = getattr(short_conv.in_proj, "base_layer", short_conv.in_proj)
     in_proj_weight = in_proj.weight
     in_proj_weight.requires_grad_(False)
     state_dict[f"{conv_prefix}.in_proj.weight"] = in_proj_weight
     quant_state_dict[f"{conv_prefix}.in_proj.weight"] = in_proj_weight
-    # Handle in_proj bias if present
     in_proj_bias = getattr(in_proj, "bias", None)
     if in_proj_bias is not None:
         in_proj_bias.requires_grad_(False)
         state_dict[f"{conv_prefix}.in_proj.bias"] = in_proj_bias
         quant_state_dict[f"{conv_prefix}.in_proj.bias"] = in_proj_bias
 
-    # out_proj: direct mapping
+    # out_proj
     get_state_dict(f"{conv_prefix}.out_proj", 0, state_dict, short_conv.out_proj)
 
-    # conv: vLLM stores as ColumnParallelLinear with weight shape (out, 1, kernel)
-    # HF expects nn.Conv1d weight with same shape (hidden, 1, kernel) for depthwise conv
+    # conv (nn.Conv1d weight)
     conv_module = short_conv.conv
     conv_weight = getattr(conv_module, "base_layer", conv_module).weight
     conv_weight.requires_grad_(False)
     state_dict[f"{conv_prefix}.conv.weight"] = conv_weight
     quant_state_dict[f"{conv_prefix}.conv.weight"] = conv_weight
-
-    # Handle conv bias if present
     conv_bias = getattr(conv_module, "bias", None)
     if conv_bias is None and hasattr(conv_module, "base_layer"):
         conv_bias = getattr(conv_module.base_layer, "bias", None)
@@ -917,6 +904,50 @@ def _extract_short_conv_layer(short_conv, conv_prefix, state_dict, quant_state_d
         state_dict[f"{conv_prefix}.conv.bias"] = conv_bias
         quant_state_dict[f"{conv_prefix}.conv.bias"] = conv_bias
     pass
+
+
+def _extract_lfm2_layer(layer, kk, prefix, state_dict, quant_state_dict, get_state_dict):
+    """Extracts all components of a single LFM2 hybrid layer."""
+    layer_prefix = f"{prefix}.layers.{kk}"
+
+    # Attention or short_conv
+    if hasattr(layer, "self_attn"):
+        attn_prefix = f"{layer_prefix}.self_attn"
+        qkv_proj = layer.self_attn.qkv_proj
+        get_state_dict(f"{attn_prefix}.q_proj", 0, state_dict, qkv_proj)
+        get_state_dict(f"{attn_prefix}.k_proj", 1, state_dict, qkv_proj)
+        get_state_dict(f"{attn_prefix}.v_proj", 2, state_dict, qkv_proj)
+        get_state_dict(f"{attn_prefix}.out_proj", 0, state_dict, layer.self_attn.out_proj)
+    elif hasattr(layer, "short_conv"):
+        _extract_short_conv_layer(layer.short_conv, f"{layer_prefix}.conv",
+                                  state_dict, quant_state_dict, get_state_dict)
+
+    # Feed-forward (w1/w3 merged in vLLM, w2 separate)
+    if hasattr(layer, "feed_forward"):
+        ff_prefix = f"{layer_prefix}.feed_forward"
+        w1_proj = layer.feed_forward.w1
+        get_state_dict(f"{ff_prefix}.w1", 0, state_dict, w1_proj)
+        get_state_dict(f"{ff_prefix}.w3", 1, state_dict, w1_proj)
+        get_state_dict(f"{ff_prefix}.w2", 0, state_dict, layer.feed_forward.w2)
+
+    # Layer norms
+    lfm2_norms = [
+        ("operator_norm",          f"{layer_prefix}.operator_norm"),
+        ("ffn_norm",               f"{layer_prefix}.ffn_norm"),
+        ("self_attn.q_layernorm",  f"{layer_prefix}.self_attn.q_layernorm"),
+        ("self_attn.k_layernorm",  f"{layer_prefix}.self_attn.k_layernorm"),
+    ]
+    for attr_path, norm_key in lfm2_norms:
+        obj = layer
+        for part in attr_path.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
+        if obj is not None and hasattr(obj, "weight"):
+            w = obj.weight.data
+            state_dict[f"{norm_key}.weight"] = w
+            quant_state_dict[f"{norm_key}.weight"] = w
+pass
 
 
 def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
@@ -1139,57 +1170,45 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         packed = packed_modules_mapping.get(name)
         return isinstance(packed, (list, tuple)) and len(packed) == 1 and packed[0] == name
 
-    # All layers
     skipped_layernorms = []
-    for kk in range(len(vllm_text_model.layers)):
-        layer = vllm_text_model.layers[kk]
-        if hasattr(layer, "self_attn"):
-            prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
-            qkv_proj = layer.self_attn.qkv_proj
-
-            use_fused_qkv = _is_fused_module("qkv_proj")
-            if use_fused_qkv:
-                # For some model types like phi3 vllm will expect fused qkv (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
-                # so we should not split them here otherwise there will be a size mismatch when activating the adapter
-                # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
-                get_state_dict(f"{prefix}.qkv_proj", 0, state_dict, qkv_proj, slice_weights=False)
-            else:
-                get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
-                get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
-                get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
-
-            # Extract o_proj or out_proj depending on model architecture
-            # LFM2 uses out_proj, most other models use o_proj
-            if hasattr(layer.self_attn, "o_proj"):
+    if model_type == "lfm2":
+        for kk in range(len(vllm_text_model.layers)):
+            layer = vllm_text_model.layers[kk]
+            _extract_lfm2_layer(layer, kk, vllm_text_model_prefix,
+                                state_dict, quant_state_dict, get_state_dict)
+        pass
+    else:
+        for kk in range(len(vllm_text_model.layers)):
+            layer = vllm_text_model.layers[kk]
+            if hasattr(layer, "self_attn"):
+                prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
+                qkv_proj = layer.self_attn.qkv_proj
                 o_proj = layer.self_attn.o_proj
-                get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
-            elif hasattr(layer.self_attn, "out_proj"):
-                out_proj = layer.self_attn.out_proj
-                get_state_dict(f"{prefix}.out_proj", 0, state_dict, out_proj)
 
-        elif hasattr(layer, "cross_attn"):
-            prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
-            qkv_proj = layer.cross_attn.qkv_proj
-            o_proj = layer.cross_attn.o_proj
-            name = re.sub(r"\.(\d+)\.", r"[\1].", prefix.replace('model.language_model','language_model.model', 1) + ".qkv_proj")
-            cross_attn_layer = eval(f'vllm_internals.{name}')
-            q_proj = cross_attn_layer.proj['q_proj_decoder']
-            kv_proj = cross_attn_layer.proj['kv_proj_encoder']
-            get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
-            get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
-            get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
+                use_fused_qkv = _is_fused_module("qkv_proj")
+                if use_fused_qkv:
+                    # For some model types like phi3 vllm will expect fused qkv (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
+                    # so we should not split them here otherwise there will be a size mismatch when activating the adapter
+                    # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
+                    get_state_dict(f"{prefix}.qkv_proj", 0, state_dict, qkv_proj, slice_weights=False)
+                else:
+                    get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
+                    get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
+                    get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
+            elif hasattr(layer, "cross_attn"):
+                prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
+                qkv_proj = layer.cross_attn.qkv_proj
+                o_proj = layer.cross_attn.o_proj
+                name = re.sub(r"\.(\d+)\.", r"[\1].", prefix.replace('model.language_model','language_model.model', 1) + ".qkv_proj")
+                cross_attn_layer = eval(f'vllm_internals.{name}')
+                q_proj = cross_attn_layer.proj['q_proj_decoder']
+                kv_proj = cross_attn_layer.proj['kv_proj_encoder']
+                get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
+                get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
+                get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
+
             get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
-        elif hasattr(layer, "short_conv"):
-            # LFM2 hybrid short convolution layers (non-attention layers)
-            conv_prefix = f"{vllm_text_model_prefix}.layers.{kk}.conv"
-            _extract_short_conv_layer(layer.short_conv, conv_prefix, state_dict, quant_state_dict, get_state_dict)
-        pass
-
-        # MLP / Feed Forward extraction
-        # LFM2 uses feed_forward with w1 (gate), w2 (down), w3 (up) — SwiGLU style
-        # Standard models use mlp with gate_up_proj (merged), down_proj
-        if hasattr(layer, "mlp"):
             proj = layer.mlp.gate_up_proj
             use_fused_gate_up = _is_fused_module("gate_up_proj")
             if use_fused_gate_up:
@@ -1200,33 +1219,23 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             else:
                 get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
                 get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+
             proj = layer.mlp.down_proj
             get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
 
-        elif hasattr(layer, "feed_forward"):
-            # LFM2 uses feed_forward with w1 (gate), w3 (up), w2 (down)
-            # In vLLM, w1 and w3 are merged into a single MergedColumnParallelLinear
-            ff_prefix = f"{vllm_text_model_prefix}.layers.{kk}.feed_forward"
-            w1_proj = layer.feed_forward.w1  # MergedColumnParallelLinear (w1 at index 0, w3 at index 1)
-            get_state_dict(f"{ff_prefix}.w1", 0, state_dict, w1_proj)
-            get_state_dict(f"{ff_prefix}.w3", 1, state_dict, w1_proj)
+            # Use layernorms from the layer configuration
+            layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
 
-            w2_proj = layer.feed_forward.w2  # RowParallelLinear
-            get_state_dict(f"{ff_prefix}.w2", 0, state_dict, w2_proj)
-        pass
-
-        # Use layernorms from the layer configuration
-        layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
-
-        for layernorm_name in layernorm_names:
-            vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
-            try:
-                layernorm = eval(vllm_name).state_dict()["weight"]
-                layernorm_name = f"{layernorm_name}.weight"
-                state_dict[layernorm_name] = layernorm
-                quant_state_dict[layernorm_name] = state_dict[layernorm_name]
-            except Exception as e:
-                skipped_layernorms.append(layernorm_name.split(".")[-1])
+            for layernorm_name in layernorm_names:
+                vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
+                try:
+                    layernorm = eval(vllm_name).state_dict()["weight"]
+                    layernorm_name = f"{layernorm_name}.weight"
+                    state_dict[layernorm_name] = layernorm
+                    quant_state_dict[layernorm_name] = state_dict[layernorm_name]
+                except Exception as e:
+                    skipped_layernorms.append(layernorm_name.split(".")[-1])
+            pass
         pass
     pass
 
@@ -1237,17 +1246,17 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     if is_vision_model:
         # Handle vision-specific layers using dedicated functions
         extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
-    # Norm
-    # For Gemma3 and similar multimodal models, norm should be under model.norm
-    # For standard models, also under model.norm
-    # LFM2 uses embedding_norm instead of norm
-    if hasattr(vllm_text_model, "norm"):
-        norm_prefix = f"{vllm_text_model_prefix}.norm.weight"
-        state_dict[norm_prefix] = vllm_text_model.norm.weight.data
-        quant_state_dict[norm_prefix] = state_dict[norm_prefix]
-    elif hasattr(vllm_text_model, "embedding_norm"):
+    if model_type == "lfm2":
+        # Handles LFM2 embedding norm
         norm_prefix = f"{vllm_text_model_prefix}.embedding_norm.weight"
         state_dict[norm_prefix] = vllm_text_model.embedding_norm.weight.data
+        quant_state_dict[norm_prefix] = state_dict[norm_prefix]
+    else:
+        # Handles standard embedding norm
+        # For Gemma3 and similar multimodal models, norm should be under model.norm
+        # For standard models, also under model.norm
+        norm_prefix = f"{vllm_text_model_prefix}.norm.weight"
+        state_dict[norm_prefix] = vllm_text_model.norm.weight.data
         quant_state_dict[norm_prefix] = state_dict[norm_prefix]
 
     # LM Head - Use get_state_dict for consistency
