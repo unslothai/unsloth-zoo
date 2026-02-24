@@ -15,15 +15,13 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import torch
-import torch.nn as nn
-from typing import Optional, Tuple, Callable, List
+from typing import Optional, Callable
 from .common import TEMPORARY_PATCHES
 from .utils import (
     patch_function,
     KWARGS_TYPE,
     raise_error,
     Cache,
-    DynamicCache,
 )
 
 def patch_MinistralAttention():
@@ -138,7 +136,7 @@ def patch_MinistralModel_forward():
         sw = getattr(self.config, "sliding_window", None)
         has_sliding_layers = any(
             lt == "sliding_attention"
-            for lt in getattr(self.config, "layer_types", [])
+            for lt in (getattr(self.config, "layer_types", None) or [])
         )
         if sw is None and not has_sliding_layers:
             # All layers are full_attention and no sliding_window is set.

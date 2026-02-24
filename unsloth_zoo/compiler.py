@@ -515,8 +515,7 @@ def fix_attention_dtype_consistency(source):
     This happens in 4-bit BNB mode when cos/sin from RoPE are in float32.
     We insert a cast to align V's dtype with Q's dtype.
     """
-    import re as _re
-    pattern = _re.compile(
+    pattern = re.compile(
         r"([ \t]*)(query_states\s*,\s*key_states\s*=\s*apply_rotary_pos_emb\([^\)]+\))"
     )
     matches = list(pattern.finditer(source))
