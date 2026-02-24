@@ -868,6 +868,57 @@ def get_vllm_state_dict(
         return _get_vllm_state_dict(llm, return_state_dict, config, is_vision_model)
 
 
+
+def _extract_short_conv_layer(short_conv, conv_prefix, state_dict, quant_state_dict, get_state_dict):
+    """
+    Extracts LFM2 hybrid short convolution layers (non-attention layers).
+
+    vLLM ShortConv: in_proj (MergedColumnParallelLinear, splits into B, C, x),
+                    out_proj (RowParallelLinear),
+                    conv (ColumnParallelLinear, weight unsqueezed for conv1d)
+
+    HF Lfm2ShortConv: in_proj (nn.Linear, hidden -> 3*hidden),
+                      out_proj (nn.Linear, hidden -> hidden),
+                      conv (nn.Conv1d, depthwise with groups=hidden_size)
+    """
+    # in_proj: vLLM uses MergedColumnParallelLinear with 3 output parts (B, C, x).
+    # HF stores as a single nn.Linear(hidden, 3*hidden). We must extract the full
+    # merged weight directly instead of going through get_state_dict which may
+    # incorrectly slice or return only one shard.
+    in_proj = getattr(short_conv.in_proj, "base_layer", short_conv.in_proj)
+    in_proj_weight = in_proj.weight
+    in_proj_weight.requires_grad_(False)
+    state_dict[f"{conv_prefix}.in_proj.weight"] = in_proj_weight
+    quant_state_dict[f"{conv_prefix}.in_proj.weight"] = in_proj_weight
+    # Handle in_proj bias if present
+    in_proj_bias = getattr(in_proj, "bias", None)
+    if in_proj_bias is not None:
+        in_proj_bias.requires_grad_(False)
+        state_dict[f"{conv_prefix}.in_proj.bias"] = in_proj_bias
+        quant_state_dict[f"{conv_prefix}.in_proj.bias"] = in_proj_bias
+
+    # out_proj: direct mapping
+    get_state_dict(f"{conv_prefix}.out_proj", 0, state_dict, short_conv.out_proj)
+
+    # conv: vLLM stores as ColumnParallelLinear with weight shape (out, 1, kernel)
+    # HF expects nn.Conv1d weight with same shape (hidden, 1, kernel) for depthwise conv
+    conv_module = short_conv.conv
+    conv_weight = getattr(conv_module, "base_layer", conv_module).weight
+    conv_weight.requires_grad_(False)
+    state_dict[f"{conv_prefix}.conv.weight"] = conv_weight
+    quant_state_dict[f"{conv_prefix}.conv.weight"] = conv_weight
+
+    # Handle conv bias if present
+    conv_bias = getattr(conv_module, "bias", None)
+    if conv_bias is None and hasattr(conv_module, "base_layer"):
+        conv_bias = getattr(conv_module.base_layer, "bias", None)
+    if conv_bias is not None:
+        conv_bias.requires_grad_(False)
+        state_dict[f"{conv_prefix}.conv.bias"] = conv_bias
+        quant_state_dict[f"{conv_prefix}.conv.bias"] = conv_bias
+    pass
+
+
 def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
@@ -1131,37 +1182,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
         elif hasattr(layer, "short_conv"):
             # LFM2 hybrid short convolution layers (non-attention layers)
-            # vLLM ShortConv: in_proj (MergedColumnParallelLinear, splits into B, C, x),
-            #                 out_proj (RowParallelLinear),
-            #                 conv (ColumnParallelLinear, weight unsqueezed for conv1d)
-            # HF Lfm2ShortConv: in_proj (nn.Linear, hidden -> 3*hidden),
-            #                   out_proj (nn.Linear, hidden -> hidden),
-            #                   conv (nn.Conv1d, depthwise with groups=hidden_size)
             conv_prefix = f"{vllm_text_model_prefix}.layers.{kk}.conv"
-            short_conv = layer.short_conv
-
-            # in_proj: vLLM splits into 3 shards via MergedColumnParallelLinear,
-            # but HF stores as a single nn.Linear(hidden, 3*hidden)
-            get_state_dict(f"{conv_prefix}.in_proj", 0, state_dict, short_conv.in_proj, slice_weights=False)
-
-            # out_proj: direct mapping
-            get_state_dict(f"{conv_prefix}.out_proj", 0, state_dict, short_conv.out_proj)
-
-            # conv: vLLM stores as ColumnParallelLinear with weight shape (out, 1, kernel)
-            # HF expects nn.Conv1d weight with same shape (hidden, 1, kernel) for depthwise conv
-            conv_module = short_conv.conv
-            conv_weight = getattr(conv_module, "base_layer", conv_module).weight
-            conv_weight.requires_grad_(False)
-            state_dict[f"{conv_prefix}.conv.weight"] = conv_weight
-            quant_state_dict[f"{conv_prefix}.conv.weight"] = conv_weight
-            # Handle conv bias if present
-            conv_bias = getattr(conv_module, "bias", None)
-            if conv_bias is None and hasattr(conv_module, "base_layer"):
-                conv_bias = getattr(conv_module.base_layer, "bias", None)
-            if conv_bias is not None:
-                conv_bias.requires_grad_(False)
-                state_dict[f"{conv_prefix}.conv.bias"] = conv_bias
-                quant_state_dict[f"{conv_prefix}.conv.bias"] = conv_bias
+            _extract_short_conv_layer(layer.short_conv, conv_prefix, state_dict, quant_state_dict, get_state_dict)
         pass
 
         # MLP / Feed Forward extraction
@@ -3012,7 +3034,8 @@ def _test_get_vllm_state_dict(
     # patch_bitsandbytes_compute_dtype(dtype)
     model_type = getattr(config, "model_type", "causal_lm")
 
-    enable_lora = model_type != "mllama"
+    # LFM2 has conv modules that aren't BaseLayerWithLoRA, so disable LoRA
+    enable_lora = model_type not in ("mllama", "lfm2")
 
     if not is_vision_model:
         model_class = AutoModelForCausalLM
