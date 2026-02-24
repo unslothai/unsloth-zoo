@@ -109,12 +109,7 @@ def patch_MinistralModel_forward():
     This also handles the case where all layer_types are 'full_attention'.
     """
     try:
-        import transformers.models.ministral.modeling_ministral as ministral_mod
-        from transformers.models.ministral.modeling_ministral import (
-            MinistralModel,
-            BaseModelOutputWithPast,
-        )
-        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+        from transformers.models.ministral.modeling_ministral import MinistralModel
     except Exception as e:
         return raise_error("MinistralModel", e)
 
