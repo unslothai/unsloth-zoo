@@ -853,11 +853,18 @@ def create_new_function(
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )
-    imports += (
-        f"from {model_location} import (" + ", ".join(x for x in items) + ")"
-        if len(items) != 0
-        else ""
-    )
+    if len(items) != 0:
+        # Validate items are actually importable to handle TRL internal API removals
+        _valid_items = []
+        try:
+            _mod = __import__(model_location, fromlist=items)
+            for _item in items:
+                if hasattr(_mod, _item):
+                    _valid_items.append(_item)
+        except Exception:
+            _valid_items = items  # Fall back to all items if module load fails
+        if _valid_items:
+            imports += f"from {model_location} import (" + ", ".join(_valid_items) + ")"
     new_source = imports + "\n\n" + new_source
     # Check logger and remove use_cache
     if "logger" in items:
