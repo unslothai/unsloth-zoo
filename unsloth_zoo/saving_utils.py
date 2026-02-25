@@ -2585,6 +2585,46 @@ def detect_keys_format(keys_to_check, forward_mapping):
     return "new" # Default, assuming most models/keys will be in the "new" (current HF) format.
 pass
 
+def _infer_prefix_and_remap(lora_weights, safetensor_keys):
+    """Infer a missing key prefix by matching LoRA keys against safetensor keys.
+
+    Some composite models (e.g. Qwen3.5) store safetensors with an extra
+    prefix like ``model.language_model.`` that differs from the runtime key
+    namespace ``model.``.  When no explicit ``_checkpoint_conversion_mapping``
+    exists, this helper detects the discrepancy and remaps LoRA keys so that
+    the merge loop can match them.
+
+    Returns a remapped ``defaultdict`` on success, or ``None`` if no prefix
+    could be inferred (caller should fall back to returning keys unchanged).
+    """
+    if not safetensor_keys:
+        return None
+
+    inferred_prefix = None
+    for lora_key in lora_weights:
+        if not isinstance(lora_key, str):
+            continue
+        suffix = lora_key + ".weight"
+        for sf_key in safetensor_keys:
+            if sf_key.endswith(suffix):
+                candidate = sf_key[: -len(suffix)]
+                if candidate:  # non-empty extra prefix
+                    inferred_prefix = candidate
+                break
+        if inferred_prefix is not None:
+            break
+
+    if inferred_prefix is None:
+        return None
+
+    remapped = defaultdict(lora_weights.default_factory)
+    for k, v in lora_weights.items():
+        new_key = inferred_prefix + k if isinstance(k, str) else k
+        remapped[new_key] = v
+    return remapped
+pass
+
+
 def _convert_lora_keys_to_safetensor_format(
     lora_weights,        # Global dict of LoraStats objects
     safetensor_keys,     # List of keys from the CURRENT shard
@@ -2596,33 +2636,9 @@ def _convert_lora_keys_to_safetensor_format(
     forward_mapping = _get_checkpoint_conversion_mapping(model_class_name)
 
     if not forward_mapping:
-        # No explicit mapping. Some composite models (e.g. Qwen3.5) store
-        # safetensors with an extra prefix like "model.language_model." that
-        # differs from the runtime key namespace "model.". Try to detect
-        # this by matching a LoRA key against the safetensor keys and, if a
-        # consistent prefix is found, remap all LoRA keys accordingly.
-        if safetensor_keys:
-            inferred_prefix = None
-            for lora_key in lora_weights:
-                if not isinstance(lora_key, str):
-                    continue
-                suffix = lora_key + ".weight"
-                for sf_key in safetensor_keys:
-                    if sf_key.endswith(suffix):
-                        candidate = sf_key[: -len(suffix)]
-                        if candidate:  # non-empty extra prefix
-                            inferred_prefix = candidate
-                        break
-                if inferred_prefix is not None:
-                    break
-
-            if inferred_prefix is not None:
-                remapped = defaultdict(lora_weights.default_factory)
-                for k, v in lora_weights.items():
-                    new_key = inferred_prefix + k if isinstance(k, str) else k
-                    remapped[new_key] = v
-                return remapped
-
+        remapped = _infer_prefix_and_remap(lora_weights, safetensor_keys)
+        if remapped is not None:
+            return remapped
         return defaultdict(lora_weights.default_factory, lora_weights)
 
     # Create reverse mapping
