@@ -130,6 +130,13 @@ DISABLED_KEYWORDS = [
     "pad_tensor_by_size",  # falcon h1
 ]
 
+DISABLE_COMPILE_FUNCTIONS = [
+    "torch_chunk_gated_delta_rule",
+    "torch_recurrent_gated_delta_rule",
+    "chunk_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule",
+]
+
 
 _full_license_header = """
 # Unsloth auto generated code
@@ -2871,6 +2878,7 @@ def unsloth_compile_transformers(
     except ModuleNotFoundError:
         return
     modeling_file = eval(model_location)
+    disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS))
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -3759,7 +3767,12 @@ def unsloth_compile_transformers(
             parameters = f"def {module}" + parameters + code_section
             print(f"Unsloth: Fixed up function {module}.")
 
-            if not disable:
+            if module in disable_compile_functions:
+                parameters = (
+                    "@torch.compiler.disable(recursive = False)\n"
+                    + parameters
+                )
+            elif not disable:
                 parameters = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
@@ -3795,7 +3808,15 @@ def unsloth_compile_transformers(
                     break
             pass
             if not bad:
-                if not disable:
+                if module in disable_compile_functions:
+                    source = re.sub(
+                        r"@torch.compile\([^\n]*\)\n",
+                        "@torch.compiler.disable(recursive = False)\n",
+                        source,
+                    )
+                    if "@torch.compiler.disable(recursive = False)\n" not in source:
+                        source = "@torch.compiler.disable(recursive = False)\n" + source
+                elif not disable:
                     source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
