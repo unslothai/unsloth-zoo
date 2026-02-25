@@ -1843,6 +1843,14 @@ def load_vllm(
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
+    if is_fp8 and DEVICE_TYPE == "cuda":
+        major_version, minor_version = torch.cuda.get_device_capability()
+        if major_version == 10:
+            # It is noticed that Deepgemm is generally slower than triton for vLLM
+            # https://x.com/TheZachMueller/status/2024619480580510117?s=20
+            # This might get implemented in vLLM later but till then we have this toggle
+            os.environ['VLLM_USE_DEEP_GEMM'] = '0'
+
     assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
     max_num_batched_tokens, approx_max_num_seqs, \
