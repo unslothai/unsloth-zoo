@@ -648,6 +648,25 @@ class ParameterModule(nn.Linear):
         )
 
 
+def patch_gpt_oss_compiler_exports():
+    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+        return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
+
+    # Export helpers so compiler generated GPT-OSS modules can resolve symbols.
+    m = transformers.models.gpt_oss.modeling_gpt_oss
+    m.ParameterModule = ParameterModule
+    m.swiglu_torch_forward = swiglu_torch_forward
+    m.dtype_from_config = dtype_from_config
+    m.transformers_version = transformers_version
+    m.Version = Version
+pass
+TEMPORARY_PATCHES.append(patch_gpt_oss_compiler_exports)
+
+
 class GptOssExperts(nn.Module):
     """
     GPT OSS MoE Experts layer with 3D stacked parameters.
