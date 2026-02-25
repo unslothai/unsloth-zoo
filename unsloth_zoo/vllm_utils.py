@@ -1172,71 +1172,71 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         return isinstance(packed, (list, tuple)) and len(packed) == 1 and packed[0] == name
 
     skipped_layernorms = []
-    if model_type == "lfm2":
-        for kk in range(len(vllm_text_model.layers)):
-            layer = vllm_text_model.layers[kk]
+    for kk in range(len(vllm_text_model.layers)):
+        layer = vllm_text_model.layers[kk]
+
+        # LFM2 layers use dedicated extraction — skip standard path
+        if model_type == "lfm2":
             _extract_lfm2_layer(layer, kk, vllm_text_model_prefix,
                                 state_dict, quant_state_dict, get_state_dict)
-        pass
-    else:
-        for kk in range(len(vllm_text_model.layers)):
-            layer = vllm_text_model.layers[kk]
-            if hasattr(layer, "self_attn"):
-                prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
-                qkv_proj = layer.self_attn.qkv_proj
-                o_proj = layer.self_attn.o_proj
+            continue
 
-                use_fused_qkv = _is_fused_module("qkv_proj")
-                if use_fused_qkv:
-                    # For some model types like phi3 vllm will expect fused qkv (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
-                    # so we should not split them here otherwise there will be a size mismatch when activating the adapter
-                    # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
-                    get_state_dict(f"{prefix}.qkv_proj", 0, state_dict, qkv_proj, slice_weights=False)
-                else:
-                    get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
-                    get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
-                    get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
-            elif hasattr(layer, "cross_attn"):
-                prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
-                qkv_proj = layer.cross_attn.qkv_proj
-                o_proj = layer.cross_attn.o_proj
-                name = re.sub(r"\.(\d+)\.", r"[\1].", prefix.replace('model.language_model','language_model.model', 1) + ".qkv_proj")
-                cross_attn_layer = eval(f'vllm_internals.{name}')
-                q_proj = cross_attn_layer.proj['q_proj_decoder']
-                kv_proj = cross_attn_layer.proj['kv_proj_encoder']
-                get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
-                get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
-                get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
+        if hasattr(layer, "self_attn"):
+            prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
+            qkv_proj = layer.self_attn.qkv_proj
+            o_proj = layer.self_attn.o_proj
 
-            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
-
-            proj = layer.mlp.gate_up_proj
-            use_fused_gate_up = _is_fused_module("gate_up_proj")
-            if use_fused_gate_up:
-                # For some model types like phi3 vllm will expect fused gate_up_proj (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
+            use_fused_qkv = _is_fused_module("qkv_proj")
+            if use_fused_qkv:
+                # For some model types like phi3 vllm will expect fused qkv (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
                 # so we should not split them here otherwise there will be a size mismatch when activating the adapter
                 # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
-                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_up_proj", 0, state_dict, proj, slice_weights=False)
+                get_state_dict(f"{prefix}.qkv_proj", 0, state_dict, qkv_proj, slice_weights=False)
             else:
-                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
-                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+                get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
+                get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
+                get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
+        elif hasattr(layer, "cross_attn"):
+            prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
+            qkv_proj = layer.cross_attn.qkv_proj
+            o_proj = layer.cross_attn.o_proj
+            name = re.sub(r"\.(\d+)\.", r"[\1].", prefix.replace('model.language_model','language_model.model', 1) + ".qkv_proj")
+            cross_attn_layer = eval(f'vllm_internals.{name}')
+            q_proj = cross_attn_layer.proj['q_proj_decoder']
+            kv_proj = cross_attn_layer.proj['kv_proj_encoder']
+            get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
+            get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
+            get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
 
-            proj = layer.mlp.down_proj
-            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
+        get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
-            # Use layernorms from the layer configuration
-            layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
+        proj = layer.mlp.gate_up_proj
+        use_fused_gate_up = _is_fused_module("gate_up_proj")
+        if use_fused_gate_up:
+            # For some model types like phi3 vllm will expect fused gate_up_proj (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
+            # so we should not split them here otherwise there will be a size mismatch when activating the adapter
+            # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_up_proj", 0, state_dict, proj, slice_weights=False)
+        else:
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
 
-            for layernorm_name in layernorm_names:
-                vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
-                try:
-                    layernorm = eval(vllm_name).state_dict()["weight"]
-                    layernorm_name = f"{layernorm_name}.weight"
-                    state_dict[layernorm_name] = layernorm
-                    quant_state_dict[layernorm_name] = state_dict[layernorm_name]
-                except Exception as e:
-                    skipped_layernorms.append(layernorm_name.split(".")[-1])
-            pass
+        proj = layer.mlp.down_proj
+        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
+
+        # Use layernorms from the layer configuration
+        layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
+
+        for layernorm_name in layernorm_names:
+            vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
+            try:
+                layernorm = eval(vllm_name).state_dict()["weight"]
+                layernorm_name = f"{layernorm_name}.weight"
+                state_dict[layernorm_name] = layernorm
+                quant_state_dict[layernorm_name] = state_dict[layernorm_name]
+            except Exception as e:
+                skipped_layernorms.append(layernorm_name.split(".")[-1])
+        pass
         pass
     pass
 
