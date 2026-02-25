@@ -17,9 +17,10 @@ import torch
 import torch.nn.functional as F
 import os
 import shutil
+import sys
+import importlib.util
 from typing import Optional, Tuple
 from torch.autograd import Function
-from .utils import logger
 
 # Get compile location
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
@@ -27,14 +28,26 @@ UNSLOTH_COMPILE_LOCATION = os.environ.get(
 )
 
 
+def _get_compile_location() -> str:
+    return os.path.abspath(
+        os.environ.get("UNSLOTH_COMPILE_LOCATION", UNSLOTH_COMPILE_LOCATION)
+    )
+
+
+def _log_info(message: str):
+    if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+        print(message)
+
+
 def install_to_cache(source_path, destination_filename=None):
     """
     Copies a file to the unsloth_compiled_cache directory
     to ensure it is available for compiled modules.
     """
-    if not os.path.exists(UNSLOTH_COMPILE_LOCATION):
+    compile_location = _get_compile_location()
+    if not os.path.exists(compile_location):
         try:
-            os.makedirs(UNSLOTH_COMPILE_LOCATION)
+            os.makedirs(compile_location)
         except:
             pass
 
@@ -42,7 +55,7 @@ def install_to_cache(source_path, destination_filename=None):
     if destination_filename is None:
         destination_filename = os.path.basename(current_file)
 
-    destination = os.path.abspath(os.path.join(UNSLOTH_COMPILE_LOCATION, destination_filename))
+    destination = os.path.abspath(os.path.join(compile_location, destination_filename))
 
     # If source and dest are different, copy.
     if current_file != destination:
@@ -53,6 +66,51 @@ def install_to_cache(source_path, destination_filename=None):
 
 
 install_to_cache(__file__, "moe_utils.py")
+
+_CACHED_FORWARD_MOE_BACKEND = None
+_CACHED_MOE_UTILS_MODULE = None
+
+
+def _load_cached_moe_utils_module():
+    global _CACHED_MOE_UTILS_MODULE
+
+    cache_file = os.path.abspath(os.path.join(_get_compile_location(), "moe_utils.py"))
+    current_file = os.path.abspath(__file__)
+    if not os.path.isfile(cache_file) or cache_file == current_file:
+        return None
+
+    try:
+        module_name = "unsloth_cached_moe_utils"
+        module = sys.modules.get(module_name, None)
+        if module is not None and os.path.abspath(getattr(module, "__file__", "")) == cache_file:
+            _CACHED_MOE_UTILS_MODULE = module
+            return module
+
+        spec = importlib.util.spec_from_file_location(module_name, cache_file)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        _CACHED_MOE_UTILS_MODULE = module
+        return module
+    except Exception:
+        return None
+
+
+def get_forward_moe_backend():
+    """
+    Resolve forward_moe_backend from the compiled cache copy when available.
+    Falls back to the local module definition.
+    """
+    global _CACHED_FORWARD_MOE_BACKEND
+    module = _load_cached_moe_utils_module()
+    if module is not None and hasattr(module, "forward_moe_backend"):
+        _CACHED_FORWARD_MOE_BACKEND = module.forward_moe_backend
+        return _CACHED_FORWARD_MOE_BACKEND
+
+    _CACHED_FORWARD_MOE_BACKEND = forward_moe_backend
+    return _CACHED_FORWARD_MOE_BACKEND
 
 # ============================================================================
 # Grouped MM wrapper
@@ -199,13 +257,13 @@ def select_moe_backend():
             return "unsloth_triton"
         if requested == "native_torch":
             return "native_torch"
-        logger.info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
+        _log_info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
     if _check_torch_grouped_mm_supported():
-        logger.info("Unsloth: Using MoE backend 'grouped_mm'")
+        _log_info("Unsloth: Using MoE backend 'grouped_mm'")
         return "grouped_mm"
     if _check_grouped_gemm_available():
-        logger.info("Unsloth: Using MoE backend 'unsloth_triton'")
+        _log_info("Unsloth: Using MoE backend 'unsloth_triton'")
         return "unsloth_triton"
     return "native_torch"
 
@@ -412,6 +470,21 @@ def _get_base_weight(param):
     if hasattr(param, "get_param"):
         return param.get_param()
 
+    # Auto-dequantize BitsAndBytes 4-bit packed MoE parameters for grouped_mm/LoRA forward
+    # (packed tensor shape is not the logical expert tensor shape).
+    quant_state = getattr(param, "quant_state", None)
+    if quant_state is not None:
+        param_cls_name = type(param).__name__
+        if param_cls_name == "Params4bit":
+            try:
+                from bitsandbytes.functional import dequantize_4bit
+                dequantized = dequantize_4bit(param.data, quant_state=quant_state)
+                if hasattr(quant_state, "dtype") and quant_state.dtype is not None:
+                    dequantized = dequantized.to(quant_state.dtype)
+                return dequantized.contiguous()
+            except Exception:
+                pass
+
     # Handle Modules (Linear, etc.)
     if hasattr(param, "weight"):
         return param.weight
@@ -573,15 +646,19 @@ def _is_moe_experts_module(module) -> bool:
     import torch.nn as nn
 
     # Check for gate_up_proj pattern
+    # After PEFT's nn.utils.parametrize wrapping, accessing gate_up_proj
+    # returns torch.Tensor (not nn.Parameter), so we must accept both.
     if hasattr(module, "gate_up_proj"):
         param = module.gate_up_proj
-        if isinstance(param, nn.Parameter) and param.ndim == 3:
+        # 4-bit parameters are packed into 2D tensors (n_params, 1) or similar.
+        # Standard MoE weights are 3D (num_experts, in, out).
+        if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim in (2, 3):
             return True
 
     # Check for w1/w2 pattern (separate gate/up projections)
     if hasattr(module, "w1") and hasattr(module, "w2"):
         w1 = module.w1
-        if isinstance(w1, nn.Parameter) and w1.ndim == 3:
+        if isinstance(w1, (nn.Parameter, torch.Tensor)) and w1.ndim in (2, 3):
             return True
 
     return False
@@ -683,6 +760,13 @@ def patch_param_wrapper_for_moe():
     # This Unsloth Zoo code section is licensed under AGPL3
 
     global _original_param_wrapper_forward
+
+    module = _load_cached_moe_utils_module()
+    if module is not None and hasattr(module, "patch_param_wrapper_for_moe"):
+        try:
+            return module.patch_param_wrapper_for_moe()
+        except Exception:
+            pass
 
     try:
         from peft.tuners.lora.layer import ParamWrapper

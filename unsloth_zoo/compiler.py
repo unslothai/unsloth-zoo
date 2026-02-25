@@ -130,6 +130,13 @@ DISABLED_KEYWORDS = [
     "pad_tensor_by_size",  # falcon h1
 ]
 
+DISABLE_COMPILE_FUNCTIONS = [
+    "torch_chunk_gated_delta_rule",
+    "torch_recurrent_gated_delta_rule",
+    "chunk_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule",
+]
+
 
 _full_license_header = """
 # Unsloth auto generated code
@@ -154,6 +161,7 @@ _license_header = (
     _full_license_header
     + """
 import os
+import sys
 import torch
 import importlib.util
 import math
@@ -168,6 +176,9 @@ import math
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_CCE = os.environ.get("UNSLOTH_ENABLE_CCE", "1") == "1"
 UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial",)
+UNSLOTH_COMPILE_LOCATION = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+if UNSLOTH_COMPILE_LOCATION not in sys.path:
+    sys.path.insert(0, UNSLOTH_COMPILE_LOCATION)
 
 import logging
 logger_compiler = logging.getLogger(__name__)
@@ -829,12 +840,6 @@ def create_new_function(
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
         items += ["SiglipEncoder"]
-    # Patch for Qwen3MoeExperts
-    if "Qwen3MoeExperts" in new_source:
-        items += ["Qwen3MoeExperts"]
-    # Patch for Qwen3VLMoeTextExperts
-    if "Qwen3VLMoeTextExperts" in new_source:
-        items += ["Qwen3VLMoeTextExperts"]
     # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
@@ -850,6 +855,25 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
+    if (
+        "forward_moe_backend" in new_source
+        or "select_moe_backend" in new_source
+        or "forward_native_grouped_mm" in new_source
+        or "forward_triton_grouped_gemm" in new_source
+        or "forward_native_moe_loop" in new_source
+    ):
+        imports += (
+            "try:\n"
+            "    from moe_utils import (\n"
+            "        forward_moe_backend,\n"
+            "        select_moe_backend,\n"
+            "        forward_native_grouped_mm,\n"
+            "        forward_triton_grouped_gemm,\n"
+            "        forward_native_moe_loop,\n"
+            "    )\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )
@@ -1110,17 +1134,44 @@ def create_standalone_class(
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
         disable = True
 
-    # Check if forward was replaced by a temporary patch (already has @torch.compiler.disable)
-    # In this case, keep the patched source as-is without adding another decorator
+    # Strip decorators from class source if present
+    # This fixes issues with classes like Qwen3NextExperts which have decorators that cause compilation failures
+    if full_class.lstrip().startswith("@"):
+        start = re.search(r"^class ", full_class, flags=re.MULTILINE)
+        if start:
+            # Found class definition - now check decorators
+            class_start = start.start()
+            preamble = full_class[:class_start]
+            class_def = full_class[class_start:]
+
+            # Split preamble into lines
+            lines = preamble.split('\n')
+            new_lines = []
+
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("@"):
+                    if "use_experts_implementation" in stripped:
+                        logger.info(f'Unsloth: stripped use_experts_implementation decorator from {module}')
+                        continue # Strip it
+                    else:
+                        logger.warning(f"Unsloth: Warning: Unknown decorator {stripped} found for {module}.")
+                        new_lines.append(line) # Keep it
+                else:
+                    new_lines.append(line)
+
+            full_class = '\n'.join(new_lines) + class_def
+
+    # Check if forward was replaced by a temporary patch (renamed function)
+    # In this case, keep the patched source as-is and replace the class forward body.
     patched_forward_info = None
-    if "@torch.compiler.disable" in forward_source:
-        func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
-        if func_match and func_match.group(1) != "forward":
-            # Find original forward in class to replace it
-            orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
-            if orig_fwd:
-                patched_forward_info = (func_match.group(1), orig_fwd.group(1))
-                disable = None  # Skip adding decorator
+    func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
+    if func_match and func_match.group(1) != "forward":
+        # Find original forward in class to replace it
+        orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
+        if orig_fwd:
+            patched_forward_info = (func_match.group(1), orig_fwd.group(1))
+            disable = None  # Keep patched source as-is for renamed forward replacements
 
     # Replace function name with module-specific name
     if patched_forward_info:
@@ -2800,6 +2851,82 @@ def compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING=False):
 pass
 
 
+def compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING=False):
+    '''
+    FLA seems to be autocompiling at every step causing severe performance downgrades.
+    I noticed this on Qwen-3.5-MoE and potentially Qwen3-Next. 4-5x from initial tests.
+    This function is to disable repetitive autotuning and use the first tuned kernel.
+    In case one wants to override this, set UNSLOTH_DISABLE_FLA_NO_AUTOTUNE=1
+    '''
+    if os.environ.get("UNSLOTH_DISABLE_FLA_NO_AUTOTUNE", "0") == "1":
+        return False
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:
+        return False
+
+    class _ReuseBestCache(dict):
+        """Reports all keys as present once at least one entry exists,
+        returning the first stored value for any unseen key.
+        This lets the first autotune run find the best config normally,
+        then reuses it for any unseen key (e.g. different NB from
+        variable sequence lengths), preventing repeated benchmarking."""
+        def __contains__(self, key):
+            return len(self) > 0 or super().__contains__(key)
+        def __getitem__(self, key):
+            if not super().__contains__(key) and len(self) > 0:
+                return next(iter(self.values()))
+            return super().__getitem__(key)
+
+    def _unwrap_autotuner(kernel):
+        obj = kernel
+        for _ in range(6):
+            if isinstance(obj, Autotuner):
+                return obj
+            if not hasattr(obj, "fn"):
+                return None
+            obj = obj.fn
+        return None
+
+    modules_and_kernels = []
+    try:
+        import fla.modules.fused_norm_gate as fused_norm_gate
+        modules_and_kernels.append((fused_norm_gate, [
+            "layer_norm_gated_fwd_kernel", "layer_norm_gated_fwd_kernel1",
+            "layer_norm_gated_bwd_kernel", "layer_norm_gated_bwd_kernel1",
+        ]))
+    except ImportError:
+        pass
+    try:
+        import fla.modules.l2norm as l2norm_module
+        modules_and_kernels.append((l2norm_module, [
+            "l2norm_fwd_kernel", "l2norm_fwd_kernel1",
+            "l2norm_bwd_kernel", "l2norm_bwd_kernel1",
+        ]))
+    except ImportError:
+        pass
+
+    patched = []
+    for module, kernel_names in modules_and_kernels:
+        for name in kernel_names:
+            kernel = getattr(module, name, None)
+            if kernel is None:
+                continue
+            autotuner = _unwrap_autotuner(kernel)
+            if autotuner is None:
+                continue
+            if not isinstance(autotuner.cache, _ReuseBestCache):
+                autotuner.cache = _ReuseBestCache(autotuner.cache)
+                patched.append(name)
+
+    if UNSLOTH_ENABLE_LOGGING and len(patched) > 0:
+        logger.info("Unsloth: Patched FLA autotune caches for " + ", ".join(patched))
+    return len(patched) > 0
+
+
+pass
+
+
 # if module ends with any of these, disable compile
 DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
@@ -2809,6 +2936,9 @@ DISABLE_COMPILE_MODULES = [
     "GptOssExperts",
     "Gemma3nTextModel",
     "Glm4MoeLiteNaiveMoe",
+    "Qwen3NextGatedDeltaNet",
+    "GatedDeltaNet",
+    "Qwen3_5MoeGatedDeltaNet",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -2868,6 +2998,8 @@ def unsloth_compile_transformers(
     except ModuleNotFoundError:
         return
     modeling_file = eval(model_location)
+    disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
+
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
         if hasattr(modeling_file, "__UNSLOTH_SUPPORTS_SDPA__"):
@@ -2930,6 +3062,7 @@ def unsloth_compile_transformers(
     # Disable compiling mamba type models
     has_causal_conv1d = compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING)
     has_mamba_ssm = compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING)
+    has_fla_no_autotune = compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING)
 
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
@@ -3755,7 +3888,12 @@ def unsloth_compile_transformers(
             parameters = f"def {module}" + parameters + code_section
             print(f"Unsloth: Fixed up function {module}.")
 
-            if not disable:
+            if module in disable_compile_functions:
+                parameters = (
+                    "@torch.compiler.disable(recursive = False)\n"
+                    + parameters
+                )
+            elif not disable:
                 parameters = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
@@ -3791,7 +3929,15 @@ def unsloth_compile_transformers(
                     break
             pass
             if not bad:
-                if not disable:
+                if module in disable_compile_functions:
+                    source = re.sub(
+                        r"@torch.compile\([^\n]*\)\n",
+                        "@torch.compiler.disable(recursive = False)\n",
+                        source,
+                    )
+                    if "@torch.compiler.disable(recursive = False)\n" not in source:
+                        source = "@torch.compiler.disable(recursive = False)\n" + source
+                elif not disable:
                     source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
