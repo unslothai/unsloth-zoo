@@ -649,7 +649,8 @@ class ParameterModule(nn.Linear):
 
 
 def patch_gpt_oss_compiler_exports():
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
+    if "gpt_oss" not in model_name:
         return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
