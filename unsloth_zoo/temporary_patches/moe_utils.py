@@ -409,6 +409,7 @@ def _get_base_weight(param):
     while hasattr(param, "base_layer"):
         param = param.base_layer
     
+    # If the parameter is a Params4bit, dequantize it
     if param.__class__.__name__ == "Params4bit":
         import bitsandbytes as bnb
         # Dequantize the parameter
@@ -581,7 +582,7 @@ def _is_moe_experts_module(module) -> bool:
     if hasattr(module, "gate_up_proj"):
         param = module.gate_up_proj
         
-        # If the param is quantized (4bit in this case), return True
+        # If the param is 4bit-quantized, return True e.g. for expert parameters in MoE, the param is a 2D tensor.
         if param.__class__.__name__ == "Params4bit" and param.ndim == 2:
             return True
 
