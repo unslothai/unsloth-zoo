@@ -1166,7 +1166,10 @@ TEMPORARY_PATCHES.append(patch_peft_dispatch_bnb_4bit)
 
 
 class _ParamShapeProxy:
-    """Thin wrapper so .shape is _original_shape for 4bit MoE params; everything else delegates."""
+    """
+    Thin wrapper so attributes for 4bit MoE params are exposed correctly for compatibility with PEFT LoRA; 
+    everything else delegates.
+    """
 
     __slots__ = ("_param", "_shape", "_ndim")
 
@@ -1188,15 +1191,17 @@ class _ParamShapeProxy:
 
 
 def patch_peft_param_wrapper_4bit_expert_shape():
-    """Make ParamWrapper.get_param() report 3D shape for 4bit MoE params so init sets num_experts etc.
+    """
+    Make ParamWrapper.get_param() report 3D shape for 4bit MoE params so init sets num_experts etc.
 
     When using quantized MoE expert params (Params4bit), the tensor is 2D flattened;
-    _original_shape holds (num_experts, in_features, out_features). The original
-    __init__ calls self.get_param() and derives num_experts, in_features, out_features
-    from param.shape, then calls update_layer; if we don't fix shape, it overwrites our
-    values. So we patch get_param() to return a proxy that exposes .shape = _original_shape
-    for 4bit params with _original_shape; the rest of init then computes and sets the
-    right attributes.
+    and _original_shape attribute holds (num_experts, in_features, out_features). 
+    
+    ParamWrapper.get_param() derives num_experts, in_features, out_features from param.shape, 
+    leading to wrong shape for Params4bit parameters.
+    
+    Patch ParamWrapper.get_param() to return a proxy that exposes .shape = _original_shape
+    for 4bit params.
     """
     try:
         from peft.tuners.lora.layer import ParamWrapper
@@ -1219,6 +1224,9 @@ def patch_peft_param_wrapper_4bit_expert_shape():
                 self.in_features = in_features
                 self.out_features = out_features
                 return _ParamShapeProxy(param, shape)
+            else:
+                # TODO: Can we raise an error here?
+                logger.warning(f"Unsloth: No _original_shape found for {param}")
         return param
 
     _patched_get_param._unsloth_4bit_expert_patched = True
