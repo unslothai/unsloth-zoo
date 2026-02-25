@@ -2811,6 +2811,7 @@ DISABLE_COMPILE_MODULES = [
     "Glm4MoeLiteNaiveMoe",
     "Qwen3NextGatedDeltaNet",
     "GatedDeltaNet",
+    "Qwen3_5MoeGatedDeltaNet",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
