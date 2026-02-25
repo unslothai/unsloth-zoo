@@ -431,7 +431,7 @@ def install_llama_cpp(
 
     # Detect GPU backend for CMake
     gpu_cmake_flags = ""
-    if gpu_support:  # Accept both True and "ON"
+    if gpu_support == "ON":
         try:
             import torch
             if hasattr(torch.version, 'hip') and torch.version.hip is not None and torch.cuda.is_available():
