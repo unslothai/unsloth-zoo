@@ -2807,6 +2807,82 @@ def compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING=False):
 pass
 
 
+def compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING=False):
+    '''
+    FLA seems to be autocompiling at every step causing sever performance downgrades.
+    I noticed this on Qwen-3.5-MoE and potentially Qwen3-Next. 4-5x from initial tests.
+    This function is to disable repetitive autotuning and use the first tuned kernel.
+    In case one wants to override this, set UNSLOTH_DISABLE_FLA_NO_AUTOTUNE=1
+    '''
+    if os.environ.get("UNSLOTH_DISABLE_FLA_NO_AUTOTUNE", "0") == "1":
+        return False
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:
+        return False
+
+    class _ReuseBestCache(dict):
+        """Reports all keys as present once at least one entry exists,
+        returning the first stored value for any unseen key.
+        This lets the first autotune run find the best config normally,
+        then reuses it for any unseen key (e.g. different NB from
+        variable sequence lengths), preventing repeated benchmarking."""
+        def __contains__(self, key):
+            return len(self) > 0 or super().__contains__(key)
+        def __getitem__(self, key):
+            if not super().__contains__(key) and len(self) > 0:
+                return next(iter(self.values()))
+            return super().__getitem__(key)
+
+    def _unwrap_autotuner(kernel):
+        obj = kernel
+        for _ in range(6):
+            if isinstance(obj, Autotuner):
+                return obj
+            if not hasattr(obj, "fn"):
+                return None
+            obj = obj.fn
+        return None
+
+    modules_and_kernels = []
+    try:
+        import fla.modules.fused_norm_gate as fused_norm_gate
+        modules_and_kernels.append((fused_norm_gate, [
+            "layer_norm_gated_fwd_kernel", "layer_norm_gated_fwd_kernel1",
+            "layer_norm_gated_bwd_kernel", "layer_norm_gated_bwd_kernel1",
+        ]))
+    except ImportError:
+        pass
+    try:
+        import fla.modules.l2norm as l2norm_module
+        modules_and_kernels.append((l2norm_module, [
+            "l2norm_fwd_kernel", "l2norm_fwd_kernel1",
+            "l2norm_bwd_kernel", "l2norm_bwd_kernel1",
+        ]))
+    except ImportError:
+        pass
+
+    patched = []
+    for module, kernel_names in modules_and_kernels:
+        for name in kernel_names:
+            kernel = getattr(module, name, None)
+            if kernel is None:
+                continue
+            autotuner = _unwrap_autotuner(kernel)
+            if autotuner is None:
+                continue
+            if not isinstance(autotuner.cache, _ReuseBestCache):
+                autotuner.cache = _ReuseBestCache(autotuner.cache)
+                patched.append(name)
+
+    if UNSLOTH_ENABLE_LOGGING and len(patched) > 0:
+        logger.info("Unsloth: Patched FLA autotune caches for " + ", ".join(patched))
+    return len(patched) > 0
+
+
+pass
+
+
 # if module ends with any of these, disable compile
 DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
@@ -2878,7 +2954,7 @@ def unsloth_compile_transformers(
     except ModuleNotFoundError:
         return
     modeling_file = eval(model_location)
-    disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS))
+    disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -2942,6 +3018,7 @@ def unsloth_compile_transformers(
     # Disable compiling mamba type models
     has_causal_conv1d = compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING)
     has_mamba_ssm = compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING)
+    has_fla_no_autotune = compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING)
 
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
