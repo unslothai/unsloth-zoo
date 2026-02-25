@@ -472,6 +472,16 @@ POSSIBLE_RESERVED_TOKENS = (
     "<unused",                   # PaliGemma
 )
 
+# Vision-specific tokens that should not be used as pad_token for text-only models.
+# Qwen3 text models share the same vocab as Qwen3-VL and include these tokens,
+# but using them as pad_token is semantically wrong and confusing.
+# See https://github.com/unslothai/unsloth/issues/4104
+VISION_RESERVED_TOKENS = frozenset((
+    "<|vision_pad|>",
+    "<|image_pad|>",
+    "<|video_pad|>",
+))
+
 @torch.inference_mode
 def patch_tokenizer(model, tokenizer):
     """
@@ -504,10 +514,24 @@ def patch_tokenizer(model, tokenizer):
             return model, original_tokenizer
         tokenizer = inner
 
+    # Detect if model is a vision model. Text-only models should not
+    # use vision-specific tokens (e.g. <|vision_pad|>) as pad_token,
+    # even if those tokens exist in the vocab.
+    # See https://github.com/unslothai/unsloth/issues/4104
+    is_vision_model = hasattr(original_tokenizer, "image_processor")
+    if not is_vision_model and model is not None and hasattr(model, "config"):
+        model_type = getattr(model.config, "model_type", "") or ""
+        is_vision_model = "vl" in model_type.lower()
+    pass
+
     bad_pad_token = False
     if hasattr(tokenizer, "pad_token") and tokenizer.pad_token is not None:
         # Check if pad_token is not the same as eos_token otherwise the loss will ignore it!!
         bad_pad_token = tokenizer.eos_token == tokenizer.pad_token
+        # Also fix text-only models that already have a vision token as pad_token
+        # (e.g. Qwen3 models with <|vision_pad|> baked into tokenizer_config.json)
+        if not bad_pad_token and not is_vision_model:
+            bad_pad_token = tokenizer.pad_token in VISION_RESERVED_TOKENS
     elif hasattr(tokenizer, "pad_token") and tokenizer.pad_token is None:
         bad_pad_token = True
     else:
@@ -524,6 +548,9 @@ def patch_tokenizer(model, tokenizer):
         final_good_match = False
 
         for possible_reserved_token in POSSIBLE_RESERVED_TOKENS:
+            # Skip vision-specific tokens for text-only models
+            if not is_vision_model and possible_reserved_token in VISION_RESERVED_TOKENS:
+                continue
             possible_reserved_token = re.escape(possible_reserved_token)
             found = re.finditer(f"{possible_reserved_token}", all_added_tokens)
             first_match = None
