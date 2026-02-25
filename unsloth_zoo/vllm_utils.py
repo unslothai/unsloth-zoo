@@ -1843,7 +1843,7 @@ def load_vllm(
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
-    if is_fp8:
+    if is_fp8 and DEVICE_TYPE == "cuda":
         major_version, minor_version = torch.cuda.get_device_capability()
         if major_version == 10:
             # It is noticed that Deepgemm is generally slower than triton for vLLM
