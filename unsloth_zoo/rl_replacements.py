@@ -644,6 +644,7 @@ def grpo_accumulated_loss(
     image_grid_thw = kwargs.get('image_grid_thw',None)
     pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
     image_sizes = kwargs.get('image_sizes',None)
+    token_type_ids = kwargs.get('token_type_ids',None)
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if getattr(trainer, "vllm_importance_sampling_correction", False) else None
     temperature = kwargs.get("temperature", 1.0)
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
@@ -761,6 +762,7 @@ def grpo_accumulated_loss(
     pixel_values_chunks = []
     image_grid_thw_chunks = []
     pixel_attention_mask_chunks = []
+    token_type_ids_chunks = []
 
     current_pixel_idx = 0
     #TRL 0.23.0 batching logic
@@ -769,6 +771,10 @@ def grpo_accumulated_loss(
 
         input_ids_chunks.append(input_ids[start:end])
         attention_mask_chunks.append(attention_mask[start:end])
+        if token_type_ids is not None:
+            token_type_ids_chunks.append(token_type_ids[start:end])
+        else:
+            token_type_ids_chunks.append(None)
 
         if image_grid_thw is not None and pixel_values is not None:
 
@@ -809,7 +815,8 @@ def grpo_accumulated_loss(
         image_grid_thw_chunks,
         pixel_attention_mask_chunks,
         image_sizes_chunks,
-        completion_ids_chunks
+        completion_ids_chunks,
+        token_type_ids_chunks,
     )
 
     if trainer._autocast_dtype is None:
@@ -909,9 +916,13 @@ def grpo_accumulated_loss(
         image_grid_thw_chunk,
         pixel_attention_mask_chunk,
         image_sizes_chunk,
-        completion_ids
+        completion_ids,
+        token_type_ids_chunk,
     ) in zipped_inputs:
             with autocaster:
+                _extra_fwd_kwargs = {}
+                if token_type_ids_chunk is not None:
+                    _extra_fwd_kwargs["token_type_ids"] = token_type_ids_chunk
                 if pixel_values is None:
                     new_hidden_states_chunk = unwrapped_model(
                         input_ids = input_ids_chunk,
@@ -920,6 +931,7 @@ def grpo_accumulated_loss(
                         image_grid_thw = image_grid_thw_chunk,
                         pixel_attention_mask = pixel_attention_mask_chunk,
                         image_sizes = image_sizes_chunk,
+                        **_extra_fwd_kwargs,
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
@@ -933,6 +945,7 @@ def grpo_accumulated_loss(
                         pixel_attention_mask = pixel_attention_mask_chunk,
                         image_sizes = image_sizes_chunk,
                         logits_to_keep = logits_to_keep + 1,
+                        **_extra_fwd_kwargs,
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]

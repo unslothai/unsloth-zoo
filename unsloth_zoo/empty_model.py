@@ -403,6 +403,11 @@ def set_additional_modules(new_model, quant_state_dict, config):
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
         language_model_prefix = "model.language_model"
+    elif hasattr(getattr(new_model, "model", None), "language_model"):
+        # Nested language_model (e.g. Qwen2.5 VL in transformers 5.x):
+        # new_model.model.language_model holds the text model
+        language_model = new_model.model.language_model
+        language_model_prefix = "model.language_model"
     else:
         language_model_prefix = "model"
         language_model = new_model.model
@@ -415,7 +420,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
         text_config = getattr(config, "text_config", None)
         if text_config is not None:
             pad_token_id = getattr(text_config, "pad_token_id", None)
-    if pad_token_id is not None: assert pad_token_id < quant_state_dict[embed_tokens_key].shape[0], f"Pad token id {pad_token_id} out of bounds for vocab size {quant_state_dict[embed_tokens_key].shape[0]}"
+    if pad_token_id is not None and embed_tokens_key in quant_state_dict: assert pad_token_id < quant_state_dict[embed_tokens_key].shape[0], f"Pad token id {pad_token_id} out of bounds for vocab size {quant_state_dict[embed_tokens_key].shape[0]}"
 
     # language_model.embed_tokens = torch.nn.Embedding.from_pretrained(
     #     quant_state_dict[embed_tokens_key],

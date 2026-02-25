@@ -1050,6 +1050,40 @@ def patch_gpt_oss_bnb4bit():
     m.transformers_version = transformers_version
     m.Version              = Version
 
+    # Fix compiled module namespaces: the compiler creates combined_module
+    # files that import GptOssExperts into their own namespace. If compilation
+    # ran before this patch, the compiled GptOssMLP.__init__ still references
+    # the original GptOssExperts (with 3D Parameter down_proj instead of
+    # ModuleList down_projs). Fix by patching compiled module symbols and
+    # replacing GptOssMLP.__init__ with a closure that captures the correct
+    # BnB4bit class via default argument binding.
+    import sys as _sys
+    for _mod_name, _mod in list(_sys.modules.items()):
+        if _mod is None:
+            continue
+        if "unsloth_compiled" not in _mod_name and "combined_module" not in _mod_name:
+            continue
+        if hasattr(_mod, "GptOssExperts"):
+            if getattr(_mod, "GptOssExperts") is not GptOssExpertsBnb4bit:
+                setattr(_mod, "GptOssExperts", GptOssExpertsBnb4bit)
+        if hasattr(_mod, "GptOssTopKRouter"):
+            if getattr(_mod, "GptOssTopKRouter") is not GptOssTopKRouter:
+                setattr(_mod, "GptOssTopKRouter", GptOssTopKRouter)
+
+    _MLP_cls = getattr(m, "GptOssMLP", None)
+    if _MLP_cls is not None and not getattr(_MLP_cls, "_unsloth_bnb4bit_init_patched", False):
+        import torch.nn as _nn
+        _ExpertsCls = GptOssExpertsBnb4bit
+        _RouterCls  = GptOssTopKRouter
+
+        def _patched_init(self, config, _Experts=_ExpertsCls, _Router=_RouterCls):
+            _nn.Module.__init__(self)
+            self.router = _Router(config)
+            self.experts = _Experts(config)
+
+        _MLP_cls.__init__ = _patched_init
+        _MLP_cls._unsloth_bnb4bit_init_patched = True
+
     return True
 
 
@@ -2075,14 +2109,22 @@ def patch_GptOssModel():
     import transformers.generation.utils
     def wrap(f):
         def return_attention_mask(*args, **kwargs):
-            if kwargs["input_embeds"].requires_grad:
+            embeds = kwargs.get("input_embeds", kwargs.get("inputs_embeds", None))
+            if embeds is not None and embeds.requires_grad:
                 if "attention_mask" in kwargs:
                     return kwargs["attention_mask"]
                 for arg in args:
                     if type(arg) is torch.Tensor and arg.dtype == torch.int32:
                         return arg
             else:
-                # Eager
+                # During generation, avoid returning BlockMask when attn_implementation is flex_attention
+                # since Unsloth uses eager attention for inference
+                config = kwargs.get("config", None)
+                if config is None and len(args) > 0:
+                    config = args[0]
+                attn_impl = getattr(config, "_attn_implementation", None) if config is not None else None
+                if attn_impl == "flex_attention":
+                    return kwargs.get("attention_mask", None)
                 return f(*args, **kwargs)
             pass
         return return_attention_mask
@@ -2305,17 +2347,28 @@ def patch_GptOssModel():
 
         # It may already have been prepared by e.g. `generate`
         if not self.training and not isinstance(attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-            }
-            attention_mask = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
+            # During inference Unsloth uses eager attention, but config may still
+            # have _attn_implementation="flex_attention" (set for training).
+            # flex_attention masking returns BlockMask which eager cannot handle,
+            # so we skip dense mask creation and pass None (eager handles it).
+            _attn_impl = getattr(self.config, "_attn_implementation", None)
+            if _attn_impl == "flex_attention":
+                attention_mask = {
+                    "full_attention": None,
+                    "sliding_attention": None,
+                }
+            else:
+                mask_kwargs = {
+                    "config": self.config,
+                    "inputs_embeds": inputs_embeds,
+                    "attention_mask": attention_mask,
+                    "cache_position": cache_position,
+                    "past_key_values": past_key_values,
+                }
+                attention_mask = {
+                    "full_attention": create_causal_mask(**mask_kwargs),
+                    "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+                }
 
         # is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         bsz, qlen, hd = hidden_states.shape
