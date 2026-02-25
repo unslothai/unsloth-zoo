@@ -2809,7 +2809,7 @@ pass
 
 def compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING=False):
     '''
-    FLA seems to be autocompiling at every step causing sever performance downgrades.
+    FLA seems to be autocompiling at every step causing severe performance downgrades.
     I noticed this on Qwen-3.5-MoE and potentially Qwen3-Next. 4-5x from initial tests.
     This function is to disable repetitive autotuning and use the first tuned kernel.
     In case one wants to override this, set UNSLOTH_DISABLE_FLA_NO_AUTOTUNE=1
