@@ -21,6 +21,8 @@ __all__ = [
 import torch
 import inspect
 import os
+import math
+import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
@@ -295,6 +297,20 @@ def grpo_update_SamplingParams(SamplingParams, generation_kwargs, vllm_sampling_
     return generation_kwargs
 pass
 RL_REPLACEMENTS["grpo_update_SamplingParams"] = grpo_update_SamplingParams
+
+
+def sanitize_logprob(logprob):
+    """Local port of trl.scripts.vllm_serve.sanitize_logprob.
+    Filters NaN logprobs from vLLM outputs."""
+    value = logprob.logprob
+    if math.isnan(value):
+        logging.getLogger(__name__).warning(
+            f"Generated NaN logprob, token logprob '{logprob}' will be ignored"
+        )
+        return None
+    return value
+
+RL_REPLACEMENTS["sanitize_logprob"] = sanitize_logprob
 # Custom compiled GRPO loss - creates 3 Triton kernels
 def grpo_compute_loss(
     ref,
