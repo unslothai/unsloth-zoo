@@ -36,8 +36,6 @@ from .utils import (
 )
 import inspect
 
-_UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
-
 
 def patch_Gemma3Processor():
     import re
@@ -316,27 +314,48 @@ TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
 
 def patch_Gemma3MLP():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3MLP
     except Exception as e:
         return raise_error("Gemma3MLP.forward", e)
 
-    def forward(self, x): # x is fp16 from RMSNorm
-        gate_proj_out = self.gate_proj(x)
-        up_proj_out = self.up_proj(x)
+    def forward(self, x):
+        # If forcing float32, keep the original float32 path.
+        if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+            gate_proj_out = self.gate_proj(x)
+            up_proj_out = self.up_proj(x)
 
-        # Upcast to fp32
-        gate_proj_fp32 = gate_proj_out.to(torch.float32)
-        up_proj_fp32 = up_proj_out.to(torch.float32)
-        activated_fp32 = self.act_fn(gate_proj_fp32) # Activation in fp32
-        intermediate_fp32 = activated_fp32 * up_proj_fp32 # Product in fp32
+            # Upcast to fp32
+            gate_proj_fp32 = gate_proj_out.to(torch.float32)
+            up_proj_fp32 = up_proj_out.to(torch.float32)
+            activated_fp32 = self.act_fn(gate_proj_fp32) # Activation in fp32
+            intermediate_fp32 = activated_fp32 * up_proj_fp32 # Product in fp32
 
-        # Downcast and down_proj
-        intermediate_fp16 = intermediate_fp32.to(torch.float16)
-        down_proj_out = self.down_proj(intermediate_fp16)
-        return down_proj_out
+            # Downcast and down_proj
+            intermediate_fp16 = intermediate_fp32.to(torch.float16)
+            down_proj_out = self.down_proj(intermediate_fp16)
+            return down_proj_out
+
+        # Otherwise, keep inputs in their native dtype and only cast
+        # the intermediate to the down_proj compute dtype if needed.
+        intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+
+        # Prefer compute_dtype (bnb Linear4bit) if present; fallback to weight dtype
+        target_dtype = getattr(self.down_proj, "compute_dtype", None)
+        if target_dtype is None:
+            weight = getattr(self.down_proj, "weight", None)
+            target_dtype = getattr(weight, "dtype", None)
+
+        if target_dtype is not None:
+            try:
+                is_float = torch.is_floating_point(torch.empty((), dtype=target_dtype))
+            except Exception:
+                is_float = False
+            if is_float and intermediate.dtype != target_dtype:
+                intermediate = intermediate.to(target_dtype)
+
+        return self.down_proj(intermediate)
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
 pass
@@ -496,8 +515,6 @@ def patch_Gemma3Attention():
         """
         # output_attentions = kwargs.get("output_attentions", False)
         attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
-        if _UNSLOTH_FLEX_ATTENTION_DISABLED:
-            attn_impl = "sdpa"
         if attn_impl == "flex_attention":
             attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
             attn_output_fp32, attn_weights = attention_interface(
@@ -751,8 +768,6 @@ def patch_Gemma3Attention_generic():
         """
         # output_attentions = kwargs.get("output_attentions", False)
         attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
-        if _UNSLOTH_FLEX_ATTENTION_DISABLED:
-            attn_impl = "sdpa"
         if attn_impl == "flex_attention":
             attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
             attn_output_fp32, attn_weights = attention_interface(
