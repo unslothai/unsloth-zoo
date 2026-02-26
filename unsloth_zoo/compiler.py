@@ -1154,6 +1154,7 @@ def create_standalone_class(
                     if (
                         "use_experts_implementation" in stripped
                         or "use_kernel_forward_from_hub" in stripped
+                        or "use_kernelized_func" in stripped
                         or stripped.startswith("@auto_docstring")
                     ):
                         decorator_name = stripped.split("(")[0].lstrip("@")
@@ -1274,6 +1275,7 @@ def create_standalone_class(
 
     # Remove @auto_docstring
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
     # source = source.replace("@auto_docstring", "")
 

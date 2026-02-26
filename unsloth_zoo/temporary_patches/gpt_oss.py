@@ -2171,12 +2171,25 @@ def patch_GptOssModel():
     import transformers.generation.utils
     def wrap(f):
         def return_attention_mask(*args, **kwargs):
-            if kwargs["input_embeds"].requires_grad:
+            input_embeds = kwargs.get("input_embeds", None)
+            if input_embeds is None:
+                input_embeds = kwargs.get("inputs_embeds", None)
+            if input_embeds is None:
+                for arg in args:
+                    if type(arg) is torch.Tensor and arg.is_floating_point():
+                        input_embeds = arg
+                        break
+
+            if input_embeds is not None and input_embeds.requires_grad:
                 if "attention_mask" in kwargs:
                     return kwargs["attention_mask"]
                 for arg in args:
-                    if type(arg) is torch.Tensor and arg.dtype == torch.int32:
+                    if (
+                        type(arg) is torch.Tensor and
+                        arg.dtype in (torch.int32, torch.int64, torch.bool)
+                    ):
                         return arg
+                return f(*args, **kwargs)
             else:
                 # Eager
                 return f(*args, **kwargs)
