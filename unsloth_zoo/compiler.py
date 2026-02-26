@@ -1171,13 +1171,14 @@ def create_standalone_class(
     # Check if forward was replaced by a temporary patch (renamed function)
     # In this case, keep the patched source as-is and replace the class forward body.
     patched_forward_info = None
-    func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
-    if func_match and func_match.group(1) != "forward":
-        # Find original forward in class to replace it
-        orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
-        if orig_fwd:
-            patched_forward_info = (func_match.group(1), orig_fwd.group(1))
-            disable = None  # Keep patched source as-is for renamed forward replacements
+    if "@torch.compiler.disable" in forward_source:
+        func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
+        if func_match and func_match.group(1) != "forward":
+            # Find original forward in class to replace it
+            orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
+            if orig_fwd:
+                patched_forward_info = (func_match.group(1), orig_fwd.group(1))
+                disable = None  # Keep patched source as-is for renamed forward replacements
 
     # Replace function name with module-specific name
     if patched_forward_info:
