@@ -1117,7 +1117,7 @@ def _get_effective_accelerator_memory_bytes():
     return total_memory
 
 
-def _should_skip_transformers_allocator_warmup_for_gpt_oss() -> bool:
+def _should_skip_transformers_allocator_warmup() -> bool:
     """
     Skip transformers allocator warmup on low-memory accelerators.
 
@@ -1126,7 +1126,7 @@ def _should_skip_transformers_allocator_warmup_for_gpt_oss() -> bool:
     """
     mode = os.environ.get("UNSLOTH_ALLOCATOR_WARMUP", "").strip().lower()
     if mode == "":
-        # Backward compatible alias for existing GPT-OSS override.
+        # Backward compatible alias for previous override variable.
         mode = os.environ.get("UNSLOTH_GPT_OSS_ALLOCATOR_WARMUP", "auto").strip().lower()
     if mode in ("off", "disable", "0", "false"):
         return True
@@ -1139,18 +1139,21 @@ def _should_skip_transformers_allocator_warmup_for_gpt_oss() -> bool:
     return total_memory <= int(24 * 1024**3)
 
 
-def patch_transformers_caching_allocator_warmup_for_gpt_oss():
+def patch_transformers_caching_allocator_warmup():
     try:
         import transformers.modeling_utils
     except Exception as e:
         return raise_error("transformers.modeling_utils", e)
 
     warmup_fn = transformers.modeling_utils.caching_allocator_warmup
+    if hasattr(warmup_fn, "__unsloth_allocator_warmup_guarded__"):
+        return
+    # Backward compatibility with previous guard attribute.
     if hasattr(warmup_fn, "__unsloth_gpt_oss_guarded__"):
         return
 
     def guarded_caching_allocator_warmup(model, expanded_device_map, hf_quantizer):
-        if _should_skip_transformers_allocator_warmup_for_gpt_oss():
+        if _should_skip_transformers_allocator_warmup():
             if UNSLOTH_ENABLE_LOGGING:
                 logger.warning_once(
                     "Unsloth: Skipping transformers caching_allocator_warmup "
@@ -1160,11 +1163,13 @@ def patch_transformers_caching_allocator_warmup_for_gpt_oss():
             return
         return warmup_fn(model, expanded_device_map, hf_quantizer)
 
+    guarded_caching_allocator_warmup.__unsloth_allocator_warmup_guarded__ = True
+    # Keep legacy marker so older checks still detect this as guarded.
     guarded_caching_allocator_warmup.__unsloth_gpt_oss_guarded__ = True
     transformers.modeling_utils.caching_allocator_warmup = guarded_caching_allocator_warmup
 
 
-TEMPORARY_PATCHES.append(patch_transformers_caching_allocator_warmup_for_gpt_oss)
+TEMPORARY_PATCHES.append(patch_transformers_caching_allocator_warmup)
 
 
 # Combo kernels uses too much VRAM for low memory GPUs
