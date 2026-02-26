@@ -276,10 +276,18 @@ class WorkerLoRAManager(AbstractWorkerManager):
         # Keep compatibility with older manager implementations by defaulting
         # to False when the adapter manager does not expose this capability.
         adapter_manager = getattr(self, "_adapter_manager", None)
-        return bool(
-            adapter_manager is not None and
-            getattr(adapter_manager, "supports_tower_connector_lora", False)
-        )
+        if adapter_manager is None:
+            return False
+        if not bool(getattr(adapter_manager, "supports_mm", True)):
+            return False
+
+        capability = getattr(adapter_manager, "supports_tower_connector_lora", False)
+        if callable(capability):
+            try:
+                capability = capability()
+            except Exception:
+                return False
+        return bool(capability)
 
 
 # from vllm try to import WorkerLoRAManager
