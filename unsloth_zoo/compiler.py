@@ -1151,8 +1151,14 @@ def create_standalone_class(
             for line in lines:
                 stripped = line.strip()
                 if stripped.startswith("@"):
-                    if "use_experts_implementation" in stripped:
-                        logger.info(f'Unsloth: stripped use_experts_implementation decorator from {module}')
+                    if (
+                        "use_experts_implementation" in stripped
+                        or "use_kernel_forward_from_hub" in stripped
+                        or "use_kernelized_func" in stripped
+                        or stripped.startswith("@auto_docstring")
+                    ):
+                        decorator_name = stripped.split("(")[0].lstrip("@")
+                        logger.info(f"Unsloth: stripped {decorator_name} decorator from {module}")
                         continue # Strip it
                     else:
                         logger.warning(f"Unsloth: Warning: Unknown decorator {stripped} found for {module}.")
@@ -1165,13 +1171,14 @@ def create_standalone_class(
     # Check if forward was replaced by a temporary patch (renamed function)
     # In this case, keep the patched source as-is and replace the class forward body.
     patched_forward_info = None
-    func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
-    if func_match and func_match.group(1) != "forward":
-        # Find original forward in class to replace it
-        orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
-        if orig_fwd:
-            patched_forward_info = (func_match.group(1), orig_fwd.group(1))
-            disable = None  # Keep patched source as-is for renamed forward replacements
+    if "@torch.compiler.disable" in forward_source:
+        func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
+        if func_match and func_match.group(1) != "forward":
+            # Find original forward in class to replace it
+            orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
+            if orig_fwd:
+                patched_forward_info = (func_match.group(1), orig_fwd.group(1))
+                disable = None  # Keep patched source as-is for renamed forward replacements
 
     # Replace function name with module-specific name
     if patched_forward_info:
@@ -1269,6 +1276,7 @@ def create_standalone_class(
 
     # Remove @auto_docstring
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
     # source = source.replace("@auto_docstring", "")
 
