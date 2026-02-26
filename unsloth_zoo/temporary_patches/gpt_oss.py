@@ -1119,17 +1119,15 @@ def _get_effective_accelerator_memory_bytes():
 
 def _should_skip_transformers_allocator_warmup_for_gpt_oss() -> bool:
     """
-    GPT-OSS 4-bit can trigger a large allocator warmup in transformers
-    (`caching_allocator_warmup`) before weights are loaded. On 16GB GPUs this
-    warmup can OOM even though the actual loaded model fits.
-    """
-    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
-    if "gpt_oss" not in model_name:
-        return False
-    if "_load_in_4bit_" not in model_name:
-        return False
+    Skip transformers allocator warmup on low-memory accelerators.
 
-    mode = os.environ.get("UNSLOTH_GPT_OSS_ALLOCATOR_WARMUP", "auto").strip().lower()
+    `caching_allocator_warmup` can allocate large single chunks before weights
+    are loaded, which can OOM constrained GPUs.
+    """
+    mode = os.environ.get("UNSLOTH_ALLOCATOR_WARMUP", "").strip().lower()
+    if mode == "":
+        # Backward compatible alias for existing GPT-OSS override.
+        mode = os.environ.get("UNSLOTH_GPT_OSS_ALLOCATOR_WARMUP", "auto").strip().lower()
     if mode in ("off", "disable", "0", "false"):
         return True
     if mode in ("on", "enable", "1", "true"):
@@ -1138,7 +1136,7 @@ def _should_skip_transformers_allocator_warmup_for_gpt_oss() -> bool:
     total_memory = _get_effective_accelerator_memory_bytes()
     if total_memory is None:
         return False
-    return total_memory <= int(20 * 1024**3)
+    return total_memory <= int(24 * 1024**3)
 
 
 def patch_transformers_caching_allocator_warmup_for_gpt_oss():
@@ -1156,8 +1154,8 @@ def patch_transformers_caching_allocator_warmup_for_gpt_oss():
             if UNSLOTH_ENABLE_LOGGING:
                 logger.warning_once(
                     "Unsloth: Skipping transformers caching_allocator_warmup "
-                    "for GPT-OSS 4-bit on low-memory accelerators. "
-                    "Set UNSLOTH_GPT_OSS_ALLOCATOR_WARMUP=on to keep warmup."
+                    "on low-memory accelerators (<24GB effective memory). "
+                    "Set UNSLOTH_ALLOCATOR_WARMUP=on to keep warmup."
                 )
             return
         return warmup_fn(model, expanded_device_map, hf_quantizer)
