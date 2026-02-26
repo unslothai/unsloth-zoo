@@ -1094,6 +1094,81 @@ def patch_gpt_oss_bnb4bit_auto():
 TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
 
 
+def _get_accelerator_total_memory_bytes():
+    try:
+        if DEVICE_TYPE == "xpu":
+            return int(torch.xpu.memory.mem_get_info(0)[-1])
+        return int(torch.cuda.memory.mem_get_info(0)[-1])
+    except Exception:
+        return None
+
+
+def _get_effective_accelerator_memory_bytes():
+    total_memory = _get_accelerator_total_memory_bytes()
+    if total_memory is None:
+        return None
+    if DEVICE_TYPE != "xpu" and hasattr(torch.cuda, "get_per_process_memory_fraction"):
+        try:
+            fraction = float(torch.cuda.get_per_process_memory_fraction(0))
+            if 0.0 < fraction < 1.0:
+                return int(total_memory * fraction)
+        except Exception:
+            pass
+    return total_memory
+
+
+def _should_skip_transformers_allocator_warmup_for_gpt_oss() -> bool:
+    """
+    GPT-OSS 4-bit can trigger a large allocator warmup in transformers
+    (`caching_allocator_warmup`) before weights are loaded. On 16GB GPUs this
+    warmup can OOM even though the actual loaded model fits.
+    """
+    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
+    if "gpt_oss" not in model_name:
+        return False
+    if "_load_in_4bit_" not in model_name:
+        return False
+
+    mode = os.environ.get("UNSLOTH_GPT_OSS_ALLOCATOR_WARMUP", "auto").strip().lower()
+    if mode in ("off", "disable", "0", "false"):
+        return True
+    if mode in ("on", "enable", "1", "true"):
+        return False
+
+    total_memory = _get_effective_accelerator_memory_bytes()
+    if total_memory is None:
+        return False
+    return total_memory <= int(20 * 1024**3)
+
+
+def patch_transformers_caching_allocator_warmup_for_gpt_oss():
+    try:
+        import transformers.modeling_utils
+    except Exception as e:
+        return raise_error("transformers.modeling_utils", e)
+
+    warmup_fn = transformers.modeling_utils.caching_allocator_warmup
+    if hasattr(warmup_fn, "__unsloth_gpt_oss_guarded__"):
+        return
+
+    def guarded_caching_allocator_warmup(model, expanded_device_map, hf_quantizer):
+        if _should_skip_transformers_allocator_warmup_for_gpt_oss():
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning_once(
+                    "Unsloth: Skipping transformers caching_allocator_warmup "
+                    "for GPT-OSS 4-bit on low-memory accelerators. "
+                    "Set UNSLOTH_GPT_OSS_ALLOCATOR_WARMUP=on to keep warmup."
+                )
+            return
+        return warmup_fn(model, expanded_device_map, hf_quantizer)
+
+    guarded_caching_allocator_warmup.__unsloth_gpt_oss_guarded__ = True
+    transformers.modeling_utils.caching_allocator_warmup = guarded_caching_allocator_warmup
+
+
+TEMPORARY_PATCHES.append(patch_transformers_caching_allocator_warmup_for_gpt_oss)
+
+
 # Combo kernels uses too much VRAM for low memory GPUs
 from ..device_type import DEVICE_TYPE
 
