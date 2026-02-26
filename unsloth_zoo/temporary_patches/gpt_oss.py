@@ -1125,9 +1125,6 @@ def _should_skip_transformers_allocator_warmup() -> bool:
     are loaded, which can OOM constrained GPUs.
     """
     mode = os.environ.get("UNSLOTH_ALLOCATOR_WARMUP", "").strip().lower()
-    if mode == "":
-        # Backward compatible alias for previous override variable.
-        mode = os.environ.get("UNSLOTH_GPT_OSS_ALLOCATOR_WARMUP", "auto").strip().lower()
     if mode in ("off", "disable", "0", "false"):
         return True
     if mode in ("on", "enable", "1", "true"):
