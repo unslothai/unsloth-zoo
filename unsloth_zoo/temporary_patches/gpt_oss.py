@@ -1094,11 +1094,28 @@ def patch_gpt_oss_bnb4bit_auto():
 TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
 
 
-def _get_accelerator_total_memory_bytes():
+_LOW_MEMORY_ACCELERATOR_BYTES = int(24 * 1024**3)
+
+
+def _get_active_accelerator_index():
     try:
         if DEVICE_TYPE == "xpu":
-            return int(torch.xpu.memory.mem_get_info(0)[-1])
-        return int(torch.cuda.memory.mem_get_info(0)[-1])
+            if hasattr(torch, "xpu") and hasattr(torch.xpu, "current_device"):
+                return int(torch.xpu.current_device())
+            return 0
+        if hasattr(torch, "cuda") and hasattr(torch.cuda, "current_device"):
+            return int(torch.cuda.current_device())
+    except Exception:
+        pass
+    return 0
+
+
+def _get_accelerator_total_memory_bytes():
+    try:
+        device_index = _get_active_accelerator_index()
+        if DEVICE_TYPE == "xpu":
+            return int(torch.xpu.memory.mem_get_info(device_index)[-1])
+        return int(torch.cuda.memory.mem_get_info(device_index)[-1])
     except Exception:
         return None
 
@@ -1109,7 +1126,8 @@ def _get_effective_accelerator_memory_bytes():
         return None
     if DEVICE_TYPE != "xpu" and hasattr(torch.cuda, "get_per_process_memory_fraction"):
         try:
-            fraction = float(torch.cuda.get_per_process_memory_fraction(0))
+            device_index = _get_active_accelerator_index()
+            fraction = float(torch.cuda.get_per_process_memory_fraction(device_index))
             if 0.0 < fraction < 1.0:
                 return int(total_memory * fraction)
         except Exception:
@@ -1133,7 +1151,7 @@ def _should_skip_transformers_allocator_warmup() -> bool:
     total_memory = _get_effective_accelerator_memory_bytes()
     if total_memory is None:
         return False
-    return total_memory <= int(24 * 1024**3)
+    return total_memory <= _LOW_MEMORY_ACCELERATOR_BYTES
 
 
 def patch_transformers_caching_allocator_warmup():
@@ -1172,10 +1190,9 @@ TEMPORARY_PATCHES.append(patch_transformers_caching_allocator_warmup)
 # Combo kernels uses too much VRAM for low memory GPUs
 from ..device_type import DEVICE_TYPE
 
-if DEVICE_TYPE == "xpu":
-    device_memory = torch.xpu.memory.mem_get_info(0)[-1]
-else:
-    device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+device_memory = _get_accelerator_total_memory_bytes()
+if device_memory is None:
+    device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
