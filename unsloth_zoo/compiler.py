@@ -993,7 +993,7 @@ def create_new_function(
         except Exception as e:
             # consider adding logging to main_process only
             # counterpoint: we may want to see errors on all processes
-            if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+            if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
                 logger.error(
                     f"Unsloth: Failed to write file {function_location} because {str(e)}"
                 )
@@ -1038,7 +1038,7 @@ def create_new_function(
                 new_module = importlib.import_module(name)
                 return new_module, old_path
         except Exception as e:
-            if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+            if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
                 logger.error(
                     f"Unsloth: Failed to import module {name} because {str(e)}"
                 )
@@ -1266,7 +1266,7 @@ def create_standalone_class(
                 old_method_source = inspect.getsource(getattr(f, method_name))
                 full_class = full_class.replace(old_method_source, method_source)
             except Exception as e:
-                if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+                if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
                     print(
                         f"Unsloth: Failed to replace method {method_name} in {module} with error = {str(e)}"
                     )
