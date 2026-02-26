@@ -372,6 +372,78 @@ if importlib.util.find_spec("vllm") is not None:
             pass
     pass
 
+    def patch_vllm_multimodal_seq2text():
+        # vLLM multimodal prompt updates can pass token payloads as nested
+        # dict/list/tensor objects. Normalize these payloads before decode.
+        try:
+            import vllm.multimodal.processing.processor as mm_processor
+            original_seq2text = mm_processor._seq2text
+            if getattr(original_seq2text, "__name__", "") == "unsloth_seq2text":
+                return
+
+            def _extract_token_ids(payload, depth = 0):
+                if depth >= 8:
+                    return None
+                if isinstance(payload, str):
+                    return payload
+                if torch.is_tensor(payload):
+                    payload = payload.tolist()
+                elif isinstance(payload, np.ndarray):
+                    payload = payload.tolist()
+                if isinstance(payload, (int, np.integer)):
+                    return [int(payload)]
+                if isinstance(payload, tuple):
+                    payload = list(payload)
+                if isinstance(payload, list):
+                    if len(payload) == 0:
+                        return payload
+                    if all(isinstance(x, (int, np.integer)) for x in payload):
+                        return [int(x) for x in payload]
+                    if len(payload) == 1:
+                        return _extract_token_ids(payload[0], depth = depth + 1)
+                    merged = []
+                    for item in payload:
+                        found = _extract_token_ids(item, depth = depth + 1)
+                        if not isinstance(found, list):
+                            return None
+                        merged.extend(found)
+                    return merged
+                if isinstance(payload, dict):
+                    preferred_keys = (
+                        "token_ids",
+                        "input_ids",
+                        "ids",
+                        "prompt_token_ids",
+                        "token_id",
+                        "tokens",
+                        "prompt",
+                        "content",
+                    )
+                    for key in preferred_keys:
+                        if key in payload:
+                            found = _extract_token_ids(payload[key], depth = depth + 1)
+                            if found is not None:
+                                return found
+                    for value in payload.values():
+                        found = _extract_token_ids(value, depth = depth + 1)
+                        if found is not None:
+                            return found
+                return None
+            pass
+
+            @functools.wraps(original_seq2text)
+            def unsloth_seq2text(tokenizer, seq, *, use_cache = True):
+                normalized_seq = _extract_token_ids(seq)
+                if normalized_seq is None:
+                    normalized_seq = seq
+                return original_seq2text(tokenizer, normalized_seq, use_cache = use_cache)
+            pass
+
+            mm_processor._seq2text = unsloth_seq2text
+        except:
+            pass
+    pass
+
     def set_inductor_config(config, runtime_shape):
         if isinstance(runtime_shape, int):
             # for a specific batchsize, tuning triton kernel parameters
@@ -406,6 +478,10 @@ else:
     pass
 
     def patch_vllm_lora_load_tensors():
+        return
+    pass
+
+    def patch_vllm_multimodal_seq2text():
         return
     pass
 
@@ -788,6 +864,7 @@ def patch_vllm(debug = True):
     patch_bitsandbytes_quant_state()
     patch_vllm_bitsandbytes()
     patch_vllm_lora_tokenizer()
+    patch_vllm_multimodal_seq2text()
     patch_vllm_lora_load_tensors()
     if os.getenv("UNSLOTH_VLLM_STANDBY", "0") == "1":
         if Version("0.10.0") <= Version(vllm_version) < Version("0.11.0"):

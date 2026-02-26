@@ -271,6 +271,16 @@ class WorkerLoRAManager(AbstractWorkerManager):
         else:
             return set(self._adapter_manager.list_adapters())
 
+    def supports_tower_connector_lora(self) -> bool:
+        # vLLM v1 vision code expects this method on the worker manager.
+        # Keep compatibility with older manager implementations by defaulting
+        # to False when the adapter manager does not expose this capability.
+        adapter_manager = getattr(self, "_adapter_manager", None)
+        return bool(
+            adapter_manager is not None and
+            getattr(adapter_manager, "supports_tower_connector_lora", False)
+        )
+
 
 # from vllm try to import WorkerLoRAManager
 try:
