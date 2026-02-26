@@ -1336,15 +1336,19 @@ def _should_use_gpt_oss_bnb4bit() -> bool:
     Default: True when load_in_4bit is active.
     Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to force BF16 path.
     """
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+    if "gpt_oss" not in _normalized_unsloth_model_name():
         return False
-    if "_load_in_4bit_" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+    if "_load_in_4bit_" not in _normalized_unsloth_model_name():
         return False
     return os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_DISABLE", "0") != "1"
 
 
 def _is_gpt_oss_4bit_load() -> bool:
-    return "_load_in_4bit_" in os.environ.get("UNSLOTH_MODEL_NAME", "")
+    return "_load_in_4bit_" in _normalized_unsloth_model_name()
+
+
+def _normalized_unsloth_model_name() -> str:
+    return os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
 
 
 def _is_transformers_v5() -> bool:
@@ -1360,7 +1364,7 @@ def patch_gpt_oss_moe_for_lora():
     IMPORTANT: We only patch the forward method, NOT replace the entire class.
     This preserves the original class structure so weights load correctly.
     """
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+    if "gpt_oss" not in _normalized_unsloth_model_name():
         return
     if _is_gpt_oss_4bit_load() or _should_use_gpt_oss_bnb4bit():
         # 4-bit loads should keep quantized weights and use default PEFT LoRA.
@@ -1794,8 +1798,8 @@ def patch_gpt_oss_linearized():
     Patch GPT OSS for 4bit loading with grouped_mm support.
     Only patches the GptOssExperts forward method - keeps original classes for proper weight loading.
     """
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
-    if "_load_in_4bit_" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    if "gpt_oss" not in _normalized_unsloth_model_name(): return
+    if "_load_in_4bit_" not in _normalized_unsloth_model_name(): return
     if _should_use_gpt_oss_bnb4bit(): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
@@ -1833,7 +1837,7 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         from ..flex_attention import (
             flex_attention_with_sink,
@@ -2074,7 +2078,7 @@ TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 def patch_GptOssModel():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel
@@ -2759,7 +2763,7 @@ except Exception as e:
 
 
 def patch_gpt_oss_init_weights_modulelist_fix():
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+    if "gpt_oss" not in _normalized_unsloth_model_name():
         return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
@@ -2804,7 +2808,7 @@ def patch_gpt_oss_for_grpo():
     When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits.
     This fixes the matrix multiplication dimension mismatch issue in GRPO training.
     """
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+    if "gpt_oss" not in _normalized_unsloth_model_name():
         return
 
     try:
