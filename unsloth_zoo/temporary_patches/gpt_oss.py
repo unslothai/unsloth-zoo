@@ -655,7 +655,8 @@ def patch_gpt_oss_compiler_exports():
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
     except Exception as e:
-        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
+        raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
+        return
 
     # Export helpers so compiler generated GPT-OSS modules can resolve symbols.
     m = transformers.models.gpt_oss.modeling_gpt_oss
@@ -664,7 +665,6 @@ def patch_gpt_oss_compiler_exports():
     m.dtype_from_config = dtype_from_config
     m.transformers_version = transformers_version
     m.Version = Version
-pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_compiler_exports)
 
 
