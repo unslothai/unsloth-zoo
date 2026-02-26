@@ -1154,6 +1154,7 @@ def create_standalone_class(
                     if (
                         "use_experts_implementation" in stripped
                         or "use_kernel_forward_from_hub" in stripped
+                        or stripped.startswith("@auto_docstring")
                     ):
                         decorator_name = stripped.split("(")[0].lstrip("@")
                         logger.info(f"Unsloth: stripped {decorator_name} decorator from {module}")
