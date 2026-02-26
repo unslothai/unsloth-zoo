@@ -378,7 +378,7 @@ if importlib.util.find_spec("vllm") is not None:
         try:
             import vllm.multimodal.processing.processor as mm_processor
             original_seq2text = mm_processor._seq2text
-            if getattr(original_seq2text, "__name__", "") == "unsloth_seq2text":
+            if getattr(original_seq2text, "__unsloth_patched_seq2text__", False):
                 return
 
             def _extract_token_ids(payload, depth = 0):
@@ -439,6 +439,7 @@ if importlib.util.find_spec("vllm") is not None:
                 return original_seq2text(tokenizer, normalized_seq, use_cache = use_cache)
             pass
 
+            unsloth_seq2text.__unsloth_patched_seq2text__ = True
             mm_processor._seq2text = unsloth_seq2text
         except:
             pass
