@@ -682,7 +682,7 @@ def sft_prepare_dataset(
                 )
             test_text = test_text[0]
         else:
-            test_text = next(iter(dataset))[dataset_text_field][0]
+            test_text = next(iter(dataset))[dataset_text_field]
 
         # Get chat template
         chat_template = getattr(processing_class, 'chat_template', '')
