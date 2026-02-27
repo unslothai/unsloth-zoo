@@ -25,6 +25,7 @@ from triton import __version__ as triton_version
 from . import DEVICE_TYPE
 from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 import inspect
+from typing import Union
 
 global HAS_CUT_CROSS_ENTROPY
 global UNSLOTH_STUDIO_ENABLED
@@ -179,12 +180,15 @@ def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,
     labels             : torch.Tensor,
-    num_items_in_batch : int = None,
+    num_items_in_batch : Union[int, torch.Tensor] = None,
     ignore_index       : int = -100,
     reduction          : str = "mean",
     logit_softcapping  : float = 0,
     accuracy_threshold : str = "auto",
 ):
+    if isinstance(num_items_in_batch, torch.Tensor):
+        num_items_in_batch = num_items_in_batch.detach().cpu().item()  # `torch.Tensor` -> `int`.
+
     # All Unsloth Zoo code licensed under LGPLv3
     if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
         num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
