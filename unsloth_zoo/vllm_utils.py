@@ -376,10 +376,20 @@ if importlib.util.find_spec("vllm") is not None:
         # vLLM multimodal prompt updates can pass token payloads as nested
         # dict/list/tensor objects. Normalize these payloads before decode.
         try:
-            import vllm.multimodal.processing.processor as mm_processor
+            # v0.15.0+ moved processing into a package
+            try:
+                import vllm.multimodal.processing.processor as mm_processor
+            except (ImportError, ModuleNotFoundError):
+                # v0.10.2 - v0.14.x uses a flat module
+                import vllm.multimodal.processing as mm_processor
+            pass
+
             original_seq2text = mm_processor._seq2text
             if getattr(original_seq2text, "__unsloth_patched_seq2text__", False):
                 return
+
+            # Check if original _seq2text accepts use_cache (v0.12.0+)
+            _has_use_cache = "use_cache" in inspect.signature(original_seq2text).parameters
 
             def _extract_token_ids(payload):
                 # Normalize known non-standard payload types to list[int].
@@ -417,11 +427,13 @@ if importlib.util.find_spec("vllm") is not None:
             pass
 
             @functools.wraps(original_seq2text)
-            def unsloth_seq2text(tokenizer, seq, *, use_cache = True):
+            def unsloth_seq2text(tokenizer, seq, **kwargs):
                 normalized_seq = _extract_token_ids(seq)
                 if normalized_seq is None:
                     normalized_seq = seq
-                return original_seq2text(tokenizer, normalized_seq, use_cache = use_cache)
+                if _has_use_cache:
+                    return original_seq2text(tokenizer, normalized_seq, **kwargs)
+                return original_seq2text(tokenizer, normalized_seq)
             pass
 
             unsloth_seq2text.__unsloth_patched_seq2text__ = True
