@@ -1167,11 +1167,9 @@ TEMPORARY_PATCHES.append(patch_peft_dispatch_bnb_4bit)
 
 class _ParamShapeProxy:
     """
-    Thin wrapper so attributes for 4bit MoE params are exposed correctly for compatibility with PEFT LoRA; 
+    Wrapper class so that attributes for 4bit MoE params are exposed correctly for compatibility with PEFT LoRA; 
     everything else delegates.
     """
-
-    __slots__ = ("_param", "_shape", "_ndim")
 
     def __init__(self, param, shape):
         self._param = param
@@ -1192,10 +1190,10 @@ class _ParamShapeProxy:
 
 def patch_peft_param_wrapper_4bit_expert_shape():
     """
-    Make ParamWrapper.get_param() report 3D shape for 4bit MoE params so init sets num_experts etc.
+    Make ParamWrapper.get_param() report 3D shape for 4bit MoE params so __init__() works as expected.
 
-    When using quantized MoE expert params (Params4bit), the tensor is 2D flattened;
-    and _original_shape attribute holds (num_experts, in_features, out_features). 
+    Quantized MoE expert params (Params4bit) are 2D flattened and _original_shape attribute holds 
+    (num_experts, in_features, out_features). 
     
     ParamWrapper.get_param() derives num_experts, in_features, out_features from param.shape, 
     leading to wrong shape for Params4bit parameters.
