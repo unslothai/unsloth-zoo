@@ -190,14 +190,13 @@ def patch_bnb4bit_quantize_convert():
         
         # Handle expert parameters - they may come as list of tensors
         # and we need to handle them specially to preserve _original_shape
-        is_expert_param = _is_expert_param_name(full_layer_name)
+        try:
+            from transformers.quantizers.quantizers_utils import get_module_from_name
+            module, _ = get_module_from_name(model, full_layer_name)
 
-        if is_expert_param and model is not None and full_layer_name is not None:
-            try:
-                from transformers.quantizers.quantizers_utils import get_module_from_name
-                module, _ = get_module_from_name(model, full_layer_name)
-
+            if _is_expert_module(module) and model is not None and full_layer_name is not None:
                 old_value = model.get_parameter_or_buffer(full_layer_name)
+
                 original_shape = tuple(value.shape)
                 
                 old_dict = {k: v for k, v in old_value.__dict__.items()}
@@ -212,12 +211,12 @@ def patch_bnb4bit_quantize_convert():
                 
                 module._is_hf_initialized = True
                 return {full_layer_name: new_value}
-            
-            except Exception as e:
-                logger.warning(f"Unsloth: Error handling expert param quantization for {full_layer_name}: {e}")
-                # Fall back to original behavior
-                pass
         
+        except Exception as e:
+            logger.warning(f"Unsloth: Error handling expert param quantization for {full_layer_name}: {e}")
+            # Fall back to original behavior
+            pass
+
         # Fall back to original convert for non-expert params or if module lookup fails
         return original_convert(self, input_dict, full_layer_name=full_layer_name, model=model, **kwargs)
     
