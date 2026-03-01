@@ -102,6 +102,9 @@ def replace_expert_params_with_bnb_params(
     for module_name, module in model.named_modules():
         if not should_convert_module(module_name):
             continue
+
+        if not _is_expert_module(module):
+            continue
         
         gate_up_proj = module.gate_up_proj
         down_proj = module.down_proj
