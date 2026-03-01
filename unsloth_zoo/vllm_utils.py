@@ -381,9 +381,9 @@ if importlib.util.find_spec("vllm") is not None:
             if getattr(original_seq2text, "__unsloth_patched_seq2text__", False):
                 return
 
-            def _extract_token_ids(payload, depth = 0):
-                if depth >= 8:
-                    return None
+            def _extract_token_ids(payload):
+                # Normalize known non-standard payload types to list[int].
+                # Upstream _seq2text only accepts str | list[int].
                 if isinstance(payload, str):
                     return payload
                 if torch.is_tensor(payload):
@@ -392,42 +392,27 @@ if importlib.util.find_spec("vllm") is not None:
                     payload = payload.tolist()
                 if isinstance(payload, (int, np.integer)):
                     return [int(payload)]
-                if isinstance(payload, tuple):
-                    payload = list(payload)
-                if isinstance(payload, list):
+                if isinstance(payload, (tuple, list)):
                     if len(payload) == 0:
                         return payload
+                    # Already flat list[int]
                     if all(isinstance(x, (int, np.integer)) for x in payload):
                         return [int(x) for x in payload]
-                    if len(payload) == 1:
-                        return _extract_token_ids(payload[0], depth = depth + 1)
-                    merged = []
-                    for item in payload:
-                        found = _extract_token_ids(item, depth = depth + 1)
-                        if not isinstance(found, list):
-                            return None
-                        merged.extend(found)
-                    return merged
+                    # One level of nesting: list[list[int]] -> list[int]
+                    if all(isinstance(x, (list, tuple)) for x in payload):
+                        merged = []
+                        for sub in payload:
+                            if not all(isinstance(v, (int, np.integer)) for v in sub):
+                                return None
+                            merged.extend(int(v) for v in sub)
+                        return merged
+                    return None
                 if isinstance(payload, dict):
-                    preferred_keys = (
-                        "token_ids",
-                        "input_ids",
-                        "ids",
-                        "prompt_token_ids",
-                        "token_id",
-                        "tokens",
-                        "prompt",
-                        "content",
-                    )
-                    for key in preferred_keys:
-                        if key in payload:
-                            found = _extract_token_ids(payload[key], depth = depth + 1)
-                            if found is not None:
-                                return found
-                    for value in payload.values():
-                        found = _extract_token_ids(value, depth = depth + 1)
-                        if found is not None:
-                            return found
+                    for key in ("token_ids", "input_ids", "prompt_token_ids"):
+                        value = payload.get(key)
+                        if value is not None:
+                            return _extract_token_ids(value)
+                    return None
                 return None
             pass
 

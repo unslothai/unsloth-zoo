@@ -278,7 +278,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
         adapter_manager = getattr(self, "_adapter_manager", None)
         if adapter_manager is None:
             return False
-        if not bool(getattr(adapter_manager, "supports_mm", True)):
+        if not bool(getattr(adapter_manager, "supports_mm", False)):
             return False
 
         capability = getattr(adapter_manager, "supports_tower_connector_lora", False)
