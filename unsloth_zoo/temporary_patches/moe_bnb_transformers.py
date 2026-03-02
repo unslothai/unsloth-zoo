@@ -44,15 +44,11 @@ def _check_bnb_available():
     return True
 
 
-def _is_expert_param_name(full_layer_name: str) -> bool:
-    """Check if a parameter name indicates an MoE expert parameter."""
-    if not full_layer_name:
-        return False
-    return "gate_up_proj" in full_layer_name or "down_proj" in full_layer_name
-
-
 def _is_expert_module(module: nn.Module) -> bool:
-    """Check if a module is an MoE experts module."""
+    """
+    Check if a module is an MoE experts module.
+    Specifically, check if the module has gate_up_proj & down_proj attributes that are nn.Parameter.
+    """
     return (
         hasattr(module, "gate_up_proj")
         and hasattr(module, "down_proj")
@@ -64,12 +60,12 @@ def _is_expert_module(module: nn.Module) -> bool:
 def replace_expert_params_with_bnb_params(
     model: nn.Module,
     modules_to_not_convert: Optional[List[str]] = None,
-    quantization_config=None,
+    quantization_config = None,
     pre_quantized: bool = False,
 ) -> nn.Module:
     """
-    This is used to patch the Bnb4bitQuantizer._process_model_before_weight_loading to 
-    replace MoE expert parameters (gate_up_proj, down_proj) with Params4bit placeholders.
+    Patch Bnb4bitQuantizer._process_model_before_weight_loading to replace MoE 
+    parameters (gate_up_proj, down_proj) with Params4bit placeholders.
     
     This follows the same pattern as replace_with_bnb_linear - creates placeholders
     on meta device that will be quantized during weight loading.
@@ -89,7 +85,6 @@ def replace_expert_params_with_bnb_params(
     has_been_replaced = False
     
     # Default quantization settings
-    compute_dtype = torch.bfloat16
     compress_statistics = True
     quant_type = "nf4"
     quant_storage = torch.uint8
@@ -100,7 +95,7 @@ def replace_expert_params_with_bnb_params(
         quant_storage = getattr(quantization_config, 'bnb_4bit_quant_storage', torch.uint8)
     
     for module_name, module in model.named_modules():
-        if not should_convert_module(module_name):
+        if not should_convert_module(module_name, modules_to_not_convert):
             continue
 
         if not _is_expert_module(module):
@@ -113,21 +108,20 @@ def replace_expert_params_with_bnb_params(
         if isinstance(gate_up_proj, Params4bit) or isinstance(down_proj, Params4bit):
             continue
         
-        # Get original shapes for PEFT LoRA compatibility
         gate_up_shape = tuple(gate_up_proj.shape)
         down_proj_shape = tuple(down_proj.shape)
         
         # Create Params4bit placeholders on meta device
         with torch.device("meta"):
             placeholder_gate_up = Params4bit(
-                torch.zeros(gate_up_shape, device="meta"),
+                torch.zeros(gate_up_shape),
                 requires_grad=False,
                 compress_statistics=compress_statistics,
                 quant_type=quant_type,
                 quant_storage=quant_storage,
             )
             placeholder_down = Params4bit(
-                torch.zeros(down_proj_shape, device="meta"),
+                torch.zeros(down_proj_shape),
                 requires_grad=False,
                 compress_statistics=compress_statistics,
                 quant_type=quant_type,
@@ -159,8 +153,8 @@ def patch_bnb4bit_quantize_convert():
     Patch Bnb4bitQuantize.convert to handle expert parameters correctly.
     
     This ensures:
-    1. Expert parameters preserve _original_shape for PEFT LoRA
-    2. Handles both single tensor and multi-tensor cases robustly
+    1. Expert parameters are quantized correctly.
+    2. Expert parameters preserve _original_shape for PEFT LoRA
     """
     if not _check_bnb_available():
         return
@@ -169,8 +163,7 @@ def patch_bnb4bit_quantize_convert():
         from transformers.integrations.bitsandbytes import Bnb4bitQuantize
     except Exception as e:
         return raise_error("transformers.integrations.bitsandbytes.Bnb4bitQuantize", e)
-    
-    # Check if already patched
+
     if hasattr(Bnb4bitQuantize.convert, "_unsloth_moe_patched"):
         return
     
@@ -194,7 +187,7 @@ def patch_bnb4bit_quantize_convert():
             from transformers.quantizers.quantizers_utils import get_module_from_name
             module, _ = get_module_from_name(model, full_layer_name)
 
-            if _is_expert_module(module) and model is not None and full_layer_name is not None:
+            if _is_expert_module(module):
                 old_value = model.get_parameter_or_buffer(full_layer_name)
 
                 original_shape = tuple(value.shape)
@@ -202,7 +195,7 @@ def patch_bnb4bit_quantize_convert():
                 old_dict = {k: v for k, v in old_value.__dict__.items()}
                 new_value = Params4bit(value, requires_grad=False, **old_dict).to(value.device)
                 
-                # Preserve _original_shape for expert params (critical for PEFT LoRA!)
+                # Preserve _original_shape for expert params (critical for PEFT LoRA compatibility)
                 if original_shape is not None:
                     setattr(new_value, "_original_shape", original_shape)
                     logger.debug(
@@ -217,7 +210,7 @@ def patch_bnb4bit_quantize_convert():
             # Fall back to original behavior
             pass
 
-        # Fall back to original convert for non-expert params or if module lookup fails
+        # Fall back to original convert for non-expert params or in case of any failure
         return original_convert(self, input_dict, full_layer_name=full_layer_name, model=model, **kwargs)
     
     patched_convert._unsloth_moe_patched = True
@@ -261,7 +254,6 @@ def patch_bnb4bit_quantizer_param_needs_quantization():
                 if isinstance(param, Params4bit):
                     return True
         except Exception:
-            # fall back to original behavior
             # TODO: Can we raise an error here?
             logger.warning(
                 f"Unsloth: Error checking MoE expert param_needs_quantization for {param_name}: {e}"
@@ -278,8 +270,7 @@ def patch_bnb4bit_quantizer_param_needs_quantization():
 
 def patch_bnb4bit_quantizer_process_model():
     """
-    Patch Bnb4BitHfQuantizer._process_model_before_weight_loading to ensure
-    replace_expert_params_with_bnb_params is called.
+    Patch Bnb4BitHfQuantizer._process_model_before_weight_loading to ensure replace_expert_params_with_bnb_params is called for expert parameters.
     """
     if not _check_bnb_available():
         return
@@ -293,26 +284,11 @@ def patch_bnb4bit_quantizer_process_model():
     if hasattr(Bnb4BitHfQuantizer._process_model_before_weight_loading, "_unsloth_moe_patched"):
         return
     
-    original_process = Bnb4BitHfQuantizer._process_model_before_weight_loading
+    original_process_model_before_weight_loading = Bnb4BitHfQuantizer._process_model_before_weight_loading
     
     def patched_process_model_before_weight_loading(self, model, device_map, **kwargs):
         """Patched to use our replace_expert_params_with_bnb_params."""
-        from transformers.integrations.bitsandbytes import replace_with_bnb_linear
-        
-        self.modules_to_not_convert = self.get_modules_to_not_convert(
-            model, self.quantization_config.llm_int8_skip_modules, model._keep_in_fp32_modules
-        )
-        if self.quantization_config.llm_int8_enable_fp32_cpu_offload:
-            if isinstance(device_map, dict):
-                keys_on_cpu = [key for key, value in device_map.items() if value in ["disk", "cpu"]]
-                self.modules_to_not_convert.extend(keys_on_cpu)
-        
-        model = replace_with_bnb_linear(
-            model,
-            modules_to_not_convert=self.modules_to_not_convert,
-            quantization_config=self.quantization_config,
-            pre_quantized=self.pre_quantized,
-        )
+        model = original_process_model_before_weight_loading(self, model, device_map, **kwargs)
         
         # Use our replace_expert_params_with_bnb_params
         model = replace_expert_params_with_bnb_params(
