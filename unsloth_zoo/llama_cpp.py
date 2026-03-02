@@ -170,8 +170,7 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
             'build-essential': (
                 'Microsoft.VisualStudio.2022.BuildTools',
                 ['--override',
-                 '--add Microsoft.VisualStudio.Workload.VCTools '
-                 '--includeRecommended --passive --wait'],
+                 '--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive --wait'],
             ),
             'openssl': ('ShiningLight.OpenSSL.Dev', []),
         }
