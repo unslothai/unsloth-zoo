@@ -26,6 +26,19 @@ UNSLOTH_COMPILE_LOCATION = os.environ.get(
     "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
 )
 
+try:
+    import bitsandbytes as bnb
+    from bitsandbytes.nn import Params4bit
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+    Params4bit = None
+
+
+def _check_bnb_available():
+    if not HAS_BNB:
+        return False
+    return True
 
 def install_to_cache(source_path, destination_filename=None):
     """
@@ -410,8 +423,7 @@ def _get_base_weight(param):
         param = param.base_layer
     
     # If the parameter is a Params4bit, dequantize it
-    if param.__class__.__name__ == "Params4bit":
-        import bitsandbytes as bnb
+    if _check_bnb_available() and isinstance(param, Params4bit):
         # Dequantize the parameter
         return bnb.functional.dequantize_4bit(param.data, param.quant_state)
 
@@ -583,7 +595,7 @@ def _is_moe_experts_module(module) -> bool:
         param = module.gate_up_proj
         
         # If the param is 4bit-quantized, return True e.g. for expert parameters in MoE, the quantized param is a 2D tensor.
-        if param.__class__.__name__ == "Params4bit" and param.ndim == 2:
+        if _check_bnb_available() and isinstance(param, Params4bit) and param.ndim == 2:
             return True
 
         if isinstance(param, nn.Parameter) and param.ndim == 3:
