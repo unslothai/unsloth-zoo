@@ -27,4 +27,4 @@ from .deepseek_v3_moe import *
 from .pixtral import *
 from .mxfp4 import *
 from .bitsandbytes import *
-from .moe_bnb_transformers import *
+from .moe_bnb import *

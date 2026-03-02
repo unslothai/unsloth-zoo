@@ -2,46 +2,36 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published
-# by the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# GNU General Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
+# You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
-MoE 4-bit Quantization Module
+MoE Expert Parameter 4-bit Quantization Patch for Transformers
 
-Provides bitsandbytes-style 4-bit quantization for Mixture of Experts layers.
-This is necessary because transformers' Qwen3MoeExperts uses nn.Parameter
-tensors instead of nn.Linear modules, so bitsandbytes' standard quantization
-skips them.
-
-Design follows bitsandbytes patterns:
-- Uses Params4bit for per-expert weight quantization
-- Quantization happens on .to(cuda), just like Linear4bit
-- Integrates with model loading via replace_with_bnb_moe_experts()
+Patches transformers' bitsandbytes quantization to handle MoE expert parameters
+(gate_up_proj, down_proj) that are nn.Parameter instead of nn.Linear.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, List, Any, Tuple
+from typing import Optional, List, Tuple
 import os
-import warnings
-from ..log import logger
-
-UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
+from .utils import patch_function, raise_error
 
 # Check bitsandbytes availability
 try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Params4bit
-    from bitsandbytes.functional import dequantize_4bit
     HAS_BNB = True
 except ImportError:
     HAS_BNB = False
@@ -49,482 +39,291 @@ except ImportError:
 
 
 def _check_bnb_available():
-    """Check if bitsandbytes is available and raise helpful error if not."""
     if not HAS_BNB:
-        raise ImportError(
-            "bitsandbytes is required for MoE 4-bit quantization. "
-            "Install via: pip install bitsandbytes"
-        )
+        return False
+    return True
 
 
-class MoeExperts4bit(nn.Module):
+def _is_expert_module(module: nn.Module) -> bool:
     """
-    Base class for 4-bit quantized MoE experts.
-
-    Follows bitsandbytes Linear4bit patterns for compatibility and maintainability:
-    - Stores per-expert weights as Params4bit
-    - Quantization happens when moving to CUDA (like Linear4bit)
-    - Self-contained forward using bnb.matmul_4bit for each expert
-
-    The module replaces Qwen3MoeExperts or similar, providing the same interface
-    but with quantized weights.
-
-    NOTE: BNB 4-bit MoE uses loop-based forward (each expert processed individually).
-    For maximum throughput, consider using grouped_mm backend with native bf16 weights.
-    Set UNSLOTH_MOE_BACKEND=grouped_mm environment variable.
+    Check if a module is an MoE experts module.
+    Specifically, check if the module has gate_up_proj & down_proj attributes that are nn.Parameter.
     """
-    _warned_loop_based = False
-
-    def __init__(
-        self,
-        num_experts: int,
-        hidden_dim: int,
-        intermediate_dim: int,
-        compute_dtype: Optional[torch.dtype] = None,
-        compress_statistics: bool = True,
-        quant_type: str = "nf4",
-        quant_storage: torch.dtype = torch.uint8,
-        device: Optional[torch.device] = None,
-    ):
-        """
-        Initialize MoeExperts4bit.
-
-        Args:
-            num_experts: Number of experts in the MoE layer
-            hidden_dim: Hidden dimension of the model
-            intermediate_dim: Intermediate dimension of FFN
-            compute_dtype: Dtype for computation (typically bf16 or fp16)
-            compress_statistics: Whether to compress quantization statistics
-            quant_type: Quantization type ("nf4" or "fp4")
-            quant_storage: Storage dtype for quantized weights
-            device: Device to place weights on
-        """
-        super().__init__()
-        _check_bnb_available()
-
-        self.num_experts = num_experts
-        self.hidden_dim = hidden_dim
-        self.intermediate_dim = intermediate_dim
-        self.compute_dtype = compute_dtype
-        self.compute_type_is_set = compute_dtype is not None
-        self.compress_statistics = compress_statistics
-        self.quant_type = quant_type
-        self.quant_storage = quant_storage
-
-        # Flag for detection
-        self._is_bnb_4bit = True
-
-        # Per-expert quantized weights stored as ParameterLists for proper registration
-        # Each expert's gate_up_proj: Params4bit of shape [2*intermediate_dim, hidden_dim]
-        # Each expert's down_proj: Params4bit of shape [hidden_dim, intermediate_dim]
-        self._bnb_gate_up_weights = nn.ParameterList()
-        self._bnb_down_weights = nn.ParameterList()
-
-        # These will hold the original Parameters for weight loading
-        # They get converted to Params4bit when .to(cuda) is called
-        self._gate_up_proj_pending = None
-        self._down_proj_pending = None
-
-        # Activation function
-        self.act_fn = F.silu
-
-    def set_compute_type(self, x: torch.Tensor):
-        """Set compute dtype based on input, following Linear4bit pattern."""
-        if x.dtype in [torch.float32, torch.bfloat16]:
-            self.compute_dtype = x.dtype
-        elif x.dtype == torch.float16:
-            if self.compute_dtype in [None, torch.float32]:
-                warnings.warn(
-                    "Input type into MoeExperts4bit is torch.float16, but compute_dtype=torch.float32. "
-                    "This may lead to slow inference.",
-                )
-                warnings.filterwarnings("ignore", message=".*slow inference.*")
-
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        """
-        Override to handle loading 3D stacked weights and convert to Params4bit.
-
-        This is called during model.load_state_dict() - the key place where on-the-fly
-        quantization happens.
-        """
-        gate_up_key = prefix + "gate_up_proj"
-        down_key = prefix + "down_proj"
-
-        # Check if loading original stacked format
-        if gate_up_key in state_dict:
-            # Store the weights temporarily - will be quantized on .to(cuda)
-            gate_up_proj = state_dict.pop(gate_up_key)
-            down_proj = state_dict.pop(down_key)
-
-            # If on CUDA, quantize immediately
-            if gate_up_proj.device.type == 'cuda':
-                self._quantize_and_store(gate_up_proj, down_proj)
-            else:
-                # Store for later quantization on .to(cuda)
-                self.register_buffer("_gate_up_proj_pending", gate_up_proj)
-                self.register_buffer("_down_proj_pending", down_proj)
-        else:
-            # Try loading per-expert quantized format
-            super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-
-    def _quantize_and_store(self, gate_up_proj: torch.Tensor, down_proj: torch.Tensor):
-        """Quantize stacked weights to per-expert Params4bit."""
-        num_experts = gate_up_proj.shape[0]
-        self.num_experts = num_experts
-
-        # Clear existing
-        self._bnb_gate_up_weights = nn.ParameterList()
-        self._bnb_down_weights = nn.ParameterList()
-
-        device = gate_up_proj.device
-
-        for expert_idx in range(num_experts):
-            # Extract 2D weight for this expert
-            gate_up_weight = gate_up_proj[expert_idx].detach().clone()  # [2*I, H]
-            down_weight = down_proj[expert_idx].detach().clone()  # [H, I]
-
-            # Create Params4bit - quantization happens here since on CUDA
-            gate_up_4bit = Params4bit(
-                gate_up_weight,
-                requires_grad=False,
-                compress_statistics=self.compress_statistics,
-                quant_type=self.quant_type,
-                quant_storage=self.quant_storage,
-                module=None,
-            )
-
-            down_4bit = Params4bit(
-                down_weight,
-                requires_grad=False,
-                compress_statistics=self.compress_statistics,
-                quant_type=self.quant_type,
-                quant_storage=self.quant_storage,
-                module=None,
-            )
-
-            # Move to device (triggers quantization)
-            gate_up_4bit = gate_up_4bit.to(device)
-            down_4bit = down_4bit.to(device)
-
-            self._bnb_gate_up_weights.append(gate_up_4bit)
-            self._bnb_down_weights.append(down_4bit)
-
-        # Clear pending buffers
-        if hasattr(self, "_gate_up_proj_pending") and self._gate_up_proj_pending is not None:
-            del self._gate_up_proj_pending
-        if hasattr(self, "_down_proj_pending") and self._down_proj_pending is not None:
-            del self._down_proj_pending
-
-    def _apply(self, fn, recurse=True):
-        """
-        Override _apply to handle quantization when .to(cuda) is called.
-
-        This is the key hook for on-the-fly quantization - when the model is moved
-        to CUDA, pending weights are quantized.
-        """
-        # Check if moving to CUDA and have pending weights
-        if hasattr(self, "_gate_up_proj_pending") and self._gate_up_proj_pending is not None:
-            # Apply the function to get the target device
-            test_tensor = fn(torch.zeros(1))
-            if test_tensor.device.type == 'cuda':
-                # Quantize now
-                pending_gate_up = fn(self._gate_up_proj_pending)
-                pending_down = fn(self._down_proj_pending)
-                self._quantize_and_store(pending_gate_up, pending_down)
-                # Skip applying to pending weights since we've consumed them
-                return self
-
-        return super()._apply(fn, recurse)
-
-    def _matmul_4bit(self, x: torch.Tensor, weight: Params4bit) -> torch.Tensor:
-        """
-        Perform 4-bit matmul using bitsandbytes, following Linear4bit.forward pattern.
-        """
-        quant_state = weight.quant_state
-        w = weight.t()
-        return bnb.matmul_4bit(x, w, bias=None, quant_state=quant_state)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Optimized forward pass using bnb.matmul_4bit for each expert.
-        Only iterates over experts that actually have tokens routed to them.
-        """
-        # Set compute type on first forward (like Linear4bit)
-        if not self.compute_type_is_set:
-            self.set_compute_type(hidden_states)
-            self.compute_type_is_set = True
-
-            # Warn about loop-based forward (only once)
-            if UNSLOTH_ENABLE_LOGGING and not MoeExperts4bit._warned_loop_based:
-                MoeExperts4bit._warned_loop_based = True
-                logger.warning(
-                    "Unsloth: Using BNB 4-bit MoE with loop-based forward. "
-                    "For higher throughput, consider using grouped_mm backend with bf16 model."
-                )
-
-        inp_dtype = hidden_states.dtype
-        if self.compute_dtype is not None:
-            hidden_states = hidden_states.to(self.compute_dtype)
-
-        final_hidden_states = torch.zeros_like(hidden_states)
-
-        # Optimized routing: only process experts that have tokens
-        # This is much faster than iterating over all 128 experts
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)  # [num_experts, top_k, num_tokens]
-            # Find which experts actually have tokens (sum across top_k and tokens dims)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False)
-
-        # Only loop over experts that have tokens routed to them
-        for expert_idx_t in expert_hit:
-            expert_idx = expert_idx_t.item()
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-
-            current_state = hidden_states[token_idx]
-
-            # Get quantized weights for this expert
-            gate_up_weight = self._bnb_gate_up_weights[expert_idx]
-            down_weight = self._bnb_down_weights[expert_idx]
-
-            # Compute gate_up projection using bnb.matmul_4bit
-            gate_up_out = self._matmul_4bit(current_state, gate_up_weight)
-            gate, up = gate_up_out.chunk(2, dim=-1)
-
-            # Activation
-            current_hidden_states = self.act_fn(gate) * up
-
-            # Compute down projection using bnb.matmul_4bit
-            current_hidden_states = self._matmul_4bit(current_hidden_states, down_weight)
-
-            # Apply routing weights
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-
-            # Scatter back
-            final_hidden_states.index_add_(
-                0, token_idx, current_hidden_states
-            )
-
-        return final_hidden_states.to(inp_dtype)
-
-    def _save_to_state_dict(self, destination, prefix, keep_vars):
-        """Save quantized weights to state dict, following Linear4bit pattern."""
-        # Handle case where weights haven't been loaded yet (empty ParameterLists)
-        if len(self._bnb_gate_up_weights) == 0:
-            # Fall back to default state dict saving
-            super()._save_to_state_dict(destination, prefix, keep_vars)
-            return
-
-        for expert_idx in range(self.num_experts):
-            gate_up_4bit = self._bnb_gate_up_weights[expert_idx]
-            down_4bit = self._bnb_down_weights[expert_idx]
-
-            # Save weight data
-            gate_up_prefix = f"{prefix}_bnb_gate_up_weights.{expert_idx}."
-            down_prefix = f"{prefix}_bnb_down_weights.{expert_idx}."
-
-            destination[f"{gate_up_prefix}weight"] = (
-                gate_up_4bit.data if keep_vars else gate_up_4bit.data.detach()
-            )
-            destination[f"{down_prefix}weight"] = (
-                down_4bit.data if keep_vars else down_4bit.data.detach()
-            )
-
-            # Save quant state components
-            if hasattr(gate_up_4bit, 'quant_state') and gate_up_4bit.quant_state is not None:
-                for k, v in gate_up_4bit.quant_state.as_dict(packed=True).items():
-                    destination[f"{gate_up_prefix}weight.{k}"] = v if keep_vars else v.detach()
-
-            if hasattr(down_4bit, 'quant_state') and down_4bit.quant_state is not None:
-                for k, v in down_4bit.quant_state.as_dict(packed=True).items():
-                    destination[f"{down_prefix}weight.{k}"] = v if keep_vars else v.detach()
+    return (
+        hasattr(module, "gate_up_proj")
+        and hasattr(module, "down_proj")
+        and isinstance(module.gate_up_proj, nn.Parameter)
+        and isinstance(module.down_proj, nn.Parameter)
+    )
 
 
-class Qwen3MoeExperts4bit(MoeExperts4bit):
-    """4-bit quantized version of Qwen3MoeExperts."""
-    pass
-
-
-class Qwen3VLMoeExperts4bit(MoeExperts4bit):
-    """4-bit quantized version of Qwen3VLMoeTextExperts."""
-    pass
-
-
-def replace_with_bnb_moe_experts(
+def replace_expert_params_with_bnb_params(
     model: nn.Module,
-    quantization_config=None,
-) -> Tuple[nn.Module, bool]:
+    modules_to_not_convert: Optional[List[str]] = None,
+    quantization_config = None,
+    pre_quantized: bool = False,
+) -> nn.Module:
     """
-    Replace MoE expert modules with 4-bit quantized versions BEFORE weights are loaded.
-
-    This follows the same pattern as transformers' replace_with_bnb_linear - we replace
-    the modules on meta device, then weights are loaded and quantized on-the-fly.
-
-    Args:
-        model: The model to convert
-        quantization_config: BitsAndBytesConfig with quantization parameters
-
+    Patch Bnb4bitQuantizer._process_model_before_weight_loading to replace MoE 
+    parameters (gate_up_proj, down_proj) with Params4bit placeholders.
+    
+    This follows the same pattern as replace_with_bnb_linear - creates placeholders
+    on meta device that will be quantized during weight loading.
+    
     Returns:
-        Tuple of (model, has_been_replaced)
+        The model with expert params replaced
     """
-    _check_bnb_available()
 
+    try:
+        from transformers.quantizers.quantizers_utils import should_convert_module
+    except Exception as e:
+        return raise_error("transformers.quantizers.quantizers_utils.should_convert_module", e)
+
+    if not _check_bnb_available():
+        return model
+    
     has_been_replaced = False
-
+    
     # Default quantization settings
-    compute_dtype = torch.bfloat16
     compress_statistics = True
     quant_type = "nf4"
     quant_storage = torch.uint8
-
+    
     if quantization_config is not None:
-        compute_dtype = getattr(quantization_config, 'bnb_4bit_compute_dtype', torch.bfloat16)
         compress_statistics = getattr(quantization_config, 'bnb_4bit_use_double_quant', True)
         quant_type = getattr(quantization_config, 'bnb_4bit_quant_type', 'nf4')
         quant_storage = getattr(quantization_config, 'bnb_4bit_quant_storage', torch.uint8)
+    
+    for module_name, module in model.named_modules():
+        if not should_convert_module(module_name, modules_to_not_convert):
+            continue
 
-    # Find all MoE expert modules
-    for module_name, module in list(model.named_modules()):
-        if hasattr(module, 'experts') and hasattr(module.experts, 'gate_up_proj'):
-            experts = module.experts
-
-            # Skip if already quantized
-            if getattr(experts, '_is_bnb_4bit', False):
-                continue
-
-            # Get dimensions from the original module
-            gate_up_proj = experts.gate_up_proj
-            num_experts = gate_up_proj.shape[0]
-
-            # Determine quantized class based on module type
-            module_class_name = type(module).__name__
-            if 'Qwen3VL' in module_class_name or 'qwen3_vl' in type(module).__module__:
-                quantized_cls = Qwen3VLMoeExperts4bit
-                # Qwen3-VL has transposed weights in grouped_mm format (E, H, 2*I)
-                # gate_up_proj: (E, H, 2*I)
-                intermediate_dim = gate_up_proj.shape[2] // 2
-                hidden_dim = gate_up_proj.shape[1]
-            else:
-                quantized_cls = Qwen3MoeExperts4bit
-                # Qwen3-MoE has weights in F.linear format (E, 2*I, H)
-                intermediate_dim = gate_up_proj.shape[1] // 2
-                hidden_dim = gate_up_proj.shape[2]
-
-            # Create quantized version on meta device (like replace_with_bnb_linear does)
-            with torch.device("meta"):
-                new_experts = quantized_cls(
-                    num_experts=num_experts,
-                    hidden_dim=hidden_dim,
-                    intermediate_dim=intermediate_dim,
-                    compute_dtype=compute_dtype,
-                    compress_statistics=compress_statistics,
-                    quant_type=quant_type,
-                    quant_storage=quant_storage,
-                )
-
-            # Copy activation function if present
-            if hasattr(experts, 'act_fn'):
-                new_experts.act_fn = experts.act_fn
-
-            # Replace the module
-            module.experts = new_experts
-            has_been_replaced = True
-
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.info(
-                    f"Unsloth: Prepared {module_name}.experts for BNB 4-bit quantization "
-                    f"({num_experts} experts, hidden={hidden_dim}, intermediate={intermediate_dim})"
-                )
-
-    return model, has_been_replaced
-
-
-def is_moe_quantized(module: nn.Module) -> bool:
-    """Check if an MoE experts module is 4-bit quantized."""
-    return getattr(module, '_is_bnb_4bit', False)
-
-
-# Compatibility functions for post-loading quantization (kept for manual use)
-def quantize_moe_experts_inplace(model: nn.Module, verbose: bool = True) -> int:
-    """
-    Post-loading quantization (uses more memory but works with any model).
-
-    NOTE: Prefer replace_with_bnb_moe_experts() for on-the-fly quantization
-    which uses less peak memory.
-    """
-    _check_bnb_available()
-
-    count = 0
-
-    for name, module in list(model.named_modules()):
-        if hasattr(module, 'experts') and hasattr(module.experts, 'gate_up_proj'):
-            experts = module.experts
-
-            if getattr(experts, '_is_bnb_4bit', False):
-                continue
-
-            module_class_name = type(module).__name__
-            if 'Qwen3VL' in module_class_name or 'qwen3_vl' in type(module).__module__:
-                quantized_cls = Qwen3VLMoeExperts4bit
-            else:
-                quantized_cls = Qwen3MoeExperts4bit
-
-            compute_dtype = experts.gate_up_proj.dtype
-
-            if verbose:
-                print(f"Unsloth: Quantizing {name}.experts to 4-bit...")
-
-            # Create new quantized module and copy weights
-            new_experts = quantized_cls(
-                num_experts=experts.gate_up_proj.shape[0],
-                hidden_dim=experts.gate_up_proj.shape[2],
-                intermediate_dim=experts.gate_up_proj.shape[1] // 2,
-                compute_dtype=compute_dtype,
+        if not _is_expert_module(module):
+            continue
+        
+        gate_up_proj = module.gate_up_proj
+        down_proj = module.down_proj
+        
+        # Skip if already quantized
+        if isinstance(gate_up_proj, Params4bit) or isinstance(down_proj, Params4bit):
+            continue
+        
+        gate_up_shape = tuple(gate_up_proj.shape)
+        down_proj_shape = tuple(down_proj.shape)
+        
+        # Create Params4bit placeholders on meta device
+        with torch.device("meta"):
+            placeholder_gate_up = Params4bit(
+                torch.zeros(gate_up_shape),
+                requires_grad=False,
+                compress_statistics=compress_statistics,
+                quant_type=quant_type,
+                quant_storage=quant_storage,
             )
-            new_experts._quantize_and_store(experts.gate_up_proj, experts.down_proj)
-
-            if hasattr(experts, 'act_fn'):
-                new_experts.act_fn = experts.act_fn
-
-            module.experts = new_experts
-            del experts
-            torch.cuda.empty_cache()
-
-            count += 1
-
-    if verbose and count > 0:
-        print(f"Unsloth: Quantized {count} MoE expert modules to 4-bit.")
-
-    return count
-
-
-def post_quantize_moe_experts(model: nn.Module, load_in_4bit: bool = False, verbose: bool = True) -> nn.Module:
-    """
-    Post-loading hook to quantize MoE experts to 4-bit.
-
-    NOTE: This uses post-quantization which requires more peak memory.
-    For lower memory usage, use replace_with_bnb_moe_experts() before weight loading.
-    """
-    if not load_in_4bit or not HAS_BNB:
-        return model
-
-    has_moe = False
-    for name, module in model.named_modules():
-        if hasattr(module, 'experts') and hasattr(module.experts, 'gate_up_proj'):
-            has_moe = True
-            break
-
-    if not has_moe:
-        return model
-
-    if verbose:
-        print("Unsloth: Quantizing MoE experts to 4-bit...")
-
-    count = quantize_moe_experts_inplace(model, verbose=verbose)
-
+            placeholder_down = Params4bit(
+                torch.zeros(down_proj_shape),
+                requires_grad=False,
+                compress_statistics=compress_statistics,
+                quant_type=quant_type,
+                quant_storage=quant_storage,
+            )
+        
+        if pre_quantized:
+            placeholder_gate_up.data = placeholder_gate_up.data.to(dtype=quant_storage)
+            placeholder_down.data = placeholder_down.data.to(dtype=quant_storage)
+        
+        # Replace the parameters
+        module.gate_up_proj = placeholder_gate_up
+        module.down_proj = placeholder_down
+        has_been_replaced = True
+        
+        logger.info(
+            f"Unsloth: Prepared {module_name}.gate_up_proj and .down_proj for BNB 4-bit quantization "
+            f"(shape: {gate_up_shape}, {down_proj_shape})"
+        )
+    
+    if not has_been_replaced:
+        logger.warning(f"Unsloth: No expert parameters were found to be replaced for {model.name_or_path}")
+    
     return model
+
+
+def patch_bnb4bit_quantize_convert():
+    """
+    Patch Bnb4bitQuantize.convert to handle expert parameters correctly.
+    
+    This ensures:
+    1. Expert parameters are quantized correctly.
+    2. Expert parameters preserve _original_shape for PEFT LoRA
+    """
+    if not _check_bnb_available():
+        return
+    
+    try:
+        from transformers.integrations.bitsandbytes import Bnb4bitQuantize
+    except Exception as e:
+        return raise_error("transformers.integrations.bitsandbytes.Bnb4bitQuantize", e)
+
+    if hasattr(Bnb4bitQuantize.convert, "_unsloth_moe_patched"):
+        return
+    
+    original_convert = Bnb4bitQuantize.convert
+    
+    def patched_convert(
+        self,
+        input_dict: dict[str, list[torch.Tensor]],
+        full_layer_name: str | None = None,
+        model: torch.nn.Module | None = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Patched convert that handles expert parameters correctly.
+        """
+        value = list(input_dict.values())[0]
+        
+        # Handle expert parameters - they may come as list of tensors
+        # and we need to handle them specially to preserve _original_shape
+        try:
+            from transformers.quantizers.quantizers_utils import get_module_from_name
+            module, _ = get_module_from_name(model, full_layer_name)
+
+            if _is_expert_module(module):
+                old_value = model.get_parameter_or_buffer(full_layer_name)
+
+                original_shape = tuple(value.shape)
+                
+                old_dict = {k: v for k, v in old_value.__dict__.items()}
+                new_value = Params4bit(value, requires_grad=False, **old_dict).to(value.device)
+                
+                # Preserve _original_shape for expert params (critical for PEFT LoRA compatibility)
+                if original_shape is not None:
+                    setattr(new_value, "_original_shape", original_shape)
+                    logger.debug(
+                        f"Unsloth: Preserved _original_shape={original_shape} for {full_layer_name}"
+                    )
+                
+                module._is_hf_initialized = True
+                return {full_layer_name: new_value}
+        
+        except Exception as e:
+            logger.warning(f"Unsloth: Error handling expert param quantization for {full_layer_name}: {e}")
+            # Fall back to original behavior
+            pass
+
+        # Fall back to original convert for non-expert params or in case of any failure
+        return original_convert(self, input_dict, full_layer_name=full_layer_name, model=model, **kwargs)
+    
+    patched_convert._unsloth_moe_patched = True
+    patch_function(Bnb4bitQuantize, "convert", patched_convert)
+    
+    logger.info("Unsloth: Patched Bnb4bitQuantize.convert for MoE expert parameter support")
+
+
+def patch_bnb4bit_quantizer_param_needs_quantization():
+    """
+    Patch Bnb4BitHfQuantizer.param_needs_quantization to recognize expert parameters
+    (gate_up_proj, down_proj) that are Params4bit placeholders as needing quantization.
+    
+    This ensures quantization ops are assigned during weight loading for expert params.
+    """
+    if not _check_bnb_available():
+        return
+    
+    try:
+        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
+        from transformers.quantizers.quantizers_utils import get_module_from_name
+    except Exception as e:
+        return raise_error("transformers.quantizers.quantizer_bnb_4bit.Bnb4BitHfQuantizer", e)
+    
+    if hasattr(Bnb4BitHfQuantizer.param_needs_quantization, "_unsloth_moe_patched"):
+        return
+    
+    original_param_needs_quantization = Bnb4BitHfQuantizer.param_needs_quantization
+    
+    def patched_param_needs_quantization(self, model: "PreTrainedModel", param_name: str, **kwargs) -> bool:
+        """Patched to recognize expert Params4bit placeholders as needing quantization."""
+        # Check if it is a Linear4bit module
+        if original_param_needs_quantization(self, model, param_name, **kwargs):
+            return True
+        
+        # Check if it is an expert parameter (gate_up_proj or down_proj) that is a Params4bit placeholder
+        try:
+            module, name = get_module_from_name(model, param_name)
+            if name in ("gate_up_proj", "down_proj"):
+                param = getattr(module, name, None)
+                if isinstance(param, Params4bit):
+                    return True
+        except Exception:
+            # TODO: Can we raise an error here?
+            logger.warning(
+                f"Unsloth: Error checking MoE expert param_needs_quantization for {param_name}: {e}"
+            )
+            pass
+        
+        return False
+    
+    patched_param_needs_quantization._unsloth_moe_patched = True
+    patch_function(Bnb4BitHfQuantizer, "param_needs_quantization", patched_param_needs_quantization)
+    
+    logger.info("Unsloth: Patched Bnb4BitHfQuantizer.param_needs_quantization for MoE expert parameters")
+
+
+def patch_bnb4bit_quantizer_process_model():
+    """
+    Patch Bnb4BitHfQuantizer._process_model_before_weight_loading to ensure replace_expert_params_with_bnb_params is called for expert parameters.
+    """
+    if not _check_bnb_available():
+        return
+    
+    try:
+        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
+    except Exception as e:
+        return raise_error("transformers.quantizers.quantizer_bnb_4bit.Bnb4BitHfQuantizer", e)
+    
+    # Check if already patched
+    if hasattr(Bnb4BitHfQuantizer._process_model_before_weight_loading, "_unsloth_moe_patched"):
+        return
+    
+    original_process_model_before_weight_loading = Bnb4BitHfQuantizer._process_model_before_weight_loading
+    
+    def patched_process_model_before_weight_loading(self, model, device_map, **kwargs):
+        """Patched to use our replace_expert_params_with_bnb_params."""
+        model = original_process_model_before_weight_loading(self, model, device_map, **kwargs)
+        
+        # Use our replace_expert_params_with_bnb_params
+        model = replace_expert_params_with_bnb_params(
+            model,
+            modules_to_not_convert=self.modules_to_not_convert,
+            quantization_config=self.quantization_config,
+            pre_quantized=self.pre_quantized,
+        )
+        return model
+    
+    patched_process_model_before_weight_loading._unsloth_moe_patched = True
+    patch_function(Bnb4BitHfQuantizer, "_process_model_before_weight_loading", patched_process_model_before_weight_loading, match_level = "relaxed")
+    
+    logger.info("Unsloth: Patched Bnb4BitHfQuantizer._process_model_before_weight_loading for MoE expert parameters")
+
+
+def patch_moe_bnb_transformers():
+    """
+    Main patch function that applies all MoE BNB quantization patches.
+    
+    1. _process_model_before_weight_loading: Creates Params4bit placeholders for expert params
+    
+    2. param_needs_quantization: Recognizes expert Params4bit placeholders as needing quantization
+    
+    3. convert: Handles expert param quantization during actual weight loading
+    """
+    if not _check_bnb_available():
+        logger.warning("Unsloth: bitsandbytes not available, skipping MoE BNB patches")
+        return
+    
+    patch_bnb4bit_quantizer_process_model()
+    patch_bnb4bit_quantizer_param_needs_quantization()
+    patch_bnb4bit_quantize_convert()
+    
+    logger.info("Unsloth: Applied MoE expert parameter 4-bit quantization patches")
+
+
+TEMPORARY_PATCHES.append(patch_moe_bnb_transformers)
