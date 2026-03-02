@@ -420,6 +420,25 @@ def try_execute_with_auto_install(command, sudo=False, print_output=False, print
 pass
 
 
+def _find_visual_studio():
+    """Detect Visual Studio Build Tools installation (aligned with setup.ps1 Find-VsBuildTools).
+    Returns (cmake_generator, vs_install_path) or (None, None) if not found."""
+    program_files = [
+        os.environ.get('ProgramFiles', r'C:\Program Files'),
+        os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+    ]
+    editions = ['BuildTools', 'Community', 'Professional', 'Enterprise']
+    vs_map = {'2022': '17', '2019': '16', '2017': '15'}
+    for year, ver in vs_map.items():
+        for pf in program_files:
+            for edition in editions:
+                candidate = os.path.join(pf, 'Microsoft Visual Studio', year, edition)
+                vc_dir = os.path.join(candidate, 'VC', 'Tools', 'MSVC')
+                if os.path.isdir(vc_dir):
+                    return f"Visual Studio {ver} {year}", candidate
+    return None, None
+
+
 def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if the folder exists
@@ -560,26 +579,8 @@ def install_llama_cpp(
             if os.path.exists(build_dir):
                 shutil.rmtree(build_dir)
 
-            # Detect Visual Studio generator (same scan as setup.ps1 Find-VsBuildTools)
-            cmake_generator = None
-            vs_install_path = None
-            program_files = [
-                os.environ.get('ProgramFiles', r'C:\Program Files'),
-                os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
-            ]
-            editions = ['BuildTools', 'Community', 'Professional', 'Enterprise']
-            vs_map = {'2022': '17', '2019': '16', '2017': '15'}
-            for year, ver in vs_map.items():
-                for pf in program_files:
-                    for edition in editions:
-                        candidate = os.path.join(pf, 'Microsoft Visual Studio', year, edition)
-                        vc_dir = os.path.join(candidate, 'VC', 'Tools', 'MSVC')
-                        if os.path.isdir(vc_dir):
-                            cmake_generator = f"Visual Studio {ver} {year}"
-                            vs_install_path = candidate
-                            break
-                    if cmake_generator: break
-                if cmake_generator: break
+            # Detect Visual Studio generator
+            cmake_generator, vs_install_path = _find_visual_studio()
 
             if not cmake_generator:
                 raise RuntimeError(
@@ -1501,28 +1502,9 @@ def check_build_requirements():
         if shutil.which('cmake') is None:
             missing.append('cmake')
 
-        # Check VS Build Tools via filesystem scan
-        # (setup.ps1 L174-197: scan Program Files for VC/Tools/MSVC)
-        vs_found = False
-        program_files = [
-            os.environ.get('ProgramFiles', r'C:\Program Files'),
-            os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
-        ]
-        editions = ['BuildTools', 'Community', 'Professional', 'Enterprise']
-        years = ['2022', '2019', '2017']
-        for year in years:
-            for pf in program_files:
-                for edition in editions:
-                    vc_dir = os.path.join(
-                        pf, 'Microsoft Visual Studio', year, edition,
-                        'VC', 'Tools', 'MSVC'
-                    )
-                    if os.path.isdir(vc_dir):
-                        vs_found = True
-                        break
-                if vs_found: break
-            if vs_found: break
-        if not vs_found:
+        # Check VS Build Tools
+        cmake_generator, _ = _find_visual_studio()
+        if cmake_generator is None:
             missing.append('build-essential')
 
         # Check OpenSSL dev
