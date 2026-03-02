@@ -1190,16 +1190,11 @@ class _ParamShapeProxy:
 
 def patch_peft_param_wrapper_4bit_expert_shape():
     """
-    Make ParamWrapper.get_param() report 3D shape for 4bit MoE params so __init__() works as expected.
+    Make ParamWrapper.get_param() report 3D shape for 4bit MoE params so ParamWrapper.__init__() works as expected.
 
-    Quantized MoE expert params (Params4bit) are 2D flattened and _original_shape attribute holds 
-    (num_experts, in_features, out_features). 
-    
-    ParamWrapper.get_param() derives num_experts, in_features, out_features from param.shape, 
-    leading to wrong shape for Params4bit parameters.
-    
-    Patch ParamWrapper.get_param() to return a proxy that exposes .shape = _original_shape
-    for 4bit params.
+    Quantized MoE expert params (Params4bit) are 2D flattened and _original_shape attribute holds (num_experts, in_features, out_features).
+    However, ParamWrapper.get_param() derives num_experts, in_features, out_features from param.shape, leading to wrong shape for Params4bit parameters.
+    Patch ParamWrapper.get_param() to return a proxy that exposes .shape = _original_shape for 4bit MoE params.
     """
     try:
         from peft.tuners.lora.layer import ParamWrapper
