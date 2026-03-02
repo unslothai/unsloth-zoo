@@ -846,7 +846,7 @@ def grpo_accumulated_loss(
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature):
 
-            ctx.saved_hidden_states = to_device(hidden_states, "cpu", non_blocking=True)
+            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True) 
             ctx.device = hidden_states.device
             ctx.dtype = hidden_states.dtype
 
