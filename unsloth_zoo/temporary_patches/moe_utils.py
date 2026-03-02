@@ -582,7 +582,7 @@ def _is_moe_experts_module(module) -> bool:
     if hasattr(module, "gate_up_proj"):
         param = module.gate_up_proj
         
-        # If the param is 4bit-quantized, return True e.g. for expert parameters in MoE, the param is a 2D tensor.
+        # If the param is 4bit-quantized, return True e.g. for expert parameters in MoE, the quantized param is a 2D tensor.
         if param.__class__.__name__ == "Params4bit" and param.ndim == 2:
             return True
 
