@@ -288,7 +288,7 @@ def patch_bnb4bit_quantizer_process_model():
     
     def patched_process_model_before_weight_loading(self, model, device_map, **kwargs):
         """Patched to use our replace_expert_params_with_bnb_params."""
-        model = original_process_model_before_weight_loading(self, model, device_map, **kwargs)
+        original_process_model_before_weight_loading(self, model, device_map, **kwargs)
         
         # Use our replace_expert_params_with_bnb_params
         model = replace_expert_params_with_bnb_params(
