@@ -20,7 +20,9 @@ __all__ = [
     "use_local_gguf",
     "install_llama_cpp",
     "check_llama_cpp",
-    "_download_convert_hf_to_gguf"
+    "_download_convert_hf_to_gguf",
+    "UNSLOTH_HOME",
+    "LLAMA_CPP_DEFAULT_DIR",
 ]
 
 import subprocess
@@ -106,6 +108,11 @@ IS_WINDOWS = sys.platform == "win32"
 KAGGLE_TMP = "/tmp"
 del keynames
 
+# Default llama.cpp location: ~/.unsloth/llama.cpp
+UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
+LLAMA_CPP_DEFAULT_DIR = os.path.join(UNSLOTH_HOME, "llama.cpp")
+os.makedirs(UNSLOTH_HOME, exist_ok=True)
+
 
 @contextlib.contextmanager
 def use_local_gguf():
@@ -113,7 +120,7 @@ def use_local_gguf():
     # Store original state
     original_sys_path = sys.path.copy()
     original_modules = set(sys.modules.keys())
-    gguf_py_path = os.path.join("llama.cpp", "gguf-py")
+    gguf_py_path = os.path.join(LLAMA_CPP_DEFAULT_DIR, "gguf-py")
 
     original_gguf_modules = {}
 
@@ -414,7 +421,7 @@ def try_execute_with_auto_install(command, sudo=False, print_output=False, print
 pass
 
 
-def check_llama_cpp(llama_cpp_folder = "llama.cpp"):
+def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if the folder exists
     if not os.path.exists(llama_cpp_folder):
@@ -482,7 +489,7 @@ pass
 
 
 def install_llama_cpp(
-    llama_cpp_folder = "llama.cpp",
+    llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR,
     llama_cpp_targets = LLAMA_CPP_TARGETS,
     print_output = False,
     gpu_support = False,
@@ -522,6 +529,7 @@ def install_llama_cpp(
 
     # Clone repo if it doesn't exist
     if not os.path.exists(llama_cpp_folder):
+        os.makedirs(os.path.dirname(llama_cpp_folder), exist_ok=True)
         print("Unsloth: Cloning llama.cpp repository")
         try_execute_with_auto_install(
             f"git clone https://github.com/ggml-org/llama.cpp {llama_cpp_folder}",
@@ -745,7 +753,7 @@ def _download_convert_hf_to_gguf(
     # Downloads from llama.cpp's Github report
 
     # Ensure llama.cpp directory exists
-    os.makedirs("llama.cpp", exist_ok=True)
+    os.makedirs(LLAMA_CPP_DEFAULT_DIR, exist_ok=True)
 
     supported_types = set() # Initialize outside try block
     temp_original_file_path = None # Initialize for finally block
@@ -759,7 +767,7 @@ def _download_convert_hf_to_gguf(
         # 2. Introspect Original Script for Supported Architectures
         logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
         with tempfile.NamedTemporaryFile(
-            mode='wb', suffix=".py", prefix="original_gguf_", dir="llama.cpp", delete=False
+            mode='wb', suffix=".py", prefix="original_gguf_", dir=LLAMA_CPP_DEFAULT_DIR, delete=False
         ) as temp_file:
             temp_original_file_path = temp_file.name
             temp_file.write(original_content)
@@ -907,7 +915,7 @@ def _download_convert_hf_to_gguf(
 
 
         # 4. Write Patched File
-        patched_filename = f"llama.cpp/{name}.py"
+        patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{name}.py")
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
         with open(patched_filename, "wb") as file:
             file.write(patched_content)
@@ -1124,7 +1132,7 @@ def convert_to_gguf(
     input_folder,
     model_dtype = "bf16",
     quantization_type = "bf16", # dequantizing from q8_0 disallow, setting default to bf16
-    converter_location = os.path.join("llama.cpp", "unsloth_convert_hf_to_gguf.py"),
+    converter_location = os.path.join(LLAMA_CPP_DEFAULT_DIR, "unsloth_convert_hf_to_gguf.py"),
     supported_text_archs = None,
     supported_vision_archs = None,
     is_vlm = False,
@@ -1328,7 +1336,7 @@ def quantize_gguf(
     input_gguf,
     output_gguf,
     quant_type,
-    quantizer_location = "llama.cpp/llama-quantize",
+    quantizer_location = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize"),
     n_threads = None,
     print_output = True,
 ):
@@ -1336,9 +1344,10 @@ def quantize_gguf(
     # Use llama-quantize for fast quantization of GGUF files.
 
     # Fix default path on Windows: binaries are in build/bin/Release/
-    if IS_WINDOWS and quantizer_location == "llama.cpp/llama-quantize":
+    default_quantizer = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize")
+    if IS_WINDOWS and quantizer_location == default_quantizer:
         quantizer_location = os.path.join(
-            "llama.cpp", "build", "bin", "Release", "llama-quantize.exe"
+            LLAMA_CPP_DEFAULT_DIR, "build", "bin", "Release", "llama-quantize.exe"
         )
 
     if n_threads is None:
