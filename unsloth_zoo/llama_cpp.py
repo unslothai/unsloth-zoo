@@ -439,6 +439,20 @@ def _find_visual_studio():
     return None, None
 
 
+def _find_openssl_root():
+    """Find OpenSSL dev installation on Windows (aligned with setup.ps1 $OpenSslRoots).
+    Returns the root path if found, or None."""
+    openssl_roots = [
+        r'C:\Program Files\OpenSSL-Win64',
+        r'C:\Program Files\OpenSSL',
+        r'C:\OpenSSL-Win64',
+    ]
+    for root in openssl_roots:
+        if os.path.exists(os.path.join(root, 'include', 'openssl', 'ssl.h')):
+            return root
+    return None
+
+
 def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if the folder exists
@@ -600,17 +614,8 @@ def install_llama_cpp(
             if vs_install_path:
                 cmake_args.append(f"-DCMAKE_GENERATOR_INSTANCE={vs_install_path}")
 
-            # Check for OpenSSL (same as setup.ps1 L810-815)
-            openssl_root = None
-            openssl_roots = [
-                r'C:\Program Files\OpenSSL-Win64',
-                r'C:\Program Files\OpenSSL',
-                r'C:\OpenSSL-Win64',
-            ]
-            for root in openssl_roots:
-                if os.path.exists(os.path.join(root, 'include', 'openssl', 'ssl.h')):
-                    openssl_root = root
-                    break
+            # Check for OpenSSL
+            openssl_root = _find_openssl_root()
             if openssl_root:
                 cmake_args.extend([
                     f"-DOPENSSL_ROOT_DIR={openssl_root}",
@@ -1554,16 +1559,9 @@ def check_libcurl_dev():
     system_type = check_linux_type()
 
     if system_type == "windows":
-        # Same roots as setup.ps1 $OpenSslRoots
-        openssl_roots = [
-            r'C:\Program Files\OpenSSL-Win64',
-            r'C:\Program Files\OpenSSL',
-            r'C:\OpenSSL-Win64',
-        ]
-        for root in openssl_roots:
-            # Same check as setup.ps1: Test-Path (Join-Path $root 'include\openssl\ssl.h')
-            if os.path.exists(os.path.join(root, 'include', 'openssl', 'ssl.h')):
-                return True, "OpenSSL"
+        root = _find_openssl_root()
+        if root is not None:
+            return True, "OpenSSL"
         return False, "openssl"
 
     if system_type == "debian":
