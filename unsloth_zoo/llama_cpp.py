@@ -561,7 +561,9 @@ def install_llama_cpp(
 
     # Clone repo if it doesn't exist
     if not os.path.exists(llama_cpp_folder):
-        os.makedirs(os.path.dirname(llama_cpp_folder), exist_ok=True)
+        parent_dir = os.path.dirname(llama_cpp_folder)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         print("Unsloth: Cloning llama.cpp repository")
         try_execute_with_auto_install(
             f"git clone https://github.com/ggml-org/llama.cpp {llama_cpp_folder}",
