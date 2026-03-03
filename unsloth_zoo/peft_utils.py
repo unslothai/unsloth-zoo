@@ -215,9 +215,9 @@ def requires_grad_for_gradient_checkpointing(model):
             input.requires_grad_(True)
         elif type_input is tuple or type_input is list:
             if len(input) == 0:
-                raise RuntimeError("Unsloth: Failed to make input require gradients!")
-                # print(f"  WARNING: Empty list input to {module.__class__.__name__}!") # 
-                # return
+                # Models with kwargs-only forward (e.g. Idefics3, SmolVLM2)
+                # pass all arguments via kwargs — positional args are always empty.
+                return
             if torch.is_floating_point(input[0]):
                 input[0].requires_grad_(True)
         else:
