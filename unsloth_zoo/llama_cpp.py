@@ -550,12 +550,49 @@ def install_llama_cpp(
 
     gpu_support = "ON" if gpu_support else "OFF"
 
+    needs_clone = False
+    needs_build = False
+
     if os.path.exists(llama_cpp_folder):
-        try:
-            quantizer, converter = check_llama_cpp(llama_cpp_folder = llama_cpp_folder)
-            print(f"Unsloth: llama.cpp folder already exists - will use `{llama_cpp_folder}`")
-            return quantizer, converter
-        except: print(f"Unsloth: llama.cpp folder exists but binaries not found - will rebuild")
+        # Repo integrity check — key directories must exist
+        required_dirs = ['src', 'ggml', 'common']
+        if not all(os.path.isdir(os.path.join(llama_cpp_folder, d)) for d in required_dirs):
+            print("Unsloth: llama.cpp repo appears corrupted (missing src/ggml/common) - will re-clone")
+            shutil.rmtree(llama_cpp_folder)
+            needs_clone = True
+            needs_build = True
+        else:
+            # Repo is intact — check for existing binaries
+            try:
+                quantizer, converter = check_llama_cpp(llama_cpp_folder = llama_cpp_folder)
+                # Binaries found — check if remote has updates
+                try:
+                    local_head = subprocess.run(
+                        ['git', 'rev-parse', 'HEAD'],
+                        cwd=llama_cpp_folder, capture_output=True, text=True
+                    ).stdout.strip()
+                    remote_result = subprocess.run(
+                        ['git', 'ls-remote', 'origin', 'HEAD'],
+                        cwd=llama_cpp_folder, capture_output=True, text=True
+                    )
+                    remote_head = remote_result.stdout.split()[0] if remote_result.returncode == 0 else ""
+                    if local_head == remote_head or not remote_head:
+                        print(f"Unsloth: llama.cpp is up-to-date - using `{llama_cpp_folder}`")
+                        return quantizer, converter
+                    else:
+                        print(f"Unsloth: llama.cpp has updates (local={local_head[:8]}.. remote={remote_head[:8]}..) - will update and rebuild")
+                        subprocess.run(['git', 'pull'], cwd=llama_cpp_folder, capture_output=True)
+                        needs_build = True
+                except Exception:
+                    # Can't check remote — use existing binaries
+                    print(f"Unsloth: Using existing llama.cpp at `{llama_cpp_folder}`")
+                    return quantizer, converter
+            except Exception:
+                print("Unsloth: llama.cpp folder exists but binaries not found - will build")
+                needs_build = True
+    else:
+        needs_clone = True
+        needs_build = True
     pass
 
     print_outputs = []
@@ -564,33 +601,35 @@ def install_llama_cpp(
     kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs, "system_type": system_type}
 
     if not missing_packages:
-        print("Unsloth: All required system packages already installed!")
+        if print_output: print("Unsloth: All required system packages already installed!")
     else:
         packages_to_install = " ".join(missing_packages)
         print(f"Unsloth: Missing packages: {packages_to_install}")
         print(f"Unsloth: Will attempt to install missing system packages.")
         install_package(packages_to_install, sudo, system_type = system_type)
 
-    print("Unsloth: Install llama.cpp and building - please wait 1 to 3 minutes")
-    if gpu_support == "ON":
-        print("Unsloth: Building llama.cpp with GPU support")
-
-    # Clone repo if it doesn't exist
-    if not os.path.exists(llama_cpp_folder):
+    # Clone repo if needed
+    if needs_clone:
         parent_dir = os.path.dirname(llama_cpp_folder)
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
-        print("Unsloth: Cloning llama.cpp repository")
+        print("Unsloth: Cloning llama.cpp repository...")
         try_execute_with_auto_install(
             f"git clone https://github.com/ggml-org/llama.cpp {llama_cpp_folder}",
             **kwargs
         )
+    pass
 
     pip = check_pip()
 
-    print("Unsloth: Install GGUF and other packages")
+    # Install Python packages (only if not already satisfied)
     try_execute(f"{pip} install gguf protobuf sentencepiece mistral_common", **kwargs)
     if just_clone_repo: return llama_cpp_folder
+
+    if needs_build:
+        print("Unsloth: Building llama.cpp - please wait 1 to 3 minutes")
+    if gpu_support == "ON":
+        print("Unsloth: Building llama.cpp with GPU support")
 
     build_success = False
     build_errors = []
