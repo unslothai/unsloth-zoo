@@ -159,11 +159,17 @@ import os, shutil, re, functools
 def _merge_lora(W, lora_stats, name):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
     W = W.to("cuda", dtype = torch.float32, non_blocking = True)
-    W = W.addmm_(
-        lora_stats.lora_B.to("cuda", dtype = torch.float32, non_blocking = True),
-        lora_stats.lora_A.to("cuda", dtype = torch.float32, non_blocking = True),
-        alpha = lora_stats.alpha,
-    )
+    lora_B = lora_stats.lora_B.to("cuda", dtype = torch.float32, non_blocking = True)
+    lora_A = lora_stats.lora_A.to("cuda", dtype = torch.float32, non_blocking = True)
+    # Handle vocab resize: LoRA may have more rows than base safetensors weight
+    if lora_B.shape[0] != W.shape[0]:
+        new_size = lora_B.shape[0]
+        old_size = W.shape[0]
+        W_new = torch.zeros(new_size, W.shape[1], dtype=W.dtype, device=W.device)
+        W_new[:old_size] = W
+        W = W_new.addmm_(lora_B, lora_A, alpha=lora_stats.alpha)
+    else:
+        W = W.addmm_(lora_B, lora_A, alpha=lora_stats.alpha)
     if not torch.isfinite(torch.amax(W)).item():
         raise ValueError('Unsloth: Merge failed as there are infinite elements in ' + name)
     return W
@@ -297,6 +303,19 @@ def assert_same_keys(model, new_state_dict):
         for k in (_normalize(x) for x in new_state_dict.keys())
         if k and not _should_ignore(k)
     }
+
+    # On tied-weight models, lm_head.weight shares storage with
+    # embed_tokens.weight and may be absent from the safetensors file
+    # or the built state_dict depending on wrapping (LoRA vs modules_to_save).
+    # Exclude both from the check to avoid false positives.
+    base_model = inner_model.model if hasattr(inner_model, "model") else inner_model
+    tie_word_embeddings = getattr(
+        getattr(base_model, "config", None), "tie_word_embeddings", False
+    )
+    if tie_word_embeddings:
+        _tied_suffixes = ("lm_head.weight", "embed_tokens.weight")
+        original_keys = {k for k in original_keys if not any(k.endswith(s) for s in _tied_suffixes)}
+        new_keys      = {k for k in new_keys      if not any(k.endswith(s) for s in _tied_suffixes)}
 
     difference = original_keys ^ new_keys
     if len(difference) != 0:
@@ -486,6 +505,7 @@ def _merge_and_overwrite_lora(
     quant_type = None,
     save_method = "merged_16bit",
     counted_lora_modules = None,
+    tie_word_embeddings = False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -689,6 +709,19 @@ def _merge_and_overwrite_lora(
                 # Check for LoRA merge
                 lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
                 lora_stats = converted_lora_weights.get(lora_key, None)
+                # Tied embeddings can omit lm_head.weight from safetensors. If lm_head has LoRA
+                # adapters, apply them onto embed_tokens.weight since both share one base tensor.
+                if (
+                    lora_stats is None
+                    and tie_word_embeddings
+                    and lora_key.endswith("embed_tokens")
+                ):
+                    lm_head_key = lora_key[:-len("embed_tokens")] + "lm_head"
+                    lora_stats = converted_lora_weights.get(lm_head_key, None)
+                    if lora_stats is None and lm_head_key.startswith("model."):
+                        lora_stats = converted_lora_weights.get(lm_head_key[len("model."):], None)
+                    if lora_stats is None and not lm_head_key.startswith("model."):
+                        lora_stats = converted_lora_weights.get("model." + lm_head_key, None)
 
                 if lora_stats is not None:
                     # Prefer modules_to_save weights if present
@@ -708,7 +741,13 @@ def _merge_and_overwrite_lora(
                 success = _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, W, W_original_dtype)
 
                 if not success:
-                    raise RuntimeError(f"Failed to write tensor to model file.")
+                    # Tensor was resized (e.g. new tokens added to embeddings).
+                    # Track it so the shard file can be rewritten afterwards.
+                    if not hasattr(_merge_and_overwrite_lora, "_resized"):
+                        _merge_and_overwrite_lora._resized = {}
+                    _merge_and_overwrite_lora._resized[output_key] = W.to(
+                        dtype=W_original_dtype, device="cpu"
+                    )
 
                 del W
                 torch.cuda.empty_cache()
@@ -718,6 +757,22 @@ def _merge_and_overwrite_lora(
         mm.flush()
         mm.close()
         raw_pointer.close()
+
+        # If any tensors were resized (vocab resize), rewrite the shard file
+        resized = getattr(_merge_and_overwrite_lora, "_resized", {})
+        if resized:
+            _merge_and_overwrite_lora._resized = {}
+            # Reload the shard, replace resized tensors, save new file
+            tensors = {}
+            with safe_open(filename_original, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key in resized:
+                        tensors[key] = resized[key]
+                    else:
+                        tensors[key] = f.get_tensor(key)
+            save_file(tensors, filename_original)
+            del tensors
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return count, safetensor_keys_seen
@@ -2039,6 +2094,7 @@ def merge_and_overwrite_lora(
             quant_type = quant_type,
             save_method = save_method,
             counted_lora_modules = counted_lora_modules_global,
+            tie_word_embeddings = bool(getattr(find_lora_base_model(model).config, "tie_word_embeddings", False)),
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
