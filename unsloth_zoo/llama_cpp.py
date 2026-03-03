@@ -464,8 +464,9 @@ def _find_lib_path(lib_name):
         path = os.path.realpath(result.stdout.strip())
         if os.path.isabs(path) and os.path.exists(path):
             return path
-    except Exception:
-        pass
+    except Exception as exc:
+        # Treat any error during probing as "library not found" but log for debugging purposes.
+        logger.debug("Failed to locate shared library %r via gcc: %s", lib_name, exc)
     return None
 
 
