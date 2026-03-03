@@ -2208,6 +2208,17 @@ def load_vllm(
                 disable_cascade_attn = True
                 print("Unsloth: Disabling `disable_cascade_attn` in vLLM to allow for better on policy RL!")
             engine_args["disable_cascade_attn"] = disable_cascade_attn
+
+        # FlashInfer has a bug with block_size=16 and head_dim>=256 on Blackwell (SM100+).
+        # https://github.com/flashinfer-ai/flashinfer/issues/1993
+        # vLLM defaults block_size to 16 on CUDA, which triggers an assertion.
+        # Affects any model with head_dim>=256 (gemma, gemma2, gemma3, qwen3_next, etc).
+        if major_version >= 10:
+            _text_config = getattr(config, "text_config", config)
+            _head_dim = getattr(_text_config, "head_dim", None)
+            if _head_dim is not None and _head_dim >= 256:
+                engine_args["block_size"] = 32
+                logger.info(f"Unsloth: Setting vLLM block_size=32 for head_dim={_head_dim} to avoid FlashInfer bug on Blackwell.")
     pass
 
     # On-the-fly quantization is added in https://github.com/vllm-project/vllm/pull/23014
