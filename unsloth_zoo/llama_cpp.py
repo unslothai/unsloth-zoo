@@ -453,6 +453,22 @@ def _find_openssl_root():
     return None
 
 
+def _find_lib_path(lib_name):
+    """Find a shared library path using gcc's linker search.
+    Returns the absolute path if found, or None."""
+    try:
+        result = subprocess.run(
+            ['gcc', f'-print-file-name={lib_name}'],
+            capture_output=True, text=True
+        )
+        path = os.path.realpath(result.stdout.strip())
+        if os.path.isabs(path) and os.path.exists(path):
+            return path
+    except Exception:
+        pass
+    return None
+
+
 def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if the folder exists
@@ -675,10 +691,34 @@ def install_llama_cpp(
                 # Clean up any partial build
                 try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
 
+                # Build cmake configure command with library detection
+                cmake_configure = (
+                    f"cmake . -B build "
+                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
+                )
+
+                # Detect OpenMP library path (fixes GOMP linker errors)
+                gomp_path = _find_lib_path('libgomp.so')
+                if gomp_path:
+                    cmake_configure += (
+                        f" -DOpenMP_C_LIB_NAMES=gomp"
+                        f" -DOpenMP_CXX_LIB_NAMES=gomp"
+                        f" -DOpenMP_gomp_LIBRARY={gomp_path}"
+                    )
+
+                # Detect OpenSSL library paths
+                ssl_path = _find_lib_path('libssl.so')
+                crypto_path = _find_lib_path('libcrypto.so')
+                if ssl_path and crypto_path:
+                    cmake_configure += (
+                        f" -DOPENSSL_ROOT_DIR=/usr"
+                        f" -DOPENSSL_SSL_LIBRARY={ssl_path}"
+                        f" -DOPENSSL_CRYPTO_LIBRARY={crypto_path}"
+                    )
+
                 try:
                     try_execute(
-                        f"cmake . -B build "\
-                        f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support} -DLLAMA_CURL=ON",
+                        cmake_configure,
                         cwd = llama_cpp_folder,
                         **kwargs
                     )
@@ -687,8 +727,7 @@ def install_llama_cpp(
                     if "LLAMA_CURL" in inner_e and "deprecated" in inner_e:
                         # As of https://github.com/ggml-org/llama.cpp/pull/18791, CURL is deprecated
                         try_execute(
-                            f"cmake . -B build "\
-                            f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}",
+                            cmake_configure,
                             cwd = llama_cpp_folder,
                             ignore_deprecation = True,
                             **kwargs
@@ -1548,6 +1587,18 @@ def check_build_requirements():
         except Exception:
             missing_packages.append(package)
 
+    # Check for libgomp (OpenMP runtime) - needed for llama.cpp CPU backend linking
+    gomp_path = _find_lib_path('libgomp.so')
+    if gomp_path is None:
+        gomp_packages = {'debian': 'libgomp1', 'rpm': 'libgomp-devel', 'arch': 'gcc'}
+        missing_packages.append(gomp_packages.get(system_type, 'libgomp1'))
+
+    # Check for libssl-dev (OpenSSL development) - needed for HTTPS support
+    ssl_path = _find_lib_path('libssl.so')
+    if ssl_path is None:
+        ssl_packages = {'debian': 'libssl-dev', 'rpm': 'openssl-devel', 'arch': 'openssl'}
+        missing_packages.append(ssl_packages.get(system_type, 'libssl-dev'))
+
     # Check for libcurl development headers
     is_installed, package_name = check_libcurl_dev()
     if not is_installed:
@@ -1606,6 +1657,10 @@ def check_linux_type():
     # Check if it's RPM-based (CentOS/RHEL/Fedora):
     elif any(os.path.exists(f) for f in ['/etc/redhat-release', '/etc/fedora-release']):
         return 'rpm'
+
+    # Check if it's Arch-based (Arch/Manjaro):
+    elif os.path.exists('/etc/arch-release'):
+        return 'arch'
 
     return 'unknown'
 pass
