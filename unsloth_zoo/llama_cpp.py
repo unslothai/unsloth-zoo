@@ -241,7 +241,7 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
                     )
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
+                pkg_mgr_name = {"rpm": "yum/dnf", "arch": "pacman"}.get(system_type, "apt-get")
                 raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist when installing {package}? Is this NOT a Linux / Mac based computer?")
             elif "Unable to locate package" in line:
                 sp.terminate()
@@ -266,6 +266,8 @@ def do_we_need_sudo(system_type="debian"):
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
         update_cmd = f"{pkg_manager} check-update"
+    elif system_type == "arch":
+        update_cmd = "pacman -Sy"
     else:
         update_cmd = "apt-get update -y"
 
@@ -279,7 +281,7 @@ def do_we_need_sudo(system_type="debian"):
                 break
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
+                pkg_mgr_name = {"rpm": "yum/dnf", "arch": "pacman"}.get(system_type, "apt-get")
                 raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist? Is this NOT a Linux / Mac based computer?")
             elif "failure resolving" in line or "Err:" in line:
                 sp.terminate()
@@ -1640,15 +1642,23 @@ def check_build_requirements():
         try:
             result = subprocess.run(['which', tool], capture_output=True, text=True)
             if result.returncode != 0:
-                # Adjust package names for RPM-based systems
+                # Adjust package names for non-Debian systems
                 if system_type == "rpm":
-                    rpm_packages = {
+                    distro_packages = {
                         'build-essential': 'gcc gcc-c++ make',
                         'cmake': 'cmake',
                         'curl': 'curl',
                         'git': 'git',
                     }
-                    package = rpm_packages.get(package, package)
+                    package = distro_packages.get(package, package)
+                elif system_type == "arch":
+                    distro_packages = {
+                        'build-essential': 'base-devel',
+                        'cmake': 'cmake',
+                        'curl': 'curl',
+                        'git': 'git',
+                    }
+                    package = distro_packages.get(package, package)
                 missing_packages.append(package)
         except Exception:
             missing_packages.append(package)
