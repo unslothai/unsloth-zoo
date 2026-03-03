@@ -1144,25 +1144,36 @@ def create_standalone_class(
             preamble = full_class[:class_start]
             class_def = full_class[class_start:]
 
-            # Split preamble into lines
+            KNOWN_STRIP_DECORATORS = (
+                "use_experts_implementation",
+                "use_kernel_forward_from_hub",
+                "use_kernelized_func",
+                "@auto_docstring",
+            )
+
+            # Split preamble into lines and handle multiline decorators
             lines = preamble.split('\n')
             new_lines = []
+            skipping_decorator = False
 
             for line in lines:
                 stripped = line.strip()
+                if skipping_decorator:
+                    # Continue skipping until we find the closing paren
+                    if ')' in stripped:
+                        skipping_decorator = False
+                    continue
                 if stripped.startswith("@"):
-                    if (
-                        "use_experts_implementation" in stripped
-                        or "use_kernel_forward_from_hub" in stripped
-                        or "use_kernelized_func" in stripped
-                        or stripped.startswith("@auto_docstring")
-                    ):
+                    if any(d in stripped for d in KNOWN_STRIP_DECORATORS):
                         decorator_name = stripped.split("(")[0].lstrip("@")
                         logger.info(f"Unsloth: stripped {decorator_name} decorator from {module}")
-                        continue # Strip it
+                        # Check if decorator args span multiple lines (open paren without close)
+                        if '(' in stripped and ')' not in stripped:
+                            skipping_decorator = True
+                        continue  # Strip it
                     else:
                         logger.warning(f"Unsloth: Warning: Unknown decorator {stripped} found for {module}.")
-                        new_lines.append(line) # Keep it
+                        new_lines.append(line)  # Keep it
                 else:
                     new_lines.append(line)
 
@@ -1274,11 +1285,11 @@ def create_standalone_class(
     # Combine all into file
     source = source + full_class
 
-    # Remove @auto_docstring
-    source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    # source = source.replace("@auto_docstring", "")
+    # Remove @auto_docstring / @use_kernelized_func / @check_model_inputs decorators
+    # Use re.DOTALL so . matches newlines for multiline decorator args like custom_intro="""..."""
+    source = re.sub(r"@auto_docstring\s*(\(.*?\))?", "", source, flags=re.DOTALL)
+    source = re.sub(r"@use_kernelized_func\s*(\(.*?\))?", "", source, flags=re.DOTALL)
+    source = re.sub(r"@check_model_inputs\s*(\(.*?\))?", "", source, flags=re.DOTALL)
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
