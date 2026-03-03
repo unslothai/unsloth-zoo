@@ -96,7 +96,7 @@ For RTX 50x, B200, 6000 GPUs, simply do `pip install unsloth`. Read our [Blackwe
 
 ## 💾 Install Unsloth
 > [!warning]
-> Python 3.14 does not support Unsloth. Use 3.13 or lower.
+> Python 3.14 is supported.
 
 You can also see our documentation for more detailed installation and updating instructions [here](https://docs.unsloth.ai/get-started/installing-+-updating).
 

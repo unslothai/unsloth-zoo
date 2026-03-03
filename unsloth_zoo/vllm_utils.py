@@ -1843,6 +1843,14 @@ def load_vllm(
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
+    if is_fp8 and DEVICE_TYPE == "cuda":
+        major_version, minor_version = torch.cuda.get_device_capability()
+        if major_version == 10:
+            # It is noticed that Deepgemm is generally slower than triton for vLLM
+            # https://x.com/TheZachMueller/status/2024619480580510117?s=20
+            # This might get implemented in vLLM later but till then we have this toggle
+            os.environ['VLLM_USE_DEEP_GEMM'] = '0'
+
     assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
     max_num_batched_tokens, approx_max_num_seqs, \
@@ -2200,6 +2208,17 @@ def load_vllm(
                 disable_cascade_attn = True
                 print("Unsloth: Disabling `disable_cascade_attn` in vLLM to allow for better on policy RL!")
             engine_args["disable_cascade_attn"] = disable_cascade_attn
+
+        # FlashInfer has a bug with block_size=16 and head_dim>=256 on Blackwell (SM100+).
+        # https://github.com/flashinfer-ai/flashinfer/issues/1993
+        # vLLM defaults block_size to 16 on CUDA, which triggers an assertion.
+        # Affects any model with head_dim>=256 (gemma, gemma2, gemma3, qwen3_next, etc).
+        if major_version >= 10:
+            _text_config = getattr(config, "text_config", config)
+            _head_dim = getattr(_text_config, "head_dim", None)
+            if _head_dim is not None and _head_dim >= 256:
+                engine_args["block_size"] = 32
+                logger.info(f"Unsloth: Setting vLLM block_size=32 for head_dim={_head_dim} to avoid FlashInfer bug on Blackwell.")
     pass
 
     # On-the-fly quantization is added in https://github.com/vllm-project/vllm/pull/23014

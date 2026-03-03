@@ -215,9 +215,14 @@ def get_transformers_model_type(config, trust_remote_code=False):
     # Gemma-3 270M has `gemma3_text` which is wrong
     import transformers.models
     all_model_types = dir(transformers.models)
+    # Models with trust_remote_code that are NOT in transformers.models
+    # but should be kept as-is (not truncated).
+    _REMOTE_CODE_MODEL_TYPES = {"nemotron_h", "nemotronh_nano_vl_v2",}
     found_type = False
     for j, model_type in enumerate(final_model_types):
-        if model_type not in all_model_types:
+        if model_type in _REMOTE_CODE_MODEL_TYPES:
+            found_type = True
+        elif model_type not in all_model_types:
             # Try splitting on _ gemma3_text -> gemma3
             model_types = list(model_type)
             model_types = ["".join(model_types[:i]) for i in range(len(model_types), 0, -1)]
@@ -290,6 +295,9 @@ def get_auto_processor(name, **kwargs):
                 with open(processor_config, "r", encoding="utf-8") as f:
                     config = json.load(f)
                 processor_class = config["processor_class"]
+                # Strip _Unsloth_Patched_ prefix from old saves (issue #4085)
+                if processor_class.startswith("_Unsloth_Patched_"):
+                    processor_class = processor_class[len("_Unsloth_Patched_"):]
                 model_type = reversal_map[processor_class]
                 break
             except:
@@ -336,6 +344,20 @@ def get_auto_processor(name, **kwargs):
             except:
                 pass
     pass
+
+    # Fix _Unsloth_Patched_ prefix in copied config files (issue #4085)
+    for cfg_name in ["processor_config.json", "preprocessor_config.json", "tokenizer_config.json"]:
+        cfg_path = os.path.join(temp_name, cfg_name)
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if cfg.get("processor_class", "").startswith("_Unsloth_Patched_"):
+                    cfg["processor_class"] = cfg["processor_class"][len("_Unsloth_Patched_"):]
+                    with open(cfg_path, "w", encoding="utf-8") as f:
+                        json.dump(cfg, f, indent=2, ensure_ascii=False)
+            except:
+                pass
 
     # Try importing again!
     from transformers import AutoProcessor

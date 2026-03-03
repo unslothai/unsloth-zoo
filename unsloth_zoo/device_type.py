@@ -27,6 +27,174 @@ import torch
 import functools
 from .utils import Version
 import inspect
+import os
+import re
+import shutil
+import subprocess
+import urllib.request
+
+_PYTORCH_WHL_BASE_URL = "https://download.pytorch.org/whl"
+
+def _safe_run_command(command, timeout = 2.0):
+    try:
+        result = subprocess.run(
+            command,
+            capture_output = True,
+            text = True,
+            check = False,
+            timeout = timeout,
+        )
+        return result.stdout or ""
+    except Exception:
+        return ""
+pass
+
+def _extract_major_minor(version_text):
+    if not version_text:
+        return None
+    match = re.search(r"([0-9]+)\.([0-9]+)", str(version_text))
+    if match is None:
+        return None
+    return f"{match.group(1)}.{match.group(2)}"
+pass
+
+def _version_sort_key(version_text):
+    parts = [int(x) for x in re.findall(r"[0-9]+", str(version_text))]
+    if len(parts) < 2: parts = parts + [0]
+    return tuple(parts)
+pass
+
+@functools.cache
+def _pytorch_rocm_index_exists(rocm_index):
+    index_url = f"{_PYTORCH_WHL_BASE_URL}/{rocm_index}/"
+    # Some endpoints reject HEAD, so fallback to GET if needed.
+    methods = ("HEAD", "GET")
+    for method in methods:
+        try:
+            request = urllib.request.Request(
+                index_url,
+                headers = {"User-Agent" : "unsloth-zoo"},
+                method = method,
+            )
+            with urllib.request.urlopen(request, timeout = 2.5) as response:
+                if 200 <= getattr(response, "status", 200) < 400:
+                    return True
+        except Exception:
+            pass
+    return False
+pass
+
+@functools.cache
+def _available_pytorch_rocm_indices():
+    # Parse official wheel listing so we can suggest only valid ROCm endpoints.
+    known_defaults = ["rocm7.1", "rocm7.0", "rocm6.4", "rocm6.3", "rocm6.2", "rocm6.1"]
+    try:
+        request = urllib.request.Request(
+            f"{_PYTORCH_WHL_BASE_URL}/",
+            headers = {"User-Agent" : "unsloth-zoo"},
+        )
+        with urllib.request.urlopen(request, timeout = 2.5) as response:
+            html = response.read().decode("utf-8", errors = "ignore")
+        matches = set(re.findall(r"rocm[0-9]+\.[0-9]+(?:\.[0-9]+)?", html))
+        if matches:
+            return sorted(matches, key = _version_sort_key, reverse = True)
+    except Exception:
+        pass
+    return known_defaults
+pass
+
+def _nearest_rocm_index(detected_major_minor, available_indices):
+    if not detected_major_minor:
+        return None
+    exact = f"rocm{detected_major_minor}"
+    if exact in available_indices:
+        return exact
+    detected_major = detected_major_minor.split(".")[0]
+    same_major = [x for x in available_indices if x.startswith(f"rocm{detected_major}.")]
+    if same_major:
+        return same_major[0]
+    return None
+pass
+
+@functools.cache
+def _detect_rocm_major_minor():
+    # Preferred sources ordered from most direct to fallback.
+    sources = []
+    hip_version = getattr(getattr(torch, "version", None), "hip", None)
+    if hip_version:
+        sources.append(str(hip_version))
+    for key in ("ROCM_VERSION", "ROCM_VERSION_FULL", "ROCM_VER"):
+        value = os.environ.get(key, "")
+        if value:
+            sources.append(value)
+    for filename in ("/opt/rocm/.info/version", "/opt/rocm/.info/version-dev"):
+        try:
+            with open(filename, "r", encoding = "utf-8") as file:
+                sources.append(file.read().strip())
+        except Exception:
+            pass
+    if shutil.which("hipcc") is not None:
+        sources.append(_safe_run_command(["hipcc", "--version"]))
+    if shutil.which("rocm-smi") is not None:
+        sources.append(_safe_run_command(["rocm-smi", "--showdriverversion"]))
+    for source in sources:
+        major_minor = _extract_major_minor(source)
+        if major_minor is not None:
+            return major_minor
+    return None
+pass
+
+@functools.cache
+def _detect_amd_rocm_runtime():
+    # Fast path for Linux ROCm installs.
+    if os.path.exists("/dev/kfd"):
+        return True
+    for env_key in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+        if env_key in os.environ:
+            return True
+    if shutil.which("rocminfo") is not None:
+        info = _safe_run_command(["rocminfo"])
+        if ("gfx" in info.lower()) or ("amd" in info.lower()):
+            return True
+    if shutil.which("rocm-smi") is not None:
+        info = _safe_run_command(["rocm-smi", "-i"])
+        if ("gpu" in info.lower()) or ("amd" in info.lower()):
+            return True
+    return False
+pass
+
+@functools.cache
+def _amd_installation_hint():
+    if not _detect_amd_rocm_runtime():
+        return None
+    available_indices = _available_pytorch_rocm_indices()
+    detected_major_minor = _detect_rocm_major_minor()
+    chosen_index = _nearest_rocm_index(detected_major_minor, available_indices)
+    if chosen_index is None:
+        chosen_index = available_indices[0] if len(available_indices) else "rocm7.0"
+    index_url = f"{_PYTORCH_WHL_BASE_URL}/{chosen_index}/"
+    index_is_valid = _pytorch_rocm_index_exists(chosen_index)
+
+    lines = [
+        "Unsloth detected signs of an AMD ROCm GPU, but your current PyTorch build has no usable HIP accelerator.",
+        "This usually means torch/torchvision/torchaudio were installed from default PyPI wheels instead of ROCm wheels.",
+    ]
+    if detected_major_minor is not None:
+        lines.append(f"Detected ROCm version hint: {detected_major_minor}")
+    else:
+        lines.append("Could not determine ROCm version exactly; choosing the latest known ROCm wheel index.")
+    lines.append("Try reinstalling PyTorch wheels with:")
+    lines.append(
+        f"uv pip install torch torchvision torchaudio --index-url {index_url} --upgrade --force-reinstall"
+    )
+    if index_is_valid:
+        lines.append(f"Verified index URL is reachable: {index_url}")
+    else:
+        lines.append(
+            "Could not verify index URL reachability from this environment; if needed, choose a ROCm index from https://pytorch.org/get-started/locally/"
+        )
+    return "\n".join(lines)
+pass
 
 @functools.cache
 def is_hip():
@@ -44,6 +212,9 @@ def get_device_type():
     # Check torch.accelerator
     if hasattr(torch, "accelerator"):
         if not torch.accelerator.is_available():
+            amd_hint = _amd_installation_hint()
+            if amd_hint is not None:
+                raise NotImplementedError(amd_hint)
             raise NotImplementedError("Unsloth cannot find any torch accelerator? You need a GPU.")
         accelerator = str(torch.accelerator.current_accelerator())
         if accelerator in ("cuda", "xpu", "hip"):
@@ -52,6 +223,9 @@ def get_device_type():
                 f"But `torch.accelerator.current_accelerator()` works with it being = `{accelerator}`\n"\
                 f"Please reinstall torch - it's most likely broken :("
             )
+    amd_hint = _amd_installation_hint()
+    if amd_hint is not None:
+        raise NotImplementedError(amd_hint)
     raise NotImplementedError("Unsloth currently only works on NVIDIA, AMD and Intel GPUs.")
 pass
 DEVICE_TYPE : str = get_device_type()
