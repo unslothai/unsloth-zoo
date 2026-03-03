@@ -1239,6 +1239,12 @@ def create_standalone_class(
     if "cuda_kernels_forward" in source:
         disable = True
 
+    # dynamic_rope_update decorator injects data-dependent branching
+    # (e.g. longrope: if seq_len > original_max_position_embeddings)
+    # which is incompatible with fullgraph=True
+    if "dynamic_rope_update" in source:
+        fullgraph = False
+
     if disable is not None:
         compile = (
             f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
