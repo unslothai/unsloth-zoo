@@ -558,8 +558,9 @@ def _is_safe_to_delete(path):
         # Safe if under ~/.unsloth/
         if real_path.startswith(real_home + os.sep):
             return True
-        # Safe if it's a dir named llama.cpp (CWD-relative fallback)
-        if os.path.basename(real_path) == "llama.cpp":
+        # Safe if it's the CWD-relative llama.cpp (backward-compat path)
+        cwd_llama = os.path.realpath(os.path.join(os.getcwd(), "llama.cpp"))
+        if real_path == cwd_llama:
             return True
     except Exception as exc:
         # On any unexpected error, treat the path as unsafe but log for debugging.
