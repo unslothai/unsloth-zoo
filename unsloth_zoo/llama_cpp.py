@@ -561,8 +561,9 @@ def _is_safe_to_delete(path):
         # Safe if it's a dir named llama.cpp (CWD-relative fallback)
         if os.path.basename(real_path) == "llama.cpp":
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        # On any unexpected error, treat the path as unsafe but log for debugging.
+        logger.debug("Failed to check if path %r is safe to delete: %s", path, exc)
     return False
 
 
