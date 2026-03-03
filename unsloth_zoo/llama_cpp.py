@@ -1472,7 +1472,16 @@ def quantize_gguf(
             n_threads = 1
         n_threads *= 2
 
-    command = f"{quantizer_location} {input_gguf} {output_gguf} {quant_type} {n_threads}"
+    def _quote(s):
+        """Quote a path for shell usage, handling both Windows and Unix."""
+        s = str(s)
+        if IS_WINDOWS:
+            # On Windows cmd, wrap in double quotes if path contains spaces
+            return f'"{s}"' if ' ' in s else s
+        import shlex
+        return shlex.quote(s)
+
+    command = f"{_quote(quantizer_location)} {_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
 
     if print_output:
         print(f"Unsloth: Quantizing to {quant_type}...")
