@@ -480,13 +480,18 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
     converter_location = None
 
     # On Windows, binaries have .exe extension and live in build/bin/Release/
-    exe = ".exe" if IS_WINDOWS else ""
-    search_dirs = [llama_cpp_folder]
     if IS_WINDOWS:
-        search_dirs.append(os.path.join(llama_cpp_folder, "build", "bin", "Release"))
+        quantizer_names = ["llama-quantize.exe", "quantize.exe"]
+        search_dirs = [
+            llama_cpp_folder,
+            os.path.join(llama_cpp_folder, "build", "bin", "Release"),
+        ]
+    else:
+        quantizer_names = ["llama-quantize", "quantize"]
+        search_dirs = [llama_cpp_folder]
 
     # Check for quantizer binary
-    for quantizer in [f"llama-quantize{exe}", f"quantize{exe}"]:
+    for quantizer in quantizer_names:
         for search_dir in search_dirs:
             location = os.path.join(search_dir, quantizer)
             if not os.path.exists(location):
