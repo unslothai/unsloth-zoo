@@ -1713,6 +1713,15 @@ def check_libcurl_dev():
         except Exception:
             return False, package_name
 
+    elif system_type == "arch":
+        package_name = "curl"
+        try:
+            result = subprocess.run(['pacman', '-Q', package_name], capture_output=True, text=True)
+            is_installed = result.returncode == 0
+            return is_installed, package_name
+        except Exception:
+            return False, package_name
+
     return False, "libcurl4-openssl-dev"
 pass
 
