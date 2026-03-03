@@ -501,7 +501,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         if extra_kwargs is None:
             extra_kwargs = {}
         def compute_loss(new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages, scaling):
-            loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = grpo_compute_loss(
+            loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, _mask  = grpo_compute_loss(
                 ref_logps,
                 new_logps,
                 old_logps,
