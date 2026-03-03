@@ -23,6 +23,7 @@ __all__ = [
     "_download_convert_hf_to_gguf",
     "UNSLOTH_HOME",
     "LLAMA_CPP_DEFAULT_DIR",
+    "IS_WINDOWS",
 ]
 
 import subprocess
@@ -109,9 +110,12 @@ KAGGLE_TMP = "/tmp"
 del keynames
 
 # Default llama.cpp location: ~/.unsloth/llama.cpp
+# Override with UNSLOTH_LLAMA_CPP_PATH env var to use a custom llama.cpp install
 UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
-LLAMA_CPP_DEFAULT_DIR = os.path.join(UNSLOTH_HOME, "llama.cpp")
-os.makedirs(UNSLOTH_HOME, exist_ok=True)
+LLAMA_CPP_DEFAULT_DIR = os.environ.get(
+    "UNSLOTH_LLAMA_CPP_PATH",
+    os.path.join(UNSLOTH_HOME, "llama.cpp"),
+)
 
 
 @contextlib.contextmanager
@@ -213,6 +217,8 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
         install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
+    elif system_type == "arch":
+        install_cmd = f"{'sudo ' if sudo else ''}pacman -S --noconfirm {package}"
     else:  # Default to debian/apt-get
         install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
 
@@ -542,6 +548,22 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
 pass
 
 
+def _is_safe_to_delete(path):
+    """Check if a path is safe to delete (must be under UNSLOTH_HOME or be a llama.cpp dir)."""
+    try:
+        real_path = os.path.realpath(path)
+        real_home = os.path.realpath(UNSLOTH_HOME)
+        # Safe if under ~/.unsloth/
+        if real_path.startswith(real_home + os.sep):
+            return True
+        # Safe if it's a dir named llama.cpp (CWD-relative fallback)
+        if os.path.basename(real_path) == "llama.cpp":
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def install_llama_cpp(
     llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR,
     llama_cpp_targets = LLAMA_CPP_TARGETS,
@@ -559,40 +581,48 @@ def install_llama_cpp(
     needs_clone = False
     needs_build = False
 
+    # Ensure ~/.unsloth/ exists before we try to use it
+    os.makedirs(UNSLOTH_HOME, exist_ok=True)
+
+    # C3: Backward compat -- if using the new default location but CWD has a working ./llama.cpp, use it
+    cwd_llama_cpp = os.path.join(os.getcwd(), "llama.cpp")
+    if (
+        llama_cpp_folder == LLAMA_CPP_DEFAULT_DIR
+        and os.path.exists(cwd_llama_cpp)
+        and cwd_llama_cpp != os.path.realpath(llama_cpp_folder)
+    ):
+        try:
+            q, c = check_llama_cpp(llama_cpp_folder=cwd_llama_cpp)
+            print(
+                f"Unsloth: Found existing llama.cpp at `{cwd_llama_cpp}` -- using it.\n"
+                f"Unsloth: Note: the default location has moved to `{LLAMA_CPP_DEFAULT_DIR}`."
+            )
+            return q, c
+        except Exception:
+            pass  # CWD copy is broken, proceed with default location
+
     if os.path.exists(llama_cpp_folder):
-        # Repo integrity check — key directories must exist
+        # Repo integrity check -- key directories must exist
         required_dirs = ['src', 'ggml', 'common']
         if not all(os.path.isdir(os.path.join(llama_cpp_folder, d)) for d in required_dirs):
             print("Unsloth: llama.cpp repo appears corrupted (missing src/ggml/common) - will re-clone")
-            shutil.rmtree(llama_cpp_folder)
+            # C4: Only delete if the path is safe
+            if _is_safe_to_delete(llama_cpp_folder):
+                shutil.rmtree(llama_cpp_folder)
+            else:
+                raise RuntimeError(
+                    f"Unsloth: llama.cpp at `{llama_cpp_folder}` appears corrupted but is not in a safe location to delete.\n"
+                    f"Please manually remove or fix it."
+                )
             needs_clone = True
             needs_build = True
         else:
-            # Repo is intact — check for existing binaries
+            # Repo is intact -- check for existing binaries
             try:
-                quantizer, converter = check_llama_cpp(llama_cpp_folder = llama_cpp_folder)
-                # Binaries found — check if remote has updates
-                try:
-                    local_head = subprocess.run(
-                        ['git', 'rev-parse', 'HEAD'],
-                        cwd=llama_cpp_folder, capture_output=True, text=True
-                    ).stdout.strip()
-                    remote_result = subprocess.run(
-                        ['git', 'ls-remote', 'origin', 'HEAD'],
-                        cwd=llama_cpp_folder, capture_output=True, text=True
-                    )
-                    remote_head = remote_result.stdout.split()[0] if remote_result.returncode == 0 else ""
-                    if local_head == remote_head or not remote_head:
-                        print(f"Unsloth: llama.cpp is up-to-date - using `{llama_cpp_folder}`")
-                        return quantizer, converter
-                    else:
-                        print(f"Unsloth: llama.cpp has updates (local={local_head[:8]}.. remote={remote_head[:8]}..) - will update and rebuild")
-                        subprocess.run(['git', 'pull'], cwd=llama_cpp_folder, capture_output=True)
-                        needs_build = True
-                except Exception:
-                    # Can't check remote — use existing binaries
-                    print(f"Unsloth: Using existing llama.cpp at `{llama_cpp_folder}`")
-                    return quantizer, converter
+                quantizer, converter = check_llama_cpp(llama_cpp_folder=llama_cpp_folder)
+                # C2: If binaries work, use them directly (no auto-update)
+                print(f"Unsloth: llama.cpp found at `{llama_cpp_folder}` -- using existing install.")
+                return quantizer, converter
             except Exception:
                 print("Unsloth: llama.cpp folder exists but binaries not found - will build")
                 needs_build = True
@@ -620,8 +650,10 @@ def install_llama_cpp(
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
         print("Unsloth: Cloning llama.cpp repository...")
+        # H2: Quote path to handle spaces in directory names
+        quoted_folder = shlex.quote(llama_cpp_folder) if not IS_WINDOWS else f'"{llama_cpp_folder}"'
         try_execute_with_auto_install(
-            f"git clone https://github.com/ggml-org/llama.cpp {llama_cpp_folder}",
+            f"git clone https://github.com/ggml-org/llama.cpp {quoted_folder}",
             **kwargs
         )
     pass
@@ -677,15 +709,13 @@ def install_llama_cpp(
             if vs_install_path:
                 cmake_args.append(f"-DCMAKE_GENERATOR_INSTANCE={vs_install_path}")
 
-            # Check for OpenSSL
+            # Check for OpenSSL (enables HTTPS for llama-server)
             openssl_root = _find_openssl_root()
             if openssl_root:
                 cmake_args.extend([
                     f"-DOPENSSL_ROOT_DIR={openssl_root}",
-                    "-DLLAMA_OPENSSL=ON",
+                    "-DLLAMA_OPENSSL=ON",  # Defined in common/CMakeLists.txt
                 ])
-            else:
-                cmake_args.append("-DLLAMA_CURL=OFF")
 
             if print_output:
                 print(f"Unsloth: cmake configure with {cmake_generator}")
@@ -724,7 +754,7 @@ def install_llama_cpp(
         # Linux/macOS: Try make first, then cmake
         try:
             if print_output: print("Trying to build with make...")
-            try_execute(f"make clean", cwd = llama_cpp_folder, **kwargs)
+            try_execute("make clean", cwd = llama_cpp_folder, **kwargs)
             try_execute(f"make all -j{cpu_count}", cwd = llama_cpp_folder, **kwargs)
             build_success = True
             print("Successfully built with make")
@@ -761,24 +791,14 @@ def install_llama_cpp(
                         f" -DOPENSSL_CRYPTO_LIBRARY={crypto_path}"
                     )
 
-                try:
-                    try_execute(
-                        cmake_configure,
-                        cwd = llama_cpp_folder,
-                        **kwargs
-                    )
-                except Exception as inner_e:
-                    inner_e = str(inner_e)
-                    if "LLAMA_CURL" in inner_e and "deprecated" in inner_e:
-                        # As of https://github.com/ggml-org/llama.cpp/pull/18791, CURL is deprecated
-                        try_execute(
-                            cmake_configure,
-                            cwd = llama_cpp_folder,
-                            ignore_deprecation = True,
-                            **kwargs
-                        )
-                    else:
-                        raise
+                # LLAMA_CURL is deprecated upstream (ggml-org/llama.cpp#18791),
+                # so we pass ignore_deprecation=True to handle any deprecation warnings.
+                try_execute(
+                    cmake_configure,
+                    cwd = llama_cpp_folder,
+                    ignore_deprecation = True,
+                    **kwargs
+                )
                 try_execute(
                     f"cmake --build build --config Release "\
                     f"-j{cpu_count} --clean-first --target "\
@@ -1436,7 +1456,8 @@ def quantize_gguf(
 
     # Fix default path on Windows: binaries are in build/bin/Release/
     default_quantizer = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize")
-    if IS_WINDOWS and quantizer_location == default_quantizer:
+    # H3: Use normpath for reliable path comparison on Windows (/ vs \)
+    if IS_WINDOWS and os.path.normpath(quantizer_location) == os.path.normpath(default_quantizer):
         quantizer_location = os.path.join(
             LLAMA_CPP_DEFAULT_DIR, "build", "bin", "Release", "llama-quantize.exe"
         )
