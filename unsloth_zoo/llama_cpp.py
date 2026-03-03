@@ -20,7 +20,10 @@ __all__ = [
     "use_local_gguf",
     "install_llama_cpp",
     "check_llama_cpp",
-    "_download_convert_hf_to_gguf"
+    "_download_convert_hf_to_gguf",
+    "UNSLOTH_HOME",
+    "LLAMA_CPP_DEFAULT_DIR",
+    "IS_WINDOWS",
 ]
 
 import subprocess
@@ -38,6 +41,7 @@ import importlib.util
 import tempfile
 import logging
 import shlex
+import shutil
 import torch
 from pathlib import Path
 import psutil
@@ -101,8 +105,17 @@ BAD_OUTCOMES = {
 keynames = "\n" + "\n".join(os.environ.keys())
 IS_COLAB_ENVIRONMENT  = "\nCOLAB_"  in keynames
 IS_KAGGLE_ENVIRONMENT = "\nKAGGLE_" in keynames
+IS_WINDOWS = sys.platform == "win32"
 KAGGLE_TMP = "/tmp"
 del keynames
+
+# Default llama.cpp location: ~/.unsloth/llama.cpp
+# Override with UNSLOTH_LLAMA_CPP_PATH env var to use a custom llama.cpp install
+UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
+LLAMA_CPP_DEFAULT_DIR = os.environ.get(
+    "UNSLOTH_LLAMA_CPP_PATH",
+    os.path.join(UNSLOTH_HOME, "llama.cpp"),
+)
 
 
 @contextlib.contextmanager
@@ -111,7 +124,7 @@ def use_local_gguf():
     # Store original state
     original_sys_path = sys.path.copy()
     original_modules = set(sys.modules.keys())
-    gguf_py_path = os.path.join("llama.cpp", "gguf-py")
+    gguf_py_path = os.path.join(LLAMA_CPP_DEFAULT_DIR, "gguf-py")
 
     original_gguf_modules = {}
 
@@ -151,10 +164,61 @@ pass
 
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
+
+    if IS_WINDOWS:
+        # Per-package winget config aligned with setup.ps1
+        # Each entry: (winget_id, extra_args_list)
+        WINGET_PACKAGES = {
+            'git': ('Git.Git', []),
+            'cmake': ('Kitware.CMake', []),
+            'build-essential': (
+                'Microsoft.VisualStudio.2022.BuildTools',
+                ['--override',
+                 '--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive --wait'],
+            ),
+            'openssl': ('ShiningLight.OpenSSL.Dev', []),
+        }
+
+        # Handle space-separated multi-package strings
+        packages = package.strip().split()
+        for pkg in packages:
+            pkg_lower = pkg.lower()
+            entry = WINGET_PACKAGES.get(pkg_lower)
+            if entry is None:
+                print(f"Unsloth: Package '{pkg}' not applicable on Windows, skipping.")
+                continue
+
+            winget_id, extra_args = entry
+            if shutil.which('winget') is None:
+                raise RuntimeError(
+                    f"Unsloth: Missing '{pkg}' and winget not available.\n"
+                    f"Install manually: winget install {winget_id}"
+                )
+
+            print(f"Unsloth: Installing {pkg} via winget ({winget_id})...")
+            cmd = [
+                'winget', 'install', '-e', '--id', winget_id,
+                '--source', 'winget',
+                '--accept-package-agreements',
+                '--accept-source-agreements',
+            ] + extra_args
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Unsloth: Failed to install {winget_id} via winget.\n"
+                    f"Install manually: winget install {winget_id}"
+                )
+            if print_output: print(f"Unsloth: Successfully installed {winget_id}", flush=True)
+            if print_outputs is not None: print_outputs.append(f"Installed {winget_id}")
+        return
+
     # Choose package manager based on system type
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
         install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
+    elif system_type == "arch":
+        install_cmd = f"{'sudo ' if sudo else ''}pacman -S --noconfirm {package}"
     else:  # Default to debian/apt-get
         install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
 
@@ -177,7 +241,7 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
                     )
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
+                pkg_mgr_name = {"rpm": "yum/dnf", "arch": "pacman"}.get(system_type, "apt-get")
                 raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist when installing {package}? Is this NOT a Linux / Mac based computer?")
             elif "Unable to locate package" in line:
                 sp.terminate()
@@ -191,6 +255,9 @@ pass
 
 def do_we_need_sudo(system_type="debian"):
     # All Unsloth Zoo code licensed under LGPLv3
+    if IS_WINDOWS:
+        return False
+
     # Check apt-get updating
     sudo = False
     print("Unsloth: Updating system package directories")
@@ -199,6 +266,8 @@ def do_we_need_sudo(system_type="debian"):
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
         update_cmd = f"{pkg_manager} check-update"
+    elif system_type == "arch":
+        update_cmd = "pacman -Sy"
     else:
         update_cmd = "apt-get update -y"
 
@@ -212,7 +281,7 @@ def do_we_need_sudo(system_type="debian"):
                 break
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                pkg_mgr_name = "yum/dnf" if system_type == "rpm" else "apt-get"
+                pkg_mgr_name = {"rpm": "yum/dnf", "arch": "pacman"}.get(system_type, "apt-get")
                 raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist? Is this NOT a Linux / Mac based computer?")
             elif "failure resolving" in line or "Err:" in line:
                 sp.terminate()
@@ -359,7 +428,57 @@ def try_execute_with_auto_install(command, sudo=False, print_output=False, print
 pass
 
 
-def check_llama_cpp(llama_cpp_folder = "llama.cpp"):
+def _find_visual_studio():
+    """Detect Visual Studio Build Tools installation (aligned with setup.ps1 Find-VsBuildTools).
+    Returns (cmake_generator, vs_install_path) or (None, None) if not found."""
+    program_files = [
+        os.environ.get('ProgramFiles', r'C:\Program Files'),
+        os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+    ]
+    editions = ['BuildTools', 'Community', 'Professional', 'Enterprise']
+    vs_map = {'2022': '17', '2019': '16', '2017': '15'}
+    for year, ver in vs_map.items():
+        for pf in program_files:
+            for edition in editions:
+                candidate = os.path.join(pf, 'Microsoft Visual Studio', year, edition)
+                vc_dir = os.path.join(candidate, 'VC', 'Tools', 'MSVC')
+                if os.path.isdir(vc_dir):
+                    return f"Visual Studio {ver} {year}", candidate
+    return None, None
+
+
+def _find_openssl_root():
+    """Find OpenSSL dev installation on Windows (aligned with setup.ps1 $OpenSslRoots).
+    Returns the root path if found, or None."""
+    openssl_roots = [
+        r'C:\Program Files\OpenSSL-Win64',
+        r'C:\Program Files\OpenSSL',
+        r'C:\OpenSSL-Win64',
+    ]
+    for root in openssl_roots:
+        if os.path.exists(os.path.join(root, 'include', 'openssl', 'ssl.h')):
+            return root
+    return None
+
+
+def _find_lib_path(lib_name):
+    """Find a shared library path using gcc's linker search.
+    Returns the absolute path if found, or None."""
+    try:
+        result = subprocess.run(
+            ['gcc', f'-print-file-name={lib_name}'],
+            capture_output=True, text=True
+        )
+        path = os.path.realpath(result.stdout.strip())
+        if os.path.isabs(path) and os.path.exists(path):
+            return path
+    except Exception as exc:
+        # Treat any error during probing as "library not found" but log for debugging purposes.
+        logger.debug("Failed to locate shared library %r via gcc: %s", lib_name, exc)
+    return None
+
+
+def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if the folder exists
     if not os.path.exists(llama_cpp_folder):
@@ -368,10 +487,26 @@ def check_llama_cpp(llama_cpp_folder = "llama.cpp"):
     quantizer_location = None
     converter_location = None
 
+    # On Windows, binaries have .exe extension and live in build/bin/Release/
+    if IS_WINDOWS:
+        quantizer_names = ["llama-quantize.exe", "quantize.exe"]
+        search_dirs = [
+            llama_cpp_folder,
+            os.path.join(llama_cpp_folder, "build", "bin", "Release"),
+        ]
+    else:
+        quantizer_names = ["llama-quantize", "quantize"]
+        search_dirs = [llama_cpp_folder]
+
     # Check for quantizer binary
-    for quantizer in ["llama-quantize", "quantize"]:
-        location = os.path.join(llama_cpp_folder, quantizer)
-        if os.path.exists(location) and os.access(location, os.X_OK):
+    for quantizer in quantizer_names:
+        for search_dir in search_dirs:
+            location = os.path.join(search_dir, quantizer)
+            if not os.path.exists(location):
+                continue
+            # os.access(X_OK) is unreliable on Windows — skip it
+            if not IS_WINDOWS and not os.access(location, os.X_OK):
+                continue
             try:
                 result = subprocess.run(
                     [location, "--help"],
@@ -383,16 +518,19 @@ def check_llama_cpp(llama_cpp_folder = "llama.cpp"):
                     quantizer_location = location
                     break
             except Exception as e: print(f"Found {quantizer} at {location} but couldn't run it: {e}")
-        pass
+        if quantizer_location is not None:
+            break
     pass
 
     if quantizer_location is None:
         # List what files are actually there for debugging
         import glob
-        files_found = glob.glob(os.path.join(llama_cpp_folder, "*"))
+        all_files = []
+        for search_dir in search_dirs:
+            all_files.extend(glob.glob(os.path.join(search_dir, "*")))
         raise RuntimeError(
-            f"Unsloth: No working quantizer found in {llama_cpp_folder}\n"
-            f"Files in directory: {', '.join(os.path.basename(f) for f in files_found[:20])}"
+            f"Unsloth: No working quantizer found in {', '.join(search_dirs)}\n"
+            f"Files found: {', '.join(os.path.basename(f) for f in all_files[:20])}"
         )
     pass
 
@@ -412,8 +550,26 @@ def check_llama_cpp(llama_cpp_folder = "llama.cpp"):
 pass
 
 
+def _is_safe_to_delete(path):
+    """Check if a path is safe to delete (must be under UNSLOTH_HOME or be a llama.cpp dir)."""
+    try:
+        real_path = os.path.realpath(path)
+        real_home = os.path.realpath(UNSLOTH_HOME)
+        # Safe if under ~/.unsloth/
+        if real_path.startswith(real_home + os.sep):
+            return True
+        # Safe if it's the CWD-relative llama.cpp (backward-compat path)
+        cwd_llama = os.path.realpath(os.path.join(os.getcwd(), "llama.cpp"))
+        if real_path == cwd_llama:
+            return True
+    except Exception as exc:
+        # On any unexpected error, treat the path as unsafe but log for debugging.
+        logger.debug("Failed to check if path %r is safe to delete: %s", path, exc)
+    return False
+
+
 def install_llama_cpp(
-    llama_cpp_folder = "llama.cpp",
+    llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR,
     llama_cpp_targets = LLAMA_CPP_TARGETS,
     print_output = False,
     gpu_support = False,
@@ -426,12 +582,57 @@ def install_llama_cpp(
 
     gpu_support = "ON" if gpu_support else "OFF"
 
-    if os.path.exists(llama_cpp_folder):
+    needs_clone = False
+    needs_build = False
+
+    # Ensure ~/.unsloth/ exists before we try to use it
+    os.makedirs(UNSLOTH_HOME, exist_ok=True)
+
+    # C3: Backward compat -- if using the new default location but CWD has a working ./llama.cpp, use it
+    cwd_llama_cpp = os.path.join(os.getcwd(), "llama.cpp")
+    if (
+        llama_cpp_folder == LLAMA_CPP_DEFAULT_DIR
+        and os.path.exists(cwd_llama_cpp)
+        and cwd_llama_cpp != os.path.realpath(llama_cpp_folder)
+    ):
         try:
-            quantizer, converter = check_llama_cpp(llama_cpp_folder = llama_cpp_folder)
-            print(f"Unsloth: llama.cpp folder already exists - will use `{llama_cpp_folder}`")
-            return quantizer, converter
-        except: print(f"Unsloth: llama.cpp folder exists but binaries not found - will rebuild")
+            q, c = check_llama_cpp(llama_cpp_folder=cwd_llama_cpp)
+            print(
+                f"Unsloth: Found existing llama.cpp at `{cwd_llama_cpp}` -- using it.\n"
+                f"Unsloth: Note: the default location has moved to `{LLAMA_CPP_DEFAULT_DIR}`."
+            )
+            return q, c
+        except Exception:
+            pass  # CWD copy is broken, proceed with default location
+
+    if os.path.exists(llama_cpp_folder):
+        # Repo integrity check -- key directories must exist
+        required_dirs = ['src', 'ggml', 'common']
+        if not all(os.path.isdir(os.path.join(llama_cpp_folder, d)) for d in required_dirs):
+            print("Unsloth: llama.cpp repo appears corrupted (missing src/ggml/common) - will re-clone")
+            # C4: Only delete if the path is safe
+            if _is_safe_to_delete(llama_cpp_folder):
+                shutil.rmtree(llama_cpp_folder)
+            else:
+                raise RuntimeError(
+                    f"Unsloth: llama.cpp at `{llama_cpp_folder}` appears corrupted but is not in a safe location to delete.\n"
+                    f"Please manually remove or fix it."
+                )
+            needs_clone = True
+            needs_build = True
+        else:
+            # Repo is intact -- check for existing binaries
+            try:
+                quantizer, converter = check_llama_cpp(llama_cpp_folder=llama_cpp_folder)
+                # C2: If binaries work, use them directly (no auto-update)
+                print(f"Unsloth: llama.cpp found at `{llama_cpp_folder}` -- using existing install.")
+                return quantizer, converter
+            except Exception:
+                print("Unsloth: llama.cpp folder exists but binaries not found - will build")
+                needs_build = True
+    else:
+        needs_clone = True
+        needs_build = True
     pass
 
     print_outputs = []
@@ -440,30 +641,37 @@ def install_llama_cpp(
     kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs, "system_type": system_type}
 
     if not missing_packages:
-        print("Unsloth: All required system packages already installed!")
+        if print_output: print("Unsloth: All required system packages already installed!")
     else:
         packages_to_install = " ".join(missing_packages)
         print(f"Unsloth: Missing packages: {packages_to_install}")
         print(f"Unsloth: Will attempt to install missing system packages.")
         install_package(packages_to_install, sudo, system_type = system_type)
 
-    print("Unsloth: Install llama.cpp and building - please wait 1 to 3 minutes")
-    if gpu_support == "ON":
-        print("Unsloth: Building llama.cpp with GPU support")
-
-    # Clone repo if it doesn't exist
-    if not os.path.exists(llama_cpp_folder):
-        print("Unsloth: Cloning llama.cpp repository")
+    # Clone repo if needed
+    if needs_clone:
+        parent_dir = os.path.dirname(llama_cpp_folder)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        print("Unsloth: Cloning llama.cpp repository...")
+        # H2: Quote path to handle spaces in directory names
+        quoted_folder = shlex.quote(llama_cpp_folder) if not IS_WINDOWS else f'"{llama_cpp_folder}"'
         try_execute_with_auto_install(
-            f"git clone https://github.com/ggml-org/llama.cpp {llama_cpp_folder}",
+            f"git clone https://github.com/ggml-org/llama.cpp {quoted_folder}",
             **kwargs
         )
+    pass
 
     pip = check_pip()
 
-    print("Unsloth: Install GGUF and other packages")
+    # Install Python packages (only if not already satisfied)
     try_execute(f"{pip} install gguf protobuf sentencepiece mistral_common", **kwargs)
     if just_clone_repo: return llama_cpp_folder
+
+    if needs_build:
+        print("Unsloth: Building llama.cpp - please wait 1 to 3 minutes")
+    if gpu_support == "ON":
+        print("Unsloth: Building llama.cpp with GPU support")
 
     build_success = False
     build_errors = []
@@ -474,60 +682,146 @@ def install_llama_cpp(
         cpu_count = cpu_count - 1
         cpu_count = max(cpu_count, 1)
 
-    # Try make first
-    try:
-        if print_output: print("Trying to build with make...")
-        try_execute(f"make clean", cwd = llama_cpp_folder, **kwargs)
-        try_execute(f"make all -j{cpu_count}", cwd = llama_cpp_folder, **kwargs)
-        build_success = True
-        print("Successfully built with make")
-    except Exception as e:
-        build_errors.append(f"Make failed: {str(e)}")
-        if print_output: print(f"Make failed, trying cmake...")
-        # Use cmake instead
+    if IS_WINDOWS:
+        # Windows: cmake-only build with Visual Studio generator
+        # Aligned with setup.ps1 Phase 4 build logic
         try:
-            # Clean up any partial build
-            try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
+            build_dir = os.path.join(llama_cpp_folder, "build")
 
+            # Clean up any partial build
+            if os.path.exists(build_dir):
+                shutil.rmtree(build_dir)
+
+            # Detect Visual Studio generator
+            cmake_generator, vs_install_path = _find_visual_studio()
+
+            if not cmake_generator:
+                raise RuntimeError(
+                    "Unsloth: Visual Studio Build Tools not found.\n"
+                    "Install via: winget install Microsoft.VisualStudio.2022.BuildTools "
+                    '--override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive --wait"'
+                )
+
+            # cmake configure
+            cmake_args = [
+                "cmake", "-S", llama_cpp_folder, "-B", build_dir,
+                "-G", cmake_generator,
+                "-Wno-dev",
+                "-DBUILD_SHARED_LIBS=OFF",
+                f"-DGGML_CUDA={gpu_support}",
+            ]
+            if vs_install_path:
+                cmake_args.append(f"-DCMAKE_GENERATOR_INSTANCE={vs_install_path}")
+
+            # Check for OpenSSL (enables HTTPS for llama-server)
+            openssl_root = _find_openssl_root()
+            if openssl_root:
+                cmake_args.extend([
+                    f"-DOPENSSL_ROOT_DIR={openssl_root}",
+                    "-DLLAMA_OPENSSL=ON",  # Defined in common/CMakeLists.txt
+                ])
+
+            if print_output:
+                print(f"Unsloth: cmake configure with {cmake_generator}")
+                print(f"Unsloth: cmake args: {' '.join(cmake_args)}")
+
+            result = subprocess.run(cmake_args, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"cmake configure failed (exit {result.returncode}):\n"
+                    f"{result.stdout}\n{result.stderr}"
+                )
+
+            # cmake build
+            build_cmd = [
+                "cmake", "--build", build_dir, "--config", "Release",
+                f"-j{cpu_count}", "--target",
+            ] + list(llama_cpp_targets)
+
+            if print_output: print("Unsloth: Building llama.cpp (this may take several minutes)...")
+
+            result = subprocess.run(build_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"cmake build failed (exit {result.returncode}):\n"
+                    f"{result.stdout}\n{result.stderr}"
+                )
+
+            # On Windows, binaries stay in build/bin/Release/ — no copy needed
+            build_success = True
+            if print_output: print("Unsloth: Successfully built with cmake (Visual Studio)")
+
+        except Exception as e:
+            build_errors.append(f"Windows cmake build failed: {str(e)}")
+
+    else:
+        # Linux/macOS: Try make first, then cmake
+        try:
+            if print_output: print("Trying to build with make...")
+            try_execute("make clean", cwd = llama_cpp_folder, **kwargs)
+            try_execute(f"make all -j{cpu_count}", cwd = llama_cpp_folder, **kwargs)
+            build_success = True
+            print("Successfully built with make")
+        except Exception as e:
+            build_errors.append(f"Make failed: {str(e)}")
+            if print_output: print(f"Make failed, trying cmake...")
+            # Use cmake instead
             try:
+                # Clean up any partial build
+                try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
+
+                # Build cmake configure command with library detection
+                cmake_configure = (
+                    f"cmake . -B build "
+                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
+                )
+
+                # Detect OpenMP library path (fixes GOMP linker errors)
+                gomp_path = _find_lib_path('libgomp.so')
+                if gomp_path:
+                    cmake_configure += (
+                        f" -DOpenMP_C_LIB_NAMES=gomp"
+                        f" -DOpenMP_CXX_LIB_NAMES=gomp"
+                        f" -DOpenMP_gomp_LIBRARY={gomp_path}"
+                    )
+
+                # Detect OpenSSL library paths
+                ssl_path = _find_lib_path('libssl.so')
+                crypto_path = _find_lib_path('libcrypto.so')
+                if ssl_path and crypto_path:
+                    cmake_configure += (
+                        f" -DOPENSSL_ROOT_DIR=/usr"
+                        f" -DOPENSSL_SSL_LIBRARY={ssl_path}"
+                        f" -DOPENSSL_CRYPTO_LIBRARY={crypto_path}"
+                    )
+
+                # LLAMA_CURL is deprecated upstream (ggml-org/llama.cpp#18791),
+                # so we pass ignore_deprecation=True to handle any deprecation warnings.
                 try_execute(
-                    f"cmake . -B build "\
-                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support} -DLLAMA_CURL=ON",
+                    cmake_configure,
+                    cwd = llama_cpp_folder,
+                    ignore_deprecation = True,
+                    **kwargs
+                )
+                try_execute(
+                    f"cmake --build build --config Release "\
+                    f"-j{cpu_count} --clean-first --target "\
+                    f"{' '.join(llama_cpp_targets)}",
                     cwd = llama_cpp_folder,
                     **kwargs
                 )
-            except Exception as inner_e:
-                inner_e = str(inner_e)
-                if "LLAMA_CURL" in inner_e and "deprecated" in inner_e:
-                    # As of https://github.com/ggml-org/llama.cpp/pull/18791, CURL is deprecated
-                    try_execute(
-                        f"cmake . -B build "\
-                        f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}",
-                        cwd = llama_cpp_folder,
-                        ignore_deprecation = True,
-                        **kwargs
-                    )
-                else:
-                    raise
-            try_execute(
-                f"cmake --build build --config Release "\
-                f"-j{cpu_count} --clean-first --target "\
-                f"{' '.join(llama_cpp_targets)}",
-                cwd = llama_cpp_folder,
-                **kwargs
-            )
-            # Move compiled objects to main folder
-            try_execute(
-                f"cp build/bin/llama-* .",
-                cwd = llama_cpp_folder,
-                **kwargs
-            )
-            build_success = True
-            # Remove build folder
-            try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
-            if print_output: print("Successfully built with cmake")
-        except Exception as e:
-            build_errors.append(f"CMake failed: {str(e)}")
+                # Move compiled objects to main folder
+                try_execute(
+                    f"cp build/bin/llama-* .",
+                    cwd = llama_cpp_folder,
+                    **kwargs
+                )
+                build_success = True
+                # Remove build folder
+                try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
+                if print_output: print("Successfully built with cmake")
+            except Exception as e:
+                build_errors.append(f"CMake failed: {str(e)}")
 
     if not build_success:
         error_msg = "=== Unsloth: FAILED building llama.cpp ===\n"
@@ -574,7 +868,7 @@ def _download_convert_hf_to_gguf(
     # Downloads from llama.cpp's Github report
 
     # Ensure llama.cpp directory exists
-    os.makedirs("llama.cpp", exist_ok=True)
+    os.makedirs(LLAMA_CPP_DEFAULT_DIR, exist_ok=True)
 
     supported_types = set() # Initialize outside try block
     temp_original_file_path = None # Initialize for finally block
@@ -588,7 +882,7 @@ def _download_convert_hf_to_gguf(
         # 2. Introspect Original Script for Supported Architectures
         logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
         with tempfile.NamedTemporaryFile(
-            mode='wb', suffix=".py", prefix="original_gguf_", dir="llama.cpp", delete=False
+            mode='wb', suffix=".py", prefix="original_gguf_", dir=LLAMA_CPP_DEFAULT_DIR, delete=False
         ) as temp_file:
             temp_original_file_path = temp_file.name
             temp_file.write(original_content)
@@ -736,7 +1030,7 @@ def _download_convert_hf_to_gguf(
 
 
         # 4. Write Patched File
-        patched_filename = f"llama.cpp/{name}.py"
+        patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{name}.py")
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
         with open(patched_filename, "wb") as file:
             file.write(patched_content)
@@ -953,7 +1247,7 @@ def convert_to_gguf(
     input_folder,
     model_dtype = "bf16",
     quantization_type = "bf16", # dequantizing from q8_0 disallow, setting default to bf16
-    converter_location = "llama.cpp/unsloth_convert_hf_to_gguf.py",
+    converter_location = os.path.join(LLAMA_CPP_DEFAULT_DIR, "unsloth_convert_hf_to_gguf.py"),
     supported_text_archs = None,
     supported_vision_archs = None,
     is_vlm = False,
@@ -1157,12 +1451,20 @@ def quantize_gguf(
     input_gguf,
     output_gguf,
     quant_type,
-    quantizer_location = "llama.cpp/llama-quantize",
+    quantizer_location = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize"),
     n_threads = None,
     print_output = True,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Use llama-quantize for fast quantization of GGUF files.
+
+    # Fix default path on Windows: binaries are in build/bin/Release/
+    default_quantizer = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize")
+    # H3: Use normpath for reliable path comparison on Windows (/ vs \)
+    if IS_WINDOWS and os.path.normpath(quantizer_location) == os.path.normpath(default_quantizer):
+        quantizer_location = os.path.join(
+            LLAMA_CPP_DEFAULT_DIR, "build", "bin", "Release", "llama-quantize.exe"
+        )
 
     if n_threads is None:
         n_threads = psutil.cpu_count()
@@ -1170,7 +1472,16 @@ def quantize_gguf(
             n_threads = 1
         n_threads *= 2
 
-    command = f"{quantizer_location} {input_gguf} {output_gguf} {quant_type} {n_threads}"
+    def _quote(s):
+        """Quote a path for shell usage, handling both Windows and Unix."""
+        s = str(s)
+        if IS_WINDOWS:
+            # On Windows cmd, wrap in double quotes if path contains spaces
+            return f'"{s}"' if ' ' in s else s
+        import shlex
+        return shlex.quote(s)
+
+    command = f"{_quote(quantizer_location)} {_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
 
     if print_output:
         print(f"Unsloth: Quantizing to {quant_type}...")
@@ -1304,6 +1615,30 @@ pass
 
 def check_build_requirements():
     """Check if build requirements are available (tool-based approach)"""
+
+    if IS_WINDOWS:
+        missing = []
+
+        # Check git (setup.ps1 L266: Get-Command git)
+        if shutil.which('git') is None:
+            missing.append('git')
+
+        # Check cmake (setup.ps1 L290: Get-Command cmake)
+        if shutil.which('cmake') is None:
+            missing.append('cmake')
+
+        # Check VS Build Tools
+        cmake_generator, _ = _find_visual_studio()
+        if cmake_generator is None:
+            missing.append('build-essential')
+
+        # Check OpenSSL dev
+        is_installed, package_name = check_libcurl_dev()
+        if not is_installed:
+            missing.append(package_name)
+
+        return missing, "windows"
+
     required_tools = {
         'gcc': 'build-essential',
         'cmake': 'cmake',
@@ -1318,18 +1653,38 @@ def check_build_requirements():
         try:
             result = subprocess.run(['which', tool], capture_output=True, text=True)
             if result.returncode != 0:
-                # Adjust package names for RPM-based systems
+                # Adjust package names for non-Debian systems
                 if system_type == "rpm":
-                    rpm_packages = {
+                    distro_packages = {
                         'build-essential': 'gcc gcc-c++ make',
                         'cmake': 'cmake',
                         'curl': 'curl',
                         'git': 'git',
                     }
-                    package = rpm_packages.get(package, package)
+                    package = distro_packages.get(package, package)
+                elif system_type == "arch":
+                    distro_packages = {
+                        'build-essential': 'base-devel',
+                        'cmake': 'cmake',
+                        'curl': 'curl',
+                        'git': 'git',
+                    }
+                    package = distro_packages.get(package, package)
                 missing_packages.append(package)
         except Exception:
             missing_packages.append(package)
+
+    # Check for libgomp (OpenMP runtime) - needed for llama.cpp CPU backend linking
+    gomp_path = _find_lib_path('libgomp.so')
+    if gomp_path is None:
+        gomp_packages = {'debian': 'libgomp1', 'rpm': 'libgomp-devel', 'arch': 'gcc'}
+        missing_packages.append(gomp_packages.get(system_type, 'libgomp1'))
+
+    # Check for libssl-dev (OpenSSL development) - needed for HTTPS support
+    ssl_path = _find_lib_path('libssl.so')
+    if ssl_path is None:
+        ssl_packages = {'debian': 'libssl-dev', 'rpm': 'openssl-devel', 'arch': 'openssl'}
+        missing_packages.append(ssl_packages.get(system_type, 'libssl-dev'))
 
     # Check for libcurl development headers
     is_installed, package_name = check_libcurl_dev()
@@ -1342,6 +1697,12 @@ pass
 def check_libcurl_dev():
     """Check if required libcurl dev package is installed (cross-platform)"""
     system_type = check_linux_type()
+
+    if system_type == "windows":
+        root = _find_openssl_root()
+        if root is not None:
+            return True, "OpenSSL"
+        return False, "openssl"
 
     if system_type == "debian":
         package_name = "libcurl4-openssl-dev"
@@ -1361,6 +1722,15 @@ def check_libcurl_dev():
         except Exception:
             return False, package_name
 
+    elif system_type == "arch":
+        package_name = "curl"
+        try:
+            result = subprocess.run(['pacman', '-Q', package_name], capture_output=True, text=True)
+            is_installed = result.returncode == 0
+            return is_installed, package_name
+        except Exception:
+            return False, package_name
+
     return False, "libcurl4-openssl-dev"
 pass
 
@@ -1369,6 +1739,9 @@ def check_linux_type():
     import platform
 
     system = platform.system().lower()
+
+    if system == "windows":
+        return "windows"
 
     if system != "linux":
         return "unknown"
@@ -1380,6 +1753,10 @@ def check_linux_type():
     # Check if it's RPM-based (CentOS/RHEL/Fedora):
     elif any(os.path.exists(f) for f in ['/etc/redhat-release', '/etc/fedora-release']):
         return 'rpm'
+
+    # Check if it's Arch-based (Arch/Manjaro):
+    elif os.path.exists('/etc/arch-release'):
+        return 'arch'
 
     return 'unknown'
 pass
