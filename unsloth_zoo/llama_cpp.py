@@ -521,8 +521,8 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
         for search_dir in search_dirs:
             all_files.extend(glob.glob(os.path.join(search_dir, "*")))
         raise RuntimeError(
-            f"Unsloth: No working quantizer found in {llama_cpp_folder}\n"
-            f"Files in directory: {', '.join(os.path.basename(f) for f in all_files[:20])}"
+            f"Unsloth: No working quantizer found in {', '.join(search_dirs)}\n"
+            f"Files found: {', '.join(os.path.basename(f) for f in all_files[:20])}"
         )
     pass
 
