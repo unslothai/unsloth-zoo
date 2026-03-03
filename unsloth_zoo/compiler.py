@@ -1316,11 +1316,11 @@ def create_standalone_class(
     # Combine all into file
     source = source + full_class
 
-    # Remove @auto_docstring / @use_kernelized_func / @check_model_inputs decorators
-    # Use re.DOTALL so . matches newlines for multiline decorator args like custom_intro="""..."""
-    source = re.sub(r"@auto_docstring\s*(\(.*?\))?", "", source, flags=re.DOTALL)
-    source = re.sub(r"@use_kernelized_func\s*(\(.*?\))?", "", source, flags=re.DOTALL)
-    source = re.sub(r"@check_model_inputs\s*(\(.*?\))?", "", source, flags=re.DOTALL)
+    # Remove @auto_docstring
+    source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    # source = source.replace("@auto_docstring", "")
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
