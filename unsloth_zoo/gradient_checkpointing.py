@@ -300,6 +300,8 @@ pass
 global CPU_BUFFERS
 global CPU_INDEX
 global GPU_BUFFERS
+global GPU_BUFFERS_B
+global USE_DOUBLE_BUFFER
 global BACKWARD_PASS
 global EXTRA_STREAMS
 global MAIN_STREAMS
@@ -322,6 +324,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     global CPU_BUFFERS
     global CPU_INDEX
     global GPU_BUFFERS
+    global GPU_BUFFERS_B
+    global USE_DOUBLE_BUFFER
     global BACKWARD_PASS
     global EXTRA_STREAMS
     global MAIN_STREAMS
@@ -353,6 +357,13 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
     try:
         GPU_BUFFERS = tuple([torch.empty(2*256*2048, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
+        # Double buffering: try to allocate buffer B
+        try:
+            GPU_BUFFERS_B = tuple([torch.empty(2*256*2048, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
+            USE_DOUBLE_BUFFER = True
+        except:
+            GPU_BUFFERS_B = None
+            USE_DOUBLE_BUFFER = False
     except Exception as e:
         print("="*10 + "\n")
         print("Unsloth: Your setup does not support `PYTORCH_CUDA_ALLOC_CONF`\n")
@@ -439,6 +450,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         use_gpu_buffer = True
                         global CPU_BUFFERS
                         global GPU_BUFFERS
+                        global GPU_BUFFERS_B
+                        global USE_DOUBLE_BUFFER
                         global BACKWARD_PASS
                         global EXTRA_STREAMS
                         global MAIN_STREAMS
@@ -464,6 +477,16 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         shape = arg.shape
                         if new_size > x.numel(): x.resize_(new_size)
                         if new_size > GPU_BUFFER.numel(): GPU_BUFFER.resize_(new_size)
+                        # resize buffer B as needed if double buffering is enabled, disable if OOM
+                        if USE_DOUBLE_BUFFER:
+                            GPU_BUFFER_B = GPU_BUFFERS_B[device_index]
+                            if new_size > GPU_BUFFER_B.numel():
+                                try:
+                                    GPU_BUFFER_B.resize_(new_size)
+                                    print("Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.")
+                                except:
+                                    # OOM - disable double buffering
+                                    USE_DOUBLE_BUFFER = False
                         x = x[:new_size].view(shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
@@ -523,11 +546,25 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM = ctx._saved_metadata
         if CPU_INDEX is not None:
             global GPU_BUFFER
-            buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
+            global USE_DOUBLE_BUFFER
+            global GPU_BUFFERS_B
+            # Select which buffer to use based on buffer index on CPU_INDEX if double buffering is enabled
+            if USE_DOUBLE_BUFFER and (CPU_INDEX % 2 == 1):
+                buffer = GPU_BUFFERS_B[device_index][:new_size].view(shape)
+            else:
+                buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
+
             x = CPU_BUFFERS[CPU_INDEX][:new_size].view(shape)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
-            EXTRA_STREAM.wait_stream(MAIN_STREAM)
+            if USE_DOUBLE_BUFFER:
+                # Double buffer mode: No need to wait for MAIN_STREAM because
+                # we're using a different buffer than the one being computed on
+                pass
+            else:
+                # Single buffer mode: Must wait for MAIN_STREAM to finish
+                EXTRA_STREAM.wait_stream(MAIN_STREAM)
+
             with torch_gpu_stream(EXTRA_STREAM):
                 buffer.copy_(x, non_blocking = True)
         else:
