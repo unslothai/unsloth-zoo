@@ -360,16 +360,16 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     # Allocate buffers to how many GPUs
     n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
     try:
-        GPU_BUFFERS = tuple([torch.empty(2*256*2048, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
+        GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
         # Double buffering: try to allocate buffer B
         try:
-            GPU_BUFFERS_B = tuple([torch.empty(2*256*2048, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
+            GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
             USE_DOUBLE_BUFFER = True
             # Per-buffer events to prevent race conditions in double buffering.
             # Each event tracks when compute on that buffer finishes
             BUFFER_EVENTS_A = tuple([torch.cuda.Event() for _ in range(n_gpus)])
             BUFFER_EVENTS_B = tuple([torch.cuda.Event() for _ in range(n_gpus)])
-        except:
+        except Exception as e:
             GPU_BUFFERS_B = None
             USE_DOUBLE_BUFFER = False
             BUFFER_EVENTS_A = None
@@ -494,7 +494,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                 try:
                                     GPU_BUFFER_B.resize_(new_size)
                                     print("Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.")
-                                except:
+                                except Exception as e:
                                     # OOM - disable double buffering
                                     USE_DOUBLE_BUFFER = False
                         x = x[:new_size].view(shape)
