@@ -310,6 +310,8 @@ global USE_UNSLOTH_GC
 global LAST_GC_INDEX
 global FIRST_PASS
 global CURRENT_GC_INDEX
+global BUFFER_EVENTS_A
+global BUFFER_EVENTS_B
 
 if DEVICE_TYPE in ("cuda", "hip"):
     torch_gpu_stream = torch.cuda.stream
@@ -334,6 +336,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     global LAST_GC_INDEX
     global FIRST_PASS
     global CURRENT_GC_INDEX
+    global BUFFER_EVENTS_A
+    global BUFFER_EVENTS_B
     CPU_BUFFERS = []
     CPU_INDEX = 0
 
@@ -361,9 +365,15 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         try:
             GPU_BUFFERS_B = tuple([torch.empty(2*256*2048, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
             USE_DOUBLE_BUFFER = True
+            # Per-buffer events to prevent race conditions in double buffering.
+            # Each event tracks when compute on that buffer finishes
+            BUFFER_EVENTS_A = tuple([torch.cuda.Event() for _ in range(n_gpus)])
+            BUFFER_EVENTS_B = tuple([torch.cuda.Event() for _ in range(n_gpus)])
         except:
             GPU_BUFFERS_B = None
             USE_DOUBLE_BUFFER = False
+            BUFFER_EVENTS_A = None
+            BUFFER_EVENTS_B = None
     except Exception as e:
         print("="*10 + "\n")
         print("Unsloth: Your setup does not support `PYTORCH_CUDA_ALLOC_CONF`\n")
@@ -548,7 +558,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             global GPU_BUFFER
             global USE_DOUBLE_BUFFER
             global GPU_BUFFERS_B
-            # Select which buffer to use based on buffer index on CPU_INDEX if double buffering is enabled
+            global BUFFER_EVENTS_A
+            global BUFFER_EVENTS_B
+            # Select which buffer to use based on CPU_INDEX parity
             if USE_DOUBLE_BUFFER and (CPU_INDEX % 2 == 1):
                 buffer = GPU_BUFFERS_B[device_index][:new_size].view(shape)
             else:
@@ -558,9 +570,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:
-                # Double buffer mode: No need to wait for MAIN_STREAM because
-                # we're using a different buffer than the one being computed on
-                pass
+                # Wait for the last compute on THIS SPECIFIC buffer to finish
+                if CPU_INDEX % 2 == 1:
+                    EXTRA_STREAM.wait_event(BUFFER_EVENTS_B[device_index])
+                else:
+                    EXTRA_STREAM.wait_event(BUFFER_EVENTS_A[device_index])
             else:
                 # Single buffer mode: Must wait for MAIN_STREAM to finish
                 EXTRA_STREAM.wait_stream(MAIN_STREAM)
@@ -648,6 +662,13 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         else:
             torch.autograd.backward(outputs_with_grad, args_with_grad)
         pass
+
+        # Record event after compute finishes so the copy stream knows
+        if CPU_INDEX is not None and USE_DOUBLE_BUFFER:
+            if CPU_INDEX % 2 == 1:
+                BUFFER_EVENTS_B[device_index].record(MAIN_STREAM)
+            else:
+                BUFFER_EVENTS_A[device_index].record(MAIN_STREAM)
 
         grads = tuple(
             inp.grad if isinstance(inp, torch.Tensor) else None
