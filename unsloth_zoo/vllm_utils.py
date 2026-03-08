@@ -1786,14 +1786,14 @@ def load_vllm(
         if   ten_percent >= 9.0: standby_target_gpu_util = 0.9
         elif ten_percent >= 4.0: standby_target_gpu_util = 0.875
         elif ten_percent >= 2.5: standby_target_gpu_util = 0.85
-        elif ten_percent >= 2.0: standby_target_gpu_util = 0.825
+        elif ten_percent >= 2.0: standby_target_gpu_util = 0.775
         elif ten_percent >= 1.4: standby_target_gpu_util = 0.8
         elif ten_percent >= 1.0: standby_target_gpu_util = 0.75
         else: standby_target_gpu_util = 0.7
     else:
         if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
         elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
-        elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
+        elif ten_percent >= 2.0: standby_target_gpu_util = 0.825
         elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
         elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
         else: standby_target_gpu_util = 0.75
