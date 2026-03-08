@@ -100,7 +100,7 @@ def get_torch_compile_options(
 
         "triton.multi_kernel"       : multi_kernel, # RuntimeError: name 'multi_kernel_0' is not defined
         "triton.use_block_ptr"      : use_block_ptr,
-        "triton.enable_persistent_tma_matmul" : (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9),
+        "triton.enable_persistent_tma_matmul" : True,
         "triton.autotune_at_compile_time"     : False,
         "triton.cooperative_reductions"       : False,
         # "reorder_for_compute_comm_overlap"  : True, # Fails for single GPU
