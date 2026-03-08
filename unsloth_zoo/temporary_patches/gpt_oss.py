@@ -122,22 +122,23 @@ def patch_gpt_oss():
     try:
         import transformers.quantizers.quantizer_mxfp4
 
-        def is_kernels_available(): return True
-
-        transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
-    except Exception as e:
-        return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
-
-    if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
-
-    try:
+        # Always allow LoRA training (works with dequantized bf16 weights too)
         transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
     if HAS_TRITON_KERNELS:
+        # Only override is_kernels_available when triton_kernels IS available
+        try:
+            def is_kernels_available(): return True
+
+            transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
+        except Exception as e:
+            return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
+
+        if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
+            transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
+
         try:
             from triton_kernels import matmul_ogs, swiglu
 
@@ -150,7 +151,8 @@ def patch_gpt_oss():
         except Exception as e:
             return raise_error("triton_kernels", e)
     else:
-        # Skip MXFP4 patches when triton_kernels not available
+        # Leave is_kernels_available intact so transformers' validate_environment()
+        # correctly sets dequantize=True, enabling bf16 fallback.
         return
 
     try:
@@ -2815,12 +2817,18 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_init_weights_modulelist_fix)
 # Patch GptOssForCausalLM.forward for GRPO training
 # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
 # ============================================================================
-def patch_gpt_oss_for_grpo():
+def patch_gpt_oss_for_grpo(phase="post_compile"):
     """
     Patch GptOssForCausalLM.forward for GRPO training.
     When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits.
     This fixes the matrix multiplication dimension mismatch issue in GRPO training.
+
+    Only runs post-compile so the compiler can pattern-match cross-entropy in the
+    original forward source and apply fused loss (preventing OOM from full logits).
     """
+    if phase != "post_compile":
+        return
+
     if "gpt_oss" not in _normalized_unsloth_model_name():
         return
 
@@ -2830,6 +2838,9 @@ def patch_gpt_oss_for_grpo():
             GptOssForCausalLM,
             MoeCausalLMOutputWithPast,
         )
+
+        if hasattr(GptOssForCausalLM, '_unsloth_grpo_patched'):
+            return
 
         _original_causal_lm_forward = GptOssForCausalLM.forward
 
@@ -2906,6 +2917,7 @@ def patch_gpt_oss_for_grpo():
         # this is a CausalLM forward and compute num_items_in_batch properly.
         _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
         GptOssForCausalLM.forward = _patched_causal_lm_forward
+        GptOssForCausalLM._unsloth_grpo_patched = True
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("Unsloth: Patched GptOssForCausalLM.forward for GRPO hidden states.")
 
