@@ -1792,11 +1792,19 @@ def load_vllm(
         elif ten_percent >= 1.0: standby_target_gpu_util = 0.75
         else: standby_target_gpu_util = 0.7
     else:
+        # Standby mode sleep/wake cycle: vLLM reserves (util * 0.95 * total_vram)
+        # for KV cache + model weights. The remainder must fit the HF training side
+        # (LoRA params, optimizer states, activations, gradient checkpoints).
+        # On GPUs with <= 24GB (L4, RTX 4090, etc.), the old 0.875 value left only
+        # ~4GB after vLLM's reservation. An 8B model in 4-bit needs ~4-5GB for
+        # weights alone, so wake_up(tags=["kv_cache"]) -> create_and_map would fail
+        # silently at the CUDA VMM level, producing cudaErrorIllegalAddress.
+        # Lowered tiers for <= 24GB GPUs to give ~5GB+ headroom.
         if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
         elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
-        elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
-        elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
-        elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
+        elif ten_percent >= 2.0: standby_target_gpu_util = 0.825
+        elif ten_percent >= 1.4: standby_target_gpu_util = 0.8
+        elif ten_percent >= 1.0: standby_target_gpu_util = 0.775
         else: standby_target_gpu_util = 0.75
         # Reduce memory usage for newer vLLM versions since it OOMs
         if UNSLOTH_ENABLE_LOGGING:
