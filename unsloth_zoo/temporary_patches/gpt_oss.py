@@ -2815,12 +2815,18 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_init_weights_modulelist_fix)
 # Patch GptOssForCausalLM.forward for GRPO training
 # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
 # ============================================================================
-def patch_gpt_oss_for_grpo():
+def patch_gpt_oss_for_grpo(phase="post_compile"):
     """
     Patch GptOssForCausalLM.forward for GRPO training.
     When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits.
     This fixes the matrix multiplication dimension mismatch issue in GRPO training.
+
+    Only runs post-compile so the compiler can pattern-match cross-entropy in the
+    original forward source and apply fused loss (preventing OOM from full logits).
     """
+    if phase != "post_compile":
+        return
+
     if "gpt_oss" not in _normalized_unsloth_model_name():
         return
 
@@ -2830,6 +2836,9 @@ def patch_gpt_oss_for_grpo():
             GptOssForCausalLM,
             MoeCausalLMOutputWithPast,
         )
+
+        if hasattr(GptOssForCausalLM, '_unsloth_grpo_patched'):
+            return
 
         _original_causal_lm_forward = GptOssForCausalLM.forward
 
@@ -2906,6 +2915,7 @@ def patch_gpt_oss_for_grpo():
         # this is a CausalLM forward and compute num_items_in_batch properly.
         _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
         GptOssForCausalLM.forward = _patched_causal_lm_forward
+        GptOssForCausalLM._unsloth_grpo_patched = True
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("Unsloth: Patched GptOssForCausalLM.forward for GRPO hidden states.")
 
