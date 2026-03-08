@@ -122,22 +122,23 @@ def patch_gpt_oss():
     try:
         import transformers.quantizers.quantizer_mxfp4
 
-        def is_kernels_available(): return True
-
-        transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
-    except Exception as e:
-        return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
-
-    if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
-
-    try:
+        # Always allow LoRA training (works with dequantized bf16 weights too)
         transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
     if HAS_TRITON_KERNELS:
+        # Only override is_kernels_available when triton_kernels IS available
+        try:
+            def is_kernels_available(): return True
+
+            transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
+        except Exception as e:
+            return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
+
+        if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
+            transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
+
         try:
             from triton_kernels import matmul_ogs, swiglu
 
@@ -150,7 +151,8 @@ def patch_gpt_oss():
         except Exception as e:
             return raise_error("triton_kernels", e)
     else:
-        # Skip MXFP4 patches when triton_kernels not available
+        # Leave is_kernels_available intact so transformers' validate_environment()
+        # correctly sets dequantize=True, enabling bf16 fallback.
         return
 
     try:
