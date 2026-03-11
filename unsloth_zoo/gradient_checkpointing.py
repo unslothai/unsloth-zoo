@@ -462,6 +462,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         global GPU_BUFFERS
                         global GPU_BUFFERS_B
                         global USE_DOUBLE_BUFFER
+                        global BUFFER_EVENTS_A
+                        global BUFFER_EVENTS_B
                         global BACKWARD_PASS
                         global EXTRA_STREAMS
                         global MAIN_STREAMS
