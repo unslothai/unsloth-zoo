@@ -442,10 +442,15 @@ def set_additional_modules(new_model, quant_state_dict, config):
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
     # Norm
-    norm_key = f"{language_model_prefix}.norm.weight"
+    model_type = getattr(config, "model_type", "causal_lm")
+    if model_type == "lfm2":
+        norm_attr = "embedding_norm"
+    else:
+        norm_attr = "norm"
+    norm_key = f"{language_model_prefix}.{norm_attr}.weight"
     norm = quant_state_dict[norm_key]
     norm = torch.nn.Parameter(norm, requires_grad = False)
-    language_model.norm.weight = norm
+    getattr(language_model, norm_attr).weight = norm
 
     # LM Head. Do note that for some models, like Mistral3ForConditionalGeneration,
     # there can be mismatch in the value of tie_word_embeddings between config and text_config
@@ -539,6 +544,15 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.up_proj",
             "model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.layers.{kk}.mlp.down_proj",
+
+            # LFM2 layers
+            "model.layers.{kk}.self_attn.out_proj",  # LFM2 uses out_proj not o_proj
+            "model.layers.{kk}.conv.in_proj",
+            "model.layers.{kk}.conv.out_proj",
+            "model.layers.{kk}.conv.conv",
+            "model.layers.{kk}.feed_forward.w1",
+            "model.layers.{kk}.feed_forward.w2",
+            "model.layers.{kk}.feed_forward.w3",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
@@ -555,6 +569,13 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.post_feedforward_layernorm",
             "model.layers.{kk}.self_attn.q_norm",
             "model.layers.{kk}.self_attn.k_norm",
+
+            # LFM2 norms
+            "model.layers.{kk}.operator_norm",
+            "model.layers.{kk}.ffn_norm",
+            "model.layers.{kk}.self_attn.q_layernorm",
+            "model.layers.{kk}.self_attn.k_layernorm",
+
             "model.visual.blocks.{kk}.norm1",
             "model.visual.blocks.{kk}.norm2",
             "model.vision_tower.vision_model.encoder.layers.{kk}.post_layernorm",
