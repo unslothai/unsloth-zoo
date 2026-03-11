@@ -917,8 +917,8 @@ class GptOssExpertsBnb4bit(nn.Module):
                 if count == 0:
                     continue
                 # Use pre-computed indices (no torch.where needed)
-                idx = sorted_tokens[offset:offset + count]
-                current_state = hidden_states[idx]
+                token_idx = sorted_tokens[offset:offset + count]
+                current_state = hidden_states[token_idx]
                 
                 gate_up = self.gate_up_projs[expert_idx](current_state)
                 gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
@@ -929,8 +929,8 @@ class GptOssExpertsBnb4bit(nn.Module):
                 # gated_output = (up + 1) * glu
                 out = self.down_projs[expert_idx](gated_output)
                 
-                weighted_output = out * routing_weights[idx, expert_idx, None].to(torch.float32)
-                next_states.index_add_(0, idx, weighted_output)
+                weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+                next_states.index_add_(0, token_idx, weighted_output)
                 
                 offset += count
             
@@ -1769,8 +1769,8 @@ def torch_native_forward(
                 continue
             
             # Use pre-computed indices (no torch.where needed)
-            idx = sorted_tokens[offset:offset + count]
-            current_state = hidden_states[idx]
+            token_idx = sorted_tokens[offset:offset + count]
+            current_state = hidden_states[token_idx]
             
             gate_up = self.gate_up_projs[expert_idx](current_state)
             down_proj = self.down_projs[expert_idx]
@@ -1778,11 +1778,11 @@ def torch_native_forward(
 
             gated_output = gated_output.to(torch.float32)
             device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
-            with torch.autocast(device_type=device_type, enabled=False):
+            with torch.autocast(device_type=device_type, enabled=False): # Force float32
                 out = down_proj(gated_output)
             
-            weighted_output = out.to(torch.float32) * routing_weights[idx, expert_idx, None].to(torch.float32)
-            next_states.index_add_(0, idx, weighted_output)
+            weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+            next_states.index_add_(0, token_idx, weighted_output)
             
             offset += count
         next_states = next_states.view(batch_size, -1, self.hidden_size)
