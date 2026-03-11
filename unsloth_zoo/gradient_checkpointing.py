@@ -493,7 +493,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                             if new_size > GPU_BUFFER_B.numel():
                                 try:
                                     GPU_BUFFER_B.resize_(new_size)
-                                    print("Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.")
                                 except Exception as e:
                                     # OOM - disable double buffering and free buffer B
                                     USE_DOUBLE_BUFFER = False
@@ -984,6 +983,10 @@ def reset_unsloth_gradient_checkpointing_buffers():
     FIRST_PASS = True
     CURRENT_GC_INDEX = 0
     USE_UNSLOTH_GC = True  # Re-enable the "Will smartly offload" message
+    # Re-enable double buffering if buffer B still exists (may have been
+    # disabled by OOM during a previous run)
+    if GPU_BUFFERS_B is not None:
+        USE_DOUBLE_BUFFER = True
 
     # Clean up freed memory
     torch.cuda.empty_cache()
