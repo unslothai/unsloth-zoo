@@ -495,8 +495,14 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     GPU_BUFFER_B.resize_(new_size)
                                     print("Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.")
                                 except Exception as e:
-                                    # OOM - disable double buffering
+                                    # OOM - disable double buffering and free buffer B
                                     USE_DOUBLE_BUFFER = False
+                                    for _b in GPU_BUFFERS_B:
+                                        if _b is not None and hasattr(_b, "resize_"):
+                                            _b.resize_(0)
+                                    GPU_BUFFERS_B = None
+                                    BUFFER_EVENTS_A = None
+                                    BUFFER_EVENTS_B = None
                         x = x[:new_size].view(shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
@@ -874,14 +880,26 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         torch.utils.checkpoint.CheckpointFunction = torch.utils.checkpoint._old_CheckpointFunction
         global CPU_BUFFERS
         global GPU_BUFFERS
+        global GPU_BUFFERS_B
+        global USE_DOUBLE_BUFFER
+        global BUFFER_EVENTS_A
+        global BUFFER_EVENTS_B
         for i in range(len(CPU_BUFFERS)):
             if hasattr(CPU_BUFFERS[i], "resize_"): CPU_BUFFERS[i].resize_(0)
             if type(CPU_BUFFERS) is list: CPU_BUFFERS[i] = None
         for i in range(len(GPU_BUFFERS)):
             if hasattr(GPU_BUFFERS[i], "resize_"): GPU_BUFFERS[i].resize_(0)
             if type(GPU_BUFFERS) is list: GPU_BUFFERS[i] = None
+        if GPU_BUFFERS_B is not None:
+            for i in range(len(GPU_BUFFERS_B)):
+                if hasattr(GPU_BUFFERS_B[i], "resize_"): GPU_BUFFERS_B[i].resize_(0)
+                if type(GPU_BUFFERS_B) is list: GPU_BUFFERS_B[i] = None
         CPU_BUFFERS = None
         GPU_BUFFERS = None
+        GPU_BUFFERS_B = None
+        USE_DOUBLE_BUFFER = False
+        BUFFER_EVENTS_A = None
+        BUFFER_EVENTS_B = None
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -911,6 +929,10 @@ def reset_unsloth_gradient_checkpointing_buffers():
     """
     global CPU_BUFFERS
     global GPU_BUFFERS
+    global GPU_BUFFERS_B
+    global USE_DOUBLE_BUFFER
+    global BUFFER_EVENTS_A
+    global BUFFER_EVENTS_B
     global CPU_INDEX
     global BACKWARD_PASS
     global LAST_GC_INDEX
@@ -946,6 +968,13 @@ def reset_unsloth_gradient_checkpointing_buffers():
     for i in range(len(GPU_BUFFERS)):
         if GPU_BUFFERS[i] is not None and hasattr(GPU_BUFFERS[i], "resize_"):
             GPU_BUFFERS[i].resize_(INITIAL_GPU_BUFFER_SIZE)
+    pass
+
+    # Reset GPU buffers B (double buffer) to initial size
+    if GPU_BUFFERS_B is not None:
+        for i in range(len(GPU_BUFFERS_B)):
+            if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
+                GPU_BUFFERS_B[i].resize_(INITIAL_GPU_BUFFER_SIZE)
     pass
 
     # Reset state variables for fresh training run
