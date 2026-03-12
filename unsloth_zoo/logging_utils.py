@@ -76,6 +76,7 @@ pass
 
 
 def NotebookProgressCallback_on_log(Trainer_metrics):
+    set_Trainer_metrics = frozenset(Trainer_metrics)
     def _NotebookProgressCallback_on_log(self, args, state, control, logs = None, **kwargs):
         # Only for when there is no evaluation
         if args.eval_strategy == IntervalStrategy.NO and "loss" in logs:
@@ -84,6 +85,16 @@ def NotebookProgressCallback_on_log(Trainer_metrics):
                 # Sometimes metric is not inside logs
                 try: values[metric.replace("/", " / ")] = logs[metric]
                 except: pass
+            pass
+            # Also pick up any extra RL metrics from logs that aren't in the
+            # pre-extracted list (e.g. dynamic per-reward-function metrics).
+            # This ensures the table can display them instead of "No Log".
+            for key, val in logs.items():
+                if key in ("loss", "learning_rate", "epoch", "grad_norm",
+                           "num_input_tokens_seen", "step"): continue
+                display_key = key.replace("/", " / ")
+                if display_key not in values:
+                    values[display_key] = val
             pass
             # First column is necessarily Step since we're not in epoch eval strategy
             values["Step"] = state.global_step
@@ -117,13 +128,23 @@ def NotebookTrainingTracker_write_line(Trainer_metrics):
             pass
             values = new_values
 
+            # Dynamically add new metric columns that appear in values
+            # but weren't in the pre-extracted list (e.g. per-reward-func metrics)
+            for key in values:
+                if key not in columns:
+                    columns.append(key)
+                    # Back-fill previous rows with empty string
+                    for row in self.inner_table[1:]:
+                        row.append("")
+            pass
+
             self.inner_table[0] = columns
             if len(self.inner_table) > 1:
                 last_values = self.inner_table[-1]
                 first_column = self.inner_table[0][0]
                 if last_values[0] != values[first_column]:
                     # write new line
-                    self.inner_table.append([values[c] if c in values else "No Log" for c in columns])
+                    self.inner_table.append([values[c] if c in values else "" for c in columns])
                 else:
                     # update last line
                     new_values = values
@@ -182,15 +203,23 @@ def get_trl_metrics():
         stats2 = re.findall(r"stats\[mode\]\[[\"\']([^\"\']{1,})[\"\']\]", file)
         metrics = metrics + metrics2 + stats2
 
-        # Get optional f-strings
+        # Get optional f-strings (variable at start: f"{var}suffix")
         metrics_f = re.findall(r"_?metrics\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         stats_f = re.findall(r"stats\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         metrics_f = metrics_f + stats_f
 
-        # Get optional f-strings for new TRL [mode]
+        # Get optional f-strings for new TRL [mode] (variable at start)
         metrics_f2 = re.findall(r"_?metrics\[mode\]\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         stats_f2 = re.findall(r"stats\[mode\]\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         metrics_f = metrics_f + metrics_f2 + stats_f2
+
+        # Get f-strings with literal prefix before variable: f"prefix/{var}/suffix"
+        # Captures (prefix, suffix) pairs — these are dynamic columns we can't
+        # pre-create, but we note them so the table can add them at runtime.
+        metrics_f3 = re.findall(r"_?metrics(?:\[mode\])?\[f[\"\']([^\"\']*?)\{[^\}]{1,}\}([^\"\']*?)[\"\']\]", file)
+        stats_f3 = re.findall(r"stats(?:\[mode\])?\[f[\"\']([^\"\']*?)\{[^\}]{1,}\}([^\"\']*?)[\"\']\]", file)
+        # These are dynamic (contain runtime variable names) so we can't add them
+        # as fixed columns. The write_line and on_log patches handle them dynamically.
 
         # Filter out prefixes if seen
         # metrics[f"{prefix}rewards/chosen"]
