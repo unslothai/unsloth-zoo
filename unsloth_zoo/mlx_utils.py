@@ -99,24 +99,33 @@ def _get_logit_softcap(model):
     return float(softcap) if softcap is not None and softcap > 0 else 0.0
 
 
+def _is_lm_head_trainable(model):
+    """Check if the LM head weight is trainable (not frozen by LoRA).
+
+    For LoRA training, the LM head weight is frozen — computing its gradient
+    in CCE is a wasted V x chunk_size x H matmul per chunk. Returns False
+    when the weight should be wrapped with mx.stop_gradient.
+    """
+    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    for key in trainable:
+        if 'lora' not in key:
+            if 'lm_head' in key or 'embed_tokens.weight' in key:
+                return True
+    return len(trainable) == 0  # no LoRA = full fine-tuning = trainable
+
+
 def make_cce_loss_fn(model):
     """Create a CCE loss function using mx.fast.cce_loss from mlx-cce.
 
     CCE computes cross-entropy directly from hidden states and the LM head weight,
-    avoiding full logit materialization. This saves significant memory.
+    avoiding full logit materialization. This saves significant memory for large
+    vocabularies. For V=256K+ models, CCE is both faster and more memory-efficient.
 
     If the LM head is quantized, passes raw uint32 weight + scales + biases
-    directly to cce_loss, using fused quantized matmul kernels. This saves
-    ~1.4GB for a 3B model (no dequantization, no grad_weight).
-
-    Weight is captured once at setup time for efficiency.
-    Supports logit softcapping (Gemma-2) and untied lm_head (Qwen-7B+).
-
-    Args:
-        model: MLX language model (used to detect softcap at setup time).
+    directly to cce_loss, using fused quantized matmul kernels.
 
     Returns:
-        A function (model, batch, lengths) -> scalar loss.
+        A function (model, batch, lengths) -> (loss, ntoks).
     """
     if not has_cce_kernel():
         raise RuntimeError(
@@ -131,10 +140,6 @@ def make_cce_loss_fn(model):
     use_quantized = _is_quantized_layer(lm_layer)
 
     if use_quantized:
-        # Quantized weights are frozen (no gradient needed).
-        # Access weight/scales/biases through the model parameter tree
-        # instead of closure-capturing bare arrays — required for mx.compile
-        # compatibility (compile rejects uncaptured array inputs).
         group_size = getattr(lm_layer, "group_size", 64)
         bits = getattr(lm_layer, "bits", 4)
         print(f"Unsloth: CCE using quantized matmul (group_size={group_size}, bits={bits})")
@@ -149,9 +154,7 @@ def make_cce_loss_fn(model):
             layer = model.lm_head if _has_lm_head_q else model.model.embed_tokens
             w = layer.weight
             sc = layer.scales
-            bi = layer.biases if _has_biases else layer.scales
-            # Mask padding targets to -100 so CCE kernel skips them
-            # in both forward (zero loss) and backward (zero gradient).
+            bi = layer.biases if _has_biases else None
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
             masked_targets = mx.where(mask, targets, -100)
@@ -164,23 +167,21 @@ def make_cce_loss_fn(model):
                 logit_softcap=softcap,
             )
             loss = loss.astype(mx.float32).sum() / ntoks
-            return loss
+            return loss, ntoks
     else:
-        # For full-precision models, access weight through the model parameter
-        # tree so nn.value_and_grad can trace gradients through it.
-        # Closure-capturing the weight would make autograd treat it as a
-        # constant, producing zero gradient for the LM head — causing NaN
-        # divergence during full fine-tuning.
         _has_lm_head = (hasattr(model, "lm_head")
                         and model.lm_head is not None
                         and hasattr(model.lm_head, "weight"))
+        _skip_weight_grad = not _is_lm_head_trainable(model)
+        if _skip_weight_grad:
+            print("Unsloth: CCE skipping weight gradient (LM head is frozen).")
 
         def loss_fn(model, batch, lengths):
             inputs, targets = batch[:, :-1], batch[:, 1:]
             hidden = model.model(inputs)
             w = model.lm_head.weight if _has_lm_head else model.model.embed_tokens.weight
-            # Mask padding targets to -100 so CCE kernel skips them
-            # in both forward (zero loss) and backward (zero gradient).
+            if _skip_weight_grad:
+                w = mx.stop_gradient(w)
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
             masked_targets = mx.where(mask, targets, -100)
@@ -191,7 +192,7 @@ def make_cce_loss_fn(model):
                 logit_softcap=softcap,
             )
             loss = loss.astype(mx.float32).sum() / ntoks
-            return loss
+            return loss, ntoks
 
     return loss_fn
 
@@ -203,18 +204,17 @@ def make_baseline_loss_fn():
     nn.losses.cross_entropy. This is the fallback when CCE is not available.
 
     Returns:
-        A function (model, batch, lengths) -> scalar loss.
+        A function (model, batch, lengths) -> (loss, ntoks).
     """
     def loss_fn(model, batch, lengths):
         inputs, targets = batch[:, :-1], batch[:, 1:]
         logits = model(inputs)
-        # Mask padding tokens using lengths from iterate_batches
         steps = mx.arange(1, targets.shape[1] + 1)
         mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
         ce = nn.losses.cross_entropy(logits, targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / ntoks
-        return loss
+        return loss, ntoks
 
     return loss_fn
 
@@ -280,16 +280,6 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     Tokenization is delegated to mlx_lm's TextDataset (appends EOS, etc.)
     so behaviour matches ``mlx_lm.lora`` exactly.
 
-    Args:
-        dataset: HuggingFace dataset or list of strings.
-        tokenizer: Tokenizer compatible with the model.
-        batch_size: Number of sequences per batch.
-        max_seq_length: Maximum sequence length (truncate to this).
-        num_batches: If set, only create this many batches.
-        seed: Random seed for shuffling.
-        dataset_text_field: Column name for text data.
-        formatting_func: Optional function to format dataset items to text.
-
     Returns:
         List of (batch, lengths) tuples, where batch has shape
         (batch_size, padded_length) and lengths has shape (batch_size, 2)
@@ -313,6 +303,31 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
 
     mx.eval([b for b, _ in batch_pairs] + [l for _, l in batch_pairs])
     return batch_pairs
+
+
+def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
+                             seed=42, dataset_text_field="text",
+                             formatting_func=None):
+    """Streaming batch generator for MLX training.
+
+    Wraps mlx-lm's iterate_batches(loop=True) as a generator, avoiding
+    materializing all batches in memory at once. Useful for large datasets.
+
+    Yields:
+        (batch, lengths) tuples — same format as create_batches.
+    """
+    from mlx_lm.tuner.trainer import iterate_batches
+
+    ds = _prepare_dataset(
+        dataset, tokenizer, dataset_text_field, formatting_func
+    )
+
+    for batch, lengths_info in iterate_batches(
+        ds, batch_size, max_seq_length,
+        loop=True,
+        seed=seed,
+    ):
+        yield batch, lengths_info
 
 
 def save_lora_adapters(model, path, adapter_config=None):
