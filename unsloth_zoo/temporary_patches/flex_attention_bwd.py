@@ -85,9 +85,6 @@ def patch_flex_attention_bwd_configs():
     if not torch.cuda.is_available():
         return False
 
-    props = torch.cuda.get_device_properties(0)
-    shmem_limit = props.shared_memory_per_multiprocessor  # bytes
-
     import torch._inductor.template_heuristics.triton as triton_heuristics
 
     # Find all non-ROCm heuristic classes with get_flex_attn_bwd_configs
@@ -106,6 +103,11 @@ def patch_flex_attention_bwd_configs():
 
         def make_patched(orig):
             def patched_get_flex_attn_bwd_configs(self, head_dim, dtype):
+                # Query shared memory limit from the current device so this
+                # works correctly in heterogeneous multi-GPU setups.
+                device = torch.cuda.current_device()
+                shmem_limit = torch.cuda.get_device_properties(device).shared_memory_per_multiprocessor
+
                 # Get original configs first
                 try:
                     configs = list(orig(self, head_dim, dtype))
@@ -140,6 +142,6 @@ def patch_flex_attention_bwd_configs():
 
 # Apply the patch at import time so it is active before any compilation.
 try:
-    _FLEX_BWD_PATCHED = patch_flex_attention_bwd_configs()
+    patch_flex_attention_bwd_configs()
 except Exception:
-    _FLEX_BWD_PATCHED = False
+    pass
