@@ -480,9 +480,7 @@ def _get_base_weight(param):
     while hasattr(param, "base_layer"):
         param = param.base_layer
     
-    # If the parameter is a Params4bit, dequantize it
     if _check_bnb_available() and isinstance(param, Params4bit):
-        # Dequantize the parameter
         return bnb.functional.dequantize_4bit(param.data, param.quant_state)
 
     if hasattr(param, "get_param"):
