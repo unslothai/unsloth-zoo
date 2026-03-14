@@ -521,9 +521,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
 
         device =_new_logps.device
         grad_inputs = torch.empty_like(_new_logps)
-        accumulated_loss              = torch.zeros(1, device = device)
-        accumulated_completion_length = torch.zeros(1, device = device)
-        accumulated_mean_kl           = torch.zeros(1, device = device)
+        accumulated_loss              = torch.zeros(1, device = device)[0]
+        accumulated_completion_length = torch.zeros(1, device = device)[0]
+        accumulated_mean_kl           = torch.zeros(1, device = device)[0]
         accumulated_delta             = []
         accumulated_flat_is_ratio     = []
         accumulated_coef_1            = []
