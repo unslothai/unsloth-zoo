@@ -175,7 +175,7 @@ def patch_bnb4bit_quantize_convert():
         return original_convert(self, input_dict, full_layer_name=full_layer_name, model=model, **kwargs)
     
     patched_convert._unsloth_moe_patched = True
-    patch_function(Bnb4bitQuantize, "convert", patched_convert)
+    patch_function(Bnb4bitQuantize, "convert", patched_convert, match_level = "relaxed")
     
     logger.info("Unsloth: Patched Bnb4bitQuantize.convert for MoE expert parameter support")
 pass
