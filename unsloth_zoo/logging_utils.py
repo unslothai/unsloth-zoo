@@ -30,7 +30,7 @@ REMOVED_METRICS = [
     "mean_token_accuracy", # SFT extras
     "entropy",  # TRL >= 0.22.0
     "aux_loss", # TRL >= 0.23.0
-    
+
     # GRPO extras
     "clip_ratio",
     'clip_ratio/low_mean',
@@ -39,6 +39,13 @@ REMOVED_METRICS = [
     'clip_ratio/high_max',
     'clip_ratio/region_mean',
     'frac_reward_zero_std',
+
+    # Conditional metrics - only populated with vLLM importance sampling
+    'sampling/sampling_logp_difference/mean',
+    'sampling/sampling_logp_difference/max',
+    'sampling/importance_sampling_ratio/min',
+    'sampling/importance_sampling_ratio/mean',
+    'sampling/importance_sampling_ratio/max',
 ]
 REMOVED_METRICS = frozenset(REMOVED_METRICS)
 
@@ -92,6 +99,7 @@ def NotebookProgressCallback_on_log(Trainer_metrics):
             for key, val in logs.items():
                 if key in ("loss", "learning_rate", "epoch", "grad_norm",
                            "num_input_tokens_seen", "step"): continue
+                if key in REMOVED_METRICS: continue
                 display_key = key.replace("/", " / ")
                 if display_key not in values:
                     values[display_key] = val
@@ -154,7 +162,7 @@ def NotebookTrainingTracker_write_line(Trainer_metrics):
                     self.inner_table[-1] = [new_values[c] for c in columns]
             else:
                 # Edit for evaluation purposes
-                self.inner_table.append([values[c] if c in values else 0 for c in columns])
+                self.inner_table.append([values[c] if c in values else "" for c in columns])
             pass
         pass
     pass
