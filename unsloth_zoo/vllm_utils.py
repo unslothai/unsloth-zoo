@@ -42,6 +42,7 @@ import gc
 import os
 import ast
 import sys
+import shutil
 import torch
 from torch import __version__ as torch_version
 import json
@@ -1791,11 +1792,19 @@ def load_vllm(
         elif ten_percent >= 1.0: standby_target_gpu_util = 0.75
         else: standby_target_gpu_util = 0.7
     else:
+        # Standby mode sleep/wake cycle: vLLM reserves (util * 0.95 * total_vram)
+        # for KV cache + model weights. The remainder must fit the HF training side
+        # (LoRA params, optimizer states, activations, gradient checkpoints).
+        # On GPUs with <= 24GB (L4, RTX 4090, etc.), the old 0.875 value left only
+        # ~4GB after vLLM's reservation. An 8B model in 4-bit needs ~4-5GB for
+        # weights alone, so wake_up(tags=["kv_cache"]) -> create_and_map would fail
+        # silently at the CUDA VMM level, producing cudaErrorIllegalAddress.
+        # Lowered tiers for <= 24GB GPUs to give ~5GB+ headroom.
         if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
         elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
-        elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
-        elif ten_percent >= 1.4: standby_target_gpu_util = 0.85
-        elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
+        elif ten_percent >= 2.0: standby_target_gpu_util = 0.825
+        elif ten_percent >= 1.4: standby_target_gpu_util = 0.8
+        elif ten_percent >= 1.0: standby_target_gpu_util = 0.775
         else: standby_target_gpu_util = 0.75
         # Reduce memory usage for newer vLLM versions since it OOMs
         if UNSLOTH_ENABLE_LOGGING:
@@ -1842,6 +1851,14 @@ def load_vllm(
         model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
+
+    if is_fp8 and DEVICE_TYPE == "cuda":
+        major_version, minor_version = torch.cuda.get_device_capability()
+        if major_version == 10:
+            # It is noticed that Deepgemm is generally slower than triton for vLLM
+            # https://x.com/TheZachMueller/status/2024619480580510117?s=20
+            # This might get implemented in vLLM later but till then we have this toggle
+            os.environ['VLLM_USE_DEEP_GEMM'] = '0'
 
     assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
@@ -1921,33 +1938,62 @@ def load_vllm(
     # Maybe FP8 Flashinfer is much better
     # See https://docs.vllm.ai/en/latest/serving/env_vars.html
     if importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
-        # Check if FLASHINFER is supported - for eg Qwen3-VL and Qwen2-VL do not work
-        if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
-            del os.environ["VLLM_ATTENTION_BACKEND"]
-        elif not vllm_supports_flashinfer(config):
-            if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
-                print(f"Unsloth: `{model_name} does not support `VLLM_ATTENTION_BACKEND==FLASHINFER`. Will disable")
-            if "VLLM_ATTENTION_BACKEND" in os.environ:
-                del os.environ["VLLM_ATTENTION_BACKEND"]
-        elif os.environ.get("VLLM_ATTENTION_BACKEND", "") != "":
-            pass
-        elif not use_bitsandbytes and major_version >= 8:
-            # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
-            os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
-        elif Version(vllm_version) >= Version("0.11.0"):
-            # On 0.11.0, Flashinfer also works!
-            os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+        # Pre-flight check: FlashInfer JIT-compiles CUDA kernels, requiring nvcc and ninja.
+        # If either is missing, skip FlashInfer so vLLM falls back to FLASH_ATTN + native sampler.
+        _has_nvcc = (
+            shutil.which("nvcc") is not None
+            or os.path.isfile(os.path.join(os.environ.get("CUDA_HOME", ""), "bin", "nvcc"))
+            or os.path.isfile(os.path.join(os.environ.get("CUDA_PATH", ""), "bin", "nvcc"))
+            or os.path.isfile("/usr/local/cuda/bin/nvcc")
+        )
+        _has_ninja = shutil.which("ninja") is not None
 
-        # Flashinfer sampler maybe makes it somewhat faster on newer GPUs
-        # Tesla T4 is 280 tok/s vs 330 tok/s
-        if major_version >= 8:
-            os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
-        elif Version(vllm_version) >= Version("0.11.0"):
-            # On 0.11.0, Flashinfer also works!
-            os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
+        if not _has_nvcc or not _has_ninja:
+            _missing = []
+            if not _has_nvcc:  _missing.append("nvcc (CUDA compiler)")
+            if not _has_ninja: _missing.append("ninja (build tool)")
+            print(
+                f"Unsloth: FlashInfer requires JIT compilation but {' and '.join(_missing)} "
+                f"{'is' if len(_missing) == 1 else 'are'} not found.\n"
+                f"  vLLM will use FLASH_ATTN attention + PyTorch sampler instead (works fine).\n"
+                f"  To enable FlashInfer, install the missing tools:\n"
+                f"    nvcc  - install the CUDA toolkit or set CUDA_HOME to your CUDA installation\n"
+                f"    ninja - pip install ninja\n"
+                f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
+            )
+            # Clear any externally-set FlashInfer env vars so vLLM uses defaults
+            if os.environ.get("VLLM_USE_FLASHINFER_SAMPLER", "") == "1":
+                del os.environ["VLLM_USE_FLASHINFER_SAMPLER"]
+            if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
+                del os.environ["VLLM_ATTENTION_BACKEND"]
         else:
-            os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
-        # os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
+            # Check if FLASHINFER is supported - for eg Qwen3-VL and Qwen2-VL do not work
+            if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
+                del os.environ["VLLM_ATTENTION_BACKEND"]
+            elif not vllm_supports_flashinfer(config):
+                if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
+                    print(f"Unsloth: `{model_name} does not support `VLLM_ATTENTION_BACKEND==FLASHINFER`. Will disable")
+                if "VLLM_ATTENTION_BACKEND" in os.environ:
+                    del os.environ["VLLM_ATTENTION_BACKEND"]
+            elif os.environ.get("VLLM_ATTENTION_BACKEND", "") != "":
+                pass
+            elif not use_bitsandbytes and major_version >= 8:
+                # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
+                os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+            elif Version(vllm_version) >= Version("0.11.0"):
+                # On 0.11.0, Flashinfer also works!
+                os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+
+            # Flashinfer sampler maybe makes it somewhat faster on newer GPUs
+            # Tesla T4 is 280 tok/s vs 330 tok/s
+            if major_version >= 8:
+                os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
+            elif Version(vllm_version) >= Version("0.11.0"):
+                # On 0.11.0, Flashinfer also works!
+                os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
+            else:
+                os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+            # os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
     pass
 
     # Prefix Caching fails for V100, Titan X CUDA Compute Capability 7.0
@@ -2200,6 +2246,17 @@ def load_vllm(
                 disable_cascade_attn = True
                 print("Unsloth: Disabling `disable_cascade_attn` in vLLM to allow for better on policy RL!")
             engine_args["disable_cascade_attn"] = disable_cascade_attn
+
+        # FlashInfer has a bug with block_size=16 and head_dim>=256 on Blackwell (SM100+).
+        # https://github.com/flashinfer-ai/flashinfer/issues/1993
+        # vLLM defaults block_size to 16 on CUDA, which triggers an assertion.
+        # Affects any model with head_dim>=256 (gemma, gemma2, gemma3, qwen3_next, etc).
+        if major_version >= 10:
+            _text_config = getattr(config, "text_config", config)
+            _head_dim = getattr(_text_config, "head_dim", None)
+            if _head_dim is not None and _head_dim >= 256:
+                engine_args["block_size"] = 32
+                logger.info(f"Unsloth: Setting vLLM block_size=32 for head_dim={_head_dim} to avoid FlashInfer bug on Blackwell.")
     pass
 
     # On-the-fly quantization is added in https://github.com/vllm-project/vllm/pull/23014
@@ -2270,6 +2327,28 @@ def load_vllm(
                     f"Error:\n{error}"
                 )
             else:
+                # Detect FlashInfer JIT compilation failures due to missing nvcc/ninja
+                error_lower = error.lower()
+                if ("could not find nvcc" in error_lower) or \
+                   ("cuda_home" in error_lower and "does not exist" in error_lower):
+                    raise RuntimeError(
+                        f"FlashInfer failed to JIT-compile: nvcc (CUDA compiler) not found.\n"
+                        f"Fix options:\n"
+                        f"  1. Install the CUDA toolkit (nvcc) or set CUDA_HOME to your CUDA installation\n"
+                        f"  2. Disable FlashInfer: set environment variable UNSLOTH_VLLM_NO_FLASHINFER=1\n"
+                        f"     e.g. import os; os.environ['UNSLOTH_VLLM_NO_FLASHINFER'] = '1'  # before importing unsloth\n"
+                        f"Original error: {error}"
+                    )
+                elif ("ninja" in error_lower) and \
+                     ("no such file" in error_lower or "errno 2" in error_lower or "not found" in error_lower):
+                    raise RuntimeError(
+                        f"FlashInfer failed to JIT-compile: ninja (build tool) not found.\n"
+                        f"Fix options:\n"
+                        f"  1. Install ninja: pip install ninja\n"
+                        f"  2. Disable FlashInfer: set environment variable UNSLOTH_VLLM_NO_FLASHINFER=1\n"
+                        f"     e.g. import os; os.environ['UNSLOTH_VLLM_NO_FLASHINFER'] = '1'  # before importing unsloth\n"
+                        f"Original error: {error}"
+                    )
                 raise RuntimeError(error)
         pass
     pass

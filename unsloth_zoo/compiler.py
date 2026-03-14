@@ -130,6 +130,13 @@ DISABLED_KEYWORDS = [
     "pad_tensor_by_size",  # falcon h1
 ]
 
+DISABLE_COMPILE_FUNCTIONS = [
+    "torch_chunk_gated_delta_rule",
+    "torch_recurrent_gated_delta_rule",
+    "chunk_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule",
+]
+
 
 _full_license_header = """
 # Unsloth auto generated code
@@ -154,6 +161,7 @@ _license_header = (
     _full_license_header
     + """
 import os
+import sys
 import torch
 import importlib.util
 import math
@@ -168,6 +176,9 @@ import math
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_CCE = os.environ.get("UNSLOTH_ENABLE_CCE", "1") == "1"
 UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial",)
+UNSLOTH_COMPILE_LOCATION = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+if UNSLOTH_COMPILE_LOCATION not in sys.path:
+    sys.path.insert(0, UNSLOTH_COMPILE_LOCATION)
 
 import logging
 logger_compiler = logging.getLogger(__name__)
@@ -507,6 +518,40 @@ def fix_rotary_embedding_dtype(source):
 pass
 
 
+def fix_attention_dtype_consistency(source):
+    """
+    Fix dtype mismatch between Q/K and V in attention modules.
+    After apply_rotary_pos_emb, Q and K may be promoted to a different dtype
+    (e.g. float32) while V stays in the original dtype (e.g. float16/bfloat16).
+    This happens in 4-bit BNB mode when cos/sin from RoPE are in float32.
+    We insert a cast to align V's dtype with Q's dtype.
+    """
+    pattern = re.compile(
+        r"([ \t]*)(query_states\s*,\s*key_states\s*=\s*apply_rotary_pos_emb\([^\)]+\))"
+    )
+    matches = list(pattern.finditer(source))
+    if not matches:
+        return source
+
+    for match in reversed(matches):
+        indent = match.group(1)
+        end_pos = match.end()
+        next_chunk = source[end_pos:end_pos + 200]
+        if "value_states = value_states.to(query_states.dtype)" in next_chunk:
+            continue
+        insert_code = (
+            f"\n{indent}# Unsloth: align V dtype with Q after RoPE (fixes 4-bit dtype mismatch)\n"
+            f"{indent}if value_states.dtype != query_states.dtype:\n"
+            f"{indent}    value_states = value_states.to(query_states.dtype)"
+        )
+        source = source[:end_pos] + insert_code + source[end_pos:]
+
+    return source
+
+
+pass
+
+
 # Use float32 for layernorms if we find evidence for it
 def higher_precision_layernorms(modeling_file):
     norm_modules = list(
@@ -795,12 +840,6 @@ def create_new_function(
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
         items += ["SiglipEncoder"]
-    # Patch for Qwen3MoeExperts
-    if "Qwen3MoeExperts" in new_source:
-        items += ["Qwen3MoeExperts"]
-    # Patch for Qwen3VLMoeTextExperts
-    if "Qwen3VLMoeTextExperts" in new_source:
-        items += ["Qwen3VLMoeTextExperts"]
     # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
@@ -816,14 +855,40 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
+    if (
+        "forward_moe_backend" in new_source
+        or "select_moe_backend" in new_source
+        or "forward_native_grouped_mm" in new_source
+        or "forward_triton_grouped_gemm" in new_source
+        or "forward_native_moe_loop" in new_source
+    ):
+        imports += (
+            "try:\n"
+            "    from moe_utils import (\n"
+            "        forward_moe_backend,\n"
+            "        select_moe_backend,\n"
+            "        forward_native_grouped_mm,\n"
+            "        forward_triton_grouped_gemm,\n"
+            "        forward_native_moe_loop,\n"
+            "    )\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )
-    imports += (
-        f"from {model_location} import (" + ", ".join(x for x in items) + ")"
-        if len(items) != 0
-        else ""
-    )
+    if len(items) != 0:
+        # Validate items are actually importable to handle TRL internal API removals
+        _valid_items = []
+        try:
+            _mod = __import__(model_location, fromlist=items)
+            for _item in items:
+                if hasattr(_mod, _item):
+                    _valid_items.append(_item)
+        except Exception:
+            _valid_items = items  # Fall back to all items if module load fails
+        if _valid_items:
+            imports += f"from {model_location} import (" + ", ".join(_valid_items) + ")"
     new_source = imports + "\n\n" + new_source
     # Check logger and remove use_cache
     if "logger" in items:
@@ -928,7 +993,7 @@ def create_new_function(
         except Exception as e:
             # consider adding logging to main_process only
             # counterpoint: we may want to see errors on all processes
-            if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+            if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
                 logger.error(
                     f"Unsloth: Failed to write file {function_location} because {str(e)}"
                 )
@@ -973,7 +1038,7 @@ def create_new_function(
                 new_module = importlib.import_module(name)
                 return new_module, old_path
         except Exception as e:
-            if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+            if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
                 logger.error(
                     f"Unsloth: Failed to import module {name} because {str(e)}"
                 )
@@ -1069,17 +1134,93 @@ def create_standalone_class(
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
         disable = True
 
-    # Check if forward was replaced by a temporary patch (already has @torch.compiler.disable)
-    # In this case, keep the patched source as-is without adding another decorator
+    # Strip decorators from class source if present
+    # This fixes issues with classes like Qwen3NextExperts which have decorators that cause compilation failures
+    STRIP_DECORATORS = {
+        "use_experts_implementation",
+        "use_kernel_forward_from_hub",
+        "use_kernelized_func",
+        "auto_docstring",
+        # add more here if needed
+    }
+
+    if full_class.lstrip().startswith("@"):
+        start = re.search(r"^class ", full_class, flags=re.MULTILINE)
+        if start:
+            # Found class definition - now check decorators
+            class_start = start.start()
+            preamble = full_class[:class_start]
+            class_def = full_class[class_start:]
+
+            # Split preamble into lines
+            lines = preamble.split('\n')
+            new_lines = []
+
+            # Capture decorator head, including dotted paths: @pkg.decorator(...)
+            decorator_head_re = re.compile(
+                r"^\s*@\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\b"
+            )
+
+            skipping = False
+            paren_depth = 0
+            skip_base_name = None
+
+            for line in lines:
+                if skipping:
+                    # Continue skipping decorator args until balanced
+                    paren_depth += line.count("(") - line.count(")")
+                    if paren_depth <= 0:
+                        skipping = False
+                        paren_depth = 0
+                        skip_base_name = None
+                    continue
+
+                stripped = line.strip()
+                if stripped.startswith("@"):
+                    m = decorator_head_re.match(line)
+                    if not m:
+                        logger.warning(
+                            f"Unsloth: Warning: Unparseable decorator {stripped} found for {module}."
+                        )
+                        new_lines.append(line)
+                        continue
+
+                    decorator_full = m.group(1)              # e.g. "foo.auto_docstring"
+                    decorator_base = decorator_full.split(".")[-1]  # e.g. "auto_docstring"
+
+                    if decorator_base in STRIP_DECORATORS:
+                        logger.info(
+                            f"Unsloth: stripped {decorator_full} decorator from {module}"
+                        )
+
+                        # If decorator has args and spans multiple lines, skip until parens close
+                        paren_depth = line.count("(") - line.count(")")
+                        if paren_depth > 0:
+                            skipping = True
+                            skip_base_name = decorator_base
+                        continue  # Strip this decorator line
+
+                    # Unknown decorator -> keep it but warn
+                    logger.warning(
+                        f"Unsloth: Warning: Unknown decorator {stripped} found for {module}."
+                    )
+                    new_lines.append(line)
+                else:
+                    new_lines.append(line)
+
+            full_class = "\n".join(new_lines) + class_def
+
+    # Check if forward was replaced by a temporary patch (renamed function)
+    # In this case, keep the patched source as-is and replace the class forward body.
     patched_forward_info = None
-    if "@torch.compiler.disable" in forward_source:
+    if 'gptossexperts' != module.lower():
         func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
         if func_match and func_match.group(1) != "forward":
             # Find original forward in class to replace it
             orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
             if orig_fwd:
                 patched_forward_info = (func_match.group(1), orig_fwd.group(1))
-                disable = None  # Skip adding decorator
+                disable = None  # Keep patched source as-is for renamed forward replacements
 
     # Replace function name with module-specific name
     if patched_forward_info:
@@ -1097,6 +1238,12 @@ def create_standalone_class(
     # For cuda_kernels_forward, we disable
     if "cuda_kernels_forward" in source:
         disable = True
+
+    # dynamic_rope_update decorator injects data-dependent branching
+    # (e.g. longrope: if seq_len > original_max_position_embeddings)
+    # which is incompatible with fullgraph=True
+    if "dynamic_rope_update" in source:
+        fullgraph = False
 
     if disable is not None:
         compile = (
@@ -1167,7 +1314,7 @@ def create_standalone_class(
                 old_method_source = inspect.getsource(getattr(f, method_name))
                 full_class = full_class.replace(old_method_source, method_source)
             except Exception as e:
-                if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
+                if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
                     print(
                         f"Unsloth: Failed to replace method {method_name} in {module} with error = {str(e)}"
                     )
@@ -1177,6 +1324,7 @@ def create_standalone_class(
 
     # Remove @auto_docstring
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
     # source = source.replace("@auto_docstring", "")
 
@@ -1199,6 +1347,9 @@ def create_standalone_class(
 
     # Fix RotaryEmbeddings being in the wrong precision
     source = fix_rotary_embedding_dtype(source)
+
+    # Fix Q/K/V dtype consistency after RoPE (for 4-bit BNB mode)
+    source = fix_attention_dtype_consistency(source)
 
     return source
 
@@ -2756,6 +2907,82 @@ def compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING=False):
 pass
 
 
+def compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING=False):
+    '''
+    FLA seems to be autocompiling at every step causing severe performance downgrades.
+    I noticed this on Qwen-3.5-MoE and potentially Qwen3-Next. 4-5x from initial tests.
+    This function is to disable repetitive autotuning and use the first tuned kernel.
+    In case one wants to override this, set UNSLOTH_DISABLE_FLA_NO_AUTOTUNE=1
+    '''
+    if os.environ.get("UNSLOTH_DISABLE_FLA_NO_AUTOTUNE", "0") == "1":
+        return False
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:
+        return False
+
+    class _ReuseBestCache(dict):
+        """Reports all keys as present once at least one entry exists,
+        returning the first stored value for any unseen key.
+        This lets the first autotune run find the best config normally,
+        then reuses it for any unseen key (e.g. different NB from
+        variable sequence lengths), preventing repeated benchmarking."""
+        def __contains__(self, key):
+            return len(self) > 0 or super().__contains__(key)
+        def __getitem__(self, key):
+            if not super().__contains__(key) and len(self) > 0:
+                return next(iter(self.values()))
+            return super().__getitem__(key)
+
+    def _unwrap_autotuner(kernel):
+        obj = kernel
+        for _ in range(6):
+            if isinstance(obj, Autotuner):
+                return obj
+            if not hasattr(obj, "fn"):
+                return None
+            obj = obj.fn
+        return None
+
+    modules_and_kernels = []
+    try:
+        import fla.modules.fused_norm_gate as fused_norm_gate
+        modules_and_kernels.append((fused_norm_gate, [
+            "layer_norm_gated_fwd_kernel", "layer_norm_gated_fwd_kernel1",
+            "layer_norm_gated_bwd_kernel", "layer_norm_gated_bwd_kernel1",
+        ]))
+    except ImportError:
+        pass
+    try:
+        import fla.modules.l2norm as l2norm_module
+        modules_and_kernels.append((l2norm_module, [
+            "l2norm_fwd_kernel", "l2norm_fwd_kernel1",
+            "l2norm_bwd_kernel", "l2norm_bwd_kernel1",
+        ]))
+    except ImportError:
+        pass
+
+    patched = []
+    for module, kernel_names in modules_and_kernels:
+        for name in kernel_names:
+            kernel = getattr(module, name, None)
+            if kernel is None:
+                continue
+            autotuner = _unwrap_autotuner(kernel)
+            if autotuner is None:
+                continue
+            if not isinstance(autotuner.cache, _ReuseBestCache):
+                autotuner.cache = _ReuseBestCache(autotuner.cache)
+                patched.append(name)
+
+    if UNSLOTH_ENABLE_LOGGING and len(patched) > 0:
+        logger.info("Unsloth: Patched FLA autotune caches for " + ", ".join(patched))
+    return len(patched) > 0
+
+
+pass
+
+
 # if module ends with any of these, disable compile
 DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
@@ -2765,6 +2992,9 @@ DISABLE_COMPILE_MODULES = [
     "GptOssExperts",
     "Gemma3nTextModel",
     "Glm4MoeLiteNaiveMoe",
+    "Qwen3NextGatedDeltaNet",
+    "GatedDeltaNet",
+    "Qwen3_5MoeGatedDeltaNet",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -2824,6 +3054,8 @@ def unsloth_compile_transformers(
     except ModuleNotFoundError:
         return
     modeling_file = eval(model_location)
+    disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
+
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
         if hasattr(modeling_file, "__UNSLOTH_SUPPORTS_SDPA__"):
@@ -2886,6 +3118,7 @@ def unsloth_compile_transformers(
     # Disable compiling mamba type models
     has_causal_conv1d = compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING)
     has_mamba_ssm = compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING)
+    has_fla_no_autotune = compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING)
 
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
@@ -3711,7 +3944,12 @@ def unsloth_compile_transformers(
             parameters = f"def {module}" + parameters + code_section
             print(f"Unsloth: Fixed up function {module}.")
 
-            if not disable:
+            if module in disable_compile_functions:
+                parameters = (
+                    "@torch.compiler.disable(recursive = False)\n"
+                    + parameters
+                )
+            elif not disable:
                 parameters = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
@@ -3747,7 +3985,15 @@ def unsloth_compile_transformers(
                     break
             pass
             if not bad:
-                if not disable:
+                if module in disable_compile_functions:
+                    source = re.sub(
+                        r"@torch.compile\([^\n]*\)\n",
+                        "@torch.compiler.disable(recursive = False)\n",
+                        source,
+                    )
+                    if "@torch.compiler.disable(recursive = False)\n" not in source:
+                        source = "@torch.compiler.disable(recursive = False)\n" + source
+                elif not disable:
                     source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:

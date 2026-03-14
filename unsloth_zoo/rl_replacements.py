@@ -21,6 +21,8 @@ __all__ = [
 import torch
 import inspect
 import os
+import math
+import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
@@ -295,6 +297,20 @@ def grpo_update_SamplingParams(SamplingParams, generation_kwargs, vllm_sampling_
     return generation_kwargs
 pass
 RL_REPLACEMENTS["grpo_update_SamplingParams"] = grpo_update_SamplingParams
+
+
+def sanitize_logprob(logprob):
+    """Local port of trl.scripts.vllm_serve.sanitize_logprob.
+    Filters NaN logprobs from vLLM outputs."""
+    value = logprob.logprob
+    if math.isnan(value):
+        logging.getLogger(__name__).warning(
+            f"Generated NaN logprob, token logprob '{logprob}' will be ignored"
+        )
+        return None
+    return value
+
+RL_REPLACEMENTS["sanitize_logprob"] = sanitize_logprob
 # Custom compiled GRPO loss - creates 3 Triton kernels
 def grpo_compute_loss(
     ref,
@@ -465,7 +481,7 @@ def grpo_compute_loss(
                 mean_kl = mean_kl_per_reward.mean()
                 return completion_length, mean_kl
     completion_length, mean_kl = masked_batch_mean(kl_i)
-    return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1
+    return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
@@ -485,7 +501,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         if extra_kwargs is None:
             extra_kwargs = {}
         def compute_loss(new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages, scaling):
-            loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = grpo_compute_loss(
+            loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, _mask  = grpo_compute_loss(
                 ref_logps,
                 new_logps,
                 old_logps,
@@ -829,8 +845,8 @@ def grpo_accumulated_loss(
         def forward(ctx, hidden_states, lm_head, index, chunks,
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature):
-
-            ctx.saved_hidden_states = to_device(hidden_states, "cpu", non_blocking=True)
+            #Only the activations are needed so if we keep entire computational graph, keeps unnecessary memory on CPU so we detach it
+            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True) 
             ctx.device = hidden_states.device
             ctx.dtype = hidden_states.dtype
 
@@ -974,7 +990,7 @@ def grpo_accumulated_loss(
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
-    return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1
+    return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, completion_mask
     # Old non efficient code path
     new_logits = torch.matmul(new_hidden_states, lm_head.t())
     new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred

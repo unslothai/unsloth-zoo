@@ -122,22 +122,23 @@ def patch_gpt_oss():
     try:
         import transformers.quantizers.quantizer_mxfp4
 
-        def is_kernels_available(): return True
-
-        transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
-    except Exception as e:
-        return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
-
-    if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
-
-    try:
+        # Always allow LoRA training (works with dequantized bf16 weights too)
         transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
     if HAS_TRITON_KERNELS:
+        # Only override is_kernels_available when triton_kernels IS available
+        try:
+            def is_kernels_available(): return True
+
+            transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
+        except Exception as e:
+            return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
+
+        if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
+            transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
+
         try:
             from triton_kernels import matmul_ogs, swiglu
 
@@ -150,7 +151,8 @@ def patch_gpt_oss():
         except Exception as e:
             return raise_error("triton_kernels", e)
     else:
-        # Skip MXFP4 patches when triton_kernels not available
+        # Leave is_kernels_available intact so transformers' validate_environment()
+        # correctly sets dequantize=True, enabling bf16 fallback.
         return
 
     try:
@@ -646,6 +648,26 @@ class ParameterModule(nn.Linear):
             unexpected_keys,
             error_msgs,
         )
+
+
+def patch_gpt_oss_compiler_exports():
+    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
+    if "gpt_oss" not in model_name:
+        return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+    except Exception as e:
+        raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
+        return
+
+    # Export helpers so compiler generated GPT-OSS modules can resolve symbols.
+    m = transformers.models.gpt_oss.modeling_gpt_oss
+    m.ParameterModule = ParameterModule
+    m.swiglu_torch_forward = swiglu_torch_forward
+    m.dtype_from_config = dtype_from_config
+    m.transformers_version = transformers_version
+    m.Version = Version
+TEMPORARY_PATCHES.append(patch_gpt_oss_compiler_exports)
 
 
 class GptOssExperts(nn.Module):
@@ -1316,15 +1338,19 @@ def _should_use_gpt_oss_bnb4bit() -> bool:
     Default: True when load_in_4bit is active.
     Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to force BF16 path.
     """
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+    if "gpt_oss" not in _normalized_unsloth_model_name():
         return False
-    if "_load_in_4bit_" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+    if "_load_in_4bit_" not in _normalized_unsloth_model_name():
         return False
     return os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_DISABLE", "0") != "1"
 
 
 def _is_gpt_oss_4bit_load() -> bool:
-    return "_load_in_4bit_" in os.environ.get("UNSLOTH_MODEL_NAME", "")
+    return "_load_in_4bit_" in _normalized_unsloth_model_name()
+
+
+def _normalized_unsloth_model_name() -> str:
+    return os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
 
 
 def _is_transformers_v5() -> bool:
@@ -1340,7 +1366,7 @@ def patch_gpt_oss_moe_for_lora():
     IMPORTANT: We only patch the forward method, NOT replace the entire class.
     This preserves the original class structure so weights load correctly.
     """
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+    if "gpt_oss" not in _normalized_unsloth_model_name():
         return
     if _is_gpt_oss_4bit_load() or _should_use_gpt_oss_bnb4bit():
         # 4-bit loads should keep quantized weights and use default PEFT LoRA.
@@ -1774,8 +1800,8 @@ def patch_gpt_oss_linearized():
     Patch GPT OSS for 4bit loading with grouped_mm support.
     Only patches the GptOssExperts forward method - keeps original classes for proper weight loading.
     """
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
-    if "_load_in_4bit_" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    if "gpt_oss" not in _normalized_unsloth_model_name(): return
+    if "_load_in_4bit_" not in _normalized_unsloth_model_name(): return
     if _should_use_gpt_oss_bnb4bit(): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
@@ -1813,7 +1839,7 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         from ..flex_attention import (
             flex_attention_with_sink,
@@ -2054,7 +2080,7 @@ TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 def patch_GptOssModel():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel
@@ -2075,12 +2101,25 @@ def patch_GptOssModel():
     import transformers.generation.utils
     def wrap(f):
         def return_attention_mask(*args, **kwargs):
-            if kwargs["input_embeds"].requires_grad:
+            input_embeds = kwargs.get("input_embeds", None)
+            if input_embeds is None:
+                input_embeds = kwargs.get("inputs_embeds", None)
+            if input_embeds is None:
+                for arg in args:
+                    if type(arg) is torch.Tensor and arg.is_floating_point():
+                        input_embeds = arg
+                        break
+
+            if input_embeds is not None and input_embeds.requires_grad:
                 if "attention_mask" in kwargs:
                     return kwargs["attention_mask"]
                 for arg in args:
-                    if type(arg) is torch.Tensor and arg.dtype == torch.int32:
+                    if (
+                        type(arg) is torch.Tensor and
+                        arg.dtype in (torch.int32, torch.int64, torch.bool)
+                    ):
                         return arg
+                return f(*args, **kwargs)
             else:
                 # Eager
                 return f(*args, **kwargs)
@@ -2739,7 +2778,7 @@ except Exception as e:
 
 
 def patch_gpt_oss_init_weights_modulelist_fix():
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+    if "gpt_oss" not in _normalized_unsloth_model_name():
         return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
@@ -2778,13 +2817,19 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_init_weights_modulelist_fix)
 # Patch GptOssForCausalLM.forward for GRPO training
 # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
 # ============================================================================
-def patch_gpt_oss_for_grpo():
+def patch_gpt_oss_for_grpo(phase="post_compile"):
     """
     Patch GptOssForCausalLM.forward for GRPO training.
     When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits.
     This fixes the matrix multiplication dimension mismatch issue in GRPO training.
+
+    Only runs post-compile so the compiler can pattern-match cross-entropy in the
+    original forward source and apply fused loss (preventing OOM from full logits).
     """
-    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+    if phase != "post_compile":
+        return
+
+    if "gpt_oss" not in _normalized_unsloth_model_name():
         return
 
     try:
@@ -2793,6 +2838,9 @@ def patch_gpt_oss_for_grpo():
             GptOssForCausalLM,
             MoeCausalLMOutputWithPast,
         )
+
+        if hasattr(GptOssForCausalLM, '_unsloth_grpo_patched'):
+            return
 
         _original_causal_lm_forward = GptOssForCausalLM.forward
 
@@ -2869,6 +2917,7 @@ def patch_gpt_oss_for_grpo():
         # this is a CausalLM forward and compute num_items_in_batch properly.
         _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
         GptOssForCausalLM.forward = _patched_causal_lm_forward
+        GptOssForCausalLM._unsloth_grpo_patched = True
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("Unsloth: Patched GptOssForCausalLM.forward for GRPO hidden states.")
 
