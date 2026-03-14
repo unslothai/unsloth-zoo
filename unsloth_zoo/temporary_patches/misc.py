@@ -1177,8 +1177,7 @@ TEMPORARY_PATCHES.append(patch_peft_dispatch_bnb_4bit)
 
 class _ParamShapeProxy:
     """
-    Wrapper class so that attributes for 4bit MoE params are exposed correctly for compatibility with PEFT LoRA; 
-    everything else delegates.
+    Wrapper class so that attributes for 4bit MoE params are exposed correctly for compatibility with PEFT LoRA, everything else delegates.
     """
 
     def __init__(self, param, shape):
@@ -1200,10 +1199,7 @@ class _ParamShapeProxy:
 
 def patch_peft_param_wrapper_4bit_expert_shape():
     """
-    Make ParamWrapper.get_param() report 3D shape for 4bit MoE params so ParamWrapper.__init__() works as expected.
-
-    Quantized MoE expert params (Params4bit) are 2D flattened and _original_shape attribute holds (num_experts, in_features, out_features).
-    However, ParamWrapper.get_param() derives num_experts, in_features, out_features from param.shape, leading to wrong shape for Params4bit parameters.
+    ParamWrapper.get_param() derives shape from param.shape, which is incorrect for Params4bit parameters.
     Patch ParamWrapper.get_param() to return a proxy that exposes .shape = _original_shape for 4bit MoE params.
     """
     try:
@@ -1229,12 +1225,12 @@ def patch_peft_param_wrapper_4bit_expert_shape():
                 return _ParamShapeProxy(param, shape)
             else:
                 # TODO: Can we raise an error here?
-                logger.warning(f"Unsloth: No _original_shape found for {param}")
+                pass
         return param
 
     _patched_get_param._unsloth_4bit_expert_patched = True
     patch_function(ParamWrapper, "get_param", _patched_get_param)
-
+pass
 TEMPORARY_PATCHES.append(patch_peft_param_wrapper_4bit_expert_shape)
 
 
