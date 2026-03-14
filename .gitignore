@@ -1,2 +1,7 @@
 __pycache__/
 unsloth_zoo.egg-info/
+test_results
+unsloth_compiled_cache
+Benchmark_Findings.md
+plot_loss_curves.py
+test_results.json
