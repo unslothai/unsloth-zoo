@@ -403,6 +403,10 @@ def set_additional_modules(new_model, quant_state_dict, config):
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
         language_model_prefix = "model.language_model"
+    elif hasattr(new_model, "model") and hasattr(new_model.model, "text_model"):
+        # Idefics3, SmolVLM2: model wraps text_model/vision_model/connector
+        language_model = new_model.model.text_model
+        language_model_prefix = "model.text_model"
     else:
         language_model_prefix = "model"
         language_model = new_model.model
@@ -491,7 +495,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
     # Preferably norms, embeddings and convolution type layers.
     additional_keys = set(
         x for x in quant_state_dict.keys()
-        if not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list"))
+        if not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list", "connector"))
     )
     print(f'Performing substitution for {additional_keys=}')
 
@@ -539,6 +543,17 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.up_proj",
             "model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.layers.{kk}.mlp.down_proj",
+
+            # Idefics3 (granite-docling, SmolVLM2): text model under model.text_model
+            "model.text_model.layers.{kk}.self_attn.q_proj",
+            "model.text_model.layers.{kk}.self_attn.k_proj",
+            "model.text_model.layers.{kk}.self_attn.v_proj",
+            "model.text_model.layers.{kk}.self_attn.qkv_proj",
+            "model.text_model.layers.{kk}.self_attn.o_proj",
+            "model.text_model.layers.{kk}.mlp.gate_proj",
+            "model.text_model.layers.{kk}.mlp.up_proj",
+            "model.text_model.layers.{kk}.mlp.gate_up_proj",
+            "model.text_model.layers.{kk}.mlp.down_proj",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
@@ -567,6 +582,12 @@ def get_model_layer_config(return_non_layered=True):
 
             # qwen3 vl
             "model.visual.deepstack_merger_list.{kk}.norm",
+
+            # Idefics3 (granite-docling, SmolVLM2)
+            "model.text_model.layers.{kk}.input_layernorm",
+            "model.text_model.layers.{kk}.post_attention_layernorm",
+            "model.vision_model.encoder.layers.{kk}.layer_norm1",
+            "model.vision_model.encoder.layers.{kk}.layer_norm2",
         },
         'vision_layers': {
 
@@ -635,6 +656,15 @@ def get_model_layer_config(return_non_layered=True):
             "model.visual.blocks.{kk}.mlp.linear_fc1",
             "model.visual.blocks.{kk}.mlp.linear_fc2",
 
+            # Idefics3 (granite-docling, SmolVLM2)
+            "model.vision_model.encoder.layers.{kk}.self_attn.q_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.k_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.v_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.qkv_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.out_proj",
+            "model.vision_model.encoder.layers.{kk}.mlp.fc1",
+            "model.vision_model.encoder.layers.{kk}.mlp.fc2",
+
         },
         'additional_layers': {
             # Primarily for layers that are neither language decoder layers or vision transformer layers/blocks.
@@ -655,6 +685,9 @@ def get_model_layer_config(return_non_layered=True):
             "model.visual.deepstack_merger_list.{kk}.linear_fc1",
             "model.visual.deepstack_merger_list.{kk}.linear_fc2",
             "model.visual.merger.linear_fc{kk}",
+
+            # Idefics3 (granite-docling, SmolVLM2)
+            "model.connector.modality_projection.proj",
 
         },
         "non_layered_components":{
@@ -689,6 +722,11 @@ def get_model_layer_config(return_non_layered=True):
             # qwen 3 vl
             "model.visual.pos_embed",
             "model.visual.merger.norm",
+
+            # Idefics3 (granite-docling, SmolVLM2)
+            "model.vision_model.embeddings.patch_embedding",
+            "model.vision_model.embeddings.position_embedding",
+            "model.vision_model.post_layernorm",
         }
     }
 
@@ -736,6 +774,11 @@ def get_model_layer_counts(config):
         return {
             "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
             "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+        }
+    elif model_type in ("idefics3_vision",):
+        return {
+            "text_layers": getattr(config.text_config, "num_hidden_layers", 30),
+            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 12),
         }
     else:
         # Standard causal LM
