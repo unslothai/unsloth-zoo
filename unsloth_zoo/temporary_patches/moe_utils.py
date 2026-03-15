@@ -142,9 +142,11 @@ def _grouped_mm_with_backward_fix(
 # Global flag to check if grouped GEMM is available
 _GROUPED_GEMM_AVAILABLE = None
 _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
+_TORCH_SCALED_GROUPED_MM_AVAILABLE = hasattr(torch, "_scaled_grouped_mm")
 
 # Check if GPU supports torch._grouped_mm (verified via runtime check)
 _TORCH_GROUPED_MM_SUPPORTED = None
+_TORCH_SCALED_GROUPED_MM_SUPPORTED = None
 
 
 def _check_torch_grouped_mm_supported():
@@ -183,6 +185,54 @@ def _check_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
 
     return _TORCH_GROUPED_MM_SUPPORTED
+
+
+def _check_torch_scaled_grouped_mm_supported():
+    """
+    Check if torch._scaled_grouped_mm is actually supported on the current GPU.
+    """
+    global _TORCH_SCALED_GROUPED_MM_SUPPORTED
+    if _TORCH_SCALED_GROUPED_MM_SUPPORTED is not None:
+        return _TORCH_SCALED_GROUPED_MM_SUPPORTED
+
+    if not _TORCH_SCALED_GROUPED_MM_AVAILABLE:
+        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
+        return False
+
+    if not torch.cuda.is_available():
+        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
+        return False
+    major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    if major != 9:
+        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
+        return False
+
+    try:
+        device = torch.cuda.current_device()
+        x = torch.randn((16, 16), device=device, dtype=torch.bfloat16)
+        w_hp = torch.randn((1, 16, 16), device=device, dtype=torch.bfloat16)
+
+        x_fp8, x_scale = _manual_fp8_rowwise_quantize(x)
+        w_fp8, w_scale = _manual_fp8_rowwise_quantize(w_hp.view(-1, w_hp.shape[-1]))
+        w_fp8 = w_fp8.view_as(w_hp)
+        w_fp8 = w_fp8.transpose(-2, -1).contiguous().transpose(-2, -1)
+        w_scale = w_scale.view(w_hp.shape[0], w_hp.shape[1])
+        offs = torch.tensor([16], device=device, dtype=torch.int32)
+
+        torch._scaled_grouped_mm(
+            x_fp8.contiguous(),
+            w_fp8,
+            x_scale.contiguous(),
+            w_scale.contiguous(),
+            offs=offs,
+            out_dtype=torch.bfloat16,
+            use_fast_accum=True,
+        )
+        _TORCH_SCALED_GROUPED_MM_SUPPORTED = True
+    except Exception:
+        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
+
+    return _TORCH_SCALED_GROUPED_MM_SUPPORTED
 
 
 _TRITON_ALLOCATOR_INITIALIZED = False
@@ -569,6 +619,60 @@ def _get_moe_weight_and_quant_state(experts_module, param_name: str):
     return weight, quant_state
 
 
+def _get_moe_weight_and_quant_info(experts_module, param_name: str):
+    """Get expert weight, quant metadata, and whether it is scale or scale_inv."""
+    param = getattr(experts_module, param_name)
+
+    base_layer = param
+    while hasattr(base_layer, "base_layer"):
+        base_layer = base_layer.base_layer
+
+    if hasattr(base_layer, "get_param"):
+        weight = base_layer.get_param()
+    elif hasattr(base_layer, "weight"):
+        weight = base_layer.weight
+    else:
+        weight = base_layer
+
+    quant_state = getattr(weight, "quant_state", None)
+    quant_kind = "quant_state" if quant_state is not None else None
+    if quant_state is None:
+        quant_state = getattr(base_layer, "weight_scale_inv", None)
+        if quant_state is not None:
+            quant_kind = "weight_scale_inv"
+        else:
+            quant_state = getattr(base_layer, "weight_scale", None)
+            if quant_state is not None:
+                quant_kind = "weight_scale"
+
+    if quant_state is None:
+        quant_state = getattr(experts_module, f"{param_name}_weight_scale_inv", None)
+        if quant_state is not None:
+            quant_kind = "weight_scale_inv"
+        else:
+            quant_state = getattr(experts_module, f"{param_name}_weight_scale", None)
+            if quant_state is not None:
+                quant_kind = "weight_scale"
+
+    block_size = getattr(param, "block_size", None)
+    if block_size is None:
+        block_size = getattr(experts_module, f"{param_name}_block_size", None)
+    if block_size is None:
+        block_size = getattr(base_layer, "block_size", None)
+    if block_size is not None:
+        try:
+            weight.block_size = block_size
+        except Exception:
+            pass
+        if quant_state is not None:
+            try:
+                quant_state.block_size = block_size
+            except Exception:
+                pass
+
+    return weight, quant_state, quant_kind
+
+
 def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
     """Best-effort extraction of per-expert FP8 quant metadata."""
     if quant_state is None or not isinstance(quant_state, torch.Tensor):
@@ -623,7 +727,151 @@ def _dequantize_expert_slice(
         except Exception:
             pass
 
+    if isinstance(expert_quant_state, torch.Tensor) and expert_quant_state.ndim == 1:
+        expert_quant_state = expert_quant_state.view(-1, 1)
+
     return weight_dequant(expert_weight, expert_quant_state, dtype=target_dtype)
+
+
+def _dequantize_full_expert_weights(
+    weight: torch.Tensor,
+    quant_state,
+    target_dtype: torch.dtype,
+    proj_type: str,
+    hidden_dim: int,
+    model_type = None,
+) -> Optional[torch.Tensor]:
+    if weight.ndim != 3:
+        return None
+    expert_ids = torch.arange(weight.shape[0], device=weight.device, dtype=torch.long)
+    return _dequantize_active_expert_weights(
+        weight,
+        quant_state,
+        expert_ids,
+        target_dtype,
+        proj_type,
+        hidden_dim,
+        model_type,
+    )
+
+
+def _make_grouped_mm_rhs_column_major(weight: torch.Tensor) -> torch.Tensor:
+    return weight.transpose(-2, -1).contiguous().transpose(-2, -1)
+
+
+def _extract_scaled_grouped_mm_weight_scale(
+    original_weight: torch.Tensor,
+    processed_weight: torch.Tensor,
+    quant_state,
+    quant_kind: Optional[str],
+) -> Optional[torch.Tensor]:
+    if quant_state is None or not isinstance(quant_state, torch.Tensor):
+        return None
+    if quant_kind == "quant_state":
+        return None
+
+    if getattr(original_weight, "block_size", None) is not None:
+        return None
+    if getattr(quant_state, "block_size", None) is not None:
+        return None
+
+    scale = quant_state
+    if scale.ndim == 0:
+        scale = scale.view(1, 1).expand(processed_weight.shape[0], processed_weight.shape[-1])
+    elif scale.ndim == 1:
+        if scale.shape[0] != processed_weight.shape[-1]:
+            return None
+        scale = scale.view(1, -1).expand(processed_weight.shape[0], -1)
+    elif scale.ndim == 2:
+        pass
+    elif scale.ndim == 3:
+        if scale.shape[1] == 1:
+            scale = scale.squeeze(1)
+        elif scale.shape[2] == 1:
+            scale = scale.squeeze(2)
+        else:
+            return None
+    else:
+        return None
+
+    if scale.ndim != 2:
+        return None
+    if scale.shape[0] != processed_weight.shape[0]:
+        return None
+    if scale.shape[1] != processed_weight.shape[-1]:
+        return None
+
+    scale = scale.to(torch.float32)
+    if quant_kind == "weight_scale_inv":
+        scale = scale.reciprocal()
+    return scale.contiguous()
+
+
+def _prepare_scaled_grouped_mm_weight(
+    experts_module,
+    param_name: str,
+    proj_type: str,
+    hidden_dim: int,
+    model_type = None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    weight, quant_state, quant_kind = _get_moe_weight_and_quant_info(experts_module, param_name)
+    if not _is_float8_tensor(weight):
+        return None
+
+    processed_weight = preprocess_weight(weight, proj_type, hidden_dim, model_type)
+    processed_weight = _make_grouped_mm_rhs_column_major(processed_weight)
+    scale = _extract_scaled_grouped_mm_weight_scale(
+        weight,
+        processed_weight,
+        quant_state,
+        quant_kind,
+    )
+    if scale is None:
+        return None
+
+    return processed_weight, scale
+
+
+def _quantize_inputs_for_scaled_grouped_mm(
+    inputs: torch.Tensor,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    return _manual_fp8_rowwise_quantize(inputs)
+
+
+def _scaled_grouped_mm_with_backward_fix(
+    inputs: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    offsets: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch._scaled_grouped_mm(
+        inputs,
+        weight,
+        input_scale,
+        weight_scale,
+        offs=offsets,
+        out_dtype=out_dtype,
+        use_fast_accum=True,
+    )
+
+
+def _manual_fp8_rowwise_quantize(
+    inputs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize each row independently into float8 and return decode scales for
+    torch._scaled_grouped_mm. This avoids relying on optional torchao/fbgemm
+    quantization helpers that are not always available in runtime environments.
+    """
+    inputs_fp32 = inputs.to(torch.float32)
+    max_fp8 = torch.finfo(torch.float8_e4m3fn).max
+    amax = inputs_fp32.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    quant_scale = (max_fp8 / amax)
+    quantized = (inputs_fp32 * quant_scale).to(torch.float8_e4m3fn)
+    decode_scale = quant_scale.reciprocal().squeeze(-1).to(torch.float32)
+    return quantized.contiguous(), decode_scale.contiguous()
 
 
 def _dequantize_active_expert_weights(
@@ -1131,6 +1379,193 @@ def _forward_native_grouped_mm_active_dequant(
     return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
 
+def _forward_native_grouped_mm_scaled_fp8(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """
+    FP8 fast path: use torch._scaled_grouped_mm directly when the expert scales
+    are compatible with a simple rowwise/tensorwise grouped matmul.
+    """
+    if not hasattr(self, "gate_up_proj") or not hasattr(self, "down_proj"):
+        return None
+    if not _check_torch_scaled_grouped_mm_supported():
+        return None
+
+    is_2d_input = hidden_states.dim() == 2
+    if is_2d_input:
+        sequence_length, hidden_dim = hidden_states.shape
+        batch_size = 1
+    else:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.view(-1, hidden_dim)
+
+    flat_top_k = top_k_index.view(-1)
+    num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
+    sorted_indices = torch.argsort(flat_top_k, stable=True)
+    token_indices = sorted_indices // top_k_index.shape[-1]
+    permuted_input = hidden_states[token_indices]
+
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    use_separated_lora = _should_use_separated_lora()
+    model_type = getattr(self, "_unsloth_model_type", None)
+
+    gate_up_prepared = _prepare_scaled_grouped_mm_weight(
+        self, "gate_up_proj", "gate_up", hidden_dim, model_type
+    )
+    down_prepared = _prepare_scaled_grouped_mm_weight(
+        self, "down_proj", "down", hidden_dim, model_type
+    )
+    if gate_up_prepared is None or down_prepared is None:
+        return None
+
+    gate_up_weight, gate_up_scale = gate_up_prepared
+    down_weight, down_scale = down_prepared
+
+    quantized_input = _quantize_inputs_for_scaled_grouped_mm(
+        permuted_input.to(_get_fp8_dequant_target_dtype(permuted_input))
+    )
+    if quantized_input is None:
+        return None
+    permuted_input_fp8, input_scale = quantized_input
+
+    try:
+        mm1_out = _scaled_grouped_mm_with_backward_fix(
+            permuted_input_fp8,
+            gate_up_weight,
+            input_scale,
+            gate_up_scale,
+            offsets,
+            out_dtype=_get_fp8_dequant_target_dtype(permuted_input),
+        )
+    except RuntimeError:
+        return None
+
+    gate_up_lora = None
+    if getattr(self, "_unsloth_lora_gate_up_proj", None) is not None:
+        gate_up_lora = self._unsloth_lora_gate_up_proj[:3]
+    elif use_separated_lora and _has_lora_adapters(self.gate_up_proj):
+        gate_up_lora = _extract_lora_weights(
+            self.gate_up_proj, num_experts=self.num_experts, experts_module=self
+        )
+
+    if gate_up_lora is not None:
+        first_weight, second_weight, scaling = gate_up_lora
+        first_weight = first_weight.to(mm1_out.dtype).contiguous()
+        second_weight = second_weight.to(mm1_out.dtype).contiguous()
+        lora_out = _grouped_mm_with_backward_fix(
+            permuted_input.to(mm1_out.dtype), first_weight, offsets
+        ).contiguous()
+        try:
+            lora_delta = _grouped_mm_with_backward_fix(lora_out, second_weight, offsets)
+        except RuntimeError:
+            lora_delta = torch.empty(
+                (lora_out.shape[0], second_weight.shape[-1]),
+                dtype=lora_out.dtype,
+                device=lora_out.device,
+            )
+            cpu_offsets = offsets.cpu().tolist()
+            prev_offset = 0
+            for i, end in enumerate(cpu_offsets):
+                if prev_offset < end:
+                    lora_delta[prev_offset:end] = torch.matmul(
+                        lora_out[prev_offset:end], second_weight[i]
+                    )
+                prev_offset = end
+        mm1_out = mm1_out + lora_delta * scaling
+
+    if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
+        bias_expanded = self.gate_up_proj_bias.repeat_interleave(
+            num_tokens_per_expert.to(self.gate_up_proj_bias.device), dim=0
+        )
+        mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
+
+    if "GptOssExperts" in self.__class__.__name__:
+        gate = mm1_out[..., ::2]
+        up = mm1_out[..., 1::2]
+        limit = getattr(self, "limit", 7.0)
+        alpha = getattr(self, "alpha", 1.702)
+        gate = gate.clamp(min=None, max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        inter = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
+    else:
+        gate, up = mm1_out.chunk(2, dim=-1)
+        inter = F.silu(gate) * up
+
+    inter_quantized = _quantize_inputs_for_scaled_grouped_mm(inter)
+    if inter_quantized is None:
+        return None
+    inter_fp8, inter_scale = inter_quantized
+
+    try:
+        mm2_out = _scaled_grouped_mm_with_backward_fix(
+            inter_fp8,
+            down_weight,
+            inter_scale,
+            down_scale,
+            offsets,
+            out_dtype=mm1_out.dtype,
+        )
+    except RuntimeError:
+        return None
+
+    down_lora = None
+    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
+        down_lora = self._unsloth_lora_down_proj[:3]
+    elif use_separated_lora and _has_lora_adapters(self.down_proj):
+        down_lora = _extract_lora_weights(
+            self.down_proj, num_experts=self.num_experts, experts_module=self
+        )
+
+    if down_lora is not None:
+        first_weight, second_weight, scaling = down_lora
+        first_weight = first_weight.to(inter.dtype).contiguous()
+        second_weight = second_weight.to(inter.dtype).contiguous()
+        lora_out = _grouped_mm_with_backward_fix(inter, first_weight, offsets).contiguous()
+        try:
+            lora_delta = _grouped_mm_with_backward_fix(lora_out, second_weight, offsets)
+        except RuntimeError:
+            lora_delta = torch.empty(
+                (lora_out.shape[0], second_weight.shape[-1]),
+                dtype=lora_out.dtype,
+                device=lora_out.device,
+            )
+            cpu_offsets = offsets.cpu().tolist()
+            prev_offset = 0
+            for i, end in enumerate(cpu_offsets):
+                if prev_offset < end:
+                    lora_delta[prev_offset:end] = torch.matmul(
+                        lora_out[prev_offset:end], second_weight[i]
+                    )
+                prev_offset = end
+        mm2_out = mm2_out + lora_delta * scaling
+
+    if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
+        bias_expanded = self.down_proj_bias.repeat_interleave(
+            num_tokens_per_expert.to(self.down_proj_bias.device), dim=0
+        ).to(mm2_out.device)
+        mm2_out = mm2_out + bias_expanded.to(mm2_out.dtype)
+
+    flat_weights = top_k_weights.view(-1)
+    permuted_weights = flat_weights[sorted_indices]
+    mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+
+    final_hidden_states = torch.zeros(
+        (batch_size * sequence_length, hidden_dim),
+        dtype=input_dtype,
+        device=hidden_states.device,
+    )
+    final_hidden_states.index_add_(0, token_indices, mm2_out.to(input_dtype))
+
+    if is_2d_input:
+        return final_hidden_states
+    return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+
+
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -1153,6 +1588,15 @@ def forward_native_grouped_mm(
         )
 
     if _moe_uses_fp8_expert_weights(self):
+        scaled_output = _forward_native_grouped_mm_scaled_fp8(
+            self, hidden_states, top_k_index, top_k_weights
+        )
+        if scaled_output is not None:
+            _log_warn_once(
+                "Unsloth: MoE grouped_mm detected compatible FP8 expert weights; using torch._scaled_grouped_mm."
+            )
+            return scaled_output
+
         _log_warn_once(
             "Unsloth: MoE grouped_mm detected FP8 expert weights; dequantizing only routed experts "
             "to a temporary high-precision grouped_mm buffer."
@@ -1452,32 +1896,20 @@ def forward_native_grouped_mm(
     return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
 
-def forward_triton_grouped_gemm(
+def _forward_triton_grouped_gemm_impl(
     self,
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
+    gate_up_proj: Optional[torch.Tensor] = None,
+    down_proj: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """
-    Grouped GEMM MoE forward pass using Triton kernels.
-    Compatible with torch.compile (recommended mode="max-autotune" with cudagraph_mark_step_begin).
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
+    gate_up_proj = self.gate_up_proj if gate_up_proj is None else gate_up_proj
+    down_proj = self.down_proj if down_proj is None else down_proj
 
-    # Import grouped GEMM interface
+
     from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
-
-    # Import autotune cache
     from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
-
-    # Helper to check TMA support - assumes helper function or just check directly
-    # In original: it was a cached closure. Here we can use _supports_tma() directly
-
-    # nonlocal _MODEL_DIMS_AND_CONFIGS # We need a way to store this!
-    # For now, let's attach it to self if possible, or use a global usage
-    # Attaching to self is cleaner: self._unsloth_moe_configs
-
-    # Create expert mask and find which experts have tokens
 
     if not hasattr(self, "_unsloth_moe_configs"):
         self._unsloth_moe_configs = None
@@ -1503,7 +1935,7 @@ def forward_triton_grouped_gemm(
 
     # Cache model dimensions and kernel configs on first call
     if self._unsloth_moe_configs is None:
-        intermediate_dim = self.gate_up_proj.shape[1] // 2
+        intermediate_dim = gate_up_proj.shape[1] // 2
 
         # Autotune first GEMM
         gemm1_configs = get_or_autotune_moe_kernels(
@@ -1541,10 +1973,10 @@ def forward_triton_grouped_gemm(
     )
     offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
 
-    if self.gate_up_proj.shape[-1] == hidden_dim:
-        w1 = self.gate_up_proj
+    if gate_up_proj.shape[-1] == hidden_dim:
+        w1 = gate_up_proj
     else:
-        w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
+        w1 = gate_up_proj.transpose(-2, -1).contiguous()
 
     # First grouped GEMM: gate_up projection
     first_gemm_output = grouped_gemm(
@@ -1579,10 +2011,10 @@ def forward_triton_grouped_gemm(
     ):
         down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
 
-    if self.down_proj.shape[-1] == intermediate.shape[-1]:
-        w2 = self.down_proj
+    if down_proj.shape[-1] == intermediate.shape[-1]:
+        w2 = down_proj
     else:
-        w2 = self.down_proj.transpose(-2, -1).contiguous()
+        w2 = down_proj.transpose(-2, -1).contiguous()
 
     second_gemm_output = grouped_gemm(
         X=intermediate,
@@ -1634,6 +2066,71 @@ def forward_triton_grouped_gemm(
         final_hidden_states = final_hidden_states.view(batch_size, seq_len, hidden_dim)
 
     return final_hidden_states
+
+
+def forward_triton_grouped_gemm(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Grouped GEMM MoE forward pass using Triton kernels.
+    Compatible with torch.compile (recommended mode="max-autotune" with cudagraph_mark_step_begin).
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if _moe_uses_fp8_expert_weights(self):
+        if _check_torch_grouped_mm_supported():
+            _log_warn_once(
+                "Unsloth: MoE Triton backend detected FP8 expert weights; routing through grouped_mm FP8 handling."
+            )
+            return forward_native_grouped_mm(
+                self, hidden_states, top_k_index, top_k_weights
+            )
+
+        target_dtype = _get_fp8_dequant_target_dtype(hidden_states)
+        hidden_dim = hidden_states.shape[-1]
+        model_type = getattr(self, "_unsloth_model_type", None)
+        gate_up_base, gate_up_quant = _get_moe_weight_and_quant_state(self, "gate_up_proj")
+        down_base, down_quant = _get_moe_weight_and_quant_state(self, "down_proj")
+        gate_up_weight = _dequantize_full_expert_weights(
+            gate_up_base,
+            gate_up_quant,
+            target_dtype,
+            "gate_up",
+            hidden_dim,
+            model_type,
+        )
+        down_weight = _dequantize_full_expert_weights(
+            down_base,
+            down_quant,
+            target_dtype,
+            "down",
+            hidden_dim,
+            model_type,
+        )
+        if gate_up_weight is None or down_weight is None:
+            _log_warn_once(
+                "Unsloth: FP8 expert metadata was insufficient for Triton dequant fallback. Falling back to native_torch MoE loop."
+            )
+            return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
+
+        _log_warn_once(
+            "Unsloth: MoE Triton backend detected FP8 expert weights; dequantizing experts on the fly for Triton grouped GEMM."
+        )
+        return _forward_triton_grouped_gemm_impl(
+            self,
+            hidden_states.to(target_dtype),
+            top_k_index,
+            top_k_weights,
+            gate_up_proj=gate_up_weight,
+            down_proj=down_weight,
+        )
+
+    return _forward_triton_grouped_gemm_impl(
+        self, hidden_states, top_k_index, top_k_weights
+    )
 
 
 @torch.compiler.disable
