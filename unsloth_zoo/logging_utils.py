@@ -40,12 +40,10 @@ REMOVED_METRICS = [
     'clip_ratio/region_mean',
     'frac_reward_zero_std',
 
-    # Conditional metrics - only populated with vLLM importance sampling
-    'sampling/sampling_logp_difference/mean',
-    'sampling/sampling_logp_difference/max',
-    'sampling/importance_sampling_ratio/min',
-    'sampling/importance_sampling_ratio/mean',
-    'sampling/importance_sampling_ratio/max',
+    # Spurious keys from TRL >= 0.26.0 (not real metrics)
+    'train',
+    'tools/call_frequency',
+    'tools/failure_frequency',
 ]
 REMOVED_METRICS = frozenset(REMOVED_METRICS)
 
@@ -197,10 +195,32 @@ def get_trl_metrics():
     filepath = inspect.getfile(trl.trainer)
     filepath = os.path.split(filepath)[0]
 
-    all_metrics = dict()
+    # TRL >= 0.26.0 moved many trainers to trl/experimental/*/
+    # The old trl/trainer/ files become thin shims that re-export.
+    # Build a map of trainer_name -> source file path, preferring the
+    # experimental (real) file when both exist.
+    trl_root = os.path.split(filepath)[0]
+    exp_dir = os.path.join(trl_root, "experimental")
+    trainer_files = dict()
     for trainer in trainers:
-        filename = os.path.join(filepath, f"{trainer}.py")
-        if not os.path.exists(filename): continue
+        candidates = []
+        # 1) trl/trainer/{trainer}.py (original or shim)
+        c1 = os.path.join(filepath, f"{trainer}.py")
+        if os.path.exists(c1):
+            candidates.append(c1)
+        # 2) trl/experimental/{name}/{trainer}.py (real code in >= 0.26.0)
+        if os.path.isdir(exp_dir):
+            name = trainer.replace("_trainer", "")
+            c2 = os.path.join(exp_dir, name, f"{trainer}.py")
+            if os.path.exists(c2):
+                candidates.append(c2)
+        # Prefer the larger file (real code vs thin shim)
+        if candidates:
+            trainer_files[trainer] = max(candidates, key = os.path.getsize)
+    pass
+
+    all_metrics = dict()
+    for trainer, filename in trainer_files.items():
         with open(filename, "r", encoding = "utf-8") as file: file = file.read()
 
         # Get metrics['kl'] or stats['kl']
