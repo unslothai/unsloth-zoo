@@ -33,24 +33,28 @@ from ..device_type import DEVICE_TYPE
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
 N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)
 
-# torch.func.grad_and_value inside torch.compile(fullgraph=True) can fail on
-# GPUs with compute capability < 8.0 (T4 = SM75) due to graph breaks inside
-# the functorch Grad transform. FunctorchHigherOrderVariable disallows nested
-# graph breaks, so any graph break from an op unsupported on older SM becomes
-# a hard error (GB0149: "Unsupported functorch tracing attempt").
+# Fix for torch.func.grad_and_value inside torch.compile(fullgraph=True):
+# grad_and_value_impl is missing from torch._dynamo.trace_rules, so dynamo
+# inlines it instead of treating it as a FunctorchHigherOrderVariable (like
+# grad_impl). This causes _grad_increment_nesting() to run eagerly during
+# tracing, pushing a Grad transform onto the real C++ interpreter stack.
+# Any graph break while Grad is on the stack fires GB0149:
+# "Unsupported functorch tracing attempt".
+# Registering grad_and_value_impl correctly prevents the eager C++ push.
+try:
+    from torch._dynamo.trace_rules import manual_torch_name_rule_map as _trace_map
+    from torch._dynamo.variables.higher_order_ops import FunctorchHigherOrderVariable as _FHOV
+    _key = "torch._functorch.eager_transforms.grad_and_value_impl"
+    if _key not in _trace_map:
+        _trace_map[_key] = _FHOV
+        torch._dynamo.trace_rules.get_torch_obj_rule_map.cache_clear()
+except Exception:
+    pass
+
+# Module-level flag for the try-except safety net below.
 # None = untested, True = compilation works, False = skip compile.
-def _check_fused_ce_compile_support():
-    if os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") == "1":
-        return False
-    if DEVICE_TYPE == "cuda" and torch.cuda.is_available():
-        try:
-            major, _ = torch.cuda.get_device_capability(0)
-            if major < 8:
-                return False
-        except Exception:
-            pass
-    return None
-_FUSED_CE_COMPILE_SUPPORTED = _check_fused_ce_compile_support()
+_FUSED_CE_COMPILE_SUPPORTED = None if \
+    os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") != "1" else False
 
 @functools.cache
 def _get_mapping(autograd):
