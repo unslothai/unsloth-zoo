@@ -977,13 +977,7 @@ def grpo_accumulated_loss(
                             batch_size = B
                         )
                     else:
-                        # Model returned logits directly, apply scaling manually
-                        if logit_scale_multiply != 0.0:
-                            new_hidden_states_chunk = new_hidden_states_chunk * logit_scale_multiply
-                        if logit_scale_divide != 0.0:
-                            new_hidden_states_chunk = new_hidden_states_chunk / logit_scale_divide
-                        if logit_softcapping != 0.0:
-                            new_hidden_states_chunk = new_hidden_states_chunk * torch.tanh(new_hidden_states_chunk / logit_softcapping)
+                        # Model returned logits directly - scaling/softcapping already applied by model forward
                         new_hidden_states_chunk = new_hidden_states_chunk.to(torch.float32)
                         if temperature != 1.0:
                             new_hidden_states_chunk = new_hidden_states_chunk / temperature
