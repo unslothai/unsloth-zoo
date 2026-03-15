@@ -33,6 +33,25 @@ from ..device_type import DEVICE_TYPE
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
 N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)
 
+# torch.func.grad_and_value inside torch.compile(fullgraph=True) can fail on
+# GPUs with compute capability < 8.0 (T4 = SM75) due to graph breaks inside
+# the functorch Grad transform. FunctorchHigherOrderVariable disallows nested
+# graph breaks, so any graph break from an op unsupported on older SM becomes
+# a hard error (GB0149: "Unsupported functorch tracing attempt").
+# None = untested, True = compilation works, False = skip compile.
+def _check_fused_ce_compile_support():
+    if os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") == "1":
+        return False
+    if DEVICE_TYPE == "cuda" and torch.cuda.is_available():
+        try:
+            major, _ = torch.cuda.get_device_capability(0)
+            if major < 8:
+                return False
+        except Exception:
+            pass
+    return None
+_FUSED_CE_COMPILE_SUPPORTED = _check_fused_ce_compile_support()
+
 @functools.cache
 def _get_mapping(autograd):
     parameters = inspect.signature(getattr(autograd, "forward")).parameters
@@ -301,30 +320,77 @@ class UnslothFusedLoss(torch.autograd.Function):
             accumulated_loss.add_(unscaled_loss)
             grad_inputs_j[:] = chunk_grad_input
         pass
-        if torch_compile:
-            accumulate_chunk = torch.compile(
-                accumulate_chunk,
-                dynamic = True,
-                fullgraph = True,
-                options = torch_compile_options,
-            )
+        global _FUSED_CE_COMPILE_SUPPORTED
+        uncompiled_accumulate_chunk = accumulate_chunk
+        if torch_compile and _FUSED_CE_COMPILE_SUPPORTED is not False:
+            try:
+                accumulate_chunk = torch.compile(
+                    accumulate_chunk,
+                    dynamic = True,
+                    fullgraph = True,
+                    options = torch_compile_options,
+                )
+            except Exception:
+                _FUSED_CE_COMPILE_SUPPORTED = False
+                accumulate_chunk = uncompiled_accumulate_chunk
 
-        for (grad_inputs_j, hidden_states_j, labels_j,) in \
-            zip(__grad_inputs, __shift_states, __shift_labels,):
-            accumulate_chunk(
-                n_chunks = n_chunks,
-                grad_inputs_j = grad_inputs_j,
-                grad_lm_head = grad_lm_head,
-                grad_lm_head_bias = grad_lm_head_bias,
-                hidden_states_j = hidden_states_j,
-                lm_head_weight = lm_head_weight,
-                lm_head_bias = lm_head_bias,
-                labels_j = labels_j,
-                divisor = divisor,
-                scaling = scaling,
-                shift_labels = shift_labels,
-                **extra_kwargs,
-            )
+        for j, (grad_inputs_j, hidden_states_j, labels_j,) in \
+            enumerate(zip(__grad_inputs, __shift_states, __shift_labels,)):
+            if j == 0 and _FUSED_CE_COMPILE_SUPPORTED is None and \
+                accumulate_chunk is not uncompiled_accumulate_chunk:
+                try:
+                    accumulate_chunk(
+                        n_chunks = n_chunks,
+                        grad_inputs_j = grad_inputs_j,
+                        grad_lm_head = grad_lm_head,
+                        grad_lm_head_bias = grad_lm_head_bias,
+                        hidden_states_j = hidden_states_j,
+                        lm_head_weight = lm_head_weight,
+                        lm_head_bias = lm_head_bias,
+                        labels_j = labels_j,
+                        divisor = divisor,
+                        scaling = scaling,
+                        shift_labels = shift_labels,
+                        **extra_kwargs,
+                    )
+                    _FUSED_CE_COMPILE_SUPPORTED = True
+                except Exception:
+                    _FUSED_CE_COMPILE_SUPPORTED = False
+                    torch._dynamo.reset()
+                    accumulated_loss.zero_()
+                    grad_inputs.zero_()
+                    if grad_lm_head is not None: grad_lm_head.zero_()
+                    if grad_lm_head_bias is not None: grad_lm_head_bias.zero_()
+                    accumulate_chunk = uncompiled_accumulate_chunk
+                    accumulate_chunk(
+                        n_chunks = n_chunks,
+                        grad_inputs_j = grad_inputs_j,
+                        grad_lm_head = grad_lm_head,
+                        grad_lm_head_bias = grad_lm_head_bias,
+                        hidden_states_j = hidden_states_j,
+                        lm_head_weight = lm_head_weight,
+                        lm_head_bias = lm_head_bias,
+                        labels_j = labels_j,
+                        divisor = divisor,
+                        scaling = scaling,
+                        shift_labels = shift_labels,
+                        **extra_kwargs,
+                    )
+            else:
+                accumulate_chunk(
+                    n_chunks = n_chunks,
+                    grad_inputs_j = grad_inputs_j,
+                    grad_lm_head = grad_lm_head,
+                    grad_lm_head_bias = grad_lm_head_bias,
+                    hidden_states_j = hidden_states_j,
+                    lm_head_weight = lm_head_weight,
+                    lm_head_bias = lm_head_bias,
+                    labels_j = labels_j,
+                    divisor = divisor,
+                    scaling = scaling,
+                    shift_labels = shift_labels,
+                    **extra_kwargs,
+                )
         pass
         ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
         ctx.scaling = scaling
