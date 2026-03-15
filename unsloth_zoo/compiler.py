@@ -1256,17 +1256,27 @@ def create_standalone_class(
 
     # Create new forward calling optimized function
     parameters = inspect.signature(f.forward).parameters
-    # .parameters removes **kwargs and *args so we get it back!
+    # Build the forwarding call using keyword arguments (name=name) for regular
+    # parameters so that decorators like @merge_with_config_defaults can find
+    # them in **kwargs.  When args are passed positionally, the decorator's
+    # func.__code__.co_varnames lookup fails (it sees the inner wrapper's
+    # varnames, not the original function's), and it injects the arg into kwargs
+    # again, causing "got multiple values for argument 'use_cache'".
     keys = list(parameters.keys())
     values = list(parameters.values())
-    for j, value in enumerate(values):
-        value = str(value)
-        if value.startswith("**"):
-            keys[j] = "**" + keys[j]
-        elif value.startswith("*"):
-            keys[j] = "*" + keys[j]
+    forwarding_parts = []
+    for j, (key, value) in enumerate(zip(keys, values)):
+        value_str = str(value)
+        if value_str.startswith("**"):
+            forwarding_parts.append("**" + key)
+        elif value_str.startswith("*"):
+            forwarding_parts.append("*" + key)
+        elif key == "self":
+            forwarding_parts.append("self")
+        else:
+            forwarding_parts.append(f"{key}={key}")
     pass
-    parameters = ", ".join(keys)
+    parameters = ", ".join(forwarding_parts)
 
     # Now create the forward function!
     # When forward is patched, use the original forward definition from class source
@@ -1350,6 +1360,15 @@ def create_standalone_class(
 
     # Fix Q/K/V dtype consistency after RoPE (for 4-bit BNB mode)
     source = fix_attention_dtype_consistency(source)
+
+    # Fix inplace ops on module outputs that have backward hooks (e.g. Gemma 3N
+    # project_per_layer_inputs: per_layer_projection *= scale). Backward hooks
+    # make the output a view, and inplace modification of such views is forbidden.
+    source = re.sub(
+        r"(per_layer_projection) \*= (self\.per_layer_projection_scale\.to\()",
+        r"\1 = \1 * \2",
+        source,
+    )
 
     return source
 
