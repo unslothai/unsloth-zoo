@@ -69,6 +69,14 @@ install_to_cache(__file__, "moe_utils.py")
 
 _CACHED_FORWARD_MOE_BACKEND = None
 _CACHED_MOE_UTILS_MODULE = None
+_WARNED_MOE_MESSAGES = set()
+
+
+def _log_warn_once(message: str):
+    if message in _WARNED_MOE_MESSAGES:
+        return
+    _WARNED_MOE_MESSAGES.add(message)
+    print(message)
 
 
 def _load_cached_moe_utils_module():
@@ -266,6 +274,25 @@ def select_moe_backend():
         _log_info("Unsloth: Using MoE backend 'unsloth_triton'")
         return "unsloth_triton"
     return "native_torch"
+
+
+def _is_float8_tensor(tensor: Optional[torch.Tensor]) -> bool:
+    return tensor is not None and getattr(tensor, "dtype", None) == torch.float8_e4m3fn
+
+
+def _get_fp8_dequant_target_dtype(hidden_states: torch.Tensor) -> torch.dtype:
+    if hidden_states.dtype in (torch.float32, torch.float16, torch.bfloat16):
+        return hidden_states.dtype
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _build_active_expert_grouping(num_tokens_per_expert: torch.Tensor):
+    active_expert_ids = torch.nonzero(num_tokens_per_expert > 0, as_tuple=False).squeeze(-1)
+    active_counts = num_tokens_per_expert.index_select(0, active_expert_ids).to(torch.int32)
+    offsets = torch.cumsum(active_counts, dim=0, dtype=torch.int32)
+    return active_expert_ids, active_counts, offsets
 
 
 def forward_moe_backend(
@@ -475,6 +502,169 @@ def _get_base_weight(param):
         return param.weight
 
     return param
+
+
+def _get_base_weight_and_quant_state(param):
+    """Get base weight together with any attached FP8 quant metadata."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    base_layer = param
+    while hasattr(base_layer, "base_layer"):
+        base_layer = base_layer.base_layer
+
+    if hasattr(base_layer, "get_param"):
+        weight = base_layer.get_param()
+    elif hasattr(base_layer, "weight"):
+        weight = base_layer.weight
+    else:
+        weight = base_layer
+
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is None:
+        quant_state = getattr(base_layer, "weight_scale_inv", None)
+        if quant_state is None:
+            quant_state = getattr(base_layer, "weight_scale", None)
+
+    block_size = getattr(base_layer, "block_size", None)
+    if block_size is not None:
+        try:
+            weight.block_size = block_size
+        except Exception:
+            pass
+        if quant_state is not None:
+            try:
+                quant_state.block_size = block_size
+            except Exception:
+                pass
+
+    return weight, quant_state
+
+
+def _get_moe_weight_and_quant_state(experts_module, param_name: str):
+    """Get expert weight plus FP8 quant metadata, including stacked-parameter attrs."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    param = getattr(experts_module, param_name)
+    weight, quant_state = _get_base_weight_and_quant_state(param)
+
+    if quant_state is None:
+        quant_state = getattr(experts_module, f"{param_name}_weight_scale_inv", None)
+        if quant_state is None:
+            quant_state = getattr(experts_module, f"{param_name}_weight_scale", None)
+
+    block_size = getattr(param, "block_size", None)
+    if block_size is None:
+        block_size = getattr(experts_module, f"{param_name}_block_size", None)
+    if block_size is not None:
+        try:
+            weight.block_size = block_size
+        except Exception:
+            pass
+        if quant_state is not None:
+            try:
+                quant_state.block_size = block_size
+            except Exception:
+                pass
+
+    return weight, quant_state
+
+
+def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
+    """Best-effort extraction of per-expert FP8 quant metadata."""
+    if quant_state is None or not isinstance(quant_state, torch.Tensor):
+        return quant_state
+
+    if quant_state.numel() == 1:
+        sliced = quant_state
+    elif quant_state.shape[0] == weight.shape[0]:
+        sliced = quant_state[expert_idx]
+    elif quant_state.shape[0] % weight.shape[0] == 0:
+        chunk_size = quant_state.shape[0] // weight.shape[0]
+        start = expert_idx * chunk_size
+        end = start + chunk_size
+        sliced = quant_state[start:end]
+    else:
+        return None
+
+    block_size = getattr(weight, "block_size", None) or getattr(quant_state, "block_size", None)
+    if block_size is not None:
+        try:
+            sliced.block_size = block_size
+        except Exception:
+            pass
+    return sliced
+
+
+def _dequantize_expert_slice(
+    expert_weight: torch.Tensor,
+    expert_quant_state,
+    target_dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    """Dequantize one expert tensor into grouped_mm-compatible precision."""
+    if expert_weight.dtype != torch.float8_e4m3fn:
+        return expert_weight.to(target_dtype)
+
+    if expert_quant_state is None:
+        return expert_weight.to(target_dtype)
+
+    try:
+        from unsloth.kernels.fp8 import weight_dequant
+    except Exception:
+        return None
+
+    block_size = getattr(expert_weight, "block_size", None) or getattr(expert_quant_state, "block_size", None)
+    if block_size is not None:
+        try:
+            expert_weight.block_size = block_size
+        except Exception:
+            pass
+        try:
+            expert_quant_state.block_size = block_size
+        except Exception:
+            pass
+
+    return weight_dequant(expert_weight, expert_quant_state, dtype=target_dtype)
+
+
+def _dequantize_active_expert_weights(
+    weight: torch.Tensor,
+    quant_state,
+    active_expert_ids: torch.Tensor,
+    target_dtype: torch.dtype,
+    proj_type: str,
+    hidden_dim: int,
+    model_type = None,
+) -> Optional[torch.Tensor]:
+    """Dequantize only the routed experts and then preprocess for grouped_mm."""
+    if weight.ndim != 3:
+        return None
+
+    active_slices = []
+    block_size = getattr(weight, "block_size", None)
+    for expert_idx in active_expert_ids.tolist():
+        expert_weight = weight[expert_idx].contiguous()
+        if block_size is not None:
+            try:
+                expert_weight.block_size = block_size
+            except Exception:
+                pass
+        expert_quant_state = _slice_fp8_quant_state(weight, quant_state, expert_idx)
+        expert_dequant = _dequantize_expert_slice(expert_weight, expert_quant_state, target_dtype)
+        if expert_dequant is None:
+            return None
+        active_slices.append(expert_dequant)
+
+    packed_weight = torch.stack(active_slices, dim=0)
+    return preprocess_weight(packed_weight, proj_type, hidden_dim, model_type)
+
+
+def _moe_uses_fp8_expert_weights(self) -> bool:
+    if not hasattr(self, "gate_up_proj") or not hasattr(self, "down_proj"):
+        return False
+
+    gate_weight, _ = _get_moe_weight_and_quant_state(self, "gate_up_proj")
+    down_weight, _ = _get_moe_weight_and_quant_state(self, "down_proj")
+    return _is_float8_tensor(gate_weight) or _is_float8_tensor(down_weight)
 
 
 def _get_lora_wrapper_for_param(experts_module, param_name):
@@ -768,6 +958,179 @@ def patch_param_wrapper_for_moe():
         return False
 
 
+def _forward_native_grouped_mm_active_dequant(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """
+    FP8 compatibility path: dequantize only routed experts, then run grouped_mm.
+    Falls back to None when the expert quant metadata cannot be interpreted safely.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if not hasattr(self, "gate_up_proj") or not hasattr(self, "down_proj"):
+        return None
+
+    is_2d_input = hidden_states.dim() == 2
+    if is_2d_input:
+        sequence_length, hidden_dim = hidden_states.shape
+        batch_size = 1
+    else:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.view(-1, hidden_dim)
+
+    flat_top_k = top_k_index.view(-1)
+    num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
+    sorted_indices = torch.argsort(flat_top_k, stable=True)
+    token_indices = sorted_indices // top_k_index.shape[-1]
+    permuted_input = hidden_states[token_indices]
+
+    active_expert_ids, active_counts, offsets = _build_active_expert_grouping(num_tokens_per_expert)
+    if active_expert_ids.numel() == 0:
+        return torch.zeros_like(hidden_states) if is_2d_input else hidden_states.new_zeros(batch_size, sequence_length, hidden_dim)
+
+    target_dtype = _get_fp8_dequant_target_dtype(permuted_input)
+    model_type = getattr(self, "_unsloth_model_type", None)
+    use_separated_lora = _should_use_separated_lora()
+
+    gate_up_base, gate_up_quant = _get_moe_weight_and_quant_state(self, "gate_up_proj")
+    down_base, down_quant = _get_moe_weight_and_quant_state(self, "down_proj")
+    gate_up_weight = _dequantize_active_expert_weights(
+        gate_up_base,
+        gate_up_quant,
+        active_expert_ids,
+        target_dtype,
+        "gate_up",
+        hidden_dim,
+        model_type,
+    )
+    down_weight = _dequantize_active_expert_weights(
+        down_base,
+        down_quant,
+        active_expert_ids,
+        target_dtype,
+        "down",
+        hidden_dim,
+        model_type,
+    )
+    if gate_up_weight is None or down_weight is None:
+        return None
+
+    permuted_input = permuted_input.to(target_dtype)
+    mm1_out = _grouped_mm_with_backward_fix(permuted_input, gate_up_weight.contiguous(), offsets)
+
+    gate_up_lora = None
+    if getattr(self, "_unsloth_lora_gate_up_proj", None) is not None:
+        gate_up_lora = self._unsloth_lora_gate_up_proj[:3]
+    elif use_separated_lora and _has_lora_adapters(self.gate_up_proj):
+        gate_up_lora = _extract_lora_weights(
+            self.gate_up_proj, num_experts=self.num_experts, experts_module=self
+        )
+
+    if gate_up_lora is not None:
+        first_weight, second_weight, scaling = gate_up_lora
+        active_expert_ids_device = active_expert_ids.to(first_weight.device)
+        first_weight = first_weight.index_select(0, active_expert_ids_device).to(target_dtype).contiguous()
+        second_weight = second_weight.index_select(0, active_expert_ids_device).to(target_dtype).contiguous()
+        lora_out = _grouped_mm_with_backward_fix(permuted_input, first_weight, offsets).contiguous()
+        try:
+            lora_delta = _grouped_mm_with_backward_fix(lora_out, second_weight, offsets)
+        except RuntimeError:
+            lora_delta = torch.empty(
+                (lora_out.shape[0], second_weight.shape[-1]),
+                dtype=lora_out.dtype,
+                device=lora_out.device,
+            )
+            cpu_offsets = offsets.cpu().tolist()
+            prev_offset = 0
+            for i, end in enumerate(cpu_offsets):
+                if prev_offset < end:
+                    lora_delta[prev_offset:end] = torch.matmul(
+                        lora_out[prev_offset:end], second_weight[i]
+                    )
+                prev_offset = end
+        mm1_out = mm1_out + lora_delta * scaling
+
+    if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
+        bias_indices = active_expert_ids.to(self.gate_up_proj_bias.device)
+        bias_expanded = self.gate_up_proj_bias.index_select(0, bias_indices).repeat_interleave(
+            active_counts.to(self.gate_up_proj_bias.device), dim=0
+        )
+        mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
+
+    if "GptOssExperts" in self.__class__.__name__:
+        gate = mm1_out[..., ::2]
+        up = mm1_out[..., 1::2]
+        limit = getattr(self, "limit", 7.0)
+        alpha = getattr(self, "alpha", 1.702)
+        gate = gate.clamp(min=None, max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        inter = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
+    else:
+        gate, up = mm1_out.chunk(2, dim=-1)
+        inter = F.silu(gate) * up
+
+    mm2_out = _grouped_mm_with_backward_fix(inter, down_weight.contiguous(), offsets)
+
+    down_lora = None
+    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
+        down_lora = self._unsloth_lora_down_proj[:3]
+    elif use_separated_lora and _has_lora_adapters(self.down_proj):
+        down_lora = _extract_lora_weights(
+            self.down_proj, num_experts=self.num_experts, experts_module=self
+        )
+
+    if down_lora is not None:
+        first_weight, second_weight, scaling = down_lora
+        active_expert_ids_device = active_expert_ids.to(first_weight.device)
+        first_weight = first_weight.index_select(0, active_expert_ids_device).to(target_dtype).contiguous()
+        second_weight = second_weight.index_select(0, active_expert_ids_device).to(target_dtype).contiguous()
+        lora_out = _grouped_mm_with_backward_fix(inter, first_weight, offsets).contiguous()
+        try:
+            lora_delta = _grouped_mm_with_backward_fix(lora_out, second_weight, offsets)
+        except RuntimeError:
+            lora_delta = torch.empty(
+                (lora_out.shape[0], second_weight.shape[-1]),
+                dtype=lora_out.dtype,
+                device=lora_out.device,
+            )
+            cpu_offsets = offsets.cpu().tolist()
+            prev_offset = 0
+            for i, end in enumerate(cpu_offsets):
+                if prev_offset < end:
+                    lora_delta[prev_offset:end] = torch.matmul(
+                        lora_out[prev_offset:end], second_weight[i]
+                    )
+                prev_offset = end
+        mm2_out = mm2_out + lora_delta * scaling
+
+    if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
+        bias_indices = active_expert_ids.to(self.down_proj_bias.device)
+        bias_expanded = self.down_proj_bias.index_select(0, bias_indices).repeat_interleave(
+            active_counts.to(self.down_proj_bias.device), dim=0
+        )
+        mm2_out = mm2_out + bias_expanded.to(mm2_out.dtype)
+
+    flat_weights = top_k_weights.view(-1)
+    permuted_weights = flat_weights[sorted_indices]
+    mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+
+    final_hidden_states = torch.zeros(
+        (batch_size * sequence_length, hidden_dim),
+        dtype=input_dtype,
+        device=hidden_states.device,
+    )
+    final_hidden_states.index_add_(0, token_indices, mm2_out.to(input_dtype))
+
+    if is_2d_input:
+        return final_hidden_states
+    return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+
+
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -788,6 +1151,22 @@ def forward_native_grouped_mm(
             f"torch._grouped_mm is not supported on this device (Compute Capability {major}.{minor}). "
             f"Set UNSLOTH_MOE_BACKEND='unsloth_triton' or 'native_torch' to use a compatible backend."
         )
+
+    if _moe_uses_fp8_expert_weights(self):
+        _log_warn_once(
+            "Unsloth: MoE grouped_mm detected FP8 expert weights; dequantizing only routed experts "
+            "to a temporary high-precision grouped_mm buffer."
+        )
+        active_dequant_output = _forward_native_grouped_mm_active_dequant(
+            self, hidden_states, top_k_index, top_k_weights
+        )
+        if active_dequant_output is not None:
+            return active_dequant_output
+        _log_warn_once(
+            "Unsloth: FP8 expert metadata was insufficient for active grouped_mm dequantization. "
+            "Falling back to native_torch MoE loop."
+        )
+        return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
     is_2d_input = hidden_states.dim() == 2
     if is_2d_input:
