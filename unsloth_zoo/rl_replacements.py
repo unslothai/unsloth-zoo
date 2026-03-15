@@ -940,6 +940,17 @@ def grpo_accumulated_loss(
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
+                    logprobs_chunk = efficient_log_softmax(
+                        new_hidden_states_chunk,
+                        lm_head,
+                        completion_ids,
+                        chunks=input_ids_chunk.shape[0]*multiplier,
+                        logit_scale_multiply=logit_scale_multiply,
+                        logit_scale_divide=logit_scale_divide,
+                        logit_softcapping=logit_softcapping,
+                        temperature=temperature,
+                        batch_size = B
+                    )
                 else:
                     new_hidden_states_chunk = unwrapped_model(
                         input_ids = input_ids_chunk,
@@ -952,18 +963,31 @@ def grpo_accumulated_loss(
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
-
-                logprobs_chunk = efficient_log_softmax(
-                    new_hidden_states_chunk,
-                    lm_head,
-                    completion_ids,
-                    chunks=input_ids_chunk.shape[0]*multiplier,
-                    logit_scale_multiply=logit_scale_multiply,
-                    logit_scale_divide=logit_scale_divide,
-                    logit_softcapping=logit_softcapping,
-                    temperature=temperature,
-                    batch_size = B
-                )
+                    # Guard: check if model returned hidden states or logits
+                    if new_hidden_states_chunk.shape[-1] == lm_head.shape[1]:
+                        logprobs_chunk = efficient_log_softmax(
+                            new_hidden_states_chunk,
+                            lm_head,
+                            completion_ids,
+                            chunks=input_ids_chunk.shape[0]*multiplier,
+                            logit_scale_multiply=logit_scale_multiply,
+                            logit_scale_divide=logit_scale_divide,
+                            logit_softcapping=logit_softcapping,
+                            temperature=temperature,
+                            batch_size = B
+                        )
+                    else:
+                        # Model returned logits directly, apply scaling manually
+                        if logit_scale_multiply != 0.0:
+                            new_hidden_states_chunk = new_hidden_states_chunk * logit_scale_multiply
+                        if logit_scale_divide != 0.0:
+                            new_hidden_states_chunk = new_hidden_states_chunk / logit_scale_divide
+                        if logit_softcapping != 0.0:
+                            new_hidden_states_chunk = new_hidden_states_chunk * torch.tanh(new_hidden_states_chunk / logit_softcapping)
+                        new_hidden_states_chunk = new_hidden_states_chunk.to(torch.float32)
+                        if temperature != 1.0:
+                            new_hidden_states_chunk = new_hidden_states_chunk / temperature
+                        logprobs_chunk = chunked_selective_log_softmax(new_hidden_states_chunk, completion_ids)
                 #This is needed to avoid race conditions with GPT OSS offload_embbed=True
                 #However, it seems that this line does not slow down or disrupt models.
                 device_synchronize()
