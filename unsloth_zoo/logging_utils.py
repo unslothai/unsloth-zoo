@@ -40,10 +40,8 @@ REMOVED_METRICS = [
     'clip_ratio/region_mean',
     'frac_reward_zero_std',
 
-    # Spurious keys from TRL >= 0.26.0 (not real metrics)
+    # Regex false positive from self._metrics["train"]["step_time"] in TRL >= 0.26.0
     'train',
-    'tools/call_frequency',
-    'tools/failure_frequency',
 ]
 REMOVED_METRICS = frozenset(REMOVED_METRICS)
 
