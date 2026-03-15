@@ -1361,6 +1361,15 @@ def create_standalone_class(
     # Fix Q/K/V dtype consistency after RoPE (for 4-bit BNB mode)
     source = fix_attention_dtype_consistency(source)
 
+    # Fix inplace ops on module outputs that have backward hooks (e.g. Gemma 3N
+    # project_per_layer_inputs: per_layer_projection *= scale). Backward hooks
+    # make the output a view, and inplace modification of such views is forbidden.
+    source = re.sub(
+        r"(per_layer_projection) \*= (self\.per_layer_projection_scale\.to\()",
+        r"\1 = \1 * \2",
+        source,
+    )
+
     return source
 
 
