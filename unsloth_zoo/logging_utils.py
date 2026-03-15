@@ -241,14 +241,6 @@ def get_trl_metrics():
         stats_f2 = re.findall(r"stats\[mode\]\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         metrics_f = metrics_f + metrics_f2 + stats_f2
 
-        # Get f-strings with literal prefix before variable: f"prefix/{var}/suffix"
-        # Captures (prefix, suffix) pairs — these are dynamic columns we can't
-        # pre-create, but we note them so the table can add them at runtime.
-        metrics_f3 = re.findall(r"_?metrics(?:\[mode\])?\[f[\"\']([^\"\']*?)\{[^\}]{1,}\}([^\"\']*?)[\"\']\]", file)
-        stats_f3 = re.findall(r"stats(?:\[mode\])?\[f[\"\']([^\"\']*?)\{[^\}]{1,}\}([^\"\']*?)[\"\']\]", file)
-        # These are dynamic (contain runtime variable names) so we can't add them
-        # as fixed columns. The write_line and on_log patches handle them dynamically.
-
         # Filter out prefixes if seen
         # metrics[f"{prefix}rewards/chosen"]
         left_prefix = 'prefix = "eval_" if train_eval == "eval" else ""' in file
