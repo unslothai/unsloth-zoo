@@ -1219,33 +1219,37 @@ def get_model_type(config):
 def get_model_layer_counts(config):
     """Layer counts per model type (int for causal_lm, dict for VL models)."""
     model_type = get_model_type(config)
+    # get_model_type prefers vision_config.model_type, so match the vision names too,
+    # and fall back to config itself when a sub-config is absent.
+    text_config = getattr(config, "text_config", config)
+    vision_config = getattr(config, "vision_config", config)
 
-    if model_type == "mllama":
+    if model_type in ("mllama", "mllama_vision_model"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
-            "global_layers": getattr(config.vision_config, "num_global_layers", 8),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
+            "global_layers": getattr(vision_config, "num_global_layers", 8),
         }
     elif model_type == "qwen2_5_vl":
         return {
             "text_layers": getattr(config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "depth", 32),
+            "vision_layers": getattr(vision_config, "depth", 32),
         }
     elif model_type == "qwen3_vl":
         return {
             "text_layers": getattr(config, "num_hidden_layers", 36),
-            "vision_layers": getattr(config.vision_config, "depth", 27),
-            "deepstack_layers": getattr(config.vision_config, "deepstack_depth", 3),
+            "vision_layers": getattr(vision_config, "depth", 27),
+            "deepstack_layers": getattr(vision_config, "deepstack_depth", 3),
         }
-    elif model_type == "gemma4":
+    elif model_type in ("gemma4", "gemma4_vision", "gemma4_unified", "gemma4_unified_vision"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
         }
-    elif model_type == "gemma3":
+    elif model_type in ("gemma3", "siglip_vision_model"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
         }
     else:
         # Standard causal LM
