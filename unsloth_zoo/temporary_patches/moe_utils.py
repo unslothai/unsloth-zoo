@@ -601,6 +601,10 @@ def _get_moe_weight_and_quant_state(experts_module, param_name: str):
         quant_state = getattr(experts_module, f"{param_name}_weight_scale_inv", None)
         if quant_state is None:
             quant_state = getattr(experts_module, f"{param_name}_weight_scale", None)
+        if quant_state is None:
+            quant_state = getattr(experts_module, f"{param_name}_scale_inv", None)
+        if quant_state is None:
+            quant_state = getattr(experts_module, f"{param_name}_scale", None)
 
     block_size = getattr(param, "block_size", None)
     if block_size is None:
@@ -651,6 +655,14 @@ def _get_moe_weight_and_quant_info(experts_module, param_name: str):
             quant_kind = "weight_scale_inv"
         else:
             quant_state = getattr(experts_module, f"{param_name}_weight_scale", None)
+            if quant_state is not None:
+                quant_kind = "weight_scale"
+    if quant_state is None:
+        quant_state = getattr(experts_module, f"{param_name}_scale_inv", None)
+        if quant_state is not None:
+            quant_kind = "weight_scale_inv"
+        else:
+            quant_state = getattr(experts_module, f"{param_name}_scale", None)
             if quant_state is not None:
                 quant_kind = "weight_scale"
 
@@ -713,6 +725,7 @@ def _dequantize_expert_slice(
 
     try:
         from unsloth.kernels.fp8 import weight_dequant
+        import triton
     except Exception:
         return None
 
@@ -726,6 +739,30 @@ def _dequantize_expert_slice(
             expert_quant_state.block_size = block_size
         except Exception:
             pass
+
+        # Match the handling used by unsloth.kernels.fp8.FP8BlockQuantLinear:
+        # some FP8 checkpoints store block scales transposed relative to the
+        # expert weight layout. In that case, transpose the scale grid before
+        # dequantizing so the recovered bf16/fp16 weights are numerically sane.
+        if (
+            isinstance(expert_quant_state, torch.Tensor)
+            and expert_quant_state.ndim == 2
+            and len(block_size) == 2
+        ):
+            m, n = expert_weight.shape
+            p, q = expert_quant_state.shape
+            if triton.cdiv(m, block_size[0]) != p or triton.cdiv(n, block_size[1]) != q:
+                if (
+                    triton.cdiv(m, block_size[0]) == q
+                    and triton.cdiv(n, block_size[1]) == p
+                ):
+                    expert_quant_state = expert_quant_state.T.contiguous()
+                    try:
+                        expert_quant_state.block_size = block_size
+                    except Exception:
+                        pass
+                else:
+                    return None
 
     if isinstance(expert_quant_state, torch.Tensor) and expert_quant_state.ndim == 1:
         expert_quant_state = expert_quant_state.view(-1, 1)
