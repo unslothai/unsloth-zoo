@@ -333,11 +333,60 @@ class UnslothFusedLoss(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output,):
-        # grad_output is assumed to be always = 1
-        if UNSLOTH_ENABLE_LOGGING:
-            scaling = ctx.scaling if ctx.scaling is not None else 1.0
-            torch._assert(torch.all(grad_output == scaling), f"Fused losses expect grad_output to be all {scaling}, but got {grad_output.ravel()[:10]}")
+        # DDP can scale grad_output by world size; normalize to expected scaling.
+        scaling = ctx.scaling if ctx.scaling is not None else 1.0
         (grad_inputs, grad_lm_head, grad_lm_head_bias, ) = ctx.saved_tensors
+
+        if torch.is_tensor(grad_output):
+            grad_scale = grad_output.detach().float().mean()
+        else:
+            grad_scale = torch.tensor(float(grad_output), device=grad_inputs.device, dtype=grad_inputs.dtype)
+
+        if torch.is_tensor(scaling):
+            scale_factor = grad_scale / scaling
+        else:
+            scale_factor = grad_scale / float(scaling)
+
+        if UNSLOTH_ENABLE_LOGGING:
+            if torch.is_tensor(grad_output):
+                grad_scale_val = float(grad_scale.detach().cpu().item())
+            else:
+                grad_scale_val = float(grad_output)
+            scaling_val = float(scaling) if not torch.is_tensor(scaling) else float(scaling.detach().cpu().item())
+
+            if scaling_val == 0.0 and grad_scale_val != 0.0:
+                raise RuntimeError(
+                    "Unsloth fused CE loss: received non-zero grad_output with scaling=0. "
+                    "This would produce incorrect zero gradients."
+                )
+
+            scale_factor_val = float(scale_factor.detach().cpu().item()) if torch.is_tensor(scale_factor) else float(scale_factor)
+            if scale_factor_val == 1.0:
+                torch._assert(
+                    torch.all(grad_output == scaling),
+                    f"Fused losses expect grad_output to be all {scaling}, but got {grad_output.ravel()[:10]}",
+                )
+            else:
+                world_size = None
+                try:
+                    import torch.distributed as dist
+                    if dist.is_available() and dist.is_initialized():
+                        world_size = dist.get_world_size()
+                except Exception:
+                    world_size = None
+                if world_size is not None:
+                    logger.info(
+                        f"Fused losses grad_output scaled by {scale_factor_val} (got {grad_scale_val}, expected {scaling_val} or {scaling_val * world_size})"
+                    )
+                else:
+                    logger.info(
+                        f"Fused losses grad_output scaled by {scale_factor_val} (got {grad_scale_val}, expected {scaling_val})"
+                    )
+
+        grad_inputs.mul_(scale_factor)
+        if grad_lm_head is not None: grad_lm_head.mul_(scale_factor)
+        if grad_lm_head_bias is not None: grad_lm_head_bias.mul_(scale_factor)
+
         return (None, grad_inputs, grad_lm_head, grad_lm_head_bias, None, None, None, None, None, None, None, None, None,)
     pass
 pass
