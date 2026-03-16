@@ -715,7 +715,7 @@ def get_model_layer_counts(config):
     """
     model_type = get_model_type(config)
 
-    if model_type == "mllama":
+    if model_type in ("mllama", "mllama_vision_model"):
         return {
             "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
             "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
@@ -732,7 +732,7 @@ def get_model_layer_counts(config):
             "vision_layers": getattr(config.vision_config, "depth", 27),
             "deepstack_layers": getattr(config.vision_config, "deepstack_depth", 3),
         }
-    elif model_type == "gemma3":
+    elif model_type in ("gemma3", "siglip_vision_model"):
         return {
             "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
             "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
