@@ -834,9 +834,19 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         hasattr(torch.utils.checkpoint, "_old_checkpoint"):
 
         torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
-        # Also restore transformers.modeling_utils.checkpoint
-        import transformers.modeling_utils
-        transformers.modeling_utils.checkpoint = torch.utils.checkpoint._old_checkpoint
+
+    # Restore transformers.modeling_utils.checkpoint independently.
+    # Must be outside the conditional above because unpatch_unsloth_gradient_checkpointing()
+    # may run first (e.g. training_utils.py:201), deleting _old_checkpoint and restoring
+    # torch.utils.checkpoint.checkpoint, which makes the condition above False.
+    # Use _old_checkpoint if still available, otherwise torch.utils.checkpoint.checkpoint
+    # (which has already been restored to the original at that point).
+    import transformers.modeling_utils
+    if getattr(transformers.modeling_utils, "checkpoint", None) is unsloth_checkpoint:
+        transformers.modeling_utils.checkpoint = getattr(
+            torch.utils.checkpoint, "_old_checkpoint",
+            torch.utils.checkpoint.checkpoint
+        )
 pass
 
 
