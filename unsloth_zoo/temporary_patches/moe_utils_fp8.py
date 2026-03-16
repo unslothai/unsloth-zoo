@@ -26,6 +26,91 @@ _TORCH_SCALED_GROUPED_MM_AVAILABLE = hasattr(torch, "_scaled_grouped_mm")
 _TORCH_SCALED_GROUPED_MM_SUPPORTED = None
 
 
+def _resolve_safetensors_files(model_name, token=None, revision=None):
+    """Resolve safetensors file path(s), supporting both single-file and sharded layouts."""
+    import safetensors.torch
+
+    if os.path.isdir(model_name):
+        single = os.path.join(model_name, "model.safetensors")
+        if os.path.isfile(single):
+            return [single], None
+        index_path = os.path.join(model_name, "model.safetensors.index.json")
+        if os.path.isfile(index_path):
+            import json
+            with open(index_path) as f:
+                index = json.load(f)
+            shard_files = sorted(set(index.get("weight_map", {}).values()))
+            paths = [os.path.join(model_name, s) for s in shard_files]
+            return paths, index.get("weight_map", {})
+        return None, None
+
+    from huggingface_hub import hf_hub_download
+
+    try:
+        path = hf_hub_download(
+            repo_id=model_name, filename="model.safetensors",
+            token=token, revision=revision,
+        )
+        return [path], None
+    except Exception:
+        pass
+
+    try:
+        index_path = hf_hub_download(
+            repo_id=model_name, filename="model.safetensors.index.json",
+            token=token, revision=revision,
+        )
+        import json
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
+        shard_files = sorted(set(weight_map.values()))
+        paths = []
+        for shard in shard_files:
+            p = hf_hub_download(
+                repo_id=model_name, filename=shard,
+                token=token, revision=revision,
+            )
+            paths.append(p)
+        return paths, weight_map
+    except Exception:
+        return None, None
+
+
+def _open_safetensors_for_keys(paths, weight_map, needed_keys):
+    """Open the safetensors file(s) that contain the needed keys and return a reader dict."""
+    import safetensors.torch
+
+    if weight_map is not None:
+        shard_to_keys = {}
+        for key in needed_keys:
+            shard = weight_map.get(key)
+            if shard is None:
+                continue
+            shard_to_keys.setdefault(shard, []).append(key)
+        shard_to_path = {}
+        for p in paths:
+            shard_to_path[os.path.basename(p)] = p
+        tensors = {}
+        for shard, keys in shard_to_keys.items():
+            p = shard_to_path.get(shard)
+            if p is None:
+                continue
+            with safetensors.torch.safe_open(p, framework="pt") as f:
+                for key in keys:
+                    if key in f.keys():
+                        tensors[key] = f.get_tensor(key)
+        return tensors
+
+    with safetensors.torch.safe_open(paths[0], framework="pt") as f:
+        available = set(f.keys())
+        tensors = {}
+        for key in needed_keys:
+            if key in available:
+                tensors[key] = f.get_tensor(key)
+        return tensors
+
+
 def _maybe_patch_glm4_stacked_moe_fp8_scales(
     model,
     model_name: str,
@@ -41,89 +126,109 @@ def _maybe_patch_glm4_stacked_moe_fp8_scales(
         quant_method = quantization_config.get("quant_method", None)
     else:
         quant_method = getattr(quantization_config, "quant_method", None)
-    if quant_method != "compressed-tensors":
+    # quant_method can be a string ("compressed-tensors") or an enum
+    # (QuantizationMethod.COMPRESSED_TENSORS). Normalize to string for comparison.
+    quant_method_str = quant_method.value if hasattr(quant_method, "value") else str(quant_method) if quant_method else None
+    if quant_method_str not in ("compressed-tensors", "compressed_tensors"):
         return False
 
     inner_model = getattr(model, "model", None)
     if inner_model is None or not hasattr(inner_model, "layers"):
         return False
 
+    # Collect layers that have stacked expert parameters (gate_up_proj).
+    # Do NOT check dtype -- compressed_tensors may have already decompressed
+    # FP8 weights to BF16, but we still need to restore them and attach scales.
     routed_layers = []
     for layer_idx, layer in enumerate(inner_model.layers):
         experts = getattr(getattr(layer, "mlp", None), "experts", None)
         if experts is None or not hasattr(experts, "gate_up_proj"):
             continue
-        if getattr(experts.gate_up_proj, "dtype", None) == torch.float8_e4m3fn:
-            routed_layers.append((layer_idx, experts))
+        # Skip if scales are already attached
+        if getattr(experts, "gate_up_proj_weight_scale", None) is not None:
+            continue
+        routed_layers.append((layer_idx, experts))
     if len(routed_layers) == 0:
         return False
 
-    if os.path.isdir(model_name):
-        safetensors_path = os.path.join(model_name, "model.safetensors")
+    paths, weight_map = _resolve_safetensors_files(model_name, token, revision)
+    if paths is None:
+        return False
+
+    # Get the set of all available keys to filter layers efficiently.
+    # For sharded models, the weight_map has all keys. For single-file, read from the file.
+    if weight_map is not None:
+        available_keys = set(weight_map.keys())
     else:
-        from huggingface_hub import hf_hub_download
+        import safetensors.torch
+        with safetensors.torch.safe_open(paths[0], framework="pt") as f:
+            available_keys = set(f.keys())
 
-        safetensors_path = hf_hub_download(
-            repo_id = model_name,
-            filename = "model.safetensors",
-            token = token,
-            revision = revision,
+    # Filter to only layers that actually have scale keys in the checkpoint.
+    # Some layers may be in the quantization ignore list and have no scales.
+    layers_with_scales = []
+    for layer_idx, experts in routed_layers:
+        check_key = f"model.layers.{layer_idx}.mlp.experts.0.gate_proj.weight_scale"
+        if check_key in available_keys:
+            layers_with_scales.append((layer_idx, experts))
+    routed_layers = layers_with_scales
+    if len(routed_layers) == 0:
+        return False
+
+    # Read FP8 weights and scales from safetensors and replace the decompressed ones
+    for layer_idx, experts in routed_layers:
+        device = experts.gate_up_proj.device
+        num_experts = experts.gate_up_proj.shape[0]
+
+        needed_keys = []
+        for expert_idx in range(num_experts):
+            prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}"
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                needed_keys.append(f"{prefix}.{proj}.weight")
+                needed_keys.append(f"{prefix}.{proj}.weight_scale")
+
+        tensors = _open_safetensors_for_keys(paths, weight_map, needed_keys)
+
+        gate_up_rows = []
+        down_rows = []
+        gate_up_scales = []
+        down_scales = []
+
+        for expert_idx in range(num_experts):
+            prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}"
+            gate = tensors.get(f"{prefix}.gate_proj.weight")
+            gate_scale = tensors.get(f"{prefix}.gate_proj.weight_scale")
+            up = tensors.get(f"{prefix}.up_proj.weight")
+            up_scale = tensors.get(f"{prefix}.up_proj.weight_scale")
+            down = tensors.get(f"{prefix}.down_proj.weight")
+            down_scale = tensors.get(f"{prefix}.down_proj.weight_scale")
+
+            if any(t is None for t in (gate, gate_scale, up, up_scale, down, down_scale)):
+                return False
+
+            gate_up_rows.append(torch.cat([gate, up], dim=0))
+            down_rows.append(down)
+            gate_up_scales.append(torch.cat([gate_scale, up_scale], dim=0))
+            down_scales.append(down_scale)
+
+        experts.gate_up_proj = nn.Parameter(
+            torch.stack(gate_up_rows, dim=0).to(device=device),
+            requires_grad = experts.gate_up_proj.requires_grad,
         )
-
-    import safetensors.torch
-
-    with safetensors.torch.safe_open(safetensors_path, framework = "pt") as file:
-        for layer_idx, experts in routed_layers:
-            device = experts.gate_up_proj.device
-            num_experts = experts.gate_up_proj.shape[0]
-            gate_up_rows = []
-            down_rows = []
-            gate_up_scales = []
-            down_scales = []
-
-            for expert_idx in range(num_experts):
-                gate = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight"
-                )
-                gate_scale = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight_scale"
-                )
-                up = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight"
-                )
-                up_scale = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight_scale"
-                )
-                down = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight"
-                )
-                down_scale = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight_scale"
-                )
-
-                gate_up_rows.append(torch.cat([gate, up], dim = 0))
-                down_rows.append(down)
-                gate_up_scales.append(torch.cat([gate_scale, up_scale], dim = 0))
-                down_scales.append(down_scale)
-
-            experts.gate_up_proj = nn.Parameter(
-                torch.stack(gate_up_rows, dim = 0).to(device = device),
-                requires_grad = experts.gate_up_proj.requires_grad,
-            )
-            experts.down_proj = nn.Parameter(
-                torch.stack(down_rows, dim = 0).to(device = device),
-                requires_grad = experts.down_proj.requires_grad,
-            )
-            experts.gate_up_proj_weight_scale = nn.Parameter(
-                torch.stack(gate_up_scales, dim = 0).to(device = device),
-                requires_grad = False,
-            )
-            experts.down_proj_weight_scale = nn.Parameter(
-                torch.stack(down_scales, dim = 0).to(device = device),
-                requires_grad = False,
-            )
-            experts.gate_up_proj_scale = experts.gate_up_proj_weight_scale
-            experts.down_proj_scale = experts.down_proj_weight_scale
+        experts.down_proj = nn.Parameter(
+            torch.stack(down_rows, dim=0).to(device=device),
+            requires_grad = experts.down_proj.requires_grad,
+        )
+        experts.gate_up_proj_weight_scale = nn.Parameter(
+            torch.stack(gate_up_scales, dim=0).to(device=device),
+            requires_grad = False,
+        )
+        experts.down_proj_weight_scale = nn.Parameter(
+            torch.stack(down_scales, dim=0).to(device=device),
+            requires_grad = False,
+        )
+        experts.gate_up_proj_scale = experts.gate_up_proj_weight_scale
+        experts.down_proj_scale = experts.down_proj_weight_scale
 
     return True
 
