@@ -333,7 +333,7 @@ def forward_moe_backend(
             return forward_moe_backend_fp8(
                 self, hidden_states, top_k_index, top_k_weights
             )
-    except Exception:
+    except ImportError:
         pass
 
     backend = select_moe_backend()
@@ -576,6 +576,9 @@ def _get_moe_weight_and_quant_state(experts_module, param_name: str):
     block_size = getattr(param, "block_size", None)
     if block_size is None:
         block_size = getattr(experts_module, f"{param_name}_block_size", None)
+    if block_size is None:
+        # FP8Experts stores block_size on the module itself
+        block_size = getattr(experts_module, "block_size", None)
     if block_size is not None:
         _try_attach_block_size(weight, block_size)
         if quant_state is not None:
@@ -961,20 +964,21 @@ def forward_native_grouped_mm(
 
     hidden_states = hidden_states.view(-1, hidden_dim)
 
-    # 1. Calculate routing
-    flat_top_k = top_k_index.view(-1)
-    num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
+    # 1. Calculate routing (no grad needed for routing indices - they come from router's topk)
+    with torch.no_grad():
+        flat_top_k = top_k_index.view(-1)
+        num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
 
-    # 2. Sort indices to group tokens by expert
-    sorted_indices = torch.argsort(flat_top_k, stable=True)
-    token_indices = sorted_indices // top_k_index.shape[-1]
+        # 2. Sort indices to group tokens by expert
+        sorted_indices = torch.argsort(flat_top_k, stable=True)
+        token_indices = sorted_indices // top_k_index.shape[-1]
+
+        # 4. Prepare Grouped MM arguments
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
     # 3. Permute Input
     # We need to gather inputs. Since we may have expanded top_k, we use token_indices to map back to original input
     permuted_input = hidden_states[token_indices]
-
-    # 4. Prepare Grouped MM arguments
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
     # ========================================================================
     # Gate + Up projection with optional separated LoRA (DEFAULT)

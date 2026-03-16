@@ -183,11 +183,12 @@ def _check_torch_scaled_grouped_mm_supported():
         _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
         return False
 
-    # The symbol can exist on older GPUs, but probing it on unsupported
-    # hardware can trigger an async launch failure that poisons the CUDA
-    # context. Keep the FP8 scaled_grouped_mm path off on pre-Hopper parts.
+    # The symbol can exist on unsupported GPUs, and the light probe can still
+    # pass on SM100 while real MoE kernels later emit incompatible MMA
+    # instructions and poison the CUDA context asynchronously. Restrict the
+    # FP8 scaled_grouped_mm path to Hopper (SM 9.x) only for now.
     major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    if major < 9:
+    if major != 9:
         _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
         return False
 
@@ -367,6 +368,9 @@ def _get_moe_weight_and_quant_info(experts_module, param_name: str):
     block_size = getattr(param, "block_size", None)
     if block_size is None:
         block_size = getattr(experts_module, f"{param_name}_block_size", None)
+    if block_size is None:
+        # FP8Experts stores block_size on the module itself
+        block_size = getattr(experts_module, "block_size", None)
     if block_size is not None:
         _try_attach_block_size(weight, block_size)
         if quant_state is not None:
@@ -675,6 +679,7 @@ def _forward_native_moe_loop_fp8(self, hidden_states, top_k_index, top_k_weights
     )
 
 
+@torch.compiler.disable
 def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     from .moe_utils import (
         _get_moe_weight_and_quant_state,
@@ -684,39 +689,54 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         forward_native_moe_loop,
     )
 
-    # Dequant FP8 weights to bf16, then use preferred non-FP8 backend.
-    # Note: _scaled_grouped_mm is NOT attempted here because the small-matrix
-    # probe can pass while real-sized matrices generate incompatible MMA
-    # instructions (e.g. on B200/SM100), which poisons the CUDA context
-    # asynchronously and cannot be caught without try/except.
+    backend = select_moe_backend()
+
+    # 1. Try _scaled_grouped_mm (fast FP8 path on Hopper/Blackwell)
+    if backend == "grouped_mm" and _check_torch_scaled_grouped_mm_supported():
+        scaled_grouped_mm_output = _forward_scaled_grouped_mm_fp8(
+            self,
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+        )
+        if scaled_grouped_mm_output is not None:
+            _log_moe_fp8_backend_once(
+                self,
+                "Unsloth: MoE FP8 is using _scaled_grouped_mm.",
+            )
+            return scaled_grouped_mm_output
+
+    # 2. Dequant FP8 weights to bf16/fp16 and run through normal MoE forward
     target_dtype = _get_fp8_dequant_target_dtype(hidden_states)
     gate_up_base, gate_up_quant = _get_moe_weight_and_quant_state(self, "gate_up_proj")
     down_base, down_quant = _get_moe_weight_and_quant_state(self, "down_proj")
     gate_up_weight = _dequantize_full_expert_weights(gate_up_base, gate_up_quant, target_dtype)
     down_weight = _dequantize_full_expert_weights(down_base, down_quant, target_dtype)
 
-    if gate_up_weight is None or down_weight is None:
-        raise RuntimeError(
-            "Unable to dequantize FP8 MoE expert weights."
+    if gate_up_weight is not None and down_weight is not None:
+        if backend == "grouped_mm":
+            _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-grouped_mm.")
+            forward_fn = forward_native_grouped_mm
+        elif backend == "unsloth_triton":
+            _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-Triton grouped GEMM.")
+            forward_fn = forward_triton_grouped_gemm
+        else:
+            _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-native_torch loop.")
+            forward_fn = forward_native_moe_loop
+
+        return _call_with_temporary_moe_weights(
+            self,
+            gate_up_weight,
+            down_weight,
+            forward_fn,
+            hidden_states.to(target_dtype),
+            top_k_index,
+            top_k_weights,
         )
 
-    backend = select_moe_backend()
-    if backend == "grouped_mm":
-        _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-grouped_mm.")
-        forward_fn = forward_native_grouped_mm
-    elif backend == "unsloth_triton":
-        _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-Triton grouped GEMM.")
-        forward_fn = forward_triton_grouped_gemm
-    else:
-        _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-native_torch loop.")
-        forward_fn = forward_native_moe_loop
-
-    return _call_with_temporary_moe_weights(
+    # 3. Last resort: per-expert fp8_linear loop
+    _log_moe_fp8_backend_once(
         self,
-        gate_up_weight,
-        down_weight,
-        forward_fn,
-        hidden_states.to(target_dtype),
-        top_k_index,
-        top_k_weights,
+        "Unsloth: MoE FP8 is using per-expert fp8_linear loop.",
     )
+    return _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weights)
