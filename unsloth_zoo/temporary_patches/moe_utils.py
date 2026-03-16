@@ -555,9 +555,6 @@ def _get_base_weight(param):
 
 
 def _get_base_weight_and_quant_state(param):
-    """Get base weight together with any attached FP8 quant metadata."""
-    # This Unsloth Zoo code section is licensed under AGPL3
-
     base_layer = param
     while hasattr(base_layer, "base_layer"):
         base_layer = base_layer.base_layer
@@ -591,9 +588,6 @@ def _get_base_weight_and_quant_state(param):
 
 
 def _get_moe_weight_and_quant_state(experts_module, param_name: str):
-    """Get expert weight plus FP8 quant metadata, including stacked-parameter attrs."""
-    # This Unsloth Zoo code section is licensed under AGPL3
-
     param = getattr(experts_module, param_name)
     weight, quant_state = _get_base_weight_and_quant_state(param)
 
@@ -624,7 +618,6 @@ def _get_moe_weight_and_quant_state(experts_module, param_name: str):
 
 
 def _get_moe_weight_and_quant_info(experts_module, param_name: str):
-    """Get expert weight, quant metadata, and whether it is scale or scale_inv."""
     param = getattr(experts_module, param_name)
 
     base_layer = param
@@ -686,7 +679,6 @@ def _get_moe_weight_and_quant_info(experts_module, param_name: str):
 
 
 def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
-    """Best-effort extraction of per-expert FP8 quant metadata."""
     if quant_state is None or not isinstance(quant_state, torch.Tensor):
         return quant_state
 
@@ -716,7 +708,6 @@ def _dequantize_expert_slice(
     expert_quant_state,
     target_dtype: torch.dtype,
 ) -> Optional[torch.Tensor]:
-    """Dequantize one expert tensor into grouped_mm-compatible precision."""
     if expert_weight.dtype != torch.float8_e4m3fn:
         return expert_weight.to(target_dtype)
 
@@ -740,10 +731,6 @@ def _dequantize_expert_slice(
         except Exception:
             pass
 
-        # Match the handling used by unsloth.kernels.fp8.FP8BlockQuantLinear:
-        # some FP8 checkpoints store block scales transposed relative to the
-        # expert weight layout. In that case, transpose the scale grid before
-        # dequantizing so the recovered bf16/fp16 weights are numerically sane.
         if (
             isinstance(expert_quant_state, torch.Tensor)
             and expert_quant_state.ndim == 2
@@ -1189,17 +1176,12 @@ def _patched_param_wrapper_forward(
         lora_data = _extract_lora_from_wrapper(self)
 
         if lora_data is not None and param_name:
-            # Store LoRA data on the EXPERTS MODULE (not base_layer)
-            # e.g., _unsloth_lora_gate_up_proj or _unsloth_lora_down_proj
             lora_attr = f"_unsloth_lora_{param_name}"
             setattr(experts_module, lora_attr, lora_data)
 
         try:
-            # Call IMMEDIATE base_layer to preserve wrapper chain
-            # (down_proj wrapper calls gate_up_proj wrapper calls Qwen3MoeExperts)
             result = immediate_base_layer(x, *args, **kwargs)
         finally:
-            # Clean up
             if param_name:
                 lora_attr = f"_unsloth_lora_{param_name}"
                 if hasattr(experts_module, lora_attr):
@@ -1701,14 +1683,9 @@ def forward_native_grouped_mm(
         # Get model type for preprocessing (if registered)
         model_type = getattr(self, "_unsloth_model_type", None)
 
-        # Handle different weight shapes using preprocessor
-        # torch._grouped_mm backward requires weights to be contiguous; preprocessing may return a transposed view.
         w1 = preprocess_weight(gate_up_base, "gate_up", hidden_dim, model_type)
-        # Base forward: X @ W
         mm1_out = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
 
-        # Add separated LoRA contribution: + ((X @ first) @ second) * scaling
-        # _extract_lora_from_wrapper returns (first_weight, second_weight, scaling)
         if gate_up_lora is not None:
             first_weight, second_weight, scaling = gate_up_lora
 
