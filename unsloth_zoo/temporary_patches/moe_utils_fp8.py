@@ -161,11 +161,13 @@ def _get_fp8_dequant_target_dtype(hidden_states: torch.Tensor) -> torch.dtype:
 
 
 def _log_moe_fp8_backend_once(experts_module, message: str):
+    from .common import logger
     from .moe_utils import _log_info
 
     if getattr(experts_module, "_unsloth_logged_fp8_backend", None) == message:
         return
     experts_module._unsloth_logged_fp8_backend = message
+    logger.info(message)
     _log_info(message)
 
 
@@ -239,51 +241,79 @@ def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
     return sliced
 
 
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
 def _dequantize_expert_slice(
     expert_weight: torch.Tensor,
     expert_quant_state,
     target_dtype: torch.dtype,
 ) -> Optional[torch.Tensor]:
+    """Dequantize one expert's FP8 weight to target_dtype using pure PyTorch."""
     from .moe_utils import _try_attach_block_size
 
     if expert_weight.dtype != torch.float8_e4m3fn:
         return expert_weight.to(target_dtype)
 
     if expert_quant_state is None:
-        return None
+        return expert_weight.to(target_dtype)
 
-    try:
-        from unsloth.kernels.fp8 import weight_dequant
-        import triton
-    except Exception:
-        return None
+    s = expert_quant_state
+    if not isinstance(s, torch.Tensor):
+        return expert_weight.to(target_dtype)
 
-    block_size = getattr(expert_weight, "block_size", None) or getattr(expert_quant_state, "block_size", None)
-    if block_size is not None:
-        _try_attach_block_size(expert_weight, block_size)
-        _try_attach_block_size(expert_quant_state, block_size)
+    w = expert_weight.to(target_dtype)
 
+    # Per-tensor scale
+    if s.numel() == 1:
+        return w * s.view(1, 1).to(target_dtype)
+
+    # Reshape 1D to column vector for per-row handling
+    if s.ndim == 1:
+        s = s.view(-1, 1)
+
+    # Per-row scale: (m, 1)
+    if s.ndim == 2 and s.shape[1] == 1:
+        # Per-sub-projection scalar scales (e.g. 2 scales for gate+up stacked weight).
         if (
-            isinstance(expert_quant_state, torch.Tensor)
-            and expert_quant_state.ndim == 2
-            and len(block_size) == 2
+            s.shape[0] > 1
+            and s.shape[0] < w.shape[0]
+            and w.shape[0] % s.shape[0] == 0
         ):
-            m, n = expert_weight.shape
-            p, q = expert_quant_state.shape
-            if triton.cdiv(m, block_size[0]) != p or triton.cdiv(n, block_size[1]) != q:
-                if (
-                    triton.cdiv(m, block_size[0]) == q
-                    and triton.cdiv(n, block_size[1]) == p
-                ):
-                    expert_quant_state = expert_quant_state.T.contiguous()
-                    _try_attach_block_size(expert_quant_state, block_size)
+            repeat_factor = w.shape[0] // s.shape[0]
+            s = s.repeat_interleave(repeat_factor, dim=0)
+
+        if w.shape[0] == s.shape[0]:
+            return w * s.to(target_dtype)
+        elif w.shape[1] == s.shape[0]:
+            return (w.t() * s.to(target_dtype)).t()
+        return w * s.to(target_dtype)
+
+    # Block scale: (ceil(m/bm), ceil(n/bn)) — expand to weight shape
+    if s.ndim == 2:
+        block_size = getattr(expert_weight, "block_size", None) or getattr(s, "block_size", None)
+        M, N = w.shape
+        p, q = s.shape
+
+        if block_size is not None and len(block_size) == 2:
+            bm, bn = block_size
+            # Check if scale is transposed
+            if _ceil_div(M, bm) != p or _ceil_div(N, bn) != q:
+                if _ceil_div(M, bm) == q and _ceil_div(N, bn) == p:
+                    s = s.T.contiguous()
+                    p, q = s.shape
                 else:
-                    return None
+                    return expert_weight.to(target_dtype)
+        else:
+            # Infer block size from scale grid
+            bm = _ceil_div(M, p)
+            bn = _ceil_div(N, q)
 
-    if isinstance(expert_quant_state, torch.Tensor) and expert_quant_state.ndim == 1:
-        expert_quant_state = expert_quant_state.view(-1, 1)
+        s_expanded = s.to(target_dtype).repeat_interleave(bm, dim=0)[:M].repeat_interleave(bn, dim=1)[:, :N]
+        return w * s_expanded
 
-    return weight_dequant(expert_weight, expert_quant_state, dtype=target_dtype)
+    return expert_weight.to(target_dtype)
 
 
 def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dtype: torch.dtype):
@@ -441,18 +471,15 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
 
     target_dtype = _get_fp8_dequant_target_dtype(permuted_input)
     permuted_input_fp8, input_scale = _manual_fp8_rowwise_quantize(permuted_input.to(target_dtype))
-    try:
-        mm1_out = torch._scaled_grouped_mm(
-            permuted_input_fp8,
-            gate_up_weight,
-            input_scale,
-            gate_up_scale,
-            offs=offsets,
-            out_dtype=target_dtype,
-            use_fast_accum=True,
-        )
-    except RuntimeError:
-        return None
+    mm1_out = torch._scaled_grouped_mm(
+        permuted_input_fp8,
+        gate_up_weight,
+        input_scale,
+        gate_up_scale,
+        offs=offsets,
+        out_dtype=target_dtype,
+        use_fast_accum=True,
+    )
 
     gate_up_lora = _get_grouped_lora(self, "gate_up_proj", "_unsloth_lora_gate_up_proj", use_separated_lora)
     if gate_up_lora is not None:
@@ -474,18 +501,15 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
         inter = F.silu(gate) * up
 
     inter_fp8, inter_scale = _manual_fp8_rowwise_quantize(inter)
-    try:
-        mm2_out = torch._scaled_grouped_mm(
-            inter_fp8,
-            down_weight,
-            inter_scale,
-            down_scale,
-            offs=offsets,
-            out_dtype=mm1_out.dtype,
-            use_fast_accum=True,
-        )
-    except RuntimeError:
-        return None
+    mm2_out = torch._scaled_grouped_mm(
+        inter_fp8,
+        down_weight,
+        inter_scale,
+        down_scale,
+        offs=offsets,
+        out_dtype=mm1_out.dtype,
+        use_fast_accum=True,
+    )
 
     down_lora = _get_grouped_lora(self, "down_proj", "_unsloth_lora_down_proj", use_separated_lora)
     if down_lora is not None:
@@ -627,12 +651,8 @@ def _forward_native_moe_loop_fp8(self, hidden_states, top_k_index, top_k_weights
 
     _log_moe_fp8_backend_once(
         self,
-        "Unsloth: MoE FP8 fallback is using the direct FP8 expert loop backend.",
+        "Unsloth: MoE FP8 is using the native_torch fallback backend.",
     )
-    try:
-        return _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weights)
-    except Exception:
-        pass
 
     target_dtype = _get_fp8_dequant_target_dtype(hidden_states)
     gate_up_base, gate_up_quant = _get_moe_weight_and_quant_state(self, "gate_up_proj")
@@ -655,90 +675,47 @@ def _forward_native_moe_loop_fp8(self, hidden_states, top_k_index, top_k_weights
     )
 
 
-def forward_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weights):
+def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     from .moe_utils import (
         _get_moe_weight_and_quant_state,
+        select_moe_backend,
         forward_native_grouped_mm,
+        forward_triton_grouped_gemm,
         forward_native_moe_loop,
     )
 
-    if not _moe_uses_fp8_expert_weights(self):
-        return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
-
-    scaled_output = _forward_scaled_grouped_mm_fp8(
-        self, hidden_states, top_k_index, top_k_weights
-    )
-    if scaled_output is not None:
-        _log_moe_fp8_backend_once(
-            self,
-            "Unsloth: MoE FP8 is using torch._scaled_grouped_mm.",
-        )
-        return scaled_output
-
+    # Dequant FP8 weights to bf16, then use preferred non-FP8 backend.
+    # Note: _scaled_grouped_mm is NOT attempted here because the small-matrix
+    # probe can pass while real-sized matrices generate incompatible MMA
+    # instructions (e.g. on B200/SM100), which poisons the CUDA context
+    # asynchronously and cannot be caught without try/except.
     target_dtype = _get_fp8_dequant_target_dtype(hidden_states)
     gate_up_base, gate_up_quant = _get_moe_weight_and_quant_state(self, "gate_up_proj")
     down_base, down_quant = _get_moe_weight_and_quant_state(self, "down_proj")
     gate_up_weight = _dequantize_full_expert_weights(gate_up_base, gate_up_quant, target_dtype)
     down_weight = _dequantize_full_expert_weights(down_base, down_quant, target_dtype)
+
     if gate_up_weight is None or down_weight is None:
-        return _forward_native_moe_loop_fp8(self, hidden_states, top_k_index, top_k_weights)
-
-    _log_moe_fp8_backend_once(
-        self,
-        "Unsloth: MoE FP8 is using dequantize-plus-grouped_mm.",
-    )
-    return _call_with_temporary_moe_weights(
-        self,
-        gate_up_weight,
-        down_weight,
-        forward_native_grouped_mm,
-        hidden_states.to(target_dtype),
-        top_k_index,
-        top_k_weights,
-    )
-
-
-def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
-    from .moe_utils import select_moe_backend
+        raise RuntimeError(
+            "Unable to dequantize FP8 MoE expert weights."
+        )
 
     backend = select_moe_backend()
     if backend == "grouped_mm":
-        return forward_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weights)
-    if backend == "unsloth_triton":
-        return forward_triton_grouped_gemm_fp8(self, hidden_states, top_k_index, top_k_weights)
-    return _forward_native_moe_loop_fp8(self, hidden_states, top_k_index, top_k_weights)
+        _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-grouped_mm.")
+        forward_fn = forward_native_grouped_mm
+    elif backend == "unsloth_triton":
+        _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-Triton grouped GEMM.")
+        forward_fn = forward_triton_grouped_gemm
+    else:
+        _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-native_torch loop.")
+        forward_fn = forward_native_moe_loop
 
-
-def forward_triton_grouped_gemm_fp8(self, hidden_states, top_k_index, top_k_weights):
-    from .moe_utils import (
-        _check_torch_grouped_mm_supported,
-        _get_moe_weight_and_quant_state,
-        forward_native_moe_loop,
-        forward_triton_grouped_gemm,
-    )
-
-    if not _moe_uses_fp8_expert_weights(self):
-        return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
-    if _check_torch_grouped_mm_supported():
-        return forward_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weights)
-
-    target_dtype = _get_fp8_dequant_target_dtype(hidden_states)
-    gate_up_base, gate_up_quant = _get_moe_weight_and_quant_state(self, "gate_up_proj")
-    down_base, down_quant = _get_moe_weight_and_quant_state(self, "down_proj")
-    gate_up_weight = _dequantize_full_expert_weights(gate_up_base, gate_up_quant, target_dtype)
-    down_weight = _dequantize_full_expert_weights(down_base, down_quant, target_dtype)
-    if gate_up_weight is None or down_weight is None:
-        return _forward_native_moe_loop_fp8(self, hidden_states, top_k_index, top_k_weights)
-
-    _log_moe_fp8_backend_once(
-        self,
-        "Unsloth: MoE FP8 is using dequantize-plus-Triton grouped GEMM.",
-    )
     return _call_with_temporary_moe_weights(
         self,
         gate_up_weight,
         down_weight,
-        forward_triton_grouped_gemm,
+        forward_fn,
         hidden_states.to(target_dtype),
         top_k_index,
         top_k_weights,
