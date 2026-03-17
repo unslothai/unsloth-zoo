@@ -400,14 +400,76 @@ def _dequantize_expert_slice(
     return expert_weight.to(target_dtype)
 
 
+def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state, target_dtype: torch.dtype,) -> Optional[torch.Tensor]:
+    """Vectorized dequantization: handles all experts in one batched op."""
+    if weight.ndim != 3 or weight.dtype != torch.float8_e4m3fn:
+        return None
+    if quant_state is None or not isinstance(quant_state, torch.Tensor):
+        return weight.to(target_dtype)
+
+    E, M, N = weight.shape
+    s = quant_state
+
+    w = weight.to(target_dtype)
+
+    # Per-tensor scalar
+    if s.numel() == 1:
+        return w * s.to(target_dtype).view(1, 1, 1)
+
+    # 3D block scales: (E, ceil(M/bm), ceil(N/bn))
+    if s.ndim == 3 and s.shape[0] == E:
+        block_size = getattr(weight, "block_size", None) or getattr(s, "block_size", None)
+        p, q = s.shape[1], s.shape[2]
+        if block_size is not None and len(block_size) == 2:
+            bm, bn = block_size
+        else:
+            bm = _ceil_div(M, p)
+            bn = _ceil_div(N, q)
+        # Expand block scales to full weight dims in one vectorized op
+        # (E, p, q) -> (E, p*bm, q*bn) -> trim to (E, M, N)
+        s_expanded = (
+            s.to(target_dtype)
+            .repeat_interleave(bm, dim=1)[:, :M, :]
+            .repeat_interleave(bn, dim=2)[:, :, :N]
+        )
+        return w * s_expanded
+
+    # 2D per-row scales: (E, M) or (E, 1)
+    if s.ndim == 2 and s.shape[0] == E:
+        if s.shape[1] == 1:
+            return w * s.to(target_dtype).unsqueeze(-1)
+        if s.shape[1] == M:
+            return w * s.to(target_dtype).unsqueeze(-1)
+        if s.shape[1] == N:
+            return w * s.to(target_dtype).unsqueeze(1)
+
+    # 1D: single per-row scale shared across experts
+    if s.ndim == 1:
+        if s.shape[0] == M:
+            return w * s.to(target_dtype).view(1, -1, 1)
+        if s.shape[0] == N:
+            return w * s.to(target_dtype).view(1, 1, -1)
+
+    return None
+
+
 def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dtype: torch.dtype, quant_kind=None):
     from .moe_utils import _try_attach_block_size
 
     if weight.ndim != 3:
         return None
 
-    dequantized = []
+    # Try vectorized path first (handles all experts at once)
     block_size = getattr(weight, "block_size", None)
+    if block_size is not None and quant_state is not None:
+        _try_attach_block_size(quant_state, block_size)
+        _try_attach_block_size(weight, block_size)
+    result = _dequantize_full_expert_weights_vectorized(weight, quant_state, target_dtype)
+    if result is not None:
+        return result
+
+    # Fallback: per-expert loop
+    dequantized = []
     for expert_idx in range(weight.shape[0]):
         expert_weight = weight[expert_idx].contiguous()
         if block_size is not None:
