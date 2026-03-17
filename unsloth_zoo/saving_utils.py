@@ -2678,20 +2678,19 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     # Validate: at least one remapped key must actually exist in the
     # safetensor shard. This catches bad inferences from partial suffix
     # matches (e.g. word-fragment prefixes like 'vision_').
-    found_any = False
-    for k in lora_weights:
-        if isinstance(k, str) and (inferred_prefix + k + ".weight") in sf_key_set:
-            found_any = True
-            break
-    if not found_any:
+    if not any(
+        isinstance(k, str) and (inferred_prefix + k + ".weight") in sf_key_set
+        for k in lora_weights
+    ):
         return None
 
-    remapped = defaultdict(lora_weights.default_factory)
-    for k, v in lora_weights.items():
-        new_key = inferred_prefix + k if isinstance(k, str) else k
-        remapped[new_key] = v
-    return remapped
-pass
+    return defaultdict(
+        lora_weights.default_factory,
+        {
+            (inferred_prefix + k if isinstance(k, str) else k): v
+            for k, v in lora_weights.items()
+        },
+    )
 
 
 def _convert_lora_keys_to_safetensor_format(
