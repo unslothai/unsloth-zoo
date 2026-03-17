@@ -1030,35 +1030,19 @@ def forward_native_grouped_mm(
 
             # Step 2: result @ second_weight
             # Handle unaligned O dimension or other grouped_mm failures
-            try:
-                if second_weight.shape[-1] % 8 != 0:
-                    pad_size = 8 - (second_weight.shape[-1] % 8)
-                    second_weight_padded = F.pad(
-                        second_weight, (0, pad_size)
-                    ).contiguous()
-                    lora_delta = _grouped_mm_with_backward_fix(
-                        lora_out, second_weight_padded, offsets
-                    )
-                    lora_delta = lora_delta[:, :-pad_size]
-                else:
-                    lora_delta = _grouped_mm_with_backward_fix(
-                        lora_out, second_weight, offsets
-                    )
-            except RuntimeError:
-                # Fallback to manual loop if grouped_mm fails (e.g. stride alignment)
-                lora_delta = torch.empty(
-                    (lora_out.shape[0], second_weight.shape[-1]),
-                    dtype=lora_out.dtype,
-                    device=lora_out.device,
+            if second_weight.shape[-1] % 8 != 0:
+                pad_size = 8 - (second_weight.shape[-1] % 8)
+                second_weight_padded = F.pad(
+                    second_weight, (0, pad_size)
+                ).contiguous()
+                lora_delta = _grouped_mm_with_backward_fix(
+                    lora_out, second_weight_padded, offsets
                 )
-                cpu_offsets = offsets.cpu().tolist()
-                prev_offset = 0
-                for i, end in enumerate(cpu_offsets):
-                    if prev_offset < end:
-                        lora_delta[prev_offset:end] = torch.matmul(
-                            lora_out[prev_offset:end], second_weight[i]
-                        )
-                    prev_offset = end
+                lora_delta = lora_delta[:, :-pad_size]
+            else:
+                lora_delta = _grouped_mm_with_backward_fix(
+                    lora_out, second_weight, offsets
+                )
 
             # Add scaled LoRA contribution
             mm1_out = mm1_out + lora_delta * scaling
@@ -1171,23 +1155,7 @@ def forward_native_grouped_mm(
             lora_out = lora_out.contiguous()
 
             # Step 2: result @ second_weight
-            try:
-                lora_delta = _grouped_mm_with_backward_fix(lora_out, second_weight, offsets)
-            except RuntimeError:
-                # Fallback to manual loop
-                lora_delta = torch.empty(
-                    (lora_out.shape[0], second_weight.shape[-1]),
-                    dtype=lora_out.dtype,
-                    device=lora_out.device,
-                )
-                cpu_offsets = offsets.cpu().tolist()
-                prev_offset = 0
-                for i, end in enumerate(cpu_offsets):
-                    if prev_offset < end:
-                        lora_delta[prev_offset:end] = torch.matmul(
-                            lora_out[prev_offset:end], second_weight[i]
-                        )
-                    prev_offset = end
+            lora_delta = _grouped_mm_with_backward_fix(lora_out, second_weight, offsets)
 
             # Add scaled LoRA contribution
             mm2_out = mm2_out + lora_delta * scaling
@@ -1419,6 +1387,17 @@ def forward_triton_grouped_gemm(
     return final_hidden_states
 
 
+def _dequantize_fp8(weight, module, param_name, expert_idx, dtype):
+    if weight.dtype == torch.float8_e4m3fn:
+        from unsloth.kernels.utils import weight_dequant
+        scale_inv_name = f"{param_name}_scale_inv"
+        if hasattr(module, scale_inv_name):
+            scale_inv = getattr(module, scale_inv_name)[expert_idx]
+            return weight_dequant(weight, scale_inv, dtype=dtype)
+        # Fallback if no scale is found; shouldn't happen for properly formatted FP8 checkpoints
+        return weight.to(dtype)
+    return weight
+
 @torch.compiler.disable
 def forward_native_moe_loop(
     self,
@@ -1458,22 +1437,27 @@ def forward_native_moe_loop(
         # Compute gate_up projection for this expert only
         # Handle 'gate_up_proj' or 'w1'/'w3'
         if hasattr(self, "gate_up_proj"):
-            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(
+            w_gate_up = _dequantize_fp8(self.gate_up_proj[expert_idx], self, "gate_up_proj", expert_idx, current_state.dtype)
+            gate, up = F.linear(current_state, w_gate_up).chunk(
                 2, dim=-1
             )
         else:
-            gate = F.linear(current_state, self.w1[expert_idx])
-            up = F.linear(current_state, self.w3[expert_idx])
+            w1 = _dequantize_fp8(self.w1[expert_idx], self, "w1", expert_idx, current_state.dtype)
+            w3 = _dequantize_fp8(self.w3[expert_idx], self, "w3", expert_idx, current_state.dtype)
+            gate = F.linear(current_state, w1)
+            up = F.linear(current_state, w3)
 
         current_hidden_states = self.act_fn(gate) * up
 
         # Compute down projection for this expert only
         if hasattr(self, "down_proj"):
+            w_down = _dequantize_fp8(self.down_proj[expert_idx], self, "down_proj", expert_idx, current_state.dtype)
             current_hidden_states = F.linear(
-                current_hidden_states, self.down_proj[expert_idx]
+                current_hidden_states, w_down
             )
         else:
-            current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])
+            w2 = _dequantize_fp8(self.w2[expert_idx], self, "w2", expert_idx, current_state.dtype)
+            current_hidden_states = F.linear(current_hidden_states, w2)
 
         # Apply routing weights
         current_hidden_states = (
