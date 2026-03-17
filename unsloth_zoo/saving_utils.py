@@ -2642,7 +2642,7 @@ def detect_keys_format(keys_to_check, forward_mapping):
 pass
 
 def _infer_prefix_and_remap(lora_weights, safetensor_keys):
-    """Infer a missing key prefix by matching LoRA keys against safetensor keys.
+    """Infer missing key prefixes by matching LoRA keys against safetensor keys.
 
     Some composite models (e.g. Qwen3.5) store safetensors with an extra
     prefix like ``model.language_model.`` that differs from the runtime key
@@ -2650,47 +2650,63 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     exists, this helper detects the discrepancy and remaps LoRA keys so that
     the merge loop can match them.
 
-    Returns a remapped ``defaultdict`` on success, or ``None`` if no prefix
-    could be inferred (caller should fall back to returning keys unchanged).
+    Uses per-key matching: keys that already match a safetensor key are
+    preserved as-is, keys with a single unambiguous prefix candidate are
+    remapped. Keys that cannot be suffix-matched (e.g. MoE expert fused
+    parameters with different naming) inherit the most common inferred
+    prefix from the keys that were successfully matched.
+
+    Returns a remapped ``defaultdict`` on success, or ``None`` if no keys
+    were remapped (caller should fall back to returning keys unchanged).
     """
     if not safetensor_keys:
         return None
 
     sf_key_set = set(safetensor_keys)
+    remapped = defaultdict(lora_weights.default_factory)
+    changed = False
+    inferred_prefixes = []  # track prefixes from successful per-key matches
+    unmatched_keys = []     # keys that couldn't be matched at all
 
-    inferred_prefix = None
-    for lora_key in lora_weights:
-        if not isinstance(lora_key, str):
+    for k, v in lora_weights.items():
+        if not isinstance(k, str):
+            remapped[k] = v
             continue
-        suffix = lora_key + ".weight"
-        for sf_key in safetensor_keys:
-            if sf_key.endswith(suffix):
-                candidate = sf_key[: -len(suffix)]
-                if candidate:  # non-empty extra prefix
-                    inferred_prefix = candidate
-                break
-        if inferred_prefix is not None:
-            break
+        # Already matches a safetensor key -- keep as-is
+        if (k + ".weight") in sf_key_set:
+            remapped[k] = v
+            continue
+        # Find all unique non-empty prefix candidates for this key
+        suffix = k + ".weight"
+        candidates = list(dict.fromkeys(
+            sf_key[: -len(suffix)]
+            for sf_key in safetensor_keys
+            if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
+        ))
+        if len(candidates) == 1:
+            remapped[candidates[0] + k] = v
+            inferred_prefixes.append(candidates[0])
+            changed = True
+        else:
+            # No match or ambiguous -- defer to fallback
+            unmatched_keys.append((k, v))
 
-    if inferred_prefix is None:
+    if not changed:
         return None
 
-    # Validate: at least one remapped key must actually exist in the
-    # safetensor shard. This catches bad inferences from partial suffix
-    # matches (e.g. word-fragment prefixes like 'vision_').
-    if not any(
-        isinstance(k, str) and (inferred_prefix + k + ".weight") in sf_key_set
-        for k in lora_weights
-    ):
-        return None
+    # For keys that couldn't be suffix-matched (e.g. MoE expert fused
+    # parameters whose safetensor naming differs from LoRA naming),
+    # apply the most common prefix inferred from successful matches.
+    if unmatched_keys and inferred_prefixes:
+        from collections import Counter
+        common_prefix = Counter(inferred_prefixes).most_common(1)[0][0]
+        for k, v in unmatched_keys:
+            remapped[common_prefix + k] = v
+    else:
+        for k, v in unmatched_keys:
+            remapped[k] = v
 
-    return defaultdict(
-        lora_weights.default_factory,
-        {
-            (inferred_prefix + k if isinstance(k, str) else k): v
-            for k, v in lora_weights.items()
-        },
-    )
+    return remapped
 
 
 def _convert_lora_keys_to_safetensor_format(
