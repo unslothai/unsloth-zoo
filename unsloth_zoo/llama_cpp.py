@@ -810,9 +810,11 @@ def install_llama_cpp(
                     cwd = llama_cpp_folder,
                     **kwargs
                 )
-                # Move compiled objects to main folder
+                # Move compiled objects to main folder.
+                # Use --remove-destination to handle existing symlinks
+                # that point back into build/bin/ (avoids "same file" error).
                 try_execute(
-                    f"cp build/bin/llama-* .",
+                    f"cp --remove-destination build/bin/llama-* .",
                     cwd = llama_cpp_folder,
                     **kwargs
                 )
