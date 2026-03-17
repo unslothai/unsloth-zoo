@@ -409,6 +409,18 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             remove_keys.add(name)
         pass
     pass
+    # Custom MoE LoRA wrappers (e.g. GPT-OSS expert LoRA) match the fallback
+    # branch and have lora_A/B/scaling but no .base_layer child, so module
+    # stays None while the other three counters are incremented.
+    # Count them here to align module_count (#3405, #3701).
+    for _key, _stats in lora_weights.items():
+        if (
+            _stats.lora_A is not None
+            and _stats.lora_B is not None
+            and _stats.module is None
+        ):
+            module_count += 1
+
     if not (module_count == lora_A_count == lora_B_count == scaling_count):
         print(
             f"[Unsloth merge debug] LoRA count mismatch: modules={module_count}, "
@@ -424,9 +436,6 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 print(f"  key={k} param={param_name} A={a_shape} B={b_shape}")
         except Exception:
             pass
-        # Allow merge to continue; downstream checks will still fail loudly if tensors are missing
-        # but this avoids silent assertion without context.
-        # TODO: handle MoE target_parameters to align counts.
 
     # Also return state_dict if needed
     if return_state_dict:
@@ -2632,6 +2641,74 @@ def detect_keys_format(keys_to_check, forward_mapping):
     return "new" # Default, assuming most models/keys will be in the "new" (current HF) format.
 pass
 
+def _infer_prefix_and_remap(lora_weights, safetensor_keys):
+    """Infer missing key prefixes by matching LoRA keys against safetensor keys.
+
+    Some composite models (e.g. Qwen3.5) store safetensors with an extra
+    prefix like ``model.language_model.`` that differs from the runtime key
+    namespace ``model.``.  When no explicit ``_checkpoint_conversion_mapping``
+    exists, this helper detects the discrepancy and remaps LoRA keys so that
+    the merge loop can match them.
+
+    Uses per-key matching: keys that already match a safetensor key are
+    preserved as-is, keys with a single unambiguous prefix candidate are
+    remapped. Keys that cannot be suffix-matched (e.g. MoE expert fused
+    parameters with different naming) inherit the most common inferred
+    prefix from the keys that were successfully matched.
+
+    Returns a remapped ``defaultdict`` on success, or ``None`` if no keys
+    were remapped (caller should fall back to returning keys unchanged).
+    """
+    if not safetensor_keys:
+        return None
+
+    sf_key_set = set(safetensor_keys)
+    remapped = defaultdict(lora_weights.default_factory)
+    changed = False
+    inferred_prefixes = []  # track prefixes from successful per-key matches
+    unmatched_keys = []     # keys that couldn't be matched at all
+
+    for k, v in lora_weights.items():
+        if not isinstance(k, str):
+            remapped[k] = v
+            continue
+        # Already matches a safetensor key -- keep as-is
+        if (k + ".weight") in sf_key_set:
+            remapped[k] = v
+            continue
+        # Find all unique non-empty prefix candidates for this key
+        suffix = k + ".weight"
+        candidates = list(dict.fromkeys(
+            sf_key[: -len(suffix)]
+            for sf_key in safetensor_keys
+            if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
+        ))
+        if len(candidates) == 1:
+            remapped[candidates[0] + k] = v
+            inferred_prefixes.append(candidates[0])
+            changed = True
+        else:
+            # No match or ambiguous -- defer to fallback
+            unmatched_keys.append((k, v))
+
+    if not changed:
+        return None
+
+    # For keys that couldn't be suffix-matched (e.g. MoE expert fused
+    # parameters whose safetensor naming differs from LoRA naming),
+    # apply the most common prefix inferred from successful matches.
+    if unmatched_keys and inferred_prefixes:
+        from collections import Counter
+        common_prefix = Counter(inferred_prefixes).most_common(1)[0][0]
+        for k, v in unmatched_keys:
+            remapped[common_prefix + k] = v
+    else:
+        for k, v in unmatched_keys:
+            remapped[k] = v
+
+    return remapped
+
+
 def _convert_lora_keys_to_safetensor_format(
     lora_weights,        # Global dict of LoraStats objects
     safetensor_keys,     # List of keys from the CURRENT shard
@@ -2643,6 +2720,9 @@ def _convert_lora_keys_to_safetensor_format(
     forward_mapping = _get_checkpoint_conversion_mapping(model_class_name)
 
     if not forward_mapping:
+        remapped = _infer_prefix_and_remap(lora_weights, safetensor_keys)
+        if remapped is not None:
+            return remapped
         return defaultdict(lora_weights.default_factory, lora_weights)
 
     # Create reverse mapping
