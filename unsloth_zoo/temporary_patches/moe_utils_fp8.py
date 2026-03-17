@@ -58,72 +58,151 @@ def _maybe_patch_glm4_stacked_moe_fp8_scales(
     if len(routed_layers) == 0:
         return False
 
+    import safetensors.torch
+    import json as _json
+
+    # Collect all tensor keys we'll need so we can find the right shards
+    needed_keys = set()
+    for layer_idx, experts in routed_layers:
+        num_experts = experts.gate_up_proj.shape[0]
+        for expert_idx in range(num_experts):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                needed_keys.add(f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{proj}.weight")
+                needed_keys.add(f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{proj}.weight_scale")
+
+    # Resolve file path(s) -- single file or sharded
+    shard_paths = {}  # tensor_key -> local file path
     if os.path.isdir(model_name):
-        safetensors_path = os.path.join(model_name, "model.safetensors")
+        single_path = os.path.join(model_name, "model.safetensors")
+        if os.path.exists(single_path):
+            shard_paths = {k: single_path for k in needed_keys}
+        else:
+            index_path = os.path.join(model_name, "model.safetensors.index.json")
+            if not os.path.exists(index_path):
+                return False
+            with open(index_path) as f:
+                weight_map = _json.load(f).get("weight_map", {})
+            for k in needed_keys:
+                shard_file = weight_map.get(k)
+                if shard_file is None:
+                    return False
+                shard_paths[k] = os.path.join(model_name, shard_file)
     else:
         from huggingface_hub import hf_hub_download
 
-        safetensors_path = hf_hub_download(
-            repo_id = model_name,
-            filename = "model.safetensors",
-            token = token,
-            revision = revision,
+        try:
+            single_path = hf_hub_download(
+                repo_id = model_name,
+                filename = "model.safetensors",
+                token = token,
+                revision = revision,
+            )
+            shard_paths = {k: single_path for k in needed_keys}
+        except Exception:
+            try:
+                index_path = hf_hub_download(
+                    repo_id = model_name,
+                    filename = "model.safetensors.index.json",
+                    token = token,
+                    revision = revision,
+                )
+                with open(index_path) as f:
+                    weight_map = _json.load(f).get("weight_map", {})
+                # Download only the unique shards we need
+                needed_shards = set()
+                for k in needed_keys:
+                    shard_file = weight_map.get(k)
+                    if shard_file is None:
+                        return False
+                    needed_shards.add(shard_file)
+                downloaded = {}
+                for shard_file in needed_shards:
+                    downloaded[shard_file] = hf_hub_download(
+                        repo_id = model_name,
+                        filename = shard_file,
+                        token = token,
+                        revision = revision,
+                    )
+                for k in needed_keys:
+                    shard_paths[k] = downloaded[weight_map[k]]
+            except Exception:
+                return False
+
+    if not shard_paths:
+        return False
+
+    # Open all unique shard files and build a multi-shard reader
+    unique_paths = set(shard_paths.values())
+    open_handles = {}
+    try:
+        for p in unique_paths:
+            open_handles[p] = safetensors.torch.safe_open(p, framework = "pt")
+
+        class _MultiShardFile:
+            def get_tensor(self, key):
+                return open_handles[shard_paths[key]].get_tensor(key)
+
+        file = _MultiShardFile()
+        _patch_result = _do_glm4_scale_patching(file, routed_layers)
+    finally:
+        open_handles.clear()
+
+    return _patch_result
+
+
+def _do_glm4_scale_patching(file, routed_layers):
+    """Inner helper that reads tensors from file and patches routed_layers."""
+    for layer_idx, experts in routed_layers:
+        device = experts.gate_up_proj.device
+        num_experts = experts.gate_up_proj.shape[0]
+        gate_up_rows = []
+        down_rows = []
+        gate_up_scales = []
+        down_scales = []
+
+        for expert_idx in range(num_experts):
+            gate = file.get_tensor(
+                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight"
+            )
+            gate_scale = file.get_tensor(
+                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight_scale"
+            )
+            up = file.get_tensor(
+                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight"
+            )
+            up_scale = file.get_tensor(
+                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight_scale"
+            )
+            down = file.get_tensor(
+                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight"
+            )
+            down_scale = file.get_tensor(
+                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight_scale"
+            )
+
+            gate_up_rows.append(torch.cat([gate, up], dim = 0))
+            down_rows.append(down)
+            gate_up_scales.append(torch.cat([gate_scale, up_scale], dim = 0))
+            down_scales.append(down_scale)
+
+        experts.gate_up_proj = nn.Parameter(
+            torch.stack(gate_up_rows, dim = 0).to(device = device),
+            requires_grad = experts.gate_up_proj.requires_grad,
         )
-
-    import safetensors.torch
-
-    with safetensors.torch.safe_open(safetensors_path, framework = "pt") as file:
-        for layer_idx, experts in routed_layers:
-            device = experts.gate_up_proj.device
-            num_experts = experts.gate_up_proj.shape[0]
-            gate_up_rows = []
-            down_rows = []
-            gate_up_scales = []
-            down_scales = []
-
-            for expert_idx in range(num_experts):
-                gate = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight"
-                )
-                gate_scale = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight_scale"
-                )
-                up = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight"
-                )
-                up_scale = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight_scale"
-                )
-                down = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight"
-                )
-                down_scale = file.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight_scale"
-                )
-
-                gate_up_rows.append(torch.cat([gate, up], dim = 0))
-                down_rows.append(down)
-                gate_up_scales.append(torch.cat([gate_scale, up_scale], dim = 0))
-                down_scales.append(down_scale)
-
-            experts.gate_up_proj = nn.Parameter(
-                torch.stack(gate_up_rows, dim = 0).to(device = device),
-                requires_grad = experts.gate_up_proj.requires_grad,
-            )
-            experts.down_proj = nn.Parameter(
-                torch.stack(down_rows, dim = 0).to(device = device),
-                requires_grad = experts.down_proj.requires_grad,
-            )
-            experts.gate_up_proj_weight_scale = nn.Parameter(
-                torch.stack(gate_up_scales, dim = 0).to(device = device),
-                requires_grad = False,
-            )
-            experts.down_proj_weight_scale = nn.Parameter(
-                torch.stack(down_scales, dim = 0).to(device = device),
-                requires_grad = False,
-            )
-            experts.gate_up_proj_scale = experts.gate_up_proj_weight_scale
-            experts.down_proj_scale = experts.down_proj_weight_scale
+        experts.down_proj = nn.Parameter(
+            torch.stack(down_rows, dim = 0).to(device = device),
+            requires_grad = experts.down_proj.requires_grad,
+        )
+        experts.gate_up_proj_weight_scale = nn.Parameter(
+            torch.stack(gate_up_scales, dim = 0).to(device = device),
+            requires_grad = False,
+        )
+        experts.down_proj_weight_scale = nn.Parameter(
+            torch.stack(down_scales, dim = 0).to(device = device),
+            requires_grad = False,
+        )
+        experts.gate_up_proj_scale = experts.gate_up_proj_weight_scale
+        experts.down_proj_scale = experts.down_proj_weight_scale
 
     return True
 
@@ -250,6 +329,7 @@ def _dequantize_expert_slice(
     expert_weight: torch.Tensor,
     expert_quant_state,
     target_dtype: torch.dtype,
+    quant_kind=None,
 ) -> Optional[torch.Tensor]:
     """Dequantize one expert's FP8 weight to target_dtype using pure PyTorch."""
     from .moe_utils import _try_attach_block_size
@@ -263,6 +343,9 @@ def _dequantize_expert_slice(
     s = expert_quant_state
     if not isinstance(s, torch.Tensor):
         return expert_weight.to(target_dtype)
+
+    if quant_kind == "weight_scale_inv":
+        s = s.reciprocal()
 
     w = expert_weight.to(target_dtype)
 
@@ -317,9 +400,7 @@ def _dequantize_expert_slice(
     return expert_weight.to(target_dtype)
 
 
-def _dequantize_full_expert_weights_vectorized(
-    weight: torch.Tensor, quant_state, target_dtype: torch.dtype,
-) -> Optional[torch.Tensor]:
+def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state, target_dtype: torch.dtype,) -> Optional[torch.Tensor]:
     """Vectorized dequantization: handles all experts in one batched op."""
     if weight.ndim != 3 or weight.dtype != torch.float8_e4m3fn:
         return None
@@ -372,7 +453,7 @@ def _dequantize_full_expert_weights_vectorized(
     return None
 
 
-def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dtype: torch.dtype):
+def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dtype: torch.dtype, quant_kind=None):
     from .moe_utils import _try_attach_block_size
 
     if weight.ndim != 3:
@@ -394,7 +475,7 @@ def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dt
         if block_size is not None:
             _try_attach_block_size(expert_weight, block_size)
         expert_quant_state = _slice_fp8_quant_state(weight, quant_state, expert_idx)
-        expert_dequant = _dequantize_expert_slice(expert_weight, expert_quant_state, target_dtype)
+        expert_dequant = _dequantize_expert_slice(expert_weight, expert_quant_state, target_dtype, quant_kind=quant_kind)
         if expert_dequant is None:
             return None
         dequantized.append(expert_dequant)
@@ -402,7 +483,7 @@ def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dt
 
 
 def _make_grouped_mm_rhs_column_major(weight: torch.Tensor) -> torch.Tensor:
-    return weight.transpose(-2, -1).contiguous().transpose(-2, -1)
+    return weight.mT.contiguous()
 
 
 def _get_moe_weight_and_quant_info(experts_module, param_name: str):
@@ -527,7 +608,8 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
     token_indices = sorted_indices // top_k_index.shape[-1]
     permuted_input = hidden_states[token_indices]
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-    use_separated_lora = True
+    from .moe_utils import _should_use_separated_lora
+    use_separated_lora = _should_use_separated_lora()
     model_type = getattr(self, "_unsloth_model_type", None)
 
     gate_up_prepared = _prepare_scaled_grouped_mm_weight(self, "gate_up_proj", "gate_up", hidden_dim, model_type)
@@ -641,17 +723,17 @@ def _slice_fp8_linear_quant_state(experts_module, param_name: str, expert_idx: i
 
 
 def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weights):
-    from unsloth.kernels.fp8 import fp8_linear
+    try:
+        from unsloth.kernels.fp8 import fp8_linear
+    except ImportError:
+        fp8_linear = None
 
-    is_2d_input = hidden_states.dim() == 2
-    if is_2d_input:
-        sequence_length, hidden_dim = hidden_states.shape
-        batch_size = 1
-    else:
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-
+    original_shape = hidden_states.shape
+    hidden_dim = hidden_states.shape[-1]
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.view(-1, hidden_dim)
+    top_k_index = top_k_index.view(-1, top_k_index.shape[-1])
+    top_k_weights = top_k_weights.view(-1, top_k_weights.shape[-1])
     final_hidden_states = torch.zeros_like(hidden_states)
 
     gate_up_weight, _, _ = _get_moe_weight_and_quant_info(self, "gate_up_proj")
@@ -676,8 +758,12 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
         expert_gate_up = gate_up_weight[expert_idx]
         gate_up_qstate = _slice_fp8_linear_quant_state(self, "gate_up_proj", expert_idx)
         gate_up_bias_expert = None if gate_up_bias is None else gate_up_bias[expert_idx]
-        if _is_float8_tensor(expert_gate_up):
+        if _is_float8_tensor(expert_gate_up) and fp8_linear is not None:
             gate_up_out = fp8_linear(current_state, expert_gate_up, gate_up_qstate, gate_up_bias_expert)
+        elif _is_float8_tensor(expert_gate_up):
+            target_dtype = _get_fp8_dequant_target_dtype(current_state)
+            expert_dequant = _dequantize_expert_slice(expert_gate_up, gate_up_qstate, target_dtype)
+            gate_up_out = F.linear(current_state, expert_dequant, gate_up_bias_expert)
         else:
             gate_up_out = F.linear(current_state, expert_gate_up, gate_up_bias_expert)
 
@@ -691,62 +777,37 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
             current_hidden_states = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
         else:
             gate, up = gate_up_out.chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
+            act_fn = getattr(self, "act_fn", None)
+            if act_fn is None:
+                act_fn = F.silu
+            current_hidden_states = act_fn(gate) * up
 
         expert_down = down_weight[expert_idx]
         down_qstate = _slice_fp8_linear_quant_state(self, "down_proj", expert_idx)
         down_bias_expert = None if down_bias is None else down_bias[expert_idx]
-        if _is_float8_tensor(expert_down):
+        if _is_float8_tensor(expert_down) and fp8_linear is not None:
             current_hidden_states = fp8_linear(
                 current_hidden_states,
                 expert_down,
                 down_qstate,
                 down_bias_expert,
             )
+        elif _is_float8_tensor(expert_down):
+            target_dtype = _get_fp8_dequant_target_dtype(current_hidden_states)
+            expert_dequant = _dequantize_expert_slice(expert_down, down_qstate, target_dtype)
+            current_hidden_states = F.linear(current_hidden_states, expert_dequant, down_bias_expert)
         else:
             current_hidden_states = F.linear(current_hidden_states, expert_down, down_bias_expert)
 
         current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
         final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(input_dtype))
 
-    if is_2d_input:
-        return final_hidden_states
-    return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
-
-
-def _forward_native_moe_loop_fp8(self, hidden_states, top_k_index, top_k_weights):
-    from .moe_utils import _get_moe_weight_and_quant_state, forward_native_moe_loop
-
-    _log_moe_fp8_backend_once(
-        self,
-        "Unsloth: MoE FP8 is using the native_torch fallback backend.",
-    )
-
-    target_dtype = _get_fp8_dequant_target_dtype(hidden_states)
-    gate_up_base, gate_up_quant = _get_moe_weight_and_quant_state(self, "gate_up_proj")
-    down_base, down_quant = _get_moe_weight_and_quant_state(self, "down_proj")
-    gate_up_weight = _dequantize_full_expert_weights(gate_up_base, gate_up_quant, target_dtype)
-    down_weight = _dequantize_full_expert_weights(down_base, down_quant, target_dtype)
-    if gate_up_weight is None or down_weight is None:
-        raise RuntimeError(
-            "Unable to dequantize FP8 MoE expert weights for the eager fallback path."
-        )
-
-    return _call_with_temporary_moe_weights(
-        self,
-        gate_up_weight,
-        down_weight,
-        forward_native_moe_loop,
-        hidden_states.to(target_dtype),
-        top_k_index,
-        top_k_weights,
-    )
+    return final_hidden_states.view(original_shape)
 
 
 @torch.compiler.disable
 def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     from .moe_utils import (
-        _get_moe_weight_and_quant_state,
         select_moe_backend,
         forward_native_grouped_mm,
         forward_triton_grouped_gemm,
@@ -772,10 +833,10 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
 
     # 2. Dequant FP8 weights to bf16/fp16 and run through normal MoE forward
     target_dtype = _get_fp8_dequant_target_dtype(hidden_states)
-    gate_up_base, gate_up_quant = _get_moe_weight_and_quant_state(self, "gate_up_proj")
-    down_base, down_quant = _get_moe_weight_and_quant_state(self, "down_proj")
-    gate_up_weight = _dequantize_full_expert_weights(gate_up_base, gate_up_quant, target_dtype)
-    down_weight = _dequantize_full_expert_weights(down_base, down_quant, target_dtype)
+    gate_up_base, gate_up_quant, gate_up_qkind = _get_moe_weight_and_quant_info(self, "gate_up_proj")
+    down_base, down_quant, down_qkind = _get_moe_weight_and_quant_info(self, "down_proj")
+    gate_up_weight = _dequantize_full_expert_weights(gate_up_base, gate_up_quant, target_dtype, quant_kind=gate_up_qkind)
+    down_weight = _dequantize_full_expert_weights(down_base, down_quant, target_dtype, quant_kind=down_qkind)
 
     if gate_up_weight is not None and down_weight is not None:
         if backend == "grouped_mm":
