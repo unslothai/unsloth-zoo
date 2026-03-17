@@ -4080,6 +4080,10 @@ def unsloth_compile_transformers(
 
         patch_torch_functions()
 
+        _conv_modules = frozenset([
+            "Conv1d", "Conv2d", "Conv3d",
+            "ConvTranspose1d", "ConvTranspose2d", "ConvTranspose3d",
+        ])
         for module in _patch_functions:
             try:
                 source = eval(f"{model_location}.torch")
@@ -4096,6 +4100,30 @@ def unsloth_compile_transformers(
                 continue
 
             source = inspect.getsource(function.forward).rstrip()
+
+            if module in _conv_modules:
+                # Conv modules: cast input to weight dtype before the conv op,
+                # then cast output back to original input dtype. This prevents
+                # dtype mismatches under mixed-precision autocast (eg bf16
+                # weight + fp16 input crashes F.conv1d).
+                lines = source.split("\n")
+                def_line = lines[0]
+                body_lines = lines[1:]
+                first_body = next((l for l in body_lines if l.strip()), "")
+                body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
+                prologue = [
+                    body_indent + "original_dtype = input.dtype",
+                    body_indent + "input = input.to(self.weight.dtype)",
+                ]
+                source = "\n".join([def_line] + prologue + body_lines)
+                append_str = ".to(original_dtype)\n"
+            else:
+                # Norm modules: detect the actual parameter name (input or x)
+                import re as _re
+                m = _re.search(r"def forward\(self,\s*(\w+)", source)
+                param_name = m.group(1) if m else "input"
+                append_str = f".to({param_name}.dtype)\n"
+
             forward = create_new_function(
                 module,
                 source,
@@ -4103,7 +4131,7 @@ def unsloth_compile_transformers(
                 functions,
                 prepend=_license_header
                 + f"\ntorch_compile_options = {torch_compile_options}\n",
-                append=".to(input.dtype)\n",
+                append=append_str,
                 overwrite=False,
                 add_torch_compile=False,
             ).forward
