@@ -330,18 +330,19 @@ def train_on_responses_only(
         return _train_on_responses_only
 
     import multiprocessing as _mp
-    if _mp.get_start_method() != 'fork':
-        num_proc = None
-    elif num_proc is None or type(num_proc) is not int:
-        import psutil
-        num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
-        # Check memory left so we can reduce multiprocessing to converse memory
-        memory_gb_left = psutil.virtual_memory().available / (1024**3)
-        if memory_gb_left <= 2:
-            num_proc = 1 # Too risky, so set to 1
+    if num_proc is None or type(num_proc) is not int:
+        if _mp.get_start_method() != 'fork':
+            num_proc = None
         else:
-            # Set it to int(memory_gb_left) so 16Gb = 16
-            num_proc = min(num_proc, int(memory_gb_left))
+            import psutil
+            num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
+            # Check memory left so we can reduce multiprocessing to converse memory
+            memory_gb_left = psutil.virtual_memory().available / (1024**3)
+            if memory_gb_left <= 2:
+                num_proc = 1 # Too risky, so set to 1
+            else:
+                # Set it to int(memory_gb_left) so 16Gb = 16
+                num_proc = min(num_proc, int(memory_gb_left))
 
     # In transformers 5.0+, VLM models skip dataset preparation in SFTTrainer.__init__
     # (skip_prepare_dataset=True when _is_vlm=True). This means the dataset may not be
@@ -553,16 +554,17 @@ def standardize_data_formats(
 
     if not isinstance(dataset, IterableDataset):
         import multiprocessing as _mp
-        if _mp.get_start_method() != 'fork':
-            num_proc = None
-        elif num_proc is None or type(num_proc) is not int:
-            import psutil
-            num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
-            memory_gb_left = psutil.virtual_memory().available / (1024**3)
-            if memory_gb_left <= 2:
-                num_proc = 1
+        if num_proc is None or type(num_proc) is not int:
+            if _mp.get_start_method() != 'fork':
+                num_proc = None
             else:
-                num_proc = min(num_proc, int(memory_gb_left))
+                import psutil
+                num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
+                memory_gb_left = psutil.virtual_memory().available / (1024**3)
+                if memory_gb_left <= 2:
+                    num_proc = 1
+                else:
+                    num_proc = min(num_proc, int(memory_gb_left))
         dataset_map_kwargs['num_proc'] = num_proc
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
@@ -716,11 +718,11 @@ def sft_prepare_dataset(
 
         if not isinstance(dataset, IterableDataset):
             import multiprocessing as _mp
-            if _mp.get_start_method() != 'fork':
-                dataset_num_proc = None
-            else:
-                dataset_num_proc = getattr(args, "dataset_num_proc", None)
-                if dataset_num_proc is None:
+            dataset_num_proc = getattr(args, "dataset_num_proc", None)
+            if dataset_num_proc is None:
+                if _mp.get_start_method() != 'fork':
+                    dataset_num_proc = None
+                else:
                     import psutil
                     dataset_num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
                     memory_gb_left = psutil.virtual_memory().available / (1024**3)
