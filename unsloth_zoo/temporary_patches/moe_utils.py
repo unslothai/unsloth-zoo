@@ -135,21 +135,21 @@ def _load_cached_moe_utils_fp8_module():
 def get_forward_moe_backend():
     """
     Resolve forward_moe_backend from the compiled cache copy when available.
-    Falls back to the local module definition.
+    Prefer the generic (non-FP8) backend; the generic backend can internally
+    detect FP8 weights and dispatch to the FP8 path if needed.
     """
     global _CACHED_FORWARD_MOE_BACKEND
-    fp8_module = _load_cached_moe_utils_fp8_module()
-    if fp8_module is not None and hasattr(fp8_module, "forward_moe_backend_fp8"):
-        _CACHED_FORWARD_MOE_BACKEND = fp8_module.forward_moe_backend_fp8
-        return _CACHED_FORWARD_MOE_BACKEND
-
     module = _load_cached_moe_utils_module()
     if module is not None and hasattr(module, "forward_moe_backend"):
         _CACHED_FORWARD_MOE_BACKEND = module.forward_moe_backend
         return _CACHED_FORWARD_MOE_BACKEND
 
-    from .moe_utils_fp8 import forward_moe_backend_fp8
-    _CACHED_FORWARD_MOE_BACKEND = forward_moe_backend_fp8
+    fp8_module = _load_cached_moe_utils_fp8_module()
+    if fp8_module is not None and hasattr(fp8_module, "forward_moe_backend_fp8"):
+        _CACHED_FORWARD_MOE_BACKEND = fp8_module.forward_moe_backend_fp8
+        return _CACHED_FORWARD_MOE_BACKEND
+
+    _CACHED_FORWARD_MOE_BACKEND = forward_moe_backend
     return _CACHED_FORWARD_MOE_BACKEND
 
 # ============================================================================
@@ -1025,11 +1025,8 @@ def forward_native_grouped_mm(
             second_weight = second_weight.to(permuted_input.dtype).contiguous()
 
             # Step 1: permuted_input @ first_weight
-            try:
-                lora_out = _grouped_mm_with_backward_fix(permuted_input, first_weight, offsets)
-                lora_out = lora_out.contiguous()
-            except RuntimeError as e:
-                raise e
+            lora_out = _grouped_mm_with_backward_fix(permuted_input, first_weight, offsets)
+            lora_out = lora_out.contiguous()
 
             # Step 2: result @ second_weight
             # Handle unaligned O dimension or other grouped_mm failures
@@ -1354,8 +1351,6 @@ def forward_triton_grouped_gemm(
     intermediate = _silu_and_mul(first_gemm_output)
 
     # Grouped GEMM 2: down projection
-
-    # Grouped GEMM 2: down projection
     # Prepare LoRA data
     down_lora = None
     if getattr(self, "_unsloth_lora_down_proj", None) is not None:
@@ -1436,6 +1431,12 @@ def forward_native_moe_loop(
     Explicitly disabled for torch.compile to prevent graph breaks/recompilation issues with dynamic control flow.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
+    original_shape = hidden_states.shape
+    if hidden_states.dim() == 3:
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        top_k_index = top_k_index.view(-1, top_k_index.shape[-1])
+        top_k_weights = top_k_weights.view(-1, top_k_weights.shape[-1])
+
     final_hidden_states = torch.zeros_like(hidden_states)
 
     # Create expert mask and find which experts have tokens
@@ -1484,4 +1485,4 @@ def forward_native_moe_loop(
             0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
         )
 
-    return final_hidden_states
+    return final_hidden_states.view(original_shape)
