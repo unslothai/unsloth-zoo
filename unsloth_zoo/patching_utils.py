@@ -30,6 +30,7 @@ __all__ = [
 from .compiler import UNSLOTH_COMPILE_LOCATION
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
+from .temporary_patches.moe_utils_fp8 import maybe_patch_stacked_moe_expert_fp8_scales
 
 # Also disable compiling on bitsandbytes
 def patch_compiling_bitsandbytes():
@@ -395,6 +396,8 @@ def patch_model_and_tokenizer(
     # patch to dict makes sure that any torch.dtype is converted to
     # string when trying to save the config or serialize it
     patch_to_dict()
+
+    maybe_patch_stacked_moe_expert_fp8_scales(model)
 
     # Check all params and patch!
     for name, module in model.named_modules():
