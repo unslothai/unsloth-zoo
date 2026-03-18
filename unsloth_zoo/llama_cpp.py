@@ -673,6 +673,37 @@ def install_llama_cpp(
     if gpu_support == "ON":
         print("Unsloth: Building llama.cpp with GPU support")
 
+    # Detect GPU backend for CMake flags (ROCm vs CUDA)
+    gpu_cmake_flags = f"-DGGML_CUDA={gpu_support}"
+    if gpu_support == "ON":
+        try:
+            import torch
+            if hasattr(torch.version, 'hip') and torch.version.hip is not None and torch.cuda.is_available():
+                # ROCm detected
+                try:
+                    gpu_arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+                except Exception:
+                    gpu_arch = ""
+                rocm_path = os.environ.get('ROCM_PATH', '/opt/rocm')
+                if gpu_arch:
+                    gpu_cmake_flags = (
+                        f"-DGGML_HIP=ON "
+                        f"-DCMAKE_C_COMPILER={rocm_path}/llvm/bin/clang "
+                        f"-DCMAKE_CXX_COMPILER={rocm_path}/llvm/bin/clang++ "
+                        f"-DCMAKE_HIP_ARCHITECTURES={gpu_arch}"
+                    )
+                else:
+                    gpu_cmake_flags = (
+                        f"-DGGML_HIP=ON "
+                        f"-DCMAKE_C_COMPILER={rocm_path}/llvm/bin/clang "
+                        f"-DCMAKE_CXX_COMPILER={rocm_path}/llvm/bin/clang++"
+                    )
+                print(f"Unsloth: Detected ROCm GPU{' (' + gpu_arch + ')' if gpu_arch else ''} -- building with HIP support")
+            else:
+                gpu_cmake_flags = f"-DGGML_CUDA={gpu_support}"
+        except Exception:
+            gpu_cmake_flags = f"-DGGML_CUDA={gpu_support}"
+
     build_success = False
     build_errors = []
 
@@ -708,7 +739,7 @@ def install_llama_cpp(
                 "-G", cmake_generator,
                 "-Wno-dev",
                 "-DBUILD_SHARED_LIBS=OFF",
-                f"-DGGML_CUDA={gpu_support}",
+                gpu_cmake_flags,
             ]
             if vs_install_path:
                 cmake_args.append(f"-DCMAKE_GENERATOR_INSTANCE={vs_install_path}")
@@ -773,7 +804,7 @@ def install_llama_cpp(
                 # Build cmake configure command with library detection
                 cmake_configure = (
                     f"cmake . -B build "
-                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
+                    f"-DBUILD_SHARED_LIBS=OFF {gpu_cmake_flags}"
                 )
 
                 # Detect OpenMP library path (fixes GOMP linker errors)
