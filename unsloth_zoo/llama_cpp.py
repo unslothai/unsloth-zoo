@@ -672,37 +672,30 @@ def install_llama_cpp(
         print("Unsloth: Building llama.cpp - please wait 1 to 3 minutes")
     if gpu_support == "ON":
         print("Unsloth: Building llama.cpp with GPU support")
-
-    # Detect GPU backend for CMake flags (ROCm vs CUDA)
-    gpu_cmake_flags = f"-DGGML_CUDA={gpu_support}"
-    if gpu_support == "ON":
+        # Detect GPU backend: ROCm uses HIP flags, CUDA uses CUDA flags
         try:
             import torch
             if hasattr(torch.version, 'hip') and torch.version.hip is not None and torch.cuda.is_available():
-                # ROCm detected
+                # ROCm detected: use HIP flags
                 try:
                     gpu_arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
                 except Exception:
                     gpu_arch = ""
                 rocm_path = os.environ.get('ROCM_PATH', '/opt/rocm')
-                if gpu_arch:
-                    gpu_cmake_flags = (
-                        f"-DGGML_HIP=ON "
-                        f"-DCMAKE_C_COMPILER={rocm_path}/llvm/bin/clang "
-                        f"-DCMAKE_CXX_COMPILER={rocm_path}/llvm/bin/clang++ "
-                        f"-DCMAKE_HIP_ARCHITECTURES={gpu_arch}"
-                    )
-                else:
-                    gpu_cmake_flags = (
-                        f"-DGGML_HIP=ON "
-                        f"-DCMAKE_C_COMPILER={rocm_path}/llvm/bin/clang "
-                        f"-DCMAKE_CXX_COMPILER={rocm_path}/llvm/bin/clang++"
-                    )
+                arch_flag = f" -DCMAKE_HIP_ARCHITECTURES={gpu_arch}" if gpu_arch else ""
+                gpu_cmake_flags = (
+                    f"-DGGML_HIP=ON"
+                    f" -DCMAKE_C_COMPILER={rocm_path}/llvm/bin/clang"
+                    f" -DCMAKE_CXX_COMPILER={rocm_path}/llvm/bin/clang++"
+                    f"{arch_flag}"
+                )
                 print(f"Unsloth: Detected ROCm GPU{' (' + gpu_arch + ')' if gpu_arch else ''} -- building with HIP support")
             else:
-                gpu_cmake_flags = f"-DGGML_CUDA={gpu_support}"
+                gpu_cmake_flags = "-DGGML_CUDA=ON"
         except Exception:
-            gpu_cmake_flags = f"-DGGML_CUDA={gpu_support}"
+            gpu_cmake_flags = "-DGGML_CUDA=ON"
+    else:
+        gpu_cmake_flags = f"-DGGML_CUDA={gpu_support}"  # "OFF"
 
     build_success = False
     build_errors = []
