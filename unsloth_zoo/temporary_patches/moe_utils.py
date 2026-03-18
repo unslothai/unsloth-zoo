@@ -27,6 +27,19 @@ UNSLOTH_COMPILE_LOCATION = os.environ.get(
     "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
 )
 
+try:
+    import bitsandbytes as bnb
+    from bitsandbytes.nn import Params4bit
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+    Params4bit = None
+
+
+def _check_bnb_available():
+    if not HAS_BNB:
+        return False
+    return True
 
 def _get_compile_location() -> str:
     return os.path.abspath(
@@ -466,6 +479,9 @@ def _get_base_weight(param):
     # Recursively unwrap PEFT layers
     while hasattr(param, "base_layer"):
         param = param.base_layer
+    
+    if _check_bnb_available() and isinstance(param, Params4bit):
+        return bnb.functional.dequantize_4bit(param.data, param.quant_state)
 
     if hasattr(param, "get_param"):
         return param.get_param()
@@ -635,9 +651,13 @@ def _is_moe_experts_module(module) -> bool:
     # returns torch.Tensor (not nn.Parameter), so we must accept both.
     if hasattr(module, "gate_up_proj"):
         param = module.gate_up_proj
+        
         # 4-bit parameters are packed into 2D tensors (n_params, 1) or similar.
+        if _check_bnb_available() and isinstance(param, Params4bit) and param.ndim == 2:
+            return True
+        
         # Standard MoE weights are 3D (num_experts, in, out).
-        if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim in (2, 3):
+        if isinstance(param, nn.Parameter) and param.ndim == 3:
             return True
 
     # Check for w1/w2 pattern (separate gate/up projections)
