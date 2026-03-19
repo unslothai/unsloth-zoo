@@ -446,6 +446,13 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             if name.endswith(".base_layer.weight"):
                 name = name[:-len(".base_layer.weight")]
 
+            # modules_to_save wraps embed_tokens / lm_head; strip the wrapper
+            # so the key matches lora_weights entries created by the branch above.
+            # Only strip .weight variant; the lora_weights branch adds both
+            # .weight and .bias from the module so we don't need a separate bias entry.
+            elif name.endswith(".modules_to_save.default.weight"):
+                name = name[:-len(".modules_to_save.default.weight")]
+
             if name in lora_weights:
                 state_dict[name + ".weight"]   = lora_weights[name]
                 if getattr(lora_weights[name].module, "bias", None) is not None:
@@ -1479,7 +1486,15 @@ from huggingface_hub import (
 
 def get_torch_storage_size_new(x, element_size):
     if isinstance(x, LoraStats):
-        shape = (x.module.in_features, x.module.out_features)
+        mod = x.module
+        # modules_to_save: use the saved weight shape directly
+        saved_w = _get_modules_to_save_weight(mod) if getattr(mod, "modules_to_save", None) is not None else None
+        if saved_w is None and hasattr(mod, "weight"):
+            saved_w = mod.weight
+        if saved_w is not None and hasattr(saved_w, "shape"):
+            return int(np.prod(saved_w.shape)) * element_size
+        # Fallback for Linear-like modules
+        shape = (mod.in_features, mod.out_features)
         return int(np.prod(shape)) * element_size
     else:
         return get_torch_storage_size(x)
