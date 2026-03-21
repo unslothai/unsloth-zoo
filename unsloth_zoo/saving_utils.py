@@ -2052,6 +2052,8 @@ def merge_and_overwrite_lora(
                 filename = filename,
                 repo_type = "model",
                 local_dir = save_directory,
+                cache_dir = str(_hf_cache_dir),
+                token=token,
             )
         pass
 
@@ -2073,6 +2075,7 @@ def merge_and_overwrite_lora(
                     filename = "tokenizer.model",
                     repo_type = "model",
                     local_dir = save_directory,
+                    cache_dir = str(_hf_cache_dir),
                     token = token,
                 )
                 print("Downloaded tokenizer.model")
@@ -2210,7 +2213,7 @@ def _try_copy_all_from_cache(
     all_found = True
     for filename in filenames_to_check:
         try:
-            cached_path_str = hf_hub_download(repo_id = repo_id, filename = filename, local_files_only = True)
+            cached_path_str = hf_hub_download(repo_id = repo_id, filename = filename, local_files_only = True, repo_type = "model", cache_dir = hf_cache_dir, token=token)
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
             print(f"Cache check failed: {filename} not found in local cache.") # Verbose
