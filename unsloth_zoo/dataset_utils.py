@@ -724,7 +724,7 @@ def sft_prepare_dataset(
         bos_token = bos_token_1 or bos_token_2
 
         if bos_token is not None:
-            if test_text is not None and (test_text.startswith(bos_token) or bos_token in chat_template):
+            if (test_text is not None and test_text.startswith(bos_token)) or bos_token in chat_template:
                 add_special_tokens = False
                 print("Unsloth: We found double BOS tokens - we shall remove one automatically.")
         pass
@@ -796,7 +796,10 @@ def sft_prepare_dataset(
                     pc_ids = pc_ids[:max_seq_length]
                 n_prompt = min(len(prompt_ids), len(pc_ids))
                 completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
-                return {"input_ids": pc_ids, "completion_mask": completion_mask}
+                result = {"input_ids": pc_ids, "completion_mask": completion_mask}
+                if _needs_token_type_ids:
+                    result["token_type_ids"] = [0] * len(pc_ids)
+                return result
 
             if use_desc:
                 map_kwargs["desc"] = 'Unsloth: Tokenizing ["prompt"+"completion"]'
