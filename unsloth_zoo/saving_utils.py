@@ -1488,7 +1488,7 @@ def get_torch_storage_size_new(x, element_size):
     if isinstance(x, LoraStats):
         mod = x.module
         # modules_to_save: use the saved weight shape directly
-        saved_w = _get_modules_to_save_weight(mod) if getattr(mod, "modules_to_save", None) is not None else None
+        saved_w = _get_modules_to_save_weight(mod)
         if saved_w is None and hasattr(mod, "weight"):
             saved_w = mod.weight
         if saved_w is not None and hasattr(saved_w, "shape"):
