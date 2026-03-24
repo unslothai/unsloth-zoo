@@ -34,7 +34,6 @@ if importlib.util.find_spec("unsloth_studio") is None:
 else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
-pass
 
 if DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
@@ -203,8 +202,6 @@ def fused_linear_cross_entropy(
     return loss
 pass
 
-
-pass
 
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
