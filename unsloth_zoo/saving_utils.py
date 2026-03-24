@@ -1493,6 +1493,10 @@ def get_torch_storage_size_new(x, element_size):
             saved_w = mod.weight
         if saved_w is not None and hasattr(saved_w, "shape"):
             return int(np.prod(saved_w.shape)) * element_size
+        # MoE LoRA wrappers with no .base_layer: infer merged shape from lora matrices
+        if mod is None and x.lora_A is not None and x.lora_B is not None:
+            shape = (x.lora_B.shape[0], x.lora_A.shape[1])
+            return int(np.prod(shape)) * element_size
         # Fallback for Linear-like modules
         shape = (mod.in_features, mod.out_features)
         return int(np.prod(shape)) * element_size
