@@ -1990,6 +1990,8 @@ def merge_and_overwrite_lora(
                     local_dir = save_directory,
                     allow_patterns = ["model.safetensors.index.json"],
                     local_dir_use_symlinks = False,
+                    cache_dir = _hf_cache_dir,
+                    token = token,
                 )
 
         if push_to_hub and safe_tensor_index_files:
@@ -2021,6 +2023,8 @@ def merge_and_overwrite_lora(
             local_dir = save_directory,
             allow_patterns = safe_tensor_index_files + safetensors_list,
             local_dir_use_symlinks = False,
+            cache_dir = _hf_cache_dir,
+            token = token,
         )
 
     if not copied_tokenizer_model_from_cache and not low_disk_space_usage and not is_local_path:
@@ -2030,6 +2034,8 @@ def merge_and_overwrite_lora(
             local_dir = save_directory,
             allow_patterns = ["tokenizer.model"],
             local_dir_use_symlinks = False,
+            cache_dir = _hf_cache_dir,
+            token = token,
         )
 
     final_safetensors_list = []
@@ -2052,6 +2058,8 @@ def merge_and_overwrite_lora(
                 filename = filename,
                 repo_type = "model",
                 local_dir = save_directory,
+                cache_dir = _hf_cache_dir,
+                token = token,
             )
         pass
 
@@ -2073,6 +2081,7 @@ def merge_and_overwrite_lora(
                     filename = "tokenizer.model",
                     repo_type = "model",
                     local_dir = save_directory,
+                    cache_dir = _hf_cache_dir,
                     token = token,
                 )
                 print("Downloaded tokenizer.model")
@@ -2210,7 +2219,14 @@ def _try_copy_all_from_cache(
     all_found = True
     for filename in filenames_to_check:
         try:
-            cached_path_str = hf_hub_download(repo_id = repo_id, filename = filename, local_files_only = True)
+            cached_path_str = hf_hub_download(
+                repo_id = repo_id,
+                filename = filename,
+                local_files_only = True,
+                repo_type = "model",
+                cache_dir = hf_cache_dir,
+                token = token,
+            )
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
             print(f"Cache check failed: {filename} not found in local cache.") # Verbose
