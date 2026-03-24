@@ -27,6 +27,7 @@ from .common import (
     _torch_compile,
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
+    UNSLOTH_COMPILE_DISABLE,
 )
 from importlib.metadata import version as importlib_version
 from ..utils import Version
@@ -1864,6 +1865,11 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    # Uncompiled flex_attention backward has a dtype bug in PyTorch
+    # (sdpa_dense_backward: expected Float got BFloat16). The inplace eager
+    # fallback also uses out= matmul which is incompatible with autograd.
+    # Skip the patch and let stock transformers eager attention handle sinks.
+    if UNSLOTH_COMPILE_DISABLE: return
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         from ..flex_attention import (
@@ -2105,6 +2111,7 @@ TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 def patch_GptOssModel():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    if UNSLOTH_COMPILE_DISABLE: return
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
