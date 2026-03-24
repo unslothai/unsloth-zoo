@@ -446,6 +446,13 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             if name.endswith(".base_layer.weight"):
                 name = name[:-len(".base_layer.weight")]
 
+            # modules_to_save wraps embed_tokens / lm_head; strip the wrapper
+            # so the key matches lora_weights entries created by the branch above.
+            # Only strip .weight variant; the lora_weights branch adds both
+            # .weight and .bias from the module so we don't need a separate bias entry.
+            elif name.endswith(".modules_to_save.default.weight"):
+                name = name[:-len(".modules_to_save.default.weight")]
+
             if name in lora_weights:
                 state_dict[name + ".weight"]   = lora_weights[name]
                 if getattr(lora_weights[name].module, "bias", None) is not None:
@@ -1479,7 +1486,19 @@ from huggingface_hub import (
 
 def get_torch_storage_size_new(x, element_size):
     if isinstance(x, LoraStats):
-        shape = (x.module.in_features, x.module.out_features)
+        mod = x.module
+        # modules_to_save: use the saved weight shape directly
+        saved_w = _get_modules_to_save_weight(mod)
+        if saved_w is None and hasattr(mod, "weight"):
+            saved_w = mod.weight
+        if saved_w is not None and hasattr(saved_w, "shape"):
+            return int(np.prod(saved_w.shape)) * element_size
+        # MoE LoRA wrappers with no .base_layer: infer merged shape from lora matrices
+        if mod is None and x.lora_A is not None and x.lora_B is not None:
+            shape = (x.lora_B.shape[0], x.lora_A.shape[1])
+            return int(np.prod(shape)) * element_size
+        # Fallback for Linear-like modules
+        shape = (mod.in_features, mod.out_features)
         return int(np.prod(shape)) * element_size
     else:
         return get_torch_storage_size(x)
@@ -1990,6 +2009,8 @@ def merge_and_overwrite_lora(
                     local_dir = save_directory,
                     allow_patterns = ["model.safetensors.index.json"],
                     local_dir_use_symlinks = False,
+                    cache_dir = _hf_cache_dir,
+                    token = token,
                 )
 
         if push_to_hub and safe_tensor_index_files:
@@ -2021,6 +2042,8 @@ def merge_and_overwrite_lora(
             local_dir = save_directory,
             allow_patterns = safe_tensor_index_files + safetensors_list,
             local_dir_use_symlinks = False,
+            cache_dir = _hf_cache_dir,
+            token = token,
         )
 
     if not copied_tokenizer_model_from_cache and not low_disk_space_usage and not is_local_path:
@@ -2030,6 +2053,8 @@ def merge_and_overwrite_lora(
             local_dir = save_directory,
             allow_patterns = ["tokenizer.model"],
             local_dir_use_symlinks = False,
+            cache_dir = _hf_cache_dir,
+            token = token,
         )
 
     final_safetensors_list = []
@@ -2052,6 +2077,8 @@ def merge_and_overwrite_lora(
                 filename = filename,
                 repo_type = "model",
                 local_dir = save_directory,
+                cache_dir = _hf_cache_dir,
+                token = token,
             )
         pass
 
@@ -2073,6 +2100,7 @@ def merge_and_overwrite_lora(
                     filename = "tokenizer.model",
                     repo_type = "model",
                     local_dir = save_directory,
+                    cache_dir = _hf_cache_dir,
                     token = token,
                 )
                 print("Downloaded tokenizer.model")
@@ -2210,7 +2238,14 @@ def _try_copy_all_from_cache(
     all_found = True
     for filename in filenames_to_check:
         try:
-            cached_path_str = hf_hub_download(repo_id = repo_id, filename = filename, local_files_only = True)
+            cached_path_str = hf_hub_download(
+                repo_id = repo_id,
+                filename = filename,
+                local_files_only = True,
+                repo_type = "model",
+                cache_dir = hf_cache_dir,
+                token = token,
+            )
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
             print(f"Cache check failed: {filename} not found in local cache.") # Verbose

@@ -208,9 +208,6 @@ from unsloth_zoo.loss_utils import (
     unsloth_fused_ce_loss,
 )
 
-if UNSLOTH_STUDIO_ENABLED:
-    from unsloth_zoo.loss_utils import fast_linear_cross_entropy
-
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
 @torch.compiler.disable(recursive = False)
 def disable_compile_scaled_dot_product_attention(*args, **kwargs):

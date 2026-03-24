@@ -642,6 +642,7 @@ def sft_prepare_dataset(
     do_truncation = max_seq_length != 0
     do_formatting_func = False
     do_tokenize = True
+    do_prompt_completion = False
 
     # Get correct column names
     column_names = set(next(iter(dataset)).keys())
@@ -668,6 +669,12 @@ def sft_prepare_dataset(
             raise RuntimeError(f"Unsloth: {processing_class.__class__} does not have .pad!")
         self.data_collator = DataCollatorForLanguageModeling(tokenizer, mlm = False)
         do_tokenize = False
+    elif "prompt" in column_names and "completion" in column_names:
+        # Prompt/completion dataset (used with completion_only_loss).
+        # TRL's __init__ already set self.data_collator for completion_only_loss
+        # before calling us -- we must NOT overwrite it here.
+        do_prompt_completion = True
+        used_column_names.append("completion_mask")
     elif dataset_text_field not in column_names:
         do_formatting_func = True
         if formatting_func is None:
@@ -683,6 +690,23 @@ def sft_prepare_dataset(
                     "Unsloth: The `formatting_func` should return a list of processed strings."
                 )
             test_text = test_text[0]
+        elif do_prompt_completion:
+            _first_ex = next(iter(dataset))
+            try:
+                from trl import is_conversational as _sft_is_conversational
+            except ImportError:
+                def _sft_is_conversational(example):
+                    for key in ("prompt", "completion", "messages"):
+                        val = example.get(key)
+                        if isinstance(val, list) and val and isinstance(val[0], dict):
+                            if "role" in val[0] and "content" in val[0]:
+                                return True
+                    return False
+            _is_conv = _sft_is_conversational(_first_ex)
+            if not _is_conv:
+                test_text = _first_ex["prompt"]
+            else:
+                test_text = None  # chat template handles BOS
         else:
             test_text = next(iter(dataset))[dataset_text_field][0]
 
@@ -700,7 +724,7 @@ def sft_prepare_dataset(
         bos_token = bos_token_1 or bos_token_2
 
         if bos_token is not None:
-            if test_text.startswith(bos_token) or bos_token in chat_template:
+            if (test_text is not None and test_text.startswith(bos_token)) or bos_token in chat_template:
                 add_special_tokens = False
                 print("Unsloth: We found double BOS tokens - we shall remove one automatically.")
         pass
@@ -733,15 +757,68 @@ def sft_prepare_dataset(
             map_kwargs["num_proc"] = dataset_num_proc
         else:
             map_kwargs["batch_size"] = dataset._ex_iterable.batch_size
-            
-        if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
-        import warnings as _w
-        with _w.catch_warnings():
-            _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
-            dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
+
+        if do_prompt_completion:
+            # Tokenize prompt/completion datasets for completion_only_loss
+            _eos_token = getattr(tokenizer, 'eos_token', None)
+
+            def _tokenize_pc(example):
+                if _is_conv:
+                    prompt_ids = processing_class.apply_chat_template(
+                        example["prompt"], tokenize=True,
+                        add_generation_prompt=True, return_dict=False,
+                        tools=example.get("tools"),
+                        **(example.get("chat_template_kwargs") or {}),
+                    )
+                    if prompt_ids and isinstance(prompt_ids[0], list):
+                        prompt_ids = prompt_ids[0]
+                    pc_processed = processing_class.apply_chat_template(
+                        example["prompt"] + example["completion"],
+                        return_dict=True, tokenize=True,
+                        tools=example.get("tools"),
+                        **(example.get("chat_template_kwargs") or {}),
+                    )
+                    if isinstance(pc_processed.get("input_ids", [None])[0], list):
+                        pc_processed = {k: v[0] for k, v in pc_processed.items()}
+                    pc_ids = pc_processed["input_ids"]
+                else:
+                    _completion = example["completion"]
+                    if _eos_token and not _completion.endswith(_eos_token):
+                        _completion = _completion + _eos_token
+                    prompt_ids = tokenizer(
+                        example["prompt"], add_special_tokens=add_special_tokens,
+                    )["input_ids"]
+                    pc_ids = tokenizer(
+                        example["prompt"] + _completion,
+                        add_special_tokens=add_special_tokens,
+                    )["input_ids"]
+                if do_truncation and max_seq_length > 0:
+                    pc_ids = pc_ids[:max_seq_length]
+                n_prompt = min(len(prompt_ids), len(pc_ids))
+                completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
+                result = {"input_ids": pc_ids, "completion_mask": completion_mask}
+                if _needs_token_type_ids:
+                    result["token_type_ids"] = [0] * len(pc_ids)
+                return result
+
+            if use_desc:
+                map_kwargs["desc"] = 'Unsloth: Tokenizing ["prompt"+"completion"]'
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
+                dataset = dataset.map(
+                    _tokenize_pc, batched=False,
+                    remove_columns=list(column_names), **map_kwargs,
+                )
+        else:
+            if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
+                dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
 
         # If VLM, switch data collator since .pad is needed!
-        if is_vlm and not hasattr(processing_class, "pad"):
+        if is_vlm and not hasattr(processing_class, "pad") and not do_prompt_completion:
             data_collator = DataCollatorForLanguageModeling(tokenizer, mlm = False)
             self.data_collator = data_collator
         pass
