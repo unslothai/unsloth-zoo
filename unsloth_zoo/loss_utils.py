@@ -69,7 +69,7 @@ __all__ = [
     "post_patch_loss_function",
     "HAS_CUT_CROSS_ENTROPY",
     "fused_linear_cross_entropy",
-    # "fast_linear_cross_entropy",
+    "fast_linear_cross_entropy",
     "_unsloth_get_batch_samples",
     "unsloth_fused_ce_loss",
 ]
@@ -200,6 +200,15 @@ def fused_linear_cross_entropy(
         )
     if num_items_in_batch is not None: loss = loss / num_items_in_batch
     return loss
+pass
+
+
+def fast_linear_cross_entropy(*args, **kwargs):
+    raise RuntimeError(
+        "Unsloth: `fast_linear_cross_entropy` has been deprecated. "
+        "Please update Unsloth and Unsloth Zoo via:\n"
+        "pip install --upgrade --no-cache-dir --no-deps unsloth_zoo unsloth"
+    )
 pass
 
 
