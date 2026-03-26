@@ -2929,6 +2929,11 @@ def compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING=False):
     I noticed this on Qwen-3.5-MoE and potentially Qwen3-Next. 4-5x from initial tests.
     This function is to disable repetitive autotuning and use the first tuned kernel.
     In case one wants to override this, set UNSLOTH_DISABLE_FLA_NO_AUTOTUNE=1
+
+    The previous version only patched fused_norm_gate and l2norm (8 kernels).
+    Qwen3.5 GatedDeltaNet layers use 45+ autotuned kernels across fla.ops and
+    fla.modules (chunk_delta_h, chunk_o, wy_fast, conv, activations, etc).
+    We now walk all fla submodules to patch every Autotuner instance.
     '''
     if os.environ.get("UNSLOTH_DISABLE_FLA_NO_AUTOTUNE", "0") == "1":
         return False
@@ -2960,39 +2965,38 @@ def compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING=False):
             obj = obj.fn
         return None
 
-    modules_and_kernels = []
     try:
-        import fla.modules.fused_norm_gate as fused_norm_gate
-        modules_and_kernels.append((fused_norm_gate, [
-            "layer_norm_gated_fwd_kernel", "layer_norm_gated_fwd_kernel1",
-            "layer_norm_gated_bwd_kernel", "layer_norm_gated_bwd_kernel1",
-        ]))
+        import fla
+        import pkgutil
+        import importlib
     except ImportError:
-        pass
-    try:
-        import fla.modules.l2norm as l2norm_module
-        modules_and_kernels.append((l2norm_module, [
-            "l2norm_fwd_kernel", "l2norm_fwd_kernel1",
-            "l2norm_bwd_kernel", "l2norm_bwd_kernel1",
-        ]))
-    except ImportError:
-        pass
+        return False
 
     patched = []
-    for module, kernel_names in modules_and_kernels:
-        for name in kernel_names:
-            kernel = getattr(module, name, None)
-            if kernel is None:
+    for _importer, modname, _ispkg in pkgutil.walk_packages(
+        fla.__path__, prefix="fla.",
+    ):
+        try:
+            mod = importlib.import_module(modname)
+        except Exception:
+            continue
+        for name in dir(mod):
+            obj = getattr(mod, name, None)
+            if obj is None:
                 continue
-            autotuner = _unwrap_autotuner(kernel)
+            autotuner = _unwrap_autotuner(obj)
             if autotuner is None:
                 continue
             if not isinstance(autotuner.cache, _ReuseBestCache):
                 autotuner.cache = _ReuseBestCache(autotuner.cache)
-                patched.append(name)
+                patched.append(f"{modname}.{name}")
+    pass
 
     if UNSLOTH_ENABLE_LOGGING and len(patched) > 0:
-        logger.info("Unsloth: Patched FLA autotune caches for " + ", ".join(patched))
+        logger.info(
+            f"Unsloth: Patched {len(patched)} FLA autotune caches: "
+            + ", ".join(patched)
+        )
     return len(patched) > 0
 
 
