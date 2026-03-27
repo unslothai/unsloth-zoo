@@ -2491,7 +2491,15 @@ def patch_lora_forwards(torch_compile_options):
         if (old1 not in source and add not in source) and (old2 not in source):
             pass
         else:
-            replace = "return lora_forward(result, lora_A, lora_B, dropout, x, scaling)"
+            # Linear/GPTQ/LoraParallel reassign result to float32 before the
+            # loop, so they save the original dtype in torch_result_dtype.
+            # Linear4bit/Linear8bitLt only cast x, leaving result untouched,
+            # so result.dtype is still the base-layer dtype at return time.
+            if re.search(r"\btorch_result_dtype\s*=\s*result\.dtype\b", source):
+                dtype_cast = "torch_result_dtype"
+            else:
+                dtype_cast = "result.dtype"
+            replace = f"return lora_forward(result, lora_A, lora_B, dropout, x, scaling).to({dtype_cast})"
             source = source.replace(old1, replace)
             source = source.replace(old2, replace)
         pass
