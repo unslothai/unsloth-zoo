@@ -446,16 +446,22 @@ def patch_transformers_masks():
     except Exception:
         torch_create_block_mask = None
 
+    # Always disable _compile flag to avoid double compilation issues
+    # When unsloth compiles create_causal_mask, the internal create_block_mask
+    # should NOT also compile itself as it causes dimension issues
+    # We need to patch both masking_utils and the original torch module
     if torch_create_block_mask is not None:
+        def create_block_mask_wrapper(*args, **kwargs):
+            kwargs["_compile"] = False
+            return torch_create_block_mask(*args, **kwargs)
+        # Patch masking_utils (for direct access)
+        masking_utils.create_block_mask = create_block_mask_wrapper
+        # Also patch the torch module directly (used by flex_attention_mask via import)
         try:
-            supports_compile = "_compile" in inspect.signature(torch_create_block_mask).parameters
+            import torch.nn.attention.flex_attention as flex_attention
+            flex_attention.create_block_mask = create_block_mask_wrapper
         except Exception:
-            supports_compile = True
-        if not supports_compile:
-            def create_block_mask_wrapper(*args, **kwargs):
-                kwargs.pop("_compile", None)
-                return torch_create_block_mask(*args, **kwargs)
-            masking_utils.create_block_mask = create_block_mask_wrapper
+            pass
 
     original_create_causal_mask = getattr(
         masking_utils,
