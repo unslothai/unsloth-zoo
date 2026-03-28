@@ -354,7 +354,7 @@ def patch_qwen3_moe():
 
         _qwen3_lora_extractor = _make_qwen_moe_lora_extractor()
 
-        transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts._unsloth_lora_extractor_fn = _qwen3_lora_extractor
+        transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts._unsloth_lora_extractor_fn = staticmethod(_qwen3_lora_extractor)
 
         forward = _make_qwen_moe_experts_forward()
         sparse_moe_block_forward = _make_qwen_moe_sparse_moe_block_forward(
