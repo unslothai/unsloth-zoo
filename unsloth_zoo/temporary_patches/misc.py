@@ -494,6 +494,34 @@ def patch_transformers_masks():
     masking_utils.create_sliding_window_causal_mask = wrap(compiled_create_sliding_window_causal_mask)
     masking_utils.create_masks_for_generate = wrap(masking_utils.create_masks_for_generate)
     generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
+    # Fix flex_attention device mismatch on multi-GPU: cache_position[0] returns
+    # a 0-dim tensor on one device, but inner_mask may run on another device.
+    # Converting offsets to Python ints makes them device-agnostic.
+    if hasattr(masking_utils, "add_offsets_to_mask_function"):
+        _original_add_offsets = masking_utils.add_offsets_to_mask_function
+        def _patched_add_offsets(mask_function, q_offset, kv_offset):
+            if hasattr(q_offset,  "item"): q_offset  = q_offset.item()
+            if hasattr(kv_offset, "item"): kv_offset = kv_offset.item()
+            return _original_add_offsets(mask_function, q_offset, kv_offset)
+        masking_utils.add_offsets_to_mask_function = _patched_add_offsets
+
+    # Fix padding/packed mask functions for multi-GPU: captured tensors may be
+    # on a different device than the indices passed during flex_attention vmap.
+    if hasattr(masking_utils, "padding_mask_function"):
+        def _patched_padding_mask_function(padding_mask):
+            def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
+                return padding_mask.to(kv_idx.device)[batch_idx, kv_idx]
+            return inner_mask
+        masking_utils.padding_mask_function = _patched_padding_mask_function
+
+    if hasattr(masking_utils, "packed_sequence_mask_function"):
+        def _patched_packed_sequence_mask_function(packed_sequence_mask):
+            def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
+                _pm = packed_sequence_mask.to(q_idx.device)
+                return _pm[batch_idx, q_idx] == _pm[batch_idx, kv_idx]
+            return inner_mask
+        masking_utils.packed_sequence_mask_function = _patched_packed_sequence_mask_function
+
     masking_utils.__unsloth_mask_patch__ = True
 pass
 TEMPORARY_PATCHES.append(patch_transformers_masks)
