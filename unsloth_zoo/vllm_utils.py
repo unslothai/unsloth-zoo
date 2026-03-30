@@ -1108,6 +1108,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
                 get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
                 get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
+            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
         elif hasattr(layer, "cross_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
             qkv_proj = layer.cross_attn.qkv_proj
@@ -1119,8 +1120,15 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
             get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
             get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
-
-        get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+        elif hasattr(layer, "linear_attn"):
+            # Qwen3.5 Gated Delta Net (GDN) linear attention layers
+            extract_gdn_layers(
+                layer.linear_attn,
+                f"{vllm_text_model_prefix}.layers.{kk}.linear_attn",
+                state_dict, quant_state_dict, get_state_dict,
+            )
+        pass
 
         proj = layer.mlp.gate_up_proj
         use_fused_gate_up = _is_fused_module("gate_up_proj")
@@ -1300,6 +1308,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         "norm1",              # Qwen2.5-VL vision encoder
         "norm2",              # Qwen2.5-VL vision encoder
         "norm",
+        "conv1d",             # Qwen3.5 GDN conv1d — assign weight directly to preserve nn.Conv1d
     ]
     # Override .to("cuda") to disable it otherwise we'll get
     # ValueError: Blockwise quantization only supports 16/32-bit floats, but got torch.uint8
@@ -1352,7 +1361,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
             if layer_name in quant_state_dict:
                 # for attributes of type nn.Parameter, there's no .weight
-                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
+                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
                 layer = torch.nn.Parameter(weight, requires_grad = False)
                 exec(f"new_model.{layer_name_br} = layer")
                 continue
