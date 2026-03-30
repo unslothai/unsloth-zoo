@@ -758,8 +758,6 @@ def grpo_accumulated_loss(
     for module in unwrapped_model.modules():
         if hasattr(module, "_hf_hook") and hasattr(module._hf_hook, "io_same_decice"):
             module._hf_hook.io_same_decice = False
-        if hasattr(module, "rope_deltas"):
-            module.rope_deltas = None
     pass
 
     all_logprobs_list = []
@@ -850,7 +848,7 @@ def grpo_accumulated_loss(
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature):
             #Only the activations are needed so if we keep entire computational graph, keeps unnecessary memory on CPU so we detach it
-            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True) 
+            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True)
             ctx.device = hidden_states.device
             ctx.dtype = hidden_states.dtype
 
