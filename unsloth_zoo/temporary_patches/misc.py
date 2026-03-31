@@ -494,16 +494,36 @@ def patch_transformers_masks():
     masking_utils.create_sliding_window_causal_mask = wrap(compiled_create_sliding_window_causal_mask)
     masking_utils.create_masks_for_generate = wrap(masking_utils.create_masks_for_generate)
     generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
-    # Multi-GPU device_map flex_attention fix
+    # Multi-GPU device_map flex_attention fix: cache_position[0] returns a
+    # 0-dim tensor on one device, but inner_mask may run on another device.
+    # Move offset tensors to the executing device inside the closure instead of
+    # using .item(), which would cause a graph break under torch.compile tracing.
     if hasattr(masking_utils, "add_offsets_to_mask_function"):
-        _original_add_offsets = masking_utils.add_offsets_to_mask_function
+        _original_add_offsets = getattr(
+            masking_utils,
+            "_unsloth_original_add_offsets_to_mask_function",
+            masking_utils.add_offsets_to_mask_function,
+        )
+        masking_utils._unsloth_original_add_offsets_to_mask_function = _original_add_offsets
         def add_offsets_wrapper(mask_function, q_offset, kv_offset):
-            if hasattr(q_offset,  "item"): q_offset  = q_offset.item()
-            if hasattr(kv_offset, "item"): kv_offset = kv_offset.item()
-            return _original_add_offsets(mask_function, q_offset, kv_offset)
+            _q_is_tensor = isinstance(q_offset, torch.Tensor)
+            _kv_is_tensor = isinstance(kv_offset, torch.Tensor)
+            def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
+                _q_off = q_offset.to(q_idx.device) if _q_is_tensor else q_offset
+                _kv_off = kv_offset.to(kv_idx.device) if _kv_is_tensor else kv_offset
+                return mask_function(batch_idx, head_idx, q_idx + _q_off, kv_idx + _kv_off)
+            return inner_mask
         masking_utils.add_offsets_to_mask_function = add_offsets_wrapper
 
+    # Fix padding/packed mask functions for multi-GPU: captured tensors may be
+    # on a different device than the indices passed during flex_attention vmap.
+    # Cache per-device copies to avoid repeated cross-device transfers.
     if hasattr(masking_utils, "padding_mask_function"):
+        masking_utils._unsloth_original_padding_mask_function = getattr(
+            masking_utils,
+            "_unsloth_original_padding_mask_function",
+            masking_utils.padding_mask_function,
+        )
         def padding_mask_wrapper(padding_mask):
             _cache = {padding_mask.device: padding_mask}
             def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
@@ -517,6 +537,11 @@ def patch_transformers_masks():
         masking_utils.padding_mask_function = padding_mask_wrapper
 
     if hasattr(masking_utils, "packed_sequence_mask_function"):
+        masking_utils._unsloth_original_packed_sequence_mask_function = getattr(
+            masking_utils,
+            "_unsloth_original_packed_sequence_mask_function",
+            masking_utils.packed_sequence_mask_function,
+        )
         def packed_sequence_mask_wrapper(packed_sequence_mask):
             _cache = {packed_sequence_mask.device: packed_sequence_mask}
             def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
