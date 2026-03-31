@@ -22,7 +22,7 @@ classifiers = [
     "Programming Language :: Python",
 ]
 dependencies = [
-    "torch>=2.4.0",
+    "torch>=2.4.0,<2.11.0",
     "torchao>=0.13.0",
     "triton>=3.0.0 ; ('linux' in sys_platform)",
     "packaging>=24.1",
