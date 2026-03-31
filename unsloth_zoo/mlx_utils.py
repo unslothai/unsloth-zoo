@@ -18,13 +18,18 @@
 MLX utilities for Apple Silicon training.
 
 Provides loss functions (CCE via mlx-cce, baseline CE), data batching,
-weight extraction helpers, and model save/load for LoRA adapters.
+weight extraction helpers, and model save/load/export for LoRA adapters
+and merged models (safetensors, GGUF, HuggingFace Hub).
 """
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils
 import json
+import os
+import sys
+import shutil
+import tempfile
 from pathlib import Path
 
 
@@ -352,24 +357,394 @@ def save_lora_adapters(model, path, adapter_config=None):
             json.dump(adapter_config, f, indent=2)
 
 
+def _get_model_config(model):
+    """Extract config dict from an MLX model.
+
+    mlx-lm stores the raw config dict at model._config when loaded.
+    Falls back to reconstructing from model.args dataclass.
+    """
+    # Prefer the raw config dict stashed by our loader
+    if hasattr(model, "_config") and isinstance(model._config, dict):
+        return dict(model._config)
+
+    # Reconstruct from the ModelArgs dataclass
+    if hasattr(model, "args"):
+        import dataclasses
+        if dataclasses.is_dataclass(model.args):
+            return dataclasses.asdict(model.args)
+
+    return {}
+
+
+def _get_src_path(model):
+    """Get the original model source path/repo for copying auxiliary files."""
+    return getattr(model, "_src_path", None)
+
+
 def save_merged_model(model, tokenizer, path):
     """Fuse LoRA weights and save the full merged model.
+
+    Produces an HF-compatible directory with sharded safetensors,
+    config.json, tokenizer files, and a model card. The output can
+    be reloaded with ``mlx_lm.load()`` or uploaded to HuggingFace Hub.
 
     Args:
         model: MLX model with LoRA layers.
         tokenizer: Tokenizer to save alongside.
         path: Directory to save merged model.
     """
+    from mlx_lm.utils import save_model, save_config, create_model_card
+    from mlx.utils import tree_unflatten
+
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
-    # Fuse LoRA weights
+    # Fuse LoRA weights into base model using mlx-lm's pattern
     model.eval()
-    de_lora_model = nn.utils.fuse_lora(model)
+    fused_linears = [
+        (n, m.fuse())
+        for n, m in model.named_modules()
+        if hasattr(m, "fuse")
+    ]
+    if fused_linears:
+        model.update_modules(tree_unflatten(fused_linears))
+    de_lora_model = model
 
-    # Save all weights — flatten nested dict for safetensors
-    weights = dict(mlx.utils.tree_flatten(de_lora_model.parameters()))
-    mx.save_safetensors(str(path / "model.safetensors"), weights)
+    # Save sharded safetensors + index.json
+    save_model(path, de_lora_model, donate_model=False)
+
+    # Save config.json
+    config = _get_model_config(model)
+    if config:
+        save_config(config, config_path=path / "config.json")
 
     # Save tokenizer
     tokenizer.save_pretrained(str(path))
+
+    # Copy auxiliary files (generation_config.json, *.py) from source
+    src_path = _get_src_path(model)
+    if src_path is not None:
+        src_path = Path(src_path)
+        if src_path.exists():
+            import glob as globmod
+            for pattern in ["generation_config.json", "*.py"]:
+                for f in globmod.glob(str(src_path / pattern)):
+                    shutil.copy(f, path)
+
+    # Model card
+    hf_repo = getattr(model, "_hf_repo", None)
+    try:
+        create_model_card(path, hf_repo)
+    except Exception:
+        # Fails if hf_repo doesn't exist on Hub — create a minimal card
+        readme = path / "README.md"
+        if not readme.exists():
+            readme.write_text("---\nlibrary_name: mlx\ntags:\n- mlx\n- unsloth\n---\n")
+
+    print(f"Unsloth: Merged model saved to {path}")
+
+
+def save_pretrained_merged(
+    model,
+    tokenizer,
+    save_directory,
+    push_to_hub=False,
+    token=None,
+    private=None,
+    tags=None,
+):
+    """Save LoRA-fused model in HF-compatible format.
+
+    This is the user-facing API matching the CUDA path's
+    ``model.save_pretrained_merged()``.
+
+    Args:
+        model: MLX model with LoRA layers.
+        tokenizer: Tokenizer to save alongside.
+        save_directory: Output directory path.
+        push_to_hub: If True, upload to HuggingFace Hub after saving.
+        token: HuggingFace token for pushing.
+        private: Whether the HF repo should be private.
+        tags: Additional tags for the model card.
+    """
+    save_merged_model(model, tokenizer, save_directory)
+
+    if push_to_hub:
+        push_to_hub_merged(
+            model, tokenizer, save_directory,
+            token=token, private=private, tags=tags,
+        )
+
+
+def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
+    """Install llama.cpp on macOS by cloning and building with cmake."""
+    import subprocess
+
+    if not os.path.exists(llama_cpp_folder):
+        print("Unsloth: Cloning llama.cpp...")
+        subprocess.run(
+            ["git", "clone", "https://github.com/ggml-org/llama.cpp", llama_cpp_folder],
+            check=True,
+        )
+
+    # Install Python dependencies — use gguf from the cloned repo to stay in sync
+    gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
+    if os.path.exists(gguf_py_dir):
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", gguf_py_dir,
+             "protobuf", "sentencepiece"],
+            check=True, capture_output=True,
+        )
+    else:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "gguf",
+             "protobuf", "sentencepiece"],
+            check=True, capture_output=True,
+        )
+
+    # Build with cmake (Metal support on macOS)
+    build_dir = os.path.join(llama_cpp_folder, "build")
+    print("Unsloth: Building llama.cpp with cmake...")
+    subprocess.run(
+        ["cmake", llama_cpp_folder, "-B", build_dir,
+         "-DBUILD_SHARED_LIBS=OFF", "-DGGML_METAL=ON"],
+        check=True, capture_output=True,
+    )
+
+    import psutil
+    n_jobs = psutil.cpu_count() or 4
+    targets = ["llama-quantize", "llama-cli", "llama-gguf-split"]
+    target_args = []
+    for t in targets:
+        target_args += ["--target", t]
+
+    subprocess.run(
+        ["cmake", "--build", build_dir, "--config", "Release",
+         f"-j{n_jobs}", "--clean-first"] + target_args,
+        check=True, capture_output=True,
+    )
+
+    # Copy binaries to llama.cpp root
+    bin_dir = os.path.join(build_dir, "bin")
+    if os.path.exists(bin_dir):
+        import glob as globmod
+        for binary in globmod.glob(os.path.join(bin_dir, "llama-*")):
+            shutil.copy(binary, llama_cpp_folder)
+
+    print("Unsloth: llama.cpp installed successfully.")
+
+
+def save_pretrained_gguf(
+    model,
+    tokenizer,
+    save_directory,
+    quantization_method="fast_quantized",
+):
+    """Save LoRA-fused model in GGUF format for llama.cpp inference.
+
+    Follows the same pipeline as unsloth's CUDA path:
+    1. Merge LoRA and save as HF-compatible safetensors
+    2. Install/check llama.cpp
+    3. Download and patch convert_hf_to_gguf.py
+    4. Convert safetensors -> GGUF (bf16/f16 intermediate)
+    5. Quantize to target format if needed
+
+    Args:
+        model: MLX model (with or without LoRA).
+        tokenizer: Tokenizer to save alongside.
+        save_directory: Output directory for GGUF file(s).
+        quantization_method: Quantization to apply. Options:
+            "not_quantized" - bf16, no quantization
+            "fast_quantized" - q8_0 (fast, good quality)
+            "quantized" - q4_k_m (small, fast inference)
+            Or any llama.cpp quant type: q2_k, q3_k_m, q4_k_m, q5_k_m,
+            q6_k, q8_0, f16, bf16, f32, etc.
+    """
+    from .llama_cpp import (
+        convert_to_gguf,
+        quantize_gguf,
+        install_llama_cpp,
+        check_llama_cpp,
+        _download_convert_hf_to_gguf,
+    )
+
+    save_directory = Path(save_directory)
+    save_directory.mkdir(parents=True, exist_ok=True)
+
+    # Map friendly names to llama.cpp quant types
+    quant_map = {
+        "not_quantized": "bf16",
+        "fast_quantized": "q8_0",
+        "quantized": "q4_k_m",
+        None: "q8_0",
+    }
+    quant_type = quant_map.get(quantization_method, quantization_method)
+
+    # Apple Silicon always supports bf16
+    model_dtype = "bf16"
+
+    # Determine first_conversion (intermediate GGUF format before quantizing)
+    # Same logic as unsloth CUDA path's save_to_gguf()
+    if quant_type in ("bf16", "f16", "f32"):
+        first_conversion = quant_type
+    elif quant_type == "q8_0":
+        # q8_0 can be done directly by convert_hf_to_gguf.py
+        first_conversion = "None"
+    else:
+        # For all other quant types, first convert to bf16 then quantize
+        first_conversion = "bf16"
+
+    first_conversion_dtype = "" if first_conversion == "None" else first_conversion
+
+    # Step 1: Save merged model to a temp HF-format directory
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir) / "merged"
+        print("Unsloth: Merging LoRA weights and saving to 16-bit...")
+        save_merged_model(model, tokenizer, tmp_path)
+
+        # Step 2: Ensure llama.cpp is installed
+        llama_cpp_folder = "llama.cpp"
+        try:
+            check_llama_cpp(llama_cpp_folder)
+        except Exception:
+            print("Unsloth: Installing llama.cpp (this only happens once)...")
+            _install_llama_cpp_macos(llama_cpp_folder)
+
+        # Step 3: Download and patch convert_hf_to_gguf.py
+        converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
+        supported_text_archs = None
+        supported_vision_archs = None
+        if not os.path.exists(converter):
+            result = _download_convert_hf_to_gguf()  # no args — uses defaults
+            if isinstance(result, tuple) and len(result) >= 3:
+                converter, supported_text_archs, supported_vision_archs = result[:3]
+
+        # Step 4: Get model name for output filename
+        hf_repo = getattr(model, "_hf_repo", None)
+        if hf_repo:
+            model_name = hf_repo.split("/")[-1]
+        else:
+            model_name = "model"
+
+        output_base = str(save_directory / model_name)
+
+        # Step 5: Convert HF -> GGUF
+        print(f"Unsloth: Converting to GGUF format...")
+        kwargs = dict(
+            model_name=output_base,
+            input_folder=str(tmp_path),
+            model_dtype=model_dtype,
+            quantization_type=first_conversion,
+            converter_location=converter,
+            is_vlm=False,
+            is_gpt_oss=False,
+            print_output=True,
+        )
+        if supported_text_archs is not None:
+            kwargs["supported_text_archs"] = supported_text_archs
+            kwargs["supported_vision_archs"] = supported_vision_archs
+        convert_to_gguf(**kwargs)
+
+        # Step 6: Quantize if the target quant differs from first_conversion
+        if quant_type not in ("bf16", "f16", "f32") and first_conversion != "None":
+            quantizer = os.path.join(llama_cpp_folder, "llama-quantize")
+            base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
+            final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
+
+            print(f"Unsloth: Quantizing to {quant_type}...")
+            quantize_gguf(
+                input_gguf=base_gguf,
+                output_gguf=final_gguf,
+                quant_type=quant_type,
+                quantizer_location=quantizer,
+                print_output=True,
+            )
+            # Remove intermediate bf16 gguf to save space
+            if os.path.exists(base_gguf) and base_gguf != final_gguf:
+                os.remove(base_gguf)
+                print(f"Unsloth: Removed intermediate {Path(base_gguf).name}")
+
+    # List produced files
+    gguf_files = sorted(save_directory.glob("*.gguf"))
+    for f in gguf_files:
+        size_gb = f.stat().st_size / (1024**3)
+        print(f"Unsloth: Saved {f.name} ({size_gb:.2f} GB)")
+    print(f"Unsloth: GGUF export complete -> {save_directory}")
+
+
+def push_to_hub_merged(
+    model,
+    tokenizer,
+    save_directory,
+    repo_id=None,
+    token=None,
+    private=None,
+    tags=None,
+):
+    """Push merged model to HuggingFace Hub.
+
+    Args:
+        model: MLX model.
+        tokenizer: Tokenizer.
+        save_directory: Local path with saved model (or where to save).
+        repo_id: HuggingFace repo ID (e.g. "username/model-name").
+            If None, uses save_directory as repo_id.
+        token: HuggingFace token.
+        private: Whether repo should be private.
+        tags: Additional tags.
+    """
+    from mlx_lm.utils import upload_to_hub
+
+    save_directory = Path(save_directory)
+
+    # Save first if not already saved
+    if not (save_directory / "model.safetensors.index.json").exists():
+        save_merged_model(model, tokenizer, save_directory)
+
+    if repo_id is None:
+        repo_id = save_directory.name
+
+    upload_to_hub(str(save_directory), repo_id)
+    print(f"Unsloth: Pushed to https://huggingface.co/{repo_id}")
+
+
+def push_to_hub_gguf(
+    model,
+    tokenizer,
+    save_directory,
+    repo_id,
+    quantization_method="fast_quantized",
+    token=None,
+    private=None,
+):
+    """Export to GGUF and push to HuggingFace Hub.
+
+    Args:
+        model: MLX model.
+        tokenizer: Tokenizer.
+        save_directory: Local path for GGUF output.
+        repo_id: HuggingFace repo ID.
+        quantization_method: GGUF quantization type.
+        token: HuggingFace token.
+        private: Whether repo should be private.
+    """
+    from huggingface_hub import HfApi
+
+    save_directory = Path(save_directory)
+
+    # Export to GGUF
+    save_pretrained_gguf(model, tokenizer, save_directory, quantization_method)
+
+    # Upload GGUF files
+    api = HfApi(token=token)
+    api.create_repo(repo_id=repo_id, exist_ok=True, private=private)
+
+    gguf_files = list(save_directory.glob("*.gguf"))
+    for gguf_file in gguf_files:
+        api.upload_file(
+            path_or_fileobj=str(gguf_file),
+            path_in_repo=gguf_file.name,
+            repo_id=repo_id,
+        )
+
+    print(f"Unsloth: GGUF pushed to https://huggingface.co/{repo_id}")

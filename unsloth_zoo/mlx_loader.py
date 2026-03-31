@@ -70,10 +70,21 @@ class FastLanguageModel:
         if token:
             tokenizer_config["token"] = token
 
-        model, tokenizer = mlx_load(
+        model, tokenizer, config = mlx_load(
             model_name,
             tokenizer_config=tokenizer_config if tokenizer_config else None,
+            return_config=True,
         )
+
+        # Stash metadata on the model for saving later
+        model._config = config
+        model._hf_repo = model_name
+        # Resolve local cache path for copying auxiliary files during save
+        try:
+            from mlx_lm.utils import _download
+            model._src_path = str(_download(model_name))
+        except Exception:
+            model._src_path = None
 
         model.max_seq_length = max_seq_length
         return model, tokenizer

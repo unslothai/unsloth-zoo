@@ -915,8 +915,8 @@ def convert_to_gguf(
     pass
 
     # Check if arch is supported
-    supported_types = supported_vision_archs | supported_text_archs
-    if supported_types is not None:
+    supported_types = (supported_vision_archs or set()) | (supported_text_archs or set())
+    if supported_types:
         assert("architectures" in config_file)
         arch = config_file["architectures"][0]
         if arch not in supported_types:
@@ -945,11 +945,11 @@ def convert_to_gguf(
                 base_name = model_name[:-5]
                 text_output = model_name
                 # Fix: mmproj should always include dtype since it's not quantized
-                mmproj_dtype = model_dtype if model_dtype else ("bf16" if torch.cuda.is_bf16_supported() else "f16")
+                mmproj_dtype = model_dtype if model_dtype else ("bf16" if (torch.cuda.is_bf16_supported() if torch.cuda.is_available() else True) else "f16")
                 mmproj_output = f"{base_name}.{mmproj_dtype.upper()}-mmproj.gguf"
             else:
                 text_output = f"{model_name}.{quantization_type.upper()}.gguf"
-                mmproj_dtype = model_dtype if model_dtype else ("bf16" if torch.cuda.is_bf16_supported() else "f16")
+                mmproj_dtype = model_dtype if model_dtype else ("bf16" if (torch.cuda.is_bf16_supported() if torch.cuda.is_available() else True) else "f16")
                 mmproj_output = f"{model_name}.{mmproj_dtype.upper()}-mmproj.gguf"
 
         # Text model conversion
@@ -969,7 +969,7 @@ def convert_to_gguf(
         # Vision projector conversion
         mmproj_args = {
             "--outfile"        : mmproj_output,
-            "--outtype"        : model_dtype if model_dtype else "bf16" if torch.cuda.is_bf16_supported() else "f16",
+            "--outtype"        : model_dtype if model_dtype else "bf16" if (torch.cuda.is_bf16_supported() if torch.cuda.is_available() else True) else "f16",
             "--mmproj"         : "",
             "--split-max-size" : max_shard_size,
         }
