@@ -510,7 +510,7 @@ def patch_transformers_masks():
                 device = getattr(kv_idx, "device", padding_mask.device)
                 pm = _cache.get(device)
                 if pm is None:
-                    pm = padding_mask.to(device)
+                    pm = padding_mask.to(device, non_blocking=True)
                     _cache[device] = pm
                 return pm[batch_idx, kv_idx]
             return inner_mask
@@ -523,7 +523,7 @@ def patch_transformers_masks():
                 device = getattr(q_idx, "device", packed_sequence_mask.device)
                 pm = _cache.get(device)
                 if pm is None:
-                    pm = packed_sequence_mask.to(device)
+                    pm = packed_sequence_mask.to(device, non_blocking=True)
                     _cache[device] = pm
                 return pm[batch_idx, q_idx] == pm[batch_idx, kv_idx]
             return inner_mask
