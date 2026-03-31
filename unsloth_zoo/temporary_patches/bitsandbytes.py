@@ -50,7 +50,7 @@ def patch_bitsandbytes_linear4bit_forward():
 
     def forward(self, x: torch.Tensor):
         # In transformers 5.0+, weights may not be in packed format yet during init
-        if self.weight.shape[-1] == 1:
+        if self.weight.data.shape[-1] == 1:
             fix_4bit_weight_quant_state_from_module(self)
 
         # Some layers may not be quantized (no quant_state) - fall back to regular matmul
