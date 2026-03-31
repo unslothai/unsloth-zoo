@@ -509,8 +509,8 @@ def patch_transformers_masks():
             _q_is_tensor = isinstance(q_offset, torch.Tensor)
             _kv_is_tensor = isinstance(kv_offset, torch.Tensor)
             def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
-                _q_off = q_offset.to(q_idx.device) if _q_is_tensor else q_offset
-                _kv_off = kv_offset.to(kv_idx.device) if _kv_is_tensor else kv_offset
+                _q_off = q_offset.to(getattr(q_idx, "device", q_offset.device), non_blocking=True) if _q_is_tensor else q_offset
+                _kv_off = kv_offset.to(getattr(kv_idx, "device", kv_offset.device), non_blocking=True) if _kv_is_tensor else kv_offset
                 return mask_function(batch_idx, head_idx, q_idx + _q_off, kv_idx + _kv_off)
             return inner_mask
         masking_utils.add_offsets_to_mask_function = add_offsets_wrapper
