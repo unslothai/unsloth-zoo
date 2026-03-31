@@ -495,25 +495,39 @@ def patch_transformers_masks():
     masking_utils.create_masks_for_generate = wrap(masking_utils.create_masks_for_generate)
     generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
     # Multi-GPU device_map flex_attention fix
-    _original_add_offsets = masking_utils.add_offsets_to_mask_function
-    def add_offsets_wrapper(mask_function, q_offset, kv_offset):
-        if hasattr(q_offset,  "item"): q_offset  = q_offset.item()
-        if hasattr(kv_offset, "item"): kv_offset = kv_offset.item()
-        return _original_add_offsets(mask_function, q_offset, kv_offset)
-    masking_utils.add_offsets_to_mask_function = add_offsets_wrapper
+    if hasattr(masking_utils, "add_offsets_to_mask_function"):
+        _original_add_offsets = masking_utils.add_offsets_to_mask_function
+        def add_offsets_wrapper(mask_function, q_offset, kv_offset):
+            if hasattr(q_offset,  "item"): q_offset  = q_offset.item()
+            if hasattr(kv_offset, "item"): kv_offset = kv_offset.item()
+            return _original_add_offsets(mask_function, q_offset, kv_offset)
+        masking_utils.add_offsets_to_mask_function = add_offsets_wrapper
 
-    def padding_mask_wrapper(padding_mask):
-        def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
-            return padding_mask.to(kv_idx.device)[batch_idx, kv_idx]
-        return inner_mask
-    masking_utils.padding_mask_function = padding_mask_wrapper
+    if hasattr(masking_utils, "padding_mask_function"):
+        def padding_mask_wrapper(padding_mask):
+            _cache = {}
+            def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
+                device = kv_idx.device if hasattr(kv_idx, "device") else padding_mask.device
+                pm = _cache.get(device)
+                if pm is None:
+                    pm = padding_mask.to(device)
+                    _cache[device] = pm
+                return pm[batch_idx, kv_idx]
+            return inner_mask
+        masking_utils.padding_mask_function = padding_mask_wrapper
 
-    def packed_sequence_mask_wrapper(packed_sequence_mask):
-        def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
-            _pm = packed_sequence_mask.to(q_idx.device)
-            return _pm[batch_idx, q_idx] == _pm[batch_idx, kv_idx]
-        return inner_mask
-    masking_utils.packed_sequence_mask_function = packed_sequence_mask_wrapper
+    if hasattr(masking_utils, "packed_sequence_mask_function"):
+        def packed_sequence_mask_wrapper(packed_sequence_mask):
+            _cache = {}
+            def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
+                device = q_idx.device if hasattr(q_idx, "device") else packed_sequence_mask.device
+                pm = _cache.get(device)
+                if pm is None:
+                    pm = packed_sequence_mask.to(device)
+                    _cache[device] = pm
+                return pm[batch_idx, q_idx] == pm[batch_idx, kv_idx]
+            return inner_mask
+        masking_utils.packed_sequence_mask_function = packed_sequence_mask_wrapper
 
     masking_utils.__unsloth_mask_patch__ = True
 pass
