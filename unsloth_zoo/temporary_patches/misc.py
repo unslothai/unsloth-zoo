@@ -505,9 +505,9 @@ def patch_transformers_masks():
 
     if hasattr(masking_utils, "padding_mask_function"):
         def padding_mask_wrapper(padding_mask):
-            _cache = {}
+            _cache = {padding_mask.device: padding_mask}
             def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
-                device = kv_idx.device if hasattr(kv_idx, "device") else padding_mask.device
+                device = getattr(kv_idx, "device", padding_mask.device)
                 pm = _cache.get(device)
                 if pm is None:
                     pm = padding_mask.to(device)
@@ -518,9 +518,9 @@ def patch_transformers_masks():
 
     if hasattr(masking_utils, "packed_sequence_mask_function"):
         def packed_sequence_mask_wrapper(packed_sequence_mask):
-            _cache = {}
+            _cache = {packed_sequence_mask.device: packed_sequence_mask}
             def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
-                device = q_idx.device if hasattr(q_idx, "device") else packed_sequence_mask.device
+                device = getattr(q_idx, "device", packed_sequence_mask.device)
                 pm = _cache.get(device)
                 if pm is None:
                     pm = packed_sequence_mask.to(device)
