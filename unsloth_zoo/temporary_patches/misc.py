@@ -494,6 +494,41 @@ def patch_transformers_masks():
     masking_utils.create_sliding_window_causal_mask = wrap(compiled_create_sliding_window_causal_mask)
     masking_utils.create_masks_for_generate = wrap(masking_utils.create_masks_for_generate)
     generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
+    # Multi-GPU device_map flex_attention fix
+    if hasattr(masking_utils, "add_offsets_to_mask_function"):
+        _original_add_offsets = masking_utils.add_offsets_to_mask_function
+        def add_offsets_wrapper(mask_function, q_offset, kv_offset):
+            if hasattr(q_offset,  "item"): q_offset  = q_offset.item()
+            if hasattr(kv_offset, "item"): kv_offset = kv_offset.item()
+            return _original_add_offsets(mask_function, q_offset, kv_offset)
+        masking_utils.add_offsets_to_mask_function = add_offsets_wrapper
+
+    if hasattr(masking_utils, "padding_mask_function"):
+        def padding_mask_wrapper(padding_mask):
+            _cache = {padding_mask.device: padding_mask}
+            def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
+                device = getattr(kv_idx, "device", padding_mask.device)
+                pm = _cache.get(device)
+                if pm is None:
+                    pm = padding_mask.to(device, non_blocking=True)
+                    _cache[device] = pm
+                return pm[batch_idx, kv_idx]
+            return inner_mask
+        masking_utils.padding_mask_function = padding_mask_wrapper
+
+    if hasattr(masking_utils, "packed_sequence_mask_function"):
+        def packed_sequence_mask_wrapper(packed_sequence_mask):
+            _cache = {packed_sequence_mask.device: packed_sequence_mask}
+            def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
+                device = getattr(q_idx, "device", packed_sequence_mask.device)
+                pm = _cache.get(device)
+                if pm is None:
+                    pm = packed_sequence_mask.to(device, non_blocking=True)
+                    _cache[device] = pm
+                return pm[batch_idx, q_idx] == pm[batch_idx, kv_idx]
+            return inner_mask
+        masking_utils.packed_sequence_mask_function = packed_sequence_mask_wrapper
+
     masking_utils.__unsloth_mask_patch__ = True
 pass
 TEMPORARY_PATCHES.append(patch_transformers_masks)
