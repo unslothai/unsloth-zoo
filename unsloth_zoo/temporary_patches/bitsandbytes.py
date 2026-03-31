@@ -44,14 +44,29 @@ def patch_bitsandbytes_linear4bit_forward():
     try:
         import bitsandbytes
         bitsandbytes.nn.modules.Linear4bit
-        fix_4bit_weight_quant_state_from_module = bitsandbytes.nn.modules.fix_4bit_weight_quant_state_from_module
+        Params4bit = bitsandbytes.nn.modules.Params4bit
     except Exception as e:
         return raise_error("bitsandbytes.Linear4bit", e)
 
+    # Use C-level descriptor to bypass Params4bit.__torch_function__ entirely.
+    # Accessing .data or .shape on Params4bit triggers __torch_function__ dispatch
+    # which can infinitely recurse under torch.compile dynamo tracing (bitsandbytes
+    # >= 0.46 has a Python __torch_function__ that calls super().__torch_function__
+    # which re-dispatches back to Params4bit).
+    _get_tensor_data = type.__getattribute__(torch.Tensor, "data").__get__
+
     def forward(self, x: torch.Tensor):
-        # In transformers 5.0+, weights may not be in packed format yet during init
-        if self.weight.data.shape[-1] == 1:
-            fix_4bit_weight_quant_state_from_module(self)
+        # In transformers 5.0+, weights may not be in packed format yet during init.
+        # Detect packed weights needing quant_state recovery (FSDP re-wrap case)
+        # without accessing .shape or .data on Params4bit -- both trigger
+        # __torch_function__ recursion under torch.compile.
+        if getattr(self.weight, "quant_state", None) is None and \
+           getattr(self, "quant_state", None) is not None:
+            if not isinstance(self.weight, Params4bit):
+                self.weight = Params4bit(
+                    self.weight, quant_storage=self.quant_storage, bnb_quantized=True,
+                )
+            self.weight.quant_state = self.quant_state
 
         # Some layers may not be quantized (no quant_state) - fall back to regular matmul
         quant_state = getattr(self.weight, "quant_state", None)
@@ -82,8 +97,8 @@ def patch_bitsandbytes_linear4bit_forward():
         # ** Errors out in torch.compile
         # weight = self.weight.t() if self.weight.dim() == 2 else self.weight
 
-        # Cannot do .t() on Params4bit, instead do it on torch.Tensor
-        weight = self.weight.data.t()
+        # Use C-level data descriptor to get raw tensor, bypassing __torch_function__
+        weight = _get_tensor_data(self.weight).t()
 
         return bitsandbytes.matmul_4bit(x, weight, bias=bias, quant_state=quant_state).to(inp_dtype)
 
