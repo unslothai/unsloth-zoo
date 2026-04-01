@@ -1339,3 +1339,88 @@ def patch_vllm_safe_apply_chat_template():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_vllm_safe_apply_chat_template)
+
+
+def patch_apply_chat_template_return_dict():
+    """Restore pre-5.0 return type for apply_chat_template(tokenize=True).
+
+    transformers 5.0+ changed the default of return_dict from False to True.
+    """
+    try:
+        from unsloth_zoo.utils import Version
+        import transformers
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return
+
+        import inspect
+        from transformers import PreTrainedTokenizerBase
+
+        _original_apply = PreTrainedTokenizerBase.apply_chat_template
+        if getattr(_original_apply, "_unsloth_patched", False):
+            return
+
+        try:
+            _orig_sig = inspect.signature(_original_apply)
+            _has_return_dict = "return_dict" in _orig_sig.parameters
+        except Exception:
+            _has_return_dict = True
+
+        if not _has_return_dict:
+            return
+
+        def _patched_apply_chat_template(self, conversation, *args, **kwargs):
+            tokenize = kwargs.get("tokenize", True)
+            if tokenize and "return_dict" not in kwargs:
+                kwargs["return_dict"] = False
+            return _original_apply(self, conversation, *args, **kwargs)
+
+        _patched_apply_chat_template._unsloth_patched = True
+        PreTrainedTokenizerBase.apply_chat_template = _patched_apply_chat_template
+    except Exception:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_apply_chat_template_return_dict)
+
+
+def patch_qwen2vl_image_processor_pixel_attrs():
+    """Add max_pixels/min_pixels property shims to Qwen2VLImageProcessor.
+
+    transformers 5.x removed these as direct instance attributes (they
+    are now stored inside self.size["longest_edge"/"shortest_edge"]).
+    vLLM 0.15.x accesses image_processor.max_pixels directly.
+    Only patch on transformers >= 5.0.0 to avoid breaking 4.x where
+    __init__ sets self.max_pixels as an instance attribute.
+    """
+    try:
+        from unsloth_zoo.utils import Version
+        import transformers
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return  # 4.x already has max_pixels/min_pixels as instance attrs
+    except Exception:
+        return
+
+    try:
+        from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+    except ImportError:
+        return
+
+    # Only add shims if not already present as a class-level descriptor
+    if not isinstance(Qwen2VLImageProcessor.__dict__.get("max_pixels"), property):
+        @property
+        def _max_pixels(self):
+            return self.size.get("longest_edge", self.size.get("max_pixels", None))
+        @property
+        def _min_pixels(self):
+            return self.size.get("shortest_edge", self.size.get("min_pixels", None))
+        Qwen2VLImageProcessor.max_pixels = _max_pixels
+        Qwen2VLImageProcessor.min_pixels = _min_pixels
+
+    try:
+        from transformers.models.qwen2_5_vl.image_processing_qwen2_5_vl import Qwen2_5_VLImageProcessor
+        if not isinstance(Qwen2_5_VLImageProcessor.__dict__.get("max_pixels"), property):
+            Qwen2_5_VLImageProcessor.max_pixels = _max_pixels
+            Qwen2_5_VLImageProcessor.min_pixels = _min_pixels
+    except (ImportError, NameError):
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)

@@ -1138,6 +1138,8 @@ def create_standalone_class(
         "use_kernel_forward_from_hub",
         "use_kernelized_func",
         "auto_docstring",
+        "merge_with_config_defaults",
+        "capture_outputs",
         # add more here if needed
     }
 
@@ -1281,8 +1283,9 @@ def create_standalone_class(
 
     # Pattern handles both simple signatures and those with return type annotations
     # e.g., "def forward(self, x):" AND "def forward(self, x) -> torch.Tensor:"
+    # Use \s+ after def to avoid matching decorator names that start with "def" (e.g. "default_...")
     definition_matches = re.findall(
-        r"[\s\n]{0,}def[^\(]{1,}\([^)]*\)(?:\s*->\s*[^:]+)?\s*\:",
+        r"[\s\n]{0,}def\s+[^\(]{1,}\([^)]*\)(?:\s*->\s*[^:]+)?\s*\:",
         definition_source,
         flags=re.MULTILINE | re.DOTALL,
     )
@@ -1333,6 +1336,9 @@ def create_standalone_class(
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    # Transformers 5.x decorators on forward methods
+    source = re.sub(r"@merge_with_config_defaults[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    source = re.sub(r"@capture_outputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
     # source = source.replace("@auto_docstring", "")
 
     # Fix Gemma 3 ignore_index being not set!
@@ -4004,6 +4010,21 @@ def unsloth_compile_transformers(
 
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
+
+            # Fix dict-based attention masks for gpt_oss (transformers 5.x).
+            # In v5, create_masks_for_generate returns a dict of masks keyed by
+            # layer pattern instead of a single tensor.
+            if "attn_weights = attn_weights + attention_mask" in source and "module" in source:
+                source = re.sub(
+                    r"(\s+)(if attention_mask is not None:\s*\n\s+attn_weights = attn_weights \+ attention_mask)",
+                    r"\1if attention_mask is not None:\n"
+                    r"\1    if isinstance(attention_mask, dict):\n"
+                    r"\1        attention_mask = attention_mask.get(getattr(module, 'layer_type', None), None)\n"
+                    r"\1    if attention_mask is not None:\n"
+                    r"\1        attn_weights = attn_weights + attention_mask",
+                    source,
+                    flags=re.MULTILINE,
+                )
 
             # Check erroring out
             bad = False
