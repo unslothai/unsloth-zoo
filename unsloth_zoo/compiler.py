@@ -1138,6 +1138,8 @@ def create_standalone_class(
         "use_kernel_forward_from_hub",
         "use_kernelized_func",
         "auto_docstring",
+        "merge_with_config_defaults",
+        "capture_outputs",
         # add more here if needed
     }
 
@@ -1281,8 +1283,10 @@ def create_standalone_class(
 
     # Pattern handles both simple signatures and those with return type annotations
     # e.g., "def forward(self, x):" AND "def forward(self, x) -> torch.Tensor:"
+    # NOTE: require \s+ after 'def' to avoid matching 'def' inside decorator
+    # names like @merge_with_config_defaults (transformers 5.x).
     definition_matches = re.findall(
-        r"[\s\n]{0,}def[^\(]{1,}\([^)]*\)(?:\s*->\s*[^:]+)?\s*\:",
+        r"[\s\n]{0,}def\s+[^\(]{1,}\([^)]*\)(?:\s*->\s*[^:]+)?\s*\:",
         definition_source,
         flags=re.MULTILINE | re.DOTALL,
     )
@@ -1329,11 +1333,13 @@ def create_standalone_class(
     # Combine all into file
     source = source + full_class
 
-    # Remove @auto_docstring
+    # Remove decorators that are not needed in standalone compiled modules
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    # source = source.replace("@auto_docstring", "")
+    # Transformers 5.x decorators on forward methods
+    source = re.sub(r"@merge_with_config_defaults[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    source = re.sub(r"@capture_outputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
