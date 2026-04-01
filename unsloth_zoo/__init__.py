@@ -74,21 +74,13 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 from importlib.util import find_spec
 import platform as _check_platform
 
-def _has_unsloth_package():
-    """Check if unsloth is actually installed (not just a local folder)."""
-    try:
-        import unsloth  # noqa: F401
-        return hasattr(unsloth, "__version__")
-    except (ImportError, ModuleNotFoundError):
-        return False
-
 _is_mlx_only = (
     _check_platform.system() == "Darwin"
     and _check_platform.machine() == "arm64"
     and find_spec("mlx") is not None
-    and not _has_unsloth_package()
+    and find_spec("torch") is None
 )
-del _check_platform, _has_unsloth_package
+del _check_platform
 
 if not _is_mlx_only:
     if find_spec("unsloth") is None:

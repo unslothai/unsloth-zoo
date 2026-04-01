@@ -22,8 +22,8 @@ This avoids importing unsloth.models (which pulls in CUDA kernels).
 """
 
 
-class FastLanguageModel:
-    """Lightweight FastLanguageModel for Apple Silicon / MLX.
+class FastMLXModel:
+    """MLX model loader for Apple Silicon.
 
     Mirrors the unsloth GPU API so notebooks work with minimal changes:
         model, tokenizer = FastLanguageModel.from_pretrained(...)
@@ -150,5 +150,6 @@ class FastLanguageModel:
         return model
 
 
-# Alias for API compat
-FastModel = FastLanguageModel
+# Aliases for backward compat
+FastLanguageModel = FastMLXModel
+FastModel = FastMLXModel

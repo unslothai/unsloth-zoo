@@ -596,6 +596,16 @@ def save_pretrained_gguf(
 
     first_conversion_dtype = "" if first_conversion == "None" else first_conversion
 
+    # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        raise ImportError(
+            "Unsloth: GGUF export requires PyTorch.\n"
+            "Install via: pip install torch\n"
+            "torch is only needed for GGUF export, not for training."
+        )
+
     # Step 1: Save merged model to a temp HF-format directory
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir) / "merged"
