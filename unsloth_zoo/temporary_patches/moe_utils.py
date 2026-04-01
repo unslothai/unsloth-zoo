@@ -959,6 +959,8 @@ def forward_native_grouped_mm(
         up = up.clamp(min=-limit, max=limit)
         glu = gate * torch.sigmoid(gate * alpha)
         inter = (up + 1.0) * glu
+    elif hasattr(self, 'act_fn'):
+        inter = self.act_fn(gate) * up
     else:
         inter = F.silu(gate) * up
 
@@ -1054,7 +1056,13 @@ def forward_native_grouped_mm(
     else:
         raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
 
-    # 5. Apply Routing Weights and Scatter Add (Reduce)
+    # 5. Apply per-expert scale if present (e.g. Gemma4)
+    if hasattr(self, 'per_expert_scale') and self.per_expert_scale is not None:
+        expert_indices_permuted = flat_top_k[sorted_indices]
+        per_token_scale = self.per_expert_scale[expert_indices_permuted].unsqueeze(-1)
+        mm2_out = mm2_out * per_token_scale.to(mm2_out.dtype)
+
+    # 6. Apply Routing Weights and Scatter Add (Reduce)
     flat_weights = top_k_weights.view(-1)
     permuted_weights = flat_weights[sorted_indices]
     mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
@@ -1183,8 +1191,12 @@ def forward_triton_grouped_gemm(
         is_first_gemm=True,
     )
 
-    # Apply SiLU activation and multiply gate with up
-    intermediate = _silu_and_mul(first_gemm_output)
+    # Apply activation and multiply gate with up
+    if hasattr(self, 'act_fn'):
+        gate, up = first_gemm_output.chunk(2, dim=-1)
+        intermediate = self.act_fn(gate) * up
+    else:
+        intermediate = _silu_and_mul(first_gemm_output)
 
     # Grouped GEMM 2: down projection
 
@@ -1241,10 +1253,15 @@ def forward_triton_grouped_gemm(
 
         second_gemm_output = second_gemm_output + lora_delta
 
+    # Apply per-expert scale if present (e.g. Gemma4)
+    # Combine with routing weights before final scatter
+    top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
+    if hasattr(self, 'per_expert_scale') and self.per_expert_scale is not None:
+        per_expert_scale_expanded = self.per_expert_scale[top_k_index].to(hidden_states.dtype)
+        top_k_weights_casted = top_k_weights_casted * per_expert_scale_expanded
+
     # Apply routing weights and sum across top_k experts
     # Output shape: (num_tokens, top_k, hidden_dim) -> (num_tokens, hidden_dim)
-    # Ensure top_k_weights matches dtype (can be float32 from softmax)
-    top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
     final_hidden_states = (
         second_gemm_output.view(num_tokens, top_k, hidden_dim)
         * top_k_weights_casted[..., None]
@@ -1306,6 +1323,10 @@ def forward_native_moe_loop(
             )
         else:
             current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])
+
+        # Apply per-expert scale if present (e.g. Gemma4)
+        if hasattr(self, 'per_expert_scale') and self.per_expert_scale is not None:
+            current_hidden_states = current_hidden_states * self.per_expert_scale[expert_idx].to(current_hidden_states.dtype)
 
         # Apply routing weights
         current_hidden_states = (
