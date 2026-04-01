@@ -2343,7 +2343,6 @@ def patch_GptOssModel():
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -2359,6 +2358,7 @@ def patch_GptOssModel():
         if not self.training:
             inputs_embeds.requires_grad_(False)
 
+        cache_position = kwargs.pop("cache_position", None)
         if cache_position is None:
             past_seen_tokens = (past_key_values.get_seq_length() if past_key_values is not None else 0)
             cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
@@ -2397,10 +2397,12 @@ def patch_GptOssModel():
             # Initialize for common return path
             all_hidden_states = None
             for decoder_layer in self.layers:
+                _attn_type = getattr(decoder_layer, "attention_type", None)
+                mask = (attention_mask[_attn_type] if isinstance(attention_mask, dict) and _attn_type is not None else attention_mask)
                 hidden_states, residual = inference_forward(
                     decoder_layer,
                     hidden_states,
-                    attention_mask[decoder_layer.attention_type],
+                    mask,
                     position_ids,
                     past_key_values,
                     use_cache,
@@ -2442,7 +2444,8 @@ def patch_GptOssModel():
                 if output_hidden_states:
                     all_hidden_states += (hidden_states,)
 
-                mask = (attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask)
+                _attn_type = getattr(decoder_layer, "attention_type", None)
+                mask = (attention_mask[_attn_type] if isinstance(attention_mask, dict) and _attn_type is not None else attention_mask)
                 hidden_states = decoder_layer(
                     hidden_states,
                     attention_mask=mask,
