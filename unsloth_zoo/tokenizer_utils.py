@@ -690,6 +690,11 @@ def patch_processor_call(processor):
 
     # Create a wrapper that handles conversation format
     def patched_call(self, images=None, text=None, videos=None, **kwargs):
+        # Handle text passed as first positional arg (processor expects images first)
+        if text is None and images is not None:
+            if isinstance(images, str) or (isinstance(images, list) and images and isinstance(images[0], str)):
+                text = images
+                images = None
         # Auto-apply chat template if text looks like conversation format
         if text is not None and _is_conversation_format(text):
             # Text is conversation format - apply chat template first

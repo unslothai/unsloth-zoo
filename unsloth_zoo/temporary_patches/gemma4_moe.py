@@ -61,25 +61,34 @@ def patch_gemma4_moe():
         dim_A = weight_A.shape[1]
         dim_B = weight_B.shape[0]
 
-        # Gemma4 uses standard F.linear format (E, out_dim, in_dim).
-        # PEFT LoRA: A=(E*R, in_dim), B=(out_dim, E*R)
-        # grouped_mm needs: first=(E, in_dim, R), second=(E, R, out_dim)
-        # This mapping is the same for both gate_up_proj and down_proj.
-        first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-        first_weight = first_weight.permute(0, 2, 1).contiguous()  # (E, in_dim, R)
+        # PEFT ParamWrapper for (E, dim1, dim2) creates:
+        #   lora_A: (E*R, dim1), lora_B: (dim2, E*R)
+        # grouped_mm base: input(N, dim2) @ W_preprocessed(E, dim2, dim1) -> (N, dim1)
+        # LoRA: input @ first(E, dim2, R) -> @ second(E, R, dim1)
+        # So: first from lora_B, second from lora_A
+        first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+        first_weight = first_weight.permute(1, 0, 2).contiguous()  # (E, dim_B, R)
 
-        second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-        second_weight = second_weight.permute(1, 2, 0).contiguous()  # (E, R, out_dim)
+        second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)  # (E, R, dim_A)
 
         return first_weight, second_weight, scaling, num_experts
 
     Gemma4TextMoEBlock._unsloth_lora_extractor_fn = staticmethod(_gemma4_lora_extractor)
 
     # ====================================================================
-    # Patch Gemma4TextMoEBlock.forward with optimized grouped GEMM backend
-    # The generic forward in moe_utils now handles act_fn and per_expert_scale
+    # Patch Gemma4TextMoEBlock.forward with optimized grouped GEMM backend.
+    # Pre-multiply per_expert_scale into routing weights so the generic
+    # grouped_mm forward doesn't need per_expert_scale special-casing.
     # ====================================================================
-    patch_function(Gemma4TextMoEBlock, "forward", get_forward_moe_backend(), force=True)
+    _moe_backend = get_forward_moe_backend()
+
+    def _gemma4_moe_forward(self, hidden_states, top_k_index, top_k_weights):
+        # Fold per_expert_scale into routing weights before grouped_mm
+        if self.per_expert_scale is not None:
+            top_k_weights = top_k_weights * self.per_expert_scale[top_k_index].to(top_k_weights.dtype)
+        return _moe_backend(self, hidden_states, top_k_index, top_k_weights)
+
+    patch_function(Gemma4TextMoEBlock, "forward", _gemma4_moe_forward, force=True)
 
     # ====================================================================
     # Patch Gemma4ForConditionalGeneration.forward for GRPO training
@@ -112,6 +121,15 @@ def patch_gemma4_moe():
             logits_to_keep=0,
             **kwargs,
         ):
+            # Gemma4 requires mm_token_type_ids during training.
+            # For text-only SFT (no pixel_values), inject zeros (all text tokens).
+            if mm_token_type_ids is None and self.training:
+                _ids = input_ids if input_ids is not None else inputs_embeds
+                if _ids is not None:
+                    mm_token_type_ids = torch.zeros(
+                        _ids.shape[:2], dtype=torch.long, device=_ids.device
+                    )
+
             RETURN_HIDDEN_STATES = (
                 os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
             )
