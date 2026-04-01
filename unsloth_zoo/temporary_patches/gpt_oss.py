@@ -2398,7 +2398,10 @@ def patch_GptOssModel():
             all_hidden_states = None
             for decoder_layer in self.layers:
                 _attn_type = getattr(decoder_layer, "attention_type", None)
-                mask = (attention_mask[_attn_type] if isinstance(attention_mask, dict) and _attn_type is not None else attention_mask)
+                if isinstance(attention_mask, dict):
+                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                else:
+                    mask = attention_mask
                 hidden_states, residual = inference_forward(
                     decoder_layer,
                     hidden_states,
@@ -2445,7 +2448,10 @@ def patch_GptOssModel():
                     all_hidden_states += (hidden_states,)
 
                 _attn_type = getattr(decoder_layer, "attention_type", None)
-                mask = (attention_mask[_attn_type] if isinstance(attention_mask, dict) and _attn_type is not None else attention_mask)
+                if isinstance(attention_mask, dict):
+                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                else:
+                    mask = attention_mask
                 hidden_states = decoder_layer(
                     hidden_states,
                     attention_mask=mask,
