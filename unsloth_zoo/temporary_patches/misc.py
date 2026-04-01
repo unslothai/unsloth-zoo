@@ -163,9 +163,7 @@ def patch_CsmDepthDecoderForCausalLM_forward():
     except Exception as e:
         return raise_error("CsmDepthDecoderForCausalLM.forward", e)
 
-    # Inspect the target function signature to decide which version to use
-    target_forward = transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM.forward
-    has_output_attentions = "output_attentions" in inspect.signature(target_forward).parameters
+    target_cls = transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM
 
     def forward(
         self,
@@ -233,33 +231,12 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         })
     pass
 
-    if has_output_attentions:
-        patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward, match_level="relaxed")
-    else:
-        # New transformers removes output_attentions and output_hidden_states
-        old_forward = forward
-        def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            backbone_last_hidden_state: Optional[torch.FloatTensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            # output_attentions: Optional[bool] = None,
-            # output_hidden_states: Optional[bool] = None,
-            cache_position: Optional[torch.LongTensor] = None,
-            logits_to_keep: Union[int, torch.Tensor] = 0,
-            **kwargs: KWARGS_TYPE,
-        ) -> Union[Tuple, CausalLMOutputWithPast]:
-            new_kwargs = locals().copy()
-            new_kwargs.pop('old_forward', None)
-            kwargs = new_kwargs.pop('kwargs', dict())
-            new_kwargs.update(kwargs)
-            return old_forward(**new_kwargs)
-        patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward, match_level="relaxed")
+    # Wrap with (self, *args, **kwargs) so check_args_kwargs accepts any
+    # removed params (output_attentions, output_hidden_states, cache_position)
+    _full_forward = forward
+    def forward(self, *args, **kwargs):
+        return _full_forward(self, *args, **kwargs)
+    patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
 
@@ -272,9 +249,7 @@ def patch_CsmForConditionalGeneration_forward():
     except Exception as e:
         return raise_error("CsmForConditionalGeneration.forward", e)
 
-    # Inspect the target function signature to decide which version to use
-    target_forward = transformers.models.csm.modeling_csm.CsmForConditionalGeneration.forward
-    has_output_attentions = "output_attentions" in inspect.signature(target_forward).parameters
+    target_cls = transformers.models.csm.modeling_csm.CsmForConditionalGeneration
 
     def forward(
         self,
@@ -392,34 +367,10 @@ def patch_CsmForConditionalGeneration_forward():
         })
     pass
 
-    if has_output_attentions:
-        patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward, match_level="relaxed")
-    else:
-        # New transformers removes output_attentions and output_hidden_states
-        old_forward = forward
-        def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            input_values: Optional[torch.Tensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            input_values_cutoffs: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            # output_attentions: Optional[bool] = None,
-            # output_hidden_states: Optional[bool] = None,
-            cache_position: Optional[torch.LongTensor] = None,
-            logits_to_keep: Union[int, torch.Tensor] = 0,
-            **kwargs: KWARGS_TYPE,
-        ) -> Union[Tuple, CsmOutputWithPast]:
-            new_kwargs = locals().copy()
-            new_kwargs.pop('old_forward', None)
-            kwargs = new_kwargs.pop('kwargs', dict())
-            new_kwargs.update(kwargs)
-            return old_forward(**new_kwargs)
-        patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward, match_level="relaxed")
+    _full_forward = forward
+    def forward(self, *args, **kwargs):
+        return _full_forward(self, *args, **kwargs)
+    patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
 

@@ -39,6 +39,24 @@ import inspect
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
 
 
+def _make_gemma3_attn_forwards(forward_function, has_cache_position):
+    """Build past_key_value / past_key_values forward variants for Gemma3Attention."""
+    functions = []
+    if has_cache_position:
+        def forward_past_key_value(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_value=None, cache_position=None, **kwargs):
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+        def forward_past_key_values(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_values=None, cache_position=None, **kwargs):
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
+    else:
+        def forward_past_key_value(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_value=None, **kwargs):
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, kwargs.pop("cache_position", None), **kwargs)
+        def forward_past_key_values(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_values=None, **kwargs):
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs.pop("cache_position", None), **kwargs)
+    functions.append(forward_past_key_value)
+    functions.append(forward_past_key_values)
+    return functions
+
+
 def patch_Gemma3Processor():
     import re
     try:
@@ -546,29 +564,10 @@ def patch_Gemma3Attention():
         return attn_output_projected, attn_weights # 3-tuple return
     pass
 
-    functions = []
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
-    functions.append(forward)
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
-    functions.append(forward)
+    has_cache_position = "cache_position" in inspect.signature(
+        transformers.models.gemma3.modeling_gemma3.Gemma3Attention.forward
+    ).parameters
+    functions = _make_gemma3_attn_forwards(forward_function, has_cache_position)
     patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention)
@@ -801,29 +800,10 @@ def patch_Gemma3Attention_generic():
         return attn_output_projected, attn_weights # 3-tuple return
     pass
 
-    functions = []
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
-    functions.append(forward)
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
-    functions.append(forward)
+    has_cache_position = "cache_position" in inspect.signature(
+        transformers.models.gemma3.modeling_gemma3.Gemma3Attention.forward
+    ).parameters
+    functions = _make_gemma3_attn_forwards(forward_function, has_cache_position)
     patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention_generic)
