@@ -21,6 +21,51 @@ No GPU dependencies — uses mlx-lm for model loading and LoRA.
 This avoids importing unsloth.models (which pulls in CUDA kernels).
 """
 
+import types
+
+
+def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
+    from .mlx_utils import save_merged_model
+    tokenizer = tokenizer or self._tokenizer
+    save_merged_model(self, tokenizer, save_directory)
+
+
+def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
+                               quantization_method="fast_quantized", **kwargs):
+    from .mlx_utils import save_pretrained_gguf
+    tokenizer = tokenizer or self._tokenizer
+    save_pretrained_gguf(self, tokenizer, save_directory,
+                         quantization_method=quantization_method)
+
+
+def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, **kwargs):
+    from .mlx_utils import push_to_hub_merged
+    tokenizer = tokenizer or self._tokenizer
+    push_to_hub_merged(self, tokenizer, repo_id, repo_id=repo_id, **kwargs)
+
+
+def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
+                            quantization_method="fast_quantized", **kwargs):
+    from .mlx_utils import push_to_hub_gguf
+    tokenizer = tokenizer or self._tokenizer
+    push_to_hub_gguf(self, tokenizer, repo_id, repo_id=repo_id,
+                     quantization_method=quantization_method, **kwargs)
+
+
+def _mlx_save_lora_adapters(self, path, adapter_config=None):
+    from .mlx_utils import save_lora_adapters
+    save_lora_adapters(self, path, adapter_config=adapter_config)
+
+
+def _patch_mlx_saving(model, tokenizer):
+    """Attach save/push methods to the model, matching unsloth's CUDA pattern."""
+    model._tokenizer = tokenizer
+    model.save_pretrained_merged = types.MethodType(_mlx_save_pretrained_merged, model)
+    model.save_pretrained_gguf   = types.MethodType(_mlx_save_pretrained_gguf, model)
+    model.push_to_hub_merged     = types.MethodType(_mlx_push_to_hub_merged, model)
+    model.push_to_hub_gguf       = types.MethodType(_mlx_push_to_hub_gguf, model)
+    model.save_lora_adapters     = types.MethodType(_mlx_save_lora_adapters, model)
+
 
 class FastMLXModel:
     """MLX model loader for Apple Silicon.
@@ -87,6 +132,10 @@ class FastMLXModel:
             model._src_path = None
 
         model.max_seq_length = max_seq_length
+
+        # Attach save/push methods to model (mirrors CUDA path's patch_saving_functions)
+        _patch_mlx_saving(model, tokenizer)
+
         return model, tokenizer
 
     @staticmethod

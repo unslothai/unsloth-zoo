@@ -39,7 +39,6 @@ Usage mirrors TRL notebooks:
 from dataclasses import dataclass
 from functools import partial
 import math
-import tempfile
 import time
 
 import mlx.core as mx
@@ -54,11 +53,6 @@ from .mlx_utils import (
     create_batches,
     iterate_training_batches,
     save_lora_adapters,
-    save_merged_model,
-    save_pretrained_merged,
-    save_pretrained_gguf,
-    push_to_hub_merged,
-    push_to_hub_gguf,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
 )
@@ -567,7 +561,7 @@ class MLXTrainer:
     def save_model(self, output_dir=None):
         """Save LoRA adapters (or full model if no LoRA)."""
         output_dir = output_dir or self.args.output_dir
-        save_lora_adapters(self.model, output_dir, adapter_config={
+        self.model.save_lora_adapters(output_dir, adapter_config={
             "learning_rate": self.args.learning_rate,
             "max_steps": self.args.max_steps,
             "max_seq_length": self.args.max_seq_length,
@@ -576,49 +570,3 @@ class MLXTrainer:
         self.tokenizer.save_pretrained(output_dir)
         print(f"Unsloth: Model saved to {output_dir}")
 
-    def save_merged_model(self, output_dir=None):
-        """Fuse LoRA weights and save the full merged model."""
-        output_dir = output_dir or self.args.output_dir
-        save_merged_model(self.model, self.tokenizer, output_dir)
-
-    def save_pretrained_merged(self, output_dir=None, **kwargs):
-        """Save LoRA-fused model in HF-compatible format (safetensors + config)."""
-        output_dir = output_dir or self.args.output_dir
-        save_pretrained_merged(self.model, self.tokenizer, output_dir, **kwargs)
-
-    def save_pretrained_gguf(self, output_dir=None, quantization_method="fast_quantized"):
-        """Save LoRA-fused model in GGUF format for llama.cpp."""
-        output_dir = output_dir or self.args.output_dir
-        save_pretrained_gguf(
-            self.model, self.tokenizer, output_dir,
-            quantization_method=quantization_method,
-        )
-
-    def push_to_hub(self, repo_id, **kwargs):
-        """Upload LoRA adapters to HuggingFace Hub."""
-        import tempfile
-        from huggingface_hub import HfApi
-        with tempfile.TemporaryDirectory() as tmp:
-            self.save_model(tmp)
-            api = HfApi()
-            api.create_repo(repo_id=repo_id, exist_ok=True)
-            api.upload_folder(folder_path=tmp, repo_id=repo_id, **kwargs)
-        print(f"Unsloth: Uploaded to https://huggingface.co/{repo_id}")
-
-    def push_to_hub_merged(self, repo_id, **kwargs):
-        """Fuse LoRA, save as HF-compatible model, and push to Hub."""
-        with tempfile.TemporaryDirectory() as tmp:
-            push_to_hub_merged(
-                self.model, self.tokenizer, tmp,
-                repo_id=repo_id, **kwargs,
-            )
-
-    def push_to_hub_gguf(self, repo_id, quantization_method="fast_quantized", **kwargs):
-        """Export to GGUF and push to HuggingFace Hub."""
-        with tempfile.TemporaryDirectory() as tmp:
-            push_to_hub_gguf(
-                self.model, self.tokenizer, tmp,
-                repo_id=repo_id,
-                quantization_method=quantization_method,
-                **kwargs,
-            )
