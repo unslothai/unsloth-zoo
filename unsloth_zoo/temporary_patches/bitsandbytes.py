@@ -45,6 +45,7 @@ def patch_bitsandbytes_linear4bit_forward():
         import bitsandbytes
         bitsandbytes.nn.modules.Linear4bit
         Params4bit = bitsandbytes.nn.modules.Params4bit
+        fix_4bit_weight_quant_state_from_module = bitsandbytes.nn.modules.fix_4bit_weight_quant_state_from_module
     except Exception as e:
         return raise_error("bitsandbytes.Linear4bit", e)
 
@@ -67,17 +68,9 @@ def patch_bitsandbytes_linear4bit_forward():
     pass
 
     def forward(self, x: torch.Tensor):
-        # In transformers 5.0+, weights may not be in packed format yet during init.
-        # Detect packed weights needing quant_state recovery (FSDP re-wrap case)
-        # without accessing .shape or .data on Params4bit -- both trigger
-        # __torch_function__ recursion under torch.compile.
-        if getattr(self.weight, "quant_state", None) is None and \
-           getattr(self, "quant_state", None) is not None:
-            if not isinstance(self.weight, Params4bit):
-                self.weight = Params4bit(
-                    self.weight, quant_storage=self.quant_storage, bnb_quantized=True,
-                )
-            self.weight.quant_state = self.quant_state
+        # In transformers 5.0+, weights may not be in packed format yet during init
+        if self.weight.shape[-1] == 1:
+            fix_4bit_weight_quant_state_from_module(self)
 
         # Some layers may not be quantized (no quant_state) - fall back to regular matmul
         quant_state = getattr(self.weight, "quant_state", None)
