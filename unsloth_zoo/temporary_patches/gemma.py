@@ -546,29 +546,58 @@ def patch_Gemma3Attention():
         return attn_output_projected, attn_weights # 3-tuple return
     pass
 
+    has_cache_position = "cache_position" in inspect.signature(
+        transformers.models.gemma3.modeling_gemma3.Gemma3Attention.forward
+    ).parameters
+
     functions = []
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
-    functions.append(forward)
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
-    functions.append(forward)
+    if has_cache_position:
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_value: Optional[Cache] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs: KWARGS_TYPE,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+        functions.append(forward)
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[Cache] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs: KWARGS_TYPE,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
+        functions.append(forward)
+    else:
+        # Transformers v5 removed cache_position from explicit params (now in **kwargs)
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_value: Optional[Cache] = None,
+            **kwargs: KWARGS_TYPE,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+            cache_position = kwargs.pop("cache_position", None)
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+        functions.append(forward)
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[Cache] = None,
+            **kwargs: KWARGS_TYPE,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+            cache_position = kwargs.pop("cache_position", None)
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
+        functions.append(forward)
     patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention)
@@ -605,7 +634,7 @@ def patch_Gemma3Attention_generic():
     except Exception as e:
         return raise_error("Gemma3Attention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-    scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
+    # scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
 
     def prepare(
@@ -801,29 +830,58 @@ def patch_Gemma3Attention_generic():
         return attn_output_projected, attn_weights # 3-tuple return
     pass
 
+    has_cache_position = "cache_position" in inspect.signature(
+        transformers.models.gemma3.modeling_gemma3.Gemma3Attention.forward
+    ).parameters
+
     functions = []
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
-    functions.append(forward)
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
-    functions.append(forward)
+    if has_cache_position:
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_value: Optional[Cache] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs: KWARGS_TYPE,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+        functions.append(forward)
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[Cache] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs: KWARGS_TYPE,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
+        functions.append(forward)
+    else:
+        # Transformers v5 removed cache_position from explicit params (now in **kwargs)
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_value: Optional[Cache] = None,
+            **kwargs: KWARGS_TYPE,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+            cache_position = kwargs.pop("cache_position", None)
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+        functions.append(forward)
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[Cache] = None,
+            **kwargs: KWARGS_TYPE,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+            cache_position = kwargs.pop("cache_position", None)
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
+        functions.append(forward)
     patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention_generic)
