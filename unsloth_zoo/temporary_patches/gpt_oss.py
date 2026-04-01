@@ -2398,10 +2398,12 @@ def patch_GptOssModel():
             # Initialize for common return path
             all_hidden_states = None
             for decoder_layer in self.layers:
+                _attn_type_inf = getattr(decoder_layer, "attention_type", None)
+                _layer_mask = attention_mask[_attn_type_inf] if isinstance(attention_mask, dict) and _attn_type_inf is not None else attention_mask
                 hidden_states, residual = inference_forward(
                     decoder_layer,
                     hidden_states,
-                    attention_mask[decoder_layer.attention_type],
+                    _layer_mask,
                     position_ids,
                     past_key_values,
                     use_cache,

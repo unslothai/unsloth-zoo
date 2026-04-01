@@ -1138,8 +1138,6 @@ def create_standalone_class(
         "use_kernel_forward_from_hub",
         "use_kernelized_func",
         "auto_docstring",
-        "merge_with_config_defaults",
-        "capture_outputs",
         # add more here if needed
     }
 
@@ -1283,8 +1281,13 @@ def create_standalone_class(
 
     # Pattern handles both simple signatures and those with return type annotations
     # e.g., "def forward(self, x):" AND "def forward(self, x) -> torch.Tensor:"
-    # NOTE: require \s+ after 'def' to avoid matching 'def' inside decorator
-    # names like @merge_with_config_defaults (transformers 5.x).
+    # NOTE: must require \s+ after 'def' to avoid matching 'def' inside decorator
+    # names like @merge_with_config_defaults (which contains "def" as a substring).
+    # Without \s+, the old pattern r"def[^\(]{1,}" greedily matches from the 'def'
+    # inside '@merge_with_config_defaults' all the way to the actual 'def forward(',
+    # producing a match starting with 'defaults\n    @capture_outputs\n    def ...'
+    # which, when substituted back, leaves the orphaned word 'defaults' on its own
+    # line and causes an IndentationError at the following @capture_outputs decorator.
     definition_matches = re.findall(
         r"[\s\n]{0,}def\s+[^\(]{1,}\([^)]*\)(?:\s*->\s*[^:]+)?\s*\:",
         definition_source,
@@ -1333,13 +1336,17 @@ def create_standalone_class(
     # Combine all into file
     source = source + full_class
 
-    # Remove decorators that are not needed in standalone compiled modules
+    # Remove @auto_docstring and other transformers 5.x decorators that are not
+    # compatible with standalone compiled functions.
+    # @merge_with_config_defaults and @capture_outputs are new in transformers 5.x and
+    # appear on method definitions (e.g. WhisperDecoder.forward). They must be stripped
+    # from the standalone forward function as they rely on self/class context.
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    # Transformers 5.x decorators on forward methods
     source = re.sub(r"@merge_with_config_defaults[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@capture_outputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    # source = source.replace("@auto_docstring", "")
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
@@ -4010,6 +4017,23 @@ def unsloth_compile_transformers(
 
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
+
+            # Fix dict-based attention masks for gpt_oss (transformers 5.x)
+            # In v5, create_masks_for_generate returns a dict of masks keyed by
+            # layer pattern ('full_attention', 'sliding_attention') instead of a
+            # single tensor. The compiled eager_attention_forward does
+            # attn_weights + attention_mask which fails on a dict.
+            if "attn_weights = attn_weights + attention_mask" in source and "module" in source:
+                source = re.sub(
+                    r"(\s+)(if attention_mask is not None:\s*\n\s+attn_weights = attn_weights \+ attention_mask)",
+                    r"\1if attention_mask is not None:\n"
+                    r"\1    if isinstance(attention_mask, dict):\n"
+                    r"\1        attention_mask = attention_mask.get(getattr(module, 'layer_type', None), None)\n"
+                    r"\1    if attention_mask is not None:\n"
+                    r"\1        attn_weights = attn_weights + attention_mask",
+                    source,
+                    flags=re.MULTILINE,
+                )
 
             # Check erroring out
             bad = False

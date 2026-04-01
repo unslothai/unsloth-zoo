@@ -1339,3 +1339,103 @@ def patch_vllm_safe_apply_chat_template():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_vllm_safe_apply_chat_template)
+
+
+def patch_apply_chat_template_return_dict():
+    """Fix apply_chat_template(tokenize=True) backwards compatibility for transformers 5.0+.
+
+    transformers 5.0.0 changed the default of return_dict from False to True in
+    apply_chat_template. When tokenize=True (the default), the function now returns a
+    BatchEncoding object instead of a plain list[int].
+
+    This breaks existing user code and Unsloth notebooks that do:
+        dataset.map(
+            lambda x: {"tokens": tokenizer.apply_chat_template(
+                x["prompt"], tokenize=True, add_generation_prompt=True)},
+            batched=True,
+        )
+    because HuggingFace datasets' map() with batched=True rejects BatchEncoding values
+    (it expects list, np.ndarray, pd.Series, or torch.Tensor).
+
+    The fix wraps PreTrainedTokenizerBase.apply_chat_template to inject return_dict=False
+    when tokenize=True and the caller did NOT explicitly pass return_dict. This preserves
+    the pre-5.0 list[int] return type for code that was written against the old API, while
+    allowing callers that explicitly pass return_dict=True to still get BatchEncoding.
+
+    Compatible with both transformers 4.x (no-op, already returns list) and 5.x (fixes
+    the new default).
+    """
+    try:
+        from unsloth_zoo.utils import Version
+        import transformers
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return  # Not needed pre-5.0: return_dict default was already False
+
+        import inspect
+        from transformers import PreTrainedTokenizerBase
+
+        _original_apply = PreTrainedTokenizerBase.apply_chat_template
+        if getattr(_original_apply, "_unsloth_patched", False):
+            return
+
+        # Determine if the original has an explicit return_dict parameter
+        try:
+            _orig_sig = inspect.signature(_original_apply)
+            _has_return_dict = "return_dict" in _orig_sig.parameters
+        except Exception:
+            _has_return_dict = True
+
+        if not _has_return_dict:
+            return  # Unexpected signature, skip patching
+
+        def _patched_apply_chat_template(self, conversation, *args, **kwargs):
+            # Only inject return_dict=False when:
+            # 1. tokenize is True (default) - caller wants token ids
+            # 2. return_dict was NOT explicitly passed by the caller
+            # This preserves old list[int] return type for existing notebooks
+            # while allowing explicit return_dict=True callers to get BatchEncoding.
+            tokenize = kwargs.get("tokenize", True)
+            if tokenize and "return_dict" not in kwargs:
+                kwargs["return_dict"] = False
+            return _original_apply(self, conversation, *args, **kwargs)
+
+        _patched_apply_chat_template._unsloth_patched = True
+        PreTrainedTokenizerBase.apply_chat_template = _patched_apply_chat_template
+    except Exception:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_apply_chat_template_return_dict)
+
+
+def patch_qwen2vl_image_processor_pixel_attrs():
+    """Add max_pixels/min_pixels property shims to Qwen2VLImageProcessor.
+
+    transformers 5.x removed max_pixels/min_pixels as direct attributes and
+    merged them into size["longest_edge"] / size["shortest_edge"]. vLLM 0.15.x
+    accesses image_processor.max_pixels directly, causing AttributeError.
+    """
+    try:
+        from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+    except ImportError:
+        return
+
+    if "max_pixels" not in Qwen2VLImageProcessor.__dict__:
+        @property
+        def _max_pixels(self):
+            return self.size.get("longest_edge", self.size.get("max_pixels", None))
+        @property
+        def _min_pixels(self):
+            return self.size.get("shortest_edge", self.size.get("min_pixels", None))
+        Qwen2VLImageProcessor.max_pixels = _max_pixels
+        Qwen2VLImageProcessor.min_pixels = _min_pixels
+
+    # Same for Qwen2_5_VL if it exists
+    try:
+        from transformers.models.qwen2_5_vl.image_processing_qwen2_5_vl import Qwen2_5_VLImageProcessor
+        if "max_pixels" not in Qwen2_5_VLImageProcessor.__dict__:
+            Qwen2_5_VLImageProcessor.max_pixels = _max_pixels
+            Qwen2_5_VLImageProcessor.min_pixels = _min_pixels
+    except ImportError:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
