@@ -70,7 +70,6 @@ def patch_tokenizer_convert_added_tokens():
 
     @classmethod
     def patched_convert_added_tokens(cls, obj, save=False, add_type_field=True):
-        # Handle dicts with "content" key that don't have "__type" field
         # Only convert if "content" is a string (AddedToken expects str), not a nested dict
         if isinstance(obj, dict) and "content" in obj and "__type" not in obj and isinstance(obj["content"], str):
             return AddedToken(**obj)

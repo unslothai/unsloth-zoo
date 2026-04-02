@@ -596,7 +596,8 @@ def _merge_and_overwrite_lora(
                     pass
 
             # Fast path for MoE models with stacked experts: merge by iterating LoRA modules instead of per-weight scan
-            if any(".mlp.experts" in k for k in converted_lora_weights.keys()):
+            # Matches standard (.mlp.experts), Gemma4 (.experts without .mlp), and .moe naming
+            if any(".experts" in k or ".moe" in k for k in converted_lora_weights.keys()):
                 count = _merge_moe_experts_file(
                     mm = mm,
                     header_metadata = header_metadata,
@@ -725,6 +726,11 @@ def _merge_and_overwrite_lora(
                 # Check for LoRA merge
                 lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
                 lora_stats = converted_lora_weights.get(lora_key, None)
+                # Fallback: handle Gemma4ClippableLinear (.linear.weight -> .weight)
+                if lora_stats is None and lora_key.endswith(".linear"):
+                    lora_stats = converted_lora_weights.get(
+                        lora_key[:-len(".linear")], None
+                    )
                 # Tied embeddings can omit lm_head.weight from safetensors. If lm_head has LoRA
                 # adapters, apply them onto embed_tokens.weight since both share one base tensor.
                 if (
@@ -1009,24 +1015,53 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
 
     # Check if this is GPT-OSS format (fused 3D tensors instead of per-expert 2D tensors)
     # GPT-OSS uses: model.layers.X.mlp.experts.gate_up_proj (3D tensor)
+    # Gemma4 uses:  model.layers.X.experts.gate_up_proj (3D tensor, no mlp prefix)
     # Standard MoE uses: model.layers.X.mlp.experts.0.gate_proj (2D tensor per expert)
     is_gpt_oss_format = False
     for key in header_metadata.keys():
-        if ".mlp.experts.gate_up_proj" in key or ".mlp.experts.down_proj" in key:
-            is_gpt_oss_format = True
-            break
+        if key.endswith(".gate_up_proj") or key.endswith(".down_proj"):
+            if ".experts." in key:
+                is_gpt_oss_format = True
+                break
+
+    # Determine if fused 3D format is transposed (GPT-OSS) or standard (Gemma4)
+    # from gate_up_proj shape: (E, H, 2*I) → transposed, (E, 2*I, H) → standard
+    _is_transposed_format = None
+    if is_gpt_oss_format:
+        for key, meta in header_metadata.items():
+            if key.endswith(".gate_up_proj") and ".experts." in key:
+                shape = meta.get("shape", [])
+                if len(shape) == 3:
+                    _is_transposed_format = shape[2] > shape[1]
+                break
 
     if is_gpt_oss_format and UNSLOTH_ENABLE_LOGGING:
         try:
-            logger.info("[merge_debug] Detected GPT-OSS fused 3D tensor format")
+            logger.info(f"[merge_debug] Detected fused 3D tensor format (transposed={_is_transposed_format})")
         except Exception:
             pass
 
+    # Build mapping from model LoRA module path -> safetensor expert prefix
+    # Handles Gemma4 (.experts without .mlp), standard (.mlp.experts), and .moe patterns
+    _moe_lora_to_shard_prefix = {}
+    for lora_key in converted_lora_weights.keys():
+        if ".experts" in lora_key or ".moe" in lora_key:
+            base = lora_key.replace(".base_layer", "")
+            # Try direct match first (standard models)
+            if f"{base}.gate_up_proj" in header_metadata or f"{base}.down_proj" in header_metadata:
+                _moe_lora_to_shard_prefix[lora_key] = base
+            else:
+                # Try remapping moe -> experts (Gemma4)
+                remapped = base.replace(".moe", ".experts")
+                if f"{remapped}.gate_up_proj" in header_metadata or f"{remapped}.down_proj" in header_metadata:
+                    _moe_lora_to_shard_prefix[lora_key] = remapped
+
     for lora_key, lora_stats in converted_lora_weights.items():
-        if ".mlp.experts" not in lora_key:
+        shard_prefix = _moe_lora_to_shard_prefix.get(lora_key)
+        if shard_prefix is None:
             continue
         is_gate = lora_key.endswith(".base_layer")
-        prefix = lora_key.replace(".base_layer", "")
+        prefix = shard_prefix
 
         # Handle GPT-OSS fused 3D tensor format
         if is_gpt_oss_format:
@@ -1035,12 +1070,12 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
 
             if is_gate:
                 # gate_up_proj is stored as 3D tensor: (num_experts, 2*intermediate_dim, hidden_dim)
-                gate_up_key = f"{prefix}.gate_up_proj"
+                gate_up_key = f"{shard_prefix}.gate_up_proj"
                 if gate_up_key in header_metadata:
                     gate_up_W = file.get_tensor(gate_up_key)
                     # Merge LoRA into fused 3D tensor
                     merged_gate_up = _merge_moe_fused_gate_up_expert(
-                        gate_up_W, lora_stats, output_dtype or gate_up_W.dtype
+                        gate_up_W, lora_stats, output_dtype or gate_up_W.dtype, is_transposed=_is_transposed_format
                     )
                     _write_tensor_direct_torch(
                         mm,
@@ -1055,19 +1090,19 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                     if UNSLOTH_ENABLE_LOGGING and debug_logged < 8:
                         try:
                             logger.info(
-                                f"[merge_debug] Merged GPT-OSS gate_up_proj for {prefix}"
+                                f"[merge_debug] Merged GPT-OSS gate_up_proj for {shard_prefix}"
                             )
                             debug_logged += 1
                         except Exception:
                             pass
             else:
                 # down_proj is stored as 3D tensor: (num_experts, hidden_dim, intermediate_dim)
-                down_key = f"{prefix}.down_proj"
+                down_key = f"{shard_prefix}.down_proj"
                 if down_key in header_metadata:
                     down_W = file.get_tensor(down_key)
                     # Merge LoRA into fused 3D tensor
                     merged_down = _merge_moe_fused_down_proj_expert(
-                        down_W, lora_stats, output_dtype or down_W.dtype
+                        down_W, lora_stats, output_dtype or down_W.dtype, is_transposed=_is_transposed_format
                     )
                     _write_tensor_direct_torch(
                         mm,
@@ -1082,7 +1117,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                     if UNSLOTH_ENABLE_LOGGING and debug_logged < 8:
                         try:
                             logger.info(
-                                f"[merge_debug] Merged GPT-OSS down_proj for {prefix}"
+                                f"[merge_debug] Merged GPT-OSS down_proj for {shard_prefix}"
                             )
                             debug_logged += 1
                         except Exception:
@@ -1171,32 +1206,36 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
     return count
 
 
-def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype):
+def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_transposed=None):
     """
-    Merge LoRA for GPT-OSS fused gate_up_proj 3D tensor.
-    gate_up_W shape: (num_experts, hidden_dim, 2*intermediate_dim) [transposed format]
-    LoRA weights are stacked per expert: lora_A (E*R, H), lora_B (2*I, E*R)
+    Merge LoRA for fused gate_up_proj 3D tensor.
+    Supports both formats:
+      - Transposed (GPT-OSS): (E, H, 2*I) with lora_A (E*R, H), lora_B (2*I, E*R)
+      - Standard (Gemma4):    (E, 2*I, H) with lora_A (E*R, H), lora_B (2*I, E*R)
+    is_transposed: if provided, overrides dimension-based heuristic (needed when dims are equal).
     """
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
             return gate_up_W
 
-        # GPT-OSS stores as (E, H, 2*I) - transposed from standard
-        num_experts, hidden_dim, two_inter = gate_up_W.shape
-        inter_dim = two_inter // 2
+        num_experts, dim1, dim2 = gate_up_W.shape
+        total_rank, dim_A = lora_stats.lora_A.shape
+        dim_B, total_rank_B = lora_stats.lora_B.shape
 
-        total_rank, hidden_dim_A = lora_stats.lora_A.shape
-        two_inter_B, total_rank_B = lora_stats.lora_B.shape
-
-        if (
-            total_rank_B != total_rank
-            or hidden_dim_A != hidden_dim
-            or two_inter_B != two_inter
-        ):
+        if total_rank_B != total_rank:
             return gate_up_W
 
         rank = total_rank // num_experts
         if total_rank % num_experts != 0:
+            return gate_up_W
+
+        if is_transposed is not None:
+            use_transpose = is_transposed
+        elif dim_A == dim1 and dim_B == dim2:
+            use_transpose = True
+        elif dim_A == dim2 and dim_B == dim1:
+            use_transpose = False
+        else:
             return gate_up_W
 
         device = (
@@ -1206,24 +1245,16 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype):
         )
         gate_up_merged = gate_up_W.to(device, dtype=torch.float32, non_blocking=True)
 
-        # Merge LoRA for each expert
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
-
-            # lora_A slice: (r, H) -> for this expert
-            a_slice = lora_stats.lora_A[start:end, :]  # (r, H)
-            # lora_B slice: (2*I, r) -> for this expert
-            b_slice = lora_stats.lora_B[:, start:end]  # (2*I, r)
-
-            # delta = lora_B @ lora_A = (2*I, r) @ (r, H) = (2*I, H)
+            a_slice = lora_stats.lora_A[start:end, :]
+            b_slice = lora_stats.lora_B[:, start:end]
             delta = b_slice.to(
                 device, dtype=torch.float32, non_blocking=True
             ) @ a_slice.to(device, dtype=torch.float32, non_blocking=True)
 
-            # Add to this expert's weights: W = W + alpha * delta^T
-            # W is (H, 2*I), delta is (2*I, H), so we need delta.T
             gate_up_merged[expert_idx] = gate_up_merged[expert_idx].add(
-                delta.T, alpha=lora_stats.alpha
+                delta.T if use_transpose else delta, alpha=lora_stats.alpha
             )
 
         return gate_up_merged.to(output_dtype)
@@ -1231,30 +1262,36 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype):
         return gate_up_W
 
 
-def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype):
+def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_transposed=None):
     """
-    Merge LoRA for GPT-OSS fused down_proj 3D tensor.
-    down_W shape: (num_experts, hidden_dim, intermediate_dim)
-    LoRA weights are stacked per expert: lora_A (E*R, I), lora_B (H, E*R)
+    Merge LoRA for fused down_proj 3D tensor.
+    Supports both formats:
+      - Transposed (GPT-OSS): (E, H, I) with lora_A (E*R, I), lora_B (H, E*R)
+      - Standard (Gemma4):    (E, H, I) with lora_A (E*R, H), lora_B (I, E*R)
+    is_transposed: if provided, overrides dimension-based heuristic (needed when H==I).
     """
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
             return down_W
 
-        num_experts, hidden_dim, inter_dim = down_W.shape
+        num_experts, dim1, dim2 = down_W.shape
+        total_rank, dim_A = lora_stats.lora_A.shape
+        dim_B, total_rank_B = lora_stats.lora_B.shape
 
-        total_rank, inter_dim_A = lora_stats.lora_A.shape
-        hidden_dim_B, total_rank_B = lora_stats.lora_B.shape
-
-        if (
-            total_rank_B != total_rank
-            or inter_dim_A != inter_dim
-            or hidden_dim_B != hidden_dim
-        ):
+        if total_rank_B != total_rank:
             return down_W
 
         rank = total_rank // num_experts
         if total_rank % num_experts != 0:
+            return down_W
+
+        if is_transposed is not None:
+            use_transpose = is_transposed
+        elif dim_A == dim1 and dim_B == dim2:
+            use_transpose = True
+        elif dim_A == dim2 and dim_B == dim1:
+            use_transpose = False
+        else:
             return down_W
 
         device = (
@@ -1264,23 +1301,16 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype):
         )
         down_merged = down_W.to(device, dtype=torch.float32, non_blocking=True)
 
-        # Merge LoRA for each expert
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
-
-            # lora_A slice: (r, I) -> for this expert
-            a_slice = lora_stats.lora_A[start:end, :]  # (r, I)
-            # lora_B slice: (H, r) -> for this expert
-            b_slice = lora_stats.lora_B[:, start:end]  # (H, r)
-
-            # delta = lora_B @ lora_A = (H, r) @ (r, I) = (H, I)
+            a_slice = lora_stats.lora_A[start:end, :]
+            b_slice = lora_stats.lora_B[:, start:end]
             delta = b_slice.to(
                 device, dtype=torch.float32, non_blocking=True
             ) @ a_slice.to(device, dtype=torch.float32, non_blocking=True)
 
-            # Add to this expert's weights: W = W + alpha * delta
             down_merged[expert_idx] = down_merged[expert_idx].add(
-                delta, alpha=lora_stats.alpha
+                delta.T if use_transpose else delta, alpha=lora_stats.alpha
             )
 
         return down_merged.to(output_dtype)
