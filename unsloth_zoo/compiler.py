@@ -2769,6 +2769,24 @@ def fixup_fused_lm_head(source):
         "logits = logits * self.config.get_text_config().final_logit_softcapping",
     )
     # END Gemma 3N fixes
+
+    # Gemma 4: normalize flat_logits/flat_labels to shift_logits/shift_labels
+    # and split chained .view(-1).to(...) into separate lines so pattern 3 matches.
+    source = source.replace(
+        "flat_logits = shift_logits.view(-1,",
+        "shift_logits = shift_logits.view(-1,",
+    )
+    source = re.sub(
+        r"([ \t]+)flat_labels = shift_labels\.view\(-1\)\.to\(([^\)]+)\)",
+        r"\1shift_labels = shift_labels.view(-1)\n\1shift_labels = shift_labels.to(\2)",
+        source,
+    )
+    source = source.replace(
+        "loss = loss_fct(flat_logits, flat_labels)",
+        "loss = loss_fct(shift_logits, shift_labels)",
+    )
+    # END Gemma 4 fixes
+
     return source
 
 
