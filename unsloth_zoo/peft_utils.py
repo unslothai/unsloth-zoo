@@ -74,6 +74,16 @@ def get_peft_regex(
     # Get only linear layers
     modules = model.named_modules()
     linear_modules = [name for name, module in modules if isinstance(module, torch.nn.Linear)]
+
+    # Gemma4 ClippableLinear wraps nn.Linear as .linear child -- detect and add those
+    try:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ClippableLinear
+        for name, module in model.named_modules():
+            if isinstance(module, Gemma4ClippableLinear):
+                linear_modules.append(name + ".linear")
+    except ImportError:
+        pass
+
     all_linear_modules = Counter(x.rsplit(".")[-1] for x in linear_modules)
 
     # Isolate lm_head / projection matrices if count == 1

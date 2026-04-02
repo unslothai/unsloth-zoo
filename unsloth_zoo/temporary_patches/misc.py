@@ -70,7 +70,7 @@ def patch_tokenizer_convert_added_tokens():
 
     @classmethod
     def patched_convert_added_tokens(cls, obj, save=False, add_type_field=True):
-        # Handle dicts with "content" key that don't have "__type" field
+        # Only convert if "content" is a string (AddedToken expects str), not a nested dict
         if isinstance(obj, dict) and "content" in obj and "__type" not in obj and isinstance(obj["content"], str):
             return AddedToken(**obj)
         return original_convert_added_tokens.__func__(cls, obj, save=save, add_type_field=add_type_field)
@@ -163,10 +163,7 @@ def patch_CsmDepthDecoderForCausalLM_forward():
     except Exception as e:
         return raise_error("CsmDepthDecoderForCausalLM.forward", e)
 
-    # Inspect the target function signature to decide which version to use
-    target_forward = transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM.forward
-    has_output_attentions = "output_attentions" in inspect.signature(target_forward).parameters
-    has_cache_position = "cache_position" in inspect.signature(target_forward).parameters
+    target_cls = transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM
 
     def forward(
         self,
@@ -234,53 +231,12 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         })
     pass
 
-    if has_output_attentions:
-        patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward, match_level="relaxed")
-    elif has_cache_position:
-        # Intermediate transformers: no output_attentions/output_hidden_states, but has cache_position
-        old_forward = forward
-        def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            backbone_last_hidden_state: Optional[torch.FloatTensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            cache_position: Optional[torch.LongTensor] = None,
-            logits_to_keep: Union[int, torch.Tensor] = 0,
-            **kwargs: KWARGS_TYPE,
-        ) -> Union[Tuple, CausalLMOutputWithPast]:
-            new_kwargs = locals().copy()
-            new_kwargs.pop('old_forward', None)
-            kwargs = new_kwargs.pop('kwargs', dict())
-            new_kwargs.update(kwargs)
-            return old_forward(**new_kwargs)
-        patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward, match_level="relaxed")
-    else:
-        # Transformers v5: no output_attentions, output_hidden_states, or cache_position
-        old_forward = forward
-        def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            backbone_last_hidden_state: Optional[torch.FloatTensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            logits_to_keep: Union[int, torch.Tensor] = 0,
-            **kwargs: KWARGS_TYPE,
-        ) -> Union[Tuple, CausalLMOutputWithPast]:
-            new_kwargs = locals().copy()
-            new_kwargs.pop('old_forward', None)
-            kwargs = new_kwargs.pop('kwargs', dict())
-            new_kwargs.update(kwargs)
-            return old_forward(**new_kwargs)
-        patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward, match_level="relaxed")
+    # Wrap with (self, *args, **kwargs) so check_args_kwargs accepts any
+    # removed params (output_attentions, output_hidden_states, cache_position)
+    _full_forward = forward
+    def forward(self, *args, **kwargs):
+        return _full_forward(self, *args, **kwargs)
+    patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
 
@@ -293,10 +249,7 @@ def patch_CsmForConditionalGeneration_forward():
     except Exception as e:
         return raise_error("CsmForConditionalGeneration.forward", e)
 
-    # Inspect the target function signature to decide which version to use
-    target_forward = transformers.models.csm.modeling_csm.CsmForConditionalGeneration.forward
-    has_output_attentions = "output_attentions" in inspect.signature(target_forward).parameters
-    has_cache_position = "cache_position" in inspect.signature(target_forward).parameters
+    target_cls = transformers.models.csm.modeling_csm.CsmForConditionalGeneration
 
     def forward(
         self,
@@ -414,55 +367,10 @@ def patch_CsmForConditionalGeneration_forward():
         })
     pass
 
-    if has_output_attentions:
-        patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward, match_level="relaxed")
-    elif has_cache_position:
-        # Intermediate transformers: no output_attentions/output_hidden_states, but has cache_position
-        old_forward = forward
-        def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            input_values: Optional[torch.Tensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            input_values_cutoffs: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            cache_position: Optional[torch.LongTensor] = None,
-            logits_to_keep: Union[int, torch.Tensor] = 0,
-            **kwargs: KWARGS_TYPE,
-        ) -> Union[Tuple, CsmOutputWithPast]:
-            new_kwargs = locals().copy()
-            new_kwargs.pop('old_forward', None)
-            kwargs = new_kwargs.pop('kwargs', dict())
-            new_kwargs.update(kwargs)
-            return old_forward(**new_kwargs)
-        patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward, match_level="relaxed")
-    else:
-        # Transformers v5: no output_attentions, output_hidden_states, or cache_position
-        old_forward = forward
-        def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            input_values: Optional[torch.Tensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            input_values_cutoffs: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            logits_to_keep: Union[int, torch.Tensor] = 0,
-            **kwargs: KWARGS_TYPE,
-        ) -> Union[Tuple, CsmOutputWithPast]:
-            new_kwargs = locals().copy()
-            new_kwargs.pop('old_forward', None)
-            kwargs = new_kwargs.pop('kwargs', dict())
-            new_kwargs.update(kwargs)
-            return old_forward(**new_kwargs)
-        patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward, match_level="relaxed")
+    _full_forward = forward
+    def forward(self, *args, **kwargs):
+        return _full_forward(self, *args, **kwargs)
+    patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
 
@@ -1382,3 +1290,88 @@ def patch_vllm_safe_apply_chat_template():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_vllm_safe_apply_chat_template)
+
+
+def patch_apply_chat_template_return_dict():
+    """Restore pre-5.0 return type for apply_chat_template(tokenize=True).
+
+    transformers 5.0+ changed the default of return_dict from False to True.
+    """
+    try:
+        from unsloth_zoo.utils import Version
+        import transformers
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return
+
+        import inspect
+        from transformers import PreTrainedTokenizerBase
+
+        _original_apply = PreTrainedTokenizerBase.apply_chat_template
+        if getattr(_original_apply, "_unsloth_patched", False):
+            return
+
+        try:
+            _orig_sig = inspect.signature(_original_apply)
+            _has_return_dict = "return_dict" in _orig_sig.parameters
+        except Exception:
+            _has_return_dict = True
+
+        if not _has_return_dict:
+            return
+
+        def _patched_apply_chat_template(self, conversation, *args, **kwargs):
+            tokenize = kwargs.get("tokenize", True)
+            if tokenize and "return_dict" not in kwargs:
+                kwargs["return_dict"] = False
+            return _original_apply(self, conversation, *args, **kwargs)
+
+        _patched_apply_chat_template._unsloth_patched = True
+        PreTrainedTokenizerBase.apply_chat_template = _patched_apply_chat_template
+    except Exception:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_apply_chat_template_return_dict)
+
+
+def patch_qwen2vl_image_processor_pixel_attrs():
+    """Add max_pixels/min_pixels property shims to Qwen2VLImageProcessor.
+
+    transformers 5.x removed these as direct instance attributes (they
+    are now stored inside self.size["longest_edge"/"shortest_edge"]).
+    vLLM 0.15.x accesses image_processor.max_pixels directly.
+    Only patch on transformers >= 5.0.0 to avoid breaking 4.x where
+    __init__ sets self.max_pixels as an instance attribute.
+    """
+    try:
+        from unsloth_zoo.utils import Version
+        import transformers
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return  # 4.x already has max_pixels/min_pixels as instance attrs
+    except Exception:
+        return
+
+    try:
+        from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+    except ImportError:
+        return
+
+    # Only add shims if not already present as a class-level descriptor
+    if not isinstance(Qwen2VLImageProcessor.__dict__.get("max_pixels"), property):
+        @property
+        def _max_pixels(self):
+            return self.size.get("longest_edge", self.size.get("max_pixels", None))
+        @property
+        def _min_pixels(self):
+            return self.size.get("shortest_edge", self.size.get("min_pixels", None))
+        Qwen2VLImageProcessor.max_pixels = _max_pixels
+        Qwen2VLImageProcessor.min_pixels = _min_pixels
+
+    try:
+        from transformers.models.qwen2_5_vl.image_processing_qwen2_5_vl import Qwen2_5_VLImageProcessor
+        if not isinstance(Qwen2_5_VLImageProcessor.__dict__.get("max_pixels"), property):
+            Qwen2_5_VLImageProcessor.max_pixels = _max_pixels
+            Qwen2_5_VLImageProcessor.min_pixels = _min_pixels
+    except (ImportError, NameError):
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
