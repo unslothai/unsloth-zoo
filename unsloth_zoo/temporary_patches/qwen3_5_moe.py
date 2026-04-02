@@ -44,7 +44,7 @@ def patch_qwen3_5_moe():
 
     try:
         import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe
-        transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeExperts._unsloth_lora_extractor_fn = _qwen3_5_lora_extractor
+        transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeExperts._unsloth_lora_extractor_fn = staticmethod(_qwen3_5_lora_extractor)
     except Exception as e:
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: Could not register Qwen3_5MoeExperts LoRA extractor: {e}")

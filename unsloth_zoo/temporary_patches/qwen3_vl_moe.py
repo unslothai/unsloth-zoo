@@ -281,7 +281,7 @@ def patch_qwen3_vl_moe():
             return first_weight, second_weight, scaling, num_experts
 
         # Register the extractor on the Experts class
-        transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts._unsloth_lora_extractor_fn = _qwen3_vl_lora_extractor
+        transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts._unsloth_lora_extractor_fn = staticmethod(_qwen3_vl_lora_extractor)
 
 
         backend = select_moe_backend()
