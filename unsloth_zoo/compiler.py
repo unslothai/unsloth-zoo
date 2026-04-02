@@ -1778,7 +1778,8 @@ def apply_fused_lm_head(forward, module=None):
                 r"self\.config\.vocab_size|"
                 r"self\.vocab_size|"
                 r"self\.config\.vocab_size|"
-                r"self\.config\.text_config\.vocab_size"
+                r"self\.config\.text_config\.vocab_size|"
+                r"self\.config\.get_text_config\(\)\.vocab_size"
                 ")",
             )
             .replace("$KWARGS$", r"(?:, \*\*(loss_kwargs|kwargs))?")
@@ -3025,6 +3026,8 @@ DISABLE_COMPILE_MODULES = [
     "GptOssMLP",
     "GptOssExperts",
     "Gemma3nTextModel",
+    "Gemma4TextMoEBlock",  # Old transformers name
+    "Gemma4TextExperts",   # New transformers name (5.5+)
     "Glm4MoeLiteNaiveMoe",
     "Qwen3NextGatedDeltaNet",
     "GatedDeltaNet",
@@ -3643,7 +3646,7 @@ def unsloth_compile_transformers(
     # Remove causal masks
     do_not_remove = False
     for module in remove_causal_masks:
-        if module.endswith(("ForConditionalGeneration", "Gemma3Model")):
+        if module.endswith(("ForConditionalGeneration", "Gemma3Model", "Gemma4Model")):
             do_not_remove = True
             print(
                 f"Unsloth: Will not remove causal mask for {model_location} since it's a VLM!"
