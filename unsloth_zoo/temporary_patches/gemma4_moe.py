@@ -69,36 +69,8 @@ def patch_gemma4_moe():
 
     Gemma4TextDecoderLayer.__init__ = _patched_decoder_init
 
-    # ====================================================================
-    # Define LoRA extraction function for Gemma4 (Standard F.linear Format)
-    # Weights are (E, out_dim, in_dim):
-    #   gate_up_proj: (E, 2*I, H)
-    #   down_proj:    (E, H, I)
-    # ====================================================================
-    def _gemma4_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
-        """
-        Custom LoRA extractor for Gemma4 MoE.
-
-        Expectation for grouped_mm:
-        - first_weight:  (E, in_dim, R)   [Input projection to rank]
-        - second_weight: (E, R, out_dim)  [Rank projection to output]
-
-        Gemma4 standard F.linear format:
-        - weight_A: (E*R, in_dim)  -> reshape to (E, R, in_dim) -> permute to (E, in_dim, R)
-        - weight_B: (out_dim, E*R) -> reshape to (out_dim, E, R) -> permute to (E, R, out_dim)
-        """
-        total_rank = weight_A.shape[0]
-        rank_per_expert = total_rank // num_experts
-        dim_A = weight_A.shape[1]
-        dim_B = weight_B.shape[0]
-
-        first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-        first_weight = first_weight.permute(1, 0, 2).contiguous()  # (E, dim_B, R)
-        second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)  # (E, R, dim_A)
-
-        return first_weight, second_weight, scaling, num_experts
-
-    Gemma4TextMoEBlock._unsloth_lora_extractor_fn = staticmethod(_gemma4_lora_extractor)
+    # Gemma4 uses standard F.linear format (E, out_dim, in_dim), same as Qwen3MoE.
+    # The default _extract_lora_from_wrapper handles this correctly — no custom extractor needed.
 
     # ====================================================================
     # Patch Gemma4TextMoEBlock.forward with optimized grouped GEMM backend.
@@ -109,8 +81,10 @@ def patch_gemma4_moe():
 
     def _gemma4_moe_forward(self, hidden_states, top_k_index, top_k_weights):
         # Fold per_expert_scale into routing weights before grouped_mm
-        pes = self._router_ref.per_expert_scale
-        top_k_weights = top_k_weights * pes[top_k_index].to(top_k_weights.dtype)
+        router_ref = getattr(self, "_router_ref", None)
+        if router_ref is not None:
+            pes = router_ref.per_expert_scale
+            top_k_weights = top_k_weights * pes[top_k_index].to(top_k_weights.dtype)
         return _moe_backend(self, hidden_states, top_k_index, top_k_weights)
 
     patch_function(Gemma4TextMoEBlock, "forward", _gemma4_moe_forward, force=True)
@@ -155,8 +129,9 @@ def patch_gemma4_moe():
                     )
 
             # Drop stale mm_token_type_ids during KV cache generation
-            if mm_token_type_ids is not None and input_ids is not None:
-                if mm_token_type_ids.shape[1] != input_ids.shape[1]:
+            _seq_ref = input_ids if input_ids is not None else inputs_embeds
+            if mm_token_type_ids is not None and _seq_ref is not None:
+                if mm_token_type_ids.shape[1] != _seq_ref.shape[1]:
                     mm_token_type_ids = None
 
             RETURN_HIDDEN_STATES = (

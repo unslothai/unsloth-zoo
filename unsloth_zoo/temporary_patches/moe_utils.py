@@ -959,7 +959,7 @@ def forward_native_grouped_mm(
         up = up.clamp(min=-limit, max=limit)
         glu = gate * torch.sigmoid(gate * alpha)
         inter = (up + 1.0) * glu
-    elif hasattr(self, 'act_fn'):
+    elif hasattr(self, 'act_fn') and callable(self.act_fn):
         inter = self.act_fn(gate) * up
     else:
         inter = F.silu(gate) * up
@@ -1186,13 +1186,11 @@ def forward_triton_grouped_gemm(
     )
 
     # Apply activation and multiply gate with up
-    if hasattr(self, 'act_fn'):
+    if hasattr(self, 'act_fn') and callable(self.act_fn):
         gate, up = first_gemm_output.chunk(2, dim=-1)
         intermediate = self.act_fn(gate) * up
     else:
         intermediate = _silu_and_mul(first_gemm_output)
-
-    # Grouped GEMM 2: down projection
 
     # Grouped GEMM 2: down projection
     # Prepare LoRA data

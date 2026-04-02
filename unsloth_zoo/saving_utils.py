@@ -727,9 +727,9 @@ def _merge_and_overwrite_lora(
                 lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
                 lora_stats = converted_lora_weights.get(lora_key, None)
                 # Fallback: handle Gemma4ClippableLinear (.linear.weight -> .weight)
-                if lora_stats is None and ".linear" in lora_key:
+                if lora_stats is None and lora_key.endswith(".linear"):
                     lora_stats = converted_lora_weights.get(
-                        lora_key.replace(".linear", ""), None
+                        lora_key[:-len(".linear")], None
                     )
                 # Tied embeddings can omit lm_head.weight from safetensors. If lm_head has LoRA
                 # adapters, apply them onto embed_tokens.weight since both share one base tensor.
@@ -1020,13 +1020,24 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
     is_gpt_oss_format = False
     for key in header_metadata.keys():
         if key.endswith(".gate_up_proj") or key.endswith(".down_proj"):
-            if ".experts." in key or ".mlp.experts." in key:
+            if ".experts." in key:
                 is_gpt_oss_format = True
+                break
+
+    # Determine if fused 3D format is transposed (GPT-OSS) or standard (Gemma4)
+    # from gate_up_proj shape: (E, H, 2*I) → transposed, (E, 2*I, H) → standard
+    _is_transposed_format = None
+    if is_gpt_oss_format:
+        for key, meta in header_metadata.items():
+            if key.endswith(".gate_up_proj") and ".experts." in key:
+                shape = meta.get("shape", [])
+                if len(shape) == 3:
+                    _is_transposed_format = shape[2] > shape[1]
                 break
 
     if is_gpt_oss_format and UNSLOTH_ENABLE_LOGGING:
         try:
-            logger.info("[merge_debug] Detected GPT-OSS fused 3D tensor format")
+            logger.info(f"[merge_debug] Detected fused 3D tensor format (transposed={_is_transposed_format})")
         except Exception:
             pass
 
@@ -1050,6 +1061,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
         if shard_prefix is None:
             continue
         is_gate = lora_key.endswith(".base_layer")
+        prefix = shard_prefix
 
         # Handle GPT-OSS fused 3D tensor format
         if is_gpt_oss_format:
@@ -1063,7 +1075,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                     gate_up_W = file.get_tensor(gate_up_key)
                     # Merge LoRA into fused 3D tensor
                     merged_gate_up = _merge_moe_fused_gate_up_expert(
-                        gate_up_W, lora_stats, output_dtype or gate_up_W.dtype
+                        gate_up_W, lora_stats, output_dtype or gate_up_W.dtype, is_transposed=_is_transposed_format
                     )
                     _write_tensor_direct_torch(
                         mm,
@@ -1090,7 +1102,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                     down_W = file.get_tensor(down_key)
                     # Merge LoRA into fused 3D tensor
                     merged_down = _merge_moe_fused_down_proj_expert(
-                        down_W, lora_stats, output_dtype or down_W.dtype
+                        down_W, lora_stats, output_dtype or down_W.dtype, is_transposed=_is_transposed_format
                     )
                     _write_tensor_direct_torch(
                         mm,
@@ -1194,12 +1206,13 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
     return count
 
 
-def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype):
+def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_transposed=None):
     """
     Merge LoRA for fused gate_up_proj 3D tensor.
     Supports both formats:
       - Transposed (GPT-OSS): (E, H, 2*I) with lora_A (E*R, H), lora_B (2*I, E*R)
-      - Standard (Gemma4):    (E, 2*I, H) with lora_A (E*R, 2*I), lora_B (H, E*R)
+      - Standard (Gemma4):    (E, 2*I, H) with lora_A (E*R, H), lora_B (2*I, E*R)
+    is_transposed: if provided, overrides dimension-based heuristic (needed when dims are equal).
     """
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
@@ -1216,7 +1229,9 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype):
         if total_rank % num_experts != 0:
             return gate_up_W
 
-        if dim_A == dim1 and dim_B == dim2:
+        if is_transposed is not None:
+            use_transpose = is_transposed
+        elif dim_A == dim1 and dim_B == dim2:
             use_transpose = True
         elif dim_A == dim2 and dim_B == dim1:
             use_transpose = False
@@ -1247,12 +1262,13 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype):
         return gate_up_W
 
 
-def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype):
+def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_transposed=None):
     """
     Merge LoRA for fused down_proj 3D tensor.
     Supports both formats:
       - Transposed (GPT-OSS): (E, H, I) with lora_A (E*R, I), lora_B (H, E*R)
       - Standard (Gemma4):    (E, H, I) with lora_A (E*R, H), lora_B (I, E*R)
+    is_transposed: if provided, overrides dimension-based heuristic (needed when H==I).
     """
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
@@ -1269,7 +1285,9 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype):
         if total_rank % num_experts != 0:
             return down_W
 
-        if dim_A == dim1 and dim_B == dim2:
+        if is_transposed is not None:
+            use_transpose = is_transposed
+        elif dim_A == dim1 and dim_B == dim2:
             use_transpose = True
         elif dim_A == dim2 and dim_B == dim1:
             use_transpose = False
