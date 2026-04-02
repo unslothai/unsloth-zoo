@@ -71,7 +71,7 @@ def patch_tokenizer_convert_added_tokens():
     @classmethod
     def patched_convert_added_tokens(cls, obj, save=False, add_type_field=True):
         # Handle dicts with "content" key that don't have "__type" field
-        if isinstance(obj, dict) and "content" in obj and "__type" not in obj:
+        if isinstance(obj, dict) and "content" in obj and "__type" not in obj and isinstance(obj["content"], str):
             return AddedToken(**obj)
         return original_convert_added_tokens.__func__(cls, obj, save=save, add_type_field=add_type_field)
 
