@@ -1169,21 +1169,68 @@ def forward_triton_grouped_gemm(
     else:
         w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
 
-    # First grouped GEMM: gate_up projection
-    first_gemm_output = grouped_gemm(
-        X=hidden_states,
-        W=w1,
-        m_sizes=token_counts_by_expert,
-        topk=top_k,
-        gather_indices=gather_indices,
-        permute_x=True,
-        permute_y=False,
-        autotune=False,  # We use cached configs
-        kernel_config_fwd=fwd_config_1,
-        kernel_config_bwd_dX=bwd_dX_config_1,
-        kernel_config_bwd_dW=bwd_dW_config_1,
-        is_first_gemm=True,
-    )
+    # ================================================================
+    # Prepare LoRA data for fused kernel path
+    # ================================================================
+    # Helper to convert LoRA weights from unsloth layout (E,K,R)/(E,R,N)
+    # to fused kernel layout (E,R,K)/(E,N,R)
+    def _to_fused_lora_layout(lora_tuple, input_dtype):
+        if lora_tuple is None:
+            return None, None
+        first_weight, second_weight, s = lora_tuple
+        # first_weight: (E, K, R) -> lora_a: (E, R, K)
+        lora_a = first_weight.to(input_dtype).transpose(-2, -1).contiguous()
+        # second_weight: (E, R, N) -> lora_b: (E, N, R)
+        lora_b = second_weight.to(input_dtype).transpose(-2, -1).contiguous()
+        return lora_a, lora_b, s
+
+    # Gate+Up LoRA
+    gate_up_lora = None
+    if getattr(self, "_unsloth_lora_gate_up_proj", None) is not None:
+        gate_up_lora = self._unsloth_lora_gate_up_proj[:3]
+    elif (
+        use_separated_lora
+        and hasattr(self, "gate_up_proj")
+        and _has_lora_adapters(self.gate_up_proj)
+    ):
+        gate_up_lora = _extract_lora_weights(
+            self.gate_up_proj, num_experts=self.num_experts, experts_module=self
+        )
+
+    gu_fused = _to_fused_lora_layout(gate_up_lora, hidden_states.dtype)
+
+    # First grouped GEMM: gate_up projection (with optional fused LoRA)
+    if gate_up_lora is not None:
+        lora_a, lora_b, scaling = gu_fused
+        first_gemm_output = grouped_gemm(
+            X=hidden_states,
+            W=w1,
+            m_sizes=token_counts_by_expert,
+            topk=top_k,
+            gather_indices=gather_indices,
+            permute_x=True,
+            permute_y=False,
+            autotune=True,
+            is_first_gemm=True,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            lora_scaling=scaling,
+        )
+    else:
+        first_gemm_output = grouped_gemm(
+            X=hidden_states,
+            W=w1,
+            m_sizes=token_counts_by_expert,
+            topk=top_k,
+            gather_indices=gather_indices,
+            permute_x=True,
+            permute_y=False,
+            autotune=False,
+            kernel_config_fwd=fwd_config_1,
+            kernel_config_bwd_dX=bwd_dX_config_1,
+            kernel_config_bwd_dW=bwd_dW_config_1,
+            is_first_gemm=True,
+        )
 
     # Apply activation and multiply gate with up
     if hasattr(self, 'act_fn') and callable(self.act_fn):
@@ -1192,8 +1239,7 @@ def forward_triton_grouped_gemm(
     else:
         intermediate = _silu_and_mul(first_gemm_output)
 
-    # Grouped GEMM 2: down projection
-    # Prepare LoRA data
+    # Down LoRA
     down_lora = None
     if getattr(self, "_unsloth_lora_down_proj", None) is not None:
         down_lora = self._unsloth_lora_down_proj[:3]
@@ -1202,48 +1248,47 @@ def forward_triton_grouped_gemm(
         and hasattr(self, "down_proj")
         and _has_lora_adapters(self.down_proj)
     ):
-        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
+        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts, experts_module=self)
 
     if self.down_proj.shape[-1] == intermediate.shape[-1]:
         w2 = self.down_proj
     else:
         w2 = self.down_proj.transpose(-2, -1).contiguous()
 
-    second_gemm_output = grouped_gemm(
-        X=intermediate,
-        W=w2,
-        m_sizes=token_counts_by_expert,
-        topk=top_k,
-        gather_indices=gather_indices,
-        permute_x=False,
-        permute_y=True,
-        autotune=False,  # We use cached configs
-        kernel_config_fwd=fwd_config_2,
-        kernel_config_bwd_dX=bwd_dX_config_2,
-        kernel_config_bwd_dW=bwd_dW_config_2,
-        is_first_gemm=False,
-    )
+    dn_fused = _to_fused_lora_layout(down_lora, intermediate.dtype)
 
-    # Add separated LoRA contribution for Down
+    # Second grouped GEMM: down projection (with optional fused LoRA)
     if down_lora is not None:
-        first_weight, second_weight, scaling = down_lora
-
-        # Intermediate is already permuted from step 1.
-        # Offsets are same.
-
-        first_weight = first_weight.to(intermediate.dtype)
-        second_weight = second_weight.to(intermediate.dtype)
-
-        lora_delta = _apply_lora_grouped_mm(
-            intermediate,
-            first_weight,
-            second_weight,
-            offsets,
-            scaling,
-            grouped_mm_func=native_moe_grouped_mm
+        lora_a, lora_b, scaling = dn_fused
+        second_gemm_output = grouped_gemm(
+            X=intermediate,
+            W=w2,
+            m_sizes=token_counts_by_expert,
+            topk=top_k,
+            gather_indices=gather_indices,
+            permute_x=False,
+            permute_y=True,
+            autotune=True,
+            is_first_gemm=False,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            lora_scaling=scaling,
         )
-
-        second_gemm_output = second_gemm_output + lora_delta
+    else:
+        second_gemm_output = grouped_gemm(
+            X=intermediate,
+            W=w2,
+            m_sizes=token_counts_by_expert,
+            topk=top_k,
+            gather_indices=gather_indices,
+            permute_x=False,
+            permute_y=True,
+            autotune=False,
+            kernel_config_fwd=fwd_config_2,
+            kernel_config_bwd_dX=bwd_dX_config_2,
+            kernel_config_bwd_dW=bwd_dW_config_2,
+            is_first_gemm=False,
+        )
 
     # Apply routing weights and sum across top_k experts
     top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
