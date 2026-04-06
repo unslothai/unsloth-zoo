@@ -2009,7 +2009,7 @@ def merge_and_overwrite_lora(
     # Step 3: Conditional index handling
     import subprocess
     is_t4 = "Tesla T4" in str(torch.cuda.get_device_name(0))
-    needs_splitting = should_split_shards(is_t4, config, safetensors_list) if save_method == "merged_16bit" else False
+    needs_splitting = should_split_shards(is_t4, config, safetensors_list, max_size_in_bytes) if save_method == "merged_16bit" else False
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
     copied_tokenizer_model_from_cache = False
@@ -2182,10 +2182,10 @@ def merge_and_overwrite_lora(
         pass
     pass
 
-    # Step 6: Regenerate index ONLY for MXFP4 dequantization
+    # Step 6: Regenerate index for MXFP4 dequantization or shard splitting
     if regenerate_index:
         # The logic is now simpler: we just write the map we already built.
-        print("Unsloth: Regenerating safetensors index for dequantized MXFP4 model...")
+        print("Unsloth: Regenerating safetensors index...")
 
         index_data = {"metadata": {}, "weight_map": weight_map}
         index_path = os.path.join(save_directory, "model.safetensors.index.json")
@@ -3266,7 +3266,7 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     return (best_fallback['device_type'], best_fallback['device_id'], fallback_chunk_size)
 pass
 
-def should_split_shards(is_t4, model_config, safetensors_list):
+def should_split_shards(is_t4, model_config, safetensors_list, max_size_in_bytes=0):
     """Determine if we need to split shards based on T4 and GPT-OSS conditions."""
     if not is_t4:
         return False
@@ -3274,6 +3274,11 @@ def should_split_shards(is_t4, model_config, safetensors_list):
     if hasattr(model_config, 'model_type'):
         if model_config.model_type.lower() == 'gpt_oss':
             return True
+
+    # Split single-file models larger than 5GB on T4 to avoid OOM during merge
+    MAX_SINGLE_SHARD_BYTES = 5 * 1024 * 1024 * 1024  # 5GB
+    if len(safetensors_list) == 1 and max_size_in_bytes > MAX_SINGLE_SHARD_BYTES:
+        return True
 
     return False
 pass
