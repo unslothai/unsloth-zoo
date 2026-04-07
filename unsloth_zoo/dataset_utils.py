@@ -184,16 +184,20 @@ pass
 
 def train_on_responses_only(
     trainer,
-    instruction_part = None,
-    response_part    = None,
-    force_match      = True,  # Match newlines as well!
-    tokenizer        = None,  # Optional
-    return_function  = False, # Useful for iterating over lists
-    num_proc         = None,
+    instruction_part  = None,
+    response_part     = None,
+    force_match       = True,  # Match newlines as well!
+    tokenizer         = None,  # Optional
+    return_function   = False, # Useful for iterating over lists
+    num_proc          = None,
+    last_response_only = False, # Train only on the last assistant turn
 ):
     """
     Trains only on responses and not on the instruction by masking out
     the labels with -100 for the instruction part.
+
+    If last_response_only=True, only the final assistant turn has its
+    labels unmasked; all earlier assistant turns remain masked at -100.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     if tokenizer is None and trainer is not None:
@@ -249,13 +253,16 @@ def train_on_responses_only(
         for input_ids, old_labels in zip(input_ids_, labels_):
             n = len(input_ids)
             labels = [-100] * n
-            
+
             use_old_labels = False
             if old_labels is not None:
                 use_old_labels = True
                 assert(n == len(old_labels))
             n_minus_1 = n - 1
             j = 0
+
+            # Collect all (assistant_k, user_j) spans for this sample
+            spans = []
             while j < n:
                 # Find <assistant>
                 if (input_ids[j] == A_first) and \
@@ -308,13 +315,7 @@ def train_on_responses_only(
                                 k = n
                             pass
 
-                            if not use_old_labels:
-                                # Now copy input_ids to labels
-                                labels[assistant_k : user_j] = input_ids [assistant_k : user_j]
-                                # print(assistant_j, assistant_k, user_j, user_k)
-                            else:
-                                # Copy over from old labels!
-                                labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
+                            spans.append((assistant_k, user_j))
                             break
                         pass
                         j += 1
@@ -322,6 +323,17 @@ def train_on_responses_only(
                 pass
                 j += 1
             pass
+
+            # Apply labels: only the last assistant turn when last_response_only=True
+            apply_spans = spans[-1:] if last_response_only else spans
+            for assistant_k, user_j in apply_spans:
+                if not use_old_labels:
+                    # Now copy input_ids to labels
+                    labels[assistant_k : user_j] = input_ids [assistant_k : user_j]
+                else:
+                    # Copy over from old labels!
+                    labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
+
             all_labels.append(labels)
         pass
         return { "labels" : torch.tensor(all_labels, dtype = torch.int64) if use_tensors else all_labels }
