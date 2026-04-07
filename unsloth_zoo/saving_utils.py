@@ -1815,14 +1815,22 @@ def merge_and_overwrite_lora(
             is_local_path = True
             print(f"Detected local model directory: {model_name}")
 
-            # Get safetensors files from local directory
-            for file in os.listdir(model_name):
-                if file.endswith(".safetensors"):
-                    safetensors_list.append(file)
-                    file_path = os.path.join(model_name, file)
-                    file_size = os.path.getsize(file_path)
-                    max_size_in_bytes = max(max_size_in_bytes, file_size)
-                    total_size_in_bytes += file_size
+            # Get safetensors files from local directory.
+            # Mistral-7B-v0.3, Codestral-22B, Mistral-Nemo and Mistral-Small ship a
+            # consolidated.safetensors that duplicates their proper shards. When
+            # proper shards coexist we drop it (it would double download/disk and
+            # cause T4 OOM during the merge pass), but if it is the only file we
+            # keep it so the user can still merge such a local directory.
+            _local_st = [f for f in os.listdir(model_name) if f.endswith(".safetensors")]
+            _has_proper_shards = any(f != "consolidated.safetensors" for f in _local_st)
+            for file in _local_st:
+                if _has_proper_shards and file == "consolidated.safetensors":
+                    continue
+                safetensors_list.append(file)
+                file_path = os.path.join(model_name, file)
+                file_size = os.path.getsize(file_path)
+                max_size_in_bytes = max(max_size_in_bytes, file_size)
+                total_size_in_bytes += file_size
 
             # Check for index file
             index_path = os.path.join(model_name, "model.safetensors.index.json")
@@ -1864,10 +1872,18 @@ def merge_and_overwrite_lora(
                                     "If using a local model, ensure the path exists and contains safetensors files.")
                 file_list = HfFileSystem(token = token).ls(model_name, detail = True)
 
-            # Process HF file listing
-            for x in file_list:
-                if not x["name"].endswith(".safetensors"): continue
-                safetensors_list.append(os.path.split(x["name"])[-1])
+            # Process HF file listing. Same soft filter as the local branch above:
+            # drop consolidated.safetensors only when proper shards coexist.
+            _hf_entries = [x for x in file_list if x["name"].endswith(".safetensors")]
+            _hf_has_proper = any(
+                os.path.split(x["name"])[-1] != "consolidated.safetensors"
+                for x in _hf_entries
+            )
+            for x in _hf_entries:
+                fname = os.path.split(x["name"])[-1]
+                if _hf_has_proper and fname == "consolidated.safetensors":
+                    continue
+                safetensors_list.append(fname)
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
 
