@@ -312,6 +312,7 @@ global FIRST_PASS
 global CURRENT_GC_INDEX
 global BUFFER_EVENTS_A
 global BUFFER_EVENTS_B
+global NEXT_BUFFER_SLOT
 
 if DEVICE_TYPE in ("cuda", "hip"):
     torch_gpu_stream = torch.cuda.stream
@@ -338,6 +339,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     global CURRENT_GC_INDEX
     global BUFFER_EVENTS_A
     global BUFFER_EVENTS_B
+    global NEXT_BUFFER_SLOT
     CPU_BUFFERS = []
     CPU_INDEX = 0
 
@@ -359,6 +361,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
 
     # Allocate buffers to how many GPUs
     n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
+    NEXT_BUFFER_SLOT = [0] * n_gpus
     try:
         GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
         # Double buffering: try to allocate buffer B
@@ -367,9 +370,17 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             USE_DOUBLE_BUFFER = True
             # Per-buffer events to prevent race conditions in double buffering.
             # Each event tracks when compute on that buffer finishes
-            BUFFER_EVENTS_A = tuple([torch.cuda.Event() for _ in range(n_gpus)])
-            BUFFER_EVENTS_B = tuple([torch.cuda.Event() for _ in range(n_gpus)])
-        except Exception as e:
+            if DEVICE_TYPE in ("cuda", "hip"):
+                event_ctor = torch.cuda.Event
+            elif DEVICE_TYPE == "xpu":
+                event_ctor = torch.xpu.Event
+            else:
+                raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
+            BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
+            BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
             GPU_BUFFERS_B = None
             USE_DOUBLE_BUFFER = False
             BUFFER_EVENTS_A = None
@@ -493,8 +504,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                             if new_size > GPU_BUFFER_B.numel():
                                 try:
                                     GPU_BUFFER_B.resize_(new_size)
-                                    print("Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.")
-                                except Exception as e:
+                                    # print("Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.")
+                                except RuntimeError as e:
+                                    if "out of memory" not in str(e).lower():
+                                        raise
                                     # OOM - disable double buffering
                                     USE_DOUBLE_BUFFER = False
                         x = x[:new_size].view(shape)
@@ -504,7 +517,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         with torch_gpu_stream(EXTRA_STREAM):
                             x.copy_(arg, non_blocking = True)
 
-                        ctx._saved_metadata = (new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM,)
+                        global NEXT_BUFFER_SLOT
+                        buffer_slot = NEXT_BUFFER_SLOT[device_index]
+                        NEXT_BUFFER_SLOT[device_index] ^= 1
+                        ctx._saved_metadata = (new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM, buffer_slot,)
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
 
@@ -513,7 +529,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                             print("Unsloth: Will smartly offload gradients to save VRAM!")
                             USE_UNSLOTH_GC = False
                     else:
-                        ctx._saved_metadata = (None, None, None, None, None, None,)
+                        ctx._saved_metadata = (None, None, None, None, None, None, None,)
                         tensor_inputs.append(arg)
                     pass
                 else:
@@ -553,15 +569,15 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         tensor_indices = ctx.tensor_indices
         tensors = ctx.saved_tensors
 
-        new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM = ctx._saved_metadata
+        new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM, buffer_slot = ctx._saved_metadata
         if CPU_INDEX is not None:
             global GPU_BUFFER
             global USE_DOUBLE_BUFFER
             global GPU_BUFFERS_B
             global BUFFER_EVENTS_A
             global BUFFER_EVENTS_B
-            # Select which buffer to use based on CPU_INDEX parity
-            if USE_DOUBLE_BUFFER and (CPU_INDEX % 2 == 1):
+            # Select which buffer to use based on per-device buffer_slot
+            if USE_DOUBLE_BUFFER and buffer_slot == 1:
                 buffer = GPU_BUFFERS_B[device_index][:new_size].view(shape)
             else:
                 buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
@@ -571,10 +587,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:
                 # Wait for the last compute on THIS SPECIFIC buffer to finish
-                if CPU_INDEX % 2 == 1:
-                    EXTRA_STREAM.wait_event(BUFFER_EVENTS_B[device_index])
-                else:
-                    EXTRA_STREAM.wait_event(BUFFER_EVENTS_A[device_index])
+                event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
+                EXTRA_STREAM.wait_event(event_buffer[device_index])
             else:
                 # Single buffer mode: Must wait for MAIN_STREAM to finish
                 EXTRA_STREAM.wait_stream(MAIN_STREAM)
@@ -665,10 +679,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
         # Record event after compute finishes so the copy stream knows
         if CPU_INDEX is not None and USE_DOUBLE_BUFFER:
-            if CPU_INDEX % 2 == 1:
-                BUFFER_EVENTS_B[device_index].record(MAIN_STREAM)
-            else:
-                BUFFER_EVENTS_A[device_index].record(MAIN_STREAM)
+            event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
+            event_buffer[device_index].record(MAIN_STREAM)
 
         grads = tuple(
             inp.grad if isinstance(inp, torch.Tensor) else None
@@ -933,6 +945,11 @@ def reset_unsloth_gradient_checkpointing_buffers():
     global FIRST_PASS
     global CURRENT_GC_INDEX
     global USE_UNSLOTH_GC
+    global NEXT_BUFFER_SLOT
+    global GPU_BUFFERS_B
+    global USE_DOUBLE_BUFFER
+    global BUFFER_EVENTS_A
+    global BUFFER_EVENTS_B
 
     # Check if buffers exist
     if CPU_BUFFERS is None or GPU_BUFFERS is None:
@@ -971,6 +988,29 @@ def reset_unsloth_gradient_checkpointing_buffers():
     FIRST_PASS = True
     CURRENT_GC_INDEX = 0
     USE_UNSLOTH_GC = True  # Re-enable the "Will smartly offload" message
+    if NEXT_BUFFER_SLOT is not None:
+        for i in range(len(NEXT_BUFFER_SLOT)):
+            NEXT_BUFFER_SLOT[i] = 0
+
+    # Re-enable double buffering if buffer B still exists, or try to re-allocate
+    if GPU_BUFFERS_B is not None:
+        USE_DOUBLE_BUFFER = True
+    else:
+        try:
+            n_gpus = len(GPU_BUFFERS)
+            dtype = GPU_BUFFERS[0].dtype
+            GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype=dtype, device=f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
+            if DEVICE_TYPE in ("cuda", "hip"):
+                event_ctor = torch.cuda.Event
+            elif DEVICE_TYPE == "xpu":
+                event_ctor = torch.xpu.Event
+            else:
+                raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
+            BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
+            BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
+            USE_DOUBLE_BUFFER = True
+        except RuntimeError:
+            pass
 
     # Clean up freed memory
     torch.cuda.empty_cache()
