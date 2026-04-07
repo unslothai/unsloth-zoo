@@ -399,7 +399,22 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):
     """Wrap a Gemma-4 text-model-style forward so it builds an internal
     DynamicCache when KV sharing is active but the caller passed use_cache=False.
     The internal cache is nulled out in the returned output so the caller's
-    semantics are preserved."""
+    semantics are preserved.
+
+    Argument resolution uses `inspect.signature.bind_partial` so that
+    `past_key_values` and `use_cache` are correctly resolved whether the
+    caller passed them positionally or by keyword. Calling the inner forward
+    via `bound.args` / `bound.kwargs` (rather than mixing positional and
+    keyword) avoids the `TypeError: got multiple values for argument`
+    case that a naive `kwargs[...] = ...` injection would trigger when the
+    caller already passed the same argument positionally.
+    """
+    import inspect
+
+    try:
+        _sig = inspect.signature(_orig_forward)
+    except (TypeError, ValueError):
+        _sig = None
 
     def forward(self, *args, **kwargs):
         num_kv_shared = getattr(
@@ -409,9 +424,24 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):
         if not num_kv_shared or num_kv_shared <= 0:
             return _orig_forward(self, *args, **kwargs)
 
-        past_key_values = kwargs.get("past_key_values", None)
-        use_cache_kw = kwargs.get("use_cache", None)
-        # Resolve what the original forward would have used.
+        # Resolve past_key_values and use_cache from EITHER args or kwargs.
+        # bind_partial handles both positional and keyword forms uniformly.
+        if _sig is None:
+            # Fallback if signature introspection failed: kwargs-only path.
+            past_key_values = kwargs.get("past_key_values", None)
+            use_cache_kw = kwargs.get("use_cache", None)
+            arguments = None
+        else:
+            try:
+                bound = _sig.bind_partial(self, *args, **kwargs)
+            except TypeError:
+                # Caller passed something the original forward will reject;
+                # let the original forward raise the canonical error.
+                return _orig_forward(self, *args, **kwargs)
+            arguments = bound.arguments
+            past_key_values = arguments.get("past_key_values", None)
+            use_cache_kw = arguments.get("use_cache", None)
+
         use_cache_resolved = (
             use_cache_kw
             if use_cache_kw is not None
@@ -431,23 +461,61 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):
         except Exception:
             return _orig_forward(self, *args, **kwargs)
 
-        # Inject the cache. We also force use_cache=True on the inner call
-        # so the original forward takes the same mask/position path it would
-        # have with a real cache -- this matches the shape the KV-sharing
-        # layers expect. The outer result is cleaned up below.
-        kwargs["past_key_values"] = DynamicCache(config=self.config)
-        kwargs["use_cache"] = True
+        # Inject the cache and force use_cache=True on the inner call so the
+        # original forward takes the same mask/position path it would have
+        # with a real cache. The outer result is cleaned up below to preserve
+        # the caller's use_cache=False contract.
+        if arguments is not None:
+            arguments["past_key_values"] = DynamicCache(config=self.config)
+            arguments["use_cache"] = True
+            # Re-bind through args/kwargs to avoid duplicate-keyword TypeErrors
+            # if the caller had passed past_key_values or use_cache positionally.
+            inner_args = bound.args
+            inner_kwargs = bound.kwargs
+            # bound.args / bound.kwargs are derived from `arguments`, so they
+            # already contain the injected values in the correct slot.
+            result = _orig_forward(*inner_args, **inner_kwargs)
+        else:
+            kwargs["past_key_values"] = DynamicCache(config=self.config)
+            kwargs["use_cache"] = True
+            result = _orig_forward(self, *args, **kwargs)
 
-        result = _orig_forward(self, *args, **kwargs)
-
-        # Preserve the caller's use_cache=False contract: strip the cache
-        # from the output. BaseModelOutputWithPast is a dataclass-like
-        # ModelOutput that allows assignment.
+        # Preserve the caller's use_cache=False contract: null the cache
+        # from EVERY shape the result might have:
+        #   1. ModelOutput (BaseModelOutputWithPast) -- attribute + dict slot
+        #   2. plain dict
+        #   3. tuple (Gemma4Model.forward is decorated with @can_return_tuple,
+        #      so return_dict=False produces a tuple where past_key_values is
+        #      typically the second element of BaseModelOutputWithPast.to_tuple())
         try:
-            if hasattr(result, "past_key_values"):
-                result.past_key_values = None
-            elif isinstance(result, dict) and "past_key_values" in result:
-                result["past_key_values"] = None
+            if isinstance(result, tuple):
+                # ModelOutput.to_tuple() drops None entries, so the cache
+                # may not be at a fixed index. Reconstruct by scanning for
+                # the injected DynamicCache instance and dropping it.
+                injected = (
+                    arguments["past_key_values"]
+                    if arguments is not None
+                    else kwargs["past_key_values"]
+                )
+                new_items = tuple(None if x is injected else x for x in result)
+                result = new_items
+            else:
+                # ModelOutput subclasses behave like dicts internally; using
+                # __setitem__ keeps both the attribute slot and the underlying
+                # OrderedDict in sync. Fall back to attribute assignment if
+                # the result does not support __setitem__.
+                set_via_item = False
+                try:
+                    if hasattr(result, "__setitem__") and "past_key_values" in result:
+                        result["past_key_values"] = None
+                        set_via_item = True
+                except (TypeError, KeyError):
+                    set_via_item = False
+                if not set_via_item and hasattr(result, "past_key_values"):
+                    try:
+                        result.past_key_values = None
+                    except (AttributeError, TypeError):
+                        pass
         except Exception:
             pass
         return result
