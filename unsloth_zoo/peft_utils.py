@@ -42,6 +42,7 @@ SKIP_QUANTIZATION_MODULES = [
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
+    "patch_embedder",           # Gemma4 vision: bare nn.Linear without Gemma4ClippableLinear wrapper, cannot dispatch bnb-packed weights
 ]
 
 def get_peft_regex(
