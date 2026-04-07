@@ -656,6 +656,7 @@ class UnslothVisionDataCollator:
         response_part    = None,
         force_match      = True, # Match newlines as well!
         num_proc         = None,
+        last_response_only = False, # Train only on the last assistant turn
         completion_only_loss = True,
         pad_to_multiple_of = None,
         resize_dimension = 0, # can be 0, 1, 'max' or 'min' (max resizes based on the max of height width, min the min size, 0 the first dim, etc)
@@ -733,12 +734,13 @@ class UnslothVisionDataCollator:
             assert(isinstance(instruction_part, str) and isinstance(response_part, str))
             self.train_on_responses_only = _train_on_responses_only(
                 None,
-                instruction_part = instruction_part,
-                response_part    = response_part,
-                force_match      = force_match,
-                tokenizer        = processor,
-                return_function  = True,
-                num_proc         = num_proc,
+                instruction_part   = instruction_part,
+                response_part      = response_part,
+                force_match        = force_match,
+                tokenizer          = processor,
+                return_function    = True,
+                num_proc           = num_proc,
+                last_response_only = last_response_only,
             )
         else:
             self.train_on_responses_only = None

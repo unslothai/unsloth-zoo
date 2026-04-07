@@ -197,7 +197,9 @@ def train_on_responses_only(
     the labels with -100 for the instruction part.
 
     If last_response_only=True, only the final assistant turn has its
-    labels unmasked; all earlier assistant turns remain masked at -100.
+    labels unmasked; all earlier assistant turns remain masked at -100
+    (they are never written, so they keep the initialized -100 values
+    and are not copied from old_labels either).
     """
     # All Unsloth Zoo code licensed under LGPLv3
     if tokenizer is None and trainer is not None:
@@ -324,7 +326,9 @@ def train_on_responses_only(
                 j += 1
             pass
 
-            # Apply labels: only the last assistant turn when last_response_only=True
+            # Apply labels: only the last assistant turn when last_response_only=True.
+            # Note: spans[-1:] safely returns [] when spans is empty (no assistant turn
+            # was found), so a sample with no assistant turn stays fully masked at -100.
             apply_spans = spans[-1:] if last_response_only else spans
             for assistant_k, user_j in apply_spans:
                 if not use_old_labels:
