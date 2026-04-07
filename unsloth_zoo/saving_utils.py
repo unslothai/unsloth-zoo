@@ -1815,14 +1815,22 @@ def merge_and_overwrite_lora(
             is_local_path = True
             print(f"Detected local model directory: {model_name}")
 
-            # Get safetensors files from local directory
-            for file in os.listdir(model_name):
-                if file.endswith(".safetensors"):
-                    safetensors_list.append(file)
-                    file_path = os.path.join(model_name, file)
-                    file_size = os.path.getsize(file_path)
-                    max_size_in_bytes = max(max_size_in_bytes, file_size)
-                    total_size_in_bytes += file_size
+            # Get safetensors files from local directory.
+            # Mistral-7B-v0.3, Codestral-22B, Mistral-Nemo and Mistral-Small ship a
+            # consolidated.safetensors that duplicates their proper shards. When
+            # proper shards coexist we drop it (it would double download/disk and
+            # cause T4 OOM during the merge pass), but if it is the only file we
+            # keep it so the user can still merge such a local directory.
+            _local_st = [f for f in os.listdir(model_name) if f.endswith(".safetensors")]
+            _has_proper_shards = any(f != "consolidated.safetensors" for f in _local_st)
+            for file in _local_st:
+                if _has_proper_shards and file == "consolidated.safetensors":
+                    continue
+                safetensors_list.append(file)
+                file_path = os.path.join(model_name, file)
+                file_size = os.path.getsize(file_path)
+                max_size_in_bytes = max(max_size_in_bytes, file_size)
+                total_size_in_bytes += file_size
 
             # Check for index file
             index_path = os.path.join(model_name, "model.safetensors.index.json")
@@ -1864,10 +1872,18 @@ def merge_and_overwrite_lora(
                                     "If using a local model, ensure the path exists and contains safetensors files.")
                 file_list = HfFileSystem(token = token).ls(model_name, detail = True)
 
-            # Process HF file listing
-            for x in file_list:
-                if not x["name"].endswith(".safetensors"): continue
-                safetensors_list.append(os.path.split(x["name"])[-1])
+            # Process HF file listing. Same soft filter as the local branch above:
+            # drop consolidated.safetensors only when proper shards coexist.
+            _hf_entries = [x for x in file_list if x["name"].endswith(".safetensors")]
+            _hf_has_proper = any(
+                os.path.split(x["name"])[-1] != "consolidated.safetensors"
+                for x in _hf_entries
+            )
+            for x in _hf_entries:
+                fname = os.path.split(x["name"])[-1]
+                if _hf_has_proper and fname == "consolidated.safetensors":
+                    continue
+                safetensors_list.append(fname)
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
 
@@ -2009,7 +2025,7 @@ def merge_and_overwrite_lora(
     # Step 3: Conditional index handling
     import subprocess
     is_t4 = "Tesla T4" in str(torch.cuda.get_device_name(0))
-    needs_splitting = should_split_shards(is_t4, config, safetensors_list) if save_method == "merged_16bit" else False
+    needs_splitting = should_split_shards(is_t4, config, safetensors_list, max_size_in_bytes) if save_method == "merged_16bit" else False
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
     copied_tokenizer_model_from_cache = False
@@ -2182,10 +2198,10 @@ def merge_and_overwrite_lora(
         pass
     pass
 
-    # Step 6: Regenerate index ONLY for MXFP4 dequantization
+    # Step 6: Regenerate index for MXFP4 dequantization or shard splitting
     if regenerate_index:
         # The logic is now simpler: we just write the map we already built.
-        print("Unsloth: Regenerating safetensors index for dequantized MXFP4 model...")
+        print("Unsloth: Regenerating safetensors index...")
 
         index_data = {"metadata": {}, "weight_map": weight_map}
         index_path = os.path.join(save_directory, "model.safetensors.index.json")
@@ -3266,7 +3282,7 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     return (best_fallback['device_type'], best_fallback['device_id'], fallback_chunk_size)
 pass
 
-def should_split_shards(is_t4, model_config, safetensors_list):
+def should_split_shards(is_t4, model_config, safetensors_list, max_size_in_bytes=0):
     """Determine if we need to split shards based on T4 and GPT-OSS conditions."""
     if not is_t4:
         return False
@@ -3274,6 +3290,11 @@ def should_split_shards(is_t4, model_config, safetensors_list):
     if hasattr(model_config, 'model_type'):
         if model_config.model_type.lower() == 'gpt_oss':
             return True
+
+    # Split single-file models larger than 5GB on T4 to avoid OOM during merge
+    MAX_SINGLE_SHARD_BYTES = 5 * 1024 * 1024 * 1024  # 5GB
+    if len(safetensors_list) == 1 and max_size_in_bytes > MAX_SINGLE_SHARD_BYTES:
+        return True
 
     return False
 pass
