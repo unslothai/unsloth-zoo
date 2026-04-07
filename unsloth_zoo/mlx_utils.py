@@ -17,7 +17,7 @@
 """
 MLX utilities for Apple Silicon training.
 
-Provides loss functions (CCE via mlx-cce, baseline CE), data batching,
+Provides loss functions (CCE and baseline CE), data batching,
 weight extraction helpers, and model save/load/export for LoRA adapters
 and merged models (safetensors, GGUF, HuggingFace Hub).
 """
@@ -31,6 +31,9 @@ import sys
 import shutil
 import tempfile
 from pathlib import Path
+
+
+from .mlx_cce import _get_runtime_cce
 
 
 def apply_gradient_checkpointing(model):
@@ -72,18 +75,33 @@ def remove_gradient_checkpointing(model):
         del layer_cls._orig_call
 
 
+def _get_text_model(model):
+    """Get the inner text model, unwrapping multimodal wrappers if present.
+
+    Standard models (Llama, Qwen): model itself is the text model.
+    Multimodal wrappers (Gemma 4): model.language_model is the text model.
+
+    Returns the text model that has .model (backbone) and optionally .lm_head.
+    """
+    if hasattr(model, "language_model"):
+        return model.language_model
+    return model
+
+
 def _get_lm_head_layer(model):
     """Get the raw LM head layer (QuantizedLinear or Linear/Embedding).
 
     Checks for a separate lm_head first (untied models like Qwen), then
     falls back to embed_tokens (tied models like Gemma/Llama).
+    Handles multimodal wrappers (e.g. Gemma 4) via _get_text_model.
 
     Returns the layer object (not its weight), so callers can access
     .weight, .scales, .biases, .group_size, .bits for quantized layers.
     """
-    if hasattr(model, "lm_head") and model.lm_head is not None:
-        return model.lm_head
-    return model.model.embed_tokens
+    tm = _get_text_model(model)
+    if hasattr(tm, "lm_head") and tm.lm_head is not None:
+        return tm.lm_head
+    return tm.model.embed_tokens
 
 
 def _is_quantized_layer(layer):
@@ -91,16 +109,12 @@ def _is_quantized_layer(layer):
     return hasattr(layer, "scales")
 
 
-def has_cce_kernel():
-    """Check if mx.fast.cce_loss is available (requires mlx-cce)."""
-    return hasattr(mx.fast, "cce_loss")
-
-
 def _get_logit_softcap(model):
-    """Get logit softcapping value if model uses it (e.g. Gemma-2), else 0.0."""
-    softcap = getattr(model, "final_logit_softcapping", None)
-    if softcap is None and hasattr(model, "args"):
-        softcap = getattr(model.args, "final_logit_softcapping", None)
+    """Get logit softcapping value if model uses it (e.g. Gemma-2/4), else 0.0."""
+    tm = _get_text_model(model)
+    softcap = getattr(tm, "final_logit_softcapping", None)
+    if softcap is None and hasattr(tm, "args"):
+        softcap = getattr(tm.args, "final_logit_softcapping", None)
     return float(softcap) if softcap is not None and softcap > 0 else 0.0
 
 
@@ -120,23 +134,16 @@ def _is_lm_head_trainable(model):
 
 
 def make_cce_loss_fn(model):
-    """Create a CCE loss function using mx.fast.cce_loss from mlx-cce.
+    """Create a CCE loss function using the bundled chunked cross-entropy engine.
 
     CCE computes cross-entropy directly from hidden states and the LM head weight,
     avoiding full logit materialization. This saves significant memory for large
-    vocabularies. For V=256K+ models, CCE is both faster and more memory-efficient.
-
-    If the LM head is quantized, passes raw uint32 weight + scales + biases
-    directly to cce_loss, using fused quantized matmul kernels.
+    vocabularies.
 
     Returns:
         A function (model, batch, lengths) -> (loss, ntoks).
+        The function has a ``_unsloth_cce_backend`` attribute for logging.
     """
-    if not has_cce_kernel():
-        raise RuntimeError(
-            "mx.fast.cce_loss not available. Install mlx-cce: pip install mlx-cce"
-        )
-
     softcap = _get_logit_softcap(model)
     if softcap > 0:
         print(f"Unsloth: CCE using logit_softcap={softcap} for this model.")
@@ -144,61 +151,86 @@ def make_cce_loss_fn(model):
     lm_layer = _get_lm_head_layer(model)
     use_quantized = _is_quantized_layer(lm_layer)
 
+    _has_wrapper = hasattr(model, "language_model")
+
+
+    tm = _get_text_model(model)
+    _has_lm_head = hasattr(tm, "lm_head") and tm.lm_head is not None
+    _has_lm_head_q = _has_lm_head and hasattr(tm.lm_head, "scales")
+
+    def _get_backbone(model):
+        """Get backbone (for hidden states) from the live model tree."""
+        if _has_wrapper:
+            return model.language_model.model
+        return model.model
+
+    def _get_lm_weight_layer(model):
+        """Get LM head or embed_tokens layer from the live model tree."""
+        if _has_wrapper:
+            tm = model.language_model
+        else:
+            tm = model
+        if _has_lm_head:
+            return tm.lm_head
+        return tm.model.embed_tokens
+
     if use_quantized:
         group_size = getattr(lm_layer, "group_size", 64)
         bits = getattr(lm_layer, "bits", 4)
         print(f"Unsloth: CCE using quantized matmul (group_size={group_size}, bits={bits})")
-        _has_lm_head_q = (hasattr(model, "lm_head")
-                          and model.lm_head is not None
-                          and hasattr(model.lm_head, "scales"))
         _has_biases = hasattr(lm_layer, "biases")
+
+        rt_cce = _get_runtime_cce(
+            ignore_index=-100,
+            logit_softcap=softcap,
+            quantized=True,
+            group_size=group_size,
+            bits=bits,
+        )
 
         def loss_fn(model, batch, lengths):
             inputs, targets = batch[:, :-1], batch[:, 1:]
-            hidden = model.model(inputs)
-            layer = model.lm_head if _has_lm_head_q else model.model.embed_tokens
+            hidden = _get_backbone(model)(inputs)
+            layer = _get_lm_weight_layer(model)
             w = layer.weight
             sc = layer.scales
-            bi = layer.biases if _has_biases else None
+            bi = layer.biases if _has_biases else mx.zeros_like(layer.scales)
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
             masked_targets = mx.where(mask, targets, -100)
             ntoks = mask.sum()
-            loss = mx.fast.cce_loss(
-                hidden, w, masked_targets,
-                scales=sc, biases=bi,
-                group_size=group_size, bits=bits,
-                ignore_index=-100,
-                logit_softcap=softcap,
-            )
+            hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / ntoks
             return loss, ntoks
     else:
-        _has_lm_head = (hasattr(model, "lm_head")
-                        and model.lm_head is not None
-                        and hasattr(model.lm_head, "weight"))
         _skip_weight_grad = not _is_lm_head_trainable(model)
         if _skip_weight_grad:
             print("Unsloth: CCE skipping weight gradient (LM head is frozen).")
 
+        rt_cce = _get_runtime_cce(
+            ignore_index=-100,
+            logit_softcap=softcap,
+        )
+
         def loss_fn(model, batch, lengths):
             inputs, targets = batch[:, :-1], batch[:, 1:]
-            hidden = model.model(inputs)
-            w = model.lm_head.weight if _has_lm_head else model.model.embed_tokens.weight
+            hidden = _get_backbone(model)(inputs)
+            w = _get_lm_weight_layer(model).weight
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
             masked_targets = mx.where(mask, targets, -100)
             ntoks = mask.sum()
-            loss = mx.fast.cce_loss(
-                hidden, w, masked_targets,
-                ignore_index=-100,
-                logit_softcap=softcap,
-            )
+            hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / ntoks
             return loss, ntoks
 
+    loss_fn._unsloth_cce_backend = "runtime-cce"
     return loss_fn
 
 
@@ -206,7 +238,7 @@ def make_baseline_loss_fn():
     """Create a standard cross-entropy loss function.
 
     Uses the full logit computation through the LM head, then applies
-    nn.losses.cross_entropy. This is the fallback when CCE is not available.
+    nn.losses.cross_entropy. Used when use_cce=False.
 
     Returns:
         A function (model, batch, lengths) -> (loss, ntoks).

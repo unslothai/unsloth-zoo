@@ -47,6 +47,8 @@ dependencies = [
     "msgspec",
     "typing_extensions",
     "filelock",
+    "mlx>=0.22.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "mlx-lm>=0.22.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
 ]
 
 [tool.setuptools.dynamic]
@@ -91,7 +93,6 @@ intelgpu = [
     "unsloth_zoo[huggingface]",
 ]
 mlx = [
-    "mlx-cce>=0.30.7 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     "mlx-lm>=0.22.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
 ]
 

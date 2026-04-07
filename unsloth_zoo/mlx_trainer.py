@@ -49,7 +49,6 @@ from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from .mlx_utils import (
     make_cce_loss_fn,
     make_baseline_loss_fn,
-    has_cce_kernel,
     create_batches,
     iterate_training_batches,
     save_lora_adapters,
@@ -311,17 +310,12 @@ class MLXTrainer:
         model = self.model
 
         # Pick loss function — returns (loss, ntoks) tuples
-        use_cce = args.use_cce and has_cce_kernel()
-        if args.use_cce and not has_cce_kernel():
-            print(
-                "Unsloth: mx.fast.cce_loss not found. "
-                "Install mlx-cce for memory-efficient CCE. "
-                "Falling back to standard cross-entropy."
-            )
+        use_cce = args.use_cce
 
         if use_cce:
             loss_fn = make_cce_loss_fn(model)
-            print("Unsloth: Using CCE loss for memory-efficient training.")
+            cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
+            print(f"Unsloth: Using CCE loss ({cce_backend}) for memory-efficient training.")
         else:
             loss_fn = make_baseline_loss_fn()
             print("Unsloth: Using standard cross-entropy loss.")
@@ -505,6 +499,12 @@ class MLXTrainer:
 
                 self._train_loss_history.append(train_loss)
                 self._step_times.append(train_time / steps if steps > 0 else 0)
+
+                # Benchmark hook: reset peak memory after warmup
+                reset_after = getattr(self, '_benchmark_reset_peak_after_step', 0)
+                if reset_after > 0 and current_step == reset_after:
+                    mx.synchronize()
+                    mx.reset_peak_memory()
 
                 print(
                     f"  Step {current_step}/{total_steps} | "
