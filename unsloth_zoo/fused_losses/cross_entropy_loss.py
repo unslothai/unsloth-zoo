@@ -466,6 +466,14 @@ def unsloth_fused_ce_loss(
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
 
+    # Move hidden_states to lm_head's device if they differ (e.g. multi-GPU
+    # device_map="balanced"). torch.func.grad_and_value wraps inputs and fails
+    # with "Cannot access storage of TensorWrapper" when tensors span devices.
+    # Autograd tracks .to() and moves gradients back to the original device.
+    device = lm_head_weight.device
+    if hidden_states.device != device:
+        hidden_states = hidden_states.to(device = device)
+
     if _FUSED_CE_LOSS_SUPPORTED:
         try:
             return apply_autograd_function(UnslothFusedLoss, dict(
@@ -484,9 +492,7 @@ def unsloth_fused_ce_loss(
                 extra_kwargs = kwargs,
             ))
         except NotImplementedError:
-            # torch.func.grad_and_value fails on some configurations, e.g.
-            # multi-GPU device_map="balanced" causes "Cannot access storage
-            # of TensorWrapper" when _autograd_grad hits cross-device tensors.
+            # Fallback if torch.func.grad_and_value still fails for other reasons.
             _FUSED_CE_LOSS_SUPPORTED = False
             logger.warning_once(
                 "Unsloth: Fused cross entropy loss is not supported (torch.func.grad_and_value failed). "
