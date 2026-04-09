@@ -494,11 +494,14 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                             BACKWARD_PASS = False
                             CPU_INDEX = 0
                             if not FIRST_PASS and not USE_DOUBLE_BUFFER and GPU_BUFFERS_B is not None:
-                                if DEVICE_TYPE in ("cuda", "hip"):
-                                    free_mem, _ = torch.cuda.mem_get_info(device_index)
-                                elif DEVICE_TYPE == "xpu":
-                                    free_mem, _ = torch.xpu.mem_get_info(device_index)
-                                else:
+                                try:
+                                    if DEVICE_TYPE in ("cuda", "hip"):
+                                        free_mem, _ = torch.cuda.mem_get_info(device_index)
+                                    elif DEVICE_TYPE == "xpu":
+                                        free_mem, _ = torch.xpu.mem_get_info(device_index)
+                                    else:
+                                        free_mem = 0
+                                except Exception as e:
                                     free_mem = 0
                                 if free_mem > DOUBLE_BUFFER_HEADROOM:
                                     USE_DOUBLE_BUFFER = True
@@ -1048,7 +1051,12 @@ def reset_unsloth_gradient_checkpointing_buffers():
 
     # Reset double buffering if buffer B still exists, or try to re-allocate
     if os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER", "0") == "1":
-        pass
+        if GPU_BUFFERS_B is not None:
+            for i in range(len(GPU_BUFFERS_B)):
+                if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
+                    GPU_BUFFERS_B[i].resize_(0)
+            GPU_BUFFERS_B = None
+        USE_DOUBLE_BUFFER = False
     elif GPU_BUFFERS_B is not None:
         for i in range(len(GPU_BUFFERS_B)):
             if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
