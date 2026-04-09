@@ -103,15 +103,37 @@ try:
     t_Unpack = t.Unpack
 except:
     from typing_extensions import Unpack as t_Unpack
-# Fix stale PIL module caching (common on Kaggle/Colab after upgrading Pillow mid-session)
-# If Pillow was upgraded (e.g. 11.x -> 12.x) without restarting the kernel, the old
-# PIL modules stay cached in sys.modules. New on-disk files (like ImageText.py) then
-# fail when they import symbols (like _Ink) from the stale cached _typing module.
+# Fix stale module caching (common on Kaggle/Colab after upgrading packages mid-session)
+# If packages were upgraded without restarting the kernel, old modules stay cached in
+# sys.modules. New on-disk files then fail when they reference symbols that only exist
+# in the upgraded version.
+# - PIL: can be fixed by clearing sys.modules (pure Python mismatch)
+# - numpy/scipy: C extensions are loaded into process memory and cannot be reloaded,
+#   so we must raise a clear error telling users to restart.
 import sys as _sys
+from importlib.metadata import version as _get_pkg_version
+
+# Check numpy -- C extensions cannot be reloaded, must restart
+_np_mod = _sys.modules.get("numpy")
+if _np_mod is not None and hasattr(_np_mod, "__version__"):
+    try:
+        _installed_numpy = _get_pkg_version("numpy")
+        if _np_mod.__version__ != _installed_numpy:
+            raise RuntimeError(
+                f"***** numpy was upgraded mid-session (loaded: {_np_mod.__version__}, "
+                f"installed: {_installed_numpy}) but the kernel still has the old version "
+                f"in memory. numpy uses C extensions that cannot be reloaded without "
+                f"restarting. Please restart your runtime/kernel after installing packages. *****"
+            )
+    except RuntimeError:
+        raise
+    except Exception:
+        pass # Best-effort check -- non-critical if importlib.metadata is unavailable
+
+# Check PIL -- can fix by clearing sys.modules
 _pil_mod = _sys.modules.get("PIL")
 if _pil_mod is not None and hasattr(_pil_mod, "__version__"):
     try:
-        from importlib.metadata import version as _get_pkg_version
         _installed_pillow = _get_pkg_version("Pillow")
         if _pil_mod.__version__ != _installed_pillow:
             for _k in [k for k in list(_sys.modules.keys()) if k == "PIL" or k.startswith("PIL.")]:
@@ -147,7 +169,15 @@ except ImportError as e:
         "Please file a bug report asap!"
     )
 except Exception as e:
-    raise Exception(e)
+    e_str = str(e)
+    if "numpy" in e_str and ("_blas" in e_str or "_multiarray" in e_str):
+        raise RuntimeError(
+            f"***** numpy was likely upgraded mid-session without restarting the kernel. "
+            f"numpy C extensions cannot be reloaded in-place. "
+            f"Please restart your runtime/kernel after installing packages. "
+            f"Original error: {e_str} *****"
+        )
+    raise
 pass
 KWARGS_TYPE = t_Unpack[t_TypedDictMeta]
 
