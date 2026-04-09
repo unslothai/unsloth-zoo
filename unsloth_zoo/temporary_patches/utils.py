@@ -118,6 +118,11 @@ except ImportError as e:
         raise RuntimeError(
             f"***** Please update and reinstall torchvision - it broke! `pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
         )
+    elif "PIL" in e or "_Ink" in e or "Pillow" in e:
+        raise RuntimeError(
+            f"***** Your Pillow (PIL) version is incompatible with torchvision. "
+            f"Please update it via `pip install --upgrade Pillow` then restart your runtime. *****"
+        )
     elif "Unpack" not in e:
         raise Exception(e)
     raise RuntimeError(
