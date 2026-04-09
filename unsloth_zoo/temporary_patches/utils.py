@@ -128,7 +128,7 @@ if _np_mod is not None and hasattr(_np_mod, "__version__"):
     except RuntimeError:
         raise
     except Exception:
-        pass
+        pass # Best-effort check -- non-critical if importlib.metadata is unavailable
 
 # Check PIL -- can fix by clearing sys.modules
 _pil_mod = _sys.modules.get("PIL")
@@ -169,15 +169,15 @@ except ImportError as e:
         "Please file a bug report asap!"
     )
 except Exception as e:
-    e = str(e)
-    if "numpy" in e and ("_blas" in e or "_multiarray" in e or "attribute" in e.lower()):
+    e_str = str(e)
+    if "numpy" in e_str and ("_blas" in e_str or "_multiarray" in e_str):
         raise RuntimeError(
             f"***** numpy was likely upgraded mid-session without restarting the kernel. "
             f"numpy C extensions cannot be reloaded in-place. "
             f"Please restart your runtime/kernel after installing packages. "
-            f"Original error: {e} *****"
+            f"Original error: {e_str} *****"
         )
-    raise Exception(e)
+    raise
 pass
 KWARGS_TYPE = t_Unpack[t_TypedDictMeta]
 
