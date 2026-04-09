@@ -793,7 +793,10 @@ def make_runtime_cce_loss_fused_finalize(
         vocab_size = weight_compute.shape[0]
 
         grad_hidden = mx.zeros_like(hidden_compute)
-        grad_weight = mx.zeros(weight_compute.shape, dtype=hidden_compute.dtype)
+        # Accumulate weight gradient in float32 to avoid precision loss
+        # when hidden is float16/bfloat16. Only matters for full fine-tuning
+        # (LoRA freezes the LM head so this VJP path is never reached).
+        grad_weight = mx.zeros(weight_compute.shape, dtype=mx.float32)
         n_reads = 4
 
         for chunk_idx, v_start in enumerate(chunk_starts_int):
@@ -834,7 +837,10 @@ def make_runtime_cce_loss_fused_finalize(
 
             d_logits_compute = d_logits.astype(hidden_compute.dtype)
             grad_hidden = grad_hidden + d_logits_compute @ weight_chunk
-            grad_weight_chunk = d_logits_compute.T @ hidden_compute
+            # Weight gradient GEMM in float32 for accumulation precision
+            d_logits_f32 = d_logits.astype(mx.float32)
+            hidden_f32 = hidden_compute.astype(mx.float32)
+            grad_weight_chunk = d_logits_f32.T @ hidden_f32
             grad_weight = mx.slice_update(
                 grad_weight,
                 grad_weight_chunk,
