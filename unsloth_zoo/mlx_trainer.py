@@ -747,6 +747,9 @@ class MLXTrainer:
                 seed=args.seed,
                 response_mask_fn=_vlm_mask_fn,
             )
+            # Safety check: detect all-masked VLM labels early
+            if _vlm_mask_fn is not None and batches:
+                _check_vlm_all_masked(batches)
             return batches, None
 
     def save_model(self, output_dir=None):
@@ -765,6 +768,11 @@ class MLXTrainer:
                 "use_cce": self.args.use_cce,
             })
             self.tokenizer.save_pretrained(output_dir)
+            # VLMs: also save the processor (image preprocessor config)
+            # so the adapter directory is complete for inference.
+            _processor = self.processor or getattr(self.model, "_processor", None)
+            if _processor is not None and hasattr(_processor, "save_pretrained"):
+                _processor.save_pretrained(output_dir)
             print(f"Unsloth: LoRA adapters saved to {output_dir}")
         else:
             save_merged_model(self.model, self.tokenizer, output_dir)
@@ -918,6 +926,53 @@ def _check_all_masked(batches, max_check=100):
         import warnings
         warnings.warn(
             f"Unsloth: {seen_bad}/{seen_bad + seen_good} samples have all -100 labels "
+            f"({ratio:.0%}). Your instruction_part / response_part may not match "
+            f"the chat template correctly.",
+            UserWarning,
+        )
+
+
+def _check_vlm_all_masked(batches, max_check=100):
+    """Safety check for VLM batches: raise if all labels are -100.
+
+    Same purpose as _check_all_masked but for VLM batch dicts
+    (which have a "labels" key instead of a 3-tuple structure).
+    """
+    seen_bad = 0
+    seen_good = 0
+    checked = 0
+    for batch_dict in batches:
+        labels = batch_dict.get("labels")
+        if labels is None:
+            continue
+        labels_list = labels.tolist()
+        for row in labels_list:
+            unique = set(row)
+            if unique == {-100}:
+                seen_bad += 1
+            else:
+                seen_good += 1
+            checked += 1
+            if checked >= max_check:
+                break
+        if checked >= max_check:
+            break
+
+    if seen_bad == 0 and seen_good == 0:
+        return
+    ratio = seen_bad / (seen_bad + seen_good)
+    # ZeroDivisionError matches fix_zero_training_loss in the HF/CUDA path
+    if ratio == 1.0:
+        raise ZeroDivisionError(
+            "Unsloth: All VLM labels in your dataset are -100. Training losses will be all 0.\n"
+            "Are you sure you used `train_on_responses_only` correctly?\n"
+            "Check that your instruction_part and response_part strings match "
+            "the chat template used by your processor."
+        )
+    elif ratio >= 0.9:
+        import warnings
+        warnings.warn(
+            f"Unsloth: {seen_bad}/{seen_bad + seen_good} VLM samples have all -100 labels "
             f"({ratio:.0%}). Your instruction_part / response_part may not match "
             f"the chat template correctly.",
             UserWarning,
