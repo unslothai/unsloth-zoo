@@ -52,6 +52,7 @@ __all__ = [
 INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # Initial size per CPU buffer
 INITIAL_GPU_BUFFER_SIZE = 2 * 256 * 2048   # Initial size per GPU buffer
 INITIAL_CPU_BUFFER_COUNT = 200             # Initial number of CPU buffers
+DOUBLE_BUFFER_HEADROOM = 256 * 1024 * 1024 # 256MB minimum free CUDA memory to enable double buffering
 
 torch_version = torch.__version__
 if Version(torch_version) < Version("2.4.0"):
@@ -367,7 +368,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         # Double buffering: try to allocate buffer B
         try:
             GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-            USE_DOUBLE_BUFFER = True
+            USE_DOUBLE_BUFFER = False # enabled after first pass if CUDA free memory > DOUBLE_BUFFER_HEADROOM
             # Per-buffer events to prevent race conditions in double buffering.
             # Each event tracks when compute on that buffer finishes
             if DEVICE_TYPE in ("cuda", "hip"):
@@ -486,6 +487,15 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         if BACKWARD_PASS:
                             BACKWARD_PASS = False
                             CPU_INDEX = 0
+                            if not FIRST_PASS and not USE_DOUBLE_BUFFER and GPU_BUFFERS_B is not None:
+                                free_mem, _ = torch.cuda.mem_get_info(device_index)
+                                if free_mem > DOUBLE_BUFFER_HEADROOM:
+                                    USE_DOUBLE_BUFFER = True
+                                    print(f"Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.")
+                                else:
+                                    for j in range(len(GPU_BUFFERS_B)):
+                                        GPU_BUFFERS_B[j].resize_(0)
+                                    GPU_BUFFERS_B = None
                         pass
 
                         # Extend buffer size
@@ -509,6 +519,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     for j in range(len(GPU_BUFFERS_B)):
                                         GPU_BUFFERS_B[j].resize_(0)
                                     GPU_BUFFERS_B = None
+                                    print("Unsloth: Disabled double buffering due to insufficient VRAM.")
                                     GPU_BUFFER.resize_(new_size)
                                 else:
                                     raise
@@ -518,7 +529,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                             if new_size > GPU_BUFFER_B.numel():
                                 try:
                                     GPU_BUFFER_B.resize_(new_size)
-                                    # print("Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.")
                                 except RuntimeError as e:
                                     if "out of memory" not in str(e).lower():
                                         raise
@@ -528,6 +538,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     for j in range(len(GPU_BUFFERS_B)):
                                         GPU_BUFFERS_B[j].resize_(0)
                                     GPU_BUFFERS_B = None
+                                    print("Unsloth: Disabled double buffering due to insufficient VRAM.")
 
                         x = x[:new_size].view(shape)
 
@@ -1024,12 +1035,12 @@ def reset_unsloth_gradient_checkpointing_buffers():
         for i in range(len(NEXT_BUFFER_SLOT)):
             NEXT_BUFFER_SLOT[i] = 0
 
-    # Re-enable double buffering if buffer B still exists, or try to re-allocate
+    # Reset double buffering if buffer B still exists, or try to re-allocate
     if GPU_BUFFERS_B is not None:
         for i in range(len(GPU_BUFFERS_B)):
             if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
                 GPU_BUFFERS_B[i].resize_(INITIAL_GPU_BUFFER_SIZE)
-        USE_DOUBLE_BUFFER = True
+        USE_DOUBLE_BUFFER = False
     else:
         try:
             n_gpus = len(GPU_BUFFERS)
@@ -1043,7 +1054,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
                 raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
             BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
             BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
-            USE_DOUBLE_BUFFER = True
+            USE_DOUBLE_BUFFER = False
         except RuntimeError:
             pass
 
