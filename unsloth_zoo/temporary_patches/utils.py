@@ -103,6 +103,24 @@ try:
     t_Unpack = t.Unpack
 except:
     from typing_extensions import Unpack as t_Unpack
+
+# Fix stale PIL module caching (common on Kaggle/Colab after upgrading Pillow mid-session)
+# If Pillow was upgraded (e.g. 11.x -> 12.x) without restarting the kernel, the old
+# PIL modules stay cached in sys.modules. New on-disk files (like ImageText.py) then
+# fail when they try to import symbols (like _Ink) from the stale cached _typing module.
+import sys as _sys
+_pil_mod = _sys.modules.get("PIL")
+if _pil_mod is not None and hasattr(_pil_mod, "__version__"):
+    try:
+        from importlib.metadata import version as _get_pkg_version
+        _installed_pillow = _get_pkg_version("Pillow")
+        if _pil_mod.__version__ != _installed_pillow:
+            for _k in [k for k in list(_sys.modules.keys()) if k == "PIL" or k.startswith("PIL.")]:
+                del _sys.modules[_k]
+    except Exception:
+        pass
+del _sys, _pil_mod
+
 try:
     from transformers.processing_utils import Unpack
     assert \
@@ -121,7 +139,7 @@ except ImportError as e:
     elif "PIL" in e or "_Ink" in e or "Pillow" in e:
         raise RuntimeError(
             f"***** Your Pillow (PIL) version is incompatible with torchvision. "
-            f"Please update it via `pip install --upgrade Pillow` then restart your runtime. *****"
+            f"Please run `pip install --upgrade --force-reinstall Pillow` then restart your runtime/kernel. *****"
         )
     elif "Unpack" not in e:
         raise Exception(e)
