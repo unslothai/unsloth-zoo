@@ -497,8 +497,22 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         x = CPU_BUFFERS[CPU_INDEX]
                         shape = arg.shape
                         if new_size > x.numel(): x.resize_(new_size)
-                        if new_size > GPU_BUFFER.numel(): GPU_BUFFER.resize_(new_size)
-                        # resize buffer B as needed if double buffering is enabled, disable if OOM
+                        if new_size > GPU_BUFFER.numel():
+                            try:
+                                GPU_BUFFER.resize_(new_size)
+                            except RuntimeError as e:
+                                if "out of memory" not in str(e).lower():
+                                    raise
+                                # clear Buffer B and try to resize Single Buffer
+                                if USE_DOUBLE_BUFFER:
+                                    USE_DOUBLE_BUFFER = False
+                                    for j in range(len(GPU_BUFFERS_B)):
+                                        GPU_BUFFERS_B[j].resize_(0)
+                                    GPU_BUFFERS_B = None
+                                    GPU_BUFFER.resize_(new_size)
+                                else:
+                                    raise
+                        # resize buffer B as needed if double buffering is enabled, disable and free Buffer B if OOM
                         if USE_DOUBLE_BUFFER:
                             GPU_BUFFER_B = GPU_BUFFERS_B[device_index]
                             if new_size > GPU_BUFFER_B.numel():
@@ -510,6 +524,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                         raise
                                     # OOM - disable double buffering
                                     USE_DOUBLE_BUFFER = False
+                                    # Reclaim buffer B
+                                    for j in range(len(GPU_BUFFERS_B)):
+                                        GPU_BUFFERS_B[j].resize_(0)
+                                    GPU_BUFFERS_B = None
+
                         x = x[:new_size].view(shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
@@ -889,14 +908,27 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         torch.utils.checkpoint.CheckpointFunction = torch.utils.checkpoint._old_CheckpointFunction
         global CPU_BUFFERS
         global GPU_BUFFERS
+        global GPU_BUFFERS_B
+        global USE_DOUBLE_BUFFER
+        global BUFFER_EVENTS_A
+        global BUFFER_EVENTS_B
+        global NEXT_BUFFER_SLOT
         for i in range(len(CPU_BUFFERS)):
             if hasattr(CPU_BUFFERS[i], "resize_"): CPU_BUFFERS[i].resize_(0)
             if type(CPU_BUFFERS) is list: CPU_BUFFERS[i] = None
         for i in range(len(GPU_BUFFERS)):
             if hasattr(GPU_BUFFERS[i], "resize_"): GPU_BUFFERS[i].resize_(0)
             if type(GPU_BUFFERS) is list: GPU_BUFFERS[i] = None
+        if GPU_BUFFERS_B is not None:
+            for i in range(len(GPU_BUFFERS_B)):
+                if hasattr(GPU_BUFFERS_B[i], "resize_"): GPU_BUFFERS_B[i].resize_(0)
+            GPU_BUFFERS_B = None
+            USE_DOUBLE_BUFFER = False
         CPU_BUFFERS = None
         GPU_BUFFERS = None
+        BUFFER_EVENTS_A = None
+        BUFFER_EVENTS_B = None
+        NEXT_BUFFER_SLOT = None
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -994,6 +1026,9 @@ def reset_unsloth_gradient_checkpointing_buffers():
 
     # Re-enable double buffering if buffer B still exists, or try to re-allocate
     if GPU_BUFFERS_B is not None:
+        for i in range(len(GPU_BUFFERS_B)):
+            if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
+                GPU_BUFFERS_B[i].resize_(INITIAL_GPU_BUFFER_SIZE)
         USE_DOUBLE_BUFFER = True
     else:
         try:
