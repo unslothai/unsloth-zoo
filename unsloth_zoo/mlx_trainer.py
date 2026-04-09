@@ -37,13 +37,18 @@ Usage mirrors TRL notebooks:
 """
 
 from dataclasses import dataclass
+import concurrent.futures
 import math
+import os
+import random
 import time
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
+
+_PAD_MULTIPLE = 32
 
 from .mlx_utils import (
     make_cce_loss_fn,
@@ -146,6 +151,13 @@ class MLXTrainer:
         if packing is not None:
             self.args.packing = packing
 
+        if self.args.packing:
+            print(
+                "Unsloth: packing=True is not yet supported on MLX. "
+                "Falling back to packing=False (standard padding)."
+            )
+            self.args.packing = False
+
         # Safety: freeze non-LoRA parameters if LoRA layers are detected.
         # mlx-lm calls model.freeze() BEFORE linear_to_lora_layers(), but users
         # might forget. Without this, LayerNorm weights remain trainable and
@@ -233,12 +245,12 @@ class MLXTrainer:
             warmup_fn = optim.linear_schedule(0.0, lr, warmup)
             if callable(main_schedule):
                 return optim.join_schedules(
-                    [warmup_fn, main_schedule], [warmup + 1]
+                    [warmup_fn, main_schedule], [warmup]
                 )
             else:
                 const_fn = optim.linear_schedule(lr, lr, decay_steps)
                 return optim.join_schedules(
-                    [warmup_fn, const_fn], [warmup + 1]
+                    [warmup_fn, const_fn], [warmup]
                 )
 
         return main_schedule
@@ -304,8 +316,8 @@ class MLXTrainer:
             if is_vlm:
                 loss, ntoks = loss_fn(self.model, batch_data)
             else:
-                batch, lengths = batch_data
-                loss, ntoks = loss_fn(self.model, batch, lengths)
+                batch, lengths, labels = batch_data
+                loss, ntoks = loss_fn(self.model, batch, lengths, labels)
             all_losses += loss * ntoks
             ntokens += ntoks
             mx.eval(all_losses, ntokens)
@@ -467,8 +479,8 @@ class MLXTrainer:
 
                 return lvalue, toks, (grad, toks_f)
         else:
-            def step_fn(batch, lengths, prev_state, do_update):
-                (lvalue, toks), grad = loss_and_grad_fn(model, batch, lengths)
+            def step_fn(batch, lengths, labels, prev_state, do_update):
+                (lvalue, toks), grad = loss_and_grad_fn(model, batch, lengths, labels)
 
                 toks_f = toks.astype(mx.float32)
                 grad = tree_map(lambda g: g * toks_f, grad)
@@ -490,9 +502,14 @@ class MLXTrainer:
         # Prepare eval batches
         eval_batches = None
         if args.eval_steps > 0 and self.eval_dataset is not None:
-            if is_vlm:
+            # Use pre-built labeled eval batches if available
+            _labeled_eval = getattr(self, '_eval_batches_labeled', None)
+            if _labeled_eval is not None:
+                eval_batches = _labeled_eval
+            elif is_vlm:
                 processor = self.processor or getattr(self.model, "_processor", None)
                 config = getattr(self.model, "_config", {})
+                _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
                 eval_batches = create_vlm_batches(
                     dataset=self.eval_dataset,
                     processor=processor,
@@ -500,6 +517,7 @@ class MLXTrainer:
                     batch_size=args.per_device_train_batch_size,
                     max_seq_length=args.max_seq_length,
                     seed=args.seed,
+                    response_mask_fn=_vlm_mask_fn,
                 )
             else:
                 eval_batches = create_batches(
@@ -566,7 +584,7 @@ class MLXTrainer:
                 )
             else:
                 lvalue, toks, grad_accum_state = step_fn(
-                    batch_data[0], batch_data[1],
+                    batch_data[0], batch_data[1], batch_data[2],
                     grad_accum_state,
                     do_update,
                 )
@@ -621,7 +639,8 @@ class MLXTrainer:
             # Eval
             if (eval_batches and args.eval_steps > 0
                     and current_step % args.eval_steps == 0):
-                val_loss, ppl = self._evaluate(eval_batches, loss_fn, is_vlm=is_vlm)
+                val_loss, ppl = self._evaluate(
+                    eval_batches, loss_fn, is_vlm=is_vlm)
                 model.train()
                 print(
                     f"  Eval  {current_step}/{total_steps} | "
@@ -699,6 +718,7 @@ class MLXTrainer:
                 "or load the model with FastLanguageModel.from_pretrained()."
             )
         config = getattr(self.model, "_config", {})
+        _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
 
         if self._batches is not None:
             return self._batches, None
@@ -710,6 +730,7 @@ class MLXTrainer:
                 batch_size=args.per_device_train_batch_size,
                 max_seq_length=args.max_seq_length,
                 seed=args.seed,
+                response_mask_fn=_vlm_mask_fn,
             )
         else:
             total_batches_needed = (
@@ -724,6 +745,7 @@ class MLXTrainer:
                 max_seq_length=args.max_seq_length,
                 num_batches=total_batches_needed,
                 seed=args.seed,
+                response_mask_fn=_vlm_mask_fn,
             )
             return batches, None
 
@@ -746,4 +768,278 @@ class MLXTrainer:
             print(f"Unsloth: LoRA adapters saved to {output_dir}")
         else:
             save_merged_model(self.model, self.tokenizer, output_dir)
+
+
+def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
+                            max_seq_length, formatting_func=None,
+                            dataset_text_field="text", num_batches=None,
+                            seed=42):
+    """Create padded batches with label masks for train_on_responses_only.
+
+    Tokenizes each dataset item, applies the masking closure to get labels,
+    sorts by length, and produces right-padded 3-tuple batches.
+
+    Returns:
+        List of (batch, lengths, labels) tuples where:
+        - batch: mx.array (BS, padded_len) — input_ids padded with 0
+        - lengths: mx.array (BS, 2) — [1, actual_len - 1] per sequence
+        - labels: mx.array (BS, padded_len) — labels padded with -100
+    """
+    eos_id = tokenizer.eos_token_id
+
+    # 1. Gather all text strings (serial, fast)
+    all_texts = []
+    for item in dataset:
+        if formatting_func is not None:
+            result = formatting_func(item)
+            texts = result if isinstance(result, list) else [result]
+        elif isinstance(item, dict):
+            text = item.get(dataset_text_field, "")
+            texts = [text] if text else []
+        elif isinstance(item, str):
+            texts = [item]
+        else:
+            continue
+
+        for text in texts:
+            if text:
+                all_texts.append(text)
+
+    # 2. Tokenize + mask in parallel (HF fast tokenizers are thread-safe;
+    #    slow tokenizers degrade gracefully via the GIL)
+    def _process_text(text):
+        encoded = tokenizer.encode(text)
+        if eos_id is not None and (not encoded or encoded[-1] != eos_id):
+            encoded.append(eos_id)
+        if len(encoded) > max_seq_length:
+            encoded = encoded[:max_seq_length]
+        if len(encoded) < 2:
+            return None
+        result = mask_fn({"input_ids": [encoded]})
+        labels = result["labels"]
+        if hasattr(labels, "tolist"):
+            labels = labels.tolist()
+        return (encoded, labels[0])
+
+    max_workers = min(4, os.cpu_count() or 1)
+    all_items = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for result in executor.map(_process_text, all_texts):
+            if result is not None:
+                all_items.append(result)
+
+    if not all_items:
+        raise ValueError(
+            "No training data found after tokenization. "
+            "Check your dataset and formatting_func."
+        )
+
+    # 2. Sort by length for efficient padding
+    all_items.sort(key=lambda x: len(x[0]))
+
+    # 3. Create padded batches
+    rng = random.Random(seed)
+    batches = []
+    for start in range(0, len(all_items), batch_size):
+        batch_items = all_items[start:start + batch_size]
+        if not batch_items:
+            continue
+        max_len = max(len(ids) for ids, _ in batch_items)
+        # Round up to nearest multiple of _PAD_MULTIPLE (matching mlx-lm)
+        padded_len = ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
+        padded_len = min(padded_len, max_seq_length)
+
+        batch_ids = []
+        batch_labels = []
+        batch_lengths = []
+        for ids, lbls in batch_items:
+            L = min(len(ids), padded_len)
+            pad_len = padded_len - L
+            batch_ids.append(ids[:L] + [0] * pad_len)
+            batch_labels.append(lbls[:L] + [-100] * pad_len)
+            batch_lengths.append([1, L - 1])
+
+        batches.append((
+            mx.array(batch_ids),
+            mx.array(batch_lengths),
+            mx.array(batch_labels),
+        ))
+
+    # 4. Shuffle batches
+    rng.shuffle(batches)
+
+    # Limit if needed
+    if num_batches is not None and len(batches) > num_batches:
+        batches = batches[:num_batches]
+
+    # Evaluate all tensors
+    all_tensors = []
+    for b, l, lb in batches:
+        all_tensors.extend([b, l, lb])
+    mx.eval(all_tensors)
+
+    return batches
+
+
+def _check_all_masked(batches, max_check=100):
+    """Safety check: raise if all labels in the first N batches are -100.
+
+    Mirrors fix_zero_training_loss from the HF path.
+    """
+    seen_bad = 0
+    seen_good = 0
+    checked = 0
+    for batch_ids, batch_lengths, batch_labels in batches:
+        labels_list = batch_labels.tolist()
+        for row in labels_list:
+            unique = set(row)
+            if unique == {-100}:
+                seen_bad += 1
+            else:
+                seen_good += 1
+            checked += 1
+            if checked >= max_check:
+                break
+        if checked >= max_check:
+            break
+
+    if seen_bad == 0 and seen_good == 0:
+        return
+    ratio = seen_bad / (seen_bad + seen_good)
+    # ZeroDivisionError matches fix_zero_training_loss in the HF/CUDA path
+    if ratio == 1.0:
+        raise ZeroDivisionError(
+            "Unsloth: All labels in your dataset are -100. Training losses will be all 0.\n"
+            "Are you sure you used `train_on_responses_only` correctly?\n"
+            "Check that your instruction_part and response_part strings match "
+            "the chat template used by your tokenizer."
+        )
+    elif ratio >= 0.9:
+        import warnings
+        warnings.warn(
+            f"Unsloth: {seen_bad}/{seen_bad + seen_good} samples have all -100 labels "
+            f"({ratio:.0%}). Your instruction_part / response_part may not match "
+            f"the chat template correctly.",
+            UserWarning,
+        )
+
+
+def train_on_responses_only(
+    trainer,
+    instruction_part=None,
+    response_part=None,
+    force_match=True,
+    tokenizer=None,
+    return_function=False,
+    num_proc=None,
+):
+    """Mask instruction tokens from loss — train only on assistant responses.
+
+    Call after MLXTrainer(...), before trainer.train(). Works for both
+    text and VLM models. Mirrors the HF/unsloth API.
+
+    Args:
+        trainer: MLXTrainer instance (can be None when return_function=True
+            and tokenizer is provided).
+        instruction_part: String marking start of user/instruction turns
+            (e.g. "<|start_header_id|>user<|end_header_id|>\\n\\n").
+        response_part: String marking start of assistant/response turns
+            (e.g. "<|start_header_id|>assistant<|end_header_id|>\\n\\n").
+        force_match: Match newlines as well (forwarded to HF implementation).
+        tokenizer: Optional tokenizer override. If None, uses trainer.tokenizer.
+        return_function: If True, return the masking closure without touching
+            the trainer.
+        num_proc: Accepted for API compatibility with the HF path, unused on MLX.
+
+    Returns:
+        The trainer (for chaining), or the masking closure if return_function=True.
+    """
+    from .dataset_utils import (
+        train_on_responses_only as _hf_train_on_responses_only,
+    )
+
+    # Resolve tokenizer: kwarg > trainer.tokenizer
+    _tokenizer = tokenizer
+    if _tokenizer is None and trainer is not None:
+        _tokenizer = trainer.tokenizer
+    if _tokenizer is None:
+        raise ValueError(
+            "Unsloth: A tokenizer must be provided either via the `tokenizer` "
+            "kwarg or via trainer.tokenizer."
+        )
+
+    # Unwrap to get a callable HF tokenizer.
+    # mlx-lm: TokenizerWrapper._tokenizer -> HF tokenizer
+    # VLM processors: processor.tokenizer -> HF tokenizer
+    if hasattr(_tokenizer, "_tokenizer"):
+        _tokenizer = _tokenizer._tokenizer
+    elif hasattr(_tokenizer, "tokenizer"):
+        _tokenizer = _tokenizer.tokenizer
+
+    # Get masking closure from the HF/CUDA implementation
+    mask_fn = _hf_train_on_responses_only(
+        None,
+        instruction_part=instruction_part,
+        response_part=response_part,
+        force_match=force_match,
+        tokenizer=_tokenizer,
+        return_function=True,
+    )
+
+    if return_function:
+        return mask_fn
+
+    if trainer is None:
+        raise ValueError(
+            "trainer is required when return_function=False. "
+            "Pass return_function=True to get the masking closure, "
+            "or provide an MLXTrainer instance."
+        )
+
+    if trainer._is_vlm:
+        # VLM path: store mask_fn for application during batch creation
+        trainer._vlm_response_mask_fn = mask_fn
+        print("Unsloth: train_on_responses_only enabled (VLM mode).")
+    else:
+        # Text path: tokenize, mask, and create batches now
+        args = trainer.args
+        total_batches_needed = (
+            args.max_steps * args.gradient_accumulation_steps
+            if args.max_steps > 0 else None
+        )
+        batches = _create_labeled_batches(
+            dataset=trainer.train_dataset,
+            tokenizer=_tokenizer,
+            mask_fn=mask_fn,
+            batch_size=args.per_device_train_batch_size,
+            max_seq_length=args.max_seq_length,
+            formatting_func=trainer.formatting_func,
+            dataset_text_field=args.dataset_text_field,
+            num_batches=total_batches_needed,
+            seed=args.seed,
+        )
+
+        # Safety check: detect all-masked labels early
+        _check_all_masked(batches)
+
+        trainer._batches = batches
+
+        # Process eval dataset too
+        if trainer.eval_dataset is not None:
+            eval_batches = _create_labeled_batches(
+                dataset=trainer.eval_dataset,
+                tokenizer=_tokenizer,
+                mask_fn=mask_fn,
+                batch_size=args.per_device_train_batch_size,
+                max_seq_length=args.max_seq_length,
+                formatting_func=trainer.formatting_func,
+                dataset_text_field=args.dataset_text_field,
+                seed=args.seed,
+            )
+            trainer._eval_batches_labeled = eval_batches
+
+        print(f"Unsloth: train_on_responses_only enabled "
+              f"({len(batches)} batches prepared).")
+
+    return trainer
 

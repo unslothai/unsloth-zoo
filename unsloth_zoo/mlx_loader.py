@@ -64,7 +64,7 @@ def _build_vlm_model_types():
         for importer, modname, ispkg in pkgutil.iter_modules(vlm_models_pkg.__path__):
             if ispkg:
                 types_set.add(modname)
-    except (ImportError, Exception):
+    except ImportError:
         pass
 
     try:
@@ -73,7 +73,7 @@ def _build_vlm_model_types():
         for src, tgt in MODEL_REMAPPING.items():
             types_set.add(src)
             types_set.add(tgt)
-    except (ImportError, Exception):
+    except (ImportError, AttributeError):
         pass
 
     return frozenset(types_set)
@@ -411,7 +411,7 @@ class FastMLXModel:
             config_path = local_path + "/config.json"
             with open(config_path, "r") as f:
                 config_data = json.load(f)
-        except Exception:
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
             config_data = {}
             local_path = None
 
@@ -556,7 +556,7 @@ class FastMLXModel:
         lora_config = {
             "rank": r,
             "alpha": lora_alpha,
-            "dropout": 0.0,
+            "dropout": lora_dropout,
             "scale": lora_alpha / r,
         }
 

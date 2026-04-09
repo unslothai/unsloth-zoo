@@ -151,8 +151,13 @@ def make_cce_loss_fn(model):
     avoiding full logit materialization. This saves significant memory for large
     vocabularies.
 
+    Args:
+        model: MLX model.
+
     Returns:
-        A function (model, batch, lengths) -> (loss, ntoks).
+        A function (model, batch, lengths, labels=None) -> (loss, ntoks).
+        When labels is provided, uses labels[:,1:] for targets with
+        (targets != -100) as the loss mask.
         The function has a ``_unsloth_cce_backend`` attribute for logging.
     """
     softcap = _get_logit_softcap(model)
@@ -196,15 +201,23 @@ def make_cce_loss_fn(model):
             bits=bits,
         )
 
-        def loss_fn(model, batch, lengths):
-            inputs, targets = batch[:, :-1], batch[:, 1:]
+        def loss_fn(model, batch, lengths, labels=None):
+            if labels is None:
+                inputs, targets = batch[:, :-1], batch[:, 1:]
+            else:
+                inputs = batch[:, :-1]
+                targets = labels[:, 1:]
             hidden = _get_backbone(model)(inputs)
             layer = _get_lm_weight_layer(model)
             w = layer.weight
             sc = layer.scales
             bi = layer.biases if _has_biases else mx.zeros_like(layer.scales)
             steps = mx.arange(1, targets.shape[1] + 1)
-            mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            if labels is None:
+                mask = length_mask
+            else:
+                mask = mx.logical_and(targets != -100, length_mask)
             masked_targets = mx.where(mask, targets, -100)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
@@ -222,14 +235,22 @@ def make_cce_loss_fn(model):
             logit_softcap=softcap,
         )
 
-        def loss_fn(model, batch, lengths):
-            inputs, targets = batch[:, :-1], batch[:, 1:]
+        def loss_fn(model, batch, lengths, labels=None):
+            if labels is None:
+                inputs, targets = batch[:, :-1], batch[:, 1:]
+            else:
+                inputs = batch[:, :-1]
+                targets = labels[:, 1:]
             hidden = _get_backbone(model)(inputs)
             w = _get_lm_weight_layer(model).weight
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             steps = mx.arange(1, targets.shape[1] + 1)
-            mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            if labels is None:
+                mask = length_mask
+            else:
+                mask = mx.logical_and(targets != -100, length_mask)
             masked_targets = mx.where(mask, targets, -100)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
@@ -249,14 +270,27 @@ def make_baseline_loss_fn():
     nn.losses.cross_entropy. Used when use_cce=False.
 
     Returns:
-        A function (model, batch, lengths) -> (loss, ntoks).
+        A function (model, batch, lengths, labels=None) -> (loss, ntoks).
+        When labels is provided, uses labels[:,1:] for targets with
+        (targets != -100) as the loss mask.
     """
-    def loss_fn(model, batch, lengths):
-        inputs, targets = batch[:, :-1], batch[:, 1:]
+    def loss_fn(model, batch, lengths, labels=None):
+        if labels is None:
+            inputs, targets = batch[:, :-1], batch[:, 1:]
+        else:
+            inputs = batch[:, :-1]
+            targets = labels[:, 1:]
         logits = model(inputs)
         steps = mx.arange(1, targets.shape[1] + 1)
-        mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
-        ce = nn.losses.cross_entropy(logits, targets) * mask
+        length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+        if labels is None:
+            mask = length_mask.astype(mx.float32)
+        else:
+            mask = mx.logical_and(targets != -100, length_mask).astype(mx.float32)
+        # Replace -100 with 0 before CE — MLX has no ignore_index;
+        # the mask already zeros out these positions in the loss.
+        safe_targets = mx.where(targets == -100, 0, targets)
+        ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / ntoks
         return loss, ntoks
@@ -316,7 +350,7 @@ def _get_image_token_ids(model):
 
     if not ids:
         return None
-    return mx.array(ids, dtype=mx.int32)
+    return ids  # plain Python list; avoids mx.eval in the hot path
 
 
 def _mask_image_tokens(targets, image_token_ids):
@@ -324,12 +358,16 @@ def _mask_image_tokens(targets, image_token_ids):
 
     Prevents the model from training to predict image placeholder tokens,
     which are fixed special tokens that provide no useful gradient signal.
+
+    Args:
+        targets: mx.array of token IDs.
+        image_token_ids: plain Python list of int token IDs, or None.
     """
-    if image_token_ids is None:
+    if not image_token_ids:
         return targets
     # Build a mask: True where target is any image token
     is_image = targets == image_token_ids[0]
-    for tok_id in image_token_ids.tolist()[1:]:
+    for tok_id in image_token_ids[1:]:
         is_image = is_image | (targets == tok_id)
     return mx.where(is_image, -100, targets)
 
@@ -393,10 +431,10 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
         input_ids = batch_dict["input_ids"]
         pixel_values = batch_dict.get("pixel_values")
         attention_mask = batch_dict.get("attention_mask")
+        labels = batch_dict.get("labels")
 
         # Standard causal LM shift
         inputs = input_ids[:, :-1]
-        targets = input_ids[:, 1:]
 
         # Forward pass — let the model create its own causal mask.
         # attention_mask is a padding indicator, not a causal attention mask;
@@ -405,24 +443,37 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits.astype(mx.float32)
 
-        # Handle sequence length mismatch from vision token injection
-        logits, targets = _align_logits_with_labels(logits, targets)
-
-        # Build mask from attention_mask (shifted to match targets)
-        if attention_mask is not None:
-            length_mask = attention_mask[:, 1:]
-            length_mask = length_mask[:, :targets.shape[1]]
+        if labels is not None:
+            # train_on_responses_only: labels encode instruction/padding masking.
+            # Still mask image placeholder tokens.
+            targets = labels[:, 1:]
+            targets = _mask_image_tokens(targets, _image_token_ids)
+            logits, targets = _align_logits_with_labels(logits, targets)
+            mask = (targets != -100).astype(mx.float32)
         else:
-            length_mask = mx.ones_like(targets, dtype=mx.float32)
+            targets = input_ids[:, 1:]
 
-        # Mask image placeholder tokens and prompt tokens
-        targets = _mask_image_tokens(targets, _image_token_ids)
-        targets = _mask_prompt_tokens(targets, _assistant_token_id)
-        # Update length_mask to exclude masked positions
-        length_mask = mx.where(targets == -100, 0, length_mask)
+            # Handle sequence length mismatch from vision token injection
+            logits, targets = _align_logits_with_labels(logits, targets)
 
-        ce = nn.losses.cross_entropy(logits, targets) * length_mask
-        ntoks = length_mask.sum()
+            # Build mask from attention_mask (shifted to match targets)
+            if attention_mask is not None:
+                length_mask = attention_mask[:, 1:]
+                length_mask = length_mask[:, :targets.shape[1]]
+            else:
+                length_mask = mx.ones_like(targets, dtype=mx.float32)
+
+            # Mask image placeholder tokens and prompt tokens
+            targets = _mask_image_tokens(targets, _image_token_ids)
+            targets = _mask_prompt_tokens(targets, _assistant_token_id)
+            # Update length_mask to exclude masked positions
+            mask = mx.where(targets == -100, 0, length_mask)
+
+        # Replace -100 with 0 before CE — MLX has no ignore_index;
+        # the mask already zeros out these positions in the loss.
+        safe_targets = mx.where(targets == -100, 0, targets)
+        ce = nn.losses.cross_entropy(logits, safe_targets) * mask
+        ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / ntoks
         return loss, ntoks
 
@@ -484,9 +535,9 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     input_ids = batch_dict["input_ids"]
     pixel_values = batch_dict.get("pixel_values")
     attention_mask = batch_dict.get("attention_mask")
+    labels = batch_dict.get("labels")
 
     inputs = input_ids[:, :-1]
-    targets = input_ids[:, 1:]
 
     embed_result = model.get_input_embeddings(inputs, pixel_values)
     merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
@@ -497,21 +548,31 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     # inputs_embeds is provided.
     hidden = lm_model(inputs, inputs_embeds=merged_embeds, **backbone_kwargs)
 
-    if attention_mask is not None:
-        length_mask = attention_mask[:, 1:][:, :targets.shape[1]]
+    if labels is not None:
+        # train_on_responses_only: labels already encode instruction and
+        # padding masking. Still need to mask image placeholder tokens
+        # since they provide no useful gradient signal.
+        targets = labels[:, 1:]
+        masked_targets = _mask_image_tokens(targets, image_token_ids)
+        ntoks = (masked_targets != -100).sum()
     else:
-        length_mask = mx.ones_like(targets, dtype=mx.float32)
+        targets = input_ids[:, 1:]
 
-    masked_targets = mx.where(length_mask, targets, -100)
+        if attention_mask is not None:
+            length_mask = attention_mask[:, 1:][:, :targets.shape[1]]
+        else:
+            length_mask = mx.ones_like(targets, dtype=mx.float32)
 
-    # Mask image placeholder tokens — they're fixed special tokens that
-    # provide no useful gradient signal.
-    masked_targets = _mask_image_tokens(masked_targets, image_token_ids)
+        masked_targets = mx.where(length_mask, targets, -100)
 
-    # Completion-only masking: mask prompt tokens before first assistant response
-    masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
+        # Mask image placeholder tokens — they're fixed special tokens that
+        # provide no useful gradient signal.
+        masked_targets = _mask_image_tokens(masked_targets, image_token_ids)
 
-    ntoks = (masked_targets != -100).sum()
+        # Completion-only masking: mask prompt tokens before first assistant response
+        masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
+
+        ntoks = (masked_targets != -100).sum()
 
     # Align sequence lengths (vision token injection changes seq len)
     h_seq, t_seq = hidden.shape[1], masked_targets.shape[1]
@@ -658,8 +719,35 @@ def _vlm_iter_kwargs(*, train, seed=42):
     return {"loop": train, "seed": seed}
 
 
+def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn):
+    """Apply response masking to a VLM batch dict, adding 'labels' key.
+
+    Converts input_ids to plain lists, runs the masking closure from
+    dataset_utils.train_on_responses_only, and stores the result as
+    an mx.array in batch_dict["labels"].
+    """
+    input_ids = batch_dict["input_ids"]
+    ids_list = input_ids.tolist()
+    result = mask_fn({"input_ids": ids_list})
+    labels_list = result["labels"]
+    # mask_fn returns plain lists when given plain list input
+    if hasattr(labels_list, "tolist"):
+        labels_list = labels_list.tolist()
+    # Re-apply attention_mask: mlx_vlm pads input_ids with zeros, and the
+    # HF mask_fn's "last turn" branch copies those zeros into labels as real
+    # token IDs (not -100). These zeros pass (targets != -100), causing
+    # spurious gradients and overcounted ntoks.
+    attention_mask = batch_dict.get("attention_mask")
+    if attention_mask is not None:
+        labels_array = mx.where(attention_mask == 0, mx.array(-100), mx.array(labels_list))
+    else:
+        labels_array = mx.array(labels_list)
+    batch_dict["labels"] = labels_array
+    return batch_dict
+
+
 def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
-                       num_batches=None, seed=42):
+                       num_batches=None, seed=42, response_mask_fn=None):
     """Pre-materialize VLM training batches using mlx_vlm's data pipeline.
 
     Args:
@@ -670,9 +758,13 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
         max_seq_length: Maximum sequence length.
         num_batches: Number of batches to materialize (None = all).
         seed: Random seed.
+        response_mask_fn: Optional masking closure from train_on_responses_only.
+            When provided, each batch dict gets a "labels" key with -100 for
+            instruction tokens.
 
     Returns:
-        List of batch dicts, each with input_ids, pixel_values, attention_mask.
+        List of batch dicts, each with input_ids, pixel_values, attention_mask,
+        and optionally labels.
     """
     try:
         from mlx_vlm.trainer.sft_trainer import iterate_batches
@@ -689,6 +781,8 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     for batch_dict in iterate_batches(
         vision_ds, batch_size, max_seq_length, **iter_kwargs,
     ):
+        if response_mask_fn is not None:
+            batch_dict = _apply_response_mask_to_vlm_batch(batch_dict, response_mask_fn)
         batch_list.append(batch_dict)
         if num_batches is not None and len(batch_list) >= num_batches:
             break
@@ -706,13 +800,18 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
 
 
 def iterate_vlm_training_batches(dataset, processor, config, batch_size,
-                                  max_seq_length, seed=42):
+                                  max_seq_length, seed=42,
+                                  response_mask_fn=None):
     """Streaming VLM batch generator.
 
     Wraps mlx_vlm's iterate_batches(train=True) as a generator.
 
+    Args:
+        response_mask_fn: Optional masking closure from train_on_responses_only.
+
     Yields:
-        Batch dicts with input_ids, pixel_values, attention_mask.
+        Batch dicts with input_ids, pixel_values, attention_mask,
+        and optionally labels.
     """
     try:
         from mlx_vlm.trainer.sft_trainer import iterate_batches
@@ -728,6 +827,8 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
     for batch_dict in iterate_batches(
         vision_ds, batch_size, max_seq_length, **iter_kwargs,
     ):
+        if response_mask_fn is not None:
+            batch_dict = _apply_response_mask_to_vlm_batch(batch_dict, response_mask_fn)
         yield batch_dict
 
 
@@ -809,11 +910,11 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         loop=(num_batches is not None),
         seed=seed,
     ):
-        batch_pairs.append((batch, lengths_info))
+        batch_pairs.append((batch, lengths_info, None))
         if num_batches is not None and len(batch_pairs) >= num_batches:
             break
 
-    mx.eval([b for b, _ in batch_pairs] + [l for _, l in batch_pairs])
+    mx.eval([b for b, l, _ in batch_pairs] + [l for _, l, _ in batch_pairs])
     return batch_pairs
 
 
@@ -839,7 +940,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
         loop=True,
         seed=seed,
     ):
-        yield batch, lengths_info
+        yield batch, lengths_info, None
 
 
 def save_lora_adapters(model, path, adapter_config=None):
