@@ -50,6 +50,10 @@ except Exception:
 _FUSED_CE_COMPILE_SUPPORTED = None if \
     os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") != "1" else False
 
+# Module-level flag: True = use fused loss, False = torch.func.grad_and_value
+# is broken (e.g. multi-GPU device_map="balanced" causes TensorWrapper storage errors).
+_FUSED_CE_LOSS_SUPPORTED = True
+
 @functools.cache
 def _get_mapping(autograd):
     parameters = inspect.signature(getattr(autograd, "forward")).parameters
@@ -454,27 +458,54 @@ def unsloth_fused_ce_loss(
     2) logit_scale_divide   (X = X / logit_scale_divide)
     3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
     """
+    global _FUSED_CE_LOSS_SUPPORTED
     scaler = trainer.accelerator.scaler if trainer is not None else None
     # Get mixed precision scaling if seen
     scaling = scaler.get_scale() if scaler is not None else scaling
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
-    return apply_autograd_function(UnslothFusedLoss, dict(
-        loss_function = compute_fused_ce_loss,
-        hidden_states = hidden_states,
-        lm_head_weight = lm_head_weight,
-        lm_head_bias = lm_head_bias,
-        labels = labels,
-        mask = mask,
-        n_items = n_items,
-        scaling = scaling,
-        shift_labels = True,
-        target_gb = target_gb,
-        torch_compile = torch_compile,
-        overwrite = overwrite,
-        extra_kwargs = kwargs,
-    ))
+
+    if _FUSED_CE_LOSS_SUPPORTED:
+        try:
+            return apply_autograd_function(UnslothFusedLoss, dict(
+                loss_function = compute_fused_ce_loss,
+                hidden_states = hidden_states,
+                lm_head_weight = lm_head_weight,
+                lm_head_bias = lm_head_bias,
+                labels = labels,
+                mask = mask,
+                n_items = n_items,
+                scaling = scaling,
+                shift_labels = True,
+                target_gb = target_gb,
+                torch_compile = torch_compile,
+                overwrite = overwrite,
+                extra_kwargs = kwargs,
+            ))
+        except NotImplementedError:
+            # torch.func.grad_and_value fails on some configurations, e.g.
+            # multi-GPU device_map="balanced" causes "Cannot access storage
+            # of TensorWrapper" when _autograd_grad hits cross-device tensors.
+            _FUSED_CE_LOSS_SUPPORTED = False
+            logger.warning_once(
+                "Unsloth: Fused cross entropy loss is not supported (torch.func.grad_and_value failed). "
+                "Using standard (non-chunked) loss. Training will use more memory."
+            )
+
+    # Standard fallback: compute loss directly, let autograd handle backward.
+    # No chunking so higher memory, but works on all configurations.
+    if mask is not None:
+        labels = labels.clone()
+        labels[mask.to(device = labels.device) == 0] = -100
+    kwargs.pop("n_chunks", None)
+    # scaling=None: in the standard autograd path the GradScaler (if any) handles
+    # scaling externally, so we must not bake it into the loss here.
+    loss, _ = compute_fused_ce_loss(
+        hidden_states, lm_head_weight, lm_head_bias, labels,
+        n_items = n_items, scaling = None, shift_labels = True, **kwargs,
+    )
+    return loss
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
