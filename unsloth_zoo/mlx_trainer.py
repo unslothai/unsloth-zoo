@@ -49,11 +49,16 @@ from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from .mlx_utils import (
     make_cce_loss_fn,
     make_baseline_loss_fn,
+    make_vlm_cce_loss_fn,
+    make_vlm_baseline_loss_fn,
     create_batches,
     iterate_training_batches,
+    create_vlm_batches,
+    iterate_vlm_training_batches,
     save_lora_adapters,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
+    _is_vlm_model,
 )
 
 
@@ -99,6 +104,10 @@ class MLXTrainingConfig:
     gradient_checkpointing: bool = True
     streaming: bool = False  # Use streaming iterator instead of materializing batches
 
+    # VLM / completion masking
+    train_on_completions: bool = False  # Mask prompt tokens in loss
+    assistant_token_id: int = 0  # Token ID marking start of assistant response
+
 
 class MLXTrainer:
     """MLX-native trainer for Apple Silicon, mirroring SFTTrainer's constructor API."""
@@ -115,14 +124,19 @@ class MLXTrainer:
         data_collator=None,
         args=None,
         formatting_func=None,
+        processor=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
+        self.processor = processor
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.formatting_func = formatting_func
         # Use args or defaults
         self.args = args or MLXTrainingConfig()
+
+        # Auto-detect VLM
+        self._is_vlm = _is_vlm_model(model)
 
         # Constructor params override args if provided
         if dataset_text_field is not None:
@@ -308,49 +322,33 @@ class MLXTrainer:
         """Inner training loop, separated for GC cleanup in finally block."""
         args = self.args
         model = self.model
+        is_vlm = self._is_vlm
 
         # Pick loss function — returns (loss, ntoks) tuples
         use_cce = args.use_cce
 
-        if use_cce:
-            loss_fn = make_cce_loss_fn(model)
-            cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
-            print(f"Unsloth: Using CCE loss ({cce_backend}) for memory-efficient training.")
+        if is_vlm:
+            if use_cce:
+                loss_fn = make_vlm_cce_loss_fn(model)
+                cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
+                print(f"Unsloth: Using VLM CCE loss ({cce_backend}) for memory-efficient training.")
+            else:
+                loss_fn = make_vlm_baseline_loss_fn()
+                print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
-            loss_fn = make_baseline_loss_fn()
-            print("Unsloth: Using standard cross-entropy loss.")
+            if use_cce:
+                loss_fn = make_cce_loss_fn(model)
+                cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
+                print(f"Unsloth: Using CCE loss ({cce_backend}) for memory-efficient training.")
+            else:
+                loss_fn = make_baseline_loss_fn()
+                print("Unsloth: Using standard cross-entropy loss.")
 
         # Prepare data — determine total_steps first
-        if self._batches is not None:
-            batches = self._batches
-            batch_iter = None
-        elif args.streaming:
-            batches = None
-            batch_iter = iterate_training_batches(
-                dataset=self.train_dataset,
-                tokenizer=self.tokenizer,
-                batch_size=args.per_device_train_batch_size,
-                max_seq_length=args.max_seq_length,
-                seed=args.seed,
-                dataset_text_field=args.dataset_text_field,
-                formatting_func=self.formatting_func,
-            )
+        if is_vlm:
+            batches, batch_iter = self._prepare_vlm_data()
         else:
-            total_batches_needed = (
-                args.max_steps * args.gradient_accumulation_steps
-                if args.max_steps > 0 else None
-            )
-            batches = create_batches(
-                dataset=self.train_dataset,
-                tokenizer=self.tokenizer,
-                batch_size=args.per_device_train_batch_size,
-                max_seq_length=args.max_seq_length,
-                num_batches=total_batches_needed,
-                seed=args.seed,
-                dataset_text_field=args.dataset_text_field,
-                formatting_func=self.formatting_func,
-            )
-            batch_iter = None
+            batches, batch_iter = self._prepare_text_data()
 
         if batches is not None and not batches:
             raise ValueError(
@@ -382,39 +380,65 @@ class MLXTrainer:
         if use_lora_plus:
             print(f"Unsloth: LoRA+ enabled (ratio={lora_plus_ratio}).")
 
-        # Build step function following mlx-lm's pattern
+        # Build step functions following mlx-lm's pattern
         max_grad_norm = args.max_grad_norm
         state = [model.state, optimizer.state, mx.random.state]
 
-        def step(batch, lengths, prev_grad, do_update):
-            (lvalue, toks), grad = loss_and_grad_fn(model, batch, lengths)
+        def _apply_update(grad, toks_f):
+            """Common gradient post-processing and optimizer update."""
+            grad = tree_map(lambda g: g / toks_f, grad)
+            if use_lora_plus:
+                flat = tree_flatten(grad)
+                scaled = [
+                    (k, v * lora_plus_ratio if "lora_b" in k else v)
+                    for k, v in flat
+                ]
+                grad = tree_unflatten(scaled)
+            if max_grad_norm > 0:
+                grad, _ = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
+            optimizer.update(model, grad)
 
-            if prev_grad is not None:
-                grad = tree_map(lambda x, y: x + y, grad, prev_grad)
+        if is_vlm:
+            def step_fn(batch_dict, prev_state, do_update):
+                (lvalue, toks), grad = loss_and_grad_fn(model, batch_dict)
 
-            if do_update:
-                if grad_accum > 1:
-                    grad = tree_map(lambda x: x / grad_accum, grad)
-                if use_lora_plus:
-                    flat = tree_flatten(grad)
-                    scaled = [
-                        (k, v * lora_plus_ratio if "lora_b" in k else v)
-                        for k, v in flat
-                    ]
-                    grad = tree_unflatten(scaled)
-                if max_grad_norm > 0:
-                    grad, _ = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
-                optimizer.update(model, grad)
-                grad = None
+                toks_f = toks.astype(mx.float32)
+                grad = tree_map(lambda g: g * toks_f, grad)
 
-            return lvalue, toks, grad
+                if prev_state is not None:
+                    prev_grad, prev_toks = prev_state
+                    grad = tree_map(lambda x, y: x + y, grad, prev_grad)
+                    toks_f = toks_f + prev_toks
+
+                if do_update:
+                    _apply_update(grad, toks_f)
+                    return lvalue, toks, None
+
+                return lvalue, toks, (grad, toks_f)
+        else:
+            def step_fn(batch, lengths, prev_state, do_update):
+                (lvalue, toks), grad = loss_and_grad_fn(model, batch, lengths)
+
+                toks_f = toks.astype(mx.float32)
+                grad = tree_map(lambda g: g * toks_f, grad)
+
+                if prev_state is not None:
+                    prev_grad, prev_toks = prev_state
+                    grad = tree_map(lambda x, y: x + y, grad, prev_grad)
+                    toks_f = toks_f + prev_toks
+
+                if do_update:
+                    _apply_update(grad, toks_f)
+                    return lvalue, toks, None
+
+                return lvalue, toks, (grad, toks_f)
 
         if args.compile:
-            step = mx.compile(step, inputs=state, outputs=state)
+            step_fn = mx.compile(step_fn, inputs=state, outputs=state)
 
-        # Prepare eval batches if eval is enabled
+        # Prepare eval batches if eval is enabled (text-only for now)
         eval_batches = None
-        if args.eval_steps > 0 and self.eval_dataset is not None:
+        if args.eval_steps > 0 and self.eval_dataset is not None and not is_vlm:
             eval_batches = create_batches(
                 dataset=self.eval_dataset,
                 tokenizer=self.tokenizer,
@@ -429,6 +453,8 @@ class MLXTrainer:
                       f"({len(eval_batches)} eval batches).")
 
         features = []
+        if is_vlm:
+            features.append("VLM")
         if use_cce:
             features.append("CCE")
         if args.gradient_checkpointing:
@@ -469,16 +495,26 @@ class MLXTrainer:
 
             do_update = (it % grad_accum == 0)
 
-            lvalue, toks, grad_accum_state = step(
-                batch_data[0], batch_data[1],
-                grad_accum_state,
-                do_update,
-            )
+            if is_vlm:
+                lvalue, toks, grad_accum_state = step_fn(
+                    batch_data,
+                    grad_accum_state,
+                    do_update,
+                )
+            else:
+                lvalue, toks, grad_accum_state = step_fn(
+                    batch_data[0], batch_data[1],
+                    grad_accum_state,
+                    do_update,
+                )
 
-            losses += lvalue
+            losses += lvalue * toks
             n_tokens += toks
             steps += 1
-            mx.eval(state, losses, n_tokens, grad_accum_state)
+            if grad_accum_state is not None:
+                mx.eval(state, losses, n_tokens, grad_accum_state[0], grad_accum_state[1])
+            else:
+                mx.eval(state, losses, n_tokens)
             train_time += time.perf_counter() - tic
 
             # Only log/eval on actual optimizer steps
@@ -490,7 +526,7 @@ class MLXTrainer:
 
             # Logging
             if current_step % args.logging_steps == 0 or current_step == total_steps:
-                train_loss = losses.item() / steps
+                train_loss = (losses / n_tokens).item()
                 tok_count = n_tokens.item()
                 trained_tokens += tok_count
                 lr_val = optimizer.learning_rate.item()
@@ -557,6 +593,76 @@ class MLXTrainer:
                 trained_tokens / total_time if total_time > 0 else 0
             ),
         }
+
+    def _prepare_text_data(self):
+        """Prepare text training data. Returns (batches, batch_iter)."""
+        args = self.args
+        if self._batches is not None:
+            return self._batches, None
+        elif args.streaming:
+            return None, iterate_training_batches(
+                dataset=self.train_dataset,
+                tokenizer=self.tokenizer,
+                batch_size=args.per_device_train_batch_size,
+                max_seq_length=args.max_seq_length,
+                seed=args.seed,
+                dataset_text_field=args.dataset_text_field,
+                formatting_func=self.formatting_func,
+            )
+        else:
+            total_batches_needed = (
+                args.max_steps * args.gradient_accumulation_steps
+                if args.max_steps > 0 else None
+            )
+            batches = create_batches(
+                dataset=self.train_dataset,
+                tokenizer=self.tokenizer,
+                batch_size=args.per_device_train_batch_size,
+                max_seq_length=args.max_seq_length,
+                num_batches=total_batches_needed,
+                seed=args.seed,
+                dataset_text_field=args.dataset_text_field,
+                formatting_func=self.formatting_func,
+            )
+            return batches, None
+
+    def _prepare_vlm_data(self):
+        """Prepare VLM training data. Returns (batches, batch_iter)."""
+        args = self.args
+        processor = self.processor or getattr(self.model, "_processor", None)
+        if processor is None:
+            raise ValueError(
+                "VLM training requires a processor. Pass processor= to MLXTrainer "
+                "or load the model with FastLanguageModel.from_pretrained()."
+            )
+        config = getattr(self.model, "_config", {})
+
+        if self._batches is not None:
+            return self._batches, None
+        elif args.streaming:
+            return None, iterate_vlm_training_batches(
+                dataset=self.train_dataset,
+                processor=processor,
+                config=config,
+                batch_size=args.per_device_train_batch_size,
+                max_seq_length=args.max_seq_length,
+                seed=args.seed,
+            )
+        else:
+            total_batches_needed = (
+                args.max_steps * args.gradient_accumulation_steps
+                if args.max_steps > 0 else None
+            )
+            batches = create_vlm_batches(
+                dataset=self.train_dataset,
+                processor=processor,
+                config=config,
+                batch_size=args.per_device_train_batch_size,
+                max_seq_length=args.max_seq_length,
+                num_batches=total_batches_needed,
+                seed=args.seed,
+            )
+            return batches, None
 
     def save_model(self, output_dir=None):
         """Save LoRA adapters (or full model if no LoRA)."""

@@ -18,10 +18,176 @@
 Lightweight FastLanguageModel for Apple Silicon / MLX.
 
 No GPU dependencies — uses mlx-lm for model loading and LoRA.
+Supports both text-only models (mlx-lm) and VLMs (mlx-vlm).
 This avoids importing unsloth.models (which pulls in CUDA kernels).
 """
 
+import json
 import types
+import warnings
+
+
+_vlm_model_types_cache = None
+
+
+def _is_vlm(config: dict) -> bool:
+    """Detect whether a model config describes a VLM.
+
+    Checks:
+    1. "vision_config" key in config → True
+    2. model_type is in mlx_vlm's supported model set (discovered dynamically)
+    """
+    if "vision_config" in config:
+        return True
+
+    model_type = config.get("model_type", "")
+    if not model_type:
+        return False
+
+    global _vlm_model_types_cache
+    if _vlm_model_types_cache is None:
+        _vlm_model_types_cache = _build_vlm_model_types()
+
+    return model_type in _vlm_model_types_cache
+
+
+def _build_vlm_model_types():
+    """Build the set of model_type strings that mlx_vlm supports.
+
+    Uses dynamic discovery via pkgutil + MODEL_REMAPPING keys/values.
+    Returns frozenset; cached at module level by _is_vlm().
+    """
+    types_set = set()
+    try:
+        import mlx_vlm.models as vlm_models_pkg
+        import pkgutil
+        for importer, modname, ispkg in pkgutil.iter_modules(vlm_models_pkg.__path__):
+            if ispkg:
+                types_set.add(modname)
+    except (ImportError, Exception):
+        pass
+
+    try:
+        from mlx_vlm.utils import MODEL_REMAPPING
+        # Add both source and target keys
+        for src, tgt in MODEL_REMAPPING.items():
+            types_set.add(src)
+            types_set.add(tgt)
+    except (ImportError, Exception):
+        pass
+
+    return frozenset(types_set)
+
+
+def _fix_missing_no_grad(model):
+    """Ensure every nn.Module submodule has _no_grad / _training.
+
+    Works around upstream model definitions that use __new__ without __init__
+    (e.g. gemma4 AudioRelativePositionEmbedding).
+    """
+    import mlx.nn as nn
+    for _, mod in model.named_modules():
+        if isinstance(mod, nn.Module):
+            if not hasattr(mod, "_no_grad"):
+                object.__setattr__(mod, "_no_grad", set())
+            if not hasattr(mod, "_training"):
+                object.__setattr__(mod, "_training", True)
+
+
+# ---------------------------------------------------------------------------
+# Runtime VLM quantization via monkey-patching mlx_vlm.utils.load_model
+# ---------------------------------------------------------------------------
+_vlm_load_model_patched = False
+_original_vlm_load_model = None
+
+# Fragments that identify multimodal sub-networks we must *never* quantize.
+_MULTIMODAL_SKIP_FRAGMENTS = (
+    "lm_head", "embed_tokens",
+    "multi_modal_projector", "mm_projector", "connector", "aligner",
+    "vision_encoder", "audio_encoder", "audio_projection",
+)
+
+
+def _vlm_config_is_already_quantized(config_data: dict) -> bool:
+    """Return True when the HF config indicates the model is pre-quantized."""
+    if "quantization" in config_data:
+        return True
+    qc = config_data.get("quantization_config", {})
+    if qc.get("quant_method"):
+        return True
+    return False
+
+
+def _build_vlm_quant_predicate(model):
+    """Build a quant_predicate for mlx_lm.utils.quantize_model.
+
+    Two layers of filtering:
+    1. Hard-skip multimodal modules (vision tower, projectors, embeddings, …)
+    2. Delegate to model.quant_predicate for model-specific rules (MoE gates, …)
+    """
+    try:
+        from mlx_vlm.utils import skip_multimodal_module
+    except ImportError:
+        skip_multimodal_module = None
+
+    # Trigger model-specific setup (e.g. phi4mm LoRA merge side-effect)
+    model_predicate = getattr(model, "quant_predicate", None)
+
+    def predicate(path: str, module):
+        # 1. Hard skip — mlx_vlm's own multimodal check
+        if skip_multimodal_module is not None and skip_multimodal_module(path):
+            return False
+        # 2. Hard skip — extra fragments (embeddings, projectors, …)
+        for frag in _MULTIMODAL_SKIP_FRAGMENTS:
+            if frag in path:
+                return False
+        # 3. Model-specific predicate (MoE gates → 8-bit, phi4mm exclusions, …)
+        if model_predicate is not None:
+            return model_predicate(path, module)
+        return True
+
+    return predicate
+
+
+def _patched_vlm_load_model(model_path, lazy=False, **kwargs):
+    """Drop-in replacement for mlx_vlm.utils.load_model with runtime quantization."""
+    import mlx.core as mx
+
+    q_bits = kwargs.pop("q_bits", None)
+    q_group_size = kwargs.pop("q_group_size", 64)
+
+    # Load float weights (always lazy so quantization runs on lazy arrays)
+    model = _original_vlm_load_model(model_path, lazy=True, **kwargs)
+
+    if q_bits is not None:
+        from mlx_lm.utils import quantize_model
+        from mlx_vlm.utils import load_config
+
+        config = load_config(model_path)
+        predicate = _build_vlm_quant_predicate(model)
+        model, updated_config = quantize_model(
+            model, config, q_group_size, q_bits, quant_predicate=predicate,
+        )
+        model._config = updated_config
+
+    if not lazy:
+        mx.eval(model.parameters())
+
+    return model
+
+
+def _ensure_vlm_load_model_patched():
+    """Idempotent installer — patches mlx_vlm.utils.load_model on first call."""
+    global _vlm_load_model_patched, _original_vlm_load_model
+
+    if _vlm_load_model_patched:
+        return
+
+    import mlx_vlm.utils as _vlm_utils
+
+    _original_vlm_load_model = _vlm_utils.load_model
+    _vlm_utils.load_model = _patched_vlm_load_model
+    _vlm_load_model_patched = True
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
@@ -67,6 +233,49 @@ def _patch_mlx_saving(model, tokenizer):
     model.save_lora_adapters     = types.MethodType(_mlx_save_lora_adapters, model)
 
 
+def _lora_walk_module(model, lora_config, target_modules, attr_names):
+    """Walk a module tree and replace matching Linear/QuantizedLinear with LoRA.
+
+    Used for vision encoders that don't have the flat `.layers` structure
+    expected by mlx-lm's `linear_to_lora_layers`.
+    """
+    import mlx.nn as nn
+    try:
+        from mlx_lm.tuner.lora import LoRALinear
+    except ImportError:
+        return
+
+    for attr_name in attr_names:
+        root = getattr(model, attr_name, None)
+        if root is None:
+            continue
+
+        def _walk(module, prefix=""):
+            for name, child in module.named_modules():
+                leaf_name = name.split(".")[-1] if "." in name else name
+                if leaf_name not in target_modules:
+                    continue
+                if isinstance(child, (nn.Linear, nn.QuantizedLinear)):
+                    lora_layer = LoRALinear.from_base(
+                        child,
+                        r=lora_config["rank"],
+                        dropout=lora_config.get("dropout", 0.0),
+                        scale=lora_config["scale"],
+                    )
+                    # Navigate to parent and replace
+                    parts = name.split(".")
+                    parent = root
+                    for p in parts[:-1]:
+                        try:
+                            parent = parent[int(p)]
+                        except (ValueError, TypeError):
+                            parent = getattr(parent, p)
+                    setattr(parent, parts[-1], lora_layer)
+
+        _walk(root)
+        break  # Only process the first matching attribute
+
+
 class FastMLXModel:
     """MLX model loader for Apple Silicon.
 
@@ -88,55 +297,142 @@ class FastMLXModel:
         load_in_4bit=True,
         token=None,
         trust_remote_code=False,
+        text_only=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
-        """Load a model via mlx-lm on Apple Silicon.
+        """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
 
         Args:
-            model_name: Any HuggingFace repo name. mlx-lm supports
-                pre-converted MLX models (mlx-community/*) and standard
-                PyTorch models (converted on-the-fly).
+            model_name: Any HuggingFace repo name.
             max_seq_length: Maximum sequence length for training.
             load_in_4bit: Accepted for API compat with CUDA unsloth.
-                On MLX, quantization is determined by the model repo itself.
             token: HuggingFace token for gated models.
+            text_only: Loading mode:
+                None  — auto-detect from config (default)
+                True  — force text-only via mlx-lm
+                False — force VLM via mlx-vlm
         """
         try:
             from mlx_lm import load as mlx_load
+            from mlx_lm.utils import _download
         except ImportError:
             raise ImportError(
                 "Unsloth: mlx-lm is required for Apple Silicon. "
                 "Install via: pip install unsloth-zoo[mlx]"
             )
 
-        print(f"Unsloth: Loading {model_name} via mlx-lm...")
+        # Step 1: Download config to decide loading path
+        try:
+            local_path = str(_download(model_name))
+            config_path = local_path + "/config.json"
+            with open(config_path, "r") as f:
+                config_data = json.load(f)
+        except Exception:
+            config_data = {}
+            local_path = None
+
+        # Step 2: Check unsloth custom loader registry
+        model_type = config_data.get("model_type", "")
+        try:
+            from unsloth.models.mlx import get_unsloth_loader
+            custom_loader = get_unsloth_loader(model_type)
+        except (ImportError, AttributeError):
+            # AttributeError: torch installed without CUDA triggers
+            # torch._C._cuda_getCurrentRawStream failures in unsloth.kernels
+            custom_loader = None
+
+        if custom_loader is not None:
+            model, tokenizer_or_processor = custom_loader(
+                model_name, config_data, max_seq_length=max_seq_length, token=token
+            )
+            model._config = config_data
+            model._hf_repo = model_name
+            model._src_path = local_path
+            model.max_seq_length = max_seq_length
+            _patch_mlx_saving(model, tokenizer_or_processor)
+            return model, tokenizer_or_processor
+
+        # Step 3: Route based on text_only
+        is_vlm = False
+        if text_only is True:
+            is_vlm = False
+        elif text_only is False:
+            is_vlm = True
+        else:
+            is_vlm = _is_vlm(config_data)
 
         tokenizer_config = {}
         if token:
             tokenizer_config["token"] = token
 
-        model, tokenizer, config = mlx_load(
-            model_name,
-            tokenizer_config=tokenizer_config if tokenizer_config else None,
-            return_config=True,
-        )
+        if is_vlm:
+            # VLM path via mlx-vlm
+            try:
+                from mlx_vlm import load as vlm_load
+            except ImportError:
+                raise ImportError(
+                    "Unsloth: mlx-vlm is required for Vision Language Models. "
+                    "Install via: pip install mlx-vlm\n"
+                    "Or pass text_only=True to load as text-only via mlx-lm."
+                )
 
-        # Stash metadata on the model for saving later
-        model._config = config
-        model._hf_repo = model_name
-        # Resolve local cache path for copying auxiliary files during save
-        try:
-            from mlx_lm.utils import _download
-            model._src_path = str(_download(model_name))
-        except Exception:
-            model._src_path = None
+            if text_only is False and not _is_vlm(config_data):
+                warnings.warn(
+                    f"text_only=False but '{model_name}' does not appear to be a VLM. "
+                    f"Attempting mlx_vlm.load() anyway — this may fail.",
+                    stacklevel=2,
+                )
 
-        model.max_seq_length = max_seq_length
+            already_quantized = _vlm_config_is_already_quantized(config_data)
+            q_bits = kwargs.pop("q_bits", 4)
+            q_group_size = kwargs.pop("q_group_size", 64)
+            want_runtime_quant = load_in_4bit and not already_quantized
 
-        # Attach save/push methods to model (mirrors CUDA path's patch_saving_functions)
-        _patch_mlx_saving(model, tokenizer)
+            if load_in_4bit and already_quantized:
+                warnings.warn(
+                    f"Unsloth: '{model_name}' is already quantized — "
+                    f"ignoring load_in_4bit.",
+                    stacklevel=2,
+                )
 
-        return model, tokenizer
+            if want_runtime_quant:
+                _ensure_vlm_load_model_patched()
+                print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
+                      f"runtime {q_bits}-bit quantization)...")
+                model, processor = vlm_load(
+                    model_name, q_bits=q_bits, q_group_size=q_group_size,
+                )
+            else:
+                print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
+                model, processor = vlm_load(model_name)
+
+            model._is_vlm_model = True
+            model._processor = processor
+
+            model._config = getattr(model, "_config", config_data)
+            model._hf_repo = model_name
+            model._src_path = local_path
+            model.max_seq_length = max_seq_length
+
+            _patch_mlx_saving(model, processor)
+            return model, processor
+        else:
+            # Text path via mlx-lm (original behavior)
+            print(f"Unsloth: Loading {model_name} via mlx-lm...")
+            model, tokenizer, config = mlx_load(
+                model_name,
+                tokenizer_config=tokenizer_config if tokenizer_config else None,
+                return_config=True,
+            )
+            model._is_vlm_model = False
+
+            model._config = config
+            model._hf_repo = model_name
+            model._src_path = local_path
+            model.max_seq_length = max_seq_length
+
+            _patch_mlx_saving(model, tokenizer)
+            return model, tokenizer
 
     @staticmethod
     def get_peft_model(
@@ -149,9 +445,15 @@ class FastMLXModel:
         use_gradient_checkpointing=True,
         random_state=3407,
         max_seq_length=2048,
+        train_vision=False,
+        train_projector=False,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
-        """Apply LoRA via mlx-lm on Apple Silicon."""
+        """Apply LoRA via mlx-lm on Apple Silicon.
+
+        For VLMs, applies LoRA to the language model and optionally to the
+        vision tower (train_vision=True) and projector (train_projector=True).
+        """
         try:
             from mlx_lm.tuner.utils import linear_to_lora_layers
         except ImportError:
@@ -173,20 +475,57 @@ class FastMLXModel:
             "scale": lora_alpha / r,
         }
 
-        num_layers = 0
-        if hasattr(model, "model") and hasattr(model.model, "layers"):
-            num_layers = len(model.model.layers)
+        is_vlm = getattr(model, "_is_vlm_model", False)
 
-        linear_to_lora_layers(
-            model,
-            num_layers=num_layers,
-            config=lora_config,
-            use_dora=False,
-        )
+        if is_vlm:
+            # VLM path: freeze everything, then apply LoRA selectively
+            _fix_missing_no_grad(model)
+            model.freeze()
 
-        # Freeze all, then selectively unfreeze LoRA weights
-        model.freeze()
-        model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+            # Apply LoRA to the language model
+            lm = model.language_model
+            num_layers = 0
+            if hasattr(lm, "model") and hasattr(lm.model, "layers"):
+                num_layers = len(lm.model.layers)
+            linear_to_lora_layers(
+                lm,
+                num_layers=num_layers,
+                config=lora_config,
+                use_dora=False,
+            )
+
+            # Optionally apply LoRA to vision tower
+            if train_vision:
+                _lora_walk_module(model, lora_config, target_modules,
+                                  attr_names=("vision_tower", "vision_model",
+                                              "vision_encoder"))
+
+            # Optionally unfreeze projector
+            if train_projector:
+                for attr in ("multi_modal_projector", "mm_projector",
+                             "connector", "aligner"):
+                    proj = getattr(model, attr, None)
+                    if proj is not None:
+                        proj.unfreeze()
+                        break
+
+            # Unfreeze all LoRA params across the entire tree
+            model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+        else:
+            # Text-only path (original behavior)
+            num_layers = 0
+            if hasattr(model, "model") and hasattr(model.model, "layers"):
+                num_layers = len(model.model.layers)
+
+            linear_to_lora_layers(
+                model,
+                num_layers=num_layers,
+                config=lora_config,
+                use_dora=False,
+            )
+
+            model.freeze()
+            model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
 
         import mlx.utils
         trainable = sum(v.size for _, v in mlx.utils.tree_flatten(model.trainable_parameters()))
