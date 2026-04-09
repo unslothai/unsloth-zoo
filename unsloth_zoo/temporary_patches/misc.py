@@ -542,8 +542,8 @@ def patch_sdpa_bool_causal_mask():
       - module.is_causal must be True (protects BERT/bidirectional).
       - sliding_window kwarg must be None (protects Gemma2/Mistral).
       - 4D torch.bool with Q == K == query seq_len (not cross-attn).
-      - Upper-triangle spot-check m[0,0,0,1]==False (pure causal vs
-        packed/custom masks).
+      - Two-cell spot-check: m[0,0,0,1]==False AND m[0,0,-1,0]==True
+        (pure causal vs packed/padded/custom masks).
     """
     if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
         return
@@ -622,11 +622,21 @@ def patch_sdpa_bool_causal_mask():
                 **kwargs,
             )
 
-        # Spot-check: a pure lower-triangular causal mask has m[0,0,0,1]==False
-        # (first query cannot see second key). Packed-sequence masks and other
-        # non-trivial patterns will have True in the upper triangle.
+        # Spot-check: a pure lower-triangular causal mask has:
+        #   m[0,0,0,1]==False  (first query cannot see second key)
+        #   m[0,0,-1,0]==True  (last query can see first key)
+        # Packed-sequence masks fail the second check because the last
+        # segment's first query cannot see the first segment's first key.
+        # Padded masks may also fail if the first position is masked out.
+        # Two O(1) probes, no CUDA ops.
         S = m.shape[-1]
-        is_pure_causal = (S < 2) or (not m[0, 0, 0, 1].item())
+        is_pure_causal = (
+            (S < 2)
+            or (
+                not m[0, 0, 0, 1].item()       # upper triangle is False
+                and m[0, 0, S - 1, 0].item()   # last row sees first col
+            )
+        )
 
         if is_pure_causal:
             # Safe to drop the mask entirely -- native is_causal path avoids
