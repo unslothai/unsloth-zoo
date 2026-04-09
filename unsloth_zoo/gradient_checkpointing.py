@@ -365,27 +365,33 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     NEXT_BUFFER_SLOT = [0] * n_gpus
     try:
         GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-        # Double buffering: try to allocate buffer B
-        try:
-            GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-            USE_DOUBLE_BUFFER = False # enabled after first pass if CUDA free memory > DOUBLE_BUFFER_HEADROOM
-            # Per-buffer events to prevent race conditions in double buffering.
-            # Each event tracks when compute on that buffer finishes
-            if DEVICE_TYPE in ("cuda", "hip"):
-                event_ctor = torch.cuda.Event
-            elif DEVICE_TYPE == "xpu":
-                event_ctor = torch.xpu.Event
-            else:
-                raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
-            BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
-            BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
-        except RuntimeError as e:
-            if "out of memory" not in str(e).lower():
-                raise
+        # Double buffering: try to allocate buffer B (can be disabled via env var)
+        if os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER", "0") == "1":
             GPU_BUFFERS_B = None
             USE_DOUBLE_BUFFER = False
             BUFFER_EVENTS_A = None
             BUFFER_EVENTS_B = None
+        else:
+            try:
+                GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
+                USE_DOUBLE_BUFFER = False # set false first, enabled after first pass if CUDA free memory > DOUBLE_BUFFER_HEADROOM
+                # Per-buffer events to prevent race conditions in double buffering.
+                # Each event tracks when compute on that buffer finishes
+                if DEVICE_TYPE in ("cuda", "hip"):
+                    event_ctor = torch.cuda.Event
+                elif DEVICE_TYPE == "xpu":
+                    event_ctor = torch.xpu.Event
+                else:
+                    raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
+                BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
+                BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
+            except RuntimeError as e:
+                if "out of memory" not in str(e).lower():
+                    raise
+                GPU_BUFFERS_B = None
+                USE_DOUBLE_BUFFER = False
+                BUFFER_EVENTS_A = None
+                BUFFER_EVENTS_B = None
     except Exception as e:
         print("="*10 + "\n")
         print("Unsloth: Your setup does not support `PYTORCH_CUDA_ALLOC_CONF`\n")
