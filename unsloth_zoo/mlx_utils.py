@@ -268,6 +268,92 @@ def make_baseline_loss_fn():
 # VLM helpers
 # ---------------------------------------------------------------------------
 
+# Image/vision special tokens that should never contribute to loss.
+# Mirrors unsloth's IMAGE_TOKENS list from vision_utils.py.
+_IMAGE_TOKEN_STRINGS = (
+    "<|image|>",           # Llama 3.2 Vision, Phi 3.5, Gemma4
+    "<|vision_start|>",    # Qwen
+    "<|vision_end|>",      # Qwen
+    "<|vision_pad|>",      # Qwen
+    "<|image_pad|>",       # Qwen
+    "<image>",             # PaliGemma, Llava, InternVL
+    "</image>",            # InternVL
+    "<image_soft_token>",  # Gemma 3
+    "<start_of_image>",    # Gemma 3
+    "<end_of_image>",      # Gemma 3
+)
+
+
+def _get_image_token_ids(model):
+    """Resolve image token IDs from model's processor/tokenizer.
+
+    Returns an mx.array of token IDs to mask from loss, or None if
+    no image tokens are found (non-VLM or tokenizer doesn't have them).
+    """
+    processor = getattr(model, "_processor", None)
+    tokenizer = getattr(processor, "tokenizer", processor) if processor else None
+    if tokenizer is None:
+        return None
+
+    ids = []
+    for tok_str in _IMAGE_TOKEN_STRINGS:
+        try:
+            tok_ids = tokenizer.convert_tokens_to_ids([tok_str])
+            if tok_ids and tok_ids[0] is not None:
+                # Some tokenizers return the unk_token_id for unknown tokens
+                unk_id = getattr(tokenizer, "unk_token_id", None)
+                if tok_ids[0] != unk_id:
+                    ids.append(tok_ids[0])
+        except Exception:
+            continue
+
+    # Also check config for image_token_index / image_token_id
+    config = getattr(model, "_config", {})
+    for key in ("image_token_index", "image_token_id"):
+        val = config.get(key)
+        if val is not None and val not in ids:
+            ids.append(val)
+
+    if not ids:
+        return None
+    return mx.array(ids, dtype=mx.int32)
+
+
+def _mask_image_tokens(targets, image_token_ids):
+    """Set image token positions in targets to -100 (ignore_index).
+
+    Prevents the model from training to predict image placeholder tokens,
+    which are fixed special tokens that provide no useful gradient signal.
+    """
+    if image_token_ids is None:
+        return targets
+    # Build a mask: True where target is any image token
+    is_image = targets == image_token_ids[0]
+    for tok_id in image_token_ids.tolist()[1:]:
+        is_image = is_image | (targets == tok_id)
+    return mx.where(is_image, -100, targets)
+
+
+def _mask_prompt_tokens(targets, assistant_token_id):
+    """Mask all tokens before the first assistant response in each sequence.
+
+    Scans each row of targets for assistant_token_id. All positions before
+    the first occurrence are set to -100 (ignore_index). If the token is
+    not found, the entire sequence is left unmasked (assumes all completion).
+
+    This implements train_on_completions_only for VLM training.
+    """
+    if assistant_token_id <= 0:
+        return targets
+    # Find the first occurrence of assistant_token_id in each row
+    is_assistant = (targets == assistant_token_id)
+    # cumsum along seq dim: positions after first assistant token have cumsum > 0
+    cumulative = mx.cumsum(is_assistant.astype(mx.int32), axis=1)
+    # Mask everything before first assistant token (cumsum == 0)
+    prompt_mask = (cumulative == 0)
+    return mx.where(prompt_mask, -100, targets)
+
+
 def _is_vlm_model(model) -> bool:
     """Check if model is a VLM (has language_model + vision component)."""
     if not hasattr(model, "language_model"):
@@ -292,7 +378,7 @@ def _align_logits_with_labels(logits, labels):
     return logits, labels
 
 
-def make_vlm_baseline_loss_fn():
+def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
     """Create a standard cross-entropy loss function for VLMs.
 
     Takes a batch dict with input_ids, pixel_values, attention_mask.
@@ -300,6 +386,9 @@ def make_vlm_baseline_loss_fn():
     Returns:
         A function (model, batch_dict) -> (loss, ntoks).
     """
+    _image_token_ids = _get_image_token_ids(model) if model is not None else None
+    _assistant_token_id = assistant_token_id
+
     def loss_fn(model, batch_dict):
         input_ids = batch_dict["input_ids"]
         pixel_values = batch_dict.get("pixel_values")
@@ -322,10 +411,15 @@ def make_vlm_baseline_loss_fn():
         # Build mask from attention_mask (shifted to match targets)
         if attention_mask is not None:
             length_mask = attention_mask[:, 1:]
-            # Truncate to match logits/targets length
             length_mask = length_mask[:, :targets.shape[1]]
         else:
             length_mask = mx.ones_like(targets, dtype=mx.float32)
+
+        # Mask image placeholder tokens and prompt tokens
+        targets = _mask_image_tokens(targets, _image_token_ids)
+        targets = _mask_prompt_tokens(targets, _assistant_token_id)
+        # Update length_mask to exclude masked positions
+        length_mask = mx.where(targets == -100, 0, length_mask)
 
         ce = nn.losses.cross_entropy(logits, targets) * length_mask
         ntoks = length_mask.sum()
@@ -384,7 +478,8 @@ def _unpack_embed_result(embed_result, model):
     return merged_embeds, backbone_kwargs
 
 
-def _vlm_cce_forward(model, batch_dict):
+def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
+                     assistant_token_id=0):
     """Shared VLM CCE forward: embed -> backbone -> hidden + masked_targets + ntoks."""
     input_ids = batch_dict["input_ids"]
     pixel_values = batch_dict.get("pixel_values")
@@ -408,7 +503,15 @@ def _vlm_cce_forward(model, batch_dict):
         length_mask = mx.ones_like(targets, dtype=mx.float32)
 
     masked_targets = mx.where(length_mask, targets, -100)
-    ntoks = length_mask.sum()
+
+    # Mask image placeholder tokens — they're fixed special tokens that
+    # provide no useful gradient signal.
+    masked_targets = _mask_image_tokens(masked_targets, image_token_ids)
+
+    # Completion-only masking: mask prompt tokens before first assistant response
+    masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
+
+    ntoks = (masked_targets != -100).sum()
 
     # Align sequence lengths (vision token injection changes seq len)
     h_seq, t_seq = hidden.shape[1], masked_targets.shape[1]
@@ -421,7 +524,7 @@ def _vlm_cce_forward(model, batch_dict):
     return hidden, masked_targets, ntoks
 
 
-def make_vlm_cce_loss_fn(model):
+def make_vlm_cce_loss_fn(model, assistant_token_id=0):
     """Create a CCE loss function for VLMs.
 
     Uses model.get_input_embeddings() to get merged vision+text embeddings,
@@ -429,6 +532,12 @@ def make_vlm_cce_loss_fn(model):
     the LM head, and applies CCE.
 
     Falls back to baseline loss if get_input_embeddings is not available.
+
+    Args:
+        model: VLM model.
+        assistant_token_id: Token ID marking start of assistant responses.
+            When > 0, all tokens before the first occurrence are masked
+            from the loss (completion-only training).
 
     Returns:
         A function (model, batch_dict) -> (loss, ntoks).
@@ -441,7 +550,7 @@ def make_vlm_cce_loss_fn(model):
             "falling back to baseline CE loss.",
             stacklevel=2,
         )
-        return make_vlm_baseline_loss_fn()
+        return make_vlm_baseline_loss_fn(model, assistant_token_id=assistant_token_id)
 
     softcap = _get_logit_softcap(model)
     lm_layer = _get_lm_head_layer(model)
@@ -449,6 +558,13 @@ def make_vlm_cce_loss_fn(model):
     # Evaluate once — trainability doesn't change during training.
     # Must be called after LoRA setup.
     _skip_weight_grad = not _is_lm_head_trainable(model)
+
+    _image_token_ids = _get_image_token_ids(model)
+    if _image_token_ids is not None:
+        print(f"Unsloth: Masking {len(_image_token_ids)} image token IDs from VLM loss.")
+    _assistant_token_id = assistant_token_id
+    if _assistant_token_id > 0:
+        print(f"Unsloth: Completion-only training (assistant_token_id={_assistant_token_id}).")
 
     if use_quantized:
         group_size = getattr(lm_layer, "group_size", 64)
@@ -463,7 +579,9 @@ def make_vlm_cce_loss_fn(model):
         )
 
         def loss_fn(model, batch_dict):
-            hidden, masked_targets, ntoks = _vlm_cce_forward(model, batch_dict)
+            hidden, masked_targets, ntoks = _vlm_cce_forward(
+                model, batch_dict, image_token_ids=_image_token_ids,
+                assistant_token_id=_assistant_token_id)
             lm_head = _get_lm_head_layer(model)
             w = lm_head.weight
             sc = lm_head.scales
@@ -488,7 +606,9 @@ def make_vlm_cce_loss_fn(model):
         )
 
         def loss_fn(model, batch_dict):
-            hidden, masked_targets, ntoks = _vlm_cce_forward(model, batch_dict)
+            hidden, masked_targets, ntoks = _vlm_cce_forward(
+                model, batch_dict, image_token_ids=_image_token_ids,
+                assistant_token_id=_assistant_token_id)
             w = _get_lm_head_layer(model).weight
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)

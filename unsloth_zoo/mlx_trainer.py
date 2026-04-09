@@ -77,9 +77,10 @@ class MLXTrainingConfig:
     # Optimization
     optim: str = "adafactor"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
     weight_decay: float = 0.01
-    max_grad_norm: float = 0.0  # 0 = disabled (default); > 0 adds overhead inside compile
+    max_grad_norm: float = 1.0  # matches HuggingFace TrainingArguments default
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
+    embedding_learning_rate: float = 0.0  # 0 = disabled, 5e-5 = recommended
 
     # Logging & output
     logging_steps: int = 1
@@ -243,36 +244,53 @@ class MLXTrainer:
         return main_schedule
 
     def _build_optimizer(self, total_steps):
-        """Create MLX optimizer with LR schedule from config."""
+        """Create MLX optimizer with LR schedule from config.
+
+        For optimizers that support weight_decay, wraps with
+        optim.decay_weight to exclude bias and norm parameters
+        (matching HuggingFace Trainer behavior).
+        """
         schedule = self._build_schedule(total_steps)
         wd = self.args.weight_decay
 
         opt_name = self.args.optim.lower()
         if opt_name == "adafactor":
-            return optim.Adafactor(
+            optimizer = optim.Adafactor(
                 learning_rate=schedule,
                 relative_step=False,
                 scale_parameter=False,
             )
         elif opt_name == "adamw":
-            return optim.AdamW(learning_rate=schedule, weight_decay=wd)
+            optimizer = optim.AdamW(learning_rate=schedule, weight_decay=0.0)
         elif opt_name == "adam":
-            return optim.Adam(learning_rate=schedule)
+            optimizer = optim.Adam(learning_rate=schedule)
         elif opt_name == "sgd":
-            return optim.SGD(learning_rate=schedule, weight_decay=wd)
+            optimizer = optim.SGD(learning_rate=schedule, weight_decay=0.0)
         elif opt_name == "muon":
-            return optim.Muon(learning_rate=schedule, weight_decay=wd)
+            optimizer = optim.Muon(learning_rate=schedule, weight_decay=0.0)
         elif opt_name == "lion":
-            return optim.Lion(learning_rate=schedule, weight_decay=wd)
+            optimizer = optim.Lion(learning_rate=schedule, weight_decay=0.0)
         else:
             print(f"Unknown optimizer '{opt_name}', falling back to Adafactor.")
-            return optim.Adafactor(
+            optimizer = optim.Adafactor(
                 learning_rate=schedule,
                 relative_step=False,
                 scale_parameter=False,
             )
 
-    def _evaluate(self, eval_batches, loss_fn):
+        # Apply weight decay only to 2D+ weight tensors (not biases, norms,
+        # embeddings). Matches HuggingFace Trainer.get_decay_parameter_names.
+        if wd > 0 and opt_name not in ("adafactor", "adam"):
+            def _wd_predicate(module, key, value):
+                return key == "weight" and value.ndim >= 2
+            optimizer = optim.chain(
+                optimizer,
+                optim.decay_weight(wd, predicate=_wd_predicate),
+            )
+
+        return optimizer
+
+    def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
         """Run evaluation loop.
 
         Returns:
@@ -282,8 +300,12 @@ class MLXTrainer:
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
 
-        for batch, lengths in eval_batches:
-            loss, ntoks = loss_fn(self.model, batch, lengths)
+        for batch_data in eval_batches:
+            if is_vlm:
+                loss, ntoks = loss_fn(self.model, batch_data)
+            else:
+                batch, lengths = batch_data
+                loss, ntoks = loss_fn(self.model, batch, lengths)
             all_losses += loss * ntoks
             ntokens += ntoks
             mx.eval(all_losses, ntokens)
@@ -333,12 +355,13 @@ class MLXTrainer:
         use_cce = args.use_cce
 
         if is_vlm:
+            _atid = args.assistant_token_id if args.train_on_completions else 0
             if use_cce:
-                loss_fn = make_vlm_cce_loss_fn(model)
+                loss_fn = make_vlm_cce_loss_fn(model, assistant_token_id=_atid)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
                 print(f"Unsloth: Using VLM CCE loss ({cce_backend}) for memory-efficient training.")
             else:
-                loss_fn = make_vlm_baseline_loss_fn()
+                loss_fn = make_vlm_baseline_loss_fn(model, assistant_token_id=_atid)
                 print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
             if use_cce:
@@ -361,17 +384,26 @@ class MLXTrainer:
             )
 
         grad_accum = args.gradient_accumulation_steps
-        if batches is not None:
-            total_steps = (
-                args.max_steps if args.max_steps > 0
-                else len(batches) // grad_accum
-            )
-        else:
+        if args.max_steps > 0:
             total_steps = args.max_steps
-            if total_steps <= 0:
+        elif batches is not None:
+            n_batches = len(batches)
+            if args.num_train_epochs > 0:
+                # Epoch-based: total micro-batches = epochs * batches_per_epoch
+                total_steps = (n_batches * args.num_train_epochs) // grad_accum
+            else:
+                total_steps = n_batches // grad_accum
+            total_steps = max(1, total_steps)
+        else:
+            # Streaming mode — must have max_steps
+            if args.num_train_epochs > 0:
                 raise ValueError(
-                    "max_steps must be > 0 when using streaming mode."
+                    "num_train_epochs requires a finite dataset (not streaming). "
+                    "Use max_steps instead, or disable streaming."
                 )
+            raise ValueError(
+                "max_steps must be > 0 when using streaming mode."
+            )
 
         # Build optimizer with LR schedule
         optimizer = self._build_optimizer(total_steps)
@@ -379,11 +411,22 @@ class MLXTrainer:
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
-        # LoRA+ gradient scaling
+        # Per-parameter gradient scaling (LoRA+, embedding LR)
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
         if use_lora_plus:
             print(f"Unsloth: LoRA+ enabled (ratio={lora_plus_ratio}).")
+
+        embedding_lr = args.embedding_learning_rate
+        main_lr = args.learning_rate
+        # Ratio < 1 slows embeddings down; 0 = disabled
+        use_embedding_lr = embedding_lr > 0 and main_lr > 0
+        embedding_lr_ratio = embedding_lr / main_lr if use_embedding_lr else 1.0
+        if use_embedding_lr:
+            print(f"Unsloth: Embedding LR = {embedding_lr:.2e} "
+                  f"(ratio={embedding_lr_ratio:.3f} of main LR {main_lr:.2e}).")
+
+        _needs_grad_scaling = use_lora_plus or use_embedding_lr
 
         # Build step functions following mlx-lm's pattern
         max_grad_norm = args.max_grad_norm
@@ -392,12 +435,15 @@ class MLXTrainer:
         def _apply_update(grad, toks_f):
             """Common gradient post-processing and optimizer update."""
             grad = tree_map(lambda g: g / toks_f, grad)
-            if use_lora_plus:
+            if _needs_grad_scaling:
                 flat = tree_flatten(grad)
-                scaled = [
-                    (k, v * lora_plus_ratio if "lora_b" in k else v)
-                    for k, v in flat
-                ]
+                scaled = []
+                for k, v in flat:
+                    if use_lora_plus and "lora_b" in k:
+                        v = v * lora_plus_ratio
+                    if use_embedding_lr and ("embed_tokens" in k or "lm_head" in k):
+                        v = v * embedding_lr_ratio
+                    scaled.append((k, v))
                 grad = tree_unflatten(scaled)
             if max_grad_norm > 0:
                 grad, _ = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
@@ -441,20 +487,30 @@ class MLXTrainer:
         if args.compile:
             step_fn = mx.compile(step_fn, inputs=state, outputs=state)
 
-        # Prepare eval batches if eval is enabled (text-only for now)
+        # Prepare eval batches
         eval_batches = None
-        if is_vlm and args.eval_steps > 0 and self.eval_dataset is not None:
-            print("Unsloth: VLM evaluation not yet supported — eval_steps ignored.")
-        if args.eval_steps > 0 and self.eval_dataset is not None and not is_vlm:
-            eval_batches = create_batches(
-                dataset=self.eval_dataset,
-                tokenizer=self.tokenizer,
-                batch_size=args.per_device_train_batch_size,
-                max_seq_length=args.max_seq_length,
-                seed=args.seed,
-                dataset_text_field=args.dataset_text_field,
-                formatting_func=self.formatting_func,
-            )
+        if args.eval_steps > 0 and self.eval_dataset is not None:
+            if is_vlm:
+                processor = self.processor or getattr(self.model, "_processor", None)
+                config = getattr(self.model, "_config", {})
+                eval_batches = create_vlm_batches(
+                    dataset=self.eval_dataset,
+                    processor=processor,
+                    config=config,
+                    batch_size=args.per_device_train_batch_size,
+                    max_seq_length=args.max_seq_length,
+                    seed=args.seed,
+                )
+            else:
+                eval_batches = create_batches(
+                    dataset=self.eval_dataset,
+                    tokenizer=self.tokenizer,
+                    batch_size=args.per_device_train_batch_size,
+                    max_seq_length=args.max_seq_length,
+                    seed=args.seed,
+                    dataset_text_field=args.dataset_text_field,
+                    formatting_func=self.formatting_func,
+                )
             if eval_batches:
                 print(f"Unsloth: Eval enabled every {args.eval_steps} steps "
                       f"({len(eval_batches)} eval batches).")
@@ -565,7 +621,7 @@ class MLXTrainer:
             # Eval
             if (eval_batches and args.eval_steps > 0
                     and current_step % args.eval_steps == 0):
-                val_loss, ppl = self._evaluate(eval_batches, loss_fn)
+                val_loss, ppl = self._evaluate(eval_batches, loss_fn, is_vlm=is_vlm)
                 model.train()
                 print(
                     f"  Eval  {current_step}/{total_steps} | "
@@ -672,14 +728,22 @@ class MLXTrainer:
             return batches, None
 
     def save_model(self, output_dir=None):
-        """Save LoRA adapters (or full model if no LoRA)."""
+        """Save LoRA adapters or full merged model (if no LoRA)."""
+        from .mlx_utils import save_merged_model
         output_dir = output_dir or self.args.output_dir
-        self.model.save_lora_adapters(output_dir, adapter_config={
-            "learning_rate": self.args.learning_rate,
-            "max_steps": self.args.max_steps,
-            "max_seq_length": self.args.max_seq_length,
-            "use_cce": self.args.use_cce,
-        })
-        self.tokenizer.save_pretrained(output_dir)
-        print(f"Unsloth: Model saved to {output_dir}")
+
+        trainable = dict(tree_flatten(self.model.trainable_parameters()))
+        has_lora = any("lora" in k for k in trainable)
+
+        if has_lora:
+            self.model.save_lora_adapters(output_dir, adapter_config={
+                "learning_rate": self.args.learning_rate,
+                "max_steps": self.args.max_steps,
+                "max_seq_length": self.args.max_seq_length,
+                "use_cce": self.args.use_cce,
+            })
+            self.tokenizer.save_pretrained(output_dir)
+            print(f"Unsloth: LoRA adapters saved to {output_dir}")
+        else:
+            save_merged_model(self.model, self.tokenizer, output_dir)
 
