@@ -37,7 +37,6 @@ Usage mirrors TRL notebooks:
 """
 
 from dataclasses import dataclass
-from functools import partial
 import math
 import time
 
@@ -161,47 +160,53 @@ class MLXTrainer:
 
     @staticmethod
     def _ensure_lora_frozen(model):
-        """Freeze all non-LoRA parameters if LoRA layers are present.
+        """Freeze accidentally trainable norm parameters when LoRA is active.
 
         Without this, LayerNorm/RMSNorm weights remain trainable, and
         adaptive optimizers produce NaN on 1D tensors at initialization
         (the second-moment estimate starts at 0, causing division by ~eps).
 
-        mlx-lm calls model.freeze() BEFORE linear_to_lora_layers(), but
-        users might forget. This method auto-fixes it.
+        Only freezes norm parameters — does NOT touch projector, vision, or
+        other intentionally trainable non-LoRA parameters.
         """
         trainable = dict(tree_flatten(model.trainable_parameters()))
         has_lora = any("lora" in k for k in trainable)
         if not has_lora:
             return  # Not a LoRA model — don't touch
 
-        non_lora = [k for k in trainable if "lora" not in k]
-        if not non_lora:
-            return  # Already properly frozen
+        # Only freeze params that look like accidentally unfrozen norms.
+        # Projector weights, vision tower weights, etc. are intentionally
+        # trainable when train_projector/train_vision is used.
+        _NORM_FRAGMENTS = (".norm.", "norm.weight", "norm.bias",
+                           ".ln_", "ln_f.weight", "ln_f.bias")
+        # Don't freeze norms inside components the user explicitly unfroze
+        # (projector via train_projector, vision tower via train_vision).
+        _INTENTIONAL_COMPONENTS = (
+            "multi_modal_projector", "mm_projector", "connector", "aligner",
+            "vision_tower", "vision_model", "vision_encoder",
+        )
+        suspect = [
+            k for k in trainable
+            if "lora" not in k
+            and any(frag in k for frag in _NORM_FRAGMENTS)
+            and not any(comp in k for comp in _INTENTIONAL_COMPONENTS)
+        ]
+        if not suspect:
+            return  # No accidental norms — nothing to fix
 
-        # Freeze all parameters first
-        model.freeze()
-
-        # Re-enable only LoRA parameters by navigating to their parent module
-        all_params = dict(tree_flatten(model.parameters()))
-        lora_keys = [k for k in all_params if "lora" in k]
-
-        for key in lora_keys:
+        for key in suspect:
             parts = key.split(".")
-            param_name = parts[-1]
             obj = model
             for p in parts[:-1]:
                 try:
                     obj = obj[int(p)]
                 except (ValueError, TypeError):
                     obj = getattr(obj, p)
-            obj.unfreeze(keys=[param_name], recurse=False)
+            obj.freeze(keys=[parts[-1]], recurse=False)
 
-        new_trainable = dict(tree_flatten(model.trainable_parameters()))
         print(
-            f"Unsloth: Froze {len(non_lora)} non-LoRA parameters "
-            f"(LayerNorm, embeddings, etc.). "
-            f"{len(new_trainable)} LoRA parameters remain trainable."
+            f"Unsloth: Froze {len(suspect)} accidentally trainable norm "
+            f"parameters to prevent optimizer NaN."
         )
 
     def _build_schedule(self, total_steps):
@@ -438,6 +443,8 @@ class MLXTrainer:
 
         # Prepare eval batches if eval is enabled (text-only for now)
         eval_batches = None
+        if is_vlm and args.eval_steps > 0 and self.eval_dataset is not None:
+            print("Unsloth: VLM evaluation not yet supported — eval_steps ignored.")
         if args.eval_steps > 0 and self.eval_dataset is not None and not is_vlm:
             eval_batches = create_batches(
                 dataset=self.eval_dataset,

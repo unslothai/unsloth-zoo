@@ -94,6 +94,89 @@ def _fix_missing_no_grad(model):
                 object.__setattr__(mod, "_training", True)
 
 
+class _TrainingKVStore:
+    """Lightweight KV store for Gemma4 KV-sharing during training.
+
+    Gemma4 E2B/E4B have shared attention layers that borrow K/V from earlier
+    "store" layers via the KV cache. During training (cache=None), the shared
+    layers silently fall through to computing their own K/V from wrong hidden
+    states. This class provides a minimal interface so store layers can write
+    K/V and shared layers can read them, without autoregressive offset tracking.
+
+    Implements the subset of KVCache that Attention.__call__ needs:
+    - offset (always 0 for training — no prior tokens)
+    - state property (returns stored K/V)
+    - update_and_fetch (stores K/V from store layer)
+    """
+    __slots__ = ("keys", "values")
+
+    def __init__(self):
+        self.keys = None
+        self.values = None
+
+    @property
+    def offset(self):
+        return 0
+
+    @property
+    def state(self):
+        return (self.keys, self.values)
+
+    def update_and_fetch(self, keys, values):
+        self.keys = keys
+        self.values = values
+        return keys, values
+
+
+def _fix_gemma4_kv_sharing(model):
+    """Fix Gemma4 KV-shared layers producing wrong K/V during training.
+
+    Gemma4 E2B/E4B have num_kv_shared_layers shared attention layers that
+    borrow K/V from earlier "store" layers via the KV cache. When cache=None
+    (training), shared layers fall through to computing their own K/V from
+    the wrong hidden state — silently producing incorrect attention.
+
+    Fix: monkey-patch the text backbone's __call__ to create _TrainingKVStore
+    objects when cache=None, so store layers populate them and shared layers
+    read correct K/V.
+    """
+    lm = getattr(model, "language_model", None)
+    if lm is None:
+        return
+    backbone = getattr(lm, "model", None)
+    if backbone is None:
+        return
+
+    first_shared = getattr(backbone, "first_kv_shared_layer_idx", None)
+    num_layers = getattr(backbone, "num_hidden_layers", None)
+    if first_shared is None or num_layers is None or first_shared >= num_layers:
+        return  # No shared layers
+
+    cls = backbone.__class__
+    if getattr(cls, "_kv_sharing_patched", False):
+        return  # Already patched
+
+    original_call = cls.__call__
+    n_stores = first_shared  # number of store-layer cache slots
+
+    def patched_call(self, inputs=None, inputs_embeds=None, mask=None,
+                     cache=None, per_layer_inputs=None, **kwargs):
+        if cache is None:
+            # Objects created once under mx.compile tracing; data flow through
+            # update_and_fetch/state is captured in the computation graph.
+            cache = [_TrainingKVStore() for _ in range(n_stores)]
+        return original_call(
+            self, inputs=inputs, inputs_embeds=inputs_embeds, mask=mask,
+            cache=cache, per_layer_inputs=per_layer_inputs, **kwargs,
+        )
+
+    cls.__call__ = patched_call
+    cls._kv_sharing_patched = True
+    n_shared = num_layers - first_shared
+    print(f"Unsloth: Fixed Gemma4 KV-sharing for training "
+          f"({n_shared} shared layers now read correct K/V).")
+
+
 # ---------------------------------------------------------------------------
 # Runtime VLM quantization via monkey-patching mlx_vlm.utils.load_model
 # ---------------------------------------------------------------------------
@@ -138,8 +221,9 @@ def _build_vlm_quant_predicate(model):
         if skip_multimodal_module is not None and skip_multimodal_module(path):
             return False
         # 2. Hard skip — extra fragments (embeddings, projectors, …)
+        path_parts = path.split(".")
         for frag in _MULTIMODAL_SKIP_FRAGMENTS:
-            if frag in path:
+            if frag in path_parts:
                 return False
         # 3. Model-specific predicate (MoE gates → 8-bit, phi4mm exclusions, …)
         if model_predicate is not None:
@@ -250,7 +334,7 @@ def _lora_walk_module(model, lora_config, target_modules, attr_names):
         if root is None:
             continue
 
-        def _walk(module, prefix=""):
+        def _walk(module):
             for name, child in module.named_modules():
                 leaf_name = name.split(".")[-1] if "." in name else name
                 if leaf_name not in target_modules:
@@ -273,7 +357,7 @@ def _lora_walk_module(model, lora_config, target_modules, attr_names):
                     setattr(parent, parts[-1], lora_layer)
 
         _walk(root)
-        break  # Only process the first matching attribute
+        break  # These are alternative names for the same component — stop after first hit
 
 
 class FastMLXModel:
@@ -408,6 +492,7 @@ class FastMLXModel:
 
             model._is_vlm_model = True
             model._processor = processor
+            _fix_gemma4_kv_sharing(model)
 
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name
@@ -480,6 +565,7 @@ class FastMLXModel:
         if is_vlm:
             # VLM path: freeze everything, then apply LoRA selectively
             _fix_missing_no_grad(model)
+            _fix_gemma4_kv_sharing(model)
             model.freeze()
 
             # Apply LoRA to the language model

@@ -731,6 +731,10 @@ def make_runtime_cce_loss_fused_finalize(
                     transpose=False,
                 )
 
+            # Quantized weight gradients are zero — correct for LoRA where the
+            # LM head is frozen and gradients flow through grad_hidden only.
+            # Full fine-tuning of quantized models would need
+            # dequantize → grad → requantize, which is not supported.
             return (
                 grad_hidden.astype(hidden.dtype),
                 mx.zeros_like(weight),

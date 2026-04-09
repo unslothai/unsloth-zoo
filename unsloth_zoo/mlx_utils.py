@@ -36,6 +36,17 @@ from pathlib import Path
 from .mlx_cce import _get_runtime_cce
 
 
+def _get_transformer_layers(model):
+    """Find transformer layers, unwrapping VLM wrappers if needed.
+
+    VLMs: model.language_model.model.layers
+    Text: model.layers or model.model.layers
+    """
+    m = getattr(model, 'language_model', model)
+    m = getattr(m, 'model', m)
+    return getattr(m, 'layers', None)
+
+
 def apply_gradient_checkpointing(model):
     """Apply gradient checkpointing to all transformer layers.
 
@@ -45,7 +56,7 @@ def apply_gradient_checkpointing(model):
 
     Follows the same pattern as mlx_lm.tuner.trainer.grad_checkpoint.
     """
-    layers = getattr(model, 'layers', None)
+    layers = _get_transformer_layers(model)
     if layers is None or len(layers) == 0:
         return
     layer_cls = type(layers[0])
@@ -65,7 +76,7 @@ def apply_gradient_checkpointing(model):
 
 def remove_gradient_checkpointing(model):
     """Remove gradient checkpointing, restoring original layer __call__."""
-    layers = getattr(model, 'layers', None)
+    layers = _get_transformer_layers(model)
     if layers is None or len(layers) == 0:
         return
     layer_cls = type(layers[0])
@@ -152,11 +163,8 @@ def make_cce_loss_fn(model):
     use_quantized = _is_quantized_layer(lm_layer)
 
     _has_wrapper = hasattr(model, "language_model")
-
-
     tm = _get_text_model(model)
     _has_lm_head = hasattr(tm, "lm_head") and tm.lm_head is not None
-    _has_lm_head_q = _has_lm_head and hasattr(tm.lm_head, "scales")
 
     def _get_backbone(model):
         """Get backbone (for hidden states) from the live model tree."""
@@ -266,7 +274,7 @@ def _is_vlm_model(model) -> bool:
         return False
     return any(hasattr(model, attr) for attr in
                ("vision_tower", "vision_model", "vision_encoder",
-                "multi_modal_projector"))
+                "multi_modal_projector", "audio_tower"))
 
 
 def _align_logits_with_labels(logits, labels):
@@ -301,8 +309,10 @@ def make_vlm_baseline_loss_fn():
         inputs = input_ids[:, :-1]
         targets = input_ids[:, 1:]
 
-        # Forward pass
-        output = model(inputs, pixel_values, attention_mask)
+        # Forward pass — let the model create its own causal mask.
+        # attention_mask is a padding indicator, not a causal attention mask;
+        # we use it only for loss masking below.
+        output = model(inputs, pixel_values=pixel_values)
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits.astype(mx.float32)
 
@@ -352,22 +362,63 @@ def _unpack_embed_result(embed_result, model):
     # doesn't crash accessing cache.offset with cache=None.
     lm = getattr(model, "language_model", None)
     if lm is not None:
-        pos_ids = getattr(lm, "_position_ids", None)
-        if pos_ids is not None:
+        _MISSING = object()
+        pos_ids = getattr(lm, "_position_ids", _MISSING)
+        if pos_ids is not _MISSING and pos_ids is not None:
             backbone_kwargs["position_ids"] = pos_ids
-        elif hasattr(lm, "_position_ids"):
-            # Model has the _position_ids mechanism but none were stashed —
-            # generate simple sequential position_ids.
-            import mlx.core as mx
+        elif pos_ids is None:
+            # Fallback: sequential position_ids. Correct for text-only and
+            # single-image samples. For multi-image with spatial m-RoPE
+            # (Qwen VL), the per-axis positions should differ for image
+            # regions — but grid_thw metadata is unavailable here so we
+            # use sequential as an approximation.
             seq_len = merged_embeds.shape[1]
             pos_ids = mx.arange(seq_len).reshape(1, -1)
             pos_ids = mx.broadcast_to(pos_ids, (merged_embeds.shape[0], seq_len))
-            # Qwen VL uses 3D position_ids: (3, batch, seq) for m-RoPE
+            # Qwen VL m-RoPE uses 3 axes: temporal, height, width
+            MROPE_AXES = 3
             pos_ids = mx.expand_dims(pos_ids, axis=0)
-            pos_ids = mx.tile(pos_ids, (3, 1, 1))
+            pos_ids = mx.tile(pos_ids, (MROPE_AXES, 1, 1))
             backbone_kwargs["position_ids"] = pos_ids
 
     return merged_embeds, backbone_kwargs
+
+
+def _vlm_cce_forward(model, batch_dict):
+    """Shared VLM CCE forward: embed -> backbone -> hidden + masked_targets + ntoks."""
+    input_ids = batch_dict["input_ids"]
+    pixel_values = batch_dict.get("pixel_values")
+    attention_mask = batch_dict.get("attention_mask")
+
+    inputs = input_ids[:, :-1]
+    targets = input_ids[:, 1:]
+
+    embed_result = model.get_input_embeddings(inputs, pixel_values)
+    merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
+
+    lm_model = model.language_model.model
+    # Pass inputs alongside inputs_embeds — some backbones access inputs.shape
+    # before checking inputs_embeds. The backbone ignores inputs when
+    # inputs_embeds is provided.
+    hidden = lm_model(inputs, inputs_embeds=merged_embeds, **backbone_kwargs)
+
+    if attention_mask is not None:
+        length_mask = attention_mask[:, 1:][:, :targets.shape[1]]
+    else:
+        length_mask = mx.ones_like(targets, dtype=mx.float32)
+
+    masked_targets = mx.where(length_mask, targets, -100)
+    ntoks = length_mask.sum()
+
+    # Align sequence lengths (vision token injection changes seq len)
+    h_seq, t_seq = hidden.shape[1], masked_targets.shape[1]
+    if h_seq > t_seq:
+        hidden = hidden[:, :t_seq, :]
+    elif t_seq > h_seq:
+        masked_targets = masked_targets[:, :h_seq]
+        ntoks = (masked_targets != -100).sum()
+
+    return hidden, masked_targets, ntoks
 
 
 def make_vlm_cce_loss_fn(model):
@@ -392,17 +443,16 @@ def make_vlm_cce_loss_fn(model):
         )
         return make_vlm_baseline_loss_fn()
 
-    from .mlx_cce import _get_runtime_cce
-
     softcap = _get_logit_softcap(model)
     lm_layer = _get_lm_head_layer(model)
     use_quantized = _is_quantized_layer(lm_layer)
+    # Evaluate once — trainability doesn't change during training.
+    # Must be called after LoRA setup.
     _skip_weight_grad = not _is_lm_head_trainable(model)
 
     if use_quantized:
         group_size = getattr(lm_layer, "group_size", 64)
         bits = getattr(lm_layer, "bits", 4)
-        _has_biases = hasattr(lm_layer, "biases")
 
         rt_cce = _get_runtime_cce(
             ignore_index=-100,
@@ -413,95 +463,35 @@ def make_vlm_cce_loss_fn(model):
         )
 
         def loss_fn(model, batch_dict):
-            input_ids = batch_dict["input_ids"]
-            pixel_values = batch_dict.get("pixel_values")
-            attention_mask = batch_dict.get("attention_mask")
-
-            inputs = input_ids[:, :-1]
-            targets = input_ids[:, 1:]
-
-            # Get merged embeddings (vision + text)
-            embed_result = model.get_input_embeddings(inputs, pixel_values)
-            merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
-
-            # Run through language model backbone (skip LM head for CCE)
-            lm_model = model.language_model.model
-            hidden = lm_model(inputs, inputs_embeds=merged_embeds, **backbone_kwargs)
-
-            # Build target mask
-            if attention_mask is not None:
-                length_mask = attention_mask[:, 1:]
-                length_mask = length_mask[:, :targets.shape[1]]
-            else:
-                length_mask = mx.ones_like(targets, dtype=mx.float32)
-
-            masked_targets = mx.where(length_mask, targets, -100)
-            ntoks = length_mask.sum()
-
-            # Truncate hidden/targets to match
-            h_seq = hidden.shape[1]
-            t_seq = masked_targets.shape[1]
-            if h_seq > t_seq:
-                hidden = hidden[:, :t_seq, :]
-            elif t_seq > h_seq:
-                masked_targets = masked_targets[:, :h_seq]
-                ntoks = (masked_targets != -100).sum()
-
-            layer = model.language_model.lm_head if hasattr(model.language_model, "lm_head") and model.language_model.lm_head is not None else model.language_model.model.embed_tokens
-            w = layer.weight
-            sc = layer.scales
-            bi = layer.biases if _has_biases else mx.zeros_like(layer.scales)
-
+            hidden, masked_targets, ntoks = _vlm_cce_forward(model, batch_dict)
+            lm_head = _get_lm_head_layer(model)
+            w = lm_head.weight
+            sc = lm_head.scales
+            bi = getattr(lm_head, "biases", None)
+            if bi is None:
+                bi = mx.zeros_like(sc)
+            # Quantized backward already returns zero weight/scales/biases
+            # gradients (see runtime_cce.py VJP), so stop_gradient is
+            # redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
             targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / ntoks
             return loss, ntoks
     else:
+        if _skip_weight_grad:
+            print("Unsloth: VLM CCE skipping weight gradient (LM head is frozen).")
+
         rt_cce = _get_runtime_cce(
             ignore_index=-100,
             logit_softcap=softcap,
         )
 
         def loss_fn(model, batch_dict):
-            input_ids = batch_dict["input_ids"]
-            pixel_values = batch_dict.get("pixel_values")
-            attention_mask = batch_dict.get("attention_mask")
-
-            inputs = input_ids[:, :-1]
-            targets = input_ids[:, 1:]
-
-            # Get merged embeddings (vision + text)
-            embed_result = model.get_input_embeddings(inputs, pixel_values)
-            merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
-
-            # Run through language model backbone (skip LM head for CCE)
-            lm_model = model.language_model.model
-            hidden = lm_model(inputs, inputs_embeds=merged_embeds, **backbone_kwargs)
-
-            # Build target mask
-            if attention_mask is not None:
-                length_mask = attention_mask[:, 1:]
-                length_mask = length_mask[:, :targets.shape[1]]
-            else:
-                length_mask = mx.ones_like(targets, dtype=mx.float32)
-
-            masked_targets = mx.where(length_mask, targets, -100)
-            ntoks = length_mask.sum()
-
-            h_seq = hidden.shape[1]
-            t_seq = masked_targets.shape[1]
-            if h_seq > t_seq:
-                hidden = hidden[:, :t_seq, :]
-            elif t_seq > h_seq:
-                masked_targets = masked_targets[:, :h_seq]
-                ntoks = (masked_targets != -100).sum()
-
-            lm_head = model.language_model.lm_head if hasattr(model.language_model, "lm_head") and model.language_model.lm_head is not None else model.language_model.model.embed_tokens
-            w = lm_head.weight
+            hidden, masked_targets, ntoks = _vlm_cce_forward(model, batch_dict)
+            w = _get_lm_head_layer(model).weight
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
-
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
             targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
             loss = rt_cce(hidden_flat, w, targets_flat)
@@ -510,6 +500,42 @@ def make_vlm_cce_loss_fn(model):
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
     return loss_fn
+
+
+_VLM_BATCH_API = None  # cached: {"vds_config_second": bool, "use_train_kwarg": bool}
+
+
+def _detect_vlm_batch_api():
+    """Detect mlx-vlm API variant (>= 0.22 vs older) and cache the result."""
+    global _VLM_BATCH_API
+    if _VLM_BATCH_API is not None:
+        return _VLM_BATCH_API
+    import inspect
+    from mlx_vlm.trainer.datasets import VisionDataset
+    from mlx_vlm.trainer.sft_trainer import iterate_batches
+    vds_params = list(inspect.signature(VisionDataset.__init__).parameters.keys())
+    _VLM_BATCH_API = {
+        "vds_config_second": len(vds_params) >= 4 and vds_params[2] == "config",
+        "use_train_kwarg": "train" in inspect.signature(iterate_batches).parameters,
+    }
+    return _VLM_BATCH_API
+
+
+def _make_vision_dataset(dataset, config, processor):
+    """Create a VisionDataset, adapting to the installed mlx-vlm API."""
+    api = _detect_vlm_batch_api()
+    from mlx_vlm.trainer.datasets import VisionDataset
+    if api["vds_config_second"]:
+        return VisionDataset(dataset, config, processor)
+    return VisionDataset(dataset, processor, config)
+
+
+def _vlm_iter_kwargs(*, train, seed=42):
+    """Build iterate_batches kwargs, adapting to the installed mlx-vlm API."""
+    api = _detect_vlm_batch_api()
+    if api["use_train_kwarg"]:
+        return {"train": train}
+    return {"loop": train, "seed": seed}
 
 
 def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
@@ -529,7 +555,6 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
         List of batch dicts, each with input_ids, pixel_values, attention_mask.
     """
     try:
-        from mlx_vlm.trainer.datasets import VisionDataset
         from mlx_vlm.trainer.sft_trainer import iterate_batches
     except ImportError:
         raise ImportError(
@@ -537,28 +562,10 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
             "Install via: pip install mlx-vlm"
         )
 
-    # mlx-vlm >= 0.22 changed VisionDataset(dataset, config, processor)
-    #   old: VisionDataset(dataset, processor, config)
-    import inspect as _inspect
-    _vds_params = list(_inspect.signature(VisionDataset.__init__).parameters.keys())
-    if len(_vds_params) >= 4 and _vds_params[2] == "config":
-        vision_ds = VisionDataset(dataset, config, processor)
-    else:
-        vision_ds = VisionDataset(dataset, processor, config)
-
-    # mlx-vlm >= 0.22 changed iterate_batches signature:
-    #   old: iterate_batches(ds, bs, maxlen, loop=, seed=)
-    #   new: iterate_batches(ds, bs, maxlen, train=)
-    import inspect
-    _ib_params = inspect.signature(iterate_batches).parameters
-    _use_train_kwarg = "train" in _ib_params
+    vision_ds = _make_vision_dataset(dataset, config, processor)
+    iter_kwargs = _vlm_iter_kwargs(train=(num_batches is not None), seed=seed)
 
     batch_list = []
-    if _use_train_kwarg:
-        iter_kwargs = {"train": (num_batches is not None)}
-    else:
-        iter_kwargs = {"loop": (num_batches is not None), "seed": seed}
-
     for batch_dict in iterate_batches(
         vision_ds, batch_size, max_seq_length, **iter_kwargs,
     ):
@@ -588,7 +595,6 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
         Batch dicts with input_ids, pixel_values, attention_mask.
     """
     try:
-        from mlx_vlm.trainer.datasets import VisionDataset
         from mlx_vlm.trainer.sft_trainer import iterate_batches
     except ImportError:
         raise ImportError(
@@ -596,18 +602,8 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
             "Install via: pip install mlx-vlm"
         )
 
-    import inspect as _inspect
-    _vds_params = list(_inspect.signature(VisionDataset.__init__).parameters.keys())
-    if len(_vds_params) >= 4 and _vds_params[2] == "config":
-        vision_ds = VisionDataset(dataset, config, processor)
-    else:
-        vision_ds = VisionDataset(dataset, processor, config)
-
-    _ib_params = _inspect.signature(iterate_batches).parameters
-    if "train" in _ib_params:
-        iter_kwargs = {"train": True}
-    else:
-        iter_kwargs = {"loop": True, "seed": seed}
+    vision_ds = _make_vision_dataset(dataset, config, processor)
+    iter_kwargs = _vlm_iter_kwargs(train=True, seed=seed)
 
     for batch_dict in iterate_batches(
         vision_ds, batch_size, max_seq_length, **iter_kwargs,
@@ -984,8 +980,6 @@ def save_pretrained_gguf(
     else:
         # For all other quant types, first convert to bf16 then quantize
         first_conversion = "bf16"
-
-    first_conversion_dtype = "" if first_conversion == "None" else first_conversion
 
     # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
     try:
