@@ -42,7 +42,10 @@ import tempfile
 import logging
 import shlex
 import shutil
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 from pathlib import Path
 import psutil
 
@@ -1308,11 +1311,11 @@ def convert_to_gguf(
                 base_name = model_name[:-5]
                 text_output = model_name
                 # Fix: mmproj should always include dtype since it's not quantized
-                mmproj_dtype = model_dtype if model_dtype else ("bf16" if torch.cuda.is_bf16_supported() else "f16")
+                mmproj_dtype = model_dtype if model_dtype else ("bf16" if (torch is not None and torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "f16")
                 mmproj_output = f"{base_name}.{mmproj_dtype.upper()}-mmproj.gguf"
             else:
                 text_output = f"{model_name}.{quantization_type.upper()}.gguf"
-                mmproj_dtype = model_dtype if model_dtype else ("bf16" if torch.cuda.is_bf16_supported() else "f16")
+                mmproj_dtype = model_dtype if model_dtype else ("bf16" if (torch is not None and torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "f16")
                 mmproj_output = f"{model_name}.{mmproj_dtype.upper()}-mmproj.gguf"
 
         # Text model conversion
@@ -1332,7 +1335,7 @@ def convert_to_gguf(
         # Vision projector conversion
         mmproj_args = {
             "--outfile"        : mmproj_output,
-            "--outtype"        : model_dtype if model_dtype else "bf16" if torch.cuda.is_bf16_supported() else "f16",
+            "--outtype"        : model_dtype if model_dtype else "bf16" if (torch is not None and torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "f16",
             "--mmproj"         : "",
             "--split-max-size" : max_shard_size,
         }
