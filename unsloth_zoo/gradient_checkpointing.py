@@ -52,7 +52,7 @@ __all__ = [
 INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # Initial size per CPU buffer
 INITIAL_GPU_BUFFER_SIZE = 2 * 256 * 2048   # Initial size per GPU buffer
 INITIAL_CPU_BUFFER_COUNT = 200             # Initial number of CPU buffers
-DOUBLE_BUFFER_HEADROOM = 256 * 1024 * 1024 # 256MB minimum free CUDA memory to enable double buffering
+DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # 512MB minimum free CUDA memory to enable double buffering
 
 torch_version = torch.__version__
 if Version(torch_version) < Version("2.4.0"):
@@ -528,7 +528,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                 if "out of memory" not in str(e).lower():
                                     raise
                                 # clear Buffer B and try to resize Single Buffer
-                                if USE_DOUBLE_BUFFER:
+                                if GPU_BUFFERS_B is not None:
                                     USE_DOUBLE_BUFFER = False
                                     for j in range(len(GPU_BUFFERS_B)):
                                         GPU_BUFFERS_B[j].resize_(0)
