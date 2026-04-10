@@ -144,6 +144,14 @@ class MLXTrainer:
         self._train_loss_history = []
         self._step_times = []
         self._batches = None  # Pre-created batches (skips internal batch creation)
+        self._step_callbacks = []  # Callbacks called after each logged step
+
+    def add_step_callback(self, fn):
+        """Register a callback called after each logged step.
+
+        fn(step, total_steps, loss, lr, tokens_sec, peak_gb, elapsed, num_tokens)
+        """
+        self._step_callbacks.append(fn)
 
     @staticmethod
     def _ensure_lora_frozen(model):
@@ -506,6 +514,8 @@ class MLXTrainer:
                     mx.synchronize()
                     mx.reset_peak_memory()
 
+                elapsed = time.perf_counter() - start_time
+
                 print(
                     f"  Step {current_step}/{total_steps} | "
                     f"Loss: {train_loss:.4f} | "
@@ -513,6 +523,13 @@ class MLXTrainer:
                     f"Tok/s: {tokens_sec:.0f} | "
                     f"Peak: {peak_mem:.2f} GB"
                 )
+
+                for cb in self._step_callbacks:
+                    try:
+                        cb(current_step, total_steps, train_loss, lr_val,
+                           tokens_sec, peak_mem, elapsed, trained_tokens)
+                    except Exception:
+                        pass
 
                 losses = 0
                 n_tokens = 0
