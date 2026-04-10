@@ -281,7 +281,6 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     new_config.vocab_size = 1
     new_config.pad_token_id = 0
 
-    # Minimize GDN (Gated Delta Net) layer sizes for hybrid models like Qwen3.5
     for attr in ("linear_num_key_heads", "linear_num_value_heads"):
         if hasattr(new_config, attr): setattr(new_config, attr, 1)
     for attr in ("linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim"):
@@ -360,7 +359,6 @@ def create_empty_vision_model(config, dtype = torch.float16):
         "pad_token_id": 1,
     })
 
-    # Minimize GDN (Gated Delta Net) layer sizes for hybrid models like Qwen3.5
     for attr in ("linear_num_key_heads", "linear_num_value_heads"):
         if hasattr(new_config.text_config, attr): setattr(new_config.text_config, attr, 1)
     for attr in ("linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim"):
@@ -556,8 +554,6 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.up_proj",
             "model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.layers.{kk}.mlp.down_proj",
-
-            # Qwen3.5 Gated Delta Net (GDN) linear attention layers
             "model.language_model.layers.{kk}.linear_attn.in_proj_qkv",
             "model.language_model.layers.{kk}.linear_attn.in_proj_z",
             "model.language_model.layers.{kk}.linear_attn.in_proj_b",
@@ -603,8 +599,6 @@ def get_model_layer_config(return_non_layered=True):
 
             # qwen3 vl
             "model.visual.deepstack_merger_list.{kk}.norm",
-
-            # Qwen3.5 GDN linear attention norms
             "model.language_model.layers.{kk}.linear_attn.norm",
             "model.layers.{kk}.linear_attn.norm",
         },
@@ -800,30 +794,21 @@ def _get_nested_attr(obj, attr_path: str):
 
 
 def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_state_dict):
-    """
-    Extracts Gated Delta Net (GDN) linear attention weights from a vLLM
-    linear_attn module into HF-compatible state_dict entries.
-    Used by Qwen3.5 hybrid models which mix GDN and standard attention layers.
-    """
     gdn = gdn_module
 
-    # in_proj_qkvz (non-LoRA: fused Q,K,V,Z) or in_proj_qkv + in_proj_z (LoRA)
     if hasattr(gdn, "in_proj_qkvz"):
         proj = getattr(gdn.in_proj_qkvz, "base_layer", gdn.in_proj_qkvz)
         weight = proj.weight
         output_sizes = list(proj.output_sizes)
-        # cumsum offsets: [0, key_dim, key_dim*2, key_dim*2+value_dim, key_dim*2+value_dim*2]
         offsets = [0]
         for s in output_sizes:
             offsets.append(offsets[-1] + s)
-        # Slots 0-2 (Q,K,V) -> HF's in_proj_qkv; Slot 3 (Z) -> HF's in_proj_z
         qkv_weight = weight[offsets[0]:offsets[3]]
         z_weight = weight[offsets[3]:offsets[4]]
         state_dict[f"{prefix}.in_proj_qkv.weight"] = qkv_weight
         quant_state_dict[f"{prefix}.in_proj_qkv.weight"] = qkv_weight
         state_dict[f"{prefix}.in_proj_z.weight"] = z_weight
         quant_state_dict[f"{prefix}.in_proj_z.weight"] = z_weight
-        # Handle FP8 weight scales if present
         if weight.dtype == torch.float8_e4m3fn:
             if hasattr(proj, 'weight_scale'):
                 ws = proj.weight_scale
@@ -842,28 +827,21 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
                 state_dict[f"{prefix}.in_proj_z{scale_suffix}"] = z_scale
                 quant_state_dict[f"{prefix}.in_proj_z{scale_suffix}"] = z_scale
     else:
-        # LoRA mode: separate in_proj_qkv and in_proj_z
         get_state_dict(f"{prefix}.in_proj_qkv", 0, state_dict, gdn.in_proj_qkv, slice_weights=False)
         get_state_dict(f"{prefix}.in_proj_z", 0, state_dict, gdn.in_proj_z, slice_weights=False)
 
-    # in_proj_ba -> split into in_proj_b (slot 0) + in_proj_a (slot 1)
     get_state_dict(f"{prefix}.in_proj_b", 0, state_dict, gdn.in_proj_ba)
     get_state_dict(f"{prefix}.in_proj_a", 1, state_dict, gdn.in_proj_ba)
 
-    # conv1d — vLLM stores as ColumnParallelLinear with unsqueeze(1),
-    # already in HF Conv1d shape (conv_dim, 1, kernel_size)
     conv_w = gdn.conv1d.weight.data
     state_dict[f"{prefix}.conv1d.weight"] = conv_w
     quant_state_dict[f"{prefix}.conv1d.weight"] = conv_w
 
-    # dt_bias, A_log — bare nn.Parameters (no .weight suffix in HF)
     state_dict[f"{prefix}.dt_bias"] = gdn.dt_bias.data
     quant_state_dict[f"{prefix}.dt_bias"] = gdn.dt_bias.data
     state_dict[f"{prefix}.A_log"] = gdn.A_log.data
     quant_state_dict[f"{prefix}.A_log"] = gdn.A_log.data
 
-    # norm (RMSNormGated) — handled by the layernorm loop in the caller
-    # out_proj (RowParallelLinear)
     get_state_dict(f"{prefix}.out_proj", 0, state_dict, gdn.out_proj)
 pass
 
