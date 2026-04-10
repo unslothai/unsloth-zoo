@@ -358,11 +358,14 @@ def create_empty_vision_model(config, dtype = torch.float16):
         "head_dim": 1,
         "pad_token_id": 1,
     })
-
-    for attr in ("linear_num_key_heads", "linear_num_value_heads"):
-        if hasattr(new_config.text_config, attr): setattr(new_config.text_config, attr, 1)
-    for attr in ("linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim"):
-        if hasattr(new_config.text_config, attr): setattr(new_config.text_config, attr, 1)
+    # Qwen 3.5 or GDN related attrs
+    _set_config_attrs(new_config.text_config, {
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 1,
+        "linear_key_head_dim": 1,
+        "linear_value_head_dim": 1,
+        "linear_conv_kernel_dim": 1,
+    })
 
     # Common vision attributes
     _set_config_attrs(new_config.vision_config, {
@@ -385,7 +388,7 @@ def create_empty_vision_model(config, dtype = torch.float16):
         new_config.vision_config.out_hidden_size = 1
     elif model_type == "qwen3_vl":
         new_config.vision_config.out_hidden_size = 1
-    elif model_type in ("qwen3_5", "qwen3_5_moe"):
+    elif model_type == "qwen3_5":
         new_config.vision_config.out_hidden_size = 1
 
     num_layers = max(text_layers, vision_layers)
@@ -877,7 +880,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
             if layer_module is not None:
                 if "qkv" in layer_path:
-                    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5", "qwen3_5_moe"):
+                    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
                         # If the HF model too prefers having merged qkv, we do this
                         # This is evident in qwen-2.5-vl and qwen-3-vl so far.
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)

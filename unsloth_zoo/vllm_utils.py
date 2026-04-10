@@ -1176,8 +1176,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     # LM Head - Use get_state_dict for consistency
     if not getattr(text_config, "tie_word_embeddings", False):
         lm_layer = [mod for name,mod in vllm_internals.named_modules() if "lm_head" in name]
-        # Use get_state_dict for consistent extraction and automatic truncation
-        get_state_dict("lm_head", 0, state_dict, lm_layer[0], slice_weights=False)
+        if len(lm_layer) != 0:
+            get_state_dict("lm_head", 0, state_dict, lm_layer[0], slice_weights=False)
+        elif hasattr(vllm_internals, "language_model") and hasattr(vllm_internals.language_model, "lm_head"):
+            get_state_dict("lm_head", 0, state_dict, vllm_internals.language_model.lm_head, slice_weights=False)
+        elif hasattr(vllm_internals, "lm_head"):
+            get_state_dict("lm_head", 0, state_dict, vllm_internals.lm_head, slice_weights=False)
+        else:
+            raise RuntimeError("Could not find lm_head in vLLM internals")
     else:
         # Fallback to embed_tokens for tied embeddings
         embed_key = f"{vllm_text_model_prefix}.embed_tokens.weight"
@@ -1308,7 +1314,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         "norm1",              # Qwen2.5-VL vision encoder
         "norm2",              # Qwen2.5-VL vision encoder
         "norm",
-        "conv1d",             # Qwen3.5 GDN conv1d — assign weight directly to preserve nn.Conv1d
+        "conv1d",
     ]
     # Override .to("cuda") to disable it otherwise we'll get
     # ValueError: Blockwise quantization only supports 16/32-bit floats, but got torch.uint8
