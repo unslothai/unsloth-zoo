@@ -232,10 +232,15 @@ def patch_CsmDepthDecoderForCausalLM_forward():
     pass
 
     # Wrap with (self, *args, **kwargs) so check_args_kwargs accepts any
-    # removed params (output_attentions, output_hidden_states, cache_position)
+    # removed params (output_attentions, output_hidden_states, cache_position).
+    # Copy the original class signature onto the wrapper so
+    # transformers._validate_model_kwargs (used by generate) still sees
+    # the real named parameters like backbone_last_hidden_state.
+    _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
+    forward.__signature__ = _original_forward_signature
     patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
@@ -367,9 +372,11 @@ def patch_CsmForConditionalGeneration_forward():
         })
     pass
 
+    _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
+    forward.__signature__ = _original_forward_signature
     patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)

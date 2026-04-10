@@ -16,6 +16,7 @@
 
 import torch
 import torch.nn as nn
+import inspect
 from typing import Optional, Tuple
 from .common import TEMPORARY_PATCHES
 from .utils import (
@@ -83,19 +84,25 @@ def patch_PixtralAttention():
         attn_output = self.o_proj(attn_output)
         return attn_output, None
 
-    # Wrap so check_args_kwargs accepts removed params (e.g. output_attentions in v5)
+    # Wrap so check_args_kwargs accepts removed params (e.g. output_attentions in v5).
+    # Preserve the original signature on the wrapper so inspect.signature
+    # (used by transformers._validate_model_kwargs among others) still sees
+    # the real named parameters.
+    target_cls = transformers.models.pixtral.modeling_pixtral.PixtralAttention
+    _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
+    forward.__signature__ = _original_forward_signature
 
     patch_function(
-        transformers.models.pixtral.modeling_pixtral.PixtralAttention,
+        target_cls,
         "__init__",
         __init__,
     )
 
     patch_function(
-        transformers.models.pixtral.modeling_pixtral.PixtralAttention,
+        target_cls,
         "forward",
         forward,
     )
