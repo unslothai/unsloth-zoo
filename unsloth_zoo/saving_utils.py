@@ -792,7 +792,54 @@ def _merge_and_overwrite_lora(
                         tensors[key] = resized[key]
                     else:
                         tensors[key] = f.get_tensor(key)
-            save_file(tensors, filename_original)
+
+            # Fix for Windows file locking (os error 1224)
+            # Use retry logic with aggressive locking cleanup
+            import time
+            import tempfile
+            import shutil
+            import os as os_module
+
+            max_retries = 10
+            base_delay = 0.2  # seconds
+
+            for attempt in range(max_retries):
+                try:
+                    # Force garbage collection and CUDA cache cleanup
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    # Aggressive: Close and remove original file if it exists
+                    if os_module.path.exists(filename_original):
+                        try:
+                            os_module.remove(filename_original)
+                            if UNSLOTH_ENABLE_LOGGING:
+                                logger.debug(f"Removed locked file: {filename_original}")
+                        except (OSError, IOError):
+                            # File still locked, will retry
+                            pass
+
+                    # Write directly to target location
+                    save_file(tensors, filename_original)
+                    break  # Success
+
+                except (OSError, IOError) as e:
+                    if attempt < max_retries - 1:
+                        # Exponential backoff
+                        delay = base_delay * (2 ** (attempt // 2))
+                        if UNSLOTH_ENABLE_LOGGING:
+                            logger.warning(
+                                f"[Retry {attempt + 1}/{max_retries}] File lock: {e}. "
+                                f"Waiting {delay:.1f}s before retry..."
+                            )
+                        time.sleep(delay)
+                    else:
+                        raise RuntimeError(
+                            f"Failed to save file after {max_retries} attempts: {e}. "
+                        )
+
             del tensors
 
         if torch.cuda.is_available():
