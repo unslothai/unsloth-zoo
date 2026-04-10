@@ -17,6 +17,8 @@
 __all__ = [
     "create_empty_model",
     "set_additional_modules",
+    "finalize_huggingface_model",
+    "patch_gemma4_vllm_lora_support",
     "extract_gdn_layers",
     "extract_vision_layers",
     "get_model_layer_config",
@@ -281,10 +283,13 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     new_config.vocab_size = 1
     new_config.pad_token_id = 0
 
-    for attr in ("linear_num_key_heads", "linear_num_value_heads"):
-        if hasattr(new_config, attr): setattr(new_config, attr, 1)
-    for attr in ("linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim"):
-        if hasattr(new_config, attr): setattr(new_config, attr, 1)
+    _set_config_attrs(new_config, {
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 1,
+        "linear_key_head_dim": 1,
+        "linear_value_head_dim": 1,
+        "linear_conv_kernel_dim": 1,
+    })
 
     # Set attention module head_dim
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -302,6 +307,50 @@ def _set_config_attrs(config_obj, attrs_to_set):
     for attr, value in attrs_to_set.items():
         if hasattr(config_obj, attr):
             setattr(config_obj, attr, value)
+pass
+
+def _get_model_device(model):
+    for tensor in model.parameters():
+        return tensor.device
+    for tensor in model.buffers():
+        return tensor.device
+    return torch.device("cpu")
+pass
+
+def patch_gemma4_vllm_lora_support():
+    from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
+    from vllm.model_executor.models import interfaces as vllm_model_interfaces
+    from vllm.lora import model_manager as vllm_lora_model_manager
+    from vllm.v1.worker import lora_model_runner_mixin
+    from unsloth_zoo import vllm_lora_worker_manager
+
+    Gemma4ForConditionalGeneration.supports_lora = True
+    Gemma4ForConditionalGeneration.embedding_modules = {}
+
+    if not hasattr(lora_model_runner_mixin.supports_lora, "_unsloth_gemma4_patch"):
+        original_supports_lora = lora_model_runner_mixin.supports_lora
+
+        def patched_supports_lora(model):
+            if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
+                return True
+            return original_supports_lora(model)
+
+        patched_supports_lora._unsloth_gemma4_patch = True
+        lora_model_runner_mixin.supports_lora = patched_supports_lora
+        vllm_model_interfaces.supports_lora = patched_supports_lora
+
+    if not hasattr(vllm_lora_model_manager.create_lora_manager, "_unsloth_gemma4_patch"):
+        original_create_lora_manager = vllm_lora_model_manager.create_lora_manager
+
+        def patched_create_lora_manager(model, *args, **kwargs):
+            if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
+                lora_manager_cls = kwargs.pop("lora_manager_cls", vllm_lora_model_manager.LoRAModelManager)
+                return lora_manager_cls(model = model, *args, **kwargs)
+            return original_create_lora_manager(model, *args, **kwargs)
+
+        patched_create_lora_manager._unsloth_gemma4_patch = True
+        vllm_lora_model_manager.create_lora_manager = patched_create_lora_manager
+        vllm_lora_worker_manager.create_lora_manager = patched_create_lora_manager
 pass
 
 
@@ -383,12 +432,7 @@ def create_empty_vision_model(config, dtype = torch.float16):
     text_layers = config.text_config.num_hidden_layers
     vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
 
-    # Set minimal sizes for different model types
-    if model_type == "qwen2_5_vl":
-        new_config.vision_config.out_hidden_size = 1
-    elif model_type == "qwen3_vl":
-        new_config.vision_config.out_hidden_size = 1
-    elif model_type == "qwen3_5":
+    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
         new_config.vision_config.out_hidden_size = 1
 
     num_layers = max(text_layers, vision_layers)
@@ -415,6 +459,9 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
 
 @torch.inference_mode
 def set_additional_modules(new_model, quant_state_dict, config):
+    def _unwrap_tensor(val):
+        return getattr(val, "data", val)
+
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
         language_model_prefix = "model.language_model"
@@ -443,7 +490,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
     # we cannot use the normal embedding init because gemma3 uses Gemma3TextScaledWordEmbedding which wraps around nn.Embedding and has a scaling factor. This new init ensures that we respect the forward from original model.
     def set_embedding(module, embed_tokens_key, pad_token_id, requires_grad=False):
         num_embeddings, embedding_dim = quant_state_dict[embed_tokens_key].shape
-        embeddings = quant_state_dict[embed_tokens_key]
+        embeddings = _unwrap_tensor(quant_state_dict[embed_tokens_key])
         if isinstance(embeddings, torch.Tensor):
             # in the newer vLLM versions, this seems to return a tensor which can't be assigned to embedding weight
             # we need to convert that to nn.Paramter and then pass it on
@@ -462,6 +509,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
     # Norm
     norm_key = f"{language_model_prefix}.norm.weight"
     norm = quant_state_dict[norm_key]
+    norm = _unwrap_tensor(norm)
     norm = torch.nn.Parameter(norm, requires_grad = False)
     language_model.norm.weight = norm
 
@@ -476,7 +524,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
 
     # Check if lm_head exists in the state dict
     if lmhead_key in quant_state_dict:
-        weight = quant_state_dict[lmhead_key]
+        weight = _unwrap_tensor(quant_state_dict[lmhead_key])
         from torch.nn import Linear
 
         # Create Linear layer with zero dimensions to avoid any weight allocation
@@ -518,6 +566,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
         for prefix in ['new_', 'new_model.']:
             try:
                 val = quant_state_dict[key]
+                val = _unwrap_tensor(val)
                 if isinstance(val, torch.Tensor):
                     val = torch.nn.Parameter(val,requires_grad=False)
                 exec(f"{prefix}{key} = val")
@@ -526,6 +575,100 @@ def set_additional_modules(new_model, quant_state_dict, config):
                 continue
 
     pass
+pass
+
+@torch.inference_mode
+def finalize_huggingface_model(
+    new_model,
+    original_meta_model,
+    config,
+    dtype,
+    quantization_config = None,
+    bnb_config = None,
+):
+    if original_meta_model is not None:
+        copy_attributes(original_meta_model, new_model)
+
+    language_model = getattr(getattr(new_model, "model", None), "language_model", None)
+    if language_model is not None and hasattr(language_model, "layers"):
+        for layer_idx, layer in enumerate(language_model.layers):
+            if hasattr(layer, "layer_idx"):
+                layer.layer_idx = layer_idx
+            for attr_name in ("self_attn", "cross_attn", "mlp", "linear_attn"):
+                submodule = getattr(layer, attr_name, None)
+                if submodule is not None and hasattr(submodule, "layer_idx"):
+                    submodule.layer_idx = layer_idx
+
+    for module in new_model.modules():
+        module_config = getattr(module, "config", None)
+        if module_config is not None:
+            set_dtype_in_config(module_config, dtype)
+
+    target_device = _get_model_device(new_model)
+    text_config = getattr(config, "text_config", config)
+    vision_config = getattr(config, "vision_config", None)
+
+    for module in new_model.modules():
+        if hasattr(module, "rotary_emb"):
+            rotary_config = text_config
+            current_rotary_config = getattr(module.rotary_emb, "config", None)
+            is_vision_rotary = (
+                vision_config is not None and
+                current_rotary_config is not None and
+                current_rotary_config.__class__ == vision_config.__class__
+            )
+            if is_vision_rotary:
+                rotary_config = vision_config
+            if not (getattr(config, "model_type", None) == "gemma4" and is_vision_rotary):
+                module.rotary_emb = module.rotary_emb.__class__(
+                    config = rotary_config,
+                    device = target_device,
+                )
+            for buffer_name in ("inv_freq", "original_inv_freq"):
+                buffer = getattr(module.rotary_emb, buffer_name, None)
+                if torch.is_tensor(buffer) and buffer.is_floating_point():
+                    module.rotary_emb._buffers[buffer_name] = buffer.to(
+                        device = target_device,
+                        dtype = dtype,
+                    )
+        if hasattr(module, "rotary_pos_emb"):
+            assert vision_config is not None, "Unsloth: vision_config is required for models with vision rotary_pos_emb"
+            head_dim = vision_config.hidden_size // vision_config.num_heads
+            module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)
+        if hasattr(module, "rotary_emb_local"):
+            local_rope_config = deepcopy(text_config)
+            local_rope_config.rope_theta = text_config.rope_local_base_freq
+            local_rope_config.rope_scaling = {"rope_type": "default"}
+            module.rotary_emb_local = module.rotary_emb_local.__class__(
+                config = local_rope_config,
+                device = target_device,
+            )
+            del local_rope_config
+
+    if (quantization_config or {}) == {} and bnb_config is None:
+        new_model = new_model.to(device = target_device, dtype = dtype)
+        if getattr(config, "model_type", None) == "gemma4":
+            for module in new_model.modules():
+                rotary_emb = getattr(module, "rotary_emb", None)
+                if rotary_emb is None:
+                    continue
+                fresh_rotary_emb = rotary_emb.__class__(
+                    config = rotary_emb.config,
+                    device = target_device,
+                )
+                for attr_name in ("max_seq_len_cached", "original_max_seq_len"):
+                    if hasattr(fresh_rotary_emb, attr_name):
+                        setattr(rotary_emb, attr_name, getattr(fresh_rotary_emb, attr_name))
+                for attr_name, attr_value in fresh_rotary_emb.__dict__.items():
+                    if attr_name == "attention_scaling" or attr_name.endswith("_attention_scaling"):
+                        setattr(rotary_emb, attr_name, attr_value)
+                for buffer_name, buffer in fresh_rotary_emb._buffers.items():
+                    if torch.is_tensor(buffer) and buffer.is_floating_point():
+                        rotary_emb._buffers[buffer_name] = buffer.to(
+                            device = target_device,
+                            dtype = torch.float32,
+                        )
+    return new_model
 pass
 
 def get_model_layer_config(return_non_layered=True):
@@ -538,6 +681,7 @@ def get_model_layer_config(return_non_layered=True):
     """
     layer_templates = {
         'standard_layers': {
+            "model.language_model.layers.{kk}.layer_scalar",
             "model.language_model.layers.{kk}.self_attn.q_proj",
             "model.language_model.layers.{kk}.self_attn.k_proj",
             "model.language_model.layers.{kk}.self_attn.v_proj",
@@ -548,6 +692,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.language_model.layers.{kk}.mlp.down_proj",
 
+            "model.layers.{kk}.layer_scalar",
             "model.layers.{kk}.self_attn.q_proj",
             "model.layers.{kk}.self_attn.k_proj",
             "model.layers.{kk}.self_attn.v_proj",
@@ -595,6 +740,12 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.vision_model.encoder.layers.{kk}.post_layernorm",
             "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm1",
             "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm2",
+            "model.vision_tower.encoder.layers.{kk}.input_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.post_attention_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.pre_feedforward_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.post_feedforward_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.q_norm",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.k_norm",
 
             # Mistral3 vision norms
             "model.vision_tower.transformer.layers.{kk}.attention_norm",
@@ -647,6 +798,13 @@ def get_model_layer_config(return_non_layered=True):
 
             "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc1",
             "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc2",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.q_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.k_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.v_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.o_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.mlp.gate_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.mlp.up_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.mlp.down_proj.linear",
 
             # qwen2.5_vl style
             "model.visual.blocks.{kk}.attn.qkv",
@@ -722,6 +880,11 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.patch_positional_embedding",
             "model.vision_tower.patch_conv",
             "model.vision_tower.ln_pre",
+            "model.vision_tower.std_bias",
+            "model.vision_tower.std_scale",
+            "model.vision_tower.patch_embedder.position_embedding_table",
+            "model.vision_tower.patch_embedder.input_proj",
+            "model.embed_vision.embedding_projection",
 
             # qwen 3 vl
             "model.visual.pos_embed",
@@ -769,6 +932,11 @@ def get_model_layer_counts(config):
             "vision_layers": getattr(config.vision_config, "depth", 27),
             "deepstack_layers": getattr(config.vision_config, "deepstack_depth", 3),
         }
+    elif model_type == "gemma4":
+        return {
+            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+        }
     elif model_type == "gemma3":
         return {
             "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
@@ -799,6 +967,10 @@ def _get_nested_attr(obj, attr_path: str):
 def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_state_dict):
     gdn = gdn_module
 
+    def store(name, value):
+        state_dict[name] = value
+        quant_state_dict[name] = value
+
     if hasattr(gdn, "in_proj_qkvz"):
         proj = getattr(gdn.in_proj_qkvz, "base_layer", gdn.in_proj_qkvz)
         weight = proj.weight
@@ -808,10 +980,8 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
             offsets.append(offsets[-1] + s)
         qkv_weight = weight[offsets[0]:offsets[3]]
         z_weight = weight[offsets[3]:offsets[4]]
-        state_dict[f"{prefix}.in_proj_qkv.weight"] = qkv_weight
-        quant_state_dict[f"{prefix}.in_proj_qkv.weight"] = qkv_weight
-        state_dict[f"{prefix}.in_proj_z.weight"] = z_weight
-        quant_state_dict[f"{prefix}.in_proj_z.weight"] = z_weight
+        store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
+        store(f"{prefix}.in_proj_z.weight", z_weight)
         if weight.dtype == torch.float8_e4m3fn:
             if hasattr(proj, 'weight_scale'):
                 ws = proj.weight_scale
@@ -825,10 +995,8 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
                 scale_suffix = '.weight_scale_inv'
                 qkv_scale = ws[scale_offsets[0]:scale_offsets[3]]
                 z_scale = ws[scale_offsets[3]:scale_offsets[4]]
-                state_dict[f"{prefix}.in_proj_qkv{scale_suffix}"] = qkv_scale
-                quant_state_dict[f"{prefix}.in_proj_qkv{scale_suffix}"] = qkv_scale
-                state_dict[f"{prefix}.in_proj_z{scale_suffix}"] = z_scale
-                quant_state_dict[f"{prefix}.in_proj_z{scale_suffix}"] = z_scale
+                store(f"{prefix}.in_proj_qkv{scale_suffix}", qkv_scale)
+                store(f"{prefix}.in_proj_z{scale_suffix}", z_scale)
     else:
         get_state_dict(f"{prefix}.in_proj_qkv", 0, state_dict, gdn.in_proj_qkv, slice_weights=False)
         get_state_dict(f"{prefix}.in_proj_z", 0, state_dict, gdn.in_proj_z, slice_weights=False)
@@ -836,14 +1004,9 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
     get_state_dict(f"{prefix}.in_proj_b", 0, state_dict, gdn.in_proj_ba)
     get_state_dict(f"{prefix}.in_proj_a", 1, state_dict, gdn.in_proj_ba)
 
-    conv_w = gdn.conv1d.weight.data
-    state_dict[f"{prefix}.conv1d.weight"] = conv_w
-    quant_state_dict[f"{prefix}.conv1d.weight"] = conv_w
-
-    state_dict[f"{prefix}.dt_bias"] = gdn.dt_bias.data
-    quant_state_dict[f"{prefix}.dt_bias"] = gdn.dt_bias.data
-    state_dict[f"{prefix}.A_log"] = gdn.A_log.data
-    quant_state_dict[f"{prefix}.A_log"] = gdn.A_log.data
+    store(f"{prefix}.conv1d.weight", gdn.conv1d.weight.data)
+    store(f"{prefix}.dt_bias", gdn.dt_bias.data)
+    store(f"{prefix}.A_log", gdn.A_log.data)
 
     get_state_dict(f"{prefix}.out_proj", 0, state_dict, gdn.out_proj)
 pass
@@ -899,7 +1062,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                     if isinstance(layer_module, torch.nn.Module):
                         if hasattr(layer_module, 'weight'):
                             get_state_dict(layer_path, 0, state_dict, layer_module)
-                    elif isinstance(layer_module, torch.nn.Parameter):
+                    elif isinstance(layer_module, torch.Tensor):
                         state_dict[f"{layer_path}"] = layer_module.data
                         quant_state_dict[f"{layer_path}"] = state_dict[f"{layer_path}"]
                     else:
@@ -914,7 +1077,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
             if hasattr(component, 'weight'):
                 # Prefer using get_state_dict when possible
                 get_state_dict(component_path, 0, state_dict, component)
-            elif isinstance(component, torch.nn.Parameter):
+            elif isinstance(component, torch.Tensor):
                 state_dict[component_path] = component.data
                 quant_state_dict[component_path] = component.data
             elif isinstance(component, torch.nn.Module):
