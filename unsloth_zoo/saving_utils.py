@@ -801,15 +801,15 @@ def _merge_and_overwrite_lora(
             for attempt in range(max_retries):
                 try:
                     # Force garbage collection and CUDA cache cleanup
-                    import gc
+                    # Force garbage collection and CUDA cache cleanup
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
                     # Aggressive: Close and remove original file if it exists
-                    if os_module.path.exists(filename_original):
+                    if os.path.exists(filename_original):
                         try:
-                            os_module.remove(filename_original)
+                            os.remove(filename_original)
                             if UNSLOTH_ENABLE_LOGGING:
                                 logger.debug(f"Removed locked file: {filename_original}")
                         except (OSError, IOError):
