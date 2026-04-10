@@ -794,31 +794,49 @@ def _merge_and_overwrite_lora(
                         tensors[key] = f.get_tensor(key)
 
             # Fix for Windows file locking (os error 1224)
-            # Use retry logic with aggressive locking cleanup
+            # Use retry logic with safe atomic operations
+            import tempfile
+            import shutil
+
             max_retries = 10
             base_delay = 0.2  # seconds
+            temp_dir = os.path.dirname(filename_original)
 
             for attempt in range(max_retries):
                 try:
-                    # Force garbage collection and CUDA cache cleanup
                     # Force garbage collection and CUDA cache cleanup
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-                    # Aggressive: Close and remove original file if it exists
-                    if os.path.exists(filename_original):
-                        try:
-                            os.remove(filename_original)
-                            if UNSLOTH_ENABLE_LOGGING:
-                                logger.debug(f"Removed locked file: {filename_original}")
-                        except (OSError, IOError):
-                            # File still locked, will retry
-                            pass
+                    # Create temp file in same directory for atomic replace
+                    with tempfile.NamedTemporaryFile(
+                        delete=False,
+                        dir=temp_dir,
+                        suffix=".safetensors.tmp"
+                    ) as tmp_file:
+                        tmp_path = tmp_file.name
 
-                    # Write directly to target location
-                    save_file(tensors, filename_original)
-                    break  # Success
+                    try:
+                        # Write to temp file (safe - original untouched)
+                        save_file(tensors, tmp_path)
+
+                        # Only delete original after successful write
+                        if os.path.exists(filename_original):
+                            os.remove(filename_original)
+
+                        # Move temp to original location (atomic)
+                        shutil.move(tmp_path, filename_original)
+                        break  # Success
+
+                    except Exception as write_error:
+                        # Clean up temp file on write failure
+                        try:
+                            if os.path.exists(tmp_path):
+                                os.remove(tmp_path)
+                        except:
+                            pass
+                        raise write_error
 
                 except (OSError, IOError) as e:
                     if attempt < max_retries - 1:
@@ -833,6 +851,7 @@ def _merge_and_overwrite_lora(
                     else:
                         raise RuntimeError(
                             f"Failed to save file after {max_retries} attempts: {e}. "
+                            "Keep original shard on write failure - no data loss."
                         )
 
             del tensors
