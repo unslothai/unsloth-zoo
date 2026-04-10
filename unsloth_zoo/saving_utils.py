@@ -798,6 +798,12 @@ def _merge_and_overwrite_lora(
             import tempfile
             import shutil
 
+            # Import safetensors exception to catch wrapped Windows errors
+            try:
+                from safetensors.torch import SafetensorError
+            except ImportError:
+                SafetensorError = Exception  # Fallback if not available
+
             max_retries = 10
             base_delay = 0.2  # seconds
             temp_dir = os.path.dirname(filename_original)
@@ -838,21 +844,29 @@ def _merge_and_overwrite_lora(
                             pass
                         raise write_error
 
-                except (OSError, IOError) as e:
-                    if attempt < max_retries - 1:
-                        # Exponential backoff
+                except (OSError, IOError, SafetensorError) as e:
+                    # Catch both OS errors and safetensors-wrapped Windows errors
+                    error_msg = str(e).lower()
+                    is_lock_error = "1224" in error_msg or "user-mapped" in error_msg or "cannot be performed" in error_msg
+
+                    if is_lock_error and attempt < max_retries - 1:
+                        # Exponential backoff for lock errors
                         delay = base_delay * (2 ** (attempt // 2))
                         if UNSLOTH_ENABLE_LOGGING:
                             logger.warning(
-                                f"[Retry {attempt + 1}/{max_retries}] File lock: {e}. "
+                                f"[Retry {attempt + 1}/{max_retries}] Windows file lock detected: {e}. "
                                 f"Waiting {delay:.1f}s before retry..."
                             )
                         time.sleep(delay)
-                    else:
+                    elif is_lock_error and attempt == max_retries - 1:
                         raise RuntimeError(
-                            f"Failed to save file after {max_retries} attempts: {e}. "
-                            "Keep original shard on write failure - no data loss."
+                            f"Failed to save file after {max_retries} attempts due to Windows file lock. "
+                            "Original shard preserved - no data loss. "
+                            "Solutions: 1) Restart Unsloth Studio 2) Disable antivirus 3) Close File Explorer windows"
                         )
+                    else:
+                        # Non-lock errors - fail immediately
+                        raise RuntimeError(f"Model merge failed with error: {e}")
 
             del tensors
 
