@@ -795,11 +795,6 @@ def _merge_and_overwrite_lora(
 
             # Fix for Windows file locking (os error 1224)
             # Use retry logic with aggressive locking cleanup
-            import time
-            import tempfile
-            import shutil
-            import os as os_module
-
             max_retries = 10
             base_delay = 0.2  # seconds
 
