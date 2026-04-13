@@ -118,8 +118,8 @@ def compute_fused_ce_loss(
     # Calculate cross entropy loss
     reduction = "sum" if n_items is not None else "mean"
     loss = torch.nn.functional.cross_entropy(
-        input  = logits.view(-1, vocab_size).float().contiguous(),
-        target = labels.view(-1).to(device).contiguous(),
+        input  = logits.reshape(-1, vocab_size).float().contiguous(),
+        target = labels.reshape(-1).to(device).contiguous(),
         reduction = reduction,
     )
     loss = loss / n_items if n_items is not None else loss
@@ -199,7 +199,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                 _labels[..., :-1][mask[..., 1:] == 0] = -100
             pass
             _labels[..., -1] = -100
-            _labels = _labels.view(-1)
+            _labels = _labels.reshape(-1)
             labels = _labels
         pass
 
@@ -228,8 +228,8 @@ class UnslothFusedLoss(torch.autograd.Function):
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
         __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
-        __shift_states = torch.chunk(hidden_states.view(-1, hd), n_chunks, dim = 0)
-        __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
+        __shift_states = torch.chunk(hidden_states.reshape(-1, hd), n_chunks, dim = 0)
+        __grad_inputs  = torch.chunk(grad_inputs.reshape(-1, hd),   n_chunks, dim = 0)
 
         def accumulate_chunk(
             n_chunks,
