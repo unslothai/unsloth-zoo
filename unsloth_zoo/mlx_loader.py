@@ -420,9 +420,11 @@ class FastMLXModel:
         try:
             from unsloth.models.mlx import get_unsloth_loader
             custom_loader = get_unsloth_loader(model_type)
-        except (ImportError, AttributeError):
+        except (ImportError, AttributeError, NotImplementedError):
             # AttributeError: torch installed without CUDA triggers
-            # torch._C._cuda_getCurrentRawStream failures in unsloth.kernels
+            #   torch._C._cuda_getCurrentRawStream failures in unsloth.kernels
+            # NotImplementedError: device_type detection raises this on Mac
+            #   when no GPU is available (we are on MLX path anyway)
             custom_loader = None
 
         if custom_loader is not None:
@@ -445,9 +447,11 @@ class FastMLXModel:
         else:
             is_vlm = _is_vlm(config_data)
 
-        tokenizer_config = {}
+        extra_kwargs = {}
         if token:
-            tokenizer_config["token"] = token
+            extra_kwargs["token"] = token
+        if trust_remote_code:
+            extra_kwargs["trust_remote_code"] = True
 
         if is_vlm:
             # VLM path via mlx-vlm
@@ -485,10 +489,11 @@ class FastMLXModel:
                       f"runtime {q_bits}-bit quantization)...")
                 model, processor = vlm_load(
                     model_name, q_bits=q_bits, q_group_size=q_group_size,
+                    **extra_kwargs,
                 )
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
-                model, processor = vlm_load(model_name)
+                model, processor = vlm_load(model_name, **extra_kwargs)
 
             model._is_vlm_model = True
             model._processor = processor
@@ -506,7 +511,7 @@ class FastMLXModel:
             print(f"Unsloth: Loading {model_name} via mlx-lm...")
             model, tokenizer, config = mlx_load(
                 model_name,
-                tokenizer_config=tokenizer_config if tokenizer_config else None,
+                tokenizer_config=extra_kwargs if extra_kwargs else None,
                 return_config=True,
             )
             model._is_vlm_model = False

@@ -170,6 +170,23 @@ class MLXTrainer:
         self._train_loss_history = []
         self._step_times = []
         self._batches = None  # Pre-created batches (skips internal batch creation)
+        self._step_callbacks = []  # Callbacks called after each logged step
+        self._eval_callbacks = []  # Callbacks called after each eval
+        self.stop_requested = False  # Set True to stop training early
+
+    def add_step_callback(self, fn):
+        """Register a callback called after each logged step.
+
+        fn(step, total_steps, loss, lr, tokens_sec, peak_gb, elapsed, num_tokens)
+        """
+        self._step_callbacks.append(fn)
+
+    def add_eval_callback(self, fn):
+        """Register a callback called after each evaluation.
+
+        fn(step, eval_loss, perplexity)
+        """
+        self._eval_callbacks.append(fn)
 
     @staticmethod
     def _ensure_lora_frozen(model):
@@ -273,31 +290,21 @@ class MLXTrainer:
                 scale_parameter=False,
             )
         elif opt_name == "adamw":
-            optimizer = optim.AdamW(learning_rate=schedule, weight_decay=0.0)
+            optimizer = optim.AdamW(learning_rate=schedule, weight_decay=wd)
         elif opt_name == "adam":
             optimizer = optim.Adam(learning_rate=schedule)
         elif opt_name == "sgd":
-            optimizer = optim.SGD(learning_rate=schedule, weight_decay=0.0)
+            optimizer = optim.SGD(learning_rate=schedule, weight_decay=wd)
         elif opt_name == "muon":
-            optimizer = optim.Muon(learning_rate=schedule, weight_decay=0.0)
+            optimizer = optim.Muon(learning_rate=schedule, weight_decay=wd)
         elif opt_name == "lion":
-            optimizer = optim.Lion(learning_rate=schedule, weight_decay=0.0)
+            optimizer = optim.Lion(learning_rate=schedule, weight_decay=wd)
         else:
             print(f"Unknown optimizer '{opt_name}', falling back to Adafactor.")
             optimizer = optim.Adafactor(
                 learning_rate=schedule,
                 relative_step=False,
                 scale_parameter=False,
-            )
-
-        # Apply weight decay only to 2D+ weight tensors (not biases, norms,
-        # embeddings). Matches HuggingFace Trainer.get_decay_parameter_names.
-        if wd > 0 and opt_name not in ("adafactor", "adam"):
-            def _wd_predicate(module, key, value):
-                return key == "weight" and value.ndim >= 2
-            optimizer = optim.chain(
-                optimizer,
-                optim.decay_weight(wd, predicate=_wd_predicate),
             )
 
         return optimizer
@@ -313,6 +320,8 @@ class MLXTrainer:
         ntokens = mx.array(0)
 
         for batch_data in eval_batches:
+            if self.stop_requested:
+                break
             if is_vlm:
                 loss, ntoks = loss_fn(self.model, batch_data)
             else:
@@ -565,6 +574,10 @@ class MLXTrainer:
         batch_idx = 0
 
         for it in range(1, total_steps * grad_accum + 1):
+            if self.stop_requested:
+                print("Unsloth: Stop requested — ending training early.")
+                break
+
             tic = time.perf_counter()
 
             # Get next batch
@@ -623,6 +636,8 @@ class MLXTrainer:
                     mx.synchronize()
                     mx.reset_peak_memory()
 
+                elapsed_total = time.perf_counter() - start_time
+
                 print(
                     f"  Step {current_step}/{total_steps} | "
                     f"Loss: {train_loss:.4f} | "
@@ -630,6 +645,13 @@ class MLXTrainer:
                     f"Tok/s: {tokens_sec:.0f} | "
                     f"Peak: {peak_mem:.2f} GB"
                 )
+
+                for cb in self._step_callbacks:
+                    try:
+                        cb(current_step, total_steps, train_loss, lr_val,
+                           tokens_sec, peak_mem, elapsed_total, trained_tokens)
+                    except Exception as e:
+                        print(f"Unsloth: step callback error: {e}")
 
                 losses = 0
                 n_tokens = 0
@@ -647,6 +669,11 @@ class MLXTrainer:
                     f"Val Loss: {val_loss:.4f} | "
                     f"Perplexity: {ppl:.2f}"
                 )
+                for cb in self._eval_callbacks:
+                    try:
+                        cb(current_step, val_loss, ppl)
+                    except Exception as e:
+                        print(f"Unsloth: eval callback error: {e}")
 
             # Checkpointing
             if args.save_steps > 0 and current_step % args.save_steps == 0:
