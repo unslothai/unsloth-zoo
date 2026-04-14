@@ -29,8 +29,88 @@ from .device_type import DEVICE_TYPE, device_synchronize
 from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()
 
+
+# The three *selective_log_softmax functions below were originally decorated
+# with ``@torch.compile(dynamic=True, fullgraph=True, options=torch_compile_options)``.
+# On some TorchInductor builds that pick oversized workspace pools for dynamic
+# shapes (observed e.g. on NVIDIA Blackwell sm_120 with torch >= 2.11 and
+# large vocabularies like Qwen 3.5's ~248k vocab) the compiled kernel can
+# request multi-GB workspace buffers even when the actual logits chunks are
+# small, causing CUDA OOM inside ``chunked_hidden_states_selective_log_softmax``
+# during GRPO training. See https://github.com/unslothai/unsloth/issues/4985.
+#
+# We keep ``torch.compile`` as the fast path but wrap each function with an
+# auto-fallback: on the first CUDA OOM or ``RuntimeError: CUDA driver error``
+# raised by the compiled path, the wrapper transparently re-runs the inputs
+# on the plain (uncompiled) Python function and remembers the decision for
+# the rest of the process. No configuration is required -- environments
+# where compile works stay fast, and environments where it OOMs are
+# automatically recovered without the caller ever seeing the error.
+import functools as _functools
+
+
+def _is_workspace_oom(exc: BaseException) -> bool:
+    """Heuristic: is this the inductor workspace OOM we want to trap?"""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        if "out of memory" in msg:
+            return True
+        if "cuda driver error" in msg and "device not ready" in msg:
+            return True
+    return False
+
+
+class _AutoFallbackCompile:
+    """Call ``compiled`` first; on workspace OOM, fall back to ``eager`` for life."""
+
+    def __init__(self, fn):
+        self.eager = fn
+        self._name = getattr(fn, "__name__", "rl_logsoftmax")
+        _functools.update_wrapper(self, fn, updated=())
+        try:
+            self.compiled = torch.compile(
+                dynamic=True, fullgraph=True, options=torch_compile_options,
+            )(fn)
+            self._use_compiled = True
+        except Exception:
+            # torch.compile() at decoration time should not raise on modern
+            # torch, but be defensive: fall back to eager silently.
+            self.compiled = None
+            self._use_compiled = False
+
+    def __call__(self, *args, **kwargs):
+        if self._use_compiled and self.compiled is not None:
+            try:
+                return self.compiled(*args, **kwargs)
+            except BaseException as exc:
+                if not _is_workspace_oom(exc):
+                    raise
+                logging.warning(
+                    "Unsloth: %s torch.compile path raised %s (%s). "
+                    "Switching to the eager path for the rest of this process. "
+                    "This is expected on some torch+GPU combinations; training "
+                    "will continue transparently. See "
+                    "https://github.com/unslothai/unsloth/issues/4985 for context.",
+                    self._name, type(exc).__name__, str(exc)[:200],
+                )
+                self._use_compiled = False
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                # Fall through to eager call below
+        return self.eager(*args, **kwargs)
+
+
+def _maybe_rl_compile(fn):
+    """Wrap ``fn`` with a compile + auto-eager-fallback dispatcher."""
+    return _AutoFallbackCompile(fn)
+
+
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_rl_compile
 def selective_log_softmax(logits, index):
     logits = logits.to(torch.float32)
     selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
@@ -43,7 +123,7 @@ pass
 
 # More memory efficient by chunking on (bsz+qlen) dimension
 # Exactly equivalent to the above
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_rl_compile
 def chunked_selective_log_softmax(logits, index, temperature: float = 1.0):
     # Split into 4 chunks only
     chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = 4, dim = 0)
@@ -66,7 +146,7 @@ pass
 
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
 
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_rl_compile
 def chunked_hidden_states_selective_log_softmax(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
