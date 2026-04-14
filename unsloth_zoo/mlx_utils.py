@@ -437,9 +437,13 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
         inputs = input_ids[:, :-1]
 
         # Forward pass — let the model create its own causal mask.
-        # attention_mask is a padding indicator, not a causal attention mask;
-        # we use it only for loss masking below.
-        output = model(inputs, pixel_values=pixel_values)
+        # Pass extra keys (e.g. image_grid_thw for Qwen) that some models need.
+        fwd_kwargs = {
+            k: v for k, v in batch_dict.items()
+            if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+            and isinstance(v, mx.array)
+        }
+        output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits.astype(mx.float32)
 
@@ -539,7 +543,14 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
 
     inputs = input_ids[:, :-1]
 
-    embed_result = model.get_input_embeddings(inputs, pixel_values)
+    # Collect extra keys (e.g. image_grid_thw for Qwen) that some models need.
+    extra_kwargs = {
+        k: v for k, v in batch_dict.items()
+        if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+        and isinstance(v, mx.array)
+    }
+
+    embed_result = model.get_input_embeddings(inputs, pixel_values, **extra_kwargs)
     merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
 
     lm_model = model.language_model.model
