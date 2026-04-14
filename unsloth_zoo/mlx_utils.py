@@ -768,7 +768,7 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size):
 
     inputs = processor(**proc_kwargs)
 
-    # Convert to mx.array
+    # Convert to mx.array with correct dtypes
     batch = {}
     for k, v in inputs.items():
         if isinstance(v, mx.array):
@@ -782,6 +782,14 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size):
                 batch[k] = mx.array(v[0]) if not isinstance(v[0], mx.array) else v[0]
         else:
             batch[k] = v
+
+    # Cast dtypes — match GPU collator's _cast_pixel_values_dtype_inplace
+    if "input_ids" in batch:
+        batch["input_ids"] = batch["input_ids"].astype(mx.int32)
+    if "attention_mask" in batch:
+        batch["attention_mask"] = batch["attention_mask"].astype(mx.int32)
+    if "pixel_values" in batch and batch["pixel_values"] is not None:
+        batch["pixel_values"] = batch["pixel_values"].astype(mx.float32)
 
     return batch
 
