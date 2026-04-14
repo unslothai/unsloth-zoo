@@ -505,7 +505,9 @@ class MLXTrainer:
 
                 return lvalue, toks, (grad, toks_f)
 
-        if args.compile:
+        _use_compile = args.compile
+        if _use_compile:
+            _uncompiled_step_fn = step_fn
             step_fn = mx.compile(step_fn, inputs=state, outputs=state)
 
         # Prepare eval batches
@@ -590,11 +592,22 @@ class MLXTrainer:
             do_update = (it % grad_accum == 0)
 
             if is_vlm:
-                lvalue, toks, grad_accum_state = step_fn(
-                    batch_data,
-                    grad_accum_state,
-                    do_update,
-                )
+                try:
+                    lvalue, toks, grad_accum_state = step_fn(
+                        batch_data,
+                        grad_accum_state,
+                        do_update,
+                    )
+                except ValueError as e:
+                    if _use_compile and "eval" in str(e).lower():
+                        print("Unsloth: mx.compile not supported for this VLM, falling back to eager mode.")
+                        step_fn = _uncompiled_step_fn
+                        _use_compile = False
+                        lvalue, toks, grad_accum_state = step_fn(
+                            batch_data, grad_accum_state, do_update,
+                        )
+                    else:
+                        raise
             else:
                 lvalue, toks, grad_accum_state = step_fn(
                     batch_data[0], batch_data[1], batch_data[2],
