@@ -683,108 +683,107 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
     return loss_fn
 
 
-_VLM_BATCH_API = None  # cached: {"vds_config_second": bool, "use_train_kwarg": bool}
+def _get_vlm_image_size(config, processor):
+    """Get target image size for uniform resizing, matching GPU collator.
 
-
-def _detect_vlm_batch_api():
-    """Detect mlx-vlm API variant (>= 0.22 vs older) and cache the result."""
-    global _VLM_BATCH_API
-    if _VLM_BATCH_API is not None:
-        return _VLM_BATCH_API
-    import inspect
-    from mlx_vlm.trainer.datasets import VisionDataset
-    from mlx_vlm.trainer.sft_trainer import iterate_batches
-    vds_params = list(inspect.signature(VisionDataset.__init__).parameters.keys())
-    _VLM_BATCH_API = {
-        "vds_config_second": len(vds_params) >= 4 and vds_params[2] == "config",
-        "use_train_kwarg": "train" in inspect.signature(iterate_batches).parameters,
-    }
-    return _VLM_BATCH_API
-
-
-def _make_vision_dataset(dataset, config, processor):
-    """Create a VisionDataset, adapting to the installed mlx-vlm API.
-
-    Patches VisionDataset.process to always pass images to prepare_inputs.
-    mlx-vlm skips images for Gemma/Qwen/SmolVLM (use_embedded_images=True)
-    which causes pixel_values=None. The fix: always pass images so
-    prepare_inputs produces pixel_values for all model types.
+    Tries vision_config.image_size, then processor.image_processor.size,
+    falls back to 512.
     """
-    api = _detect_vlm_batch_api()
-    from mlx_vlm.trainer.datasets import VisionDataset
+    vc = config.get("vision_config", {})
+    if isinstance(vc, dict):
+        sz = vc.get("image_size")
+        if isinstance(sz, int) and sz > 0:
+            return sz
+    ip = getattr(processor, "image_processor", None)
+    if ip is not None:
+        sz = getattr(ip, "size", None)
+        if isinstance(sz, dict):
+            h = sz.get("height", sz.get("shortest_edge", 0))
+            if isinstance(h, int) and h > 0:
+                return h
+        elif isinstance(sz, int) and sz > 0:
+            return sz
+    return 512
 
-    # Patch: override use_embedded_images behavior
-    _orig_process = VisionDataset.process
 
-    def _patched_process(self, item):
-        from mlx_vlm.utils import prepare_inputs
-        from mlx_vlm.trainer.datasets import get_prompt
-        import warnings
+def _collate_vlm_batch(items, processor, max_seq_length, image_size):
+    """Collate a batch of VLM samples using the processor directly.
 
-        images = item.get("images", item.get("image", []))
-        if not isinstance(images, list):
-            images = [images] if images else []
+    Mirrors Unsloth's GPU UnslothVisionDataCollator:
+    1. Extract images from messages or top-level keys
+    2. Resize to uniform size
+    3. apply_chat_template for text
+    4. Single processor() call handles tokenization + image processing + padding
+    """
+    from PIL import Image
+    LANCZOS = Image.Resampling.LANCZOS
 
-        audio = item.get("audio", item.get("audios", []))
-        if not isinstance(audio, list):
-            audio = [audio] if audio else []
+    all_texts = []
+    all_images = []
 
-        conversations = item.get("messages", item.get("conversations"))
-        model_type = self.config.get("model_type")
+    for item in items:
+        messages = item.get("messages", item.get("conversations", []))
 
-        prompts = []
-        if isinstance(conversations, list) and isinstance(conversations[0], list):
-            for conversation in conversations:
-                prompt = get_prompt(model_type, self.processor, conversation)
-                prompts.append(prompt)
+        # Extract images: top-level first, then from message content
+        images = []
+        img = item.get("image", item.get("images"))
+        if img is not None:
+            images = [img] if not isinstance(img, list) else img
+        if not images:
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "image":
+                            pil = part.get("image")
+                            if pil is not None:
+                                images.append(pil)
+
+        # Resize to uniform size (like GPU collator _resize_images_inplace)
+        target = (image_size, image_size) if isinstance(image_size, int) else image_size
+        resized = []
+        for img in images:
+            if isinstance(img, Image.Image):
+                img = img.convert("RGB").resize(target, LANCZOS)
+            resized.append(img)
+
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False,
+        )
+        all_texts.append(text)
+        if resized:
+            all_images.append(resized[0] if len(resized) == 1 else resized)
+
+    # Single processor call — like GPU collator
+    proc_kwargs = dict(
+        text=all_texts,
+        padding=True,
+        truncation=True,
+        max_length=max_seq_length,
+        return_tensors="np",
+        add_special_tokens=False,
+    )
+    if all_images:
+        proc_kwargs["images"] = all_images
+
+    inputs = processor(**proc_kwargs)
+
+    # Convert to mx.array
+    batch = {}
+    for k, v in inputs.items():
+        if isinstance(v, mx.array):
+            batch[k] = v
+        elif hasattr(v, "shape"):
+            batch[k] = mx.array(v)
+        elif isinstance(v, list) and len(v) > 0 and hasattr(v[0], "shape"):
+            try:
+                batch[k] = mx.stack([mx.array(x) if not isinstance(x, mx.array) else x for x in v])
+            except Exception:
+                batch[k] = mx.array(v[0]) if not isinstance(v[0], mx.array) else v[0]
         else:
-            prompt = get_prompt(model_type, self.processor, conversations)
-            prompts.append(prompt)
+            batch[k] = v
 
-        image_token_index = self.config.get("image_token_index") or self.config.get(
-            "image_token_id"
-        )
-        if not image_token_index:
-            raise ValueError(
-                "Config must contain 'image_token_index' or 'image_token_id'"
-            )
-
-        # Always pass images (fix for Gemma/Qwen use_embedded_images bug)
-        inputs = prepare_inputs(
-            processor=self.processor,
-            images=images if images else None,
-            audio=audio if audio else None,
-            prompts=prompts,
-            image_token_index=image_token_index,
-            resize_shape=self.image_resize_shape,
-        )
-
-        return {
-            "pixel_values": inputs.get("pixel_values"),
-            "input_ids": inputs["input_ids"],
-            "attention_mask": inputs.get(
-                "attention_mask", mx.ones_like(inputs["input_ids"])
-            ),
-            **{
-                k: v
-                for k, v in inputs.items()
-                if k not in ["input_ids", "pixel_values", "attention_mask"]
-            },
-        }
-
-    VisionDataset.process = _patched_process
-
-    if api["vds_config_second"]:
-        return VisionDataset(dataset, config, processor)
-    return VisionDataset(dataset, processor, config)
-
-
-def _vlm_iter_kwargs(*, train, seed=42):
-    """Build iterate_batches kwargs, adapting to the installed mlx-vlm API."""
-    api = _detect_vlm_batch_api()
-    if api["use_train_kwarg"]:
-        return {"train": train}
-    return {"loop": train, "seed": seed}
+    return batch
 
 
 def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn):
@@ -798,13 +797,8 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn):
     ids_list = input_ids.tolist()
     result = mask_fn({"input_ids": ids_list})
     labels_list = result["labels"]
-    # mask_fn returns plain lists when given plain list input
     if hasattr(labels_list, "tolist"):
         labels_list = labels_list.tolist()
-    # Re-apply attention_mask: mlx_vlm pads input_ids with zeros, and the
-    # HF mask_fn's "last turn" branch copies those zeros into labels as real
-    # token IDs (not -100). These zeros pass (targets != -100), causing
-    # spurious gradients and overcounted ntoks.
     attention_mask = batch_dict.get("attention_mask")
     if attention_mask is not None:
         labels_array = mx.where(attention_mask == 0, mx.array(-100), mx.array(labels_list))
@@ -816,46 +810,36 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn):
 
 def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                        num_batches=None, seed=42, response_mask_fn=None):
-    """Pre-materialize VLM training batches using mlx_vlm's data pipeline.
+    """Pre-materialize VLM training batches using the processor directly.
 
-    Args:
-        dataset: HuggingFace dataset with image/text conversations.
-        processor: VLM processor (from mlx_vlm.load).
-        config: Model config dict.
-        batch_size: Batch size.
-        max_seq_length: Maximum sequence length.
-        num_batches: Number of batches to materialize (None = all).
-        seed: Random seed.
-        response_mask_fn: Optional masking closure from train_on_responses_only.
-            When provided, each batch dict gets a "labels" key with -100 for
-            instruction tokens.
-
-    Returns:
-        List of batch dicts, each with input_ids, pixel_values, attention_mask,
-        and optionally labels.
+    Mirrors Unsloth's GPU UnslothVisionDataCollator:
+    resize images → processor(text, images, padding=True) → uniform batches.
     """
-    try:
-        from mlx_vlm.trainer.sft_trainer import iterate_batches
-    except ImportError:
-        raise ImportError(
-            "Unsloth: mlx-vlm trainer is required for VLM training. "
-            "Install via: pip install mlx-vlm"
-        )
+    import numpy as np
 
-    vision_ds = _make_vision_dataset(dataset, config, processor)
-    iter_kwargs = _vlm_iter_kwargs(train=(num_batches is not None), seed=seed)
+    image_size = _get_vlm_image_size(config, processor)
+
+    indices = list(range(len(dataset)))
+    np.random.seed(seed)
+    if num_batches is not None:
+        np.random.shuffle(indices)
+
+    batch_indices = [
+        indices[i : i + batch_size]
+        for i in range(0, len(indices) - batch_size + 1, batch_size)
+    ]
 
     batch_list = []
-    for batch_dict in iterate_batches(
-        vision_ds, batch_size, max_seq_length, **iter_kwargs,
-    ):
+    for bi in batch_indices:
+        items = [dataset[idx] for idx in bi]
+        batch_dict = _collate_vlm_batch(items, processor, max_seq_length, image_size)
         if response_mask_fn is not None:
             batch_dict = _apply_response_mask_to_vlm_batch(batch_dict, response_mask_fn)
         batch_list.append(batch_dict)
         if num_batches is not None and len(batch_list) >= num_batches:
             break
 
-    # Evaluate all tensors in the batch dicts
+    # Evaluate all tensors
     all_tensors = []
     for bd in batch_list:
         for v in bd.values():
@@ -870,34 +854,29 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
 def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   max_seq_length, seed=42,
                                   response_mask_fn=None):
-    """Streaming VLM batch generator.
+    """Streaming VLM batch generator using processor directly.
 
-    Wraps mlx_vlm's iterate_batches(train=True) as a generator.
-
-    Args:
-        response_mask_fn: Optional masking closure from train_on_responses_only.
-
-    Yields:
-        Batch dicts with input_ids, pixel_values, attention_mask,
-        and optionally labels.
+    Yields batch dicts with input_ids, pixel_values, attention_mask,
+    and optionally labels.
     """
-    try:
-        from mlx_vlm.trainer.sft_trainer import iterate_batches
-    except ImportError:
-        raise ImportError(
-            "Unsloth: mlx-vlm trainer is required for VLM training. "
-            "Install via: pip install mlx-vlm"
-        )
+    import numpy as np
 
-    vision_ds = _make_vision_dataset(dataset, config, processor)
-    iter_kwargs = _vlm_iter_kwargs(train=True, seed=seed)
+    image_size = _get_vlm_image_size(config, processor)
 
-    for batch_dict in iterate_batches(
-        vision_ds, batch_size, max_seq_length, **iter_kwargs,
-    ):
-        if response_mask_fn is not None:
-            batch_dict = _apply_response_mask_to_vlm_batch(batch_dict, response_mask_fn)
-        yield batch_dict
+    indices = list(range(len(dataset)))
+    batch_indices = [
+        indices[i : i + batch_size]
+        for i in range(0, len(indices) - batch_size + 1, batch_size)
+    ]
+
+    while True:
+        order = np.random.permutation(len(batch_indices))
+        for b in order:
+            items = [dataset[idx] for idx in batch_indices[b]]
+            batch_dict = _collate_vlm_batch(items, processor, max_seq_length, image_size)
+            if response_mask_fn is not None:
+                batch_dict = _apply_response_mask_to_vlm_batch(batch_dict, response_mask_fn)
+            yield batch_dict
 
 
 def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
