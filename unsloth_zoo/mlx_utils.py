@@ -703,9 +703,77 @@ def _detect_vlm_batch_api():
 
 
 def _make_vision_dataset(dataset, config, processor):
-    """Create a VisionDataset, adapting to the installed mlx-vlm API."""
+    """Create a VisionDataset, adapting to the installed mlx-vlm API.
+
+    Patches VisionDataset.process to always pass images to prepare_inputs.
+    mlx-vlm skips images for Gemma/Qwen/SmolVLM (use_embedded_images=True)
+    which causes pixel_values=None. The fix: always pass images so
+    prepare_inputs produces pixel_values for all model types.
+    """
     api = _detect_vlm_batch_api()
     from mlx_vlm.trainer.datasets import VisionDataset
+
+    # Patch: override use_embedded_images behavior
+    _orig_process = VisionDataset.process
+
+    def _patched_process(self, item):
+        from mlx_vlm.utils import prepare_inputs
+        from mlx_vlm.trainer.datasets import get_prompt
+        import warnings
+
+        images = item.get("images", item.get("image", []))
+        if not isinstance(images, list):
+            images = [images] if images else []
+
+        audio = item.get("audio", item.get("audios", []))
+        if not isinstance(audio, list):
+            audio = [audio] if audio else []
+
+        conversations = item.get("messages", item.get("conversations"))
+        model_type = self.config.get("model_type")
+
+        prompts = []
+        if isinstance(conversations, list) and isinstance(conversations[0], list):
+            for conversation in conversations:
+                prompt = get_prompt(model_type, self.processor, conversation)
+                prompts.append(prompt)
+        else:
+            prompt = get_prompt(model_type, self.processor, conversations)
+            prompts.append(prompt)
+
+        image_token_index = self.config.get("image_token_index") or self.config.get(
+            "image_token_id"
+        )
+        if not image_token_index:
+            raise ValueError(
+                "Config must contain 'image_token_index' or 'image_token_id'"
+            )
+
+        # Always pass images (fix for Gemma/Qwen use_embedded_images bug)
+        inputs = prepare_inputs(
+            processor=self.processor,
+            images=images if images else None,
+            audio=audio if audio else None,
+            prompts=prompts,
+            image_token_index=image_token_index,
+            resize_shape=self.image_resize_shape,
+        )
+
+        return {
+            "pixel_values": inputs.get("pixel_values"),
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs.get(
+                "attention_mask", mx.ones_like(inputs["input_ids"])
+            ),
+            **{
+                k: v
+                for k, v in inputs.items()
+                if k not in ["input_ids", "pixel_values", "attention_mask"]
+            },
+        }
+
+    VisionDataset.process = _patched_process
+
     if api["vds_config_second"]:
         return VisionDataset(dataset, config, processor)
     return VisionDataset(dataset, processor, config)
