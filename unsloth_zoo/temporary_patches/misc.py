@@ -511,39 +511,12 @@ TEMPORARY_PATCHES.append(patch_transformers_masks)
 
 
 def patch_sdpa_bool_causal_mask():
-    """Drop materialised bool causal masks before dispatching to SDPA.
+    """Fix unslothai/unsloth#4906: inf grad_norm on Qwen3.5 at seq_len > 65536.
 
-    Fixes unslothai/unsloth#4906 -- inf grad_norm on Qwen3.5 at seq_len > 65536.
-
-    When `patch_transformers_masks` (above) wraps `create_causal_mask` with
-    `torch.compile(dynamic=True)`, HF's `find_packed_sequence_indices` takes
-    the `is_tracing` branch and returns a non-None packed_sequence_mask even
-    for sequential positions. That sets `allow_is_causal_skip=False` inside
-    `create_causal_mask`, so `sdpa_mask` materialises a dense [1, 1, Q, K]
-    bool causal mask instead of returning None.
-
-    On builds that fall through to PyTorch SDPA's memory-efficient (Cutlass)
-    backend -- e.g. head_dim=256 models without flash-attn installed --
-    that backend with bf16 + a dense bool causal mask at seq_len > 65536
-    produces wrong forward outputs AND wrong gradients. The 65536 = 2**16
-    boundary matches a hard Cutlass int16 sequence-index limit.
-
-    Fix: wrap `sdpa_attention_forward` so that when the incoming
-    attention_mask is a plain lower-triangular 4D bool causal mask with
-    Q == K, we discard it and call SDPA with `attention_mask=None,
-    is_causal=True`. SDPA's native causal path does not hit the broken
-    backward kernel and is also faster.
-
-    For non-pure-causal bool masks at long sequence lengths (packed
-    sequences, sliding window), we convert bool -> float additive bias
-    to avoid the Cutlass bool-mask bug while preserving mask semantics.
-
-    Guardrails (all O(1) Python-level checks, no CUDA ops):
-      - module.is_causal must be True (protects BERT/bidirectional).
-      - sliding_window kwarg must be None (protects Gemma2/Mistral).
-      - 4D torch.bool with Q == K == query seq_len (not cross-attn).
-      - Two-cell spot-check: m[0,0,0,1]==False AND m[0,0,-1,0]==True
-        (pure causal vs packed/padded/custom masks).
+    Cutlass SDPA backward (no flash-attn, head_dim=256, bf16) returns garbage
+    gradients when fed a dense bool causal mask at seq_len >= 2**16. Drop pure
+    causal bool masks and call SDPA with is_causal=True; convert non-pure bool
+    masks to float additive bias to dodge the Cutlass bool-mask path.
     """
     if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
         return
@@ -574,8 +547,7 @@ def patch_sdpa_bool_causal_mask():
     ):
         m = attention_mask
 
-        # Resolve is_causal: explicit param takes priority, else module attr.
-        # Non-causal modules (BERT encoder, SigLIP) must keep their masks.
+        # Non-causal modules (BERT, SigLIP) keep their masks; explicit param wins.
         resolved_is_causal = (
             is_causal if is_causal is not None
             else getattr(module, "is_causal", True)
@@ -587,8 +559,7 @@ def patch_sdpa_bool_causal_mask():
                 **kwargs,
             )
 
-        # Sliding-window layers (Gemma2, Mistral, Qwen2/3) must keep their
-        # windowed masks -- do not replace with full causal.
+        # Sliding-window layers (Gemma2, Mistral, Qwen2/3) keep windowed masks.
         if kwargs.get("sliding_window", None) is not None:
             return _orig(
                 module, query, key, value, attention_mask,
@@ -596,7 +567,7 @@ def patch_sdpa_bool_causal_mask():
                 **kwargs,
             )
 
-        # Hybrid models (e.g. Qwen3.5) may pass a dict keyed by layer type.
+        # Hybrid models (Qwen3.5) may pass a dict keyed by layer type.
         if isinstance(m, dict):
             layer_type = getattr(module, "layer_type", None)
             if layer_type not in m:
@@ -607,8 +578,7 @@ def patch_sdpa_bool_causal_mask():
                 )
             m = m[layer_type]
 
-        # Only intercept 4D bool masks where Q == K == query seq_len
-        # (self-attention prefill, not cross-attention or kv-cache decode).
+        # Only intercept 4D bool self-attn masks (not cross-attn or kv-cache decode).
         if not (
             isinstance(m, torch.Tensor)
             and m.dtype == torch.bool
@@ -622,35 +592,27 @@ def patch_sdpa_bool_causal_mask():
                 **kwargs,
             )
 
-        # Spot-check: a pure lower-triangular causal mask has:
-        #   m[0,0,0,1]==False  (first query cannot see second key)
-        #   m[0,0,-1,0]==True  (last query can see first key)
-        # Packed-sequence masks fail the second check because the last
-        # segment's first query cannot see the first segment's first key.
-        # Padded masks may also fail if the first position is masked out.
-        # Two O(1) probes, no CUDA ops.
+        # Pure lower-triangular check via two O(1) probes: upper-tri is False
+        # and last row sees first col. Packed/padded masks fail the second.
         S = m.shape[-1]
         is_pure_causal = (
             (S < 2)
             or (
-                not m[0, 0, 0, 1].item()       # upper triangle is False
-                and m[0, 0, S - 1, 0].item()   # last row sees first col
+                not m[0, 0, 0, 1].item()
+                and m[0, 0, S - 1, 0].item()
             )
         )
 
         if is_pure_causal:
-            # Safe to drop the mask entirely -- native is_causal path avoids
-            # the Cutlass >65536 bug and is faster.
+            # Drop mask, use native is_causal path (avoids Cutlass >65536 bug, faster).
             return _orig(
                 module, query, key, value, None,
                 dropout = dropout, scaling = scaling, is_causal = True,
                 **kwargs,
             )
 
-        # Non-pure-causal bool mask (packed sequences, custom patterns).
-        # Convert bool -> float additive bias to avoid the Cutlass bool-mask
-        # bug while preserving mask semantics. SDPA dispatches to a different
-        # (working) kernel for float attn_mask inputs.
+        # Non-pure bool mask (packed sequences, custom patterns): convert to float
+        # additive bias so SDPA dispatches to the working (non-bool) kernel.
         m_float = torch.where(m, 0.0, torch.finfo(query.dtype).min).to(query.dtype)
         return _orig(
             module, query, key, value, m_float,
