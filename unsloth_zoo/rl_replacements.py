@@ -29,6 +29,13 @@ from .device_type import DEVICE_TYPE, device_synchronize
 from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()
 
+# Models whose fp16 hidden states can overflow in the RL logit matmul
+# (hidden_states @ lm_head). When matched, the matmul is upcasted to float32.
+LOGIT_MATMUL_UPCAST_MODELS = frozenset({
+    "gemma3", "gemma3n", "gemma3_text",
+    "gemma4", "gemma4_text",
+})
+
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def selective_log_softmax(logits, index):
@@ -679,14 +686,13 @@ def grpo_accumulated_loss(
     prev_max_left_pad    = kwargs.get("max_left_pad", 0) #Always get max_left_pad for when training LLMs, enabled by deafult.
 
     # Use float32 for the hidden_states @ lm_head matmul to prevent fp16 overflow.
-    # Auto-detected for known models; can also be forced via kwargs.
+    # Auto-detected for models in LOGIT_MATMUL_UPCAST_MODELS; can also be forced via kwargs.
     logit_matmul_upcast = kwargs.get("logit_matmul_upcast", False)
     if not logit_matmul_upcast:
         _cfg = getattr(trainer.model, "config", None)
         _mt = getattr(_cfg, "model_type", "")
         _text_mt = getattr(getattr(_cfg, "text_config", None), "model_type", "")
-        _upcast_models = {"gemma3", "gemma3n", "gemma3_text", "gemma4", "gemma4_text"}
-        if _mt in _upcast_models or _text_mt in _upcast_models:
+        if _mt in LOGIT_MATMUL_UPCAST_MODELS or _text_mt in LOGIT_MATMUL_UPCAST_MODELS:
             logit_matmul_upcast = True
 
     #Delete this from kwargs so less issues
