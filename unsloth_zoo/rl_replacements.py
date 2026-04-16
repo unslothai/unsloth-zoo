@@ -688,20 +688,6 @@ def grpo_accumulated_loss(
     logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
     prev_max_left_pad    = kwargs.get("max_left_pad", 0) #Always get max_left_pad for when training LLMs, enabled by deafult.
 
-    # Use float32 for the hidden_states @ lm_head matmul to prevent fp16 overflow.
-    # Only auto-enables when the model is actually running in fp16 (not bf16/fp32).
-    # Import inside function so the compiled trainer (which exec's this source) can resolve it.
-    from unsloth_zoo.rl_replacements import LOGIT_MATMUL_UPCAST_MODELS
-    logit_matmul_upcast = kwargs.get("logit_matmul_upcast", False)
-    if not logit_matmul_upcast:
-        _is_fp16 = getattr(trainer, "_autocast_dtype", None) == torch.float16
-        if _is_fp16:
-            _cfg = getattr(trainer.model, "config", None)
-            _mt = getattr(_cfg, "model_type", "")
-            _text_mt = getattr(getattr(_cfg, "text_config", None), "model_type", "")
-            if _mt in LOGIT_MATMUL_UPCAST_MODELS or _text_mt in LOGIT_MATMUL_UPCAST_MODELS:
-                logit_matmul_upcast = True
-
     #Delete this from kwargs so less issues
     _ = kwargs.pop("sampling_per_token_logps", None)
     kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap if sampling_per_token_logps is not None else None
@@ -720,6 +706,18 @@ def grpo_accumulated_loss(
         trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
         if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = None
     pass
+
+    # Use float32 for the hidden_states @ lm_head matmul to prevent fp16 overflow.
+    # Must be after _autocast_dtype init above so we can check the actual precision.
+    from unsloth_zoo.rl_replacements import LOGIT_MATMUL_UPCAST_MODELS
+    logit_matmul_upcast = kwargs.get("logit_matmul_upcast", False)
+    if not logit_matmul_upcast and trainer._autocast_dtype == torch.float16:
+        _cfg = getattr(trainer.model, "config", None)
+        _mt = getattr(_cfg, "model_type", "")
+        _text_mt = getattr(getattr(_cfg, "text_config", None), "model_type", "")
+        if _mt in LOGIT_MATMUL_UPCAST_MODELS or _text_mt in LOGIT_MATMUL_UPCAST_MODELS:
+            logit_matmul_upcast = True
+
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
     lm_head = trainer.model.get_output_embeddings().weight
