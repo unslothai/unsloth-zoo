@@ -804,11 +804,10 @@ def _merge_and_overwrite_lora(
             # maps to MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows and
             # rename(2) on POSIX, so the original shard is never absent if the
             # replacement fails.
-            from safetensors import SafetensorError
-
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if os.name == 'nt':
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             max_retries = 5
             base_delay  = 0.2  # seconds
@@ -817,23 +816,25 @@ def _merge_and_overwrite_lora(
             os.close(fd)
 
             try:
+                save_file(tensors, tmp_path)
+                # Preserve original file permissions (mkstemp creates 0o600)
+                try:
+                    original_mode = os.stat(filename_original).st_mode
+                    os.chmod(tmp_path, original_mode)
+                except OSError:
+                    pass
                 for attempt in range(max_retries):
                     try:
-                        save_file(tensors, tmp_path)
                         os.replace(tmp_path, filename_original)
                         tmp_path = None
                         break
-                    except (OSError, SafetensorError) as e:
+                    except (OSError, safetensors.SafetensorError) as e:
                         winerror  = getattr(e, "winerror", None)
-                        errno_    = getattr(e, "errno", None)
                         error_msg = str(e).lower()
                         is_lock_error = (
                             winerror in {5, 32, 1224}
-                            or errno_ in {5, 13, 32, 1224}
                             or "user-mapped" in error_msg
                             or "being used by another process" in error_msg
-                            or "access is denied" in error_msg
-                            or "cannot be performed" in error_msg
                         )
                         if is_lock_error and attempt < max_retries - 1:
                             delay = base_delay * (2 ** attempt)
@@ -843,7 +844,8 @@ def _merge_and_overwrite_lora(
                                     f"detected for {filename_original}: {e}. "
                                     f"Waiting {delay:.1f}s before retry..."
                                 )
-                            gc.collect()
+                            if os.name == 'nt':
+                                gc.collect()
                             time.sleep(delay)
                             continue
                         if is_lock_error:
