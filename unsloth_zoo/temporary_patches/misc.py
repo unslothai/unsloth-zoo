@@ -513,10 +513,11 @@ TEMPORARY_PATCHES.append(patch_transformers_masks)
 def patch_sdpa_bool_causal_mask():
     """Fix unslothai/unsloth#4906: inf grad_norm on Qwen3.5 at seq_len > 65536.
 
-    Cutlass SDPA backward (no flash-attn, head_dim=256, bf16) returns garbage
-    gradients when fed a dense bool causal mask at seq_len >= 2**16. Drop pure
-    causal bool masks and call SDPA with is_causal=True; convert non-pure bool
-    masks to float additive bias to dodge the Cutlass bool-mask path.
+    Upstream bug: pytorch/pytorch#162588. Cutlass SDPA returns garbage
+    gradients on bool causal masks at seq_len >= 2**16 (bf16, head_dim=256,
+    no flash-attn). Drop pure causal bool masks and call with is_causal=True;
+    convert non-pure bool masks to float additive bias. Below 2**16 we skip
+    the wrapper since the bug cannot fire.
     """
     if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
         return
@@ -547,22 +548,12 @@ def patch_sdpa_bool_causal_mask():
     ):
         m = attention_mask
 
-        # Fast path: below the Cutlass 2**16 sequence index overflow, the
-        # original SDPA bool mask path is correct and cheaper than what this
-        # patch would otherwise do. Drop out of the wrapper entirely so
-        # short / medium context training does not pay any cost.
-        #
-        # Even the pure causal rewrite (attention_mask=None, is_causal=True)
-        # can pick a different SDPA backend than the bool mask path and
-        # increase reserved VRAM. On Gemma4-31B LoRA SFT at seq_len up to
-        # 8192, the wrapper adds about 2.5 GB of reserved VRAM vs the
-        # original code. Gate on both the query seq_len and, if present, the
-        # mask's last dim so both self attention and cross attention clear
-        # the check.
+        # Below 2**16 the Cutlass bool-mask overflow cannot fire
+        # (pytorch/pytorch#162588), so skip the wrapper. The pure-causal
+        # rewrite picks a heavier SDPA backend and costs ~2.5 GB on
+        # Gemma4-31B LoRA SFT (8192 seq_len).
         _q_len = query.shape[2] if query.dim() >= 3 else 0
-        _mask_key_len = (
-            m.shape[-1] if isinstance(m, torch.Tensor) and m.dim() >= 1 else 0
-        )
+        _mask_key_len = m.shape[-1] if isinstance(m, torch.Tensor) and m.dim() >= 1 else 0
         if _q_len < 65536 and _mask_key_len < 65536:
             return _orig(
                 module, query, key, value, attention_mask,
