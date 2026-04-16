@@ -678,13 +678,16 @@ def grpo_accumulated_loss(
     logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
     prev_max_left_pad    = kwargs.get("max_left_pad", 0) #Always get max_left_pad for when training LLMs, enabled by deafult.
 
-    # Use float32 for the hidden_states @ lm_head matmul when the env var is set.
-    # UNSLOTH_FORCE_LOGIT_UPCAST is set by unsloth/models/loader.py for models
-    # whose fp16 hidden states can overflow (e.g. Gemma-4).
-    # Can also be forced via kwargs["logit_matmul_upcast"] = True.
+    # Use float32 for the hidden_states @ lm_head matmul to prevent fp16 overflow.
+    # Auto-detected for known models; can also be forced via kwargs.
     logit_matmul_upcast = kwargs.get("logit_matmul_upcast", False)
     if not logit_matmul_upcast:
-        logit_matmul_upcast = os.environ.get("UNSLOTH_FORCE_LOGIT_UPCAST", "0") == "1"
+        _cfg = getattr(trainer.model, "config", None)
+        _mt = getattr(_cfg, "model_type", "")
+        _text_mt = getattr(getattr(_cfg, "text_config", None), "model_type", "")
+        _upcast_models = {"gemma3", "gemma3n", "gemma3_text", "gemma4", "gemma4_text"}
+        if _mt in _upcast_models or _text_mt in _upcast_models:
+            logit_matmul_upcast = True
 
     #Delete this from kwargs so less issues
     _ = kwargs.pop("sampling_per_token_logps", None)
