@@ -91,15 +91,19 @@ def chunked_hidden_states_selective_log_softmax(
     chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
     chunked_index = torch.chunk(flat_index, chunks=chunks, dim=0)
 
+    # Hoist the transpose (and optional fp32 cast) outside the chunk loop
+    if logit_matmul_upcast:
+        lm_head_t = lm_head.float().t()
+    else:
+        lm_head_t = lm_head.t()
+
     all_per_token_logps = []
 
     for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index):
-        # logit_matmul_upcast: use float32 for the logit matmul to prevent
-        # fp16 overflow on models like Gemma-4 whose hidden states can be large.
         if logit_matmul_upcast:
-            chunk_logits = chunk_hidden_states.float() @ lm_head.float().t()
+            chunk_logits = chunk_hidden_states.float() @ lm_head_t
         else:
-            chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
+            chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head_t
 
         if logit_scale_multiply != 0.0:
             chunk_logits = chunk_logits * logit_scale_multiply
@@ -685,16 +689,18 @@ def grpo_accumulated_loss(
     prev_max_left_pad    = kwargs.get("max_left_pad", 0) #Always get max_left_pad for when training LLMs, enabled by deafult.
 
     # Use float32 for the hidden_states @ lm_head matmul to prevent fp16 overflow.
-    # Auto-detected for models in LOGIT_MATMUL_UPCAST_MODELS; can also be forced via kwargs.
+    # Only auto-enables when the model is actually running in fp16 (not bf16/fp32).
     # Import inside function so the compiled trainer (which exec's this source) can resolve it.
     from unsloth_zoo.rl_replacements import LOGIT_MATMUL_UPCAST_MODELS
     logit_matmul_upcast = kwargs.get("logit_matmul_upcast", False)
     if not logit_matmul_upcast:
-        _cfg = getattr(trainer.model, "config", None)
-        _mt = getattr(_cfg, "model_type", "")
-        _text_mt = getattr(getattr(_cfg, "text_config", None), "model_type", "")
-        if _mt in LOGIT_MATMUL_UPCAST_MODELS or _text_mt in LOGIT_MATMUL_UPCAST_MODELS:
-            logit_matmul_upcast = True
+        _is_fp16 = getattr(trainer, "_autocast_dtype", None) == torch.float16
+        if _is_fp16:
+            _cfg = getattr(trainer.model, "config", None)
+            _mt = getattr(_cfg, "model_type", "")
+            _text_mt = getattr(getattr(_cfg, "text_config", None), "model_type", "")
+            if _mt in LOGIT_MATMUL_UPCAST_MODELS or _text_mt in LOGIT_MATMUL_UPCAST_MODELS:
+                logit_matmul_upcast = True
 
     #Delete this from kwargs so less issues
     _ = kwargs.pop("sampling_per_token_logps", None)
