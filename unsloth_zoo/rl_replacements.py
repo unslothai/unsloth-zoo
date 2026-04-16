@@ -687,6 +687,8 @@ def grpo_accumulated_loss(
 
     # Use float32 for the hidden_states @ lm_head matmul to prevent fp16 overflow.
     # Auto-detected for models in LOGIT_MATMUL_UPCAST_MODELS; can also be forced via kwargs.
+    # Import inside function so the compiled trainer (which exec's this source) can resolve it.
+    from unsloth_zoo.rl_replacements import LOGIT_MATMUL_UPCAST_MODELS
     logit_matmul_upcast = kwargs.get("logit_matmul_upcast", False)
     if not logit_matmul_upcast:
         _cfg = getattr(trainer.model, "config", None)
