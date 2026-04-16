@@ -793,87 +793,105 @@ def _merge_and_overwrite_lora(
                     else:
                         tensors[key] = f.get_tensor(key)
 
-            # Fix for Windows file locking (WinError 1224: "cannot be performed
-            # on a file with a user-mapped section open"). Root cause: the
-            # safe_open block above memory-maps filename_original via the Rust
-            # safetensors backend, and on Windows the MapViewOfFile section
-            # release can lag after __exit__, so a following save_file that
-            # re-opens the same path for writing can hit WinError 1224. Force a
-            # collect once to drop the lingering mmap, then write to a sibling
-            # temp file and atomically swap it in with os.replace. os.replace
-            # maps to MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows and
-            # rename(2) on POSIX, so the original shard is never absent if the
-            # replacement fails.
-            if os.name == 'nt':
+            # Fix for Windows file locking (WinError 1224). On POSIX,
+            # save_file directly -- no temp-file dance needed (preserves
+            # symlinks, hardlinks, and avoids extra disk usage).
+            if os.name != "nt":
+                save_file(tensors, filename_original)
+                del tensors
+            else:
+                # Windows: atomic temp-file + os.replace with retry.
+                # The safe_open block above memory-maps filename_original
+                # via the Rust safetensors backend, and on Windows the
+                # MapViewOfFile section release can lag after __exit__,
+                # so a following save_file that re-opens the same path
+                # for writing can hit WinError 1224.
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-            max_retries = 5
-            base_delay  = 0.2  # seconds
-            temp_dir    = os.path.dirname(os.path.abspath(filename_original))
-            fd, tmp_path = tempfile.mkstemp(dir=temp_dir, suffix=".safetensors.tmp")
-            os.close(fd)
-
-            try:
-                save_file(tensors, tmp_path)
-                # Preserve original file permissions (mkstemp creates 0o600)
+                max_retries = 5
+                base_delay  = 0.2  # seconds
+                temp_dir    = os.path.dirname(os.path.abspath(filename_original))
                 try:
                     original_mode = os.stat(filename_original).st_mode
-                    os.chmod(tmp_path, original_mode)
                 except OSError:
-                    pass
-                for attempt in range(max_retries):
-                    try:
-                        os.replace(tmp_path, filename_original)
-                        tmp_path = None
-                        break
-                    except (OSError, safetensors.SafetensorError) as e:
-                        winerror  = getattr(e, "winerror", None)
-                        error_msg = str(e).lower()
-                        is_lock_error = (
-                            winerror in {5, 32, 1224}
-                            or "user-mapped" in error_msg
-                            or "being used by another process" in error_msg
-                        )
-                        if is_lock_error and attempt < max_retries - 1:
-                            delay = base_delay * (2 ** attempt)
-                            if UNSLOTH_ENABLE_LOGGING:
-                                logger.warning(
-                                    f"[Retry {attempt + 1}/{max_retries}] Windows file lock "
-                                    f"detected for {filename_original}: {e}. "
-                                    f"Waiting {delay:.1f}s before retry..."
-                                )
-                            if os.name == 'nt':
-                                gc.collect()
-                            time.sleep(delay)
-                            continue
-                        if is_lock_error:
-                            raise RuntimeError(
-                                f"Failed to rewrite {filename_original} after {max_retries} "
-                                f"attempts due to Windows file lock. Original shard is intact "
-                                f"(atomic replace never committed). "
-                                f"Solutions: 1) Restart Unsloth Studio 2) Disable antivirus "
-                                f"3) Close File Explorer windows"
-                            ) from e
-                        raise RuntimeError(
-                            f"Model merge failed while rewriting {filename_original}: {e}"
-                        ) from e
-            finally:
-                if tmp_path is not None and os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
+                    original_mode = None
 
-            del tensors
+                fd, tmp_path = tempfile.mkstemp(dir=temp_dir, suffix=".safetensors.tmp")
+                os.close(fd)
+
+                try:
+                    save_file(tensors, tmp_path)
+                    if original_mode is not None:
+                        try:
+                            os.chmod(tmp_path, original_mode)
+                        except OSError:
+                            pass
+
+                    # Release mmap-backed tensor refs before replacing source shard
+                    del tensors
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    for attempt in range(max_retries):
+                        try:
+                            os.replace(tmp_path, filename_original)
+                            tmp_path = None
+                            break
+                        except OSError as e:
+                            winerror  = getattr(e, "winerror", None)
+                            error_msg = str(e).lower()
+                            is_lock_error = (
+                                winerror in {32, 1224}
+                                or (
+                                    winerror == 5 and (
+                                        "user-mapped" in error_msg
+                                        or "being used by another process" in error_msg
+                                        or "sharing violation" in error_msg
+                                    )
+                                )
+                                or "user-mapped" in error_msg
+                                or "being used by another process" in error_msg
+                            )
+                            if is_lock_error and attempt < max_retries - 1:
+                                delay = base_delay * (2 ** attempt)
+                                if UNSLOTH_ENABLE_LOGGING:
+                                    logger.warning(
+                                        f"[Retry {attempt + 1}/{max_retries}] Windows file lock "
+                                        f"detected for {filename_original}: {e}. "
+                                        f"Waiting {delay:.1f}s before retry..."
+                                    )
+                                gc.collect()
+                                time.sleep(delay)
+                                continue
+                            if is_lock_error:
+                                raise RuntimeError(
+                                    f"Failed to rewrite {filename_original} after {max_retries} "
+                                    f"attempts due to Windows file lock. Original shard is intact "
+                                    f"(atomic replace never committed). "
+                                    f"Solutions: 1) Restart Unsloth Studio 2) Disable antivirus "
+                                    f"3) Close File Explorer windows"
+                                ) from e
+                            raise RuntimeError(
+                                f"Model merge failed while rewriting {filename_original}: {e}"
+                            ) from e
+                finally:
+                    if tmp_path is not None and os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return count, safetensor_keys_seen
 
+    except RuntimeError:
+        raise
     except Exception as e:
-        raise RuntimeError(f"Model merge failed with error: {e}")
+        raise RuntimeError(f"Model merge failed with error: {e}") from e
 
     finally:
         # Cleanup memory mapping
