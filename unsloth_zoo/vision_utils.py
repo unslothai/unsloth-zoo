@@ -660,6 +660,7 @@ class UnslothVisionDataCollator:
         pad_to_multiple_of = None,
         resize_dimension = 0, # can be 0, 1, 'max' or 'min' (max resizes based on the max of height width, min the min size, 0 the first dim, etc)
         snap_to_patch_size = False,
+        last_response_only = False, # Train only on the last assistant turn
     ):
         if not hasattr(processor, "image_processor"):
             raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
@@ -733,12 +734,13 @@ class UnslothVisionDataCollator:
             assert(isinstance(instruction_part, str) and isinstance(response_part, str))
             self.train_on_responses_only = _train_on_responses_only(
                 None,
-                instruction_part = instruction_part,
-                response_part    = response_part,
-                force_match      = force_match,
-                tokenizer        = processor,
-                return_function  = True,
-                num_proc         = num_proc,
+                instruction_part   = instruction_part,
+                response_part      = response_part,
+                force_match        = force_match,
+                tokenizer          = processor,
+                return_function    = True,
+                num_proc           = num_proc,
+                last_response_only = last_response_only,
             )
         else:
             self.train_on_responses_only = None
