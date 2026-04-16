@@ -82,7 +82,7 @@ class MLXTrainingConfig:
     # Optimization
     optim: str = "adafactor"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
     weight_decay: float = 0.01
-    max_grad_norm: float = 1.0  # matches HuggingFace TrainingArguments default
+    max_grad_norm: float = 0.0  # 0 = disabled (default); > 0 runs optim.clip_grad_norm
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
     embedding_learning_rate: float = 0.0  # 0 = disabled, 5e-5 = recommended
