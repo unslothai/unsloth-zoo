@@ -29,6 +29,7 @@ from .device_type import DEVICE_TYPE, device_synchronize
 from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()
 
+
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def selective_log_softmax(logits, index):
@@ -76,6 +77,7 @@ def chunked_hidden_states_selective_log_softmax(
     logit_scale_divide: float = 0.0,
     logit_softcapping: float = 0.0,
     temperature: float = 1.0,
+    logit_matmul_upcast: bool = False,
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -87,7 +89,10 @@ def chunked_hidden_states_selective_log_softmax(
     all_per_token_logps = []
 
     for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index):
-        chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
+        if logit_matmul_upcast:
+            chunk_logits = chunk_hidden_states.float() @ lm_head.float().t()
+        else:
+            chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
 
         if logit_scale_multiply != 0.0:
             chunk_logits = chunk_logits * logit_scale_multiply
@@ -690,6 +695,16 @@ def grpo_accumulated_loss(
         trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
         if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = None
     pass
+
+    # Use float32 for the hidden_states @ lm_head matmul to prevent fp16 overflow.
+    logit_matmul_upcast = kwargs.get("logit_matmul_upcast", False)
+    if not logit_matmul_upcast and trainer._autocast_dtype == torch.float16:
+        _cfg = getattr(trainer.model, "config", None)
+        _mt = getattr(_cfg, "model_type", "")
+        _text_mt = getattr(getattr(_cfg, "text_config", None), "model_type", "")
+        if _mt.startswith(("gemma4",)) or _text_mt.startswith(("gemma4",)):
+            logit_matmul_upcast = True
+
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
     lm_head = trainer.model.get_output_embeddings().weight
@@ -855,7 +870,7 @@ def grpo_accumulated_loss(
         @staticmethod
         def forward(ctx, hidden_states, lm_head, index, chunks,
                     logit_scale_multiply, logit_scale_divide,
-                    logit_softcapping, temperature):
+                    logit_softcapping, temperature, logit_matmul_upcast):
             #Only the activations are needed so if we keep entire computational graph, keeps unnecessary memory on CPU so we detach it
             ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True)
             ctx.device = hidden_states.device
@@ -864,7 +879,7 @@ def grpo_accumulated_loss(
             ctx.lm_head = lm_head
             ctx.lm_head_requires_grad = lm_head.requires_grad
             ctx.index = index
-            ctx.args = (chunks, logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature)
+            ctx.args = (chunks, logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature, logit_matmul_upcast)
 
             with torch.no_grad():
                 output = chunked_hidden_states_selective_log_softmax(
@@ -904,11 +919,13 @@ def grpo_accumulated_loss(
                 None,
                 None,
                 None,
+                None,
             )
 
     def efficient_log_softmax(hidden_states, lm_head, index, chunks=32,
                             logit_scale_multiply=0.0, logit_scale_divide=0.0,
-                            logit_softcapping=0.0, temperature=1, batch_size=8):
+                            logit_softcapping=0.0, temperature=1, batch_size=8,
+                            logit_matmul_upcast=False):
         if (index.shape[1] <= 1024 and batch_size <= 8) or batch_size==1:
             #We save a gigabyte or speed with the normal path under these specific conditions
             return chunked_hidden_states_selective_log_softmax(
@@ -919,13 +936,14 @@ def grpo_accumulated_loss(
                 logit_scale_multiply,
                 logit_scale_divide,
                 logit_softcapping,
-                temperature
+                temperature,
+                logit_matmul_upcast,
             )
         else:
             return Unsloth_Offloaded_Log_Softmax.apply(
                 hidden_states, lm_head, index, chunks,
                 logit_scale_multiply, logit_scale_divide,
-                logit_softcapping, temperature
+                logit_softcapping, temperature, logit_matmul_upcast
             )
 
 
@@ -968,7 +986,8 @@ def grpo_accumulated_loss(
                         logit_scale_divide=logit_scale_divide,
                         logit_softcapping=logit_softcapping,
                         temperature=temperature,
-                        batch_size = B
+                        batch_size = B,
+                        logit_matmul_upcast=logit_matmul_upcast,
                     )
                 else:
                     new_hidden_states_chunk = unwrapped_model(
