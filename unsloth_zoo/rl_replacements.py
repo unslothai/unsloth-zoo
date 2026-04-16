@@ -32,7 +32,6 @@ RL_REPLACEMENTS = dict()
 # Models whose fp16 hidden states can overflow in the RL logit matmul
 # (hidden_states @ lm_head). When matched, the matmul is upcasted to float32.
 LOGIT_MATMUL_UPCAST_MODELS = frozenset({
-    "gemma3", "gemma3n", "gemma3_text",
     "gemma4", "gemma4_text",
 })
 
