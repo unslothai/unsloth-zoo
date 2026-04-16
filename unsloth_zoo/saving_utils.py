@@ -793,19 +793,12 @@ def _merge_and_overwrite_lora(
                     else:
                         tensors[key] = f.get_tensor(key)
 
-            # Fix for Windows file locking (WinError 1224). On POSIX,
-            # save_file directly -- no temp-file dance needed (preserves
-            # symlinks, hardlinks, and avoids extra disk usage).
+            # POSIX: direct save. Windows: temp-file + os.replace to
+            # avoid WinError 1224 (mmap section release can lag).
             if os.name != "nt":
                 save_file(tensors, filename_original)
                 del tensors
             else:
-                # Windows: atomic temp-file + os.replace with retry.
-                # The safe_open block above memory-maps filename_original
-                # via the Rust safetensors backend, and on Windows the
-                # MapViewOfFile section release can lag after __exit__,
-                # so a following save_file that re-opens the same path
-                # for writing can hit WinError 1224.
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -829,7 +822,7 @@ def _merge_and_overwrite_lora(
                         except OSError:
                             pass
 
-                    # Release mmap-backed tensor refs before replacing source shard
+                    # Drop mmap refs before os.replace
                     del tensors
                     gc.collect()
                     if torch.cuda.is_available():
