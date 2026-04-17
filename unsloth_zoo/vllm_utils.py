@@ -1781,6 +1781,7 @@ def load_vllm(
 
     if is_vision_model and getattr(config, "model_type", None) == "gemma4":
         patch_gemma4_vllm_lora_support()
+        patch_gemma4_vllm_k_eq_v_support()
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.

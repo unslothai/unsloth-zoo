@@ -19,6 +19,7 @@ __all__ = [
     "set_additional_modules",
     "finalize_huggingface_model",
     "patch_gemma4_vllm_lora_support",
+    "patch_gemma4_vllm_k_eq_v_support",
     "extract_gdn_layers",
     "extract_vision_layers",
     "get_model_layer_config",
@@ -351,6 +352,51 @@ def patch_gemma4_vllm_lora_support():
         patched_create_lora_manager._unsloth_gemma4_patch = True
         vllm_lora_model_manager.create_lora_manager = patched_create_lora_manager
         vllm_lora_worker_manager.create_lora_manager = patched_create_lora_manager
+
+# vLLM load seems to be failing at least with 0.19.0
+# due to the diff b/w sepearate kv and shared kv like gemma4
+# This is to address that issue :)
+def patch_gemma4_vllm_k_eq_v_support():
+    from vllm.model_executor.models.gemma4 import Gemma4Attention
+
+    if hasattr(Gemma4Attention.forward, "_unsloth_gemma4_k_eq_v_patch"):
+        return
+
+    original_forward = Gemma4Attention.forward
+
+    def patched_forward(self, positions, hidden_states, **kwargs):
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        if self.use_k_eq_v and qkv.shape[-1] == (self.q_size + self.kv_size):
+            q, k = qkv.split([self.q_size, self.kv_size], dim = -1)
+            # Gemma4 full-attention k_eq_v layers reuse K as the pre-norm V input.
+            v = k
+        else:
+            return original_forward(self, positions, hidden_states, **kwargs)
+
+        q = q.unflatten(-1, (self.num_heads, self.head_dim))
+        q = self.q_norm(q)
+        q = q.flatten(-2, -1)
+
+        if not self.is_kv_shared_layer:
+            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            k = self.k_norm(k)
+            k = k.flatten(-2, -1)
+            q, k = self.rotary_emb(positions, q, k)
+
+            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            v = self.v_norm(v)
+            v = v.flatten(-2, -1)
+        else:
+            q = self.rotary_emb(positions, q, k)[0]
+
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    patched_forward._unsloth_gemma4_k_eq_v_patch = True
+    Gemma4Attention.forward = patched_forward
+pass
 pass
 
 
