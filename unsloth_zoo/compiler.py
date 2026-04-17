@@ -1138,6 +1138,8 @@ def create_standalone_class(
         "use_kernel_forward_from_hub",
         "use_kernelized_func",
         "auto_docstring",
+        "merge_with_config_defaults",
+        "capture_outputs",
         # add more here if needed
     }
 
@@ -1281,8 +1283,9 @@ def create_standalone_class(
 
     # Pattern handles both simple signatures and those with return type annotations
     # e.g., "def forward(self, x):" AND "def forward(self, x) -> torch.Tensor:"
+    # Use \s+ after def to avoid matching decorator names that start with "def" (e.g. "default_...")
     definition_matches = re.findall(
-        r"[\s\n]{0,}def[^\(]{1,}\([^)]*\)(?:\s*->\s*[^:]+)?\s*\:",
+        r"[\s\n]{0,}def\s+[^\(]{1,}\([^)]*\)(?:\s*->\s*[^:]+)?\s*\:",
         definition_source,
         flags=re.MULTILINE | re.DOTALL,
     )
@@ -1333,6 +1336,9 @@ def create_standalone_class(
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    # Transformers 5.x decorators on forward methods
+    source = re.sub(r"@merge_with_config_defaults[\s]{0,}(\([^\)]{0,}\))?", "", source)
+    source = re.sub(r"@capture_outputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
     # source = source.replace("@auto_docstring", "")
 
     # Fix Gemma 3 ignore_index being not set!
@@ -1772,7 +1778,8 @@ def apply_fused_lm_head(forward, module=None):
                 r"self\.config\.vocab_size|"
                 r"self\.vocab_size|"
                 r"self\.config\.vocab_size|"
-                r"self\.config\.text_config\.vocab_size"
+                r"self\.config\.text_config\.vocab_size|"
+                r"self\.config\.get_text_config\(\)\.vocab_size"
                 ")",
             )
             .replace("$KWARGS$", r"(?:, \*\*(loss_kwargs|kwargs))?")
@@ -2762,6 +2769,24 @@ def fixup_fused_lm_head(source):
         "logits = logits * self.config.get_text_config().final_logit_softcapping",
     )
     # END Gemma 3N fixes
+
+    # Gemma 4: normalize flat_logits/flat_labels to shift_logits/shift_labels
+    # and split chained .view(-1).to(...) into separate lines so pattern 3 matches.
+    source = source.replace(
+        "flat_logits = shift_logits.view(-1,",
+        "shift_logits = shift_logits.view(-1,",
+    )
+    source = re.sub(
+        r"([ \t]+)flat_labels = shift_labels\.view\(-1\)\.to\(([^\)]+)\)",
+        r"\1shift_labels = shift_labels.view(-1)\n\1shift_labels = shift_labels.to(\2)",
+        source,
+    )
+    source = source.replace(
+        "loss = loss_fct(flat_logits, flat_labels)",
+        "loss = loss_fct(shift_logits, shift_labels)",
+    )
+    # END Gemma 4 fixes
+
     return source
 
 
@@ -3019,6 +3044,8 @@ DISABLE_COMPILE_MODULES = [
     "GptOssMLP",
     "GptOssExperts",
     "Gemma3nTextModel",
+    "Gemma4TextMoEBlock",  # Old transformers name
+    "Gemma4TextExperts",   # New transformers name (5.5+)
     "Glm4MoeLiteNaiveMoe",
     "Qwen3NextGatedDeltaNet",
     "GatedDeltaNet",
@@ -3637,7 +3664,7 @@ def unsloth_compile_transformers(
     # Remove causal masks
     do_not_remove = False
     for module in remove_causal_masks:
-        if module.endswith(("ForConditionalGeneration", "Gemma3Model")):
+        if module.endswith(("ForConditionalGeneration", "Gemma3Model", "Gemma4Model")):
             do_not_remove = True
             print(
                 f"Unsloth: Will not remove causal mask for {model_location} since it's a VLM!"
@@ -4004,6 +4031,21 @@ def unsloth_compile_transformers(
 
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
+
+            # Fix dict-based attention masks for gpt_oss (transformers 5.x).
+            # In v5, create_masks_for_generate returns a dict of masks keyed by
+            # layer pattern instead of a single tensor.
+            if "attn_weights = attn_weights + attention_mask" in source and "module" in source:
+                source = re.sub(
+                    r"(\s+)(if attention_mask is not None:\s*\n\s+attn_weights = attn_weights \+ attention_mask)",
+                    r"\1if attention_mask is not None:\n"
+                    r"\1    if isinstance(attention_mask, dict):\n"
+                    r"\1        attention_mask = attention_mask.get(getattr(module, 'layer_type', None), None)\n"
+                    r"\1    if attention_mask is not None:\n"
+                    r"\1        attn_weights = attn_weights + attention_mask",
+                    source,
+                    flags=re.MULTILINE,
+                )
 
             # Check erroring out
             bad = False

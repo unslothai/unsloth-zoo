@@ -959,6 +959,8 @@ def forward_native_grouped_mm(
         up = up.clamp(min=-limit, max=limit)
         glu = gate * torch.sigmoid(gate * alpha)
         inter = (up + 1.0) * glu
+    elif hasattr(self, 'act_fn') and callable(self.act_fn):
+        inter = self.act_fn(gate) * up
     else:
         inter = F.silu(gate) * up
 
@@ -1183,10 +1185,12 @@ def forward_triton_grouped_gemm(
         is_first_gemm=True,
     )
 
-    # Apply SiLU activation and multiply gate with up
-    intermediate = _silu_and_mul(first_gemm_output)
-
-    # Grouped GEMM 2: down projection
+    # Apply activation and multiply gate with up
+    if hasattr(self, 'act_fn') and callable(self.act_fn):
+        gate, up = first_gemm_output.chunk(2, dim=-1)
+        intermediate = self.act_fn(gate) * up
+    else:
+        intermediate = _silu_and_mul(first_gemm_output)
 
     # Grouped GEMM 2: down projection
     # Prepare LoRA data
@@ -1242,9 +1246,8 @@ def forward_triton_grouped_gemm(
         second_gemm_output = second_gemm_output + lora_delta
 
     # Apply routing weights and sum across top_k experts
-    # Output shape: (num_tokens, top_k, hidden_dim) -> (num_tokens, hidden_dim)
-    # Ensure top_k_weights matches dtype (can be float32 from softmax)
     top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
+    # Output shape: (num_tokens, top_k, hidden_dim) -> (num_tokens, hidden_dim)
     final_hidden_states = (
         second_gemm_output.view(num_tokens, top_k, hidden_dim)
         * top_k_weights_casted[..., None]

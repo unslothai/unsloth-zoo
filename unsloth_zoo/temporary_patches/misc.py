@@ -70,8 +70,8 @@ def patch_tokenizer_convert_added_tokens():
 
     @classmethod
     def patched_convert_added_tokens(cls, obj, save=False, add_type_field=True):
-        # Handle dicts with "content" key that don't have "__type" field
-        if isinstance(obj, dict) and "content" in obj and "__type" not in obj:
+        # Only convert if "content" is a string (AddedToken expects str), not a nested dict
+        if isinstance(obj, dict) and "content" in obj and "__type" not in obj and isinstance(obj["content"], str):
             return AddedToken(**obj)
         return original_convert_added_tokens.__func__(cls, obj, save=save, add_type_field=add_type_field)
 
@@ -163,9 +163,7 @@ def patch_CsmDepthDecoderForCausalLM_forward():
     except Exception as e:
         return raise_error("CsmDepthDecoderForCausalLM.forward", e)
 
-    # Inspect the target function signature to decide which version to use
-    target_forward = transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM.forward
-    has_output_attentions = "output_attentions" in inspect.signature(target_forward).parameters
+    target_cls = transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM
 
     def forward(
         self,
@@ -233,33 +231,12 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         })
     pass
 
-    if has_output_attentions:
-        patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward, match_level="relaxed")
-    else:
-        # New transformers removes output_attentions and output_hidden_states
-        old_forward = forward
-        def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            backbone_last_hidden_state: Optional[torch.FloatTensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            # output_attentions: Optional[bool] = None,
-            # output_hidden_states: Optional[bool] = None,
-            cache_position: Optional[torch.LongTensor] = None,
-            logits_to_keep: Union[int, torch.Tensor] = 0,
-            **kwargs: KWARGS_TYPE,
-        ) -> Union[Tuple, CausalLMOutputWithPast]:
-            new_kwargs = locals().copy()
-            new_kwargs.pop('old_forward', None)
-            kwargs = new_kwargs.pop('kwargs', dict())
-            new_kwargs.update(kwargs)
-            return old_forward(**new_kwargs)
-        patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward, match_level="relaxed")
+    # Wrap with (self, *args, **kwargs) so check_args_kwargs accepts any
+    # removed params (output_attentions, output_hidden_states, cache_position)
+    _full_forward = forward
+    def forward(self, *args, **kwargs):
+        return _full_forward(self, *args, **kwargs)
+    patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
 
@@ -272,9 +249,7 @@ def patch_CsmForConditionalGeneration_forward():
     except Exception as e:
         return raise_error("CsmForConditionalGeneration.forward", e)
 
-    # Inspect the target function signature to decide which version to use
-    target_forward = transformers.models.csm.modeling_csm.CsmForConditionalGeneration.forward
-    has_output_attentions = "output_attentions" in inspect.signature(target_forward).parameters
+    target_cls = transformers.models.csm.modeling_csm.CsmForConditionalGeneration
 
     def forward(
         self,
@@ -392,34 +367,10 @@ def patch_CsmForConditionalGeneration_forward():
         })
     pass
 
-    if has_output_attentions:
-        patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward, match_level="relaxed")
-    else:
-        # New transformers removes output_attentions and output_hidden_states
-        old_forward = forward
-        def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            input_values: Optional[torch.Tensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            input_values_cutoffs: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            # output_attentions: Optional[bool] = None,
-            # output_hidden_states: Optional[bool] = None,
-            cache_position: Optional[torch.LongTensor] = None,
-            logits_to_keep: Union[int, torch.Tensor] = 0,
-            **kwargs: KWARGS_TYPE,
-        ) -> Union[Tuple, CsmOutputWithPast]:
-            new_kwargs = locals().copy()
-            new_kwargs.pop('old_forward', None)
-            kwargs = new_kwargs.pop('kwargs', dict())
-            new_kwargs.update(kwargs)
-            return old_forward(**new_kwargs)
-        patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward, match_level="relaxed")
+    _full_forward = forward
+    def forward(self, *args, **kwargs):
+        return _full_forward(self, *args, **kwargs)
+    patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
 
@@ -494,9 +445,200 @@ def patch_transformers_masks():
     masking_utils.create_sliding_window_causal_mask = wrap(compiled_create_sliding_window_causal_mask)
     masking_utils.create_masks_for_generate = wrap(masking_utils.create_masks_for_generate)
     generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
+    # Multi-GPU device_map flex_attention fix: cache_position[0] returns a
+    # 0-dim tensor on one device, but inner_mask may run on another device.
+    # Move offset tensors to the executing device inside the closure instead of
+    # using .item(), which would cause a graph break under torch.compile tracing.
+    if hasattr(masking_utils, "add_offsets_to_mask_function"):
+        _original_add_offsets = getattr(
+            masking_utils,
+            "_unsloth_original_add_offsets_to_mask_function",
+            masking_utils.add_offsets_to_mask_function,
+        )
+        masking_utils._unsloth_original_add_offsets_to_mask_function = _original_add_offsets
+        def add_offsets_wrapper(mask_function, q_offset, kv_offset):
+            _q_is_tensor = isinstance(q_offset, torch.Tensor)
+            _kv_is_tensor = isinstance(kv_offset, torch.Tensor)
+            def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
+                _q_off = q_offset.to(getattr(q_idx, "device", q_offset.device), non_blocking=True) if _q_is_tensor else q_offset
+                _kv_off = kv_offset.to(getattr(kv_idx, "device", kv_offset.device), non_blocking=True) if _kv_is_tensor else kv_offset
+                return mask_function(batch_idx, head_idx, q_idx + _q_off, kv_idx + _kv_off)
+            return inner_mask
+        masking_utils.add_offsets_to_mask_function = add_offsets_wrapper
+
+    # Fix padding/packed mask functions for multi-GPU: captured tensors may be
+    # on a different device than the indices passed during flex_attention vmap.
+    # Cache per-device copies to avoid repeated cross-device transfers.
+    if hasattr(masking_utils, "padding_mask_function"):
+        masking_utils._unsloth_original_padding_mask_function = getattr(
+            masking_utils,
+            "_unsloth_original_padding_mask_function",
+            masking_utils.padding_mask_function,
+        )
+        def padding_mask_wrapper(padding_mask):
+            _cache = {padding_mask.device: padding_mask}
+            def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
+                device = getattr(kv_idx, "device", padding_mask.device)
+                pm = _cache.get(device)
+                if pm is None:
+                    pm = padding_mask.to(device, non_blocking=True)
+                    _cache[device] = pm
+                return pm[batch_idx, kv_idx]
+            return inner_mask
+        masking_utils.padding_mask_function = padding_mask_wrapper
+
+    if hasattr(masking_utils, "packed_sequence_mask_function"):
+        masking_utils._unsloth_original_packed_sequence_mask_function = getattr(
+            masking_utils,
+            "_unsloth_original_packed_sequence_mask_function",
+            masking_utils.packed_sequence_mask_function,
+        )
+        def packed_sequence_mask_wrapper(packed_sequence_mask):
+            _cache = {packed_sequence_mask.device: packed_sequence_mask}
+            def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
+                device = getattr(q_idx, "device", packed_sequence_mask.device)
+                pm = _cache.get(device)
+                if pm is None:
+                    pm = packed_sequence_mask.to(device, non_blocking=True)
+                    _cache[device] = pm
+                return pm[batch_idx, q_idx] == pm[batch_idx, kv_idx]
+            return inner_mask
+        masking_utils.packed_sequence_mask_function = packed_sequence_mask_wrapper
+
     masking_utils.__unsloth_mask_patch__ = True
 pass
 TEMPORARY_PATCHES.append(patch_transformers_masks)
+
+
+def patch_sdpa_bool_causal_mask():
+    """Fix unslothai/unsloth#4906: inf grad_norm on Qwen3.5 at seq_len > 65536.
+
+    Upstream bug: pytorch/pytorch#162588. Cutlass SDPA returns garbage
+    gradients on bool causal masks at seq_len >= 2**16 (bf16, head_dim=256,
+    no flash-attn). Drop pure causal bool masks and call with is_causal=True;
+    convert non-pure bool masks to float additive bias. Below 2**16 we skip
+    the wrapper since the bug cannot fire.
+    """
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+        return
+    try:
+        import transformers.integrations.sdpa_attention as sdpa_mod
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    except Exception as e:
+        return raise_error("transformers.integrations.sdpa_attention", e)
+
+    current = getattr(sdpa_mod, "sdpa_attention_forward", None)
+    if current is None:
+        return
+    if getattr(current, "__unsloth_bool_causal_mask_fix__", False):
+        return  # already installed
+
+    _orig = current
+
+    def sdpa_attention_forward_unsloth(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout = 0.0,
+        scaling = None,
+        is_causal = None,
+        **kwargs,
+    ):
+        m = attention_mask
+
+        # Below 2**16 the Cutlass bool-mask overflow cannot fire
+        # (pytorch/pytorch#162588), so skip the wrapper. The pure-causal
+        # rewrite picks a heavier SDPA backend and costs ~2.5 GB on
+        # Gemma4-31B LoRA SFT (8192 seq_len).
+        _q_len = query.shape[2] if query.dim() >= 3 else 0
+        _mask_key_len = m.shape[-1] if isinstance(m, torch.Tensor) and m.dim() >= 1 else 0
+        if _q_len < 65536 and _mask_key_len < 65536:
+            return _orig(
+                module, query, key, value, attention_mask,
+                dropout = dropout, scaling = scaling, is_causal = is_causal,
+                **kwargs,
+            )
+
+        # Non-causal modules (BERT, SigLIP) keep their masks; explicit param wins.
+        resolved_is_causal = (
+            is_causal if is_causal is not None
+            else getattr(module, "is_causal", True)
+        )
+        if not resolved_is_causal:
+            return _orig(
+                module, query, key, value, attention_mask,
+                dropout = dropout, scaling = scaling, is_causal = is_causal,
+                **kwargs,
+            )
+
+        # Sliding-window layers (Gemma2, Mistral, Qwen2/3) keep windowed masks.
+        if kwargs.get("sliding_window", None) is not None:
+            return _orig(
+                module, query, key, value, attention_mask,
+                dropout = dropout, scaling = scaling, is_causal = is_causal,
+                **kwargs,
+            )
+
+        # Hybrid models (Qwen3.5) may pass a dict keyed by layer type.
+        if isinstance(m, dict):
+            layer_type = getattr(module, "layer_type", None)
+            if layer_type not in m:
+                return _orig(
+                    module, query, key, value, attention_mask,
+                    dropout = dropout, scaling = scaling, is_causal = is_causal,
+                    **kwargs,
+                )
+            m = m[layer_type]
+
+        # Only intercept 4D bool self-attn masks (not cross-attn or kv-cache decode).
+        if not (
+            isinstance(m, torch.Tensor)
+            and m.dtype == torch.bool
+            and m.dim() == 4
+            and m.shape[-1] == m.shape[-2]
+            and m.shape[-1] == query.shape[2]
+        ):
+            return _orig(
+                module, query, key, value, attention_mask,
+                dropout = dropout, scaling = scaling, is_causal = is_causal,
+                **kwargs,
+            )
+
+        # Pure lower-triangular check via two O(1) probes: upper-tri is False
+        # and last row sees first col. Packed/padded masks fail the second.
+        S = m.shape[-1]
+        is_pure_causal = (
+            (S < 2)
+            or (
+                not m[0, 0, 0, 1].item()
+                and m[0, 0, S - 1, 0].item()
+            )
+        )
+
+        if is_pure_causal:
+            # Drop mask, use native is_causal path (avoids Cutlass >65536 bug, faster).
+            return _orig(
+                module, query, key, value, None,
+                dropout = dropout, scaling = scaling, is_causal = True,
+                **kwargs,
+            )
+
+        # Non-pure bool mask (packed sequences, custom patterns): convert to float
+        # additive bias so SDPA dispatches to the working (non-bool) kernel.
+        m_float = torch.where(m, 0.0, torch.finfo(query.dtype).min).to(query.dtype)
+        return _orig(
+            module, query, key, value, m_float,
+            dropout = dropout, scaling = scaling, is_causal = False,
+            **kwargs,
+        )
+
+    sdpa_attention_forward_unsloth.__unsloth_bool_causal_mask_fix__ = True
+    sdpa_mod.sdpa_attention_forward = sdpa_attention_forward_unsloth
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_attention_forward_unsloth
+pass
+TEMPORARY_PATCHES.append(patch_sdpa_bool_causal_mask)
 
 
 def patch_modernbert_attention_mask():
@@ -1279,3 +1421,88 @@ def patch_vllm_safe_apply_chat_template():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_vllm_safe_apply_chat_template)
+
+
+def patch_apply_chat_template_return_dict():
+    """Restore pre-5.0 return type for apply_chat_template(tokenize=True).
+
+    transformers 5.0+ changed the default of return_dict from False to True.
+    """
+    try:
+        from unsloth_zoo.utils import Version
+        import transformers
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return
+
+        import inspect
+        from transformers import PreTrainedTokenizerBase
+
+        _original_apply = PreTrainedTokenizerBase.apply_chat_template
+        if getattr(_original_apply, "_unsloth_patched", False):
+            return
+
+        try:
+            _orig_sig = inspect.signature(_original_apply)
+            _has_return_dict = "return_dict" in _orig_sig.parameters
+        except Exception:
+            _has_return_dict = True
+
+        if not _has_return_dict:
+            return
+
+        def _patched_apply_chat_template(self, conversation, *args, **kwargs):
+            tokenize = kwargs.get("tokenize", True)
+            if tokenize and "return_dict" not in kwargs:
+                kwargs["return_dict"] = False
+            return _original_apply(self, conversation, *args, **kwargs)
+
+        _patched_apply_chat_template._unsloth_patched = True
+        PreTrainedTokenizerBase.apply_chat_template = _patched_apply_chat_template
+    except Exception:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_apply_chat_template_return_dict)
+
+
+def patch_qwen2vl_image_processor_pixel_attrs():
+    """Add max_pixels/min_pixels property shims to Qwen2VLImageProcessor.
+
+    transformers 5.x removed these as direct instance attributes (they
+    are now stored inside self.size["longest_edge"/"shortest_edge"]).
+    vLLM 0.15.x accesses image_processor.max_pixels directly.
+    Only patch on transformers >= 5.0.0 to avoid breaking 4.x where
+    __init__ sets self.max_pixels as an instance attribute.
+    """
+    try:
+        from unsloth_zoo.utils import Version
+        import transformers
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return  # 4.x already has max_pixels/min_pixels as instance attrs
+    except Exception:
+        return
+
+    try:
+        from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+    except ImportError:
+        return
+
+    # Only add shims if not already present as a class-level descriptor
+    if not isinstance(Qwen2VLImageProcessor.__dict__.get("max_pixels"), property):
+        @property
+        def _max_pixels(self):
+            return self.size.get("longest_edge", self.size.get("max_pixels", None))
+        @property
+        def _min_pixels(self):
+            return self.size.get("shortest_edge", self.size.get("min_pixels", None))
+        Qwen2VLImageProcessor.max_pixels = _max_pixels
+        Qwen2VLImageProcessor.min_pixels = _min_pixels
+
+    try:
+        from transformers.models.qwen2_5_vl.image_processing_qwen2_5_vl import Qwen2_5_VLImageProcessor
+        if not isinstance(Qwen2_5_VLImageProcessor.__dict__.get("max_pixels"), property):
+            Qwen2_5_VLImageProcessor.max_pixels = _max_pixels
+            Qwen2_5_VLImageProcessor.min_pixels = _min_pixels
+    except (ImportError, NameError):
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)

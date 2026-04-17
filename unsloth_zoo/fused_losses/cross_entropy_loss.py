@@ -228,7 +228,7 @@ class UnslothFusedLoss(torch.autograd.Function):
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
         __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
-        __shift_states = torch.chunk(hidden_states.view(-1, hd), n_chunks, dim = 0)
+        __shift_states = torch.chunk(hidden_states.reshape(-1, hd), n_chunks, dim = 0)
         __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
 
         def accumulate_chunk(
@@ -460,6 +460,15 @@ def unsloth_fused_ce_loss(
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
+
+    # Move hidden_states to lm_head's device if they differ (e.g. multi-GPU
+    # device_map="balanced"). torch.func.grad_and_value wraps inputs and fails
+    # with "Cannot access storage of TensorWrapper" when tensors span devices.
+    # Autograd tracks .to() and moves gradients back to the original device.
+    device = lm_head_weight.device
+    if hidden_states.device != device:
+        hidden_states = hidden_states.to(device = device)
+
     return apply_autograd_function(UnslothFusedLoss, dict(
         loss_function = compute_fused_ce_loss,
         hidden_states = hidden_states,

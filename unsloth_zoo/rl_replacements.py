@@ -94,7 +94,7 @@ def chunked_hidden_states_selective_log_softmax(
         if logit_scale_divide != 0.0:
             chunk_logits = chunk_logits / logit_scale_divide
         if logit_softcapping != 0.0:
-            chunk_logits = chunk_logits * torch.tanh(chunk_logits / logit_softcapping)
+            chunk_logits = logit_softcapping * torch.tanh(chunk_logits / logit_softcapping)
 
         chunk_logits = chunk_logits.to(torch.float32)
 
@@ -662,6 +662,9 @@ def grpo_accumulated_loss(
     image_grid_thw = kwargs.get('image_grid_thw',None)
     pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
     image_sizes = kwargs.get('image_sizes',None)
+    # Transformers 5.x requires token_type_ids/mm_token_type_ids for some vision models
+    token_type_ids = kwargs.get('token_type_ids',None)
+    mm_token_type_ids = kwargs.get('mm_token_type_ids',None)
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if getattr(trainer, "vllm_importance_sampling_correction", False) else None
     temperature = kwargs.get("temperature", 1.0)
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
@@ -822,6 +825,10 @@ def grpo_accumulated_loss(
     else:
         image_sizes_chunks = chunk_optional(image_sizes, B)
 
+    # Transformers 5.x needs token_type_ids/mm_token_type_ids for some vision models
+    token_type_ids_chunks = chunk_optional(token_type_ids, B)
+    mm_token_type_ids_chunks = chunk_optional(mm_token_type_ids, B)
+
     zipped_inputs = zip(
         input_ids_chunks,
         attention_mask_chunks,
@@ -829,6 +836,8 @@ def grpo_accumulated_loss(
         image_grid_thw_chunks,
         pixel_attention_mask_chunks,
         image_sizes_chunks,
+        token_type_ids_chunks,
+        mm_token_type_ids_chunks,
         completion_ids_chunks
     )
 
@@ -850,7 +859,7 @@ def grpo_accumulated_loss(
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature):
             #Only the activations are needed so if we keep entire computational graph, keeps unnecessary memory on CPU so we detach it
-            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True) 
+            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True)
             ctx.device = hidden_states.device
             ctx.dtype = hidden_states.dtype
 
@@ -929,8 +938,15 @@ def grpo_accumulated_loss(
         image_grid_thw_chunk,
         pixel_attention_mask_chunk,
         image_sizes_chunk,
+        token_type_ids_chunk,
+        mm_token_type_ids_chunk,
         completion_ids
     ) in zipped_inputs:
+            _extra_vision_kwargs = {}
+            if token_type_ids_chunk is not None:
+                _extra_vision_kwargs["token_type_ids"] = token_type_ids_chunk
+            if mm_token_type_ids_chunk is not None:
+                _extra_vision_kwargs["mm_token_type_ids"] = mm_token_type_ids_chunk
             with autocaster:
                 if pixel_values is None:
                     new_hidden_states_chunk = unwrapped_model(
@@ -940,6 +956,7 @@ def grpo_accumulated_loss(
                         image_grid_thw = image_grid_thw_chunk,
                         pixel_attention_mask = pixel_attention_mask_chunk,
                         image_sizes = image_sizes_chunk,
+                        **_extra_vision_kwargs,
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
@@ -964,6 +981,7 @@ def grpo_accumulated_loss(
                         pixel_attention_mask = pixel_attention_mask_chunk,
                         image_sizes = image_sizes_chunk,
                         logits_to_keep = logits_to_keep + 1,
+                        **_extra_vision_kwargs,
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
