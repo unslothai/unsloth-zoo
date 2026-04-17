@@ -257,6 +257,8 @@ def _patch_mixed_precision_set_dtype(model):
 # ---------------------------------------------------------------------------
 _vlm_load_model_patched = False
 _original_vlm_load_model = None
+_vlm_prompt_utils_patched = False
+_original_vlm_apply_chat_template = None
 
 # Fragments that identify multimodal sub-networks we must *never* quantize.
 _MULTIMODAL_SKIP_FRAGMENTS = (
@@ -366,6 +368,331 @@ def _ensure_vlm_load_model_patched():
     _original_vlm_load_model = _vlm_utils.load_model
     _vlm_utils.load_model = _patched_vlm_load_model
     _vlm_load_model_patched = True
+
+
+def _content_has_structured_multimodal_markers(content):
+    """Return True when content already contains explicit image/audio/video items."""
+    if isinstance(content, list):
+        for item in content:
+            if _content_has_structured_multimodal_markers(item):
+                return True
+        return False
+
+    if isinstance(content, dict):
+        item_type = str(content.get("type", "")).lower()
+        if item_type in {
+            "image",
+            "image_url",
+            "input_image",
+            "audio",
+            "input_audio",
+            "video",
+        }:
+            return True
+        nested = content.get("content", None)
+        if nested is not None and nested is not content:
+            return _content_has_structured_multimodal_markers(nested)
+        return False
+
+    return False
+
+
+def _normalize_prompt_messages(prompt_utils_module, prompt):
+    """Normalize prompt-like items into a message list without discarding content."""
+    messages = []
+    for item in prompt:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+
+        role_content = prompt_utils_module._get_role_content(item)
+        if role_content is not None:
+            role, content = role_content
+            messages.append({"role": role, "content": content})
+            continue
+
+        messages.append({"role": "user", "content": str(item)})
+    return messages
+
+
+def _build_stable_media_messages(
+    prompt_utils_module,
+    model_type,
+    prompt,
+    *,
+    num_images,
+    num_audios,
+    kwargs,
+):
+    """Rebuild text-only chat while keeping conversation-level media on turn 1.
+
+    mlx-vlm's prompt helper used to attach `num_images` / `num_audios` to the
+    last user turn for list prompts. That shifts the image token between turns
+    during multi-turn chat, which breaks prompt-cache reuse for models like
+    Qwen3.5 that pre-compute multimodal rope positions from the full prompt.
+    """
+    target_idx = -1
+    for i, item in enumerate(prompt):
+        if isinstance(item, str):
+            target_idx = i
+            break
+        role_content = prompt_utils_module._get_role_content(item)
+        if role_content is not None and role_content[0] not in ("system", "assistant"):
+            target_idx = i
+            break
+
+    messages = []
+    for i, item in enumerate(prompt):
+        is_target = i == target_idx
+        if isinstance(item, str):
+            messages.append(
+                prompt_utils_module.get_message_json(
+                    model_type,
+                    item,
+                    skip_image_token=not is_target,
+                    skip_audio_token=not is_target,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                    **kwargs,
+                )
+            )
+            continue
+
+        role_content = prompt_utils_module._get_role_content(item)
+        if role_content is None:
+            continue
+        role, content = role_content
+        content = prompt_utils_module.extract_text_from_content(content)
+        messages.append(
+            prompt_utils_module.get_message_json(
+                model_type,
+                content,
+                role,
+                skip_image_token=not is_target or role in ["system", "assistant"],
+                skip_audio_token=not is_target or role in ["system", "assistant"],
+                num_images=num_images,
+                num_audios=num_audios,
+                **kwargs,
+            )
+        )
+    return messages
+
+
+def _get_vlm_image_token(processor):
+    """Best-effort image token string for manual prompt fallbacks."""
+    image_token = getattr(processor, "image_token", None)
+    if isinstance(image_token, str) and image_token:
+        return image_token
+    tokenizer = getattr(processor, "tokenizer", None)
+    image_token = getattr(tokenizer, "image_token", None)
+    if isinstance(image_token, str) and image_token:
+        return image_token
+    return "<image>"
+
+
+def _flatten_multimodal_content_for_prompt(content, image_token, *, audio_token="<audio>", video_token="<video>"):
+    """Flatten OpenAI-style multimodal content into a plain prompt string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            parts.append(
+                _flatten_multimodal_content_for_prompt(
+                    item,
+                    image_token,
+                    audio_token=audio_token,
+                    video_token=video_token,
+                )
+            )
+        stitched = []
+        prev_marker = False
+        markers = {image_token, audio_token, video_token}
+        for part in parts:
+            if not part:
+                continue
+            is_marker = part in markers
+            if prev_marker and not is_marker and not part[0].isspace():
+                stitched.append(" ")
+            stitched.append(part)
+            prev_marker = is_marker
+        return "".join(stitched).strip()
+    if isinstance(content, dict):
+        item_type = str(content.get("type", "")).lower()
+        if item_type in ("image", "image_url", "input_image"):
+            return image_token
+        if item_type in ("audio", "input_audio"):
+            return audio_token
+        if item_type == "video":
+            return video_token
+        nested = content.get("content", None)
+        if nested is not None and nested is not content:
+            return _flatten_multimodal_content_for_prompt(
+                nested,
+                image_token,
+                audio_token=audio_token,
+                video_token=video_token,
+            )
+        text = content.get("text", "") or content.get("content", "")
+        return str(text) if text else ""
+    return str(content) if content is not None else ""
+
+
+def _build_qwen2_vl_fallback_prompt(processor, prompt, *, add_generation_prompt):
+    """Manual chat fallback for Qwen2-VL when its tokenizer template returns empty."""
+    image_token = f"<|vision_start|>{_get_vlm_image_token(processor)}<|vision_end|>"
+
+    normalized = []
+    for item in prompt:
+        if isinstance(item, str):
+            normalized.append(("user", item))
+            continue
+        if isinstance(item, dict):
+            normalized.append((item.get("role", "user"), item.get("content", "")))
+            continue
+        role = getattr(item, "role", "user")
+        content = getattr(item, "content", str(item))
+        normalized.append((role, content))
+
+    lines = []
+    role_map = {
+        "user": "Human",
+        "assistant": "Assistant",
+        "system": "System",
+    }
+    for role, content in normalized:
+        flattened = _flatten_multimodal_content_for_prompt(content, image_token)
+        prefix = role_map.get(role, role.capitalize())
+        lines.append(f"{prefix}: {flattened}" if flattened else f"{prefix}:")
+
+    if add_generation_prompt:
+        lines.append("Assistant:")
+    return "\n".join(lines).strip()
+
+
+def _ensure_vlm_prompt_utils_patched():
+    """Patch mlx-vlm chat-template helper for stable multi-turn multimodal chat."""
+    global _vlm_prompt_utils_patched, _original_vlm_apply_chat_template
+
+    if _vlm_prompt_utils_patched:
+        return
+
+    import importlib
+
+    prompt_utils = importlib.import_module("mlx_vlm.prompt_utils")
+    _original_vlm_apply_chat_template = prompt_utils.apply_chat_template
+
+    def patched_apply_chat_template(
+        processor,
+        config,
+        prompt,
+        add_generation_prompt=True,
+        return_messages=False,
+        num_images=0,
+        num_audios=0,
+        **kwargs,
+    ):
+        config_data = config if isinstance(config, dict) else config.__dict__
+        model_type = config_data["model_type"]
+
+        if model_type == "qwen2_vl" and isinstance(prompt, (dict, list)):
+            rendered = _original_vlm_apply_chat_template(
+                processor,
+                config,
+                prompt,
+                add_generation_prompt=add_generation_prompt,
+                return_messages=return_messages,
+                num_images=num_images,
+                num_audios=num_audios,
+                **kwargs,
+            )
+            if return_messages:
+                return rendered
+            if isinstance(rendered, str) and rendered.strip():
+                return rendered
+            prompt_items = prompt if isinstance(prompt, list) else [prompt]
+            return _build_qwen2_vl_fallback_prompt(
+                processor,
+                prompt_items,
+                add_generation_prompt=add_generation_prompt,
+            )
+
+        if isinstance(prompt, dict):
+            content = prompt.get("content", "")
+            if _content_has_structured_multimodal_markers(content):
+                messages = [{"role": prompt.get("role", "user"), "content": content}]
+                if return_messages:
+                    return messages
+                return prompt_utils.get_chat_template(
+                    processor,
+                    messages,
+                    add_generation_prompt,
+                    **kwargs,
+                )
+
+        if isinstance(prompt, list):
+            normalized_messages = _normalize_prompt_messages(prompt_utils, prompt)
+            has_structured_multimodal = any(
+                _content_has_structured_multimodal_markers(
+                    message.get("content", "")
+                )
+                for message in normalized_messages
+            )
+            if has_structured_multimodal:
+                if return_messages:
+                    return normalized_messages
+                return prompt_utils.get_chat_template(
+                    processor,
+                    normalized_messages,
+                    add_generation_prompt,
+                    **kwargs,
+                )
+
+            if (num_images > 0 or num_audios > 0) and len(normalized_messages) > 1:
+                messages = _build_stable_media_messages(
+                    prompt_utils,
+                    model_type,
+                    prompt,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                    kwargs=kwargs,
+                )
+                if return_messages:
+                    return messages
+                return prompt_utils.get_chat_template(
+                    processor,
+                    messages,
+                    add_generation_prompt,
+                    **kwargs,
+                )
+
+        return _original_vlm_apply_chat_template(
+            processor,
+            config,
+            prompt,
+            add_generation_prompt=add_generation_prompt,
+            return_messages=return_messages,
+            num_images=num_images,
+            num_audios=num_audios,
+            **kwargs,
+        )
+
+    prompt_utils.apply_chat_template = patched_apply_chat_template
+
+    for modname in (
+        "mlx_vlm.chat",
+        "mlx_vlm.generate",
+        "mlx_vlm.server",
+        "mlx_vlm.evals.utils",
+    ):
+        try:
+            module = importlib.import_module(modname)
+        except Exception:
+            continue
+        if hasattr(module, "apply_chat_template"):
+            module.apply_chat_template = patched_apply_chat_template
+
+    _vlm_prompt_utils_patched = True
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
@@ -645,6 +972,7 @@ class FastMLXModel:
                 )
 
             install_mlx_compile_patches()
+            _ensure_vlm_prompt_utils_patched()
 
             already_quantized = _vlm_config_is_already_quantized(config_data)
             q_bits = kwargs.pop("q_bits", 4)
