@@ -14,10 +14,20 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import inspect
+from typing import Optional
 import torch
 import os
-from .common import TEMPORARY_PATCHES
-from .utils import raise_error
+from .common import TEMPORARY_PATCHES, torch_compile
+from .utils import (
+    raise_error,
+    patch_function,
+    patch_function_past_key_values,
+    KWARGS_TYPE,
+    Cache,
+)
+
+_UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
 
 
 # ============================================================================
@@ -606,3 +616,315 @@ def patch_Gemma4AudioAttention():
     Gemma4AudioAttention.forward = forward
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4AudioAttention)
+
+
+# ============================================================================
+# Gemma-4 float16 force-fp32 patches.
+#
+# Goal: make float16 training (notably GRPO) numerically stable without
+# falling back to a blanket float32 compute path. Bisection on E2B GRPO
+# (see PR description) showed the fp16 NaN originates in the text-decoder
+# MLP gate*up product and propagates through the attention projections.
+# The patches below mirror the proven Gemma-3 UNSLOTH_FORCE_FLOAT32 recipe,
+# adapted for Gemma-4's specific forward shapes:
+#
+#   * Gemma4RMSNorm           -> fp32 norm, fp32 (weight * hidden), clamp to
+#                                fp16 range, return fp16.
+#   * Gemma4TextMLP           -> fp32 act_fn(gate) * up, cast fp16 before
+#                                down_proj.
+#   * Gemma4TextAttention     -> fp32 Q/K/V, fp32 q_norm/k_norm/v_norm, fp32
+#                                RoPE, fp32 SDPA, cast fp16 before o_proj.
+#   * Gemma4TextScaledWordEmbedding -> fp32 embed lookup * embed_scale,
+#                                return fp32 so the first RMSNorm gets a
+#                                full-precision input.
+#
+# Every patch is gated on UNSLOTH_FORCE_FLOAT32=1 and registered through
+# TEMPORARY_PATCHES so the registry order matches the existing Gemma-3
+# behavior: the loader flips the env flag for fp16 + gemma4, and these
+# patches become active.
+#
+# Minimality policy: the plan mandates keeping the set as small as
+# bisection evidence allows. The four patches below are the analogues of
+# the four Gemma-3 patches that ship today; Gemma-4 does not have a
+# Gemma-3-style `_update_causal_mask`, so no causal-mask patch is added.
+# ============================================================================
+
+
+def _gemma4_modeling():
+    try:
+        import transformers.models.gemma4.modeling_gemma4 as mod
+        return mod
+    except ImportError:
+        return None
+
+
+def patch_Gemma4RMSNorm():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        return
+    mod = _gemma4_modeling()
+    if mod is None:
+        return
+    try:
+        Gemma4RMSNorm = mod.Gemma4RMSNorm
+    except AttributeError as e:
+        return raise_error("Gemma4RMSNorm.forward", e)
+
+    # Clamp below fp16_max so the subsequent fp16 cast (plus any PEFT LoRA
+    # round-trip to fp16) can never materialize +-inf. 65280 is exactly
+    # representable in both fp16 and bf16 and sits one bf16 ulp below fp16_max.
+    _SAFE_FP16 = 65280.0
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        x_fp32 = hidden_states.to(torch.float32)
+        mean_squared = x_fp32.pow(2).mean(-1, keepdim=True) + self.eps
+        normed = x_fp32 * torch.rsqrt(mean_squared)
+        if self.with_scale:
+            normed = normed * self.weight.to(torch.float32)
+        normed = torch.clamp(normed, min=-_SAFE_FP16, max=_SAFE_FP16)
+        return normed.to(torch.float16)
+    try:
+        patch_function(Gemma4RMSNorm, "forward", forward, fullgraph=True)
+    except Exception as e:
+        return raise_error("Gemma4RMSNorm.forward", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4RMSNorm)
+
+
+def patch_Gemma4TextScaledWordEmbedding():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        return
+    mod = _gemma4_modeling()
+    if mod is None:
+        return
+    try:
+        Gemma4TextScaledWordEmbedding = mod.Gemma4TextScaledWordEmbedding
+    except AttributeError as e:
+        return raise_error("Gemma4TextScaledWordEmbedding.forward", e)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        emb = torch.nn.functional.embedding(
+            input_ids,
+            weight=self.weight,
+            padding_idx=self.padding_idx,
+        )
+        scale = self.embed_scale.to(torch.float32)
+        return emb.to(torch.float32) * scale
+    try:
+        patch_function(
+            Gemma4TextScaledWordEmbedding, "forward", forward, fullgraph=True,
+        )
+    except Exception as e:
+        return raise_error("Gemma4TextScaledWordEmbedding.forward", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4TextScaledWordEmbedding)
+
+
+def patch_Gemma4TextMLP():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        return
+    mod = _gemma4_modeling()
+    if mod is None:
+        return
+    try:
+        Gemma4TextMLP = mod.Gemma4TextMLP
+    except AttributeError as e:
+        return raise_error("Gemma4TextMLP.forward", e)
+
+    # Clamp below fp16_max with a 224-unit safety margin so that subsequent
+    # bf16 and fp16 casts round DOWN (65280 is exactly representable in both).
+    # Without the margin bf16 rounds 65504 -> 65536 -> +inf on fp16 cast.
+    _SAFE_FP16 = 65280.0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Disable fp16 autocast so gate_proj/up_proj execute at bf16 (the
+        # actual model weight dtype under UNSLOTH_FORCE_FLOAT32). Running them
+        # inside the GRPO fp16 autocast context otherwise saturates the
+        # projection outputs to fp16_max, and the subsequent gate*up product
+        # + down_proj matmul then tips into +-inf - this is the NaN trigger
+        # on Gemma-4 E2B fp16 GRPO at step ~1-2.
+        device_type = x.device.type
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            x_bf = x.to(torch.bfloat16)
+            gate_bf = self.gate_proj(x_bf)
+            up_bf = self.up_proj(x_bf)
+
+            # Activation + multiplication in fp32 to avoid bf16 mantissa loss,
+            # since gate values can be in the 10^4 range post-saturation.
+            activated_fp32 = self.act_fn(gate_bf.to(torch.float32))
+            product_fp32 = activated_fp32 * up_bf.to(torch.float32)
+
+            # Clamp strictly below fp16_max so the subsequent fp16 cast (and
+            # any PEFT LoRA internal cast to fp16) never materialize +-inf.
+            product_fp32 = torch.clamp(product_fp32, min=-_SAFE_FP16, max=_SAFE_FP16)
+
+            # Cast directly to fp16 (not bf16). bf16 rounds up near fp16_max
+            # which poisons downstream fp16 casts; fp16 by construction has
+            # max 65504 so the downstream path cannot see +-inf.
+            out = self.down_proj(product_fp32.to(torch.float16))
+
+            # Safety net: even with clamped input, down_proj's fp16 matmul
+            # accumulator can overflow for layers with wide intermediate
+            # dimensions, producing +-inf. Rescue to a safe fp16 magnitude so
+            # the residual stream never carries non-finite values into
+            # subsequent norms / attention. NaN is treated as 0 (structural
+            # defect) and inf as the signed safe bound (saturation).
+            out = torch.nan_to_num(
+                out, nan=0.0, posinf=_SAFE_FP16, neginf=-_SAFE_FP16,
+            )
+        return out
+    try:
+        patch_function(
+            Gemma4TextMLP, "forward", forward, fullgraph=False,
+        )
+    except Exception as e:
+        return raise_error("Gemma4TextMLP.forward", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4TextMLP)
+
+
+def patch_Gemma4TextAttention():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        return
+    mod = _gemma4_modeling()
+    if mod is None:
+        return
+    try:
+        Gemma4TextAttention = mod.Gemma4TextAttention
+        apply_rotary_pos_emb = mod.apply_rotary_pos_emb
+        ALL_ATTENTION_FUNCTIONS = mod.ALL_ATTENTION_FUNCTIONS
+    except AttributeError as e:
+        return raise_error("Gemma4TextAttention.forward", e)
+
+    scaled_dot_product_attention = torch.compiler.disable(
+        torch.nn.functional.scaled_dot_product_attention, recursive=True,
+    )
+
+    fp16_max = float(torch.finfo(torch.float16).max)
+    fp16_min = float(torch.finfo(torch.float16).min)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        shared_kv_states: dict,
+        past_key_values: Optional[Cache] = None,
+        **kwargs,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        device_type = hidden_states.device.type
+
+        # Same motivation as patch_Gemma4TextMLP: GRPO sets fp16 autocast but
+        # the model weights live in bf16. Without disabling autocast here the
+        # q/k/v projections saturate to fp16_max and SDPA overflows. We run
+        # the projections in bf16 (match weights), normalisation + RoPE + SDPA
+        # in fp32 for precision, then clamp and cast to the o_proj weight
+        # dtype for the output projection.
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            h_bf = hidden_states.to(torch.bfloat16)
+            cos, sin = position_embeddings
+            cos_fp32 = cos.to(torch.float32)
+            sin_fp32 = sin.to(torch.float32)
+
+            query_fp32 = self.q_proj(h_bf).view(hidden_shape).to(torch.float32)
+            query_fp32 = self.q_norm(query_fp32).to(torch.float32)
+            query_fp32 = apply_rotary_pos_emb(query_fp32, cos_fp32, sin_fp32, unsqueeze_dim=2)
+            query_fp32 = query_fp32.transpose(1, 2)
+
+            if self.is_kv_shared_layer:
+                key_states, value_states = shared_kv_states[self.kv_shared_layer_index]
+                key_states = key_states.to(query_fp32.device).to(torch.float32)
+                value_states = value_states.to(query_fp32.device).to(torch.float32)
+            else:
+                key_fp32 = self.k_proj(h_bf).view(hidden_shape).to(torch.float32)
+                if self.v_proj is not None:
+                    value_fp32 = self.v_proj(h_bf).view(hidden_shape).to(torch.float32)
+                else:
+                    value_fp32 = key_fp32
+
+                key_fp32 = self.k_norm(key_fp32).to(torch.float32)
+                key_fp32 = apply_rotary_pos_emb(key_fp32, cos_fp32, sin_fp32, unsqueeze_dim=2)
+                key_fp32 = key_fp32.transpose(1, 2)
+
+                value_fp32 = self.v_norm(value_fp32).to(torch.float32)
+                value_fp32 = value_fp32.transpose(1, 2)
+
+                key_states, value_states = key_fp32, value_fp32
+
+            if past_key_values is not None and not self.is_kv_shared_layer:
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, self.layer_idx,
+                )
+            if self.store_full_length_kv:
+                shared_kv_states[self.layer_idx] = key_states, value_states
+
+            attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
+            if _UNSLOTH_FLEX_ATTENTION_DISABLED and attn_impl == "flex_attention":
+                attn_impl = "sdpa"
+
+            attn_mask = attention_mask
+            if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
+                attn_mask = attn_mask.to(torch.float32)
+
+            if attn_impl in ("sdpa", "eager") or attn_impl not in ALL_ATTENTION_FUNCTIONS:
+                is_causal = (
+                    query_fp32.shape[2] > 1
+                    and attn_mask is None
+                    and getattr(self, "is_causal", True)
+                )
+                attn_output_fp32 = scaled_dot_product_attention(
+                    query_fp32.contiguous(),
+                    key_states.contiguous(),
+                    value_states.contiguous(),
+                    attn_mask=attn_mask,
+                    dropout_p=self.attention_dropout if self.training else 0.0,
+                    is_causal=bool(is_causal),
+                    scale=getattr(self, "scaling", None),
+                    enable_gqa=getattr(self, "num_key_value_groups", 1) != 1,
+                )
+                attn_weights = None
+            else:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
+                attn_output_fp32, attn_weights = attention_interface(
+                    self,
+                    query_fp32,
+                    key_states,
+                    value_states,
+                    attn_mask,
+                    dropout=self.attention_dropout if self.training else 0.0,
+                    scaling=getattr(self, "scaling", None),
+                    sliding_window=getattr(self, "sliding_window", None),
+                    **kwargs,
+                )
+
+            if attn_impl != "flex_attention":
+                attn_output_fp32 = attn_output_fp32.transpose(1, 2).contiguous()
+            attn_output_fp32 = attn_output_fp32.reshape(*input_shape, -1)
+
+            # Clamp below fp16_max with safety margin; cast to fp16 directly
+            # so any PEFT LoRA internal cast to fp16 stays finite.
+            _SAFE_FP16 = 65280.0
+            attn_output_fp32 = torch.clamp(
+                attn_output_fp32, min=-_SAFE_FP16, max=_SAFE_FP16,
+            )
+            attn_output = self.o_proj(attn_output_fp32.to(torch.float16))
+            # Safety net mirroring the MLP patch: o_proj's fp16 accumulator
+            # can still overflow for long sequences; saturate non-finite
+            # values so downstream norms never see +-inf / NaN.
+            attn_output = torch.nan_to_num(
+                attn_output, nan=0.0, posinf=_SAFE_FP16, neginf=-_SAFE_FP16,
+            )
+        return attn_output, None if attn_impl in ("sdpa", "eager") else attn_weights
+
+    try:
+        # relaxed match: Gemma-4's signature contains KW-only shared_kv_states;
+        # the patched forward uses **kwargs to stay compatible with any
+        # additional parameters a future transformers build may add.
+        patch_function(
+            Gemma4TextAttention, "forward", forward, match_level="relaxed",
+        )
+    except Exception as e:
+        return raise_error("Gemma4TextAttention.forward", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4TextAttention)
