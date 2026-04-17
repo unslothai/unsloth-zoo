@@ -14,19 +14,26 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-Compile qualification and runtime monkey patches for MLX model architectures.
+"""Compile qualification, policy resolution, and runtime monkey patches for MLX.
 
-Today the heavy patch surface is concentrated in mlx-vlm backends, but this is
-the canonical compile policy module for MLX training and verification.
+This module is the canonical compile entrypoint for Unsloth's MLX training
+stack. The file is large because it owns three different layers of behavior:
 
-This module does 2 things:
-1. Discover and classify compile blockers across installed MLX architectures.
-2. Install a maintainable patch layer for repeated blocker patterns.
+1. Qualification:
+   Discover installed `mlx_vlm` architectures, scan them for known compile
+   blocker patterns, and report whether each architecture has been verified.
+2. Policy:
+   Decide whether a particular training run should use `mx.compile`, fall back
+   to eager mode, or raise when strict compile is requested.
+3. Runtime patching:
+   Install monkey patches for repeated blocker patterns so verified
+   architectures can run compiled training without carrying architecture-local
+   one-off shims throughout the trainer.
 
-The qualification matrix is intentionally conservative: architectures are only
-marked compile-ready once explicitly verified. Everything else falls back to
-eager mode with a reason attached.
+The qualification matrix is intentionally conservative. Architectures are only
+marked compile-ready once explicitly verified. Everything else either runs eager
+or stays in "pattern candidate" state until a verifier or real training sweep
+confirms the patch set is functionally correct.
 """
 
 from __future__ import annotations
@@ -227,6 +234,14 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class MLXVLMTraitReport:
+    """Static scan result for one installed `mlx_vlm` architecture.
+
+    Trait reports are architecture-level hints only. They are used to:
+    - surface likely compile blocker categories for maintainers
+    - identify shared patch bundles that can be applied generically
+    - explain why an architecture is qualified, unqualified, or a candidate
+    """
+
     arch: str
     blocker_categories: tuple[str, ...]
     pattern_traits: tuple[str, ...]
@@ -237,6 +252,18 @@ class MLXVLMTraitReport:
 
 @dataclass(frozen=True)
 class CompilePatternBundle:
+    """A reusable compile patch bundle keyed by architecture traits.
+
+    Each bundle owns:
+    - a human-readable name and description
+    - a matcher that decides whether an architecture likely needs the bundle
+    - an installer that applies the runtime monkey patches
+
+    The matcher is intentionally separate from verification. A bundle can be a
+    candidate for an architecture before that architecture is considered
+    compile-ready.
+    """
+
     name: str
     description: str
     matcher: Callable[[str, MLXVLMTraitReport], bool]
@@ -245,6 +272,8 @@ class CompilePatternBundle:
 
 @dataclass(frozen=True)
 class MLXVLMCompilePolicy:
+    """User-facing compile policy after CLI/config normalization."""
+
     mode: str = "best_effort"
     arch_overrides: tuple[tuple[str, str], ...] = ()
     backend_overrides: tuple[tuple[str, str], ...] = ()
@@ -252,6 +281,8 @@ class MLXVLMCompilePolicy:
 
 @dataclass(frozen=True)
 class ResolvedTrainingCompileDecision:
+    """Final per-model compile decision used by the trainer."""
+
     arch: str
     enabled: bool
     policy_mode: str
@@ -265,6 +296,8 @@ class ResolvedTrainingCompileDecision:
 
 @dataclass(frozen=True)
 class MLXVLMCompileQualification:
+    """Qualified compile status for one architecture after patches are installed."""
+
     arch: str
     training_compile: bool
     generation_compile: bool
@@ -278,6 +311,12 @@ class MLXVLMCompileQualification:
 
 
 def _iter_arch_modules() -> Iterable[tuple[str, Path]]:
+    """Yield installed `mlx_vlm.models.<arch>` package roots.
+
+    We inspect the installed package instead of maintaining a static registry so
+    the qualification layer reflects the actual venv contents.
+    """
+
     try:
         import mlx_vlm.models as vlm_models_pkg
     except ImportError:
@@ -302,11 +341,15 @@ def _iter_arch_modules() -> Iterable[tuple[str, Path]]:
 
 @lru_cache(maxsize=1)
 def discover_architectures() -> tuple[str, ...]:
+    """Return discovered `mlx_vlm` architecture names from the active env."""
+
     return tuple(name for name, _ in _iter_arch_modules())
 
 
 @lru_cache(maxsize=None)
 def _read_architecture_source(arch: str) -> str:
+    """Read non-processor Python source for one installed architecture."""
+
     arch_dir = dict(_iter_arch_modules()).get(arch)
     if arch_dir is None or not arch_dir.exists():
         return ""
@@ -323,6 +366,8 @@ def _read_architecture_source(arch: str) -> str:
 
 
 def _scan_architecture_sources(arch: str) -> tuple[str, ...]:
+    """Scan architecture source for coarse compile blocker categories."""
+
     source = _read_architecture_source(arch)
     if not source:
         return ()
@@ -334,6 +379,8 @@ def _scan_architecture_sources(arch: str) -> tuple[str, ...]:
 
 
 def _scan_pattern_traits(arch: str) -> tuple[str, ...]:
+    """Scan architecture source for reusable patch traits."""
+
     source = _read_architecture_source(arch)
     if not source:
         return ()
@@ -349,6 +396,8 @@ def _verification_state(
     patched: bool,
     has_pattern_candidates: bool,
 ) -> str:
+    """Classify verification state for reporting and policy explanations."""
+
     if arch in _VERIFIED_TRAINING_ARCHES and arch in _VERIFIED_GENERATION_ARCHES:
         return "fully_verified"
     if arch in _VERIFIED_TRAINING_ARCHES:
@@ -371,6 +420,8 @@ def _config_get(config, key, default=None):
 
 
 def _extract_backend_arches(config, arch: str | None = None) -> tuple[str, ...]:
+    """Extract nested backend model types from an MLX config object."""
+
     backend_arches = []
     seen = set()
     for key in _BACKEND_CONFIG_KEYS:
@@ -388,6 +439,8 @@ def _get_model_config(model):
 
 
 def get_backend_architectures(model_or_arch) -> tuple[str, ...]:
+    """Return nested backend architectures for a loaded MLX model instance."""
+
     if isinstance(model_or_arch, str):
         return ()
 
@@ -400,6 +453,8 @@ def _build_trait_report(
     arch: str,
     backend_arches: tuple[str, ...] = (),
 ) -> MLXVLMTraitReport:
+    """Build one trait report from static source scans and runtime patch state."""
+
     blockers = _scan_architecture_sources(arch)
     traits = _scan_pattern_traits(arch)
     patched = arch in _PATCHED_ARCHES
@@ -419,10 +474,14 @@ def _build_trait_report(
 
 @lru_cache(maxsize=1)
 def build_compile_trait_reports() -> dict[str, MLXVLMTraitReport]:
+    """Build trait reports for every discovered architecture in the venv."""
+
     return {arch: _build_trait_report(arch) for arch in discover_architectures()}
 
 
 def get_model_architecture(model) -> str | None:
+    """Infer the top-level `mlx_vlm` architecture name from a loaded model."""
+
     module = getattr(model, "__module__", "")
     if ".models." not in module:
         return None
@@ -430,6 +489,8 @@ def get_model_architecture(model) -> str | None:
 
 
 def get_compile_trait_report(model_or_arch) -> MLXVLMTraitReport | None:
+    """Return the trait report for an architecture or loaded model."""
+
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
     if not arch:
         return None
@@ -447,6 +508,8 @@ def _build_compile_qualification(
     arch: str,
     trait_report: MLXVLMTraitReport | None = None,
 ) -> MLXVLMCompileQualification:
+    """Build a user-facing compile qualification for one architecture."""
+
     report = trait_report or build_compile_trait_reports().get(arch)
     if report is None:
         return MLXVLMCompileQualification(
@@ -510,6 +573,8 @@ def _build_compile_qualification(
 
 @lru_cache(maxsize=1)
 def build_compile_qualifications() -> dict[str, MLXVLMCompileQualification]:
+    """Build compile qualifications for every discovered architecture."""
+
     return {
         arch: _build_compile_qualification(arch, build_compile_trait_reports().get(arch))
         for arch in discover_architectures()
@@ -517,6 +582,8 @@ def build_compile_qualifications() -> dict[str, MLXVLMCompileQualification]:
 
 
 def get_compile_qualification(model_or_arch) -> MLXVLMCompileQualification | None:
+    """Return the compile qualification for an architecture or loaded model."""
+
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
     if not arch:
         return None
@@ -527,6 +594,8 @@ def get_compile_qualification(model_or_arch) -> MLXVLMCompileQualification | Non
 
 
 def get_backend_compile_qualifications(model_or_arch) -> tuple[MLXVLMCompileQualification, ...]:
+    """Return compile qualifications for any nested backend architectures."""
+
     qualifications = []
     for backend_arch in get_backend_architectures(model_or_arch):
         qual = get_compile_qualification(backend_arch)
@@ -536,6 +605,13 @@ def get_backend_compile_qualifications(model_or_arch) -> tuple[MLXVLMCompileQual
 
 
 def _model_repo_training_compile_block_reason(model_or_arch) -> str | None:
+    """Return a repo-specific compile block reason when policy should stay eager.
+
+    This is intentionally separate from architecture qualification. Sometimes an
+    architecture is broadly patchable, but a known repo family still fails real
+    training due to an unresolved runtime issue.
+    """
+
     if isinstance(model_or_arch, str):
         return None
     repo = str(getattr(model_or_arch, "_hf_repo", "") or "").lower()
@@ -548,6 +624,8 @@ def _model_repo_training_compile_block_reason(model_or_arch) -> str | None:
 
 
 def _normalize_policy_mode(mode: str | None) -> str:
+    """Normalize user-facing compile mode aliases to the internal enum."""
+
     aliases = {
         None: "best_effort",
         "default": "best_effort",
@@ -569,6 +647,8 @@ def _normalize_policy_mode(mode: str | None) -> str:
 def _normalize_override_items(
     overrides: Mapping[str, str] | Iterable[tuple[str, str]] | str | None,
 ) -> tuple[tuple[str, str], ...]:
+    """Normalize architecture/backend override mappings from CLI or config."""
+
     if overrides is None:
         return ()
     if isinstance(overrides, str):
@@ -598,6 +678,8 @@ def build_compile_policy(
     policy: MLXVLMCompilePolicy | None = None,
     args=None,
 ) -> MLXVLMCompilePolicy:
+    """Build the normalized compile policy from config objects or CLI args."""
+
     if policy is not None:
         return MLXVLMCompilePolicy(
             mode=_normalize_policy_mode(policy.mode),
@@ -623,6 +705,8 @@ def _resolve_effective_policy_mode(
     backend_arches: tuple[str, ...],
     policy: MLXVLMCompilePolicy,
 ) -> str:
+    """Resolve the final policy mode after arch/backend overrides are applied."""
+
     arch_overrides = dict(policy.arch_overrides)
     backend_overrides = dict(policy.backend_overrides)
     if arch in arch_overrides:
@@ -641,6 +725,17 @@ def resolve_training_compile(
     policy: MLXVLMCompilePolicy | None = None,
     args=None,
 ) -> ResolvedTrainingCompileDecision:
+    """Resolve whether a training run should use `mx.compile`.
+
+    Resolution order:
+    1. Normalize the global policy and any per-arch/backend overrides.
+    2. Check for repo-specific blocklist reasons.
+    3. Require the main architecture and every backend architecture to be
+       training-qualified.
+    4. Return either an enabled compile decision or an eager fallback / raise
+       decision, depending on policy strictness.
+    """
+
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
     compiled_policy = build_compile_policy(policy=policy, args=args)
     if not arch:
@@ -745,11 +840,15 @@ def resolve_training_compile(
 
 
 def _invalidate_qualification_cache():
+    """Clear cached trait/qualification reports after patch installation."""
+
     build_compile_trait_reports.cache_clear()
     build_compile_qualifications.cache_clear()
 
 
 def _patch_staticmethod(cls, name, fn):
+    """Replace a class staticmethod only when it is not already patched."""
+
     current = getattr(cls, name, None)
     if current is fn:
         return
@@ -757,10 +856,52 @@ def _patch_staticmethod(cls, name, fn):
 
 
 def _patch_method(cls, name, fn):
+    """Replace a class method only when it is not already patched."""
+
     current = getattr(cls, name, None)
     if current is fn:
         return
     setattr(cls, name, fn)
+
+
+def _try_import_module(module_name: str):
+    """Best-effort import for optional `mlx_vlm` modules.
+
+    Patch installers are intentionally permissive because the installed MLX
+    stack may not include every architecture. Silent `None` keeps the patch
+    registry idempotent across different environments.
+    """
+
+    try:
+        return importlib.import_module(module_name)
+    except Exception:
+        return None
+
+
+def _iter_trait_model_modules(
+    trait: str,
+    *,
+    include_arches: Iterable[str] = (),
+):
+    """Yield model modules for architectures that share a compile trait.
+
+    Most `mlx_vlm` architectures follow `mlx_vlm.models.<arch>.<arch>`. Using
+    trait discovery here lets a future architecture inherit a shared patch
+    automatically when it exposes the same source-level pattern and follows the
+    standard module layout.
+    """
+
+    candidate_arches = set(include_arches)
+    candidate_arches.update(
+        arch
+        for arch, report in build_compile_trait_reports().items()
+        if trait in report.pattern_traits
+    )
+    for arch in sorted(candidate_arches):
+        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
+        if module is None:
+            continue
+        yield arch, module
 
 
 def _install_safe_fused_sdpa_mask_patches():
@@ -934,6 +1075,13 @@ def _merge_replacement_segments(inputs_embeds, replacements_by_batch):
 
 
 def _masked_scatter_no_numpy(final_embedding, image_mask_expanded, scaled_image_features):
+    """Compile-safe replacement for `masked_scatter`-style multimodal merges.
+
+    Upstream `mlx_vlm` variants often flatten to NumPy or use mutation-heavy
+    scatter helpers. This version stays entirely in MLX array ops so it can run
+    under `mx.compile` and backward.
+    """
+
     import mlx.core as mx
 
     final_shape = final_embedding.shape
@@ -953,35 +1101,47 @@ def _masked_scatter_no_numpy(final_embedding, image_mask_expanded, scaled_image_
     return flat_output.reshape(final_shape)
 
 
+def _tolist_if_needed(values):
+    """Convert MLX/NumPy metadata arrays to Python lists when available."""
+
+    if hasattr(values, "tolist"):
+        return values.tolist()
+    return values
+
+
 def _grid_to_tuple(grid_thw):
+    """Normalize `(t, h, w)` vision grid metadata to immutable Python tuples."""
+
     if grid_thw is None:
         return ()
-    if hasattr(grid_thw, "tolist"):
-        grid_thw = grid_thw.tolist()
+    grid_thw = _tolist_if_needed(grid_thw)
     return tuple(tuple(int(x) for x in item) for item in grid_thw)
 
 
 def _size_pairs_to_tuple(values):
+    """Normalize `(h, w)` metadata pairs to immutable Python tuples."""
+
     if values is None:
         return ()
-    if hasattr(values, "tolist"):
-        values = values.tolist()
+    values = _tolist_if_needed(values)
     return tuple(tuple(int(x) for x in item) for item in values)
 
 
 def _positions_to_tuple(positions):
+    """Normalize 2-column position metadata to immutable Python tuples."""
+
     if positions is None:
         return ()
-    if hasattr(positions, "tolist"):
-        positions = positions.tolist()
+    positions = _tolist_if_needed(positions)
     return tuple((int(item[0]), int(item[1])) for item in positions)
 
 
 def _positions_per_batch_to_tuple(positions):
+    """Normalize batched 1D position metadata to immutable Python tuples."""
+
     if positions is None:
         return ()
-    if hasattr(positions, "tolist"):
-        positions = positions.tolist()
+    positions = _tolist_if_needed(positions)
     return tuple(
         tuple(int(pos) for pos in batch_positions)
         for batch_positions in positions
@@ -989,10 +1149,11 @@ def _positions_per_batch_to_tuple(positions):
 
 
 def _spans_per_batch_to_tuple(spans):
+    """Normalize batched `(start, end)` span metadata to Python tuples."""
+
     if spans is None:
         return ()
-    if hasattr(spans, "tolist"):
-        spans = spans.tolist()
+    spans = _tolist_if_needed(spans)
     return tuple(
         tuple((int(start), int(end)) for start, end in batch_spans)
         for batch_spans in spans
@@ -1000,20 +1161,25 @@ def _spans_per_batch_to_tuple(spans):
 
 
 def _lengths_to_tuple(lengths):
+    """Normalize 1D length metadata to immutable Python tuples."""
+
     if lengths is None:
         return None
-    if hasattr(lengths, "tolist"):
-        lengths = lengths.tolist()
+    lengths = _tolist_if_needed(lengths)
     return tuple(int(x) for x in lengths)
 
 
 def _split_points(cu_seqlens):
+    """Return Python split indices from cumulative sequence lengths."""
+
     if isinstance(cu_seqlens, (tuple, list)):
         return list(cu_seqlens[1:-1])
     return cu_seqlens[1:-1].tolist()
 
 
 def _build_cu_seqlens(grid_thw):
+    """Build cumulative sequence lengths from normalized `(t, h, w)` grids."""
+
     cu_seqlens = [0]
     total = 0
     for num_frames, height, width in grid_thw:
@@ -1025,12 +1191,16 @@ def _build_cu_seqlens(grid_thw):
 
 
 def _attach_position_ids(features, position_ids):
+    """Attach explicit position ids to an embeddings feature container."""
+
     if position_ids is not None:
         features.position_ids = position_ids
     return features
 
 
 def _add_visual_embeds(hidden_states, visual_pos_masks, visual_embeds):
+    """Compile-safe additive merge for sparse visual embeddings."""
+
     import mlx.core as mx
 
     flat_mask = visual_pos_masks.reshape((-1,))
@@ -1050,6 +1220,8 @@ def _add_visual_embeds(hidden_states, visual_pos_masks, visual_embeds):
 
 
 def _downsample_square_tokens(x, downsample_ratio):
+    """Downsample square token grids without leaving MLX array ops."""
+
     bs, hw, input_dim = x.shape
     h = w = int(hw**0.5)
     pad = (downsample_ratio - h % downsample_ratio) % downsample_ratio
@@ -1072,6 +1244,8 @@ def _downsample_square_tokens(x, downsample_ratio):
 
 
 def _install_qwen2_5_compile_patches():
+    """Install compile-safe vision and embedding patches for Qwen2.5-VL."""
+
     try:
         module = importlib.import_module("mlx_vlm.models.qwen2_5_vl.qwen2_5_vl")
         vision_module = importlib.import_module("mlx_vlm.models.qwen2_5_vl.vision")
@@ -1290,6 +1464,8 @@ def _install_qwen2_5_compile_patches():
 
 
 def _install_qwen2_compile_patches():
+    """Install compile-safe vision and embedding patches for Qwen2-VL."""
+
     try:
         module = importlib.import_module("mlx_vlm.models.qwen2_vl.qwen2_vl")
         vision_module = importlib.import_module("mlx_vlm.models.qwen2_vl.vision")
@@ -1441,6 +1617,8 @@ def _install_qwen2_compile_patches():
 
 
 def _install_qwen3_family_compile_patches():
+    """Install shared compile patches for the Qwen3 VL family."""
+
     try:
         module = importlib.import_module("mlx_vlm.models.qwen3_vl.qwen3_vl")
         vision_module = importlib.import_module("mlx_vlm.models.qwen3_vl.vision")
@@ -1755,6 +1933,8 @@ def _install_qwen3_family_compile_patches():
 
 
 def _install_glm_ocr_compile_patches():
+    """Install compile-safe GLM OCR vision and embedding patches."""
+
     try:
         module = importlib.import_module("mlx_vlm.models.glm_ocr.glm_ocr")
         vision_module = importlib.import_module("mlx_vlm.models.glm_ocr.vision")
@@ -1912,6 +2092,8 @@ def _install_glm_ocr_compile_patches():
 
 
 def _install_paddleocr_vl_compile_patches():
+    """Install compile-safe PaddleOCR-VL vision and embedding patches."""
+
     try:
         module = importlib.import_module("mlx_vlm.models.paddleocr_vl.paddleocr_vl")
         vision_module = importlib.import_module("mlx_vlm.models.paddleocr_vl.vision")
@@ -2109,26 +2291,35 @@ def _install_paddleocr_vl_compile_patches():
 
 
 def _install_qwen_like_image_merge_patches():
-    for modname in (
-        "mlx_vlm.models.qwen2_vl.qwen2_vl",
-        "mlx_vlm.models.qwen2_5_vl.qwen2_5_vl",
-        "mlx_vlm.models.glm_ocr.glm_ocr",
-        "mlx_vlm.models.paddleocr_vl.paddleocr_vl",
+    """Patch qwen-style placeholder-token image merges with a shared helper.
+
+    This covers the common pattern where a model replaces one placeholder token
+    per image feature segment. We intentionally exclude the Qwen3 family here
+    because it returns an additional broadcast mask and has its own multimodal
+    deepstack plumbing.
+    """
+
+    for arch, module in _iter_trait_model_modules(
+        "qwen_like_image_merge",
+        include_arches=("qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"),
     ):
-        try:
-            module = importlib.import_module(modname)
-        except Exception:
+        if arch.startswith("qwen3"):
+            continue
+        model_cls = getattr(module, "Model", None)
+        if (
+            model_cls is None
+            or getattr(model_cls, "merge_input_ids_with_image_features", None) is None
+        ):
             continue
         _patch_staticmethod(
-            module.Model,
+            model_cls,
             "merge_input_ids_with_image_features",
             _merge_special_token_features_only,
         )
-        _PATCHED_ARCHES.add(modname.split(".models.", 1)[1].split(".", 1)[0])
+        _PATCHED_ARCHES.add(arch)
 
-    try:
-        qwen3_module = importlib.import_module("mlx_vlm.models.qwen3_vl.qwen3_vl")
-    except Exception:
+    qwen3_module = _try_import_module("mlx_vlm.models.qwen3_vl.qwen3_vl")
+    if qwen3_module is None:
         return
 
     def merge_qwen3(image_features, inputs_embeds, input_ids, image_token_index, video_token_index):
@@ -2149,9 +2340,10 @@ def _install_qwen_like_image_merge_patches():
 
 
 def _install_qwen3_get_input_embeddings_patch():
-    try:
-        module = importlib.import_module("mlx_vlm.models.qwen3_vl.qwen3_vl")
-    except Exception:
+    """Patch Qwen3-VL embeddings to expose compile-safe multimodal metadata."""
+
+    module = _try_import_module("mlx_vlm.models.qwen3_vl.qwen3_vl")
+    if module is None:
         return
 
     InputEmbeddingsFeatures = module.InputEmbeddingsFeatures
@@ -2206,6 +2398,8 @@ def _install_qwen3_get_input_embeddings_patch():
 
 
 def _install_llama_pixtral_mistral_compile_patches():
+    """Install compile-safe multimodal merge patches for llama-like families."""
+
     def merge_single_image_token_family(
         image_token_index, image_features, inputs_embeds, input_ids
     ):
@@ -2532,6 +2726,8 @@ def _install_llama_pixtral_mistral_compile_patches():
 
 
 def _install_mistral4_compile_patches():
+    """Install the Mistral4-specific attention backend compatibility patch."""
+
     try:
         module = importlib.import_module("mlx_vlm.models.mistral4.language")
     except Exception:
@@ -2601,6 +2797,8 @@ def _install_mistral4_compile_patches():
 
 
 def _install_gemma3n_compile_patches():
+    """Install Gemma3n multiscale fusion and merge compatibility patches."""
+
     try:
         module = importlib.import_module("mlx_vlm.models.gemma3n.gemma3n")
         vision_module = importlib.import_module("mlx_vlm.models.gemma3n.vision")
@@ -2775,6 +2973,8 @@ def _install_gemma3n_compile_patches():
 
 
 def _install_deepseek_ocr_compile_patches():
+    """Install DeepSeek OCR compile patches for SAM/projector/image merging."""
+
     try:
         deepseekocr_module = importlib.import_module("mlx_vlm.models.deepseekocr.deepseekocr")
         sam_module = importlib.import_module("mlx_vlm.models.deepseekocr.sam")
@@ -3121,22 +3321,26 @@ def _install_deepseek_ocr_compile_patches():
 
 
 def _install_masked_scatter_multimodal_patches():
-    for modname in (
-        "mlx_vlm.models.gemma3.gemma3",
-        "mlx_vlm.models.idefics2.idefics2",
-        "mlx_vlm.models.idefics3.idefics3",
+    """Patch `masked_scatter` implementations that rely on host-side mutation."""
+
+    for arch, module in _iter_trait_model_modules(
+        "masked_scatter_multimodal",
+        include_arches=("gemma3", "idefics2", "idefics3"),
     ):
-        try:
-            module = importlib.import_module(modname)
-        except Exception:
-            continue
         if getattr(module, "masked_scatter", None) is None:
             continue
         setattr(module, "masked_scatter", _masked_scatter_no_numpy)
-        _PATCHED_ARCHES.add(modname.split(".models.", 1)[1].split(".", 1)[0])
+        _PATCHED_ARCHES.add(arch)
 
 
 def _install_idefics_family_compile_patches():
+    """Patch Idefics-family image filtering and multimodal merges for compile.
+
+    The shared issue here is Python-side filtering of padded images and image
+    placeholder merging. Architectures that expose the same source-level trait
+    and standard model module layout can inherit this patch automatically.
+    """
+
     def patched_prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         special_image_mask = input_ids == self.config.image_token_index
         outputs, _ = _merge_sequence_mask_features(
@@ -3204,25 +3408,26 @@ def _install_idefics_family_compile_patches():
         )
         return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
-    for modname in (
-        "mlx_vlm.models.idefics2.idefics2",
-        "mlx_vlm.models.idefics3.idefics3",
+    for arch, module in _iter_trait_model_modules(
+        "padded_image_filtering",
+        include_arches=("idefics2", "idefics3"),
     ):
-        try:
-            module = importlib.import_module(modname)
-        except Exception:
+        if arch == "smolvlm":
+            continue
+        model_cls = getattr(module, "Model", None)
+        if model_cls is None:
             continue
         _patch_method(
-            module.Model,
+            model_cls,
             "_prepare_inputs_for_multimodal",
             patched_prepare_inputs_for_multimodal,
         )
-        _patch_method(module.Model, "get_input_embeddings", patched_get_input_embeddings)
-        _PATCHED_ARCHES.add(modname.split(".models.", 1)[1].split(".", 1)[0])
+        if getattr(model_cls, "get_input_embeddings", None) is not None:
+            _patch_method(model_cls, "get_input_embeddings", patched_get_input_embeddings)
+        _PATCHED_ARCHES.add(arch)
 
-    try:
-        smol_module = importlib.import_module("mlx_vlm.models.smolvlm.smolvlm")
-    except Exception:
+    smol_module = _try_import_module("mlx_vlm.models.smolvlm.smolvlm")
+    if smol_module is None:
         return
 
     _patch_method(
@@ -3234,10 +3439,11 @@ def _install_idefics_family_compile_patches():
 
 
 def _install_negative_image_placeholder_patches():
-    try:
-        phi3_module = importlib.import_module("mlx_vlm.models.phi3_v.phi3_v")
-        phi3_vision_module = importlib.import_module("mlx_vlm.models.phi3_v.vision")
-    except Exception:
+    """Install Phi-3 vision patches for negative placeholder-token flows."""
+
+    phi3_module = _try_import_module("mlx_vlm.models.phi3_v.phi3_v")
+    phi3_vision_module = _try_import_module("mlx_vlm.models.phi3_v.vision")
+    if phi3_module is None or phi3_vision_module is None:
         return
 
     def patched_phi3_get_input_embeddings(
@@ -3357,10 +3563,11 @@ def _install_negative_image_placeholder_patches():
 
 
 def _install_expanded_image_placeholder_patches():
-    try:
-        module = importlib.import_module("mlx_vlm.models.multi_modality.multi_modality")
-        vision_module = importlib.import_module("mlx_vlm.models.multi_modality.vision")
-    except Exception:
+    """Install placeholder-expansion patches for repeated image-token families."""
+
+    module = _try_import_module("mlx_vlm.models.multi_modality.multi_modality")
+    vision_module = _try_import_module("mlx_vlm.models.multi_modality.vision")
+    if module is None or vision_module is None:
         return
 
     def patched_fast_gelu(self, input):
@@ -3413,6 +3620,8 @@ def _install_expanded_image_placeholder_patches():
 
 
 def _install_phi4_multimodal_patches():
+    """Install Phi-4 multimodal span and resize patches."""
+
     def patch_siglip_resize(module):
         interpolate_module = importlib.import_module("mlx_vlm.models.interpolate")
 
@@ -3616,6 +3825,13 @@ def _install_phi4_multimodal_patches():
 
 @lru_cache(maxsize=1)
 def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
+    """Return the shared compile patch registry.
+
+    This is the main maintainer entrypoint for adding new compile patterns.
+    Matchers should prefer source traits over hardcoded architecture lists when
+    the same fix is semantically reusable.
+    """
+
     return (
         CompilePatternBundle(
             name="qwen_like_image_merge",
@@ -3751,6 +3967,8 @@ def _matching_pattern_bundle_names(
     arch: str,
     report: MLXVLMTraitReport | None = None,
 ) -> tuple[str, ...]:
+    """Return bundle names whose matchers apply to one architecture report."""
+
     report = report or build_compile_trait_reports().get(arch)
     if report is None:
         return ()
@@ -3762,6 +3980,8 @@ def _matching_pattern_bundle_names(
 
 
 def install_mlx_compile_patches():
+    """Install every shared compile patch bundle once and rebuild reports."""
+
     global _PATCHES_INSTALLED
     if _PATCHES_INSTALLED:
         return build_compile_qualifications()
@@ -3779,6 +3999,8 @@ def install_mlx_compile_patches():
 
 
 def summarize_compile_qualifications() -> dict[str, int]:
+    """Return a small summary snapshot of current compile qualification state."""
+
     qualifications = build_compile_qualifications().values()
     out = {
         "architectures": 0,
