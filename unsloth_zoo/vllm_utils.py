@@ -3010,6 +3010,7 @@ def _test_get_vllm_state_dict(
     load_in_4bit = False,
     skip_generation = False,
     is_vision_model = False,
+    compilation_config = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if model is allowed to be used in vLLM
@@ -3049,6 +3050,8 @@ def _test_get_vllm_state_dict(
     model_type = getattr(config, "model_type", "causal_lm")
 
     enable_lora = model_type != "mllama"
+    if compilation_config is None and model_type == "gemma4":
+        compilation_config = 0
 
     if not is_vision_model:
         model_class = AutoModelForCausalLM
@@ -3090,6 +3093,7 @@ def _test_get_vllm_state_dict(
         use_bitsandbytes       = load_in_4bit,
         is_vision_model        = is_vision_model,
         enable_lora            = enable_lora,
+        compilation_config     = compilation_config,
     )
 
     state_dict, quant_state_dict = get_vllm_state_dict(

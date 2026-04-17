@@ -352,51 +352,81 @@ def patch_gemma4_vllm_lora_support():
         patched_create_lora_manager._unsloth_gemma4_patch = True
         vllm_lora_model_manager.create_lora_manager = patched_create_lora_manager
         vllm_lora_worker_manager.create_lora_manager = patched_create_lora_manager
+pass
 
-# vLLM load seems to be failing at least with 0.19.0
-# due to the diff b/w sepearate kv and shared kv like gemma4
-# This is to address that issue :)
+# vLLM's Gemma4 k_eq_v path now expects qkv_proj to always expose q+k+v.
+# For prequantized bitsandbytes checkpoints, the synthetic v shard is still
+# missing from the quant-state dict on full-attention k_eq_v layers, so we
+# materialize it during loader-side quant-state stacking instead of patching
+# the runtime attention forward.
 def patch_gemma4_vllm_k_eq_v_support():
-    from vllm.model_executor.models.gemma4 import Gemma4Attention
+    from vllm.model_executor.model_loader.bitsandbytes_loader import (
+        BitsAndBytesModelLoader,
+    )
 
-    if hasattr(Gemma4Attention.forward, "_unsloth_gemma4_k_eq_v_patch"):
+    if hasattr(
+        BitsAndBytesModelLoader._stack_quantization_states,
+        "_unsloth_gemma4_k_eq_v_patch",
+    ):
         return
 
-    original_forward = Gemma4Attention.forward
+    original_stack_quantization_states = (
+        BitsAndBytesModelLoader._stack_quantization_states
+    )
 
-    def patched_forward(self, positions, hidden_states, **kwargs):
-        qkv, _ = self.qkv_proj(hidden_states)
+    def _get_gemma4_text_config(model):
+        config = getattr(model, "config", None)
+        if config is None:
+            return None
 
-        if self.use_k_eq_v and qkv.shape[-1] == (self.q_size + self.kv_size):
-            q, k = qkv.split([self.q_size, self.kv_size], dim = -1)
-            # Gemma4 full-attention k_eq_v layers reuse K as the pre-norm V input.
-            v = k
-        else:
-            return original_forward(self, positions, hidden_states, **kwargs)
+        text_config = getattr(config, "text_config", config)
+        model_type = getattr(config, "model_type", None)
+        text_model_type = getattr(text_config, "model_type", None)
+        if model_type != "gemma4" and text_model_type not in ("gemma4", "gemma4_text"):
+            return None
+        return text_config
 
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        q = self.q_norm(q)
-        q = q.flatten(-2, -1)
+    def _get_gemma4_k_eq_v_qkv_param_names(model):
+        text_config = _get_gemma4_text_config(model)
+        if text_config is None or not getattr(text_config, "attention_k_eq_v", False):
+            return ()
 
-        if not self.is_kv_shared_layer:
-            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = self.k_norm(k)
-            k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
+        param_names = set(name for name, _ in model.named_parameters())
+        qkv_param_names = []
+        for layer_idx, layer_type in enumerate(getattr(text_config, "layer_types", ())):
+            if layer_type != "full_attention":
+                continue
 
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = self.v_norm(v)
-            v = v.flatten(-2, -1)
-        else:
-            q = self.rotary_emb(positions, q, k)[0]
+            for prefix in ("language_model.model", "model"):
+                qkv_param_name = (
+                    f"{prefix}.layers.{layer_idx}.self_attn.qkv_proj.weight"
+                )
+                if qkv_param_name in param_names:
+                    qkv_param_names.append(qkv_param_name)
+                    break
+        return tuple(qkv_param_names)
 
-        attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
-        return output
+    def patched_stack_quantization_states(self, model, quant_state_dict):
+        stacked_quant_state_dict = original_stack_quantization_states(
+            self, model, quant_state_dict
+        )
 
-    patched_forward._unsloth_gemma4_k_eq_v_patch = True
-    Gemma4Attention.forward = patched_forward
-pass
+        for qkv_param_name in _get_gemma4_k_eq_v_qkv_param_names(model):
+            quant_states = stacked_quant_state_dict.get(qkv_param_name)
+            if not isinstance(quant_states, dict) or 2 in quant_states or 1 not in quant_states:
+                continue
+
+            # Gemma4 full-attention k_eq_v layers reuse K as V. The raw weight
+            # loader already duplicates k_proj -> v_proj; prequant BnB needs the
+            # same duplication for shard-local QuantState metadata.
+            quant_states[2] = deepcopy(quant_states[1])
+
+        return stacked_quant_state_dict
+
+    patched_stack_quantization_states._unsloth_gemma4_k_eq_v_patch = True
+    BitsAndBytesModelLoader._stack_quantization_states = (
+        patched_stack_quantization_states
+    )
 pass
 
 
