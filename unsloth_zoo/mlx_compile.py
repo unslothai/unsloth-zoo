@@ -763,6 +763,74 @@ def _patch_method(cls, name, fn):
     setattr(cls, name, fn)
 
 
+def _install_safe_fused_sdpa_mask_patches():
+    """Work around MLX SDPA NaN gradients on fully masked query rows.
+
+    Patch `mx.fast.scaled_dot_product_attention` itself so every direct caller
+    in mlx-vlm inherits the fix, including `ensure_fused_sdpa` and models that
+    invoke the fast kernel directly.
+
+    The upstream failure mode is:
+    - additive float mask
+    - one or more query rows entirely masked (all `-inf`)
+    - finite forward output, non-finite backward gradients
+
+    Preserve the intended semantics by:
+    1. clearing fully masked rows in the additive mask before SDPA
+    2. zeroing the corresponding output rows after SDPA
+    """
+    fast_ns = getattr(mx, "fast", None)
+    current = getattr(fast_ns, "scaled_dot_product_attention", None) if fast_ns is not None else None
+    if current is None or getattr(fast_ns, "_unsloth_safe_sdpa_mask_patch", False):
+        return
+
+    original_fast_sdpa = current
+
+    @mx.compile
+    def safe_scaled_dot_product_attention(q, k, v, scale=1.0, mask=None, **kwargs):
+        row_all_masked = None
+        if mask is not None and hasattr(mask, "dtype") and mx.issubdtype(mask.dtype, mx.floating):
+            # MLX's fused SDPA backward is unstable when an additive float mask
+            # contains one or more query rows that are entirely masked out with
+            # negative infinity (every key position is -inf for that query
+            # row). Forward remains
+            # finite, but gradients can become NaN.
+            #
+            # Semantically those rows should contribute zero output because the
+            # query is padding / otherwise invalid. Preserve that meaning by:
+            # 1. clearing the all-masked rows before calling SDPA, avoiding the
+            #    upstream backward bug
+            # 2. explicitly zeroing those rows in the output afterward
+            #
+            # This only applies to additive float masks with true -inf rows.
+            # Large finite negative biases (for example -1e9 or -1e30) are
+            # valid finite masks with non-zero semantics and must pass through
+            # unchanged.
+            row_all_masked = mx.all(
+                mx.logical_and(mx.logical_not(mx.isfinite(mask)), mask < 0),
+                axis=-1,
+            )
+            mask = mx.where(
+                mx.expand_dims(row_all_masked, axis=-1),
+                mx.zeros_like(mask),
+                mask,
+            )
+
+        out = original_fast_sdpa(q, k, v, scale=scale, mask=mask, **kwargs)
+        if row_all_masked is not None:
+            # Restore the intended zero-output semantics for fully masked query
+            # rows after the SDPA call.
+            out = mx.where(
+                mx.expand_dims(row_all_masked, axis=-1),
+                mx.zeros_like(out),
+                out,
+            )
+        return out
+
+    fast_ns.scaled_dot_product_attention = safe_scaled_dot_product_attention
+    fast_ns._unsloth_safe_sdpa_mask_patch = True
+
+
 def _merge_special_token_features(
     image_token_id,
     video_token_id,
@@ -2536,6 +2604,7 @@ def _install_gemma3n_compile_patches():
     try:
         module = importlib.import_module("mlx_vlm.models.gemma3n.gemma3n")
         vision_module = importlib.import_module("mlx_vlm.models.gemma3n.vision")
+        language_module = importlib.import_module("mlx_vlm.models.gemma3n.language")
         kernels_module = importlib.import_module("mlx_vlm.models.kernels")
     except Exception:
         return
@@ -2562,33 +2631,129 @@ def _install_gemma3n_compile_patches():
             resized_inputs.append(tensor)
 
         channel_cat_imgs = mx.concatenate(resized_inputs, axis=1)
-        img = self.ffn(channel_cat_imgs.transpose(0, 2, 3, 1))
+        img = self.ffn(channel_cat_imgs.swapaxes(1, 3)).swapaxes(1, 3)
 
         if any(
             expected != actual
             for expected, actual in zip(high_resolution, self.output_resolution)
         ):
-            img_nchw = img.transpose(0, 3, 1, 2)
             if (
                 high_resolution[0] % self.output_resolution[0] != 0
                 or high_resolution[1] % self.output_resolution[1] != 0
             ):
-                img_nchw = kernels_module._bicubic_interpolate_mlx(
-                    img_nchw,
+                img = kernels_module._bicubic_interpolate_mlx(
+                    img,
                     self.output_resolution[0],
                     self.output_resolution[1],
                 )
             else:
                 h_strides = high_resolution[0] // self.output_resolution[0]
                 w_strides = high_resolution[1] // self.output_resolution[1]
-                img_nchw = nn.AvgPool2d(
+                img = nn.AvgPool2d(
                     kernel_size=(h_strides, w_strides),
                     stride=(h_strides, w_strides),
-                )(img_nchw)
-            img = img_nchw.transpose(0, 2, 3, 1)
+                )(img.swapaxes(1, 3))
             img = self.norm(img) if self.noskip else img
 
         return img
+
+    def _safe_branch_magnitude(x):
+        # Gemma3n's AltUp branch rescaling squares hidden states to estimate an
+        # RMS magnitude. In fp16, some finite branch activations exceed the
+        # range where squaring remains finite, so `x ** 2` overflows even
+        # though `x` itself is still valid. Compute the magnitude in float32
+        # and cast back afterward to preserve the intended rescaling.
+        return (mx.mean(x.astype(mx.float32) ** 2, axis=-1, keepdims=True) ** 0.5)
+
+    def patched_gemma3model_call(
+        self,
+        inputs=None,
+        inputs_embeds=None,
+        mask=None,
+        cache=None,
+        **kwargs,
+    ):
+        min_scale = mx.array(mx.finfo(mx.float32).eps, dtype=mx.float32)
+        per_layer_inputs = kwargs.pop("per_layer_inputs", None)
+        n_to_process = kwargs.pop("n_to_process", None)
+
+        if inputs_embeds is None:
+            h = self.embed_tokens(inputs) * (self.hidden_size**0.5)
+        else:
+            h = inputs_embeds
+
+        if per_layer_inputs is None and inputs is not None:
+            per_layer_inputs = self.get_per_layer_inputs(inputs)
+        elif per_layer_inputs is not None:
+            target_len = n_to_process if n_to_process is not None else h.shape[1]
+            if target_len != h.shape[1]:
+                target_len = h.shape[1]
+
+            cache_offset = next(
+                (
+                    int(c.offset)
+                    for c in (cache or [])
+                    if c is not None and hasattr(c, "offset")
+                ),
+                0,
+            )
+            max_start = max(per_layer_inputs.shape[1] - target_len, 0)
+            start = min(cache_offset, max_start)
+            per_layer_inputs = per_layer_inputs[:, start : start + target_len]
+
+        per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        if mask is None:
+            full_mask = language_module.create_attention_mask(
+                h,
+                cache[self.first_full_idx :],
+            )
+            sliding_window_mask = language_module.create_attention_mask(
+                h,
+                cache[self.first_sliding_idx :],
+            )
+        h0 = h
+
+        target_magnitude = _safe_branch_magnitude(h0)
+
+        h_list = [h0]
+        h_list.extend([proj(h0) for proj in self.altup_projections])
+        h = mx.stack(h_list, axis=0)
+        mags = _safe_branch_magnitude(h[1:])
+        scale = target_magnitude / mx.maximum(mags, min_scale)
+        h = mx.concatenate([h[:1], h[1:] * scale.astype(h.dtype)], axis=0)
+
+        for i, layer in enumerate(self.layers):
+            per_layer_input = per_layer_inputs[:, :, i, :]
+
+            is_global = self.config.layer_types[i] == "full_attention"
+
+            local_mask = mask
+            if mask is None and is_global:
+                local_mask = full_mask
+            elif mask is None:
+                local_mask = sliding_window_mask
+
+            h = layer(
+                h,
+                local_mask,
+                cache[self.layer_idx_to_cache_idx[i]],
+                per_layer_input,
+            )
+
+        target_magnitude = _safe_branch_magnitude(h[0])
+        head = h[:1]
+        tail = [proj(h[i + 1]) for i, proj in enumerate(self.altup_unembed_projections)]
+        tail = mx.stack(tail, axis=0)
+        mags = _safe_branch_magnitude(tail)
+        scale = target_magnitude / mx.maximum(mags, min_scale)
+        h = mx.concatenate([head, tail * scale.astype(tail.dtype)], axis=0)
+
+        h = mx.mean(h, axis=0)
+        return self.norm(h)
 
     module.masked_scatter = _masked_scatter_no_numpy
     _patch_staticmethod(
@@ -2600,6 +2765,11 @@ def _install_gemma3n_compile_patches():
         vision_module.MobileNetV5MultiScaleFusionAdapter,
         "__call__",
         patched_msfa_call,
+    )
+    _patch_method(
+        language_module.Gemma3Model,
+        "__call__",
+        patched_gemma3model_call,
     )
     _PATCHED_ARCHES.add("gemma3n")
 
@@ -3595,6 +3765,9 @@ def install_mlx_compile_patches():
     global _PATCHES_INSTALLED
     if _PATCHES_INSTALLED:
         return build_compile_qualifications()
+
+    _install_safe_fused_sdpa_mask_patches()
+    _PATCHED_PATTERN_BUNDLES.add("safe_fused_sdpa_mask")
 
     for bundle in list_compile_pattern_bundles():
         bundle.installer()

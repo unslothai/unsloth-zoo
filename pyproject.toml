@@ -34,6 +34,7 @@ dependencies = [
     # --- MLX-only deps (macOS arm64) ---
     "mlx>=0.22.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     "mlx-lm>=0.22.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "mlx-vlm>=0.4.4 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
     "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",

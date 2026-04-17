@@ -184,6 +184,74 @@ def _fix_gemma4_kv_sharing(model):
           f"({n_shared} shared layers now read correct K/V).")
 
 
+def _fp16_needs_bf16_modules(model):
+    """Return modules that should stay bf16 under fp16 training.
+
+    Some Pixtral/Mistral3-family VLMs emit vision hidden states above fp16's
+    finite range on real OCR-style images. The projector output remains small,
+    but the selected vision features can exceed 65,504 before projection, so
+    a plain `model.set_dtype(mx.float16)` overflows inside get_input_embeddings.
+
+    Gemma3n has a different fp16 failure mode in the text backbone: its AltUp
+    branch mixing is numerically stable in bf16 but still produces non-finite
+    gradients in fp16 on real training batches.
+    """
+    model_module = type(model).__module__
+    vision_tower = getattr(model, "vision_tower", None)
+    vision_module = type(vision_tower).__module__ if vision_tower is not None else ""
+
+    modules = []
+    if (
+        "mlx_vlm.models.mistral3.mistral3" in model_module
+        or "mlx_vlm.models.pixtral" in vision_module
+    ):
+        if vision_tower is not None:
+            modules.append(vision_tower)
+
+        for attr in ("multi_modal_projector", "mm_projector", "connector", "aligner"):
+            module = getattr(model, attr, None)
+            if module is not None:
+                modules.append(module)
+                break
+
+    if "mlx_vlm.models.gemma3n.gemma3n" in model_module:
+        language_model = getattr(model, "language_model", None)
+        if language_model is not None:
+            modules.append(language_model)
+
+    return tuple(modules)
+
+
+def _patch_mixed_precision_set_dtype(model):
+    """Patch set_dtype so unstable fp16 vision towers keep a safer dtype."""
+    if getattr(model, "_unsloth_mixed_precision_set_dtype_patched", False):
+        return
+
+    original_set_dtype = model.set_dtype
+
+    def patched_set_dtype(self, dtype):
+        result = original_set_dtype(dtype)
+
+        try:
+            import mlx.core as mx
+        except ImportError:
+            return result
+
+        safe_modules = _fp16_needs_bf16_modules(self)
+        if dtype == mx.float16 and safe_modules:
+            for module in safe_modules:
+                if hasattr(module, "set_dtype"):
+                    module.set_dtype(mx.bfloat16)
+            self._unsloth_vision_precision_override = "bf16"
+        else:
+            self._unsloth_vision_precision_override = None
+
+        return result
+
+    model.set_dtype = types.MethodType(patched_set_dtype, model)
+    model._unsloth_mixed_precision_set_dtype_patched = True
+
+
 # ---------------------------------------------------------------------------
 # Runtime VLM quantization via monkey-patching mlx_vlm.utils.load_model
 # ---------------------------------------------------------------------------
@@ -524,6 +592,7 @@ class FastMLXModel:
                 )
                 model._is_vlm_model = True
                 model._processor = tokenizer_or_processor
+                _patch_mixed_precision_set_dtype(model)
             elif chat_template is not None:
                 from .mlx_utils import normalize_mlx_chat_template
 
@@ -621,6 +690,7 @@ class FastMLXModel:
             model._unsloth_compile_trait_report = get_compile_trait_report(model)
             model._unsloth_compile_qualification = get_compile_qualification(model)
             model._unsloth_compile_backend_qualifications = get_backend_compile_qualifications(model)
+            _patch_mixed_precision_set_dtype(model)
 
             _patch_mlx_saving(model, processor)
             return model, processor
