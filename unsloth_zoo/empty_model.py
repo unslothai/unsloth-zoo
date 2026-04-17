@@ -32,7 +32,7 @@ import os
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
-from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config
+from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
 
 def is_comparable(val):
     # Don't treat tensors as comparable, only basic types
