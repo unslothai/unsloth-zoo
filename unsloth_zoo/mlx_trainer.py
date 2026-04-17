@@ -719,7 +719,10 @@ class MLXTrainer:
                                 "Unsloth: strict mx.compile was enabled for this VLM "
                                 "and runtime fallback is disabled."
                             ) from e
-                        print("Unsloth: mx.compile not supported for this VLM, falling back to eager mode.")
+                        print(
+                            "Unsloth: mx.compile failed at runtime for this VLM; "
+                            "falling back to eager mode."
+                        )
                         step_fn = _uncompiled_step_fn
                         _use_compile = False
                         state = [model.state, optimizer.state, mx.random.state]

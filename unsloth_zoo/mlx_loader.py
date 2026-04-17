@@ -260,6 +260,23 @@ _original_vlm_load_model = None
 _vlm_prompt_utils_patched = False
 _original_vlm_apply_chat_template = None
 
+_MULTIMODAL_ITEM_TYPES = frozenset(
+    {
+        "image",
+        "image_url",
+        "input_image",
+        "audio",
+        "input_audio",
+        "video",
+    }
+)
+_NON_USER_ROLES = frozenset({"system", "assistant"})
+_ROLE_PROMPT_NAMES = {
+    "user": "Human",
+    "assistant": "Assistant",
+    "system": "System",
+}
+
 # Fragments that identify multimodal sub-networks we must *never* quantize.
 _MULTIMODAL_SKIP_FRAGMENTS = (
     "lm_head", "embed_tokens",
@@ -380,14 +397,7 @@ def _content_has_structured_multimodal_markers(content):
 
     if isinstance(content, dict):
         item_type = str(content.get("type", "")).lower()
-        if item_type in {
-            "image",
-            "image_url",
-            "input_image",
-            "audio",
-            "input_audio",
-            "video",
-        }:
+        if item_type in _MULTIMODAL_ITEM_TYPES:
             return True
         nested = content.get("content", None)
         if nested is not None and nested is not content:
@@ -415,10 +425,27 @@ def _normalize_prompt_messages(prompt_utils_module, prompt):
     return messages
 
 
-def _build_stable_media_messages(
+def _messages_have_structured_multimodal_content(messages):
+    """Return True when any normalized message already carries media markers."""
+    return any(
+        _content_has_structured_multimodal_markers(message.get("content", ""))
+        for message in messages
+    )
+
+
+def _first_media_user_message_index(messages):
+    """Return the first user-like turn that should own conversation-level media."""
+    for i, message in enumerate(messages):
+        role = str(message.get("role", "user")).lower()
+        if role not in _NON_USER_ROLES:
+            return i
+    return -1
+
+
+def _anchor_conversation_media_to_first_user_turn(
     prompt_utils_module,
     model_type,
-    prompt,
+    messages,
     *,
     num_images,
     num_audios,
@@ -431,51 +458,30 @@ def _build_stable_media_messages(
     during multi-turn chat, which breaks prompt-cache reuse for models like
     Qwen3.5 that pre-compute multimodal rope positions from the full prompt.
     """
-    target_idx = -1
-    for i, item in enumerate(prompt):
-        if isinstance(item, str):
-            target_idx = i
-            break
-        role_content = prompt_utils_module._get_role_content(item)
-        if role_content is not None and role_content[0] not in ("system", "assistant"):
-            target_idx = i
-            break
+    target_idx = _first_media_user_message_index(messages)
+    if target_idx < 0:
+        return messages
 
-    messages = []
-    for i, item in enumerate(prompt):
-        is_target = i == target_idx
-        if isinstance(item, str):
-            messages.append(
-                prompt_utils_module.get_message_json(
-                    model_type,
-                    item,
-                    skip_image_token=not is_target,
-                    skip_audio_token=not is_target,
-                    num_images=num_images,
-                    num_audios=num_audios,
-                    **kwargs,
-                )
-            )
-            continue
-
-        role_content = prompt_utils_module._get_role_content(item)
-        if role_content is None:
-            continue
-        role, content = role_content
-        content = prompt_utils_module.extract_text_from_content(content)
-        messages.append(
+    anchored = []
+    for i, message in enumerate(messages):
+        role = str(message.get("role", "user"))
+        content = prompt_utils_module.extract_text_from_content(
+            message.get("content", "")
+        )
+        is_target = i == target_idx and role.lower() not in _NON_USER_ROLES
+        anchored.append(
             prompt_utils_module.get_message_json(
                 model_type,
                 content,
                 role,
-                skip_image_token=not is_target or role in ["system", "assistant"],
-                skip_audio_token=not is_target or role in ["system", "assistant"],
+                skip_image_token=not is_target,
+                skip_audio_token=not is_target,
                 num_images=num_images,
                 num_audios=num_audios,
                 **kwargs,
             )
         )
-    return messages
+    return anchored
 
 
 def _get_vlm_image_token(processor):
@@ -490,7 +496,13 @@ def _get_vlm_image_token(processor):
     return "<image>"
 
 
-def _flatten_multimodal_content_for_prompt(content, image_token, *, audio_token="<audio>", video_token="<video>"):
+def _flatten_multimodal_content_for_prompt(
+    content,
+    image_token,
+    *,
+    audio_token="<audio>",
+    video_token="<video>",
+):
     """Flatten OpenAI-style multimodal content into a plain prompt string."""
     if isinstance(content, str):
         return content
@@ -538,36 +550,114 @@ def _flatten_multimodal_content_for_prompt(content, image_token, *, audio_token=
     return str(content) if content is not None else ""
 
 
-def _build_qwen2_vl_fallback_prompt(processor, prompt, *, add_generation_prompt):
-    """Manual chat fallback for Qwen2-VL when its tokenizer template returns empty."""
+def _build_role_prompt_fallback(processor, messages, *, add_generation_prompt):
+    """Render a plain role-prefixed prompt while preserving media markers."""
     image_token = f"<|vision_start|>{_get_vlm_image_token(processor)}<|vision_end|>"
-
-    normalized = []
-    for item in prompt:
-        if isinstance(item, str):
-            normalized.append(("user", item))
-            continue
-        if isinstance(item, dict):
-            normalized.append((item.get("role", "user"), item.get("content", "")))
-            continue
-        role = getattr(item, "role", "user")
-        content = getattr(item, "content", str(item))
-        normalized.append((role, content))
-
     lines = []
-    role_map = {
-        "user": "Human",
-        "assistant": "Assistant",
-        "system": "System",
-    }
-    for role, content in normalized:
+    for message in messages:
+        role = str(message.get("role", "user"))
+        content = message.get("content", "")
         flattened = _flatten_multimodal_content_for_prompt(content, image_token)
-        prefix = role_map.get(role, role.capitalize())
+        prefix = _ROLE_PROMPT_NAMES.get(role.lower(), role.capitalize())
         lines.append(f"{prefix}: {flattened}" if flattened else f"{prefix}:")
 
     if add_generation_prompt:
         lines.append("Assistant:")
     return "\n".join(lines).strip()
+
+
+_EMPTY_VLM_CHAT_TEMPLATE_FALLBACKS = {
+    # Upstream Qwen2-VL MLX template expects a flat content list instead of
+    # standard role-wrapped chat messages, so normal chat rendering can return
+    # an empty string. Fall back to a simple role-prefixed prompt instead.
+    "qwen2_vl": _build_role_prompt_fallback,
+}
+
+
+def _render_empty_template_fallback(model_type, processor, messages, *, add_generation_prompt):
+    """Render a model-specific fallback when an upstream template is unusable."""
+    builder = _EMPTY_VLM_CHAT_TEMPLATE_FALLBACKS.get(model_type)
+    if builder is None:
+        return None
+    return builder(
+        processor,
+        messages,
+        add_generation_prompt=add_generation_prompt,
+    )
+
+
+def _prepare_vlm_template_messages(
+    prompt_utils_module,
+    model_type,
+    prompt,
+    *,
+    num_images,
+    num_audios,
+    kwargs,
+):
+    """Normalize prompt input and apply the smallest rewrite needed for VLM chat.
+
+    There are two cases where we bypass mlx-vlm's higher-level helper and render
+    messages ourselves:
+    1. The prompt already uses structured multimodal content and must survive
+       intact instead of being flattened back to plain text.
+    2. The caller passes conversation-level `num_images` / `num_audios`. In
+       that case we anchor those media tokens to the first user turn so prompt
+       cache reuse does not silently change rope positions between turns.
+    """
+    prompt_items = prompt if isinstance(prompt, list) else [prompt]
+    normalized_messages = _normalize_prompt_messages(prompt_utils_module, prompt_items)
+    has_structured_multimodal = _messages_have_structured_multimodal_content(
+        normalized_messages
+    )
+    needs_media_anchor = (
+        not has_structured_multimodal and (num_images > 0 or num_audios > 0)
+    )
+
+    template_messages = normalized_messages
+    if needs_media_anchor:
+        template_messages = _anchor_conversation_media_to_first_user_turn(
+            prompt_utils_module,
+            model_type,
+            normalized_messages,
+            num_images=num_images,
+            num_audios=num_audios,
+            kwargs=kwargs,
+        )
+
+    return normalized_messages, template_messages, (
+        has_structured_multimodal or needs_media_anchor
+    )
+
+
+def _render_vlm_template_or_fallback(
+    prompt_utils_module,
+    model_type,
+    processor,
+    messages,
+    *,
+    add_generation_prompt,
+    kwargs,
+):
+    """Render a message list, falling back only when the upstream template is empty."""
+    rendered = prompt_utils_module.get_chat_template(
+        processor,
+        messages,
+        add_generation_prompt,
+        **kwargs,
+    )
+    if isinstance(rendered, str) and rendered.strip():
+        return rendered
+
+    fallback = _render_empty_template_fallback(
+        model_type,
+        processor,
+        messages,
+        add_generation_prompt=add_generation_prompt,
+    )
+    if fallback is not None:
+        return fallback
+    return rendered
 
 
 def _ensure_vlm_prompt_utils_patched():
@@ -595,8 +685,8 @@ def _ensure_vlm_prompt_utils_patched():
         config_data = config if isinstance(config, dict) else config.__dict__
         model_type = config_data["model_type"]
 
-        if model_type == "qwen2_vl" and isinstance(prompt, (dict, list)):
-            rendered = _original_vlm_apply_chat_template(
+        if not isinstance(prompt, (dict, list)):
+            return _original_vlm_apply_chat_template(
                 processor,
                 config,
                 prompt,
@@ -606,67 +696,30 @@ def _ensure_vlm_prompt_utils_patched():
                 num_audios=num_audios,
                 **kwargs,
             )
+
+        normalized_messages, template_messages, needs_custom_render = (
+            _prepare_vlm_template_messages(
+                prompt_utils,
+                model_type,
+                prompt,
+                num_images=num_images,
+                num_audios=num_audios,
+                kwargs=kwargs,
+            )
+        )
+        if needs_custom_render:
             if return_messages:
-                return rendered
-            if isinstance(rendered, str) and rendered.strip():
-                return rendered
-            prompt_items = prompt if isinstance(prompt, list) else [prompt]
-            return _build_qwen2_vl_fallback_prompt(
+                return template_messages
+            return _render_vlm_template_or_fallback(
+                prompt_utils,
+                model_type,
                 processor,
-                prompt_items,
+                template_messages,
                 add_generation_prompt=add_generation_prompt,
+                kwargs=kwargs,
             )
 
-        if isinstance(prompt, dict):
-            content = prompt.get("content", "")
-            if _content_has_structured_multimodal_markers(content):
-                messages = [{"role": prompt.get("role", "user"), "content": content}]
-                if return_messages:
-                    return messages
-                return prompt_utils.get_chat_template(
-                    processor,
-                    messages,
-                    add_generation_prompt,
-                    **kwargs,
-                )
-
-        if isinstance(prompt, list):
-            normalized_messages = _normalize_prompt_messages(prompt_utils, prompt)
-            has_structured_multimodal = any(
-                _content_has_structured_multimodal_markers(
-                    message.get("content", "")
-                )
-                for message in normalized_messages
-            )
-            if has_structured_multimodal:
-                if return_messages:
-                    return normalized_messages
-                return prompt_utils.get_chat_template(
-                    processor,
-                    normalized_messages,
-                    add_generation_prompt,
-                    **kwargs,
-                )
-
-            if (num_images > 0 or num_audios > 0) and len(normalized_messages) > 1:
-                messages = _build_stable_media_messages(
-                    prompt_utils,
-                    model_type,
-                    prompt,
-                    num_images=num_images,
-                    num_audios=num_audios,
-                    kwargs=kwargs,
-                )
-                if return_messages:
-                    return messages
-                return prompt_utils.get_chat_template(
-                    processor,
-                    messages,
-                    add_generation_prompt,
-                    **kwargs,
-                )
-
-        return _original_vlm_apply_chat_template(
+        rendered = _original_vlm_apply_chat_template(
             processor,
             config,
             prompt,
@@ -675,6 +728,17 @@ def _ensure_vlm_prompt_utils_patched():
             num_images=num_images,
             num_audios=num_audios,
             **kwargs,
+        )
+        if return_messages or not (isinstance(rendered, str) and not rendered.strip()):
+            return rendered
+
+        return _render_vlm_template_or_fallback(
+            prompt_utils,
+            model_type,
+            processor,
+            normalized_messages,
+            add_generation_prompt=add_generation_prompt,
+            kwargs=kwargs,
         )
 
     prompt_utils.apply_chat_template = patched_apply_chat_template
