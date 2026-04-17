@@ -36,7 +36,7 @@ Usage mirrors TRL notebooks:
     trainer.train()
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 import concurrent.futures
 import math
 import os
@@ -69,9 +69,12 @@ from .mlx_utils import (
 )
 from .mlx_compile import (
     build_compile_policy,
+    explain_compile_support,
     get_compile_qualification,
     get_model_architecture,
+    normalize_mlx_patch_mode,
     resolve_training_compile,
+    trace_compile_application,
 )
 
 
@@ -119,6 +122,9 @@ class MLXTrainingConfig:
     compile_mode: str = "best_effort"  # "best_effort", "strict", "eager"
     compile_arch_overrides: dict[str, str] | None = None
     compile_backend_overrides: dict[str, str] | None = None
+    patch_mode: str = "patched"  # "patched" runs the MLX compile monkey patches, "unpatched" forces eager baseline mode.
+    compile_auto_tune: bool = True
+    compile_trace: bool = True
     gradient_checkpointing: bool = True
     streaming: bool = False  # Use streaming iterator instead of materializing batches
 
@@ -204,6 +210,20 @@ class MLXTrainer:
         fn(step, eval_loss, perplexity)
         """
         self._eval_callbacks.append(fn)
+
+    @staticmethod
+    def _apply_compile_recommendations(args, decision):
+        """Apply safe compile setting recommendations to the active args object."""
+
+        applied = []
+        if decision is None:
+            return applied
+        for rec in getattr(decision, "setting_recommendations", ()):
+            if rec.setting == "gradient_checkpointing" and args.compile_auto_tune:
+                if bool(getattr(args, "gradient_checkpointing", True)) is False:
+                    args.gradient_checkpointing = bool(rec.recommended_value)
+                    applied.append((rec.setting, rec.recommended_value, rec.reason))
+        return applied
 
     @staticmethod
     def _ensure_lora_frozen(model):
@@ -403,6 +423,32 @@ class MLXTrainer:
         """
         args = self.args
         model = self.model
+        args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
+        model._unsloth_patch_mode = args.patch_mode
+
+        self._compile_decision = None
+        self._compile_trace = None
+        self._compile_auto_tune_applied = []
+        if self._is_vlm and (args.compile or args.compile_trace):
+            compile_policy = build_compile_policy(args=args)
+            qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
+            if qual is not None:
+                model._unsloth_compile_qualification = qual
+            self._compile_decision = resolve_training_compile(model, policy=compile_policy, args=args)
+            model._unsloth_compile_decision = self._compile_decision
+            if args.compile_trace:
+                self._compile_trace = trace_compile_application(model, policy=compile_policy, args=args)
+                model._unsloth_compile_trace = self._compile_trace
+                model._unsloth_compile_explain = explain_compile_support(model, policy=compile_policy, args=args)
+            if args.compile_auto_tune:
+                self._compile_auto_tune_applied = self._apply_compile_recommendations(
+                    args, self._compile_decision
+                )
+                for setting, value, reason in self._compile_auto_tune_applied:
+                    print(
+                        f"Unsloth: Auto-tuned {setting}={value!r} for MLX compile "
+                        f"({reason})"
+                    )
 
         # Set wired memory limit (reduces page faults)
         if mx.metal.is_available():
@@ -580,14 +626,27 @@ class MLXTrainer:
                 return lvalue, toks, (grad, toks_f)
 
         compile_policy = build_compile_policy(args=args)
-        _compile_decision = None
+        _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = compile_policy.mode != "eager"
         if is_vlm and _use_compile:
             qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
             if qual is not None:
                 model._unsloth_compile_qualification = qual
-            _compile_decision = resolve_training_compile(model, policy=compile_policy)
+            if _compile_decision is None:
+                _compile_decision = resolve_training_compile(model, policy=compile_policy, args=args)
             model._unsloth_compile_decision = _compile_decision
+            if getattr(args, "compile_trace", True):
+                self._compile_trace = getattr(self, "_compile_trace", None) or trace_compile_application(
+                    model,
+                    policy=compile_policy,
+                    args=args,
+                )
+                model._unsloth_compile_trace = self._compile_trace
+                model._unsloth_compile_explain = explain_compile_support(
+                    model,
+                    policy=compile_policy,
+                    args=args,
+                )
             if _compile_decision.should_raise:
                 raise ValueError(
                     f"Unsloth: strict mx.compile requested for VLM arch "
@@ -600,6 +659,10 @@ class MLXTrainer:
                     f"'{_compile_decision.arch}' during training; using eager mode "
                     f"({_compile_decision.reason})."
                 )
+                if getattr(model, "_unsloth_compile_explain", None):
+                    print("Unsloth: Compile trace summary:")
+                    for line in model._unsloth_compile_explain.splitlines():
+                        print(f"  {line}")
                 _use_compile = False
         if _use_compile:
             _uncompiled_step_fn = step_fn
@@ -655,6 +718,8 @@ class MLXTrainer:
             features.append("GC")
         if _use_compile:
             features.append("compile")
+        elif _compile_decision is not None:
+            features.append(f"compile={_compile_decision.support_state}")
         if use_lora_plus:
             features.append(f"LoRA+(r={lora_plus_ratio})")
         features.append(f"LR={args.lr_scheduler_type}")
@@ -669,6 +734,10 @@ class MLXTrainer:
               f"grad_accum={grad_accum}, "
               f"seq_len={args.max_seq_length}")
         print(f"Unsloth: Features: {', '.join(features)}")
+        if _compile_decision is not None and _compile_decision.setting_recommendations:
+            print("Unsloth: Compile recommendations:")
+            for rec in _compile_decision.setting_recommendations:
+                print(f"  - {rec.setting}={rec.recommended_value!r}: {rec.reason}")
 
         # Training loop — mlx-lm pattern
         model.train()
@@ -867,6 +936,23 @@ class MLXTrainer:
             "train_samples_per_second": (
                 trained_tokens / total_time if total_time > 0 else 0
             ),
+            "compile_enabled": bool(_use_compile),
+            "compile_support_state": (
+                _compile_decision.support_state if _compile_decision is not None else "n/a"
+            ),
+            "compile_reason": (
+                _compile_decision.reason if _compile_decision is not None else ""
+            ),
+            "compile_policy_mode": (
+                _compile_decision.policy_mode if _compile_decision is not None else compile_policy.mode
+            ),
+            "patch_mode": getattr(self.args, "patch_mode", "patched"),
+            "compile_trace": (
+                asdict(self._compile_trace)
+                if is_dataclass(getattr(self, "_compile_trace", None))
+                else getattr(self, "_compile_trace", None)
+            ),
+            "compile_auto_tune_applied": list(getattr(self, "_compile_auto_tune_applied", [])),
         }
 
     def _prepare_text_data(self):

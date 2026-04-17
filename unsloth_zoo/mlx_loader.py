@@ -28,10 +28,13 @@ import types
 import warnings
 
 from .mlx_compile import (
+    explain_compile_support,
     get_compile_qualification,
     get_compile_trait_report,
     get_backend_compile_qualifications,
     install_mlx_compile_patches,
+    normalize_mlx_patch_mode,
+    trace_compile_application,
 )
 
 _vlm_model_types_cache = None
@@ -895,6 +898,7 @@ class FastMLXModel:
         token=None,
         trust_remote_code=False,
         text_only=None,
+        patch_mode="patched",
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -919,6 +923,7 @@ class FastMLXModel:
             )
 
         chat_template = kwargs.pop("chat_template", None)
+        patch_mode = normalize_mlx_patch_mode(kwargs.pop("patch_mode", patch_mode))
 
         # Step 1: Download config to decide loading path
         try:
@@ -999,6 +1004,7 @@ class FastMLXModel:
             model._hf_repo = model_name
             model._src_path = local_path
             model.max_seq_length = max_seq_length
+            model._unsloth_patch_mode = patch_mode
             _patch_mlx_saving(model, tokenizer_or_processor)
             return model, tokenizer_or_processor
 
@@ -1035,7 +1041,8 @@ class FastMLXModel:
                     stacklevel=2,
                 )
 
-            install_mlx_compile_patches()
+            if patch_mode == "patched":
+                install_mlx_compile_patches()
             _ensure_vlm_prompt_utils_patched()
 
             already_quantized = _vlm_config_is_already_quantized(config_data)
@@ -1079,9 +1086,12 @@ class FastMLXModel:
             model._hf_repo = model_name
             model._src_path = local_path
             model.max_seq_length = max_seq_length
+            model._unsloth_patch_mode = patch_mode
             model._unsloth_compile_trait_report = get_compile_trait_report(model)
             model._unsloth_compile_qualification = get_compile_qualification(model)
             model._unsloth_compile_backend_qualifications = get_backend_compile_qualifications(model)
+            model._unsloth_compile_trace = trace_compile_application(model)
+            model._unsloth_compile_explain = explain_compile_support(model)
             _patch_mixed_precision_set_dtype(model)
 
             _patch_mlx_saving(model, processor)
@@ -1110,6 +1120,7 @@ class FastMLXModel:
             model._hf_repo = model_name
             model._src_path = local_path
             model.max_seq_length = max_seq_length
+            model._unsloth_patch_mode = patch_mode
 
             _patch_mlx_saving(model, tokenizer)
             return model, tokenizer

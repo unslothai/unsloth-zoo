@@ -254,20 +254,24 @@ class MLXVLMTraitReport:
 class CompilePatternBundle:
     """A reusable compile patch bundle keyed by architecture traits.
 
-    Each bundle owns:
-    - a human-readable name and description
-    - a matcher that decides whether an architecture likely needs the bundle
-    - an installer that applies the runtime monkey patches
+    The bundle registry is intentionally declarative. A bundle describes:
+    - how to recognize a family via `matcher`
+    - which semantic patch primitives it needs
+    - which thin family adapter explains method/contract differences
+    - which runtime patch primitives implement the monkey patches
 
-    The matcher is intentionally separate from verification. A bundle can be a
-    candidate for an architecture before that architecture is considered
-    compile-ready.
+    Installation happens through a generic patch-plan executor rather than
+    through per-architecture installer dispatch. That keeps the public surface
+    easy to trace even when a runtime primitive still needs specialized code
+    under the hood.
     """
 
     name: str
     description: str
     matcher: Callable[[str, MLXVLMTraitReport], bool]
-    installer: Callable[[], None]
+    primitive_names: tuple[str, ...] = ()
+    adapter_name: str | None = None
+    runtime_primitive_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -292,6 +296,9 @@ class ResolvedTrainingCompileDecision:
     reason: str
     qualification: "MLXVLMCompileQualification | None"
     backend_qualifications: tuple["MLXVLMCompileQualification", ...] = ()
+    support_state: str = "unsupported"
+    setting_recommendations: tuple["CompileSettingRecommendation", ...] = ()
+    patch_mode: str = "patched"
 
 
 @dataclass(frozen=True)
@@ -305,9 +312,85 @@ class MLXVLMCompileQualification:
     blocker_categories: tuple[str, ...]
     reason: str
     verification_state: str = "unqualified"
+    support_state: str = "unsupported"
     backend_arches: tuple[str, ...] = ()
     installed_patterns: tuple[str, ...] = ()
     trait_report: MLXVLMTraitReport | None = None
+
+
+@dataclass(frozen=True)
+class CompilePatchPrimitive:
+    """Reusable compile-safe operation shared across multiple model families."""
+
+    name: str
+    description: str
+
+
+@dataclass(frozen=True)
+class CompilePatchAdapter:
+    """Thin family-level contract description for shared patch primitives.
+
+    Adapters should prefer semantic matching over explicit architecture lists.
+    A future family should ideally pick up an existing adapter because it
+    exposes the same source traits or naming convention, not because we added
+    one more architecture string by hand.
+    """
+
+    name: str
+    description: str
+    arch_names: tuple[str, ...] = ()
+    arch_prefixes: tuple[str, ...] = ()
+    required_traits: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CompilePatchPlan:
+    """Resolved patch plan for one matched compile bundle.
+
+    Patch plans are the maintainer-facing bridge between the declarative bundle
+    registry and the actual monkey patches that get applied at runtime.
+    """
+
+    bundle_name: str
+    adapter_name: str | None
+    semantic_primitives: tuple[str, ...]
+    runtime_primitives: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CompileSettingRecommendation:
+    """Recommended or auto-applied training setting for compile stability."""
+
+    setting: str
+    recommended_value: object
+    reason: str
+    auto_applied: bool = False
+
+
+@dataclass(frozen=True)
+class CompileTraceReport:
+    """Machine-readable explanation of compile support for one model or arch."""
+
+    arch: str
+    patch_mode: str
+    backend_arches: tuple[str, ...]
+    verification_state: str
+    support_state: str
+    blocker_categories: tuple[str, ...]
+    pattern_traits: tuple[str, ...]
+    matched_bundles: tuple[str, ...]
+    installed_bundles: tuple[str, ...]
+    patch_primitives: tuple[str, ...]
+    runtime_primitives: tuple[str, ...]
+    adapters: tuple[str, ...]
+    qualification_reason: str
+    decision_mode: str
+    decision_enabled: bool
+    decision_reason: str
+    fallback_allowed: bool
+    strict_requested: bool
+    backend_qualification_arches: tuple[str, ...] = ()
+    recommendations: tuple[CompileSettingRecommendation, ...] = ()
 
 
 def _iter_arch_modules() -> Iterable[tuple[str, Path]]:
@@ -411,6 +494,151 @@ def _verification_state(
     return "unqualified"
 
 
+def _support_state(
+    *,
+    training_ok: bool,
+    generation_ok: bool,
+    patched: bool,
+    matched_patterns: tuple[str, ...] = (),
+) -> str:
+    """Return the user-facing support state for one architecture.
+
+    `supported_inferred` is reserved for architectures where the shared patch
+    system confidently matched reusable patterns, but the family has not yet
+    been promoted to explicitly verified. We still keep runtime compile policy
+    conservative unless verification exists.
+    """
+
+    if training_ok or generation_ok:
+        return "supported_verified"
+    if patched and matched_patterns:
+        return "supported_inferred"
+    if patched:
+        return "patched_unverified"
+    if matched_patterns:
+        return "fallback_only"
+    return "unsupported"
+
+
+@lru_cache(maxsize=1)
+def list_compile_patch_primitives() -> tuple[CompilePatchPrimitive, ...]:
+    """Return the reusable compile-safe primitive registry."""
+
+    return (
+        CompilePatchPrimitive(
+            name="safe_fused_sdpa_mask",
+            description="Protect MLX fused SDPA from NaN gradients on fully masked additive float rows.",
+        ),
+        CompilePatchPrimitive(
+            name="compile_safe_feature_merge",
+            description="Merge placeholder-token multimodal features without NumPy or mutation-heavy scatter.",
+        ),
+        CompilePatchPrimitive(
+            name="compile_safe_masked_scatter",
+            description="Flatten masked-scatter style image/audio insertion into pure MLX array ops.",
+        ),
+        CompilePatchPrimitive(
+            name="segmented_vision_attention",
+            description="Split vision q/k/v by cumulative sequence lengths and run fused SDPA per chunk.",
+        ),
+        CompilePatchPrimitive(
+            name="vision_metadata_normalization",
+            description="Normalize tiny grid/shape/span metadata to immutable Python tuples before compiled array math.",
+        ),
+        CompilePatchPrimitive(
+            name="explicit_position_plumbing",
+            description="Replace mutable or host-side position state with explicit position-id handling.",
+        ),
+        CompilePatchPrimitive(
+            name="cached_image_feature_plumbing",
+            description="Support cached image feature injection through get_input_embeddings paths.",
+        ),
+        CompilePatchPrimitive(
+            name="dtype_normalization",
+            description="Cast pixels, masks, and multimodal features to stable dtypes for compiled training.",
+        ),
+        CompilePatchPrimitive(
+            name="padded_image_filtering",
+            description="Replace Python-side padded image filtering with compile-safe MLX operations.",
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def list_compile_patch_adapters() -> tuple[CompilePatchAdapter, ...]:
+    """Return family-level adapters used by the compile patch registry."""
+
+    return (
+        CompilePatchAdapter(
+            name="qwen_like_merge",
+            description="Families that merge one placeholder token per image or video feature segment.",
+            arch_names=("glm_ocr", "paddleocr_vl"),
+            arch_prefixes=("qwen",),
+            required_traits=("qwen_like_image_merge",),
+        ),
+        CompilePatchAdapter(
+            name="qwen3_deepstack",
+            description="Qwen3 multimodal families that return visual masks and deepstack embeddings.",
+            arch_prefixes=("qwen3",),
+            required_traits=("qwen3_deepstack_multimodal",),
+        ),
+        CompilePatchAdapter(
+            name="single_image_token",
+            description="Wrappers that merge image features through a single placeholder token path.",
+            arch_prefixes=("aya", "llama", "llava", "mistral", "pixtral"),
+            required_traits=("single_image_token_merge",),
+        ),
+        CompilePatchAdapter(
+            name="idefics_family",
+            description="Idefics-style padded-image families with shared multimodal filtering and embedding contracts.",
+            arch_prefixes=("idefics", "smolvlm"),
+            required_traits=("padded_image_filtering",),
+        ),
+        CompilePatchAdapter(
+            name="phi_placeholder_family",
+            description="Families that encode images or audio via placeholder spans in the text stream.",
+            arch_names=("multi_modality",),
+            arch_prefixes=("phi",),
+            required_traits=(
+                "negative_image_placeholders",
+                "expanded_image_placeholders",
+                "phi4_multimodal_spans",
+            ),
+        ),
+        CompilePatchAdapter(
+            name="gemma_vision_family",
+            description="Gemma multimodal families with masked-scatter or multiscale fusion style image insertion.",
+            arch_prefixes=("gemma",),
+            required_traits=("masked_scatter_multimodal", "gemma3n_multiscale_fusion"),
+        ),
+        CompilePatchAdapter(
+            name="ocr_projector_family",
+            description="OCR-oriented vision/projector families with custom image sequence construction.",
+            arch_names=("glm_ocr", "paddleocr_vl"),
+            arch_prefixes=("deepseekocr",),
+            required_traits=("deepseek_ocr_multimodal",),
+        ),
+        CompilePatchAdapter(
+            name="mistral_attention_family",
+            description="Mistral-family backends that need attention or multimodal wrapper compatibility patches.",
+            arch_names=("mistral3", "mistral4", "pixtral", "mllama"),
+            required_traits=("mistral4_attention_backend",),
+        ),
+    )
+
+
+def normalize_mlx_patch_mode(value) -> str:
+    """Normalize compile patch mode for loader, trainer, and test harnesses."""
+
+    mode = str(value or "patched").strip().lower()
+    if mode not in {"patched", "unpatched"}:
+        raise ValueError(
+            "Unsloth: patch_mode must be 'patched' or 'unpatched', "
+            f"got {value!r}."
+        )
+    return mode
+
+
 def _config_get(config, key, default=None):
     if config is None:
         return default
@@ -419,13 +647,56 @@ def _config_get(config, key, default=None):
     return getattr(config, key, default)
 
 
+def _iter_backend_subconfigs(config) -> Iterable[tuple[str, object]]:
+    """Yield likely nested backend configs from an MLX config object.
+
+    The explicit key allowlist keeps the common paths readable and stable, but
+    newer mlx-vlm families may introduce additional `*_config` children. We
+    therefore also scan the config object's visible attributes / mapping keys
+    for nested config-shaped values that advertise a `model_type`.
+    """
+
+    if config is None:
+        return ()
+
+    seen = set()
+    items = []
+
+    def add(name, value) -> None:
+        if value is None or name in seen:
+            return
+        model_type = _config_get(value, "model_type")
+        if not model_type:
+            return
+        seen.add(name)
+        items.append((name, value))
+
+    for key in _BACKEND_CONFIG_KEYS:
+        add(key, _config_get(config, key))
+
+    if isinstance(config, Mapping):
+        for key, value in config.items():
+            if isinstance(key, str) and key.endswith("_config"):
+                add(key, value)
+    else:
+        for key in dir(config):
+            if key.startswith("_") or not key.endswith("_config"):
+                continue
+            try:
+                value = getattr(config, key)
+            except Exception:
+                continue
+            add(key, value)
+
+    return tuple(items)
+
+
 def _extract_backend_arches(config, arch: str | None = None) -> tuple[str, ...]:
     """Extract nested backend model types from an MLX config object."""
 
     backend_arches = []
     seen = set()
-    for key in _BACKEND_CONFIG_KEYS:
-        subconfig = _config_get(config, key)
+    for key, subconfig in _iter_backend_subconfigs(config):
         model_type = _config_get(subconfig, "model_type")
         if not model_type or model_type == arch or model_type in seen:
             continue
@@ -525,6 +796,12 @@ def _build_compile_qualification(
     generation_ok = arch in _VERIFIED_GENERATION_ARCHES
     patched = arch in _PATCHED_ARCHES
     matched_patterns = _matching_pattern_bundle_names(arch, report)
+    support_state = _support_state(
+        training_ok=training_ok,
+        generation_ok=generation_ok,
+        patched=patched,
+        matched_patterns=matched_patterns,
+    )
     installed_patterns = tuple(
         name for name in matched_patterns if name in _PATCHED_PATTERN_BUNDLES
     )
@@ -565,6 +842,7 @@ def _build_compile_qualification(
         blocker_categories=report.blocker_categories,
         reason=reason,
         verification_state=report.verification_state,
+        support_state=support_state,
         backend_arches=report.backend_arches,
         installed_patterns=installed_patterns,
         trait_report=report,
@@ -720,6 +998,113 @@ def _resolve_effective_policy_mode(
     return policy.mode
 
 
+def _arch_matches_prefixes(arch: str, prefixes: tuple[str, ...]) -> bool:
+    return bool(prefixes) and arch.startswith(prefixes)
+
+
+def _adapter_matches(
+    adapter: CompilePatchAdapter,
+    arch: str,
+    report: MLXVLMTraitReport,
+) -> bool:
+    """Return whether a declarative adapter applies to one architecture.
+
+    Adapters intentionally match on multiple signals:
+    - exact architecture names for true exceptions
+    - architecture prefixes for stable family naming
+    - required traits for semantic reuse across future variants
+    """
+
+    if arch in adapter.arch_names:
+        return True
+    if _arch_matches_prefixes(arch, adapter.arch_prefixes):
+        return True
+    if not adapter.required_traits:
+        return False
+    return any(trait in report.pattern_traits for trait in adapter.required_traits)
+
+
+def _adapter_names_for_arch(arch: str, report: MLXVLMTraitReport | None = None) -> tuple[str, ...]:
+    """Return matching adapter names for one architecture."""
+
+    report = report or build_compile_trait_reports().get(arch)
+    if report is None:
+        return ()
+
+    names = []
+    for adapter in list_compile_patch_adapters():
+        if _adapter_matches(adapter, arch, report):
+            names.append(adapter.name)
+    return tuple(dict.fromkeys(names))
+
+
+def _recommend_compile_settings(
+    model_or_arch,
+    *,
+    qualification: MLXVLMCompileQualification | None = None,
+    decision: ResolvedTrainingCompileDecision | None = None,
+    args=None,
+) -> tuple[CompileSettingRecommendation, ...]:
+    """Return compile-aware training setting recommendations.
+
+    Recommendations are intentionally conservative. They target settings that
+    materially affect compiled training stability or memory behavior.
+    """
+
+    arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
+    report = get_compile_trait_report(model_or_arch if arch else "")
+    qualification = qualification or get_compile_qualification(model_or_arch if arch else "")
+    recommendations: list[CompileSettingRecommendation] = []
+
+    def add(setting: str, value, reason: str) -> None:
+        recommendations.append(
+            CompileSettingRecommendation(
+                setting=setting,
+                recommended_value=value,
+                reason=reason,
+            )
+        )
+
+    compile_requested = bool(getattr(args, "compile", True)) if args is not None else True
+    if compile_requested and report is not None and report.pattern_traits:
+        if getattr(args, "gradient_checkpointing", True) is False:
+            add(
+                "gradient_checkpointing",
+                True,
+                "Compiled multimodal training is substantially more memory-stable with gradient checkpointing enabled.",
+            )
+        if getattr(args, "use_cce", True) is False and any(
+            trait in report.pattern_traits
+            for trait in (
+                "qwen_like_image_merge",
+                "qwen3_deepstack_multimodal",
+                "masked_scatter_multimodal",
+                "padded_image_filtering",
+                "phi4_multimodal_spans",
+            )
+        ):
+            add(
+                "use_cce",
+                True,
+                "CCE is the preferred compiled training loss path for these multimodal families and generally gives safer memory behavior.",
+            )
+
+    if decision is not None and not decision.enabled:
+        add(
+            "compile",
+            False,
+            f"Compile should stay disabled for this run ({decision.reason}).",
+        )
+    elif qualification is not None and qualification.support_state == "supported_inferred":
+        add(
+            "compile_mode",
+            "best_effort",
+            "This family matches reusable compile patterns but is not explicitly verified yet, so best-effort mode is safer than strict mode.",
+        )
+
+    return tuple(recommendations)
+
+
 def resolve_training_compile(
     model_or_arch,
     policy: MLXVLMCompilePolicy | None = None,
@@ -738,9 +1123,71 @@ def resolve_training_compile(
 
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
     compiled_policy = build_compile_policy(policy=policy, args=args)
-    if not arch:
+    patch_mode = normalize_mlx_patch_mode(
+        getattr(
+            args,
+            "patch_mode",
+            getattr(model_or_arch, "_unsloth_patch_mode", "patched"),
+        )
+    )
+
+    def finalize(
+        *,
+        arch_name: str,
+        enabled: bool,
+        policy_mode: str,
+        fallback_allowed: bool,
+        strict_requested: bool,
+        should_raise: bool,
+        reason: str,
+        qualification: MLXVLMCompileQualification | None,
+        backend_qualifications: tuple[MLXVLMCompileQualification, ...] = (),
+    ) -> ResolvedTrainingCompileDecision:
+        support_state = qualification.support_state if qualification is not None else "unsupported"
+        recommendations = _recommend_compile_settings(
+            model_or_arch,
+            qualification=qualification,
+            decision=None,
+            args=args,
+        )
+        decision = ResolvedTrainingCompileDecision(
+            arch=arch_name,
+            enabled=enabled,
+            policy_mode=policy_mode,
+            fallback_allowed=fallback_allowed,
+            strict_requested=strict_requested,
+            should_raise=should_raise,
+            reason=reason,
+            qualification=qualification,
+            backend_qualifications=backend_qualifications,
+            support_state=support_state,
+            setting_recommendations=recommendations,
+            patch_mode=patch_mode,
+        )
+        recommendations = _recommend_compile_settings(
+            model_or_arch,
+            qualification=qualification,
+            decision=decision,
+            args=args,
+        )
         return ResolvedTrainingCompileDecision(
-            arch="unknown",
+            arch=decision.arch,
+            enabled=decision.enabled,
+            policy_mode=decision.policy_mode,
+            fallback_allowed=decision.fallback_allowed,
+            strict_requested=decision.strict_requested,
+            should_raise=decision.should_raise,
+            reason=decision.reason,
+            qualification=decision.qualification,
+            backend_qualifications=decision.backend_qualifications,
+            support_state=decision.support_state,
+            setting_recommendations=recommendations,
+            patch_mode=decision.patch_mode,
+        )
+
+    if not arch:
+        return finalize(
+            arch_name="unknown",
             enabled=False,
             policy_mode=compiled_policy.mode,
             fallback_allowed=compiled_policy.mode == "best_effort",
@@ -748,6 +1195,19 @@ def resolve_training_compile(
             should_raise=compiled_policy.mode == "strict",
             reason="could not determine mlx_vlm architecture",
             qualification=None,
+        )
+
+    if patch_mode == "unpatched":
+        return finalize(
+            arch_name=arch,
+            enabled=False,
+            policy_mode="eager",
+            fallback_allowed=False,
+            strict_requested=False,
+            should_raise=False,
+            reason="compile patches disabled by patch_mode=unpatched",
+            qualification=get_compile_qualification(model_or_arch),
+            backend_qualifications=get_backend_compile_qualifications(model_or_arch),
         )
 
     qualification = get_compile_qualification(model_or_arch)
@@ -758,8 +1218,8 @@ def resolve_training_compile(
     fallback_allowed = policy_mode == "best_effort"
 
     if policy_mode == "eager":
-        return ResolvedTrainingCompileDecision(
-            arch=arch,
+        return finalize(
+            arch_name=arch,
             enabled=False,
             policy_mode=policy_mode,
             fallback_allowed=False,
@@ -772,8 +1232,8 @@ def resolve_training_compile(
 
     model_block_reason = _model_repo_training_compile_block_reason(model_or_arch)
     if model_block_reason is not None:
-        return ResolvedTrainingCompileDecision(
-            arch=arch,
+        return finalize(
+            arch_name=arch,
             enabled=False,
             policy_mode=policy_mode,
             fallback_allowed=fallback_allowed,
@@ -789,8 +1249,8 @@ def resolve_training_compile(
     ]
     if qualification is None:
         reason = "architecture not discovered"
-        return ResolvedTrainingCompileDecision(
-            arch=arch,
+        return finalize(
+            arch_name=arch,
             enabled=False,
             policy_mode=policy_mode,
             fallback_allowed=fallback_allowed,
@@ -802,8 +1262,8 @@ def resolve_training_compile(
         )
     if not qualification.training_compile:
         reason = qualification.reason
-        return ResolvedTrainingCompileDecision(
-            arch=arch,
+        return finalize(
+            arch_name=arch,
             enabled=False,
             policy_mode=policy_mode,
             fallback_allowed=fallback_allowed,
@@ -815,8 +1275,8 @@ def resolve_training_compile(
         )
     if backend_blockers:
         reason = "backend compile not qualified: " + ", ".join(backend_blockers)
-        return ResolvedTrainingCompileDecision(
-            arch=arch,
+        return finalize(
+            arch_name=arch,
             enabled=False,
             policy_mode=policy_mode,
             fallback_allowed=fallback_allowed,
@@ -826,8 +1286,8 @@ def resolve_training_compile(
             qualification=qualification,
             backend_qualifications=backend_qualifications,
         )
-    return ResolvedTrainingCompileDecision(
-        arch=arch,
+    return finalize(
+        arch_name=arch,
         enabled=True,
         policy_mode=policy_mode,
         fallback_allowed=fallback_allowed,
@@ -3843,7 +4303,9 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                     and "qwen_like_image_merge" in report.pattern_traits
                 )
             ),
-            installer=_install_qwen_like_image_merge_patches,
+            primitive_names=("compile_safe_feature_merge", "compile_safe_masked_scatter"),
+            adapter_name="qwen_like_merge",
+            runtime_primitive_names=("qwen_like_image_merge_runtime",),
         ),
         CompilePatternBundle(
             name="qwen2_vision_windowing",
@@ -3852,7 +4314,15 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 arch == "qwen2_5_vl"
                 or (arch.startswith("qwen2") and "qwen2_vision_windowing" in report.pattern_traits)
             ),
-            installer=lambda: (_install_qwen2_compile_patches(), _install_qwen2_5_compile_patches()),
+            primitive_names=(
+                "segmented_vision_attention",
+                "vision_metadata_normalization",
+                "explicit_position_plumbing",
+                "cached_image_feature_plumbing",
+                "dtype_normalization",
+            ),
+            adapter_name="qwen_like_merge",
+            runtime_primitive_names=("qwen2_vision_windowing_runtime",),
         ),
         CompilePatternBundle(
             name="qwen3_family_multimodal",
@@ -3861,7 +4331,17 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 arch in {"qwen3_vl", "qwen3_5", "qwen3_5_moe"}
                 or (arch.startswith("qwen3") and "qwen3_deepstack_multimodal" in report.pattern_traits)
             ),
-            installer=_install_qwen3_family_compile_patches,
+            primitive_names=(
+                "compile_safe_feature_merge",
+                "compile_safe_masked_scatter",
+                "segmented_vision_attention",
+                "vision_metadata_normalization",
+                "explicit_position_plumbing",
+                "cached_image_feature_plumbing",
+                "dtype_normalization",
+            ),
+            adapter_name="qwen3_deepstack",
+            runtime_primitive_names=("qwen3_family_multimodal_runtime",),
         ),
         CompilePatternBundle(
             name="single_image_token_merge",
@@ -3873,7 +4353,9 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                     and "single_image_token_merge" in report.pattern_traits
                 )
             ),
-            installer=_install_llama_pixtral_mistral_compile_patches,
+            primitive_names=("compile_safe_feature_merge", "cached_image_feature_plumbing"),
+            adapter_name="single_image_token",
+            runtime_primitive_names=("single_image_token_merge_runtime",),
         ),
         CompilePatternBundle(
             name="mistral4_attention_backend",
@@ -3882,7 +4364,9 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 arch == "mistral4"
                 or (arch.startswith("mistral4") and "mistral4_attention_backend" in report.pattern_traits)
             ),
-            installer=_install_mistral4_compile_patches,
+            primitive_names=("segmented_vision_attention", "dtype_normalization"),
+            adapter_name="mistral_attention_family",
+            runtime_primitive_names=("mistral4_attention_backend_runtime",),
         ),
         CompilePatternBundle(
             name="gemma3n_multiscale_fusion",
@@ -3890,7 +4374,13 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             matcher=lambda arch, report: (
                 arch == "gemma3n" or "gemma3n_multiscale_fusion" in report.pattern_traits
             ),
-            installer=_install_gemma3n_compile_patches,
+            primitive_names=(
+                "compile_safe_masked_scatter",
+                "vision_metadata_normalization",
+                "dtype_normalization",
+            ),
+            adapter_name="gemma_vision_family",
+            runtime_primitive_names=("gemma3n_multiscale_fusion_runtime",),
         ),
         CompilePatternBundle(
             name="deepseek_ocr_multimodal",
@@ -3902,7 +4392,15 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                     and "deepseek_ocr_multimodal" in report.pattern_traits
                 )
             ),
-            installer=_install_deepseek_ocr_compile_patches,
+            primitive_names=(
+                "compile_safe_feature_merge",
+                "segmented_vision_attention",
+                "vision_metadata_normalization",
+                "cached_image_feature_plumbing",
+                "dtype_normalization",
+            ),
+            adapter_name="ocr_projector_family",
+            runtime_primitive_names=("deepseek_ocr_multimodal_runtime",),
         ),
         CompilePatternBundle(
             name="masked_scatter_multimodal",
@@ -3911,7 +4409,8 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 arch in {"gemma3", "idefics2", "idefics3"}
                 or "masked_scatter_multimodal" in report.pattern_traits
             ),
-            installer=_install_masked_scatter_multimodal_patches,
+            primitive_names=("compile_safe_masked_scatter",),
+            runtime_primitive_names=("masked_scatter_multimodal_runtime",),
         ),
         CompilePatternBundle(
             name="padded_image_filtering",
@@ -3920,7 +4419,13 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 arch in {"idefics2", "idefics3", "smolvlm"}
                 or "padded_image_filtering" in report.pattern_traits
             ),
-            installer=_install_idefics_family_compile_patches,
+            primitive_names=(
+                "padded_image_filtering",
+                "compile_safe_feature_merge",
+                "cached_image_feature_plumbing",
+            ),
+            adapter_name="idefics_family",
+            runtime_primitive_names=("padded_image_filtering_runtime",),
         ),
         CompilePatternBundle(
             name="negative_image_placeholders",
@@ -3928,7 +4433,13 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             matcher=lambda arch, report: (
                 arch == "phi3_v" or "negative_image_placeholders" in report.pattern_traits
             ),
-            installer=_install_negative_image_placeholder_patches,
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "cached_image_feature_plumbing",
+            ),
+            adapter_name="phi_placeholder_family",
+            runtime_primitive_names=("negative_image_placeholders_runtime",),
         ),
         CompilePatternBundle(
             name="expanded_image_placeholders",
@@ -3937,7 +4448,9 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 arch == "multi_modality"
                 or "expanded_image_placeholders" in report.pattern_traits
             ),
-            installer=_install_expanded_image_placeholder_patches,
+            primitive_names=("compile_safe_feature_merge", "cached_image_feature_plumbing"),
+            adapter_name="phi_placeholder_family",
+            runtime_primitive_names=("expanded_image_placeholders_runtime",),
         ),
         CompilePatternBundle(
             name="phi4_multimodal_spans",
@@ -3946,19 +4459,42 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 arch in {"phi4_siglip", "phi4mm"}
                 or "phi4_multimodal_spans" in report.pattern_traits
             ),
-            installer=_install_phi4_multimodal_patches,
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "cached_image_feature_plumbing",
+                "dtype_normalization",
+            ),
+            adapter_name="phi_placeholder_family",
+            runtime_primitive_names=("phi4_multimodal_spans_runtime",),
         ),
         CompilePatternBundle(
             name="glm_ocr_vision_compile",
             description="GLM OCR vision/merge compile patch set.",
             matcher=lambda arch, report: arch == "glm_ocr",
-            installer=_install_glm_ocr_compile_patches,
+            primitive_names=(
+                "segmented_vision_attention",
+                "vision_metadata_normalization",
+                "explicit_position_plumbing",
+                "cached_image_feature_plumbing",
+                "dtype_normalization",
+            ),
+            adapter_name="ocr_projector_family",
+            runtime_primitive_names=("glm_ocr_vision_compile_runtime",),
         ),
         CompilePatternBundle(
             name="paddleocr_vl_multimodal",
             description="PaddleOCR-VL vision/projector/input-embedding compile patch set.",
             matcher=lambda arch, report: arch == "paddleocr_vl",
-            installer=_install_paddleocr_vl_compile_patches,
+            primitive_names=(
+                "segmented_vision_attention",
+                "vision_metadata_normalization",
+                "explicit_position_plumbing",
+                "cached_image_feature_plumbing",
+                "dtype_normalization",
+            ),
+            adapter_name="ocr_projector_family",
+            runtime_primitive_names=("paddleocr_vl_multimodal_runtime",),
         ),
     )
 
@@ -3979,6 +4515,188 @@ def _matching_pattern_bundle_names(
     )
 
 
+def _matching_pattern_bundles(
+    arch: str,
+    report: MLXVLMTraitReport | None = None,
+) -> tuple[CompilePatternBundle, ...]:
+    """Return full bundle objects whose matchers apply to one architecture."""
+
+    report = report or build_compile_trait_reports().get(arch)
+    if report is None:
+        return ()
+    return tuple(
+        bundle
+        for bundle in list_compile_pattern_bundles()
+        if bundle.matcher(arch, report)
+    )
+
+
+def _resolve_compile_patch_plan(bundle: CompilePatternBundle) -> CompilePatchPlan:
+    """Lower one declarative bundle into the runtime plan we actually execute."""
+
+    return CompilePatchPlan(
+        bundle_name=bundle.name,
+        adapter_name=bundle.adapter_name,
+        semantic_primitives=bundle.primitive_names,
+        runtime_primitives=bundle.runtime_primitive_names or bundle.primitive_names,
+    )
+
+
+def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
+    """Return the runtime primitive executor registry.
+
+    These runtime primitives are intentionally small semantic units that can be
+    composed by bundle plans. Some still wrap heavier helper bodies, but the
+    installation path itself no longer dispatches directly on architecture-
+    local installer names.
+    """
+
+    return {
+        "qwen_like_image_merge_runtime": _install_qwen_like_image_merge_patches,
+        "qwen2_vision_windowing_runtime": lambda: (
+            _install_qwen2_compile_patches(),
+            _install_qwen2_5_compile_patches(),
+        ),
+        "qwen3_family_multimodal_runtime": _install_qwen3_family_compile_patches,
+        "single_image_token_merge_runtime": _install_llama_pixtral_mistral_compile_patches,
+        "mistral4_attention_backend_runtime": _install_mistral4_compile_patches,
+        "gemma3n_multiscale_fusion_runtime": _install_gemma3n_compile_patches,
+        "deepseek_ocr_multimodal_runtime": _install_deepseek_ocr_compile_patches,
+        "masked_scatter_multimodal_runtime": _install_masked_scatter_multimodal_patches,
+        "padded_image_filtering_runtime": _install_idefics_family_compile_patches,
+        "negative_image_placeholders_runtime": _install_negative_image_placeholder_patches,
+        "expanded_image_placeholders_runtime": _install_expanded_image_placeholder_patches,
+        "phi4_multimodal_spans_runtime": _install_phi4_multimodal_patches,
+        "glm_ocr_vision_compile_runtime": _install_glm_ocr_compile_patches,
+        "paddleocr_vl_multimodal_runtime": _install_paddleocr_vl_compile_patches,
+    }
+
+
+def _apply_compile_patch_plan(plan: CompilePatchPlan) -> None:
+    """Apply one resolved runtime patch plan.
+
+    The plan executor is intentionally generic so new model families usually
+    only need registry updates:
+    - add or extend a trait matcher
+    - point a bundle at an adapter
+    - reuse or add runtime primitives
+    """
+
+    executors = _runtime_patch_primitive_installers()
+    for primitive_name in plan.runtime_primitives:
+        executor = executors.get(primitive_name)
+        if executor is None:
+            raise KeyError(
+                f"Unsloth: unknown MLX compile runtime primitive {primitive_name!r} "
+                f"for bundle {plan.bundle_name!r}"
+            )
+        executor()
+
+
+def trace_compile_application(
+    model_or_arch,
+    *,
+    policy: MLXVLMCompilePolicy | None = None,
+    args=None,
+) -> CompileTraceReport:
+    """Return a machine-readable trace of compile support and patch selection."""
+
+    qualification = get_compile_qualification(model_or_arch)
+    report = get_compile_trait_report(model_or_arch)
+    decision = resolve_training_compile(model_or_arch, policy=policy, args=args)
+    arch = decision.arch
+    patch_mode = decision.patch_mode
+    backend_arches = tuple(
+        report.backend_arches if report is not None else ()
+    )
+    bundles = _matching_pattern_bundles(arch, report)
+    matched_bundle_names = tuple(bundle.name for bundle in bundles)
+    installed_bundles = tuple(
+        bundle.name for bundle in bundles if bundle.name in _PATCHED_PATTERN_BUNDLES
+    ) if patch_mode == "patched" else ()
+    primitive_names = []
+    runtime_primitive_names = []
+    adapter_names = list(_adapter_names_for_arch(arch, report))
+    for bundle in bundles:
+        primitive_names.extend(bundle.primitive_names)
+        runtime_primitive_names.extend(bundle.runtime_primitive_names or bundle.primitive_names)
+        if bundle.adapter_name is not None:
+            adapter_names.append(bundle.adapter_name)
+
+    if patch_mode == "patched" and "safe_fused_sdpa_mask" in _PATCHED_PATTERN_BUNDLES:
+        primitive_names.append("safe_fused_sdpa_mask")
+        runtime_primitive_names.append("safe_fused_sdpa_mask")
+
+    return CompileTraceReport(
+        arch=arch,
+        patch_mode=patch_mode,
+        backend_arches=backend_arches,
+        verification_state=qualification.verification_state if qualification is not None else "unqualified",
+        support_state=decision.support_state,
+        blocker_categories=qualification.blocker_categories if qualification is not None else (),
+        pattern_traits=report.pattern_traits if report is not None else (),
+        matched_bundles=matched_bundle_names,
+        installed_bundles=installed_bundles,
+        patch_primitives=tuple(dict.fromkeys(primitive_names)),
+        runtime_primitives=tuple(dict.fromkeys(runtime_primitive_names)),
+        adapters=tuple(dict.fromkeys(adapter_names)),
+        qualification_reason=qualification.reason if qualification is not None else "architecture not discovered",
+        decision_mode=decision.policy_mode,
+        decision_enabled=decision.enabled,
+        decision_reason=decision.reason,
+        fallback_allowed=decision.fallback_allowed,
+        strict_requested=decision.strict_requested,
+        backend_qualification_arches=tuple(qual.arch for qual in decision.backend_qualifications),
+        recommendations=decision.setting_recommendations,
+    )
+
+
+def explain_compile_support(
+    model_or_arch,
+    *,
+    policy: MLXVLMCompilePolicy | None = None,
+    args=None,
+) -> str:
+    """Return a human-readable summary of compile support and patch selection."""
+
+    trace = trace_compile_application(model_or_arch, policy=policy, args=args)
+    lines = [
+        f"arch={trace.arch}",
+        f"patch_mode={trace.patch_mode}",
+        f"support_state={trace.support_state}",
+        f"verification_state={trace.verification_state}",
+        f"decision={trace.decision_mode}:{'enabled' if trace.decision_enabled else 'disabled'}",
+        f"decision_reason={trace.decision_reason}",
+    ]
+    if trace.backend_arches:
+        lines.append("backend_arches=" + ",".join(trace.backend_arches))
+    if trace.backend_qualification_arches:
+        lines.append(
+            "backend_qualifications=" + ",".join(trace.backend_qualification_arches)
+        )
+    if trace.pattern_traits:
+        lines.append("traits=" + ",".join(trace.pattern_traits))
+    if trace.matched_bundles:
+        lines.append("matched_bundles=" + ",".join(trace.matched_bundles))
+    if trace.patch_primitives:
+        lines.append("patch_primitives=" + ",".join(trace.patch_primitives))
+    if trace.runtime_primitives:
+        lines.append("runtime_primitives=" + ",".join(trace.runtime_primitives))
+    if trace.adapters:
+        lines.append("adapters=" + ",".join(trace.adapters))
+    if trace.blocker_categories:
+        lines.append("blockers=" + ",".join(trace.blocker_categories))
+    if trace.recommendations:
+        lines.append(
+            "recommendations="
+            + "; ".join(
+                f"{rec.setting}={rec.recommended_value} ({rec.reason})"
+                for rec in trace.recommendations
+            )
+        )
+    return "\n".join(lines)
+
+
 def install_mlx_compile_patches():
     """Install every shared compile patch bundle once and rebuild reports."""
 
@@ -3990,7 +4708,7 @@ def install_mlx_compile_patches():
     _PATCHED_PATTERN_BUNDLES.add("safe_fused_sdpa_mask")
 
     for bundle in list_compile_pattern_bundles():
-        bundle.installer()
+        _apply_compile_patch_plan(_resolve_compile_patch_plan(bundle))
         _PATCHED_PATTERN_BUNDLES.add(bundle.name)
 
     _PATCHES_INSTALLED = True
@@ -4009,6 +4727,11 @@ def summarize_compile_qualifications() -> dict[str, int]:
         "patched": 0,
         "pattern_candidates": 0,
         "bundles_installed": len(_PATCHED_PATTERN_BUNDLES),
+        "supported_verified": 0,
+        "supported_inferred": 0,
+        "patched_unverified": 0,
+        "fallback_only": 0,
+        "unsupported": 0,
     }
     for qual in qualifications:
         out["architectures"] += 1
@@ -4016,4 +4739,5 @@ def summarize_compile_qualifications() -> dict[str, int]:
         out["generation_compile_ready"] += int(qual.generation_compile)
         out["patched"] += int(qual.patched)
         out["pattern_candidates"] += int(qual.verification_state == "pattern_candidate")
+        out[qual.support_state] += 1
     return out
