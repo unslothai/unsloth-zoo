@@ -632,29 +632,96 @@ class MLXTrainer:
         # Build step functions following mlx-lm's pattern
         max_grad_norm = args.max_grad_norm
         state = [model.state, optimizer.state, mx.random.state]
-        track_grad_norm = False  # Disabled: pins full backward graph (+22GB), same issue as clip_grad_norm
+        track_grad_norm = grad_accum == 1
+        # The direct grad_accum==1 fast path delegates clipping to
+        # mlx.optimizers.clip_grad_norm(). That helper is exact, but on current
+        # MLX it can materially increase peak memory on real bf16 VLM runs.
+        # Keep the shortcut only for unclipped updates.
+        _direct_single_step_update = (
+            grad_accum == 1 and
+            not _needs_grad_scaling and
+            max_grad_norm <= 0
+        )
+
+        def _grad_leaf_scale(name, safe_toks_f, clip_scale=None):
+            """Return the exact scalar applied to one grad leaf before update.
+
+            The final update semantics are intentionally unchanged:
+            1. divide by supervised-token count
+            2. apply LoRA+/embedding LR multipliers
+            3. apply one global clip scalar when enabled
+
+            Keeping this in one helper ensures the norm pass and the final
+            update pass stay in lockstep.
+            """
+            scale = mx.array(1.0, dtype=mx.float32) / safe_toks_f
+            if use_lora_plus and "lora_b" in name:
+                scale = scale * lora_plus_ratio
+            if use_embedding_lr and ("embed_tokens" in name or "lm_head" in name):
+                scale = scale * embedding_lr_ratio
+            if clip_scale is not None:
+                scale = scale * clip_scale
+            return scale
 
         def _apply_update(grad, toks_f):
-            """Common gradient post-processing and optimizer update."""
+            """Common gradient post-processing and optimizer update.
+
+            This uses a two-pass exact clip path instead of materializing
+            multiple full gradient trees. The resulting update is numerically
+            equivalent to the older implementation while avoiding the extra
+            tree allocation from ``optim.clip_grad_norm`` on large MLX runs.
+            """
             safe_toks_f = mx.maximum(
                 toks_f, mx.array(1.0, dtype=mx.float32)
             )
-            grad = tree_map(lambda g: g / safe_toks_f, grad)
-            if _needs_grad_scaling:
-                flat = tree_flatten(grad)
-                scaled = []
-                for k, v in flat:
-                    if use_lora_plus and "lora_b" in k:
-                        v = v * lora_plus_ratio
-                    if use_embedding_lr and ("embed_tokens" in k or "lm_head" in k):
-                        v = v * embedding_lr_ratio
-                    scaled.append((k, v))
-                grad = tree_unflatten(scaled)
+            flat_grad = tree_flatten(grad)
+            need_norm = track_grad_norm or max_grad_norm > 0
             grad_norm = mx.array(0.0, dtype=mx.float32)
-            if track_grad_norm:
-                for _, g in tree_flatten(grad):
-                    g = g.astype(mx.float32)
-                    grad_norm = grad_norm + mx.sum(g * g)
+            clip_scale = None
+
+            if need_norm:
+                norm_sq = mx.array(0.0, dtype=mx.float32)
+                for name, value in flat_grad:
+                    scaled = value.astype(mx.float32) * _grad_leaf_scale(
+                        name, safe_toks_f
+                    )
+                    norm_sq = norm_sq + mx.sum(scaled * scaled)
+                grad_norm = mx.sqrt(norm_sq)
+                if max_grad_norm > 0:
+                    clip_scale = mx.minimum(
+                        mx.array(max_grad_norm, dtype=mx.float32) / (grad_norm + 1e-6),
+                        mx.array(1.0, dtype=mx.float32),
+                    )
+
+            final_grad = tree_unflatten([
+                (
+                    name,
+                    value * _grad_leaf_scale(name, safe_toks_f, clip_scale),
+                )
+                for name, value in flat_grad
+            ])
+            optimizer.update(model, final_grad)
+            return grad_norm
+
+        def _apply_update_direct(grad):
+            """Fast exact path for the common ``grad_accum == 1`` case.
+
+            When gradients are updated immediately and there is no additional
+            per-leaf scaling (LoRA+ / embedding LR), the older
+            ``grad * ntoks`` then ``/ ntoks`` round-trip only serves to
+            promote the whole tree into ``float32`` before clipping. That
+            significantly increases peak memory on large bf16/fp16 runs while
+            leaving the mathematical update unchanged.
+
+            In this case the raw gradients already represent the final
+            per-token average, so we can compute the logged norm in float32 and
+            clip/update the original tree directly.
+            """
+            grad_norm = mx.array(0.0, dtype=mx.float32)
+            if track_grad_norm or max_grad_norm > 0:
+                for _, value in tree_flatten(grad):
+                    value32 = value.astype(mx.float32)
+                    grad_norm = grad_norm + mx.sum(value32 * value32)
                 grad_norm = mx.sqrt(grad_norm)
             if max_grad_norm > 0:
                 grad, _ = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
@@ -664,6 +731,12 @@ class MLXTrainer:
         if is_vlm:
             def step_fn(batch_dict, prev_state, do_update):
                 (lvalue, toks), grad = loss_and_grad_fn(model, batch_dict)
+
+                if _direct_single_step_update:
+                    grad_norm = _apply_update_direct(grad)
+                    if track_grad_norm:
+                        return lvalue, toks, None, grad_norm
+                    return lvalue, toks, None
 
                 toks_f = toks.astype(mx.float32)
                 grad = tree_map(lambda g: g * toks_f, grad)
@@ -685,6 +758,12 @@ class MLXTrainer:
         else:
             def step_fn(batch, lengths, labels, prev_state, do_update):
                 (lvalue, toks), grad = loss_and_grad_fn(model, batch, lengths, labels)
+
+                if _direct_single_step_update:
+                    grad_norm = _apply_update_direct(grad)
+                    if track_grad_norm:
+                        return lvalue, toks, None, grad_norm
+                    return lvalue, toks, None
 
                 toks_f = toks.astype(mx.float32)
                 grad = tree_map(lambda g: g * toks_f, grad)
