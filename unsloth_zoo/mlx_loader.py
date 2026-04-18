@@ -23,6 +23,8 @@ This avoids importing unsloth.models (which pulls in CUDA kernels).
 """
 
 import json
+import importlib
+import inspect
 import os
 import types
 import warnings
@@ -38,6 +40,15 @@ from .mlx_compile import (
 )
 
 _vlm_model_types_cache = None
+_SAFE_TEXT_SANITIZE_PATCHED: set[str] = set()
+_MULTIMODAL_STRIP_KEYS = (
+    "vision_tower",
+    "audio_tower",
+    "embed_audio",
+    "embed_vision",
+    "multi_modal_projector",
+    "mm_projector",
+)
 
 
 def _is_vlm(config: dict) -> bool:
@@ -187,6 +198,115 @@ def _fix_gemma4_kv_sharing(model):
           f"({n_shared} shared layers now read correct K/V).")
 
 
+def _safe_getsource(obj) -> str:
+    try:
+        return inspect.getsource(obj)
+    except Exception:
+        return ""
+
+
+def _has_multimodal_strip_sanitize(model_or_cls) -> bool:
+    """Return whether a loader-side sanitize path strips multimodal towers.
+
+    We use this as a generic signal for "text-only load of a multimodal wrapper"
+    instead of hardcoding every Gemma-like family by name.
+    """
+
+    cls = model_or_cls if inspect.isclass(model_or_cls) else type(model_or_cls)
+    sanitize = getattr(cls, "sanitize", None)
+    if sanitize is None:
+        return False
+    source = _safe_getsource(sanitize)
+    if not source:
+        return False
+    return any(token in source for token in _MULTIMODAL_STRIP_KEYS)
+
+
+def _get_mlx_lm_model_class(model_type: str):
+    if not model_type:
+        return None
+    try:
+        module = importlib.import_module(f"mlx_lm.models.{model_type}")
+    except Exception:
+        return None
+    return getattr(module, "Model", None)
+
+
+def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
+    """Return whether a multimodal wrapper should stay on the VLM load path.
+
+    We still want a plain tokenizer API for text-only training, but some repos
+    are fundamentally multimodal wrappers whose `mlx_lm` text path works only
+    by stripping modality towers in `sanitize()`. That is a strong signal that
+    the text loader is reconstructing a different object graph than the actual
+    checkpoint. When that happens, keeping the runtime on the VLM model path is
+    more robust than trying to maintain one sanitizer workaround per family.
+    """
+
+    if not _is_vlm(config):
+        return False
+
+    cls = _get_mlx_lm_model_class(model_type)
+    if cls is None:
+        return False
+
+    return _has_multimodal_strip_sanitize(cls)
+
+
+def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
+    """Patch nested-weight sanitize assumptions for text-only multimodal loads.
+
+    Some `mlx_lm` multimodal wrappers sanitize text-only checkpoints by first
+    unflattening weights and then blindly indexing `weights["model"]`. That is
+    brittle across upstream packing changes: some checkpoints expose the text
+    wrapper under `"model"`, others expose the same multimodal towers at the
+    top level. We patch the sanitize method by behavior, not by one exact
+    architecture, so any future loader with the same nested-vs-top-level
+    assumption is handled the same way.
+    """
+
+    if not model_type or model_type in _SAFE_TEXT_SANITIZE_PATCHED:
+        return
+
+    try:
+        module = importlib.import_module(f"mlx_lm.models.{model_type}")
+    except Exception:
+        return
+
+    cls = getattr(module, "Model", None)
+    sanitize = getattr(cls, "sanitize", None)
+    if cls is None or sanitize is None:
+        return
+
+    source = _safe_getsource(sanitize)
+    if 'weights["model"]' not in source or not any(token in source for token in _MULTIMODAL_STRIP_KEYS):
+        return
+
+    tree_unflatten = getattr(module, "tree_unflatten", None)
+    tree_flatten = getattr(module, "tree_flatten", None)
+    if tree_unflatten is None or tree_flatten is None:
+        return
+
+    original_sanitize = sanitize
+
+    def patched_sanitize(self, weights):
+        structured = tree_unflatten(list(weights.items()))
+        target = structured.get("model")
+        if not isinstance(target, dict):
+            target = structured
+
+        for key in _MULTIMODAL_STRIP_KEYS:
+            if isinstance(target, dict):
+                target.pop(key, None)
+
+        if target is not structured and isinstance(structured, dict):
+            structured["model"] = target
+        return dict(tree_flatten(structured))
+
+    cls.sanitize = patched_sanitize
+    _SAFE_TEXT_SANITIZE_PATCHED.add(model_type)
+
+
 def _fp16_needs_bf16_modules(model):
     """Return modules that should stay bf16 under fp16 training.
 
@@ -195,9 +315,10 @@ def _fp16_needs_bf16_modules(model):
     but the selected vision features can exceed 65,504 before projection, so
     a plain `model.set_dtype(mx.float16)` overflows inside get_input_embeddings.
 
-    Gemma3n has a different fp16 failure mode in the text backbone: its AltUp
-    branch mixing is numerically stable in bf16 but still produces non-finite
-    gradients in fp16 on real training batches.
+    Text-only loads of multimodal wrapper models can also be numerically shaky
+    in fp16. We detect those by behavior: if the wrapper sanitize path strips
+    multimodal towers before handing off to a text backbone, we keep that
+    backbone in bf16 under an fp16 training request.
     """
     model_module = type(model).__module__
     vision_tower = getattr(model, "vision_tower", None)
@@ -217,10 +338,15 @@ def _fp16_needs_bf16_modules(model):
                 modules.append(module)
                 break
 
-    if "mlx_vlm.models.gemma3n.gemma3n" in model_module:
-        language_model = getattr(model, "language_model", None)
-        if language_model is not None:
-            modules.append(language_model)
+    if _has_multimodal_strip_sanitize(model):
+        language_backbone = getattr(model, "language_model", None) or getattr(model, "model", None)
+        if language_backbone is not None:
+            modules.append(language_backbone)
+
+    if getattr(model, "_unsloth_text_only_vlm", False):
+        language_backbone = getattr(model, "language_model", None) or getattr(model, "model", None)
+        if language_backbone is not None:
+            modules.append(language_backbone)
 
     return tuple(modules)
 
@@ -1010,7 +1136,9 @@ class FastMLXModel:
 
         # Step 3: Route based on text_only
         is_vlm = False
-        if text_only is True:
+        force_vlm_text_path = bool(text_only is True and _prefer_vlm_loader_for_text(config_data, model_type))
+
+        if text_only is True and not force_vlm_text_path:
             is_vlm = False
         elif text_only is False:
             is_vlm = True
@@ -1069,7 +1197,10 @@ class FastMLXModel:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
                 model, processor = vlm_load(model_name, **extra_kwargs)
 
-            from .mlx_utils import normalize_vlm_processor_chat_template
+            from .mlx_utils import (
+                normalize_mlx_chat_template,
+                normalize_vlm_processor_chat_template,
+            )
 
             processor = normalize_vlm_processor_chat_template(
                 processor,
@@ -1078,6 +1209,12 @@ class FastMLXModel:
                 model_type=model_type,
                 strict=False,
             )
+            if force_vlm_text_path:
+                print(
+                    "Unsloth: text_only=True requested for a multimodal wrapper; "
+                    "keeping the model on the mlx-vlm path and returning its tokenizer."
+                )
+                model._unsloth_text_only_vlm = True
             model._is_vlm_model = True
             model._processor = processor
             _fix_gemma4_kv_sharing(model)
@@ -1094,11 +1231,24 @@ class FastMLXModel:
             model._unsloth_compile_explain = explain_compile_support(model)
             _patch_mixed_precision_set_dtype(model)
 
-            _patch_mlx_saving(model, processor)
-            return model, processor
+            public_target = processor
+            if force_vlm_text_path:
+                public_target = normalize_mlx_chat_template(
+                    getattr(processor, "tokenizer", processor),
+                    chat_template=chat_template,
+                    model_name=model_name,
+                    model_type=model_type,
+                    is_vlm=False,
+                    strict=False,
+                )
+                model._tokenizer = public_target
+
+            _patch_mlx_saving(model, public_target)
+            return model, public_target
         else:
             # Text path via mlx-lm (original behavior)
             print(f"Unsloth: Loading {model_name} via mlx-lm...")
+            _ensure_safe_text_wrapper_sanitize(model_type)
             model, tokenizer, config = mlx_load(
                 model_name,
                 tokenizer_config=extra_kwargs if extra_kwargs else None,
@@ -1121,6 +1271,7 @@ class FastMLXModel:
             model._src_path = local_path
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
+            _patch_mixed_precision_set_dtype(model)
 
             _patch_mlx_saving(model, tokenizer)
             return model, tokenizer

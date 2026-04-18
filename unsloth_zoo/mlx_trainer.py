@@ -127,6 +127,9 @@ class MLXTrainingConfig:
     compile_trace: bool = True
     gradient_checkpointing: bool = True
     streaming: bool = False  # Use streaming iterator instead of materializing batches
+    memory_limit_gb: float | None = None  # None = auto Metal guard (~85% of recommended working set); <= 0 disables
+    cache_limit_gb: float | None = None  # Optional MLX Metal cache cap in GB; <= 0 disables override
+    wired_limit_gb: float | None = None  # None = min(recommended working set, memory limit); <= 0 disables
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
@@ -411,6 +414,65 @@ class MLXTrainer:
         perplexity = math.exp(min(avg_loss, 100))
         return avg_loss, perplexity
 
+    @staticmethod
+    def _bytes_to_gb(value):
+        """Convert a byte count to decimal GB for user-facing memory logs."""
+        try:
+            return float(value) / 1e9
+        except Exception:
+            return None
+
+    def _configure_memory_limits(self):
+        """Apply conservative Metal memory limits so failed runs exit cleanly.
+
+        MLX exposes hard Metal allocator caps. Using them is much safer than
+        letting a large multimodal compile/eval run pressure the whole machine
+        into paging or a kernel panic. The default is intentionally conservative:
+        cap MLX to ~85% of Apple's recommended working-set size unless the user
+        overrides or disables it.
+        """
+        if not mx.metal.is_available():
+            return {}
+
+        args = self.args
+        info = mx.device_info()
+        recommended_gb = self._bytes_to_gb(
+            info.get("max_recommended_working_set_size")
+        )
+        if recommended_gb is None or recommended_gb <= 0:
+            return {}
+
+        configured = {}
+
+        memory_limit_gb = getattr(args, "memory_limit_gb", None)
+        if memory_limit_gb is None:
+            memory_limit_gb = recommended_gb * 0.85
+        elif memory_limit_gb <= 0:
+            memory_limit_gb = None
+        if memory_limit_gb is not None:
+            mx.metal.set_memory_limit(int(memory_limit_gb * 1e9))
+            configured["memory_limit_gb"] = float(memory_limit_gb)
+
+        cache_limit_gb = getattr(args, "cache_limit_gb", None)
+        if cache_limit_gb is not None and cache_limit_gb > 0:
+            mx.metal.set_cache_limit(int(cache_limit_gb * 1e9))
+            configured["cache_limit_gb"] = float(cache_limit_gb)
+
+        wired_limit_gb = getattr(args, "wired_limit_gb", None)
+        if wired_limit_gb is None:
+            wired_limit_gb = min(
+                recommended_gb,
+                configured.get("memory_limit_gb", recommended_gb),
+            )
+        elif wired_limit_gb <= 0:
+            wired_limit_gb = None
+        if wired_limit_gb is not None:
+            mx.set_wired_limit(int(wired_limit_gb * 1e9))
+            configured["wired_limit_gb"] = float(wired_limit_gb)
+
+        configured["recommended_working_set_gb"] = float(recommended_gb)
+        return configured
+
     def train(self):
         """Run MLX-native training loop.
 
@@ -450,10 +512,27 @@ class MLXTrainer:
                         f"({reason})"
                     )
 
-        # Set wired memory limit (reduces page faults)
-        if mx.metal.is_available():
-            mx.set_wired_limit(
-                mx.device_info()["max_recommended_working_set_size"]
+        # Apply MLX Metal memory limits before building large VLM batches. This
+        # makes runaway multimodal eval/train runs fail with an allocator error
+        # instead of consuming the whole machine.
+        self._memory_limits_applied = self._configure_memory_limits()
+        if self._memory_limits_applied:
+            parts = []
+            if "memory_limit_gb" in self._memory_limits_applied:
+                parts.append(
+                    f"memory_limit={self._memory_limits_applied['memory_limit_gb']:.2f} GB"
+                )
+            if "cache_limit_gb" in self._memory_limits_applied:
+                parts.append(
+                    f"cache_limit={self._memory_limits_applied['cache_limit_gb']:.2f} GB"
+                )
+            if "wired_limit_gb" in self._memory_limits_applied:
+                parts.append(
+                    f"wired_limit={self._memory_limits_applied['wired_limit_gb']:.2f} GB"
+                )
+            print(
+                "Unsloth: MLX Metal memory guard enabled "
+                f"({', '.join(parts)})."
             )
 
         # Apply gradient checkpointing if requested
@@ -953,6 +1032,7 @@ class MLXTrainer:
                 else getattr(self, "_compile_trace", None)
             ),
             "compile_auto_tune_applied": list(getattr(self, "_compile_auto_tune_applied", [])),
+            "memory_limits_applied": dict(getattr(self, "_memory_limits_applied", {})),
         }
 
     def _prepare_text_data(self):

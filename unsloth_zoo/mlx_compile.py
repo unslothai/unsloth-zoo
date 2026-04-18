@@ -43,16 +43,18 @@ from functools import lru_cache
 from pathlib import Path
 from itertools import accumulate
 import importlib
+import inspect
 import mlx.core as mx
 import numpy as np
 import pkgutil
 import re
-from typing import Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
 _PATCHES_INSTALLED = False
 _PATCHED_ARCHES: set[str] = set()
 _PATCHED_PATTERN_BUNDLES: set[str] = set()
+_PATCH_BINDINGS: set[tuple[str, str, str, str]] = set()
 
 # Architectures explicitly verified for mlx compile support.
 # Training verification currently covers:
@@ -271,6 +273,7 @@ class CompilePatternBundle:
     matcher: Callable[[str, MLXVLMTraitReport], bool]
     primitive_names: tuple[str, ...] = ()
     adapter_name: str | None = None
+    protocol_names: tuple[str, ...] = ()
     runtime_primitive_names: tuple[str, ...] = ()
 
 
@@ -353,6 +356,7 @@ class CompilePatchPlan:
 
     bundle_name: str
     adapter_name: str | None
+    protocol_names: tuple[str, ...]
     semantic_primitives: tuple[str, ...]
     runtime_primitives: tuple[str, ...]
 
@@ -391,6 +395,53 @@ class CompileTraceReport:
     strict_requested: bool
     backend_qualification_arches: tuple[str, ...] = ()
     recommendations: tuple[CompileSettingRecommendation, ...] = ()
+    direct_protocols: tuple[str, ...] = ()
+    inferred_protocols: tuple[str, ...] = ()
+    satisfied_protocols: tuple[str, ...] = ()
+    missing_protocols: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CompileProtocolRequirement:
+    """Patchable runtime protocol used to discover generic MLX patch targets."""
+
+    name: str
+    description: str
+    candidate_method_names: tuple[str, ...]
+    module_keywords: tuple[str, ...] = ()
+    source_tokens: tuple[str, ...] = ()
+    required_traits: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CompileProtocolTarget:
+    """One discovered runtime target that may satisfy a compile patch protocol."""
+
+    protocol_name: str
+    arch: str
+    module_name: str
+    class_name: str
+    method_name: str
+    matched_traits: tuple[str, ...]
+    missing_source_tokens: tuple[str, ...] = ()
+    status: str = "protocol_matched"
+    signature: str | None = None
+
+
+@dataclass(frozen=True)
+class CompilePatchabilityReport:
+    """Maintainer-facing dry-run report for compile patch support on one arch."""
+
+    arch: str
+    support_state: str
+    matched_bundles: tuple[str, ...]
+    suggested_patch_plan: tuple[CompilePatchPlan, ...]
+    discovered_targets: tuple[CompileProtocolTarget, ...]
+    direct_protocols: tuple[str, ...]
+    inferred_protocols: tuple[str, ...]
+    satisfied_protocols: tuple[str, ...]
+    missing_protocols: tuple[str, ...]
+    blockers: tuple[str, ...]
 
 
 def _iter_arch_modules() -> Iterable[tuple[str, Path]]:
@@ -562,6 +613,124 @@ def list_compile_patch_primitives() -> tuple[CompilePatchPrimitive, ...]:
             description="Replace Python-side padded image filtering with compile-safe MLX operations.",
         ),
     )
+
+
+@lru_cache(maxsize=1)
+def list_protocol_requirements(
+    protocol_name: str | None = None,
+) -> tuple[CompileProtocolRequirement, ...]:
+    """Return the protocol registry used for generic compile target discovery.
+
+    These protocols are intentionally broader than architecture names. They
+    describe the stable runtime contracts we look for when deciding whether an
+    existing patch primitive can be reused by a new family.
+    """
+
+    protocols = (
+        CompileProtocolRequirement(
+            name="multimodal_merge",
+            description="Model-level multimodal embedding merge path.",
+            candidate_method_names=(
+                "get_input_embeddings",
+                "merge_input_ids_with_image_features",
+                "_merge_input_ids_with_image_features",
+                "_prepare_inputs_for_multimodal",
+            ),
+            source_tokens=("input_ids", "image", "embed"),
+            required_traits=(
+                "qwen_like_image_merge",
+                "single_image_token_merge",
+                "deepseek_ocr_multimodal",
+                "negative_image_placeholders",
+                "expanded_image_placeholders",
+                "phi4_multimodal_spans",
+            ),
+        ),
+        CompileProtocolRequirement(
+            name="vision_attention",
+            description="Vision attention implementation that can be chunked or mask-normalized.",
+            candidate_method_names=("__call__",),
+            module_keywords=("vision",),
+            source_tokens=("qkv", "scale"),
+            required_traits=(
+                "qwen2_vision_windowing",
+                "qwen3_deepstack_multimodal",
+                "mistral4_attention_backend",
+                "deepseek_ocr_multimodal",
+            ),
+        ),
+        CompileProtocolRequirement(
+            name="position_primitives",
+            description="Vision or language position helper path requiring compile-safe metadata handling.",
+            candidate_method_names=(
+                "rot_pos_emb",
+                "get_window_index",
+                "fast_pos_embed_interpolate",
+                "get_rope_index",
+            ),
+            source_tokens=("pos",),
+            required_traits=(
+                "qwen2_vision_windowing",
+                "qwen3_deepstack_multimodal",
+                "mutable_position_state",
+            ),
+        ),
+        CompileProtocolRequirement(
+            name="cached_image_features",
+            description="Embedding path that accepts cached or precomputed visual features.",
+            candidate_method_names=("get_input_embeddings", "_prepare_inputs_for_multimodal"),
+            source_tokens=("cached", "image"),
+            required_traits=(
+                "qwen2_vision_windowing",
+                "qwen3_deepstack_multimodal",
+                "single_image_token_merge",
+                "padded_image_filtering",
+                "deepseek_ocr_multimodal",
+                "negative_image_placeholders",
+                "expanded_image_placeholders",
+                "phi4_multimodal_spans",
+            ),
+        ),
+        CompileProtocolRequirement(
+            name="masked_scatter",
+            description="Masked-scatter or placeholder insertion helper for multimodal features.",
+            candidate_method_names=("masked_scatter", "merge_multimodal_and_text"),
+            source_tokens=("mask",),
+            required_traits=("masked_scatter_multimodal", "gemma3n_multiscale_fusion"),
+        ),
+        CompileProtocolRequirement(
+            name="placeholder_expansion",
+            description="Families that expand or replace negative/repeated placeholder spans.",
+            candidate_method_names=(
+                "_prepare_inputs_for_multimodal",
+                "get_input_embeddings",
+                "merge_input_ids_with_image_features",
+            ),
+            source_tokens=("token", "image"),
+            required_traits=(
+                "negative_image_placeholders",
+                "expanded_image_placeholders",
+                "phi4_multimodal_spans",
+            ),
+        ),
+        CompileProtocolRequirement(
+            name="padded_image_filtering",
+            description="Python-side padded image filtering path that should become pure MLX ops.",
+            candidate_method_names=("_prepare_inputs_for_multimodal", "get_input_embeddings"),
+            source_tokens=("pixel_attention_mask", "real_images_inds"),
+            required_traits=("padded_image_filtering",),
+        ),
+        CompileProtocolRequirement(
+            name="deepstack_process",
+            description="Visual deepstack side-channel that injects extra visual embeddings into the language path.",
+            candidate_method_names=("_deepstack_process",),
+            source_tokens=("visual", "embed"),
+            required_traits=("qwen3_deepstack_multimodal",),
+        ),
+    )
+    if protocol_name is None:
+        return protocols
+    return tuple(proto for proto in protocols if proto.name == protocol_name)
 
 
 @lru_cache(maxsize=1)
@@ -773,6 +942,366 @@ def get_compile_trait_report(model_or_arch) -> MLXVLMTraitReport | None:
     if backend_arches == report.backend_arches:
         return report
     return _build_trait_report(arch, backend_arches=backend_arches)
+
+
+def _iter_arch_python_module_names(arch: str) -> tuple[str, ...]:
+    """Return importable Python module names for one installed architecture."""
+
+    arch_dir = dict(_iter_arch_modules()).get(arch)
+    if arch_dir is None or not arch_dir.exists():
+        return ()
+
+    module_names = []
+    for path in sorted(arch_dir.rglob("*.py")):
+        if "__pycache__" in path.parts or path.name.startswith("processing"):
+            continue
+        rel = path.relative_to(arch_dir)
+        stem = rel.with_suffix("")
+        if stem.name == "__init__":
+            module_name = f"mlx_vlm.models.{arch}"
+        else:
+            module_name = f"mlx_vlm.models.{arch}." + ".".join(stem.parts)
+        module_names.append(module_name)
+    return tuple(dict.fromkeys(module_names))
+
+
+def _iter_arch_imported_modules(arch: str) -> tuple[tuple[str, object], ...]:
+    """Import available architecture modules for protocol discovery."""
+
+    imported = []
+    for module_name in _iter_arch_python_module_names(arch):
+        module = _try_import_module(module_name)
+        if module is None:
+            continue
+        imported.append((module_name, module))
+    return tuple(imported)
+
+
+def _safe_getsource(obj) -> str:
+    try:
+        return inspect.getsource(obj)
+    except Exception:
+        return ""
+
+
+def _stringify_signature(callable_obj) -> str | None:
+    try:
+        return str(inspect.signature(callable_obj))
+    except Exception:
+        return None
+
+
+def _discover_protocol_target_for_class(
+    arch: str,
+    module_name: str,
+    cls,
+    requirement: CompileProtocolRequirement,
+    report: MLXVLMTraitReport,
+) -> tuple[CompileProtocolTarget, ...]:
+    """Return protocol targets discovered on one class."""
+
+    if requirement.required_traits:
+        matched_traits = tuple(
+            trait for trait in requirement.required_traits if trait in report.pattern_traits
+        )
+        if not matched_traits:
+            return ()
+    else:
+        matched_traits = ()
+
+    lower_module_name = module_name.lower()
+    if requirement.module_keywords and not any(
+        keyword in lower_module_name for keyword in requirement.module_keywords
+    ):
+        return ()
+
+    source = _safe_getsource(cls)
+    targets = []
+    for method_name in requirement.candidate_method_names:
+        method = getattr(cls, method_name, None)
+        if method is None or not callable(method):
+            continue
+        method_source = _safe_getsource(method)
+        combined_source = source + "\n" + method_source
+        missing_tokens = tuple(
+            token for token in requirement.source_tokens if token not in combined_source
+        )
+        status = "protocol_matched" if not missing_tokens else "protocol_mismatch"
+        targets.append(
+            CompileProtocolTarget(
+                protocol_name=requirement.name,
+                arch=arch,
+                module_name=module_name,
+                class_name=getattr(cls, "__name__", repr(cls)),
+                method_name=method_name,
+                matched_traits=matched_traits,
+                missing_source_tokens=missing_tokens,
+                status=status,
+                signature=_stringify_signature(method),
+            )
+        )
+    return tuple(targets)
+
+
+def _discover_protocol_target_for_module_functions(
+    arch: str,
+    module_name: str,
+    module,
+    requirement: CompileProtocolRequirement,
+    report: MLXVLMTraitReport,
+) -> tuple[CompileProtocolTarget, ...]:
+    """Return protocol targets discovered on module-level helpers."""
+
+    if requirement.required_traits:
+        matched_traits = tuple(
+            trait for trait in requirement.required_traits if trait in report.pattern_traits
+        )
+        if not matched_traits:
+            return ()
+    else:
+        matched_traits = ()
+
+    lower_module_name = module_name.lower()
+    if requirement.module_keywords and not any(
+        keyword in lower_module_name for keyword in requirement.module_keywords
+    ):
+        return ()
+
+    module_source = _safe_getsource(module)
+    targets = []
+    for method_name in requirement.candidate_method_names:
+        fn = getattr(module, method_name, None)
+        if fn is None or not callable(fn) or inspect.isclass(fn):
+            continue
+        fn_source = _safe_getsource(fn)
+        combined_source = module_source + "\n" + fn_source
+        missing_tokens = tuple(
+            token for token in requirement.source_tokens if token not in combined_source
+        )
+        status = "protocol_matched" if not missing_tokens else "protocol_mismatch"
+        targets.append(
+            CompileProtocolTarget(
+                protocol_name=requirement.name,
+                arch=arch,
+                module_name=module_name,
+                class_name="<module>",
+                method_name=method_name,
+                matched_traits=matched_traits,
+                missing_source_tokens=missing_tokens,
+                status=status,
+                signature=_stringify_signature(fn),
+            )
+        )
+    return tuple(targets)
+
+
+def discover_compile_protocol_targets(
+    model_or_arch,
+) -> tuple[CompileProtocolTarget, ...]:
+    """Discover patchable protocol targets for an architecture or loaded model.
+
+    This is the main maintainer helper for new-family triage. It inspects the
+    installed `mlx_vlm` modules for a family and reports which generic compile
+    protocols match actual classes/methods, plus any missing source tokens that
+    prevented a clean protocol match.
+    """
+
+    arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
+    if not arch:
+        return ()
+    report = get_compile_trait_report(model_or_arch if not isinstance(model_or_arch, str) else arch)
+    if report is None:
+        return ()
+
+    targets = []
+    for module_name, module in _iter_arch_imported_modules(arch):
+        for requirement in list_protocol_requirements():
+            targets.extend(
+                _discover_protocol_target_for_module_functions(
+                    arch,
+                    module_name,
+                    module,
+                    requirement,
+                    report,
+                )
+            )
+        for _, cls in sorted(vars(module).items()):
+            if not inspect.isclass(cls) or getattr(cls, "__module__", None) != module.__name__:
+                continue
+            for requirement in list_protocol_requirements():
+                targets.extend(
+                    _discover_protocol_target_for_class(
+                        arch,
+                        module_name,
+                        cls,
+                        requirement,
+                        report,
+                    )
+                )
+    unique = {}
+    for target in targets:
+        key = (
+            target.protocol_name,
+            target.module_name,
+            target.class_name,
+            target.method_name,
+        )
+        current = unique.get(key)
+        if current is None or (current.status != "protocol_matched" and target.status == "protocol_matched"):
+            unique[key] = target
+    return tuple(sorted(unique.values(), key=lambda x: (x.protocol_name, x.module_name, x.class_name, x.method_name)))
+
+
+def validate_compile_patchability(model_or_arch) -> CompilePatchabilityReport:
+    """Validate whether a family is patchable by current generic compile protocols."""
+
+    arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
+    if not arch:
+        return CompilePatchabilityReport(
+            arch="unknown",
+            support_state="unsupported",
+            matched_bundles=(),
+            suggested_patch_plan=(),
+            discovered_targets=(),
+            direct_protocols=(),
+            inferred_protocols=(),
+            satisfied_protocols=(),
+            missing_protocols=(),
+            blockers=("could not determine mlx_vlm architecture",),
+        )
+
+    report = get_compile_trait_report(model_or_arch if not isinstance(model_or_arch, str) else arch)
+    qualification = get_compile_qualification(model_or_arch if not isinstance(model_or_arch, str) else arch)
+    bundles = _matching_pattern_bundles(arch, report)
+    targets = discover_compile_protocol_targets(model_or_arch if not isinstance(model_or_arch, str) else arch)
+    direct_protocols = tuple(
+        sorted(
+            {
+                target.protocol_name
+                for target in targets
+                if target.status == "protocol_matched"
+            }
+        )
+    )
+    planned_protocols = tuple(
+        sorted(
+            {
+                protocol_name
+                for bundle in bundles
+                for protocol_name in bundle.protocol_names
+            }
+        )
+    )
+    inferred_protocols = tuple(
+        protocol_name
+        for protocol_name in planned_protocols
+        if protocol_name not in direct_protocols
+    )
+    matched_protocols = tuple(
+        sorted(set(direct_protocols) | set(inferred_protocols))
+    )
+    required_protocols = tuple(
+        sorted(planned_protocols)
+    )
+    missing_protocols = tuple(
+        protocol_name
+        for protocol_name in required_protocols
+        if protocol_name not in matched_protocols
+    )
+    blockers = []
+    if qualification is not None and qualification.blocker_categories:
+        blockers.append("static blockers: " + ", ".join(qualification.blocker_categories))
+    if missing_protocols:
+        blockers.append("missing protocols: " + ", ".join(missing_protocols))
+    mismatches = [
+        target
+        for target in targets
+        if target.status != "protocol_matched"
+    ]
+    if mismatches:
+        blockers.append(
+            "protocol mismatches: "
+            + ", ".join(
+                f"{target.protocol_name}@{target.class_name}.{target.method_name}"
+                for target in mismatches[:8]
+            )
+        )
+
+    return CompilePatchabilityReport(
+        arch=arch,
+        support_state=qualification.support_state if qualification is not None else "unsupported",
+        matched_bundles=tuple(bundle.name for bundle in bundles),
+        suggested_patch_plan=tuple(_resolve_compile_patch_plan(bundle) for bundle in bundles),
+        discovered_targets=targets,
+        direct_protocols=direct_protocols,
+        inferred_protocols=inferred_protocols,
+        satisfied_protocols=matched_protocols,
+        missing_protocols=missing_protocols,
+        blockers=tuple(blockers),
+    )
+
+
+def suggest_compile_patch_plan(model_or_arch) -> tuple[CompilePatchPlan, ...]:
+    """Return the dry-run bundle plan that would be used for a family."""
+
+    return validate_compile_patchability(model_or_arch).suggested_patch_plan
+
+
+def find_similar_compile_families(
+    model_or_arch,
+    *,
+    limit: int = 5,
+    verified_only: bool = False,
+) -> tuple[tuple[str, float, tuple[str, ...]], ...]:
+    """Return nearby families based on shared traits, bundles, and protocols.
+
+    This helper is aimed at maintainers adding support for a new family. It
+    answers "what existing architecture looks most like this one?" so the next
+    step is usually to compare patchability and trace output against a known
+    neighbor rather than reading every patch body from scratch.
+    """
+
+    arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
+    if not arch:
+        return ()
+
+    report = validate_compile_patchability(model_or_arch if not isinstance(model_or_arch, str) else arch)
+    traits = set(get_compile_trait_report(model_or_arch if not isinstance(model_or_arch, str) else arch).pattern_traits)
+    bundles = set(report.matched_bundles)
+    protocols = set(report.satisfied_protocols)
+    query_features = traits | bundles | protocols
+    if not query_features:
+        return ()
+
+    qualifications = build_compile_qualifications()
+    candidates = []
+    for other_arch, other_report in build_compile_trait_reports().items():
+        if other_arch == arch:
+            continue
+        qualification = qualifications.get(other_arch)
+        if verified_only and (qualification is None or qualification.support_state != "supported_verified"):
+            continue
+        other_patchability = validate_compile_patchability(other_arch)
+        other_features = (
+            set(other_report.pattern_traits)
+            | set(other_patchability.matched_bundles)
+            | set(other_patchability.satisfied_protocols)
+        )
+        if not other_features:
+            continue
+        overlap = query_features & other_features
+        if not overlap:
+            continue
+        score = len(overlap) / len(query_features | other_features)
+        candidates.append(
+            (
+                other_arch,
+                score,
+                tuple(sorted(overlap)),
+            )
+        )
+    candidates.sort(key=lambda item: (-item[1], item[0]))
+    return tuple(candidates[: max(0, limit)])
 
 
 def _build_compile_qualification(
@@ -1306,6 +1835,19 @@ def _invalidate_qualification_cache():
     build_compile_qualifications.cache_clear()
 
 
+def _record_patch_binding(kind: str, cls, name: str) -> None:
+    """Record one concrete runtime patch binding for maintainer tracing."""
+
+    _PATCH_BINDINGS.add(
+        (
+            kind,
+            getattr(cls, "__module__", "<unknown>"),
+            getattr(cls, "__name__", repr(cls)),
+            name,
+        )
+    )
+
+
 def _patch_staticmethod(cls, name, fn):
     """Replace a class staticmethod only when it is not already patched."""
 
@@ -1313,6 +1855,7 @@ def _patch_staticmethod(cls, name, fn):
     if current is fn:
         return
     setattr(cls, name, staticmethod(fn))
+    _record_patch_binding("staticmethod", cls, name)
 
 
 def _patch_method(cls, name, fn):
@@ -1322,6 +1865,7 @@ def _patch_method(cls, name, fn):
     if current is fn:
         return
     setattr(cls, name, fn)
+    _record_patch_binding("method", cls, name)
 
 
 def _try_import_module(module_name: str):
@@ -4305,6 +4849,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             ),
             primitive_names=("compile_safe_feature_merge", "compile_safe_masked_scatter"),
             adapter_name="qwen_like_merge",
+            protocol_names=("multimodal_merge", "masked_scatter"),
             runtime_primitive_names=("qwen_like_image_merge_runtime",),
         ),
         CompilePatternBundle(
@@ -4322,6 +4867,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 "dtype_normalization",
             ),
             adapter_name="qwen_like_merge",
+            protocol_names=("vision_attention", "position_primitives", "cached_image_features"),
             runtime_primitive_names=("qwen2_vision_windowing_runtime",),
         ),
         CompilePatternBundle(
@@ -4341,6 +4887,14 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 "dtype_normalization",
             ),
             adapter_name="qwen3_deepstack",
+            protocol_names=(
+                "multimodal_merge",
+                "masked_scatter",
+                "vision_attention",
+                "position_primitives",
+                "cached_image_features",
+                "deepstack_process",
+            ),
             runtime_primitive_names=("qwen3_family_multimodal_runtime",),
         ),
         CompilePatternBundle(
@@ -4355,6 +4909,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             ),
             primitive_names=("compile_safe_feature_merge", "cached_image_feature_plumbing"),
             adapter_name="single_image_token",
+            protocol_names=("multimodal_merge", "cached_image_features"),
             runtime_primitive_names=("single_image_token_merge_runtime",),
         ),
         CompilePatternBundle(
@@ -4366,6 +4921,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             ),
             primitive_names=("segmented_vision_attention", "dtype_normalization"),
             adapter_name="mistral_attention_family",
+            protocol_names=("vision_attention",),
             runtime_primitive_names=("mistral4_attention_backend_runtime",),
         ),
         CompilePatternBundle(
@@ -4380,6 +4936,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 "dtype_normalization",
             ),
             adapter_name="gemma_vision_family",
+            protocol_names=("masked_scatter", "multimodal_merge"),
             runtime_primitive_names=("gemma3n_multiscale_fusion_runtime",),
         ),
         CompilePatternBundle(
@@ -4400,6 +4957,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 "dtype_normalization",
             ),
             adapter_name="ocr_projector_family",
+            protocol_names=("multimodal_merge", "vision_attention", "cached_image_features"),
             runtime_primitive_names=("deepseek_ocr_multimodal_runtime",),
         ),
         CompilePatternBundle(
@@ -4410,6 +4968,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 or "masked_scatter_multimodal" in report.pattern_traits
             ),
             primitive_names=("compile_safe_masked_scatter",),
+            protocol_names=("masked_scatter",),
             runtime_primitive_names=("masked_scatter_multimodal_runtime",),
         ),
         CompilePatternBundle(
@@ -4425,6 +4984,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 "cached_image_feature_plumbing",
             ),
             adapter_name="idefics_family",
+            protocol_names=("padded_image_filtering", "multimodal_merge", "cached_image_features"),
             runtime_primitive_names=("padded_image_filtering_runtime",),
         ),
         CompilePatternBundle(
@@ -4439,6 +4999,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 "cached_image_feature_plumbing",
             ),
             adapter_name="phi_placeholder_family",
+            protocol_names=("placeholder_expansion", "multimodal_merge", "cached_image_features"),
             runtime_primitive_names=("negative_image_placeholders_runtime",),
         ),
         CompilePatternBundle(
@@ -4450,6 +5011,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             ),
             primitive_names=("compile_safe_feature_merge", "cached_image_feature_plumbing"),
             adapter_name="phi_placeholder_family",
+            protocol_names=("placeholder_expansion", "multimodal_merge", "cached_image_features"),
             runtime_primitive_names=("expanded_image_placeholders_runtime",),
         ),
         CompilePatternBundle(
@@ -4466,6 +5028,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 "dtype_normalization",
             ),
             adapter_name="phi_placeholder_family",
+            protocol_names=("placeholder_expansion", "multimodal_merge", "cached_image_features"),
             runtime_primitive_names=("phi4_multimodal_spans_runtime",),
         ),
         CompilePatternBundle(
@@ -4480,6 +5043,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 "dtype_normalization",
             ),
             adapter_name="ocr_projector_family",
+            protocol_names=("vision_attention", "multimodal_merge", "cached_image_features"),
             runtime_primitive_names=("glm_ocr_vision_compile_runtime",),
         ),
         CompilePatternBundle(
@@ -4494,6 +5058,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
                 "dtype_normalization",
             ),
             adapter_name="ocr_projector_family",
+            protocol_names=("vision_attention", "multimodal_merge", "cached_image_features"),
             runtime_primitive_names=("paddleocr_vl_multimodal_runtime",),
         ),
     )
@@ -4537,6 +5102,7 @@ def _resolve_compile_patch_plan(bundle: CompilePatternBundle) -> CompilePatchPla
     return CompilePatchPlan(
         bundle_name=bundle.name,
         adapter_name=bundle.adapter_name,
+        protocol_names=bundle.protocol_names,
         semantic_primitives=bundle.primitive_names,
         runtime_primitives=bundle.runtime_primitive_names or bundle.primitive_names,
     )
@@ -4593,6 +5159,91 @@ def _apply_compile_patch_plan(plan: CompilePatchPlan) -> None:
         executor()
 
 
+def trace_patch_bindings(model_or_arch) -> tuple[tuple[str, str, str, str], ...]:
+    """Return concrete runtime patch bindings applied for one architecture.
+
+    This is intentionally lower-level than `trace_compile_application(...)`.
+    It answers "what class/method names were actually monkey-patched?" so a
+    maintainer can quickly diff current bindings against upstream changes.
+    """
+
+    arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
+    if not arch:
+        return ()
+    arch_token = f"mlx_vlm.models.{arch}"
+    return tuple(
+        sorted(
+            binding
+            for binding in _PATCH_BINDINGS
+            if arch_token in binding[1]
+        )
+    )
+
+
+def explain_compile_failure(model_or_arch, compile_error=None) -> str:
+    """Summarize why compile support is missing or fragile for a family."""
+
+    decision = resolve_training_compile(model_or_arch)
+    patchability = validate_compile_patchability(model_or_arch)
+    lines = [
+        f"arch={patchability.arch}",
+        f"decision={'enabled' if decision.enabled else 'disabled'}",
+        f"decision_reason={decision.reason}",
+    ]
+    if compile_error is not None:
+        lines.append(f"compile_error={compile_error}")
+    if patchability.matched_bundles:
+        lines.append("matched_bundles=" + ",".join(patchability.matched_bundles))
+    if patchability.direct_protocols:
+        lines.append("direct_protocols=" + ",".join(patchability.direct_protocols))
+    if patchability.inferred_protocols:
+        lines.append("inferred_protocols=" + ",".join(patchability.inferred_protocols))
+    if patchability.satisfied_protocols:
+        lines.append("satisfied_protocols=" + ",".join(patchability.satisfied_protocols))
+    if patchability.missing_protocols:
+        lines.append("missing_protocols=" + ",".join(patchability.missing_protocols))
+    if patchability.blockers:
+        lines.append("blockers=" + "; ".join(patchability.blockers))
+    bindings = trace_patch_bindings(model_or_arch)
+    if bindings:
+        lines.append(
+            "patch_bindings="
+            + ", ".join(f"{class_name}.{method_name}" for _, _, class_name, method_name in bindings[:12])
+        )
+    similar = find_similar_compile_families(model_or_arch, verified_only=True)
+    if similar:
+        lines.append(
+            "similar_verified="
+            + ", ".join(f"{arch}:{score:.2f}" for arch, score, _ in similar[:3])
+        )
+    return "\n".join(lines)
+
+
+def diff_patchability(model_or_arch_a, model_or_arch_b) -> dict[str, Any]:
+    """Compare compile patchability between two families or loaded models."""
+
+    left = validate_compile_patchability(model_or_arch_a)
+    right = validate_compile_patchability(model_or_arch_b)
+    return {
+        "left_arch": left.arch,
+        "right_arch": right.arch,
+        "left_bundles": left.matched_bundles,
+        "right_bundles": right.matched_bundles,
+        "left_direct_protocols": left.direct_protocols,
+        "right_direct_protocols": right.direct_protocols,
+        "left_inferred_protocols": left.inferred_protocols,
+        "right_inferred_protocols": right.inferred_protocols,
+        "left_protocols": left.satisfied_protocols,
+        "right_protocols": right.satisfied_protocols,
+        "only_left_protocols": tuple(sorted(set(left.satisfied_protocols) - set(right.satisfied_protocols))),
+        "only_right_protocols": tuple(sorted(set(right.satisfied_protocols) - set(left.satisfied_protocols))),
+        "left_missing_protocols": left.missing_protocols,
+        "right_missing_protocols": right.missing_protocols,
+        "left_blockers": left.blockers,
+        "right_blockers": right.blockers,
+    }
+
+
 def trace_compile_application(
     model_or_arch,
     *,
@@ -4610,6 +5261,7 @@ def trace_compile_application(
         report.backend_arches if report is not None else ()
     )
     bundles = _matching_pattern_bundles(arch, report)
+    patchability = validate_compile_patchability(model_or_arch if not isinstance(model_or_arch, str) else arch)
     matched_bundle_names = tuple(bundle.name for bundle in bundles)
     installed_bundles = tuple(
         bundle.name for bundle in bundles if bundle.name in _PATCHED_PATTERN_BUNDLES
@@ -4648,6 +5300,10 @@ def trace_compile_application(
         strict_requested=decision.strict_requested,
         backend_qualification_arches=tuple(qual.arch for qual in decision.backend_qualifications),
         recommendations=decision.setting_recommendations,
+        direct_protocols=patchability.direct_protocols,
+        inferred_protocols=patchability.inferred_protocols,
+        satisfied_protocols=patchability.satisfied_protocols,
+        missing_protocols=patchability.missing_protocols,
     )
 
 
@@ -4684,6 +5340,14 @@ def explain_compile_support(
         lines.append("runtime_primitives=" + ",".join(trace.runtime_primitives))
     if trace.adapters:
         lines.append("adapters=" + ",".join(trace.adapters))
+    if trace.satisfied_protocols:
+        lines.append("protocols=" + ",".join(trace.satisfied_protocols))
+    if trace.direct_protocols:
+        lines.append("direct_protocols=" + ",".join(trace.direct_protocols))
+    if trace.inferred_protocols:
+        lines.append("inferred_protocols=" + ",".join(trace.inferred_protocols))
+    if trace.missing_protocols:
+        lines.append("missing_protocols=" + ",".join(trace.missing_protocols))
     if trace.blocker_categories:
         lines.append("blockers=" + ",".join(trace.blocker_categories))
     if trace.recommendations:
