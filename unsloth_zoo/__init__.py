@@ -102,6 +102,7 @@ _is_mlx_only = (
 
 if _is_mlx_only:
     # MLX mode: skip all CUDA/torch-specific initialization.
+    os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
     UNSLOTH_ZOO_IS_PRESENT = True
     del _is_mlx_only, _check_platform, find_spec
     # Everything below this point is GPU-only. Use a flag to gate it.

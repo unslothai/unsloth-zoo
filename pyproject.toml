@@ -64,6 +64,11 @@ include-package-data = false
 exclude = ["images*"]
 
 [project.optional-dependencies]
+mlx = [
+    "mlx>=0.22.0",
+    "mlx-lm>=0.22.0",
+    "mlx-vlm>=0.4.4",
+]
 core = [
     "packaging>=24.1",
     "tyro",
