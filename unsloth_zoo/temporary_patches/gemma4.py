@@ -658,38 +658,23 @@ def patch_Gemma4TextMLP():
     """Stabilize Gemma-4 MLP under fp16 autocast (GRPO on fp16, Tesla T4).
 
     Root cause: `down_proj(act_fn(gate_proj(x)) * up_proj(x))` summed over
-    the wide intermediate dimension can exceed `fp16_max` = 65504 so the
-    fp16 matmul cast produces +-inf. That inf poisons the residual stream
-    and generation then samples NaN logits, tripping the categorical
-    assert at GRPO step ~2 on E2B/E4B with `dtype=torch.float16`.
+    the wide intermediate dimension can exceed fp16_max = 65504 so the fp16
+    matmul cast produces +-inf. That inf poisons the residual stream and
+    generation then samples NaN logits, tripping the categorical assert at
+    GRPO step ~2 on E2B/E4B with dtype=torch.float16.
 
-    Minimal surgical fix (single patch, no attention/norm/embedding
-    changes required):
+    Fix, three cheap operations, single patch:
 
-      1. Run the gate + up activation and multiply in fp32 so the product
-         cannot overflow before we clamp. gate_proj / up_proj stay as fp16
-         tensor-core matmuls (fast on T4 at 65 TFLOPS, B200, etc).
-      2. Clamp the product to 65280 (one bf16 ulp below fp16_max) so
-         down_proj never sees a saturated input - prevents the main failure
-         mode and preserves numerical fidelity for typical activations.
-      3. `nan_to_num` the output as defense-in-depth against the rare case
-         where the fp16 accumulator in down_proj still overflows for long
-         sequences or weights that have drifted during GRPO.
+      1. act_fn(gate) * up in fp32 so the product cannot overflow.
+      2. Clamp to 65280 (one bf16 ulp below fp16_max) before down_proj.
+      3. nan_to_num on the output, rescuing the rare down_proj fp16
+         accumulator overflow on wide intermediate dims.
 
-    Dtype contract: preserves the upstream one (input dtype -> input dtype).
-    No KV cache dtype mismatch, so no attention patch is needed. Upstream
-    Gemma4RMSNorm already computes internally in fp32 and returns
-    `type_as(hidden_states)`, so no RMSNorm patch is needed either.
-
-    Tesla T4 (SM 7.5, no bf16) notes:
-      - Our FORCE_FLOAT32 path falls back to fp16 weights on T4 (bf16
-        unsupported), so the autocast context is fp16 and the patch's
-        fp32 product runs on CUDA cores (8.1 TFLOPS) while the
-        gate/up/down matmuls stay on fp16 tensor cores (65 TFLOPS).
-        Net: minimal perf overhead, matmul throughput preserved.
-      - int8 tensor cores (130 TOPS on T4) via bitsandbytes Linear8bitLt
-        could further accelerate the matmuls; out of scope for this patch
-        since it requires a different module path and calibration flow.
+    Dtype contract is unchanged from upstream (input dtype -> input dtype),
+    so RMSNorm / Attention / Embedding need no companion patches and the KV
+    cache stays aligned with the text attention output. gate_proj, up_proj
+    and down_proj remain fp16 tensor-core matmuls (full T4 throughput at
+    65 TFLOPS).
     """
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
         return
@@ -701,18 +686,24 @@ def patch_Gemma4TextMLP():
     except AttributeError as e:
         return raise_error("Gemma4TextMLP.forward", e)
 
+    # 65280 is the bf16 value one ulp below fp16_max (65504) and is exactly
+    # representable in both fp16 and bf16, so clamping here survives any
+    # downstream round-trip through PEFT's internal dtype casts.
     _SAFE_FP16 = 65280.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(x)
         up = self.up_proj(x)
+        # fp32 act + multiply so the product cannot overflow before clamp.
         product = self.act_fn(gate.float()) * up.float()
         product = torch.clamp(product, min=-_SAFE_FP16, max=_SAFE_FP16)
         out = self.down_proj(product.to(x.dtype))
-        out = torch.nan_to_num(
+        # nan_to_num catches the rare down_proj fp16 accumulator overflow
+        # on wide intermediate dims (empirically observed at GRPO step ~2
+        # on E2B before any training). Cheap elementwise on the residual.
+        return torch.nan_to_num(
             out, nan=0.0, posinf=_SAFE_FP16, neginf=-_SAFE_FP16,
         )
-        return out
     try:
         patch_function(
             Gemma4TextMLP, "forward", forward, fullgraph=False,
