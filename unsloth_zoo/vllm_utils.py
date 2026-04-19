@@ -1137,6 +1137,12 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             )
         pass
 
+        if not hasattr(layer, "mlp"):
+            if hasattr(layer, "layer_scalar"):
+                state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
+                quant_state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
+            continue
+
         proj = layer.mlp.gate_up_proj
         use_fused_gate_up = _is_fused_module("gate_up_proj")
         if use_fused_gate_up:
@@ -1216,6 +1222,8 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
     def _normalize_state_dict_tensor(value):
         if isinstance(value, torch.nn.Parameter):
             value = value.detach()
+        if not isinstance(value, torch.Tensor):
+            return value
         if value.is_sparse:
             value = value.to_dense()
         return value.contiguous()
@@ -1779,9 +1787,11 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
-    if is_vision_model and getattr(config, "model_type", None) == "gemma4":
-        patch_gemma4_vllm_lora_support()
-        patch_gemma4_vllm_k_eq_v_support()
+    if getattr(config, "model_type", None) == "gemma4":
+        if enable_lora:
+            patch_gemma4_vllm_lora_support()
+        if use_bitsandbytes:
+            patch_gemma4_vllm_k_eq_v_support()
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
