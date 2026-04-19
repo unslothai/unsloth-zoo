@@ -59,10 +59,19 @@ from .mlx_utils import (
     iterate_training_batches,
     create_vlm_batches,
     iterate_vlm_training_batches,
+    normalize_mlx_chat_template,
+    normalize_vlm_processor_chat_template,
+    collect_mlx_texts,
     save_lora_adapters,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
+)
+from .mlx_compile import (
+    build_compile_policy,
+    get_compile_qualification,
+    get_model_architecture,
+    resolve_training_compile,
 )
 
 
@@ -102,16 +111,21 @@ class MLXTrainingConfig:
     max_seq_length: int = 2048
     packing: bool = False
     dataset_num_proc: int = 2
+    chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
 
     # MLX-specific
     use_cce: bool = True
     compile: bool = True
+    compile_mode: str = "best_effort"  # "best_effort", "strict", "eager"
+    compile_arch_overrides: dict[str, str] | None = None
+    compile_backend_overrides: dict[str, str] | None = None
     gradient_checkpointing: bool = True
     streaming: bool = False  # Use streaming iterator instead of materializing batches
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
     assistant_token_id: int = 0  # Token ID marking start of assistant response
+    vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
 
 
 class MLXTrainer:
@@ -168,6 +182,9 @@ class MLXTrainer:
         # Training state
         self._global_step = 0
         self._train_loss_history = []
+        self._grad_norm_history = []
+        self._tokens_per_second_history = []
+        self._peak_memory_history = []
         self._step_times = []
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
@@ -284,6 +301,21 @@ class MLXTrainer:
 
         opt_name = self.args.optim.lower()
         if opt_name == "adafactor":
+            unsupported = self._adafactor_unsupported_parameters(self.model)
+            if unsupported:
+                preview = ", ".join(
+                    f"{name}{shape}" for name, shape in unsupported[:3]
+                )
+                if len(unsupported) > 3:
+                    preview += f", +{len(unsupported) - 3} more"
+                print(
+                    "Unsloth: Adafactor does not support rank>2 trainable "
+                    "parameters in MLX; using AdamW instead "
+                    f"({preview})."
+                )
+                opt_name = "adamw"
+
+        if opt_name == "adafactor":
             optimizer = optim.Adafactor(
                 learning_rate=schedule,
                 relative_step=False,
@@ -301,13 +333,36 @@ class MLXTrainer:
             optimizer = optim.Lion(learning_rate=schedule, weight_decay=wd)
         else:
             print(f"Unknown optimizer '{opt_name}', falling back to Adafactor.")
+            opt_name = "adafactor"
             optimizer = optim.Adafactor(
                 learning_rate=schedule,
                 relative_step=False,
                 scale_parameter=False,
             )
 
+        self._resolved_optimizer_name = opt_name
         return optimizer
+
+    @staticmethod
+    def _adafactor_unsupported_parameters(model):
+        """Return trainable params that MLX Adafactor cannot update safely.
+
+        MLX Adafactor currently treats every tensor with ndim >= 2 as factored
+        and reconstructs the update with a matrix multiply. That is correct for
+        2-D matrices, but rank-3/rank-4 tensors from vision patch embeddings,
+        convolutions, and some projectors fail or broadcast incorrectly.
+        """
+        unsupported = []
+        try:
+            trainable = tree_flatten(model.trainable_parameters())
+        except Exception:
+            return unsupported
+
+        for name, value in trainable:
+            ndim = getattr(value, "ndim", None)
+            if ndim is not None and ndim > 2:
+                unsupported.append((name, tuple(getattr(value, "shape", ()))))
+        return unsupported
 
     def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
         """Run evaluation loop.
@@ -452,10 +507,14 @@ class MLXTrainer:
         # Build step functions following mlx-lm's pattern
         max_grad_norm = args.max_grad_norm
         state = [model.state, optimizer.state, mx.random.state]
+        track_grad_norm = False  # Disabled: pins full backward graph (+22GB), same issue as clip_grad_norm
 
         def _apply_update(grad, toks_f):
             """Common gradient post-processing and optimizer update."""
-            grad = tree_map(lambda g: g / toks_f, grad)
+            safe_toks_f = mx.maximum(
+                toks_f, mx.array(1.0, dtype=mx.float32)
+            )
+            grad = tree_map(lambda g: g / safe_toks_f, grad)
             if _needs_grad_scaling:
                 flat = tree_flatten(grad)
                 scaled = []
@@ -466,9 +525,16 @@ class MLXTrainer:
                         v = v * embedding_lr_ratio
                     scaled.append((k, v))
                 grad = tree_unflatten(scaled)
+            grad_norm = mx.array(0.0, dtype=mx.float32)
+            if track_grad_norm:
+                for _, g in tree_flatten(grad):
+                    g = g.astype(mx.float32)
+                    grad_norm = grad_norm + mx.sum(g * g)
+                grad_norm = mx.sqrt(grad_norm)
             if max_grad_norm > 0:
                 grad, _ = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
             optimizer.update(model, grad)
+            return grad_norm
 
         if is_vlm:
             def step_fn(batch_dict, prev_state, do_update):
@@ -483,9 +549,13 @@ class MLXTrainer:
                     toks_f = toks_f + prev_toks
 
                 if do_update:
-                    _apply_update(grad, toks_f)
+                    grad_norm = _apply_update(grad, toks_f)
+                    if track_grad_norm:
+                        return lvalue, toks, None, grad_norm
                     return lvalue, toks, None
 
+                if track_grad_norm:
+                    return lvalue, toks, (grad, toks_f), mx.array(0.0, dtype=mx.float32)
                 return lvalue, toks, (grad, toks_f)
         else:
             def step_fn(batch, lengths, labels, prev_state, do_update):
@@ -500,12 +570,37 @@ class MLXTrainer:
                     toks_f = toks_f + prev_toks
 
                 if do_update:
-                    _apply_update(grad, toks_f)
+                    grad_norm = _apply_update(grad, toks_f)
+                    if track_grad_norm:
+                        return lvalue, toks, None, grad_norm
                     return lvalue, toks, None
 
+                if track_grad_norm:
+                    return lvalue, toks, (grad, toks_f), mx.array(0.0, dtype=mx.float32)
                 return lvalue, toks, (grad, toks_f)
 
-        _use_compile = args.compile
+        compile_policy = build_compile_policy(args=args)
+        _compile_decision = None
+        _use_compile = compile_policy.mode != "eager"
+        if is_vlm and _use_compile:
+            qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
+            if qual is not None:
+                model._unsloth_compile_qualification = qual
+            _compile_decision = resolve_training_compile(model, policy=compile_policy)
+            model._unsloth_compile_decision = _compile_decision
+            if _compile_decision.should_raise:
+                raise ValueError(
+                    f"Unsloth: strict mx.compile requested for VLM arch "
+                    f"'{_compile_decision.arch}', but compile cannot be enabled "
+                    f"({_compile_decision.reason})."
+                )
+            if not _compile_decision.enabled:
+                print(
+                    f"Unsloth: mx.compile disabled for VLM arch "
+                    f"'{_compile_decision.arch}' during training; using eager mode "
+                    f"({_compile_decision.reason})."
+                )
+                _use_compile = False
         if _use_compile:
             _uncompiled_step_fn = step_fn
             step_fn = mx.compile(step_fn, inputs=state, outputs=state)
@@ -539,6 +634,13 @@ class MLXTrainer:
                     seed=args.seed,
                     dataset_text_field=args.dataset_text_field,
                     formatting_func=self.formatting_func,
+                    chat_template=getattr(args, "chat_template", None),
+                    model_name=getattr(self.model, "_hf_repo", None),
+                    model_type=(
+                        getattr(self.model, "_config", {}).get("model_type")
+                        if isinstance(getattr(self.model, "_config", {}), dict)
+                        else None
+                    ),
                 )
             if eval_batches:
                 print(f"Unsloth: Eval enabled every {args.eval_steps} steps "
@@ -551,12 +653,16 @@ class MLXTrainer:
             features.append("CCE")
         if args.gradient_checkpointing:
             features.append("GC")
-        if args.compile:
+        if _use_compile:
             features.append("compile")
         if use_lora_plus:
             features.append(f"LoRA+(r={lora_plus_ratio})")
         features.append(f"LR={args.lr_scheduler_type}")
-        features.append(f"opt={args.optim}")
+        resolved_opt = getattr(self, "_resolved_optimizer_name", args.optim)
+        if str(resolved_opt).lower() != str(args.optim).lower():
+            features.append(f"opt={args.optim}->{resolved_opt}")
+        else:
+            features.append(f"opt={args.optim}")
 
         print(f"Unsloth: Training for {total_steps} steps, "
               f"BS={args.per_device_train_batch_size}, "
@@ -593,35 +699,69 @@ class MLXTrainer:
 
             if is_vlm:
                 try:
-                    lvalue, toks, grad_accum_state = step_fn(
-                        batch_data,
-                        grad_accum_state,
-                        do_update,
-                    )
+                    if track_grad_norm:
+                        lvalue, toks, grad_accum_state, grad_norm = step_fn(
+                            batch_data,
+                            grad_accum_state,
+                            do_update,
+                        )
+                    else:
+                        lvalue, toks, grad_accum_state = step_fn(
+                            batch_data,
+                            grad_accum_state,
+                            do_update,
+                        )
+                        grad_norm = mx.array(0.0, dtype=mx.float32)
                 except ValueError as e:
                     if _use_compile and "eval" in str(e).lower():
+                        if _compile_decision is not None and not _compile_decision.fallback_allowed:
+                            raise RuntimeError(
+                                "Unsloth: strict mx.compile was enabled for this VLM "
+                                "and runtime fallback is disabled."
+                            ) from e
                         print("Unsloth: mx.compile not supported for this VLM, falling back to eager mode.")
                         step_fn = _uncompiled_step_fn
                         _use_compile = False
-                        lvalue, toks, grad_accum_state = step_fn(
-                            batch_data, grad_accum_state, do_update,
-                        )
+                        state = [model.state, optimizer.state, mx.random.state]
+                        if track_grad_norm:
+                            lvalue, toks, grad_accum_state, grad_norm = step_fn(
+                                batch_data, grad_accum_state, do_update,
+                            )
+                        else:
+                            lvalue, toks, grad_accum_state = step_fn(
+                                batch_data, grad_accum_state, do_update,
+                            )
+                            grad_norm = mx.array(0.0, dtype=mx.float32)
                     else:
                         raise
             else:
-                lvalue, toks, grad_accum_state = step_fn(
-                    batch_data[0], batch_data[1], batch_data[2],
-                    grad_accum_state,
-                    do_update,
-                )
+                if track_grad_norm:
+                    lvalue, toks, grad_accum_state, grad_norm = step_fn(
+                        batch_data[0], batch_data[1], batch_data[2],
+                        grad_accum_state,
+                        do_update,
+                    )
+                else:
+                    lvalue, toks, grad_accum_state = step_fn(
+                        batch_data[0], batch_data[1], batch_data[2],
+                        grad_accum_state,
+                        do_update,
+                    )
+                    grad_norm = mx.array(0.0, dtype=mx.float32)
 
             losses += lvalue * toks
             n_tokens += toks
             steps += 1
             if grad_accum_state is not None:
-                mx.eval(state, losses, n_tokens, grad_accum_state[0], grad_accum_state[1])
+                mx.eval(state, losses, n_tokens, grad_norm, grad_accum_state[0], grad_accum_state[1])
             else:
-                mx.eval(state, losses, n_tokens)
+                mx.eval(state, losses, n_tokens, grad_norm)
+            if int(toks.item()) == 0:
+                raise ValueError(
+                    "Unsloth MLX: a training batch produced zero supervised "
+                    "tokens after masking/truncation. Increase max_seq_length, "
+                    "reduce image size, or check the chat template / labels."
+                )
             train_time += time.perf_counter() - tic
 
             # Only log/eval on actual optimizer steps
@@ -641,6 +781,11 @@ class MLXTrainer:
                 peak_mem = mx.get_peak_memory() / 1e9
 
                 self._train_loss_history.append(train_loss)
+                grad_norm_val = float(grad_norm.item()) if track_grad_norm else None
+                if grad_norm_val is not None:
+                    self._grad_norm_history.append(grad_norm_val)
+                self._tokens_per_second_history.append(tokens_sec)
+                self._peak_memory_history.append(peak_mem)
                 self._step_times.append(train_time / steps if steps > 0 else 0)
 
                 # Benchmark hook: reset peak memory after warmup
@@ -651,9 +796,14 @@ class MLXTrainer:
 
                 elapsed_total = time.perf_counter() - start_time
 
+                grad_text = (
+                    f"Grad: {grad_norm_val:.4f} | "
+                    if grad_norm_val is not None else ""
+                )
                 print(
                     f"  Step {current_step}/{total_steps} | "
                     f"Loss: {train_loss:.4f} | "
+                    f"{grad_text}"
                     f"LR: {lr_val:.2e} | "
                     f"Tok/s: {tokens_sec:.0f} | "
                     f"Peak: {peak_mem:.2f} GB"
@@ -719,6 +869,16 @@ class MLXTrainer:
     def _prepare_text_data(self):
         """Prepare text training data. Returns (batches, batch_iter)."""
         args = self.args
+        config = getattr(self.model, "_config", {})
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        self.tokenizer = normalize_mlx_chat_template(
+            self.tokenizer,
+            chat_template=getattr(args, "chat_template", None),
+            model_name=getattr(self.model, "_hf_repo", None),
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
         if self._batches is not None:
             return self._batches, None
         elif args.streaming:
@@ -730,6 +890,9 @@ class MLXTrainer:
                 seed=args.seed,
                 dataset_text_field=args.dataset_text_field,
                 formatting_func=self.formatting_func,
+                chat_template=getattr(args, "chat_template", None),
+                model_name=getattr(self.model, "_hf_repo", None),
+                model_type=model_type,
             )
         else:
             total_batches_needed = (
@@ -745,6 +908,9 @@ class MLXTrainer:
                 seed=args.seed,
                 dataset_text_field=args.dataset_text_field,
                 formatting_func=self.formatting_func,
+                chat_template=getattr(args, "chat_template", None),
+                model_name=getattr(self.model, "_hf_repo", None),
+                model_type=model_type,
             )
             return batches, None
 
@@ -758,6 +924,16 @@ class MLXTrainer:
                 "or load the model with FastLanguageModel.from_pretrained()."
             )
         config = getattr(self.model, "_config", {})
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        processor = normalize_vlm_processor_chat_template(
+            processor,
+            chat_template=getattr(args, "vlm_chat_template", None),
+            model_name=getattr(self.model, "_hf_repo", None),
+            model_type=model_type,
+            strict=False,
+        )
+        self.processor = processor
+        self.model._processor = processor
         _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
 
         if self._batches is not None:
@@ -771,6 +947,7 @@ class MLXTrainer:
                 max_seq_length=args.max_seq_length,
                 seed=args.seed,
                 response_mask_fn=_vlm_mask_fn,
+                formatting_func=self.formatting_func,
             )
         else:
             total_batches_needed = (
@@ -786,6 +963,7 @@ class MLXTrainer:
                 num_batches=total_batches_needed,
                 seed=args.seed,
                 response_mask_fn=_vlm_mask_fn,
+                formatting_func=self.formatting_func,
             )
             # Safety check: detect all-masked VLM labels early
             if _vlm_mask_fn is not None and batches:
@@ -866,7 +1044,8 @@ class MLXTrainer:
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             max_seq_length, formatting_func=None,
                             dataset_text_field="text", num_batches=None,
-                            seed=42):
+                            seed=42, chat_template=None,
+                            model_name=None, model_type=None):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -879,20 +1058,29 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         - labels: mx.array (BS, padded_len) — labels padded with -100
     """
     eos_id = tokenizer.eos_token_id
+    tokenizer = normalize_mlx_chat_template(
+        tokenizer,
+        chat_template=chat_template,
+        model_name=model_name,
+        model_type=model_type,
+        is_vlm=False,
+        strict=False,
+    )
 
     # 1. Gather all text strings (serial, fast)
     all_texts = []
     for item in dataset:
         if formatting_func is not None:
             result = formatting_func(item)
-            texts = result if isinstance(result, list) else [result]
-        elif isinstance(item, dict):
-            text = item.get(dataset_text_field, "")
-            texts = [text] if text else []
-        elif isinstance(item, str):
-            texts = [item]
+            texts = collect_mlx_texts(
+                tokenizer, result, dataset_text_field=dataset_text_field,
+                is_vlm=False,
+            )
         else:
-            continue
+            texts = collect_mlx_texts(
+                tokenizer, item, dataset_text_field=dataset_text_field,
+                is_vlm=False,
+            )
 
         for text in texts:
             if text:
@@ -1157,6 +1345,13 @@ def train_on_responses_only(
             dataset_text_field=args.dataset_text_field,
             num_batches=total_batches_needed,
             seed=args.seed,
+            chat_template=getattr(args, "chat_template", None),
+            model_name=getattr(trainer.model, "_hf_repo", None),
+            model_type=(
+                getattr(trainer.model, "_config", {}).get("model_type")
+                if isinstance(getattr(trainer.model, "_config", {}), dict)
+                else None
+            ),
         )
 
         # Safety check: detect all-masked labels early
@@ -1175,6 +1370,13 @@ def train_on_responses_only(
                 formatting_func=trainer.formatting_func,
                 dataset_text_field=args.dataset_text_field,
                 seed=args.seed,
+                chat_template=getattr(args, "chat_template", None),
+                model_name=getattr(trainer.model, "_hf_repo", None),
+                model_type=(
+                    getattr(trainer.model, "_config", {}).get("model_type")
+                    if isinstance(getattr(trainer.model, "_config", {}), dict)
+                    else None
+                ),
             )
             trainer._eval_batches_labeled = eval_batches
 
@@ -1182,4 +1384,3 @@ def train_on_responses_only(
               f"({len(batches)} batches prepared).")
 
     return trainer
-
