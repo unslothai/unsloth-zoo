@@ -959,17 +959,22 @@ def grpo_accumulated_loss(
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
-                    logprobs_chunk = efficient_log_softmax(
-                        new_hidden_states_chunk,
-                        lm_head,
-                        completion_ids,
-                        chunks=input_ids_chunk.shape[0]*multiplier,
-                        logit_scale_multiply=logit_scale_multiply,
-                        logit_scale_divide=logit_scale_divide,
-                        logit_softcapping=logit_softcapping,
-                        temperature=temperature,
-                        batch_size = B
-                    )
+                    # Guard: check if model returned hidden states or logits
+                    if new_hidden_states_chunk.shape[-1] == lm_head.shape[1]:
+                        logprobs_chunk = efficient_log_softmax(
+                            new_hidden_states_chunk,
+                            lm_head,
+                            completion_ids,
+                            chunks=input_ids_chunk.shape[0]*multiplier,
+                            logit_scale_multiply=logit_scale_multiply,
+                            logit_scale_divide=logit_scale_divide,
+                            logit_softcapping=logit_softcapping,
+                            temperature=temperature,
+                            batch_size = B
+                        )
+                    else:
+                        # Model returned logits directly - scaling/softcapping already applied by model forward
+                        logprobs_chunk = chunked_selective_log_softmax(new_hidden_states_chunk, completion_ids, temperature)
                 else:
                     new_hidden_states_chunk = unwrapped_model(
                         input_ids = input_ids_chunk,
