@@ -680,29 +680,21 @@ def patch_Gemma4TextMLP():
     except AttributeError as e:
         return raise_error("Gemma4TextMLP.forward", e)
 
-    # 65280 is the largest value exactly representable in both fp16 and bf16:
-    # one bf16 ULP below 65536 (the next representable bf16 value) and 224
-    # below fp16_max=65504. Note fp16_max itself is not representable in bf16
-    # (it rounds up to 65536). Clamping here therefore survives any downstream
-    # round-trip through PEFT's internal dtype casts without rounding to inf.
+    # Largest value exactly representable in both fp16 and bf16 (one bf16
+    # ULP below 65536, which would round to fp16 inf).
     _SAFE_FP16 = 65280.0
 
     def forward(self, x):
         gate = self.gate_proj(x)
-        # Gate on the matmul output dtype rather than x.dtype so that
-        # bf16/fp32 activations combined with fp16 weights (via autocast or
-        # do_forced_float32) still enter the stabilization path when the
-        # projection actually produces fp16 outputs.
+        # Gate on matmul output dtype, not x.dtype, to catch fp16-cast
+        # projections over bf16/fp32 activations (autocast or forced fp16).
         if gate.dtype != torch.float16:
             return self.down_proj(self.act_fn(gate) * self.up_proj(x))
-        # fp32 act + multiply so the product cannot overflow before clamp.
         product = self.act_fn(gate.float()) * self.up_proj(x).float()
         product = torch.clamp(product, min=-_SAFE_FP16, max=_SAFE_FP16)
         out = self.down_proj(product.to(gate.dtype))
-        # nan_to_num catches the rare down_proj fp16 accumulator overflow
-        # on wide intermediate dims. Replacements are 0 so the MLP output
-        # at overflow positions defers to the identity residual instead of
-        # injecting a near-fp16_max value that would dominate hidden_states.
+        # Replace overflow with 0 so the residual keeps the identity path
+        # instead of being dominated by a near-fp16_max injection.
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     try:
         patch_function(
