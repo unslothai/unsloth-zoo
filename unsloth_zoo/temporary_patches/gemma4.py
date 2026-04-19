@@ -646,14 +646,6 @@ TEMPORARY_PATCHES.append(patch_Gemma4AudioAttention)
 # ============================================================================
 
 
-def _gemma4_modeling():
-    try:
-        import transformers.models.gemma4.modeling_gemma4 as mod
-        return mod
-    except ImportError:
-        return None
-
-
 def patch_Gemma4TextMLP():
     """Stabilize Gemma-4 MLP under fp16 autocast (GRPO on fp16, Tesla T4).
 
@@ -679,8 +671,9 @@ def patch_Gemma4TextMLP():
     """
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
         return
-    mod = _gemma4_modeling()
-    if mod is None:
+    try:
+        import transformers.models.gemma4.modeling_gemma4 as mod
+    except ImportError:
         return
     try:
         Gemma4TextMLP = mod.Gemma4TextMLP
@@ -694,7 +687,9 @@ def patch_Gemma4TextMLP():
     # round-trip through PEFT's internal dtype casts without rounding to inf.
     _SAFE_FP16 = 65280.0
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
+        if x.dtype != torch.float16:
+            return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         gate = self.gate_proj(x)
         up = self.up_proj(x)
         # fp32 act + multiply so the product cannot overflow before clamp.
@@ -702,11 +697,10 @@ def patch_Gemma4TextMLP():
         product = torch.clamp(product, min=-_SAFE_FP16, max=_SAFE_FP16)
         out = self.down_proj(product.to(x.dtype))
         # nan_to_num catches the rare down_proj fp16 accumulator overflow
-        # on wide intermediate dims (empirically observed at GRPO step ~2
-        # on E2B before any training). Cheap elementwise on the residual.
-        return torch.nan_to_num(
-            out, nan=0.0, posinf=_SAFE_FP16, neginf=-_SAFE_FP16,
-        )
+        # on wide intermediate dims. Replacements are 0 so the MLP output
+        # at overflow positions defers to the identity residual instead of
+        # injecting a near-fp16_max value that would dominate hidden_states.
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     try:
         patch_function(
             Gemma4TextMLP, "forward", forward, fullgraph=False,
