@@ -361,11 +361,8 @@ def patch_gemma4_vllm_lora_support():
         vllm_lora_worker_manager.create_lora_manager = patched_create_lora_manager
 pass
 
-# vLLM's Gemma4 k_eq_v path now expects qkv_proj to always expose q+k+v.
-# For prequantized bitsandbytes checkpoints, the synthetic v shard is still
-# missing from the quant-state dict on full-attention k_eq_v layers, so we
-# materialize it during loader-side quant-state stacking instead of patching
-# the runtime attention forward.
+# Prequantized BnB Gemma4 k_eq_v layers lack a synthetic v quant-state shard;
+# we duplicate K -> V at loader-side quant-state stacking time.
 def patch_gemma4_vllm_k_eq_v_support():
     from vllm.model_executor.model_loader.bitsandbytes_loader import (
         BitsAndBytesModelLoader,
@@ -426,9 +423,8 @@ def patch_gemma4_vllm_k_eq_v_support():
             if quant_states is None:
                 continue
 
-            # Gemma4 full-attention k_eq_v layers reuse K as V. The raw weight
-            # loader already duplicates k_proj -> v_proj; prequant BnB needs the
-            # same duplication for shard-local QuantState metadata.
+            # k_eq_v reuses K as V: the raw-weight loader already duplicates
+            # k_proj -> v_proj, so prequant BnB needs the matching QuantState.
             if kind == "packed":
                 if isinstance(quant_states, dict) and 2 not in quant_states and 1 in quant_states:
                     quant_states[2] = deepcopy(quant_states[1])
