@@ -688,14 +688,17 @@ def patch_Gemma4TextMLP():
     _SAFE_FP16 = 65280.0
 
     def forward(self, x):
-        if x.dtype != torch.float16:
-            return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         gate = self.gate_proj(x)
-        up = self.up_proj(x)
+        # Gate on the matmul output dtype rather than x.dtype so that
+        # bf16/fp32 activations combined with fp16 weights (via autocast or
+        # do_forced_float32) still enter the stabilization path when the
+        # projection actually produces fp16 outputs.
+        if gate.dtype != torch.float16:
+            return self.down_proj(self.act_fn(gate) * self.up_proj(x))
         # fp32 act + multiply so the product cannot overflow before clamp.
-        product = self.act_fn(gate.float()) * up.float()
+        product = self.act_fn(gate.float()) * self.up_proj(x).float()
         product = torch.clamp(product, min=-_SAFE_FP16, max=_SAFE_FP16)
-        out = self.down_proj(product.to(x.dtype))
+        out = self.down_proj(product.to(gate.dtype))
         # nan_to_num catches the rare down_proj fp16 accumulator overflow
         # on wide intermediate dims. Replacements are 0 so the MLP output
         # at overflow positions defers to the identity residual instead of
