@@ -44,10 +44,14 @@ pass
 # More memory efficient by chunking on (bsz+qlen) dimension
 # Exactly equivalent to the above
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
-def chunked_selective_log_softmax(logits, index, temperature: float = 1.0):
-    # Split into 4 chunks only
-    chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = 4, dim = 0)
-    chunked_index  = torch.chunk(index.reshape(-1), chunks = 4, dim = 0)
+def chunked_selective_log_softmax(
+    logits,
+    index,
+    temperature: float = 1.0,
+    chunks: int = 4,
+):
+    chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = chunks, dim = 0)
+    chunked_index  = torch.chunk(index.reshape(-1), chunks = chunks, dim = 0)
     all_per_token_logps = []
     # Below loop does the same as selective_log_softmax(chunk_logits, chunk_index)
     for chunk_logits, chunk_index in zip(chunked_logits, chunked_index):
@@ -973,8 +977,19 @@ def grpo_accumulated_loss(
                             batch_size = B
                         )
                     else:
-                        # Model returned logits directly - scaling/softcapping already applied by model forward
-                        logprobs_chunk = chunked_selective_log_softmax(new_hidden_states_chunk, completion_ids, temperature)
+                        # Model returned logits directly: skip lm_head matmul. The
+                        # model's forward has already applied architectural scaling/
+                        # softcapping, so re-applying them here would double-transform
+                        # the logits and corrupt GRPO logprobs. Only the GRPO-specific
+                        # temperature is applied inside chunked_selective_log_softmax.
+                        # Chunk count mirrors the lm_head matmul path above so large-
+                        # vocab models don't blow out VRAM on the fallback branch.
+                        logprobs_chunk = chunked_selective_log_softmax(
+                            new_hidden_states_chunk,
+                            completion_ids,
+                            temperature = temperature,
+                            chunks = input_ids_chunk.shape[0] * multiplier,
+                        )
                 else:
                     new_hidden_states_chunk = unwrapped_model(
                         input_ids = input_ids_chunk,
@@ -1002,8 +1017,19 @@ def grpo_accumulated_loss(
                             batch_size = B
                         )
                     else:
-                        # Model returned logits directly - scaling/softcapping already applied by model forward
-                        logprobs_chunk = chunked_selective_log_softmax(new_hidden_states_chunk, completion_ids, temperature)
+                        # Model returned logits directly: skip lm_head matmul. The
+                        # model's forward has already applied architectural scaling/
+                        # softcapping, so re-applying them here would double-transform
+                        # the logits and corrupt GRPO logprobs. Only the GRPO-specific
+                        # temperature is applied inside chunked_selective_log_softmax.
+                        # Chunk count mirrors the lm_head matmul path above so large-
+                        # vocab models don't blow out VRAM on the fallback branch.
+                        logprobs_chunk = chunked_selective_log_softmax(
+                            new_hidden_states_chunk,
+                            completion_ids,
+                            temperature = temperature,
+                            chunks = input_ids_chunk.shape[0] * multiplier,
+                        )
                 #This is needed to avoid race conditions with GPT OSS offload_embbed=True
                 #However, it seems that this line does not slow down or disrupt models.
                 device_synchronize()
