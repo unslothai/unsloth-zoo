@@ -801,13 +801,58 @@ class MLXTrainer:
         has_lora = any("lora" in k for k in trainable)
 
         if has_lora:
+            hf_repo = getattr(self.model, "_hf_repo", None) or ""
+
+
+            _lora_rank, _lora_scale, _lora_dropout = 8, 1.0, 0.0
+            for _, m in self.model.named_modules():
+                if hasattr(m, "lora_a"):
+                    _lora_rank = m.lora_a.shape[-1]
+                    _lora_scale = getattr(m, "scale", 1.0)
+
+                    _drop = getattr(m, "dropout", None)
+                    _lora_dropout = getattr(_drop, "p", 0.0) if _drop else 0.0
+                    break
+
+
+            from .mlx_utils import _get_transformer_layers
+            layers = _get_transformer_layers(self.model)
+            _num_layers = len(layers) if layers else -1
+
+            # Save in mlx-lm's expected format so load_adapters() works
             self.model.save_lora_adapters(output_dir, adapter_config={
+                # mlx-lm format (load_adapters expects these)
+                "num_layers": _num_layers,
+                "lora_parameters": {
+                    "rank": _lora_rank,
+                    "scale": _lora_scale,
+                    "dropout": _lora_dropout,
+                },
+                "fine_tune_type": "lora",
+                # mlx-vlm format (expects rank/scale at top level)
+                "rank": _lora_rank,
+                "scale": _lora_scale,
+                "dropout": _lora_dropout,
+                # Shared fields
+                "peft_type": "LORA",
+                "base_model_name_or_path": hf_repo,
                 "learning_rate": self.args.learning_rate,
                 "max_steps": self.args.max_steps,
                 "max_seq_length": self.args.max_seq_length,
                 "use_cce": self.args.use_cce,
             })
             self.tokenizer.save_pretrained(output_dir)
+
+            # Copy base model's config.json so the checkpoint is loadable
+            src_path = getattr(self.model, "_src_path", None)
+            if src_path is not None:
+                import shutil
+                from pathlib import Path
+                src_config = Path(src_path) / "config.json"
+                dst_config = Path(output_dir) / "config.json"
+                if src_config.exists() and not dst_config.exists():
+                    shutil.copy(str(src_config), str(dst_config))
+
             # VLMs: also save the processor (image preprocessor config)
             # so the adapter directory is complete for inference.
             _processor = self.processor or getattr(self.model, "_processor", None)

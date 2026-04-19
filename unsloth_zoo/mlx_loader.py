@@ -23,6 +23,7 @@ This avoids importing unsloth.models (which pulls in CUDA kernels).
 """
 
 import json
+import os
 import types
 import warnings
 
@@ -317,6 +318,46 @@ def _patch_mlx_saving(model, tokenizer):
     model.save_lora_adapters     = types.MethodType(_mlx_save_lora_adapters, model)
 
 
+def _discover_lora_keys(model, target_set):
+    """Discover LoRA-eligible module keys filtered by target_modules.
+
+    mlx-lm's linear_to_lora_layers auto-discovers ALL linear modules when
+    config["keys"] is None. This function does the same discovery but filters
+    to only modules whose leaf name is in target_set.
+
+    Args:
+        model: MLX model with a .layers attribute.
+        target_set: set of leaf module names to LoRA, or None for ALL linear modules.
+
+    Returns:
+        set of full module paths (e.g. {"self_attn.q_proj", "self_attn.v_proj"}).
+        None if target_set is None (let mlx-lm auto-discover everything).
+    """
+    if target_set is None:
+        return None  # mlx-lm will auto-discover all linear modules
+
+    import mlx.nn as nn
+    try:
+        from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear
+    except ImportError:
+        SwitchLinear = QuantizedSwitchLinear = type(None)
+
+    lora_types = (
+        nn.Linear, nn.QuantizedLinear,
+        SwitchLinear, QuantizedSwitchLinear,
+        nn.Embedding, nn.QuantizedEmbedding,
+    )
+    keys = set()
+    layers = getattr(model, "layers", [])
+    for layer in layers:
+        for path, module in layer.named_modules():
+            if hasattr(module, "to_lora") or isinstance(module, lora_types):
+                leaf = path.split(".")[-1]
+                if leaf in target_set:
+                    keys.add(path)
+    return keys
+
+
 def _lora_walk_module(model, lora_config, target_modules, attr_names):
     """Walk a module tree and replace matching Linear/QuantizedLinear with LoRA.
 
@@ -415,16 +456,41 @@ class FastMLXModel:
             config_data = {}
             local_path = None
 
+        adapter_cfg_path = os.path.join(local_path, "adapter_config.json") if local_path else None
+        if adapter_cfg_path and os.path.exists(adapter_cfg_path):
+            try:
+                with open(adapter_cfg_path, "r") as f:
+                    adapter_cfg = json.load(f)
+                base_model_id = adapter_cfg.get("base_model_name_or_path", "")
+                if base_model_id:
+                    print(f"Unsloth: Detected LoRA adapter, loading base model '{base_model_id}'...")
+                    model, tokenizer = mlx_load(
+                        base_model_id,
+                        adapter_path=local_path,
+                        tokenizer_config={"token": token} if token else None,
+                    )
+
+                    base_local = str(_download(base_model_id))
+                    base_config_path = os.path.join(base_local, "config.json")
+                    if os.path.exists(base_config_path):
+                        with open(base_config_path, "r") as f:
+                            config_data = json.load(f)
+                    model._config = config_data
+                    model._hf_repo = base_model_id
+                    model._src_path = base_local
+                    model._is_vlm_model = False
+                    model.max_seq_length = max_seq_length
+                    _patch_mlx_saving(model, tokenizer)
+                    return model, tokenizer
+            except Exception as e:
+                print(f"Unsloth: LoRA adapter detection failed ({e}), falling back to standard load.")
+
         # Step 2: Check unsloth custom loader registry
         model_type = config_data.get("model_type", "")
         try:
             from unsloth.models.mlx import get_unsloth_loader
             custom_loader = get_unsloth_loader(model_type)
         except (ImportError, AttributeError, NotImplementedError):
-            # AttributeError: torch installed without CUDA triggers
-            #   torch._C._cuda_getCurrentRawStream failures in unsloth.kernels
-            # NotImplementedError: device_type detection raises this on Mac
-            #   when no GPU is available (we are on MLX path anyway)
             custom_loader = None
 
         if custom_loader is not None:
@@ -532,7 +598,7 @@ class FastMLXModel:
         lora_alpha=16,
         lora_dropout=0,
         bias="none",
-        use_gradient_checkpointing=True,
+        use_gradient_checkpointing="mlx",
         random_state=3407,
         max_seq_length=2048,
         train_vision=False,
@@ -558,6 +624,13 @@ class FastMLXModel:
                 "gate_proj", "up_proj", "down_proj",
             ]
 
+        # "all-linear" is a PEFT special keyword meaning all linear layers.
+        # On MLX, pass None to _discover_lora_keys so it includes everything.
+        if target_modules == ["all-linear"] or target_modules == "all-linear":
+            target_set = None  # discover ALL linear modules
+        else:
+            target_set = set(target_modules)
+
         lora_config = {
             "rank": r,
             "alpha": lora_alpha,
@@ -573,11 +646,12 @@ class FastMLXModel:
             _fix_gemma4_kv_sharing(model)
             model.freeze()
 
-            # Apply LoRA to the language model
+            # Apply LoRA to the language model (filtered by target_modules)
             lm = model.language_model
             num_layers = 0
             if hasattr(lm, "model") and hasattr(lm.model, "layers"):
                 num_layers = len(lm.model.layers)
+            lora_config["keys"] = _discover_lora_keys(lm, target_set)
             linear_to_lora_layers(
                 lm,
                 num_layers=num_layers,
@@ -603,11 +677,12 @@ class FastMLXModel:
             # Unfreeze all LoRA params across the entire tree
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
         else:
-            # Text-only path (original behavior)
+            # Text-only path — filter by target_modules
             num_layers = 0
             if hasattr(model, "model") and hasattr(model.model, "layers"):
                 num_layers = len(model.model.layers)
 
+            lora_config["keys"] = _discover_lora_keys(model, target_set)
             linear_to_lora_layers(
                 model,
                 num_layers=num_layers,
@@ -617,6 +692,17 @@ class FastMLXModel:
 
             model.freeze()
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+
+        # Apply gradient checkpointing if requested
+        # "mlx" (default) or True → apply; False or "none" → skip
+        if isinstance(use_gradient_checkpointing, str):
+            _apply_gc = use_gradient_checkpointing.lower() not in ("false", "none", "")
+        else:
+            _apply_gc = bool(use_gradient_checkpointing)
+
+        if _apply_gc:
+            from .mlx_utils import apply_gradient_checkpointing
+            apply_gradient_checkpointing(model)
 
         import mlx.utils
         trainable = sum(v.size for _, v in mlx.utils.tree_flatten(model.trainable_parameters()))
