@@ -323,22 +323,27 @@ def patch_gemma4_vllm_lora_support():
     from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
     from vllm.model_executor.models import interfaces as vllm_model_interfaces
     from vllm.lora import model_manager as vllm_lora_model_manager
-    from vllm.v1.worker import lora_model_runner_mixin
+    try:
+        from vllm.v1.worker import lora_model_runner_mixin
+    except ImportError:
+        lora_model_runner_mixin = None
     from unsloth_zoo import vllm_lora_worker_manager
 
     Gemma4ForConditionalGeneration.supports_lora = True
     Gemma4ForConditionalGeneration.embedding_modules = {}
 
-    if not hasattr(lora_model_runner_mixin.supports_lora, "_unsloth_gemma4_patch"):
-        original_supports_lora = lora_model_runner_mixin.supports_lora
-
+    original_supports_lora = getattr(
+        lora_model_runner_mixin, "supports_lora", vllm_model_interfaces.supports_lora
+    )
+    if not hasattr(original_supports_lora, "_unsloth_gemma4_patch"):
         def patched_supports_lora(model):
             if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
                 return True
             return original_supports_lora(model)
 
         patched_supports_lora._unsloth_gemma4_patch = True
-        lora_model_runner_mixin.supports_lora = patched_supports_lora
+        if lora_model_runner_mixin is not None:
+            lora_model_runner_mixin.supports_lora = patched_supports_lora
         vllm_model_interfaces.supports_lora = patched_supports_lora
 
     if not hasattr(vllm_lora_model_manager.create_lora_manager, "_unsloth_gemma4_patch"):
@@ -691,9 +696,15 @@ def finalize_huggingface_model(
                 if submodule is not None and hasattr(submodule, "layer_idx"):
                     submodule.layer_idx = layer_idx
 
+    known_configs = {id(config)}
+    for sub_name in ("text_config", "vision_config", "audio_config"):
+        sub_cfg = getattr(config, sub_name, None)
+        if sub_cfg is not None:
+            known_configs.add(id(sub_cfg))
+
     for module in new_model.modules():
         module_config = getattr(module, "config", None)
-        if module_config is not None:
+        if module_config is not None and id(module_config) in known_configs:
             set_dtype_in_config(module_config, dtype)
 
     target_device = _get_model_device(new_model)
@@ -717,7 +728,8 @@ def finalize_huggingface_model(
                 config = rotary_config,
                 device = target_device,
             )
-            buffer_dtype = torch.float32 if (is_gemma4 and is_vision_rotary) else dtype
+            # Gemma4's rotary math requires float32 buffers; other archs follow dtype.
+            buffer_dtype = torch.float32 if is_gemma4 else dtype
             for buffer_name in ("inv_freq", "original_inv_freq"):
                 buffer = getattr(module.rotary_emb, buffer_name, None)
                 if torch.is_tensor(buffer) and buffer.is_floating_point():
@@ -741,24 +753,21 @@ def finalize_huggingface_model(
     if (quantization_config or {}) == {} and bnb_config is None:
         new_model = new_model.to(device = target_device, dtype = dtype)
         if is_gemma4:
+            # Restore float32 rotary buffers / attention_scaling that .to(dtype) may have downcast.
             for module in new_model.modules():
                 rotary_emb = getattr(module, "rotary_emb", None)
                 if rotary_emb is None:
                     continue
                 rotary_cfg = getattr(rotary_emb, "config", None)
-                if rotary_cfg is None:
-                    continue
-                fresh_rotary_emb = rotary_emb.__class__(
-                    config = rotary_cfg,
-                    device = target_device,
-                )
-                for attr_name in ("max_seq_len_cached", "original_max_seq_len"):
-                    if hasattr(fresh_rotary_emb, attr_name):
-                        setattr(rotary_emb, attr_name, getattr(fresh_rotary_emb, attr_name))
-                for attr_name, attr_value in fresh_rotary_emb.__dict__.items():
-                    if attr_name == "attention_scaling" or attr_name.endswith("_attention_scaling"):
-                        setattr(rotary_emb, attr_name, attr_value)
-                for buffer_name, buffer in fresh_rotary_emb._buffers.items():
+                if rotary_cfg is not None:
+                    fresh_rotary_emb = rotary_emb.__class__(
+                        config = rotary_cfg,
+                        device = target_device,
+                    )
+                    for attr_name, attr_value in fresh_rotary_emb.__dict__.items():
+                        if attr_name == "attention_scaling" or attr_name.endswith("_attention_scaling"):
+                            setattr(rotary_emb, attr_name, attr_value)
+                for buffer_name, buffer in list(rotary_emb._buffers.items()):
                     if torch.is_tensor(buffer) and buffer.is_floating_point():
                         rotary_emb._buffers[buffer_name] = buffer.to(
                             device = target_device,
@@ -955,13 +964,13 @@ def get_model_layer_config(return_non_layered=True):
             # qwen 3 vl
             "model.visual.deepstack_merger_list.{kk}.linear_fc1",
             "model.visual.deepstack_merger_list.{kk}.linear_fc2",
-            "model.visual.merger.linear_fc1",
-            "model.visual.merger.linear_fc2",
 
         },
         "non_layered_components":{
             # we do not handle quantization for these layers yet
             # the set_additional_modules would process these layers
+            "model.visual.merger.linear_fc1",
+            "model.visual.merger.linear_fc2",
             "model.multi_modal_projector",
             "model.language_model.norm",
             'model.vision_model.layernorm_pre',
@@ -1081,9 +1090,20 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
         state_dict[name] = value
         quant_state_dict[name] = value
 
+    def _store_quant_state(name, quant_state):
+        if quant_state is None:
+            return
+        quant_state_dict[f"{name}.weight.quant_state"] = quant_state
+        try:
+            for k, v in quant_state.as_dict(packed=True).items():
+                state_dict[f"{name}.weight.{k}"] = v
+        except Exception:
+            pass
+
     if hasattr(gdn, "in_proj_qkvz"):
         proj = getattr(gdn.in_proj_qkvz, "base_layer", gdn.in_proj_qkvz)
-        weight = _unwrap(proj.weight)
+        raw_weight = proj.weight
+        weight = _unwrap(raw_weight)
 
         output_sizes = getattr(proj, "output_sizes", None)
         if output_sizes is None:
@@ -1109,24 +1129,10 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
         store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
         store(f"{prefix}.in_proj_z.weight", z_weight)
 
-        qs_attr = getattr(weight, "bnb_quant_state", None)
+        qs_attr = getattr(raw_weight, "bnb_quant_state", getattr(weight, "bnb_quant_state", None))
         if isinstance(qs_attr, dict):
-            qkv_qs = qs_attr.get(0)
-            z_qs = qs_attr.get(3)
-            if qkv_qs is not None:
-                quant_state_dict[f"{prefix}.in_proj_qkv.weight.quant_state"] = qkv_qs
-                try:
-                    for k, v in qkv_qs.as_dict(packed=True).items():
-                        state_dict[f"{prefix}.in_proj_qkv.weight.{k}"] = v
-                except Exception:
-                    pass
-            if z_qs is not None:
-                quant_state_dict[f"{prefix}.in_proj_z.weight.quant_state"] = z_qs
-                try:
-                    for k, v in z_qs.as_dict(packed=True).items():
-                        state_dict[f"{prefix}.in_proj_z.weight.{k}"] = v
-                except Exception:
-                    pass
+            _store_quant_state(f"{prefix}.in_proj_qkv", qs_attr.get(0))
+            _store_quant_state(f"{prefix}.in_proj_z",   qs_attr.get(3))
 
         if weight.dtype == torch.float8_e4m3fn:
             scale_attr = None
@@ -1151,10 +1157,35 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
         get_state_dict(f"{prefix}.in_proj_z", 0, state_dict, gdn.in_proj_z, slice_weights=False)
 
     ba_layer = getattr(gdn.in_proj_ba, "base_layer", gdn.in_proj_ba)
-    ba_weight = _unwrap(ba_layer.weight)
+    raw_ba_weight = ba_layer.weight
+    ba_weight = _unwrap(raw_ba_weight)
     mid = ba_weight.shape[0] // 2
     store(f"{prefix}.in_proj_b.weight", ba_weight[:mid])
     store(f"{prefix}.in_proj_a.weight", ba_weight[mid:])
+
+    ba_qs = getattr(raw_ba_weight, "bnb_quant_state", getattr(ba_weight, "bnb_quant_state", None))
+    if isinstance(ba_qs, dict):
+        _store_quant_state(f"{prefix}.in_proj_b", ba_qs.get(0))
+        _store_quant_state(f"{prefix}.in_proj_a", ba_qs.get(1))
+
+    if ba_weight.dtype == torch.float8_e4m3fn:
+        scale_attr = None
+        if hasattr(ba_layer, "weight_scale"):
+            scale_attr = "weight_scale"
+        elif hasattr(ba_layer, "weight_scale_inv"):
+            scale_attr = "weight_scale_inv"
+        ws = _unwrap(getattr(ba_layer, scale_attr)) if scale_attr is not None else None
+        if ws is not None:
+            if ws.ndim == 2 and ws.shape[1] > 1:
+                block_size = ba_layer.weight_block_size[0]
+                scale_mid = mid // block_size
+                b_scale = ws[:scale_mid]
+                a_scale = ws[scale_mid:]
+            else:
+                b_scale = ws[:mid]
+                a_scale = ws[mid:]
+            store(f"{prefix}.in_proj_b.{scale_attr}", b_scale)
+            store(f"{prefix}.in_proj_a.{scale_attr}", a_scale)
 
     store(f"{prefix}.conv1d.weight", gdn.conv1d.weight.data)
     store(f"{prefix}.dt_bias", gdn.dt_bias.data)

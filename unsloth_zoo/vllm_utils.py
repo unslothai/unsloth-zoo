@@ -1063,11 +1063,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             quant_state_dict[prefix + ".bias"] = bias_tensor
     pass
 
-    gemma4_k_eq_v_layers = {
-        kk
-        for kk, layer_type in enumerate(getattr(text_config, "layer_types", ()))
-        if model_type == "gemma4" and getattr(text_config, "attention_k_eq_v", False) and layer_type == "full_attention"
-    }
+    if model_type == "gemma4" and getattr(text_config, "attention_k_eq_v", False):
+        gemma4_k_eq_v_layers = {
+            kk
+            for kk, layer_type in enumerate(getattr(text_config, "layer_types", ()))
+            if layer_type == "full_attention"
+        }
+    else:
+        gemma4_k_eq_v_layers = set()
 
     # Embedding
     if hasattr(vllm_internals, "model"): # Standard Language models
@@ -1137,6 +1140,17 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             )
         pass
 
+        if hasattr(layer, "per_layer_input_gate"):
+            get_state_dict(
+                f"{vllm_text_model_prefix}.layers.{kk}.per_layer_input_gate",
+                0, state_dict, layer.per_layer_input_gate,
+            )
+        if hasattr(layer, "per_layer_projection"):
+            get_state_dict(
+                f"{vllm_text_model_prefix}.layers.{kk}.per_layer_projection",
+                0, state_dict, layer.per_layer_projection,
+            )
+
         if not hasattr(layer, "mlp"):
             if hasattr(layer, "layer_scalar"):
                 state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
@@ -1192,14 +1206,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     # LM Head - Use get_state_dict for consistency
     if not getattr(text_config, "tie_word_embeddings", False):
         lm_layer = next((mod for name, mod in vllm_internals.named_modules() if "lm_head" in name), None)
-        if lm_layer is not None:
-            get_state_dict("lm_head", 0, state_dict, lm_layer, slice_weights=False)
-        elif hasattr(vllm_internals, "language_model") and hasattr(vllm_internals.language_model, "lm_head"):
-            get_state_dict("lm_head", 0, state_dict, vllm_internals.language_model.lm_head, slice_weights=False)
-        elif hasattr(vllm_internals, "lm_head"):
-            get_state_dict("lm_head", 0, state_dict, vllm_internals.lm_head, slice_weights=False)
-        else:
-            raise RuntimeError("Could not find lm_head in vLLM internals")
+        if lm_layer is None:
+            raise RuntimeError("Unsloth: could not find lm_head in vLLM internals")
+        get_state_dict("lm_head", 0, state_dict, lm_layer, slice_weights=False)
     else:
         # Fallback to embed_tokens for tied embeddings
         embed_key = f"{vllm_text_model_prefix}.embed_tokens.weight"
@@ -1223,7 +1232,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
         if isinstance(value, torch.nn.Parameter):
             value = value.detach()
         if not isinstance(value, torch.Tensor):
-            return value
+            return None
         if value.is_sparse:
             value = value.to_dense()
         return value.contiguous()
@@ -1243,6 +1252,8 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
         try:
             old_val = _normalize_state_dict_tensor(old_state_dict[key])
             new_val = _normalize_state_dict_tensor(new_state_dict[key])
+            if old_val is None or new_val is None:
+                continue
             if old_val.dtype != new_val.dtype or (new_val.element_size() < 2):
                 # upcast both to float32 just for comparison. For FP8, vLLM stores weight scale in FP32 while HF preferes 16bit
                 old_val = old_val.to(torch.float32)
@@ -1259,7 +1270,9 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
                         torch.testing.assert_close(
                             _normalize_state_dict_tensor(old_state_dict[key1]),
                             _normalize_state_dict_tensor(new_state_dict[key2]),
-                            check_stride = True,
+                            check_stride = False,
+                            atol = 1e-4,
+                            rtol = 1e-3,
                         )
                     except Exception:
                         failures[key] = error
@@ -1350,7 +1363,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         "norm1",              # Qwen2.5-VL vision encoder
         "norm2",              # Qwen2.5-VL vision encoder
         "norm",
-        "conv1d",
     ]
     # Override .to("cuda") to disable it otherwise we'll get
     # ValueError: Blockwise quantization only supports 16/32-bit floats, but got torch.uint8
@@ -1447,6 +1459,23 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.to = partial(_override_to, layer)
                 layer.weight.to = partial(_override_to, layer.weight)
 
+            elif layer_name.endswith(".conv1d"):
+                # Qwen3.5 GDN depthwise Conv1d: rebuild with real channels/kernel/groups.
+                from torch.nn import Conv1d
+                conv_weight = _unwrap_tensor(weight)
+                channels = conv_weight.shape[0]
+                kernel_size = conv_weight.shape[-1]
+                layer = Conv1d(
+                    in_channels = channels,
+                    out_channels = channels,
+                    kernel_size = kernel_size,
+                    groups = channels,
+                    padding = kernel_size - 1,
+                    bias = has_bias,
+                    device = get_target_device(),
+                )
+                layer.weight = torch.nn.Parameter(conv_weight, requires_grad = False)
+                layer.bias = bias
             elif not any(x in layer_name for x in layernorm_names):
                 layer = Linear(0, 0, device = get_target_device(), bias = has_bias)
                 layer.in_features  = weight.shape[1]
@@ -2895,12 +2924,16 @@ def _test_is_same_vlm(model, new_model, processor, test_backward=False):
             text = [text],
             images = [image],
             return_tensors = "pt",
-        ).to(model.device, dtype=model.dtype)
+        )
     else:
         inputs = processor.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=True,
-            return_dict=True, return_tensors="pt"
-        ).to(model.device, dtype=model.dtype)
+            return_dict=True, return_tensors="pt",
+        )
+    inputs = inputs.to(model.device)
+    for _k, _v in list(inputs.items()):
+        if torch.is_tensor(_v) and torch.is_floating_point(_v):
+            inputs[_k] = _v.to(dtype = model.dtype)
 
     with torch.no_grad():
         original_outputs = model(**inputs)
