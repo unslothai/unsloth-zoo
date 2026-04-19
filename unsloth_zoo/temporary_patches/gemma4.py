@@ -666,7 +666,8 @@ def patch_Gemma4TextMLP():
     Fix, three cheap operations, single patch:
 
       1. act_fn(gate) * up in fp32 so the product cannot overflow.
-      2. Clamp to 65280 (one bf16 ulp below fp16_max) before down_proj.
+      2. Clamp to 65280 (largest value exactly representable in both fp16
+         and bf16) before down_proj.
       3. nan_to_num on the output, rescuing the rare down_proj fp16
          accumulator overflow on wide intermediate dims.
 
@@ -686,9 +687,11 @@ def patch_Gemma4TextMLP():
     except AttributeError as e:
         return raise_error("Gemma4TextMLP.forward", e)
 
-    # 65280 is the bf16 value one ulp below fp16_max (65504) and is exactly
-    # representable in both fp16 and bf16, so clamping here survives any
-    # downstream round-trip through PEFT's internal dtype casts.
+    # 65280 is the largest value exactly representable in both fp16 and bf16:
+    # one bf16 ULP below 65536 (the next representable bf16 value) and 224
+    # below fp16_max=65504. Note fp16_max itself is not representable in bf16
+    # (it rounds up to 65536). Clamping here therefore survives any downstream
+    # round-trip through PEFT's internal dtype casts without rounding to inf.
     _SAFE_FP16 = 65280.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
