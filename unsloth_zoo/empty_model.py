@@ -649,13 +649,15 @@ def set_additional_modules(new_model, quant_state_dict, config):
     if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
         print(f'Performing substitution for {additional_keys=}')
 
+    _new_model_buffer_names = {name for name, _ in new_model.named_buffers()}
     for key in additional_keys:
         # sometimes it can be in new_model.model. instead of new_model.
         for prefix in ['new_', 'new_model.']:
             try:
                 val = quant_state_dict[key]
                 val = _unwrap_tensor(val)
-                if isinstance(val, torch.Tensor):
+                # why: upstream may register e.g. Gemma4VisionModel.std_bias/std_scale as buffers, so preserve buffer vs parameter semantics.
+                if isinstance(val, torch.Tensor) and key not in _new_model_buffer_names:
                     val = torch.nn.Parameter(val,requires_grad=False)
                 exec(f"{prefix}{key} = val")
                 break

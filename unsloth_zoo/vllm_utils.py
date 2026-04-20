@@ -1394,6 +1394,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     pass
 
     skipped_layernorms = []
+    _new_model_buffer_names = {name for name, _ in new_model.named_buffers()}
     for kk in range(layer_count):
         for layer_name in layer_names:
             layer_name = layer_name.format(kk = kk)
@@ -1438,7 +1439,11 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             if layer_name in quant_state_dict:
                 # for attributes of type nn.Parameter, there's no .weight
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
-                layer = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
+                # why: upstream may register e.g. Gemma4DecoderLayer.layer_scalar as a buffer (register_buffer), so preserve buffer vs parameter semantics from new_model.
+                if layer_name in _new_model_buffer_names:
+                    layer = _unwrap_tensor(weight)
+                else:
+                    layer = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
                 exec(f"new_model.{layer_name_br} = layer")
                 continue
             elif fp8_weight_scale is not None:
