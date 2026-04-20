@@ -587,13 +587,13 @@ def set_additional_modules(new_model, quant_state_dict, config):
     #     freeze = True,
     #     padding_idx = pad_token_id,
     # )
-    # we cannot use the normal embedding init because gemma3 uses Gemma3TextScaledWordEmbedding which wraps around nn.Embedding and has a scaling factor. This new init ensures that we respect the forward from original model.
+    # gemma3 uses Gemma3TextScaledWordEmbedding (nn.Embedding subclass with
+    # an embed_scale); in-place weight assignment preserves its forward.
     def set_embedding(module, embed_tokens_key, pad_token_id, requires_grad=False):
         num_embeddings, embedding_dim = quant_state_dict[embed_tokens_key].shape
         embeddings = _unwrap_tensor(quant_state_dict[embed_tokens_key])
         if isinstance(embeddings, torch.Tensor):
-            # in the newer vLLM versions, this seems to return a tensor which can't be assigned to embedding weight
-            # we need to convert that to nn.Paramter and then pass it on
+            # Newer vLLM returns a plain tensor; wrap it so it can be assigned.
             embeddings = torch.nn.Parameter(embeddings, requires_grad = requires_grad)
         module.weight = embeddings
         module.padding_idx = pad_token_id
@@ -622,39 +622,30 @@ def set_additional_modules(new_model, quant_state_dict, config):
     else:
         lmhead_key = "lm_head.weight"
 
-    # Check if lm_head exists in the state dict
     if lmhead_key in quant_state_dict:
         weight = _unwrap_tensor(quant_state_dict[lmhead_key])
         from torch.nn import Linear
 
-        # Create Linear layer with zero dimensions to avoid any weight allocation
+        # Zero-dim Linear skips default weight allocation before we assign the real one.
         layer = Linear(0, 0, device=weight.device, bias=False)
-        # Set correct dimensions
         layer.in_features = weight.shape[1]
         layer.out_features = weight.shape[0]
-        # Assign the weight directly (no deletion needed since no weight was allocated)
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
 
-        # Set lm_head at the correct level
         if hasattr(new_model, "lm_head"):
             new_model.lm_head = layer
+        elif hasattr(language_model, "lm_head"):
+            language_model.lm_head = layer
         else:
-            # For multimodal models, check if language_model has lm_head
-            if hasattr(language_model, "lm_head"):
-                language_model.lm_head = layer
-            else:
-                new_model.lm_head = layer
+            new_model.lm_head = layer
 
         if getattr(config, "tie_word_embeddings", False):
-            # For tied embeddings, tie the weights properly
             if hasattr(new_model, "tie_weights"):
                 new_model.tie_weights()
             elif hasattr(language_model, "tie_weights"):
                 language_model.tie_weights()
 
-    # Process additional keys
-    # For any layers that are potentially in non layered components.
-    # Preferably norms, embeddings and convolution type layers.
+    # Non-layered components (norms, embeddings, conv-style layers).
     non_layered_components = get_model_layer_config()["non_layered_components"]
     exact_non_layered = {n for n in non_layered_components if "{kk}" not in n}
     additional_keys = set(

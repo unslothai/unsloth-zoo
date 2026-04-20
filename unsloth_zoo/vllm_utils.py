@@ -1237,8 +1237,7 @@ pass
 @torch.inference_mode
 def assert_same_state_dict(old_state_dict, new_state_dict):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Check if state_dict are equivalent
-    # hf, vllm
+    # args: hf, vllm
 
     def _normalize_state_dict_tensor(value):
         if isinstance(value, torch.nn.Parameter):
@@ -1409,7 +1408,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 weight = quant_state_dict[f"{layer_name}.weight"]
 
             if f"{layer_name}.bias" in quant_state_dict:
-                # Has bias!
                 has_bias = True
                 bias = _unwrap_tensor(quant_state_dict[f"{layer_name}.bias"])
                 bias = torch.nn.Parameter(bias, requires_grad = False)
@@ -1418,7 +1416,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 bias = None
             pass
 
-            # check if either of layer_name.weight_scale or layer_name.weight_scale_inv exists and set that attribute to fp8_weight_scale
             fp8_weight_scale = None
             if f"{layer_name}.weight_scale" in quant_state_dict:
                 fp8_weight_scale = quant_state_dict[f"{layer_name}.weight_scale"]
@@ -1467,7 +1464,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.weight_scale_inv = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
                     layer.quant_method = "fp8"
             elif f"{layer_name}.weight.quant_state" in quant_state_dict:
-                # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
                 layer = Linear4bit(0, 0, device = get_target_device(), bias = has_bias, compute_dtype = compute_dtype, **kwargs)
                 layer.in_features  = quant_state.shape[1]
@@ -1509,10 +1505,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 # LayerNorms (including vision norms)
                 weight_param = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad=False)
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
-                # Set weight
                 exec(f"new_model.{layer_name_br}.weight = None")
                 exec(f"new_model.{layer_name_br}.weight = weight_param")
-                # Set bias if it exists
                 if bias is not None:
                     exec(f"new_model.{layer_name_br}.bias = None")
                     exec(f"new_model.{layer_name_br}.bias = bias")
