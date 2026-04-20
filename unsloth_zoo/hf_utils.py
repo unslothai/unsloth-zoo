@@ -50,30 +50,14 @@ def dtype_from_config(config):
     return dtype
 
 def set_dtype_in_config(config, dtype):
-    string_dtype = str(dtype).split(".")[-1] if isinstance(dtype, torch.dtype) else dtype
-    if hasattr(config, "dtype"):
-        target_fields = ["dtype"]
-    elif hasattr(config, "torch_dtype"):
-        target_fields = ["torch_dtype"]
-    else:
-        target_fields = ["torch_dtype" if HAS_TORCH_DTYPE else "dtype"]
-
-    success = False
-    for field in target_fields:
-        try:
-            setattr(config, field, string_dtype)
-            success = True
-            continue
-        except Exception:
-            pass
-
-        try:
-            config.__dict__[field] = string_dtype
-            success = True
-        except Exception:
-            pass
-
-    if not success:
+    try:
+        # if dtype is not a string, convert it to a string
+        string_dtype = str(dtype).split(".")[-1] if isinstance(dtype, torch.dtype) else dtype
+        if HAS_TORCH_DTYPE:
+            setattr(config, "torch_dtype", string_dtype)
+        else:
+            setattr(config, "dtype", string_dtype)
+    except:
         set_dtype_in_config_fallback(config, string_dtype)
 
 def set_dtype_in_config_fallback(config, dtype):
