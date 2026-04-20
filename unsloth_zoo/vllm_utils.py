@@ -1845,10 +1845,12 @@ def load_vllm(
     _outer_model_type = getattr(config, "model_type", None)
     _text_model_type = getattr(getattr(config, "text_config", None), "model_type", None)
     if _outer_model_type in _gemma4_model_types or _text_model_type in _gemma4_model_types:
-        # why: released Gemma4 E2B/E4B ship with audio_config set even for text/image inference; previously raised NotImplementedError here, which blocked the audio-capable configs outright. audio_tower weights are silently skipped during extraction and the user is warned instead.
+        # why: Gemma4 E2B/E4B release checkpoints carry audio_config even for text/image inference. Previously raised NotImplementedError here, which blocked audio-capable configs outright. audio_tower weights are not extracted, so deepcopy+strip audio_config prevents the rebuilt HF model from instantiating a silently-uninitialized audio_tower.
         if _outer_model_type == "gemma4" and getattr(config, "audio_config", None) is not None:
             if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
-                print("Unsloth: Gemma4 audio_tower weights are not extracted; audio-capable inference is not supported.")
+                print("Unsloth: Gemma4 audio_tower weights are not extracted; audio-capable inference is not supported. Stripping audio_config to prevent a silently-uninitialized audio_tower.")
+            config = deepcopy(config)
+            config.audio_config = None
         if is_vision_model and _outer_model_type == "gemma4":
             patch_gemma4_vllm_lora_support()
 
