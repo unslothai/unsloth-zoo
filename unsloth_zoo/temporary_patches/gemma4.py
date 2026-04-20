@@ -608,72 +608,25 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4AudioAttention)
 
 
-# ============================================================================
-# Gemma-4 float16 stability patch.
+# Gemma-4 float16 MLP overflow fix.
 #
-# Goal: make float16 training (notably GRPO on E2B and E4B) numerically
-# stable without paying blanket fp32 compute cost, so that Tesla T4 - which
-# has no bf16 tensor cores - can run Gemma-4 GRPO at full fp16 matmul speed.
+# `down_proj(act_fn(gate_proj(x)) * up_proj(x))` overflows fp16 at layers.0
+# (E2B) / layers.1 (E4B): the product + fp16 matmul accumulator saturate to
+# +-inf, poison the residual stream, and generation samples NaN logits that
+# trip the CUDA categorical sampler on GRPO step ~2.
 #
-# The NaN chain (verified via TensorStatisticsHooks on E2B GRPO):
-#
-#   1. When the user requests dtype=torch.float16 (or fp16 autocast), gate
-#      and up projections produce fp16 activations.
-#   2. `down_proj(act_fn(gate_proj(x)) * up_proj(x))` saturates in fp16 at
-#      `layers.0.mlp.down_proj` (E2B) / `layers.1.mlp.down_proj` (E4B).
-#   3. The +-inf in down_proj output poisons the residual stream; the next
-#      generation step samples NaN logits and the CUDA categorical sampler
-#      trips a device-side assert.
-#
-# Minimal fix: a single patch on Gemma4TextMLP. The product is computed in
-# fp32, clamped to a safe fp16 bound, and down_proj's output is rescued
-# with `nan_to_num` for the rare tail overflow from its fp16 accumulator.
-#
-# Why we do NOT patch RMSNorm / Attention / Embedding:
-#   * Gemma4RMSNorm already casts to fp32 internally and returns
-#     `type_as(hidden_states)` - that dtype contract is fine for fp16.
-#   * Gemma4TextScaledWordEmbedding multiplies by sqrt(hidden_size) which
-#     is ~45-60 for E2B/E4B, well within fp16 range.
-#   * Gemma4TextAttention projections did not overflow in any run; the
-#     failing path is exclusively the MLP gate*up product + down_proj
-#     accumulator.
-#
-# Bisection evidence: 8-step GRPO on unsloth/gemma-4-E2B-it and
-# unsloth/gemma-4-E4B-it, with gradient_checkpointing on and off, completes
-# cleanly with just patch_Gemma4TextMLP. Adding Attention, RMSNorm, or
-# Embedding patches on top produces byte-identical loss / grad_norm / kl
-# trajectories.
-# ============================================================================
+# Fix: fp32 gate*up, clamp to a safe bound, fp16 cast, nan_to_num on the
+# down_proj output. Gated on gate output dtype so bf16/fp32 users see no
+# change and no env flag is required. RMSNorm / Attention / Embedding
+# patches are unnecessary (verified by bisection - identical loss/kl/grad
+# trajectories).
 
 
 def patch_Gemma4TextMLP():
-    """Stabilize Gemma-4 MLP under fp16 autocast (GRPO on fp16, Tesla T4).
+    """fp16 overflow clamp for Gemma4TextMLP.
 
-    Root cause: `down_proj(act_fn(gate_proj(x)) * up_proj(x))` summed over
-    the wide intermediate dimension can exceed fp16_max = 65504 so the fp16
-    matmul cast produces +-inf. That inf poisons the residual stream and
-    generation then samples NaN logits, tripping the categorical assert at
-    GRPO step ~2 on E2B/E4B with dtype=torch.float16.
-
-    Fix, three cheap operations, single patch:
-
-      1. act_fn(gate) * up in fp32 so the product cannot overflow.
-      2. Clamp to 65280 (largest value exactly representable in both fp16
-         and bf16) before down_proj.
-      3. nan_to_num on the output, rescuing the rare down_proj fp16
-         accumulator overflow on wide intermediate dims.
-
-    Dtype contract is unchanged from upstream (input dtype -> input dtype),
-    so RMSNorm / Attention / Embedding need no companion patches and the KV
-    cache stays aligned with the text attention output. gate_proj, up_proj
-    and down_proj remain fp16 tensor-core matmuls (full T4 throughput at
-    65 TFLOPS).
-
-    The fp16 clamp path is gated on the gate_proj output dtype at every
-    forward, so the patch is a zero-cost no-op for bf16 / fp32 users (no
-    env flag or FORCE_FLOAT32 dependency) and self-activates whenever the
-    activation landing in the MLP is fp16 (explicit dtype, autocast, or
-    PEFT fp16 cast).
+    Does gate*up in fp32, clamps to a safe fp16 bound, then nan_to_nums
+    the down_proj output. Self-gated on gate dtype - no-op on bf16/fp32.
     """
     try:
         import transformers.models.gemma4.modeling_gemma4 as mod
@@ -684,21 +637,19 @@ def patch_Gemma4TextMLP():
     except AttributeError as e:
         return raise_error("Gemma4TextMLP.forward", e)
 
-    # Largest value exactly representable in both fp16 and bf16 (one bf16
-    # ULP below 65536, which would round to fp16 inf).
+    # Largest value representable in both fp16 and bf16 (65536 rounds to
+    # fp16 inf).
     _SAFE_FP16 = 65280.0
 
     def forward(self, x):
         gate = self.gate_proj(x)
-        # Gate on matmul output dtype, not x.dtype, to catch fp16-cast
-        # projections over bf16/fp32 activations (autocast or forced fp16).
+        # Check matmul output dtype so autocast / PEFT fp16 casts are caught.
         if gate.dtype != torch.float16:
             return self.down_proj(self.act_fn(gate) * self.up_proj(x))
         product = self.act_fn(gate.float()) * self.up_proj(x).float()
         product = torch.clamp(product, min=-_SAFE_FP16, max=_SAFE_FP16)
         out = self.down_proj(product.to(gate.dtype))
-        # Replace overflow with 0 so the residual keeps the identity path
-        # instead of being dominated by a near-fp16_max injection.
+        # Zero overflows so the residual identity path survives.
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     try:
         patch_function(
