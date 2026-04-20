@@ -265,11 +265,14 @@ def test_normalize_state_dict_tensor_guards_non_tensor():
 
 def test_gemma4_lora_patch_preserves_signature_for_inspect():
     # Pre-fix: patched_create_lora_manager(model, *args, **kwargs) hid vllm_config,
-    # breaking _call_create_lora_manager's signature-based forwarding.
+    # breaking _call_create_lora_manager's signature-based forwarding. Current
+    # fix wraps with functools.wraps and delegates to the original manager so
+    # vLLM shim kwargs reach the constructor correctly.
     from unsloth_zoo import empty_model
     src = inspect.getsource(empty_model.patch_gemma4_vllm_lora_support)
     assert "@wraps(original_create_lora_manager)" in src
-    assert "lora_manager_cls(model, *args, **kwargs)" in src
+    assert "original_create_lora_manager(model, *args, **kwargs)" in src
+    assert 'kwargs.setdefault("lora_manager_cls"' in src
 
 
 def test_gemma4_k_eq_v_patch_handles_split_kv_layout():
@@ -410,10 +413,12 @@ def test_lm_head_extraction_collapsed_to_single_path():
 
 def test_gemma4_k_eq_v_set_hoists_constant_check():
     # Pre-fix: model_type == "gemma4" and attention_k_eq_v were evaluated on
-    # every iteration of the set comprehension.
+    # every iteration of the set comprehension. Current fix also routes the
+    # model-type check through the shared _is_gemma4_config helper so that
+    # text-only Gemma4 (model_type == "gemma4_text") is matched too.
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils._get_vllm_state_dict)
-    assert 'if model_type == "gemma4" and getattr(text_config, "attention_k_eq_v"' in src
+    assert 'if _is_gemma4_config(config) and getattr(text_config, "attention_k_eq_v"' in src
     assert "gemma4_k_eq_v_layers = set()" in src
 
 
@@ -1096,3 +1101,270 @@ def test_lm_head_lookup_uses_exact_name_not_substring():
     assert 'name.endswith(".lm_head")' in src
     # Loose substring test must not be present.
     assert '"lm_head" in name' not in src
+
+
+# ----- Regression tests for review-iter-1 hardening -----
+
+
+def test_convert_regex_handles_trailing_digit_parameter_paths():
+    # Pre-fix: `re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)` required a
+    # trailing dot, so a parameter-list-style key such as
+    # `model.language_model.embed_tokens_per_layer.0` was not converted to
+    # bracket form and `exec(...)` hit a SyntaxError.
+    import re
+    pattern = r"\.([\d]+)(?=\.|$)"
+    sub = lambda x: f"[{x.group(1)}]"
+    assert re.sub(pattern, sub, "model.language_model.embed_tokens_per_layer.0") \
+        == "model.language_model.embed_tokens_per_layer[0]"
+    assert re.sub(pattern, sub, "model.layers.12.self_attn.q_proj") \
+        == "model.layers[12].self_attn.q_proj"
+    assert re.sub(pattern, sub, "model.visual.merger.linear_fc1") \
+        == "model.visual.merger.linear_fc1"
+
+
+def test_convert_vllm_to_huggingface_uses_robust_bracket_regex():
+    # The Parameter-assignment path for `if layer_name in quant_state_dict`
+    # must use the anchor-or-end regex so that keys ending in `.DIGIT` get
+    # converted to bracket form.
+    from unsloth_zoo import vllm_utils
+    src = inspect.getsource(vllm_utils.convert_vllm_to_huggingface)
+    assert r'r"\.([\d]+)(?=\.|$)"' in src
+    param_branch_anchor = "# for attributes of type nn.Parameter, there's no .weight"
+    idx = src.index(param_branch_anchor)
+    nearby = src[idx:idx + 400]
+    assert r'r"\.([\d]+)(?=\.|$)"' in nearby
+    assert r'r"\.([\d]{1,})\."' not in nearby
+
+
+def test_finalize_rotary_reinit_failure_skips_float32_lift():
+    # Regression: a bare `try/except Exception: pass` on rotary reinit used
+    # to float32-lift buffers on the stale rotary. The fix only lifts when
+    # reinit succeeds so wrong-shape placeholder buffers do not get blessed.
+    from unsloth_zoo.empty_model import finalize_huggingface_model
+
+    class _BadCfg:
+        pass
+
+    class _ExplodingRotary(torch.nn.Module):
+        calls = 0
+
+        def __init__(self, config=None, device=None):
+            super().__init__()
+            _ExplodingRotary.calls += 1
+            if _ExplodingRotary.calls > 1:
+                raise KeyError("rope_type")
+            self.config = config
+            self.register_buffer("inv_freq", torch.arange(4, dtype=torch.float16))
+
+    class _Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_emb = _ExplodingRotary(config=_BadCfg())
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_idx = -1
+            self.self_attn = _Attn()
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([_Layer()])
+
+    cfg = types.SimpleNamespace(model_type="gemma4")
+    cfg.text_config = cfg
+    model = _Model()
+    finalize_huggingface_model(
+        model, None, cfg, torch.float16,
+        quantization_config={"x": 1}, bnb_config=None,
+    )
+    rotary = model.model.layers[0].self_attn.rotary_emb
+    # reinit raised -> buffer dtype unchanged from pre-call (fp16)
+    assert rotary.inv_freq.dtype == torch.float16
+
+
+def test_is_gemma4_config_matches_both_variants():
+    from unsloth_zoo.empty_model import _is_gemma4_config
+
+    top_only = types.SimpleNamespace(model_type="gemma4")
+    assert _is_gemma4_config(top_only)
+
+    nested_text_only = types.SimpleNamespace(model_type="unrelated")
+    nested_text_only.text_config = types.SimpleNamespace(model_type="gemma4_text")
+    assert _is_gemma4_config(nested_text_only)
+
+    text_only_causal = types.SimpleNamespace(model_type="gemma4_text")
+    text_only_causal.text_config = text_only_causal
+    assert _is_gemma4_config(text_only_causal)
+
+    not_gemma4 = types.SimpleNamespace(model_type="llama")
+    not_gemma4.text_config = not_gemma4
+    assert not _is_gemma4_config(not_gemma4)
+
+    assert not _is_gemma4_config(None)
+
+
+def test_load_vllm_routes_gemma4_gate_through_helper():
+    from unsloth_zoo import vllm_utils
+    src = inspect.getsource(vllm_utils.load_vllm)
+    assert "_is_gemma4_config(config)" in src
+    assert 'getattr(config, "model_type", None) == "gemma4"' not in src
+
+
+def test_load_vllm_gemma4_patch_runs_after_bnb_autodetect():
+    # Regression: the Gemma4 k_eq_v patch was gated on the caller-provided
+    # `use_bitsandbytes` before model-name / quant_method auto-detection, so
+    # `-bnb-4bit` models with use_bitsandbytes=False at call time would skip
+    # the patch. The fix moves the gate below the autodetect line.
+    from unsloth_zoo import vllm_utils
+    src = inspect.getsource(vllm_utils.load_vllm)
+    autodetect_anchor = "use_bitsandbytes = use_bitsandbytes or"
+    gate_anchor = "patch_gemma4_vllm_k_eq_v_support()"
+    assert autodetect_anchor in src
+    assert gate_anchor in src
+    assert src.index(autodetect_anchor) < src.index(gate_anchor)
+
+
+def test_patch_gemma4_vllm_lora_support_preserves_embedding_modules():
+    # Regression: `cls.embedding_modules = {}` clobbered a pre-existing
+    # embedding registry on the vLLM class, which vLLM's LoRA manager uses
+    # to route adapters to embedding layers. The fix guards the assignment
+    # so it only runs when the attribute is absent.
+    from unsloth_zoo import empty_model
+    src = inspect.getsource(empty_model.patch_gemma4_vllm_lora_support)
+    assert 'if not hasattr(cls, "embedding_modules"):' in src
+    guard_idx = src.index('if not hasattr(cls, "embedding_modules"):')
+    assign_idx = src.index("cls.embedding_modules = {}")
+    assert guard_idx < assign_idx, (
+        "embedding_modules assignment must sit inside the hasattr guard"
+    )
+
+
+def test_patch_gemma4_vllm_lora_support_guards_gemma4_mm_import():
+    # Regression: a hard `from vllm...gemma4_mm import ...` at top of the
+    # patch function crashed with ModuleNotFoundError on text-only Gemma4
+    # vLLM builds. The fix wraps each class import in try/except.
+    from unsloth_zoo import empty_model
+    src = inspect.getsource(empty_model.patch_gemma4_vllm_lora_support)
+    mm_line = "from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration"
+    assert mm_line in src
+    mm_idx = src.index(mm_line)
+    pre = src[:mm_idx]
+    assert pre.rstrip().endswith("try:")
+    assert "if not classes_to_patch:" in src
+    assert "return" in src[src.index("if not classes_to_patch:"):]
+
+
+def test_patch_gemma4_vllm_k_eq_v_support_guards_private_loader_attr():
+    # Regression: hasattr(BitsAndBytesModelLoader._stack_quantization_states, ...)
+    # raised AttributeError on vLLM builds where the private method was
+    # renamed or absent. Fix routes through getattr with a None default.
+    from unsloth_zoo import empty_model
+    src = inspect.getsource(empty_model.patch_gemma4_vllm_k_eq_v_support)
+    assert 'getattr(\n        BitsAndBytesModelLoader, "_stack_quantization_states", None' in src \
+        or 'getattr(BitsAndBytesModelLoader, "_stack_quantization_states", None' in src
+    assert "if stack_quantization_states is None:" in src
+
+
+def test_patch_gemma4_vllm_k_eq_v_support_searches_hf_style_prefix():
+    # Regression: _get_gemma4_k_eq_v_pairs only searched
+    # ("language_model.model", "model") prefixes, missing HF-style
+    # model.language_model for multimodal Gemma4.
+    from unsloth_zoo import empty_model
+    src = inspect.getsource(empty_model.patch_gemma4_vllm_k_eq_v_support)
+    assert '"model.language_model"' in src
+    assert '"language_model.model"' in src
+
+
+def test_patch_gemma4_vllm_lora_support_early_returns_when_no_classes():
+    import sys as _sys
+    import types as _types
+    from unsloth_zoo import empty_model
+
+    stub_packages = {
+        "vllm": _types.ModuleType("vllm"),
+        "vllm.model_executor": _types.ModuleType("vllm.model_executor"),
+        "vllm.model_executor.models": _types.ModuleType("vllm.model_executor.models"),
+        "vllm.model_executor.models.interfaces": _types.ModuleType("vllm.model_executor.models.interfaces"),
+        "vllm.lora": _types.ModuleType("vllm.lora"),
+        "vllm.lora.model_manager": _types.ModuleType("vllm.lora.model_manager"),
+    }
+    for name in stub_packages:
+        stub_packages[name].__path__ = []
+    stub_packages["vllm.model_executor.models.interfaces"].supports_lora = lambda model: False
+
+    class _FakeLoRAManager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class _FakeCreate:
+        pass
+
+    def fake_create(model, *args, **kwargs):
+        return None
+
+    stub_packages["vllm.lora.model_manager"].LoRAModelManager = _FakeLoRAManager
+    stub_packages["vllm.lora.model_manager"].create_lora_manager = fake_create
+    stub_packages["vllm.model_executor.models"].gemma4_mm = None  # do not register submodule
+
+    saved = {}
+    for name, mod in stub_packages.items():
+        saved[name] = _sys.modules.get(name)
+        _sys.modules[name] = mod
+    # Ensure neither gemma4 nor gemma4_mm submodules resolve.
+    for missing in (
+        "vllm.model_executor.models.gemma4",
+        "vllm.model_executor.models.gemma4_mm",
+        "vllm.v1",
+        "vllm.v1.worker",
+    ):
+        saved[missing] = _sys.modules.get(missing)
+        _sys.modules[missing] = None
+    try:
+        # Must return without raising when no gemma4 class importable.
+        empty_model.patch_gemma4_vllm_lora_support()
+        # And the fake create_lora_manager must not have been replaced.
+        assert stub_packages["vllm.lora.model_manager"].create_lora_manager is fake_create
+    finally:
+        for name, prev in saved.items():
+            if prev is None:
+                _sys.modules.pop(name, None)
+            else:
+                _sys.modules[name] = prev
+
+
+def test_patch_gemma4_vllm_k_eq_v_support_noop_when_private_attr_missing():
+    import sys as _sys
+    import types as _types
+    from unsloth_zoo import empty_model
+
+    fake_pkg = _types.ModuleType("vllm.model_executor.model_loader.bitsandbytes_loader")
+
+    class _FakeLoader:
+        pass
+
+    fake_pkg.BitsAndBytesModelLoader = _FakeLoader
+    saved = {}
+    for name in (
+        "vllm",
+        "vllm.model_executor",
+        "vllm.model_executor.model_loader",
+        "vllm.model_executor.model_loader.bitsandbytes_loader",
+    ):
+        saved[name] = _sys.modules.get(name)
+    for name in ("vllm", "vllm.model_executor", "vllm.model_executor.model_loader"):
+        if _sys.modules.get(name) is None:
+            _sys.modules[name] = _types.ModuleType(name)
+            _sys.modules[name].__path__ = []
+    _sys.modules["vllm.model_executor.model_loader.bitsandbytes_loader"] = fake_pkg
+    try:
+        empty_model.patch_gemma4_vllm_k_eq_v_support()
+        assert not hasattr(_FakeLoader, "_stack_quantization_states")
+    finally:
+        for name, prev in saved.items():
+            if prev is None:
+                _sys.modules.pop(name, None)
+            else:
+                _sys.modules[name] = prev
