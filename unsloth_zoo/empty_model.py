@@ -329,15 +329,28 @@ def patch_gemma4_vllm_lora_support():
         lora_model_runner_mixin = None
     from unsloth_zoo import vllm_lora_worker_manager
 
-    Gemma4ForConditionalGeneration.supports_lora = True
-    Gemma4ForConditionalGeneration.embedding_modules = {}
+    gemma4_lora_classes = ["Gemma4ForConditionalGeneration"]
+    classes_to_patch = [Gemma4ForConditionalGeneration]
+    try:
+        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+        gemma4_lora_classes.append("Gemma4ForCausalLM")
+        classes_to_patch.append(Gemma4ForCausalLM)
+    except Exception:
+        pass
+    gemma4_lora_classes = set(gemma4_lora_classes)
+
+    for cls in classes_to_patch:
+        if not getattr(cls, "_unsloth_gemma4_class_patched", False):
+            cls.supports_lora = True
+            cls.embedding_modules = {}
+            cls._unsloth_gemma4_class_patched = True
 
     original_supports_lora = getattr(
         lora_model_runner_mixin, "supports_lora", vllm_model_interfaces.supports_lora
     )
     if not hasattr(original_supports_lora, "_unsloth_gemma4_patch"):
         def patched_supports_lora(model):
-            if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
+            if model.__class__.__name__ in gemma4_lora_classes:
                 return True
             return original_supports_lora(model)
 
@@ -351,7 +364,7 @@ def patch_gemma4_vllm_lora_support():
 
         @wraps(original_create_lora_manager)
         def patched_create_lora_manager(model, *args, **kwargs):
-            if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
+            if model.__class__.__name__ in gemma4_lora_classes:
                 lora_manager_cls = kwargs.pop("lora_manager_cls", vllm_lora_model_manager.LoRAModelManager)
                 return lora_manager_cls(model, *args, **kwargs)
             return original_create_lora_manager(model, *args, **kwargs)
@@ -642,9 +655,14 @@ def set_additional_modules(new_model, quant_state_dict, config):
     # Process additional keys
     # For any layers that are potentially in non layered components.
     # Preferably norms, embeddings and convolution type layers.
+    non_layered_components = get_model_layer_config()["non_layered_components"]
+    exact_non_layered = {n for n in non_layered_components if "{kk}" not in n}
     additional_keys = set(
         x for x in quant_state_dict.keys()
-        if not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list"))
+        if (
+            any(x == n or x.startswith(n + ".") for n in exact_non_layered)
+            or not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list"))
+        )
     )
     print(f'Performing substitution for {additional_keys=}')
 
@@ -698,6 +716,16 @@ def finalize_huggingface_model(
         if sub_cfg is not None:
             known_configs.add(id(sub_cfg))
 
+    live_root = getattr(new_model, "config", None)
+    if live_root is not None and id(live_root) not in known_configs:
+        set_dtype_in_config(live_root, dtype)
+        known_configs.add(id(live_root))
+        for sub_name in ("text_config", "vision_config", "audio_config"):
+            sub_cfg = getattr(live_root, sub_name, None)
+            if sub_cfg is not None and id(sub_cfg) not in known_configs:
+                set_dtype_in_config(sub_cfg, dtype)
+                known_configs.add(id(sub_cfg))
+
     for module in new_model.modules():
         module_config = getattr(module, "config", None)
         if module_config is not None and id(module_config) in known_configs:
@@ -708,6 +736,13 @@ def finalize_huggingface_model(
     vision_config = getattr(config, "vision_config", None)
     is_gemma4 = getattr(config, "model_type", None) == "gemma4"
 
+    vision_config_ids = set()
+    if vision_config is not None:
+        vision_config_ids.add(id(vision_config))
+    live_vision_config = getattr(live_root, "vision_config", None) if live_root is not None else None
+    if live_vision_config is not None:
+        vision_config_ids.add(id(live_vision_config))
+
     for module in new_model.modules():
         if hasattr(module, "rotary_emb"):
             rotary_config = text_config
@@ -715,8 +750,7 @@ def finalize_huggingface_model(
             is_vision_rotary = (
                 vision_config is not None and
                 current_rotary_config is not None and
-                current_rotary_config is not text_config and
-                current_rotary_config.__class__ == vision_config.__class__
+                id(current_rotary_config) in vision_config_ids
             )
             if is_vision_rotary:
                 rotary_config = vision_config
@@ -724,14 +758,13 @@ def finalize_huggingface_model(
                 config = rotary_config,
                 device = target_device,
             )
-            # Gemma4's rotary math requires float32 buffers; other archs follow dtype.
-            buffer_dtype = torch.float32 if is_gemma4 else dtype
+            # Always keep rotary math buffers in float32 for precision.
             for buffer_name in ("inv_freq", "original_inv_freq"):
                 buffer = getattr(module.rotary_emb, buffer_name, None)
                 if torch.is_tensor(buffer) and buffer.is_floating_point():
                     module.rotary_emb._buffers[buffer_name] = buffer.to(
                         device = target_device,
-                        dtype = buffer_dtype,
+                        dtype = torch.float32,
                     )
         if hasattr(module, "rotary_pos_emb") and vision_config is not None:
             head_dim = vision_config.hidden_size // vision_config.num_heads
@@ -1001,6 +1034,11 @@ def get_model_layer_config(return_non_layered=True):
             # qwen 3 vl
             "model.visual.pos_embed",
             "model.visual.merger.norm",
+
+            # Gemma4 top-level per-layer-input modules
+            "model.language_model.embed_tokens_per_layer",
+            "model.language_model.per_layer_model_projection",
+            "model.language_model.per_layer_projection_norm",
         }
     }
 
@@ -1122,13 +1160,28 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
 
         qkv_weight = weight[offsets[0]:offsets[3]]
         z_weight = weight[offsets[3]:offsets[4]]
-        store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
-        store(f"{prefix}.in_proj_z.weight", z_weight)
 
         qs_attr = getattr(raw_weight, "bnb_quant_state", getattr(weight, "bnb_quant_state", None))
+        qkv_states = [qs_attr.get(i) for i in (0, 1, 2)] if isinstance(qs_attr, dict) else [None, None, None]
+        if sum(qs is not None for qs in qkv_states) > 1:
+            try:
+                from bitsandbytes.functional import dequantize_4bit
+            except Exception:
+                raise RuntimeError(
+                    "Unsloth: prequantized BnB Qwen3.5 GDN requires bitsandbytes for fused in_proj_qkv reconstruction."
+                )
+            parts = []
+            for i, qs in enumerate(qkv_states):
+                shard = weight[offsets[i]:offsets[i + 1]]
+                parts.append(dequantize_4bit(shard, quant_state=qs) if qs is not None else shard)
+            store(f"{prefix}.in_proj_qkv.weight", torch.cat(parts, dim=0))
+        else:
+            store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
+            if isinstance(qs_attr, dict):
+                _store_quant_state(f"{prefix}.in_proj_qkv", qkv_states[0])
+        store(f"{prefix}.in_proj_z.weight", z_weight)
         if isinstance(qs_attr, dict):
-            _store_quant_state(f"{prefix}.in_proj_qkv", qs_attr.get(0))
-            _store_quant_state(f"{prefix}.in_proj_z",   qs_attr.get(3))
+            _store_quant_state(f"{prefix}.in_proj_z", qs_attr.get(3))
 
         if weight.dtype == torch.float8_e4m3fn:
             scale_attr = None
@@ -1156,13 +1209,25 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
     raw_ba_weight = ba_layer.weight
     ba_weight = _unwrap(raw_ba_weight)
     mid = ba_weight.shape[0] // 2
-    store(f"{prefix}.in_proj_b.weight", ba_weight[:mid])
-    store(f"{prefix}.in_proj_a.weight", ba_weight[mid:])
 
     ba_qs = getattr(raw_ba_weight, "bnb_quant_state", getattr(ba_weight, "bnb_quant_state", None))
-    if isinstance(ba_qs, dict):
-        _store_quant_state(f"{prefix}.in_proj_b", ba_qs.get(0))
-        _store_quant_state(f"{prefix}.in_proj_a", ba_qs.get(1))
+    ba_states = [ba_qs.get(i) for i in (0, 1)] if isinstance(ba_qs, dict) else [None, None]
+    if isinstance(ba_qs, dict) and ba_states[0] is not None and ba_states[1] is None:
+        try:
+            from bitsandbytes.functional import dequantize_4bit
+        except Exception:
+            raise RuntimeError(
+                "Unsloth: prequantized BnB Qwen3.5 GDN requires bitsandbytes for in_proj_ba split."
+            )
+        full = dequantize_4bit(ba_weight, quant_state=ba_states[0])
+        store(f"{prefix}.in_proj_b.weight", full[:mid])
+        store(f"{prefix}.in_proj_a.weight", full[mid:])
+    else:
+        store(f"{prefix}.in_proj_b.weight", ba_weight[:mid])
+        store(f"{prefix}.in_proj_a.weight", ba_weight[mid:])
+        if isinstance(ba_qs, dict):
+            _store_quant_state(f"{prefix}.in_proj_b", ba_states[0])
+            _store_quant_state(f"{prefix}.in_proj_a", ba_states[1])
 
     if ba_weight.dtype == torch.float8_e4m3fn:
         scale_attr = None

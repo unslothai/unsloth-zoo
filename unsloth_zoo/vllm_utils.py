@@ -1151,10 +1151,25 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 0, state_dict, layer.per_layer_projection,
             )
 
+        # Use layernorms from the layer configuration
+        layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
+
+        for layernorm_name in layernorm_names:
+            vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
+            try:
+                layernorm = eval(vllm_name).state_dict()["weight"]
+                layernorm_name = f"{layernorm_name}.weight"
+                state_dict[layernorm_name] = layernorm
+                quant_state_dict[layernorm_name] = state_dict[layernorm_name]
+            except Exception as e:
+                skipped_layernorms.append(layernorm_name.split(".")[-1])
+        pass
+
+        if hasattr(layer, "layer_scalar"):
+            state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
+            quant_state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
+
         if not hasattr(layer, "mlp"):
-            if hasattr(layer, "layer_scalar"):
-                state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
-                quant_state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
             continue
 
         proj = layer.mlp.gate_up_proj
@@ -1170,23 +1185,6 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
         proj = layer.mlp.down_proj
         get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
-
-        # Use layernorms from the layer configuration
-        layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
-
-        for layernorm_name in layernorm_names:
-            vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
-            try:
-                layernorm = eval(vllm_name).state_dict()["weight"]
-                layernorm_name = f"{layernorm_name}.weight"
-                state_dict[layernorm_name] = layernorm
-                quant_state_dict[layernorm_name] = state_dict[layernorm_name]
-            except Exception as e:
-                skipped_layernorms.append(layernorm_name.split(".")[-1])
-        pass
-        if hasattr(layer, "layer_scalar"):
-            state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
-            quant_state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
     pass
 
     if len(skipped_layernorms) != 0:
@@ -1202,6 +1200,20 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     norm_prefix = f"{vllm_text_model_prefix}.norm.weight"
     state_dict[norm_prefix] = vllm_text_model.norm.weight.data
     quant_state_dict[norm_prefix] = state_dict[norm_prefix]
+
+    # Gemma4 top-level per-layer-input modules
+    for extra_name in ("embed_tokens_per_layer", "per_layer_model_projection", "per_layer_projection_norm"):
+        component = getattr(vllm_text_model, extra_name, None)
+        if component is None:
+            continue
+        prefix = f"{vllm_text_model_prefix}.{extra_name}"
+        if hasattr(component, "weight"):
+            get_state_dict(prefix, 0, state_dict, component, slice_weights=False)
+        else:
+            for param_name, param in component.named_parameters():
+                key = f"{prefix}.{param_name}"
+                state_dict[key] = param.data
+                quant_state_dict[key] = param.data
 
     # LM Head - Use get_state_dict for consistency
     if not getattr(text_config, "tie_word_embeddings", False):
@@ -1254,11 +1266,14 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
             new_val = _normalize_state_dict_tensor(new_state_dict[key])
             if old_val is None or new_val is None:
                 continue
-            if old_val.dtype != new_val.dtype or (new_val.element_size() < 2):
+            loose_tol = old_val.dtype != new_val.dtype or (new_val.element_size() < 2)
+            if loose_tol:
                 # upcast both to float32 just for comparison. For FP8, vLLM stores weight scale in FP32 while HF preferes 16bit
                 old_val = old_val.to(torch.float32)
                 new_val = new_val.to(torch.float32)
-            torch.testing.assert_close(old_val, new_val, check_stride = False, atol = 1e-4, rtol = 1e-3)
+                torch.testing.assert_close(old_val, new_val, check_stride = False, atol = 1e-4, rtol = 1e-3)
+            else:
+                torch.testing.assert_close(old_val, new_val, check_stride = False)
         except Exception as error:
             if key == "lm_head.weight":
                 # Try tied embeddings fallback
@@ -1416,8 +1431,14 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             if layer_name in quant_state_dict:
                 # for attributes of type nn.Parameter, there's no .weight
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
-                layer = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
-                exec(f"new_model.{layer_name_br} = layer")
+                raw_value = _unwrap_tensor(weight)
+                parent_path, _, attr_name = layer_name_br.rpartition(".")
+                parent = eval(f"new_model.{parent_path}") if parent_path else new_model
+                if attr_name in getattr(parent, "_buffers", {}):
+                    parent._buffers[attr_name] = raw_value
+                else:
+                    layer = torch.nn.Parameter(raw_value, requires_grad = False)
+                    exec(f"new_model.{layer_name_br} = layer")
                 continue
             elif fp8_weight_scale is not None:
                 if fp8_weight_scale.ndim == 1:
@@ -1459,7 +1480,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.to = partial(_override_to, layer)
                 layer.weight.to = partial(_override_to, layer.weight)
 
-            elif layer_name.endswith(".conv1d"):
+            elif layer_name.endswith(".conv1d") and "linear_attn" in layer_name:
                 # Qwen3.5 GDN depthwise Conv1d: rebuild with real channels/kernel/groups.
                 from torch.nn import Conv1d
                 conv_weight = _unwrap_tensor(weight)
@@ -2918,8 +2939,12 @@ def _test_is_same_vlm(model, new_model, processor, test_backward=False):
     )
 
     if processor.__class__.__name__ in ("Gemma3Processor", "Gemma4Processor"):
-        from transformers.image_utils import load_image
-        image = load_image(messages[0]["content"][0]["image"])
+        try:
+            from transformers.image_utils import load_image
+            image = load_image(messages[0]["content"][0]["image"])
+        except Exception:
+            from PIL import Image
+            image = Image.new("RGB", (224, 224), color = (128, 128, 128))
         inputs = processor(
             text = [text],
             images = [image],
