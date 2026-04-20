@@ -582,9 +582,8 @@ def set_additional_modules(new_model, quant_state_dict, config):
         language_model_prefix = "model"
         language_model = new_model.model
 
-    # Embeddings
     embed_tokens_key = f"{language_model_prefix}.embed_tokens.weight"
-    # Use explicit None check since pad_token_id=0 is valid (0 is falsy in Python)
+    # Explicit None check since pad_token_id=0 is valid.
     pad_token_id = getattr(config, "pad_token_id", None)
     if pad_token_id is None:
         text_config = getattr(config, "text_config", None)
@@ -592,11 +591,6 @@ def set_additional_modules(new_model, quant_state_dict, config):
             pad_token_id = getattr(text_config, "pad_token_id", None)
     if pad_token_id is not None: assert pad_token_id < quant_state_dict[embed_tokens_key].shape[0], f"Pad token id {pad_token_id} out of bounds for vocab size {quant_state_dict[embed_tokens_key].shape[0]}"
 
-    # language_model.embed_tokens = torch.nn.Embedding.from_pretrained(
-    #     quant_state_dict[embed_tokens_key],
-    #     freeze = True,
-    #     padding_idx = pad_token_id,
-    # )
     # gemma3 uses Gemma3TextScaledWordEmbedding (nn.Embedding subclass with
     # an embed_scale); in-place weight assignment preserves its forward.
     def set_embedding(module, embed_tokens_key, pad_token_id, requires_grad=False):
@@ -616,7 +610,6 @@ def set_additional_modules(new_model, quant_state_dict, config):
         # This is to handle visual embeddings in Qwen 3 VL
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
-    # Norm
     norm_key = f"{language_model_prefix}.norm.weight"
     norm = quant_state_dict[norm_key]
     norm = _unwrap_tensor(norm)
