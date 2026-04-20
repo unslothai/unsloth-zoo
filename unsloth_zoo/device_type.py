@@ -215,7 +215,7 @@ def get_device_type():
             amd_hint = _amd_installation_hint()
             if amd_hint is not None:
                 raise NotImplementedError(amd_hint)
-            raise NotImplementedError("Unsloth cannot find any torch accelerator? You need a GPU.")
+            return "cpu"
         accelerator = str(torch.accelerator.current_accelerator())
         if accelerator in ("cuda", "xpu", "hip"):
             raise RuntimeError(
@@ -226,7 +226,7 @@ def get_device_type():
     amd_hint = _amd_installation_hint()
     if amd_hint is not None:
         raise NotImplementedError(amd_hint)
-    raise NotImplementedError("Unsloth currently only works on NVIDIA, AMD and Intel GPUs.")
+    return "cpu"
 pass
 DEVICE_TYPE : str = get_device_type()
 # HIP fails for autocast and other torch functions. Use CUDA instead
