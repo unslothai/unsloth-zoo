@@ -66,18 +66,17 @@ def set_dtype_in_config(config, dtype):
 
     success = False
     for field in target_fields:
+        field_set = False
         try:
             setattr(config, field, string_dtype)
-            success = True
-            continue
+            field_set = True
         except Exception:
-            pass
-
-        try:
-            config.__dict__[field] = string_dtype
-            success = True
-        except Exception:
-            pass
+            try:
+                config.__dict__[field] = string_dtype
+                field_set = True
+            except Exception:
+                pass
+        success = success or field_set
 
     if not success:
         set_dtype_in_config_fallback(config, dtype)

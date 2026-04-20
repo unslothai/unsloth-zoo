@@ -1839,9 +1839,15 @@ def load_vllm(
     _outer_model_type = getattr(config, "model_type", None)
     _text_model_type = getattr(getattr(config, "text_config", None), "model_type", None)
     if _outer_model_type in _gemma4_model_types or _text_model_type in _gemma4_model_types:
+        if _outer_model_type == "gemma4" and getattr(config, "audio_config", None) is not None:
+            raise NotImplementedError(
+                "Unsloth: Gemma4 audio-capable multimodal models are not yet supported; "
+                "audio_tower weights are not extracted during vLLM to HF conversion."
+            )
         if is_vision_model and _outer_model_type == "gemma4":
             patch_gemma4_vllm_lora_support()
-        patch_gemma4_vllm_k_eq_v_support()
+        if use_bitsandbytes:
+            patch_gemma4_vllm_k_eq_v_support()
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.

@@ -322,13 +322,16 @@ def patch_gemma4_vllm_lora_support():
     from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
     from vllm.model_executor.models import interfaces as vllm_model_interfaces
     from vllm.lora import model_manager as vllm_lora_model_manager
-    from vllm.v1.worker import lora_model_runner_mixin
+    try:
+        from vllm.v1.worker import lora_model_runner_mixin
+    except ImportError:
+        lora_model_runner_mixin = None
     from unsloth_zoo import vllm_lora_worker_manager
 
     Gemma4ForConditionalGeneration.supports_lora = True
     Gemma4ForConditionalGeneration.embedding_modules = {}
 
-    if not hasattr(lora_model_runner_mixin.supports_lora, "_unsloth_gemma4_patch"):
+    if lora_model_runner_mixin is not None and not hasattr(lora_model_runner_mixin.supports_lora, "_unsloth_gemma4_patch"):
         original_supports_lora = lora_model_runner_mixin.supports_lora
 
         def patched_supports_lora(model):
@@ -360,9 +363,12 @@ pass
 # materialize it during loader-side quant-state stacking instead of patching
 # the runtime attention forward.
 def patch_gemma4_vllm_k_eq_v_support():
-    from vllm.model_executor.model_loader.bitsandbytes_loader import (
-        BitsAndBytesModelLoader,
-    )
+    try:
+        from vllm.model_executor.model_loader.bitsandbytes_loader import (
+            BitsAndBytesModelLoader,
+        )
+    except ImportError:
+        return
 
     if hasattr(
         BitsAndBytesModelLoader._stack_quantization_states,
@@ -1068,7 +1074,18 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
     if hasattr(gdn, "in_proj_qkvz"):
         proj = getattr(gdn.in_proj_qkvz, "base_layer", gdn.in_proj_qkvz)
         weight = proj.weight
+        if getattr(weight, "bnb_quant_state", None) is not None:
+            raise NotImplementedError(
+                "Unsloth: BnB 4-bit fused Qwen3.5 in_proj_qkvz conversion is not "
+                "yet supported; the split projections require preserved per-shard "
+                "quant_state metadata."
+            )
         output_sizes = list(proj.output_sizes)
+        if len(output_sizes) < 4:
+            raise ValueError(
+                f"Unsloth: expected in_proj_qkvz to have >=4 output shards (q,k,v,z), "
+                f"got {len(output_sizes)}: {output_sizes}"
+            )
         offsets = [0]
         for s in output_sizes:
             offsets.append(offsets[-1] + s)
@@ -1086,9 +1103,12 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
                 scale_suffix = '.weight_scale_inv'
             else:
                 ws = None
-            if ws is not None and ws.ndim == 2 and ws.shape[1] > 1:
-                block_size = proj.weight_block_size[0]
-                scale_offsets = [x // block_size for x in offsets]
+            if ws is not None and ws.ndim == 2:
+                if ws.shape[1] > 1:
+                    block_size = proj.weight_block_size[0]
+                    scale_offsets = [x // block_size for x in offsets]
+                else:
+                    scale_offsets = offsets
                 qkv_scale = ws[scale_offsets[0]:scale_offsets[3]]
                 z_scale = ws[scale_offsets[3]:scale_offsets[4]]
                 store(f"{prefix}.in_proj_qkv{scale_suffix}", qkv_scale)
