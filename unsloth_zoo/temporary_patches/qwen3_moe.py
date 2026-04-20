@@ -45,22 +45,12 @@ from .moe_utils import (
 def _make_qwen_moe_lora_extractor():
     def _qwen_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
         """
-        LoRA extractor for Qwen-family MoE models (Qwen3-MoE, Qwen3.5/3.6 MoE,
-        Qwen3-Next). Base weights are stored as (E, out_dim, in_dim) for F.linear
-        and reshaped to (E, in_dim, out_dim) for grouped_mm by preprocess_weight.
+        LoRA extractor for Qwen-family MoE (Qwen3-MoE, Qwen3.5/3.6, Qwen3-Next).
 
-        Expectation for grouped_mm forward: out = ((X @ first) @ second) * scaling
-        - first_weight:  (E, in_dim, R)
-        - second_weight: (E, R, out_dim)
-
-        PEFT ParamWrapper produces:
-          weight_A: (E*R, in_dim)  -> view(E, R, in_dim).permute(0, 2, 1) = (E, in_dim, R)
-          weight_B: (out_dim, E*R) -> view(out_dim, E, R).permute(1, 2, 0) = (E, R, out_dim)
-
-        This mapping is independent of whether base weights are stored in
-        "standard" (E, out, in) or "transposed" (E, in, out) layout, since PEFT
-        LoRA weights have a fixed shape relative to the linear's in/out dims,
-        not the raw base-weight storage order.
+        PEFT LoRA shapes are fixed by the linear's in/out dims, independent of
+        raw base-weight storage order, so no model-specific dispatch is needed:
+          weight_A: (E*R, in_dim)  -> (E, in_dim, R)
+          weight_B: (out_dim, E*R) -> (E, R, out_dim)
         """
         total_rank = weight_A.shape[0]
         rank_per_expert = total_rank // num_experts
