@@ -554,7 +554,8 @@ def test_finalize_non_gemma4_rotary_buffers_follow_model_dtype():
         quantization_config={"x": 1}, bnb_config=None,
     )
     rotary = model.model.layers[0].self_attn.rotary_emb
-    assert rotary.inv_freq.dtype == torch.bfloat16
+    # Rotary inv_freq is kept at float32 for all archs to preserve RoPE precision.
+    assert rotary.inv_freq.dtype == torch.float32
 
 
 def test_set_dtype_in_config_else_branch_picks_correct_field():
@@ -641,3 +642,209 @@ def test_gemma4_per_layer_extraction_emits_state_dict_entries():
         )
     assert "model.language_model.layers.0.per_layer_input_gate.weight" in state_dict
     assert "model.language_model.layers.0.per_layer_projection.weight" in state_dict
+
+
+def test_set_additional_modules_loads_visual_merger_linear_fc():
+    # Regression: the "linear" filter in set_additional_modules dropped
+    # model.visual.merger.linear_fc1/2 after the PR moved them into
+    # non_layered_components. set_additional_modules must now restore them.
+    from unsloth_zoo.empty_model import set_additional_modules
+
+    class _LM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(2, 1)
+            self.norm = torch.nn.LayerNorm(1)
+
+    class _Merger(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_fc1 = torch.nn.Linear(1, 1, bias=False)
+            self.linear_fc2 = torch.nn.Linear(1, 1, bias=False)
+
+    class _Visual(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.merger = _Merger()
+
+    class _Inner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = _LM()
+            self.visual = _Visual()
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _Inner()
+            self.lm_head = torch.nn.Linear(1, 2, bias=False)
+
+    model = _Model()
+    fc1_target = torch.full((1, 1), 7.0)
+    fc2_target = torch.full((1, 1), 9.0)
+    quant_state_dict = {
+        "model.language_model.embed_tokens.weight": torch.zeros(2, 1),
+        "model.language_model.norm.weight": torch.ones(1),
+        "lm_head.weight": torch.zeros(2, 1),
+        "model.visual.merger.linear_fc1.weight": fc1_target,
+        "model.visual.merger.linear_fc2.weight": fc2_target,
+    }
+    cfg = types.SimpleNamespace(pad_token_id=0, text_config=types.SimpleNamespace(tie_word_embeddings=False))
+    set_additional_modules(model, quant_state_dict, cfg)
+    torch.testing.assert_close(model.model.visual.merger.linear_fc1.weight.data, fc1_target)
+    torch.testing.assert_close(model.model.visual.merger.linear_fc2.weight.data, fc2_target)
+
+
+def test_get_vllm_state_dict_extracts_layernorm_when_layer_lacks_mlp():
+    # Regression: the early `continue` for layers without `mlp` previously
+    # short-circuited before the layernorm extraction loop, dropping
+    # input_layernorm.weight on linear-attention / MoE-only layers.
+    from unsloth_zoo import vllm_utils
+    src = inspect.getsource(vllm_utils._get_vllm_state_dict)
+    layernorm_idx = src.index('layer_config[\'layernorms\']')
+    no_mlp_idx = src.index('if not hasattr(layer, "mlp"):')
+    assert layernorm_idx < no_mlp_idx, (
+        "layernorm extraction loop must run before the no-mlp early continue "
+        "so layernorms are exported for every decoder layer"
+    )
+
+
+def test_finalize_huggingface_model_dtype_propagates_to_replaced_live_config():
+    # Regression: copy_attributes can replace new_model.config with a config
+    # object whose id() differs from the input `config`, so the id-keyed
+    # dtype reapply loop missed it. After the fix, the live config tree is
+    # also brought up to date.
+    from unsloth_zoo.empty_model import finalize_huggingface_model
+
+    class _LiveCfg:
+        def __init__(self, dtype):
+            self.dtype = dtype
+            self.text_config = self
+            self.model_type = "llama"
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = _LiveCfg("bfloat16")
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList()
+
+    input_cfg = types.SimpleNamespace(model_type="llama", dtype="bfloat16")
+    input_cfg.text_config = input_cfg
+    model = _Model()
+    finalize_huggingface_model(
+        model, None, input_cfg, torch.float16,
+        quantization_config={"x": 1}, bnb_config=None,
+    )
+    assert model.config.dtype == "float16"
+
+
+def test_finalize_huggingface_model_vision_rotary_uses_identity_check():
+    # Regression: previously vision rotary classification compared __class__
+    # of the rotary's config against vision_config's class, which misfires
+    # when text and vision configs share a Python class. Identity-based
+    # check must not reroute a text rotary to vision_config in that case.
+    from unsloth_zoo.empty_model import finalize_huggingface_model
+
+    class _SharedCfg:
+        def __init__(self, hidden_size=4):
+            self.hidden_size = hidden_size
+
+    text_cfg_obj = _SharedCfg(8)
+    vision_cfg_obj = _SharedCfg(16)
+
+    captured = {}
+
+    class _Rotary(torch.nn.Module):
+        def __init__(self, config=None, device=None):
+            super().__init__()
+            self.config = config
+            captured["last_hidden"] = config.hidden_size
+            self.register_buffer("inv_freq", torch.arange(4, dtype=torch.float32))
+
+    class _Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_emb = _Rotary(config=text_cfg_obj)
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_idx = -1
+            self.self_attn = _Attn()
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([_Layer()])
+
+    cfg = types.SimpleNamespace(model_type="llama")
+    cfg.text_config = text_cfg_obj
+    cfg.vision_config = vision_cfg_obj
+
+    model = _Model()
+    finalize_huggingface_model(
+        model, None, cfg, torch.float16,
+        quantization_config={"x": 1}, bnb_config=None,
+    )
+    assert captured["last_hidden"] == text_cfg_obj.hidden_size, (
+        "rotary using text_config must not be re-classified as a vision rotary "
+        "just because the two configs share a Python class"
+    )
+
+
+def test_layer_scalar_keeps_buffer_registration_after_conversion():
+    # Regression: the `if layer_name in quant_state_dict` branch in
+    # convert_vllm_to_huggingface always wrapped the value in nn.Parameter,
+    # silently moving HF Gemma4 layer_scalar from `_buffers` to `_parameters`.
+    from unsloth_zoo import vllm_utils
+    src = inspect.getsource(vllm_utils.convert_vllm_to_huggingface)
+    assert "_buffers" in src
+    assert 'getattr(parent, "_buffers"' in src or "parent._buffers" in src
+
+
+def test_assert_same_state_dict_uses_tight_tolerance_for_same_dtype():
+    # Regression: assert_same_state_dict previously applied atol=1e-4 /
+    # rtol=1e-3 unconditionally, masking weight-extraction errors on
+    # same-dtype non-FP8 weights. The relaxed tolerance must now only
+    # apply to the dtype-mismatch / FP8 upcast branch.
+    from unsloth_zoo.vllm_utils import assert_same_state_dict
+    a = torch.randn(8, 8, dtype=torch.float32)
+    b = a.clone()
+    b[0, 0] += 5e-4
+    raised = False
+    try:
+        assert_same_state_dict({"w": a}, {"w": b})
+    except Exception:
+        raised = True
+    assert raised, "5e-4 fp32 mismatch must fail the tight torch default tolerance"
+
+
+def test_conv1d_branch_requires_linear_attn_in_layer_name():
+    # Regression: `endswith(".conv1d")` would silently rebuild any future
+    # non-GDN .conv1d layer as depthwise. Branch must require linear_attn.
+    from unsloth_zoo import vllm_utils
+    src = inspect.getsource(vllm_utils.convert_vllm_to_huggingface)
+    assert 'endswith(".conv1d") and "linear_attn" in layer_name' in src
+
+
+def test_gemma4_lora_patch_covers_both_classes():
+    # Regression: only Gemma4ForConditionalGeneration was patched, so
+    # text-only Gemma4ForCausalLM still hit the unsupported-LoRA path.
+    from unsloth_zoo import empty_model
+    src = inspect.getsource(empty_model.patch_gemma4_vllm_lora_support)
+    assert "Gemma4ForCausalLM" in src
+    assert "_unsloth_gemma4_class_patched" in src
+
+
+def test_get_model_layer_config_includes_gemma4_top_level_ple_modules():
+    # Regression: top-level Gemma4 PLE modules (embed_tokens_per_layer,
+    # per_layer_model_projection, per_layer_projection_norm) were missing
+    # from extraction tables, leaving them with random init.
+    from unsloth_zoo.empty_model import get_model_layer_config
+    cfg = get_model_layer_config()
+    non_layered = set(cfg["non_layered_components"])
+    assert "model.language_model.embed_tokens_per_layer" in non_layered
+    assert "model.language_model.per_layer_model_projection" in non_layered
+    assert "model.language_model.per_layer_projection_norm" in non_layered
