@@ -635,7 +635,8 @@ def set_additional_modules(new_model, quant_state_dict, config):
         x for x in quant_state_dict.keys()
         if not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list"))
     )
-    print(f'Performing substitution for {additional_keys=}')
+    if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+        print(f'Performing substitution for {additional_keys=}')
 
     for key in additional_keys:
         # sometimes it can be in new_model.model. instead of new_model.
@@ -708,7 +709,8 @@ def finalize_huggingface_model(
                         dtype = dtype,
                     )
         if hasattr(module, "rotary_pos_emb"):
-            assert vision_config is not None, "Unsloth: vision_config is required for models with vision rotary_pos_emb"
+            if vision_config is None:
+                raise ValueError("Unsloth: vision_config is required for models with vision rotary_pos_emb")
             head_dim = vision_config.hidden_size // vision_config.num_heads
             module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)
         if hasattr(module, "rotary_emb_local"):
@@ -723,27 +725,28 @@ def finalize_huggingface_model(
 
     if (quantization_config or {}) == {} and bnb_config is None:
         new_model = new_model.to(device = target_device, dtype = dtype)
-        if getattr(config, "model_type", None) == "gemma4":
-            for module in new_model.modules():
-                rotary_emb = getattr(module, "rotary_emb", None)
-                if rotary_emb is None:
-                    continue
-                fresh_rotary_emb = rotary_emb.__class__(
-                    config = rotary_emb.config,
-                    device = target_device,
-                )
-                for attr_name in ("max_seq_len_cached", "original_max_seq_len"):
-                    if hasattr(fresh_rotary_emb, attr_name):
-                        setattr(rotary_emb, attr_name, getattr(fresh_rotary_emb, attr_name))
-                for attr_name, attr_value in fresh_rotary_emb.__dict__.items():
-                    if attr_name == "attention_scaling" or attr_name.endswith("_attention_scaling"):
-                        setattr(rotary_emb, attr_name, attr_value)
-                for buffer_name, buffer in fresh_rotary_emb._buffers.items():
-                    if torch.is_tensor(buffer) and buffer.is_floating_point():
-                        rotary_emb._buffers[buffer_name] = buffer.to(
-                            device = target_device,
-                            dtype = torch.float32,
-                        )
+
+    if getattr(config, "model_type", None) == "gemma4":
+        for module in new_model.modules():
+            rotary_emb = getattr(module, "rotary_emb", None)
+            if rotary_emb is None:
+                continue
+            fresh_rotary_emb = rotary_emb.__class__(
+                config = rotary_emb.config,
+                device = target_device,
+            )
+            for attr_name in ("max_seq_len_cached", "original_max_seq_len"):
+                if hasattr(fresh_rotary_emb, attr_name):
+                    setattr(rotary_emb, attr_name, getattr(fresh_rotary_emb, attr_name))
+            for attr_name, attr_value in fresh_rotary_emb.__dict__.items():
+                if attr_name == "attention_scaling" or attr_name.endswith("_attention_scaling"):
+                    setattr(rotary_emb, attr_name, attr_value)
+            for buffer_name, buffer in fresh_rotary_emb._buffers.items():
+                if torch.is_tensor(buffer) and buffer.is_floating_point():
+                    rotary_emb._buffers[buffer_name] = buffer.to(
+                        device = target_device,
+                        dtype = torch.float32,
+                    )
     return new_model
 pass
 
@@ -795,6 +798,12 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.linear_attn.out_proj",
             "model.layers.{kk}.linear_attn.dt_bias",
             "model.layers.{kk}.linear_attn.A_log",
+
+            # Gemma4 per-layer text projections
+            "model.language_model.layers.{kk}.per_layer_input_gate",
+            "model.language_model.layers.{kk}.per_layer_projection",
+            "model.layers.{kk}.per_layer_input_gate",
+            "model.layers.{kk}.per_layer_projection",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
@@ -831,6 +840,10 @@ def get_model_layer_config(return_non_layered=True):
             "model.visual.deepstack_merger_list.{kk}.norm",
             "model.language_model.layers.{kk}.linear_attn.norm",
             "model.layers.{kk}.linear_attn.norm",
+
+            # Gemma4 per-layer text projection norm
+            "model.language_model.layers.{kk}.post_per_layer_input_norm",
+            "model.layers.{kk}.post_per_layer_input_norm",
         },
         'vision_layers': {
 

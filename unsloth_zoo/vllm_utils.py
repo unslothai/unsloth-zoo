@@ -1216,6 +1216,8 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
     def _normalize_state_dict_tensor(value):
         if isinstance(value, torch.nn.Parameter):
             value = value.detach()
+        if not isinstance(value, torch.Tensor):
+            return value
         if value.is_sparse:
             value = value.to_dense()
         return value.contiguous()
@@ -1342,7 +1344,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         "norm1",              # Qwen2.5-VL vision encoder
         "norm2",              # Qwen2.5-VL vision encoder
         "norm",
-        "conv1d",
     ]
     # Override .to("cuda") to disable it otherwise we'll get
     # ValueError: Blockwise quantization only supports 16/32-bit floats, but got torch.uint8
@@ -1439,6 +1440,21 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.to = partial(_override_to, layer)
                 layer.weight.to = partial(_override_to, layer.weight)
 
+            elif layer_name.endswith(".conv1d"):
+                # why: empty-model placeholder Conv1d keeps kernel_size=1 / groups=1,
+                # so rebuild from the real extracted weight to match GDN depthwise shape.
+                out_ch, _in_per_group, kernel = weight.shape
+                layer = torch.nn.Conv1d(
+                    in_channels = out_ch,
+                    out_channels = out_ch,
+                    kernel_size = kernel,
+                    groups = out_ch,
+                    padding = kernel - 1,
+                    bias = has_bias,
+                    device = get_target_device(),
+                )
+                layer.weight = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
+                layer.bias = bias
             elif not any(x in layer_name for x in layernorm_names):
                 layer = Linear(0, 0, device = get_target_device(), bias = has_bias)
                 layer.in_features  = weight.shape[1]
@@ -1779,8 +1795,9 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
-    if is_vision_model and getattr(config, "model_type", None) == "gemma4":
-        patch_gemma4_vllm_lora_support()
+    if getattr(config, "model_type", None) == "gemma4":
+        if is_vision_model:
+            patch_gemma4_vllm_lora_support()
         patch_gemma4_vllm_k_eq_v_support()
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")

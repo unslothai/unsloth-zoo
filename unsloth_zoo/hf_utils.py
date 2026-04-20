@@ -50,7 +50,10 @@ def dtype_from_config(config):
     return dtype
 
 def set_dtype_in_config(config, dtype):
+    if isinstance(dtype, str) and dtype.startswith("torch."):
+        dtype = dtype.split(".", 1)[1]
     runtime_dtype = getattr(torch, dtype, dtype) if isinstance(dtype, str) else dtype
+    string_dtype = str(runtime_dtype).split(".")[-1] if isinstance(runtime_dtype, torch.dtype) else runtime_dtype
     target_fields = []
 
     if hasattr(config, "dtype"):
@@ -64,14 +67,14 @@ def set_dtype_in_config(config, dtype):
     success = False
     for field in target_fields:
         try:
-            setattr(config, field, runtime_dtype)
+            setattr(config, field, string_dtype)
             success = True
             continue
         except Exception:
             pass
 
         try:
-            config.__dict__[field] = runtime_dtype
+            config.__dict__[field] = string_dtype
             success = True
         except Exception:
             pass
