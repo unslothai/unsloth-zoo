@@ -427,10 +427,24 @@ _LORA_TARGET_ALIASES = {
 
 
 def _lora_name_matches_target(name, target_modules):
-    leaf = name.split(".")[-1] if name else name
-    if leaf in target_modules or name in target_modules:
+    if target_modules is None:
         return True
-    return any(leaf in _LORA_TARGET_ALIASES.get(target, ()) for target in target_modules)
+    if not name:
+        return False
+    parts = name.split(".")
+    leaf = parts[-1]
+    parent_leaf = parts[-2] if len(parts) >= 2 else ""
+    if (
+        leaf in target_modules
+        or parent_leaf in target_modules
+        or name in target_modules
+    ):
+        return True
+    return any(
+        alias in (leaf, parent_leaf)
+        for target in target_modules
+        for alias in _LORA_TARGET_ALIASES.get(target, ())
+    )
 
 
 def _vlm_config_is_already_quantized(config_data: dict) -> bool:
@@ -931,7 +945,14 @@ def _patch_mlx_saving(model, tokenizer):
     model.save_lora_adapters     = types.MethodType(_mlx_save_lora_adapters, model)
 
 
-def _lora_walk_module(model, lora_config, target_modules, attr_names):
+def _lora_walk_module(
+    model,
+    lora_config,
+    target_modules,
+    attr_names,
+    *,
+    match_all_linear=False,
+):
     """Walk a module tree and replace matching Linear/QuantizedLinear with LoRA.
 
     Used for vision encoders that don't have the flat `.layers` structure
@@ -952,7 +973,7 @@ def _lora_walk_module(model, lora_config, target_modules, attr_names):
 
         def _walk(module):
             for name, child in module.named_modules():
-                if not _lora_name_matches_target(name, target_modules):
+                if not match_all_linear and not _lora_name_matches_target(name, target_modules):
                     continue
                 if isinstance(child, (nn.Linear, nn.QuantizedLinear)):
                     lora_layer = LoRALinear.from_base(
@@ -1349,14 +1370,24 @@ class FastMLXModel:
                                   attr_names=("vision_tower", "vision_model",
                                               "vision_encoder"))
 
-            # Optionally unfreeze projector
+            # Optionally train the multimodal projector / connector. Prefer
+            # projector LoRA over unfreezing raw weights because many MLX VLM
+            # checkpoints expose projector layers as QuantizedLinear, and MLX
+            # does not backprop into quantized weights directly.
             if train_projector:
-                for attr in ("multi_modal_projector", "mm_projector",
-                             "connector", "aligner"):
-                    proj = getattr(model, attr, None)
-                    if proj is not None:
-                        proj.unfreeze()
-                        break
+                _lora_walk_module(
+                    model,
+                    lora_config,
+                    target_modules=(),
+                    attr_names=(
+                        "multi_modal_projector",
+                        "mm_projector",
+                        "connector",
+                        "aligner",
+                        "embed_vision",
+                    ),
+                    match_all_linear=True,
+                )
 
             # Unfreeze all LoRA params across the entire tree
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
