@@ -1846,8 +1846,6 @@ def load_vllm(
             )
         if is_vision_model and _outer_model_type == "gemma4":
             patch_gemma4_vllm_lora_support()
-        if use_bitsandbytes:
-            patch_gemma4_vllm_k_eq_v_support()
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
@@ -1928,6 +1926,11 @@ def load_vllm(
     quant_method = get_quant_type(config)
     use_bitsandbytes = use_bitsandbytes or \
         model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
+
+    # why: patch_gemma4_vllm_k_eq_v_support must run after the -bnb-4bit / quant_method normalization above, so prequantized Gemma4 checkpoints passed with use_bitsandbytes=False still get the synthetic-V loader patch.
+    if _outer_model_type in _gemma4_model_types or _text_model_type in _gemma4_model_types:
+        if use_bitsandbytes:
+            patch_gemma4_vllm_k_eq_v_support()
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 

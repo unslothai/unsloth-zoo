@@ -290,6 +290,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         "linear_key_head_dim": 1,
         "linear_value_head_dim": 1,
         "linear_conv_kernel_dim": 1,
+        "hidden_size_per_layer_input": 1,
+        "vocab_size_per_layer_input": 8,
     })
 
     # Set attention module head_dim
@@ -742,6 +744,10 @@ def finalize_huggingface_model(
             rotary_cfg = getattr(rotary_emb, "config", None)
             if rotary_cfg is None:
                 continue
+            # why: rotary_emb.config was the shrunken stub from create_empty_vision_model; use the outer real vision_config for vision rotary.
+            if vision_config is not None and rotary_cfg.__class__ == vision_config.__class__:
+                rotary_cfg = vision_config
+                rotary_emb.config = vision_config
             fresh_rotary_emb = rotary_emb.__class__(
                 config = rotary_cfg,
                 device = target_device,
@@ -1103,10 +1109,13 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
                 scale_suffix = '.weight_scale_inv'
             else:
                 ws = None
-            if ws is not None and ws.ndim == 2:
-                if ws.shape[1] > 1:
-                    block_size = proj.weight_block_size[0]
-                    scale_offsets = [x // block_size for x in offsets]
+            if ws is not None:
+                if ws.ndim == 2:
+                    if ws.shape[1] > 1:
+                        block_size = proj.weight_block_size[0]
+                        scale_offsets = [x // block_size for x in offsets]
+                    else:
+                        scale_offsets = offsets
                 else:
                     scale_offsets = offsets
                 qkv_scale = ws[scale_offsets[0]:scale_offsets[3]]

@@ -65,14 +65,17 @@ def set_dtype_in_config(config, dtype):
         target_fields.append("torch_dtype" if HAS_TORCH_DTYPE else "dtype")
 
     success = False
-    for field in target_fields:
+    # why: transformers 5.x keeps config.dtype as torch.dtype at runtime; Qwen3_5GatedDeltaNet reads config.dtype and passes it into FusedRMSNormGated which rejects strings. Write torch_dtype first (its setter aliases to dtype), then overwrite dtype with the runtime torch.dtype object.
+    ordered_fields = sorted(target_fields, key=lambda f: 0 if f == "torch_dtype" else 1)
+    for field in ordered_fields:
+        value = runtime_dtype if field == "dtype" else string_dtype
         field_set = False
         try:
-            setattr(config, field, string_dtype)
+            setattr(config, field, value)
             field_set = True
         except Exception:
             try:
-                config.__dict__[field] = string_dtype
+                config.__dict__[field] = value
                 field_set = True
             except Exception:
                 pass
