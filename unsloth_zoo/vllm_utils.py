@@ -1084,6 +1084,19 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     # Use get_state_dict for consistent extraction and automatic truncation
     get_state_dict(f"{vllm_text_model_prefix}.embed_tokens", 0, state_dict, embed_tokens, slice_weights=False)
 
+    for _top_name in ("embed_tokens_per_layer", "per_layer_model_projection"):
+        _top_mod = getattr(vllm_text_model, _top_name, None)
+        if _top_mod is not None:
+            get_state_dict(
+                f"{vllm_text_model_prefix}.{_top_name}",
+                0, state_dict, _top_mod, slice_weights=False,
+            )
+    _pln = getattr(vllm_text_model, "per_layer_projection_norm", None)
+    if _pln is not None and hasattr(_pln, "weight"):
+        _pln_key = f"{vllm_text_model_prefix}.per_layer_projection_norm.weight"
+        state_dict[_pln_key] = _pln.weight.data
+        quant_state_dict[_pln_key] = state_dict[_pln_key]
+
     # Get layer configuration for this model type
     layer_config = get_model_layer_config()
 
@@ -1150,6 +1163,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
         proj = layer.mlp.down_proj
         get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
+
+        for _proj_name in ("per_layer_input_gate", "per_layer_projection"):
+            _proj_mod = getattr(layer, _proj_name, None)
+            if _proj_mod is not None:
+                get_state_dict(
+                    f"{vllm_text_model_prefix}.layers.{kk}.{_proj_name}",
+                    0, state_dict, _proj_mod,
+                )
 
         # Use layernorms from the layer configuration
         layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
@@ -1238,8 +1259,19 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
             old_val = _normalize_state_dict_tensor(old_state_dict[key])
             new_val = _normalize_state_dict_tensor(new_state_dict[key])
             if not (isinstance(old_val, torch.Tensor) and isinstance(new_val, torch.Tensor)):
-                if old_val != new_val:
-                    failures[key] = RuntimeError(f"non-tensor state dict entries differ: {old_val!r} vs {new_val!r}")
+                if isinstance(old_val, torch.Tensor) != isinstance(new_val, torch.Tensor):
+                    failures[key] = RuntimeError(
+                        f"type mismatch: {type(old_val).__name__} vs {type(new_val).__name__}"
+                    )
+                else:
+                    try:
+                        equal = bool(old_val == new_val)
+                    except (ValueError, RuntimeError, TypeError):
+                        equal = False
+                    if not equal:
+                        failures[key] = RuntimeError(
+                            f"non-tensor state dict entries differ: {old_val!r} vs {new_val!r}"
+                        )
                 continue
             if old_val.dtype != new_val.dtype or (new_val.element_size() < 2):
                 # upcast both to float32 just for comparison. For FP8, vLLM stores weight scale in FP32 while HF preferes 16bit
@@ -1799,8 +1831,11 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
-    if getattr(config, "model_type", None) == "gemma4":
-        if is_vision_model:
+    _gemma4_model_types = ("gemma4", "gemma4_text")
+    _outer_model_type = getattr(config, "model_type", None)
+    _text_model_type = getattr(getattr(config, "text_config", None), "model_type", None)
+    if _outer_model_type in _gemma4_model_types or _text_model_type in _gemma4_model_types:
+        if is_vision_model and _outer_model_type == "gemma4":
             patch_gemma4_vllm_lora_support()
         patch_gemma4_vllm_k_eq_v_support()
 

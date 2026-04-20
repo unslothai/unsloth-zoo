@@ -482,6 +482,8 @@ def create_empty_vision_model(config, dtype = torch.float16):
         "intermediate_size": 1,
         "head_dim": 1,
         "pad_token_id": 1,
+        "hidden_size_per_layer_input": 1,
+        "vocab_size_per_layer_input": 8,
     })
     # Qwen 3.5 or GDN related attrs
     _set_config_attrs(new_config.text_config, {
@@ -731,8 +733,11 @@ def finalize_huggingface_model(
             rotary_emb = getattr(module, "rotary_emb", None)
             if rotary_emb is None:
                 continue
+            rotary_cfg = getattr(rotary_emb, "config", None)
+            if rotary_cfg is None:
+                continue
             fresh_rotary_emb = rotary_emb.__class__(
-                config = rotary_emb.config,
+                config = rotary_cfg,
                 device = target_device,
             )
             for attr_name in ("max_seq_len_cached", "original_max_seq_len"):
@@ -1072,16 +1077,18 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
         store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
         store(f"{prefix}.in_proj_z.weight", z_weight)
         if weight.dtype == torch.float8_e4m3fn:
+            scale_suffix = None
             if hasattr(proj, 'weight_scale'):
                 ws = proj.weight_scale
+                scale_suffix = '.weight_scale'
             elif hasattr(proj, 'weight_scale_inv'):
                 ws = proj.weight_scale_inv
+                scale_suffix = '.weight_scale_inv'
             else:
                 ws = None
             if ws is not None and ws.ndim == 2 and ws.shape[1] > 1:
                 block_size = proj.weight_block_size[0]
                 scale_offsets = [x // block_size for x in offsets]
-                scale_suffix = '.weight_scale_inv'
                 qkv_scale = ws[scale_offsets[0]:scale_offsets[3]]
                 z_scale = ws[scale_offsets[3]:scale_offsets[4]]
                 store(f"{prefix}.in_proj_qkv{scale_suffix}", qkv_scale)
