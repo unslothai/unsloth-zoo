@@ -1217,7 +1217,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     # LM Head - Use get_state_dict for consistency
     if not getattr(text_config, "tie_word_embeddings", False):
-        lm_layer = next((mod for name, mod in vllm_internals.named_modules() if "lm_head" in name), None)
+        lm_layer = next((mod for name, mod in vllm_internals.named_modules() if name == "lm_head" or name.endswith(".lm_head")), None)
         if lm_layer is None:
             raise RuntimeError("Unsloth: could not find lm_head in vLLM internals")
         get_state_dict("lm_head", 0, state_dict, lm_layer, slice_weights=False)

@@ -734,7 +734,6 @@ def finalize_huggingface_model(
     target_device = _get_model_device(new_model)
     text_config = getattr(config, "text_config", config)
     vision_config = getattr(config, "vision_config", None)
-    is_gemma4 = getattr(config, "model_type", None) == "gemma4"
 
     vision_config_ids = set()
     if vision_config is not None:
@@ -743,24 +742,24 @@ def finalize_huggingface_model(
     if live_vision_config is not None:
         vision_config_ids.add(id(live_vision_config))
 
-    for module in new_model.modules():
+    local_rope_config = None
+    for module_name, module in new_model.named_modules():
         if hasattr(module, "rotary_emb"):
-            rotary_config = text_config
             current_rotary_config = getattr(module.rotary_emb, "config", None)
-            is_vision_rotary = (
-                vision_config is not None and
-                current_rotary_config is not None and
-                id(current_rotary_config) in vision_config_ids
+            is_vision_rotary = vision_config is not None and (
+                "vision_tower" in module_name
+                or "vision_model" in module_name
+                or (current_rotary_config is not None and id(current_rotary_config) in vision_config_ids)
             )
-            if is_vision_rotary:
-                rotary_config = vision_config
-            module.rotary_emb = module.rotary_emb.__class__(
-                config = rotary_config,
-                device = target_device,
-            )
-            # Always keep rotary math buffers in float32 for precision.
-            for buffer_name in ("inv_freq", "original_inv_freq"):
-                buffer = getattr(module.rotary_emb, buffer_name, None)
+            rotary_config = vision_config if is_vision_rotary else text_config
+            try:
+                module.rotary_emb = module.rotary_emb.__class__(
+                    config = rotary_config,
+                    device = target_device,
+                )
+            except Exception:
+                pass
+            for buffer_name, buffer in list(module.rotary_emb._buffers.items()):
                 if torch.is_tensor(buffer) and buffer.is_floating_point():
                     module.rotary_emb._buffers[buffer_name] = buffer.to(
                         device = target_device,
@@ -770,38 +769,27 @@ def finalize_huggingface_model(
             head_dim = vision_config.hidden_size // vision_config.num_heads
             module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)
         if hasattr(module, "rotary_emb_local"):
-            local_rope_config = deepcopy(text_config)
-            local_rope_config.rope_theta = text_config.rope_local_base_freq
-            local_rope_config.rope_scaling = {"rope_type": "default"}
+            if local_rope_config is None:
+                local_rope_config = deepcopy(text_config)
+                local_rope_config.rope_theta = text_config.rope_local_base_freq
+                local_rope_config.rope_scaling = {"rope_type": "default"}
             module.rotary_emb_local = module.rotary_emb_local.__class__(
                 config = local_rope_config,
                 device = target_device,
             )
-            del local_rope_config
 
     if (quantization_config or {}) == {} and bnb_config is None:
         new_model = new_model.to(device = target_device, dtype = dtype)
-        if is_gemma4:
-            # Restore float32 rotary buffers / attention_scaling that .to(dtype) may have downcast.
-            for module in new_model.modules():
-                rotary_emb = getattr(module, "rotary_emb", None)
-                if rotary_emb is None:
-                    continue
-                rotary_cfg = getattr(rotary_emb, "config", None)
-                if rotary_cfg is not None:
-                    fresh_rotary_emb = rotary_emb.__class__(
-                        config = rotary_cfg,
+        for module in new_model.modules():
+            rotary_emb = getattr(module, "rotary_emb", None)
+            if rotary_emb is None:
+                continue
+            for buffer_name, buffer in list(rotary_emb._buffers.items()):
+                if torch.is_tensor(buffer) and buffer.is_floating_point():
+                    rotary_emb._buffers[buffer_name] = buffer.to(
                         device = target_device,
+                        dtype = torch.float32,
                     )
-                    for attr_name, attr_value in fresh_rotary_emb.__dict__.items():
-                        if attr_name == "attention_scaling" or attr_name.endswith("_attention_scaling"):
-                            setattr(rotary_emb, attr_name, attr_value)
-                for buffer_name, buffer in list(rotary_emb._buffers.items()):
-                    if torch.is_tensor(buffer) and buffer.is_floating_point():
-                        rotary_emb._buffers[buffer_name] = buffer.to(
-                            device = target_device,
-                            dtype = torch.float32,
-                        )
     return new_model
 pass
 
@@ -1220,8 +1208,9 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
                 "Unsloth: prequantized BnB Qwen3.5 GDN requires bitsandbytes for in_proj_ba split."
             )
         full = dequantize_4bit(ba_weight, quant_state=ba_states[0])
-        store(f"{prefix}.in_proj_b.weight", full[:mid])
-        store(f"{prefix}.in_proj_a.weight", full[mid:])
+        full_mid = full.shape[0] // 2
+        store(f"{prefix}.in_proj_b.weight", full[:full_mid])
+        store(f"{prefix}.in_proj_a.weight", full[full_mid:])
     else:
         store(f"{prefix}.in_proj_b.weight", ba_weight[:mid])
         store(f"{prefix}.in_proj_a.weight", ba_weight[mid:])
