@@ -1237,6 +1237,10 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
         try:
             old_val = _normalize_state_dict_tensor(old_state_dict[key])
             new_val = _normalize_state_dict_tensor(new_state_dict[key])
+            if not (isinstance(old_val, torch.Tensor) and isinstance(new_val, torch.Tensor)):
+                if old_val != new_val:
+                    failures[key] = RuntimeError(f"non-tensor state dict entries differ: {old_val!r} vs {new_val!r}")
+                continue
             if old_val.dtype != new_val.dtype or (new_val.element_size() < 2):
                 # upcast both to float32 just for comparison. For FP8, vLLM stores weight scale in FP32 while HF preferes 16bit
                 old_val = old_val.to(torch.float32)
