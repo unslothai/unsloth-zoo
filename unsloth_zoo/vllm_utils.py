@@ -1063,10 +1063,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             quant_state_dict[prefix + ".bias"] = bias_tensor
     pass
 
+    _effective_model_type = getattr(text_config, "model_type", model_type)
     gemma4_k_eq_v_layers = {
         kk
         for kk, layer_type in enumerate(getattr(text_config, "layer_types", ()))
-        if model_type == "gemma4" and getattr(text_config, "attention_k_eq_v", False) and layer_type == "full_attention"
+        if _effective_model_type in ("gemma4", "gemma4_text") and getattr(text_config, "attention_k_eq_v", False) and layer_type == "full_attention"
     }
 
     # Embedding

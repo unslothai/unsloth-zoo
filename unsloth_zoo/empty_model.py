@@ -333,8 +333,8 @@ def patch_gemma4_vllm_lora_support():
     Gemma4ForConditionalGeneration.supports_lora = True
     Gemma4ForConditionalGeneration.embedding_modules = {}
 
-    if lora_model_runner_mixin is not None and not hasattr(lora_model_runner_mixin.supports_lora, "_unsloth_gemma4_patch"):
-        original_supports_lora = lora_model_runner_mixin.supports_lora
+    if not hasattr(vllm_model_interfaces.supports_lora, "_unsloth_gemma4_patch"):
+        original_supports_lora = vllm_model_interfaces.supports_lora
 
         def patched_supports_lora(model):
             if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
@@ -342,8 +342,9 @@ def patch_gemma4_vllm_lora_support():
             return original_supports_lora(model)
 
         patched_supports_lora._unsloth_gemma4_patch = True
-        lora_model_runner_mixin.supports_lora = patched_supports_lora
         vllm_model_interfaces.supports_lora = patched_supports_lora
+        if lora_model_runner_mixin is not None:
+            lora_model_runner_mixin.supports_lora = patched_supports_lora
 
     if not hasattr(vllm_lora_model_manager.create_lora_manager, "_unsloth_gemma4_patch"):
         original_create_lora_manager = vllm_lora_model_manager.create_lora_manager
@@ -676,9 +677,12 @@ def finalize_huggingface_model(
     if original_meta_model is not None:
         copy_attributes(original_meta_model, new_model)
 
-    language_model = getattr(getattr(new_model, "model", None), "language_model", None)
-    if language_model is not None and hasattr(language_model, "layers"):
-        for layer_idx, layer in enumerate(language_model.layers):
+    _inner_model = getattr(new_model, "model", None)
+    _layer_owners = [getattr(_inner_model, "language_model", None), _inner_model]
+    for _layers_owner in _layer_owners:
+        if _layers_owner is None or not hasattr(_layers_owner, "layers"):
+            continue
+        for layer_idx, layer in enumerate(_layers_owner.layers):
             if hasattr(layer, "layer_idx"):
                 layer.layer_idx = layer_idx
             for attr_name in ("self_attn", "cross_attn", "mlp", "linear_attn"):
