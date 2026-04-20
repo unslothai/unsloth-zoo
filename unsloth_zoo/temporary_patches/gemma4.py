@@ -617,8 +617,8 @@ TEMPORARY_PATCHES.append(patch_Gemma4AudioAttention)
 #
 # The NaN chain (verified via TensorStatisticsHooks on E2B GRPO):
 #
-#   1. Under UNSLOTH_FORCE_FLOAT32 the loader stores linear weights as fp16
-#      (see unsloth_zoo/patching_utils.py do_forced_float32 block).
+#   1. When the user requests dtype=torch.float16 (or fp16 autocast), gate
+#      and up projections produce fp16 activations.
 #   2. `down_proj(act_fn(gate_proj(x)) * up_proj(x))` saturates in fp16 at
 #      `layers.0.mlp.down_proj` (E2B) / `layers.1.mlp.down_proj` (E4B).
 #   3. The +-inf in down_proj output poisons the residual stream; the next
@@ -668,9 +668,13 @@ def patch_Gemma4TextMLP():
     cache stays aligned with the text attention output. gate_proj, up_proj
     and down_proj remain fp16 tensor-core matmuls (full T4 throughput at
     65 TFLOPS).
+
+    The fp16 clamp path is gated on the gate_proj output dtype at every
+    forward, so the patch is a zero-cost no-op for bf16 / fp32 users (no
+    env flag or FORCE_FLOAT32 dependency) and self-activates whenever the
+    activation landing in the MLP is fp16 (explicit dtype, autocast, or
+    PEFT fp16 cast).
     """
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
-        return
     try:
         import transformers.models.gemma4.modeling_gemma4 as mod
     except ImportError:
