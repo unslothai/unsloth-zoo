@@ -848,3 +848,251 @@ def test_get_model_layer_config_includes_gemma4_top_level_ple_modules():
     assert "model.language_model.embed_tokens_per_layer" in non_layered
     assert "model.language_model.per_layer_model_projection" in non_layered
     assert "model.language_model.per_layer_projection_norm" in non_layered
+
+
+def test_finalize_non_gemma4_rotary_stays_fp32_through_to_dtype():
+    # Regression: the non-Gemma4 branch previously skipped the float32 rotary
+    # buffer restoration after new_model.to(dtype), downcasting inv_freq /
+    # original_inv_freq to bf16/fp16 for Qwen3.5 and other non-Gemma4 models.
+    # Must exercise the (quantization_config == {} and bnb_config is None)
+    # path so .to(dtype) actually runs.
+    from unsloth_zoo.empty_model import finalize_huggingface_model
+
+    class _Cfg:
+        pass
+
+    class _Rotary(torch.nn.Module):
+        def __init__(self, config=None, device=None):
+            super().__init__()
+            self.config = config if config is not None else _Cfg()
+            self.register_buffer("inv_freq", torch.arange(4, dtype=torch.float32))
+            self.register_buffer("original_inv_freq", torch.arange(4, dtype=torch.float32))
+
+    class _Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_emb = _Rotary(config=_Cfg())
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_idx = -1
+            self.self_attn = _Attn()
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([_Layer()])
+
+    cfg = types.SimpleNamespace(model_type="llama")
+    cfg.text_config = cfg
+    model = _Model()
+    finalize_huggingface_model(
+        model, None, cfg, torch.bfloat16,
+        quantization_config={}, bnb_config=None,
+    )
+    rotary = model.model.layers[0].self_attn.rotary_emb
+    assert rotary.inv_freq.dtype == torch.float32
+    assert rotary.original_inv_freq.dtype == torch.float32
+
+
+def test_finalize_tolerates_rotary_rebuild_failure_without_crashing():
+    # Regression: module.rotary_emb.__class__(config=..., device=...) can
+    # raise for Gemma4 multimodal rotary when copy_attributes drifts the
+    # config identity so the vision rotary ends up with a text config shape.
+    # finalize_huggingface_model must catch the exception, keep the existing
+    # rotary instance, and still float32-lift its buffers.
+    from unsloth_zoo.empty_model import finalize_huggingface_model
+
+    class _BadCfg:
+        pass
+
+    class _ExplodingRotary(torch.nn.Module):
+        calls = 0
+
+        def __init__(self, config=None, device=None):
+            super().__init__()
+            _ExplodingRotary.calls += 1
+            if _ExplodingRotary.calls > 1:
+                raise KeyError("rope_type")
+            self.config = config
+            self.register_buffer("inv_freq", torch.arange(4, dtype=torch.float32))
+
+    class _Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_emb = _ExplodingRotary(config=_BadCfg())
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_idx = -1
+            self.self_attn = _Attn()
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([_Layer()])
+
+    cfg = types.SimpleNamespace(model_type="gemma4")
+    cfg.text_config = cfg
+    model = _Model()
+    # Must not raise even though the rotary re-init raises KeyError on second call.
+    finalize_huggingface_model(
+        model, None, cfg, torch.float16,
+        quantization_config={"x": 1}, bnb_config=None,
+    )
+    rotary = model.model.layers[0].self_attn.rotary_emb
+    assert rotary.inv_freq.dtype == torch.float32
+
+
+def test_finalize_routes_vision_tower_rotary_to_vision_config_by_module_path():
+    # Regression: id()-based text/vision routing drifted after copy_attributes,
+    # misrouting vision rotary through text_config (which lacks the vision
+    # rope_parameters shape). The fix adds a module-path fallback so a rotary
+    # under 'vision_tower' is built with vision_config even when identity
+    # match fails.
+    from unsloth_zoo.empty_model import finalize_huggingface_model
+
+    class _TextCfg:
+        hidden_size = 8
+        num_heads = 2
+
+    class _VisionCfg:
+        hidden_size = 16
+        num_heads = 2
+
+    captured = {}
+
+    class _Rotary(torch.nn.Module):
+        def __init__(self, config=None, device=None):
+            super().__init__()
+            captured["config_hidden_size"] = getattr(config, "hidden_size", None)
+            self.config = config
+            self.register_buffer("inv_freq", torch.arange(4, dtype=torch.float32))
+
+    class _Inner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # New unrelated config instance so id() match against the top-level
+            # vision_config fails; module path must take over.
+            self.rotary_emb = _Rotary(config=object())
+
+    class _VisionTower(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _Inner()
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList()
+            self.model.vision_tower = _VisionTower()
+
+    cfg = types.SimpleNamespace(model_type="gemma4")
+    cfg.text_config = _TextCfg()
+    cfg.vision_config = _VisionCfg()
+
+    model = _Model()
+    finalize_huggingface_model(
+        model, None, cfg, torch.float16,
+        quantization_config={"x": 1}, bnb_config=None,
+    )
+    assert captured["config_hidden_size"] == _VisionCfg.hidden_size, (
+        "vision-tower rotary must be rebuilt with vision_config even when "
+        "the config identity check fails"
+    )
+
+
+def test_extract_gdn_layers_dequantize_uses_unpacked_midpoint():
+    # Regression: `mid = ba_weight.shape[0] // 2` was computed on the packed
+    # uint8 Params4bit buffer (numel/2 shape), then reused to slice the
+    # dequantized full tensor whose shape[0] is out_features. When those two
+    # differ, in_proj_b / in_proj_a ended up with wrong rows.
+    from unsloth_zoo.empty_model import extract_gdn_layers
+
+    class _PlainProj(torch.nn.Module):
+        def __init__(self, out_features, in_features):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.randn(out_features, in_features), requires_grad=False,
+            )
+
+    class _FakeQS:
+        def as_dict(self, packed=True):
+            return {}
+
+    class _PackedParam(torch.nn.Parameter):
+        def __new__(cls, data, quant_states):
+            inst = torch.nn.Parameter.__new__(cls, data, requires_grad=False)
+            inst.bnb_quant_state = quant_states
+            return inst
+
+    class _BAProj(torch.nn.Module):
+        def __init__(self, packed_len):
+            super().__init__()
+            # Only index 0 has a QuantState -> triggers dequantize branch.
+            self.weight = _PackedParam(
+                torch.zeros(packed_len, dtype=torch.uint8),
+                {0: _FakeQS(), 1: None},
+            )
+
+    class _GDN(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hidden_size = 4
+            self.num_k_heads = 2
+            self.num_v_heads = 4
+            self.head_k_dim = 2
+            self.head_v_dim = 4
+            self.key_dim = 4
+            self.value_dim = 16
+            self.in_proj_qkvz = _PlainProj(
+                2 * self.key_dim + 2 * self.value_dim, self.hidden_size,
+            )
+            # Packed length 12 -> packed mid 6. Dequantized shape below is 24 x 1
+            # so the correct mid is 12.
+            self.in_proj_ba = _BAProj(12)
+            self.conv1d = _PlainProj(self.key_dim * 2 + self.value_dim, 4)
+            self.dt_bias = torch.nn.Parameter(torch.randn(self.num_v_heads), requires_grad=False)
+            self.A_log = torch.nn.Parameter(torch.randn(self.num_v_heads), requires_grad=False)
+            self.norm = torch.nn.Module()
+            self.norm.weight = torch.nn.Parameter(
+                torch.randn(self.head_v_dim), requires_grad=False,
+            )
+            self.out_proj = _PlainProj(self.hidden_size, self.value_dim)
+
+    bnb = sys.modules.setdefault("bitsandbytes", types.ModuleType("bitsandbytes"))
+    bnb_fn = types.ModuleType("bitsandbytes.functional")
+
+    def fake_dequantize_4bit(data, quant_state=None):
+        return torch.arange(24, dtype=torch.float32).reshape(24, 1)
+
+    bnb_fn.dequantize_4bit = fake_dequantize_4bit
+    sys.modules["bitsandbytes.functional"] = bnb_fn
+
+    def _fake_get_state_dict(prefix, kk, sd, module, slice_weights=True):
+        sd[f"{prefix}.weight"] = module.weight.data
+
+    gdn = _GDN()
+    state_dict, quant_state_dict = {}, {}
+    extract_gdn_layers(gdn, "prefix", state_dict, quant_state_dict, _fake_get_state_dict)
+    b = state_dict["prefix.in_proj_b.weight"]
+    a = state_dict["prefix.in_proj_a.weight"]
+    assert b.shape[0] == 12, f"in_proj_b got {b.shape[0]} rows, expected 12 (dequantized mid)"
+    assert a.shape[0] == 12, f"in_proj_a got {a.shape[0]} rows, expected 12 (dequantized mid)"
+
+
+def test_lm_head_lookup_uses_exact_name_not_substring():
+    # Regression: `"lm_head" in name` would match a submodule named e.g.
+    # 'lm_head_norm' before the real 'lm_head', returning the wrong module.
+    # The fix requires an exact match or a .lm_head suffix.
+    from unsloth_zoo import vllm_utils
+    src = inspect.getsource(vllm_utils._get_vllm_state_dict)
+    assert 'name == "lm_head"' in src
+    assert 'name.endswith(".lm_head")' in src
+    # Loose substring test must not be present.
+    assert '"lm_head" in name' not in src
