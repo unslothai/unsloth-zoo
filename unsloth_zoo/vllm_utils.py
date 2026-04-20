@@ -1265,7 +1265,11 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
                     )
                 else:
                     try:
-                        equal = bool(old_val == new_val)
+                        cmp = old_val == new_val
+                        if hasattr(cmp, "all"):
+                            equal = bool(cmp.all())
+                        else:
+                            equal = bool(cmp)
                     except (ValueError, RuntimeError, TypeError):
                         equal = False
                     if not equal:
