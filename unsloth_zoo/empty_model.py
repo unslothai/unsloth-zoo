@@ -35,6 +35,15 @@ from .utils import get_quant_type
 from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
 
+def _is_gemma4_config(config):
+    if config is None:
+        return False
+    model_type = getattr(config, "model_type", None)
+    text_config = getattr(config, "text_config", config)
+    text_model_type = getattr(text_config, "model_type", None)
+    return model_type == "gemma4" or text_model_type in ("gemma4", "gemma4_text")
+pass
+
 def is_comparable(val):
     # Don't treat tensors as comparable, only basic types
     from enum import Enum
@@ -320,7 +329,6 @@ pass
 
 def patch_gemma4_vllm_lora_support():
     from functools import wraps
-    from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
     from vllm.model_executor.models import interfaces as vllm_model_interfaces
     from vllm.lora import model_manager as vllm_lora_model_manager
     try:
@@ -329,20 +337,29 @@ def patch_gemma4_vllm_lora_support():
         lora_model_runner_mixin = None
     from unsloth_zoo import vllm_lora_worker_manager
 
-    gemma4_lora_classes = ["Gemma4ForConditionalGeneration"]
-    classes_to_patch = [Gemma4ForConditionalGeneration]
+    gemma4_lora_classes = []
+    classes_to_patch = []
     try:
-        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
-        gemma4_lora_classes.append("Gemma4ForCausalLM")
-        classes_to_patch.append(Gemma4ForCausalLM)
+        from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
+        classes_to_patch.append(Gemma4ForConditionalGeneration)
+        gemma4_lora_classes.append("Gemma4ForConditionalGeneration")
     except Exception:
         pass
+    try:
+        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+        classes_to_patch.append(Gemma4ForCausalLM)
+        gemma4_lora_classes.append("Gemma4ForCausalLM")
+    except Exception:
+        pass
+    if not classes_to_patch:
+        return
     gemma4_lora_classes = set(gemma4_lora_classes)
 
     for cls in classes_to_patch:
         if not getattr(cls, "_unsloth_gemma4_class_patched", False):
             cls.supports_lora = True
-            cls.embedding_modules = {}
+            if not hasattr(cls, "embedding_modules"):
+                cls.embedding_modules = {}
             cls._unsloth_gemma4_class_patched = True
 
     original_supports_lora = getattr(
@@ -365,8 +382,7 @@ def patch_gemma4_vllm_lora_support():
         @wraps(original_create_lora_manager)
         def patched_create_lora_manager(model, *args, **kwargs):
             if model.__class__.__name__ in gemma4_lora_classes:
-                lora_manager_cls = kwargs.pop("lora_manager_cls", vllm_lora_model_manager.LoRAModelManager)
-                return lora_manager_cls(model, *args, **kwargs)
+                kwargs.setdefault("lora_manager_cls", vllm_lora_model_manager.LoRAModelManager)
             return original_create_lora_manager(model, *args, **kwargs)
 
         patched_create_lora_manager._unsloth_gemma4_patch = True
@@ -381,27 +397,21 @@ def patch_gemma4_vllm_k_eq_v_support():
         BitsAndBytesModelLoader,
     )
 
-    if hasattr(
-        BitsAndBytesModelLoader._stack_quantization_states,
-        "_unsloth_gemma4_k_eq_v_patch",
-    ):
+    stack_quantization_states = getattr(
+        BitsAndBytesModelLoader, "_stack_quantization_states", None,
+    )
+    if stack_quantization_states is None:
+        return
+    if hasattr(stack_quantization_states, "_unsloth_gemma4_k_eq_v_patch"):
         return
 
-    original_stack_quantization_states = (
-        BitsAndBytesModelLoader._stack_quantization_states
-    )
+    original_stack_quantization_states = stack_quantization_states
 
     def _get_gemma4_text_config(model):
         config = getattr(model, "config", None)
-        if config is None:
+        if not _is_gemma4_config(config):
             return None
-
-        text_config = getattr(config, "text_config", config)
-        model_type = getattr(config, "model_type", None)
-        text_model_type = getattr(text_config, "model_type", None)
-        if model_type != "gemma4" and text_model_type not in ("gemma4", "gemma4_text"):
-            return None
-        return text_config
+        return getattr(config, "text_config", config)
 
     def _get_gemma4_k_eq_v_pairs(model):
         text_config = _get_gemma4_text_config(model)
@@ -414,7 +424,7 @@ def patch_gemma4_vllm_k_eq_v_support():
             if layer_type != "full_attention":
                 continue
 
-            for prefix in ("language_model.model", "model"):
+            for prefix in ("model.language_model", "language_model.model", "model"):
                 k_name = f"{prefix}.layers.{layer_idx}.self_attn.k_proj.weight"
                 v_name = f"{prefix}.layers.{layer_idx}.self_attn.v_proj.weight"
                 qkv_name = f"{prefix}.layers.{layer_idx}.self_attn.qkv_proj.weight"
@@ -743,19 +753,24 @@ def finalize_huggingface_model(
                 or (current_rotary_config is not None and id(current_rotary_config) in vision_config_ids)
             )
             rotary_config = vision_config if is_vision_rotary else text_config
+            reinit_ok = True
             try:
                 module.rotary_emb = module.rotary_emb.__class__(
                     config = rotary_config,
                     device = target_device,
                 )
-            except Exception:
-                pass
-            for buffer_name, buffer in list(module.rotary_emb._buffers.items()):
-                if torch.is_tensor(buffer) and buffer.is_floating_point():
-                    module.rotary_emb._buffers[buffer_name] = buffer.to(
-                        device = target_device,
-                        dtype = torch.float32,
-                    )
+            except Exception as rotary_reinit_error:
+                reinit_ok = False
+                logger.warning(
+                    f"Unsloth: skipped rotary_emb reinit for {module_name}: {rotary_reinit_error}"
+                )
+            if reinit_ok:
+                for buffer_name, buffer in list(module.rotary_emb._buffers.items()):
+                    if torch.is_tensor(buffer) and buffer.is_floating_point():
+                        module.rotary_emb._buffers[buffer_name] = buffer.to(
+                            device = target_device,
+                            dtype = torch.float32,
+                        )
         if hasattr(module, "rotary_pos_emb") and vision_config is not None:
             head_dim = vision_config.hidden_size // vision_config.num_heads
             module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)

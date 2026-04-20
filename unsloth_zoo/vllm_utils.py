@@ -53,6 +53,7 @@ import inspect
 from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
 from .empty_model import *
+from .empty_model import _is_gemma4_config
 from .hf_utils import (
     dtype_from_config,
     add_dtype_kwargs,
@@ -1063,7 +1064,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             quant_state_dict[prefix + ".bias"] = bias_tensor
     pass
 
-    if model_type == "gemma4" and getattr(text_config, "attention_k_eq_v", False):
+    if _is_gemma4_config(config) and getattr(text_config, "attention_k_eq_v", False):
         gemma4_k_eq_v_layers = {
             kk
             for kk, layer_type in enumerate(getattr(text_config, "layer_types", ()))
@@ -1427,7 +1428,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
             if layer_name in quant_state_dict:
                 # for attributes of type nn.Parameter, there's no .weight
-                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
+                layer_name_br = re.sub(r"\.([\d]+)(?=\.|$)", lambda x: f"[{x.group(1)}]", layer_name)
                 raw_value = _unwrap_tensor(weight)
                 parent_path, _, attr_name = layer_name_br.rpartition(".")
                 parent = eval(f"new_model.{parent_path}") if parent_path else new_model
@@ -1831,12 +1832,6 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
-    if getattr(config, "model_type", None) == "gemma4":
-        if enable_lora:
-            patch_gemma4_vllm_lora_support()
-        if use_bitsandbytes:
-            patch_gemma4_vllm_k_eq_v_support()
-
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
     standby_util_override = os.getenv("UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE", "0") != "0"
@@ -1916,6 +1911,12 @@ def load_vllm(
     quant_method = get_quant_type(config)
     use_bitsandbytes = use_bitsandbytes or \
         model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
+
+    if _is_gemma4_config(config):
+        if enable_lora:
+            patch_gemma4_vllm_lora_support()
+        if use_bitsandbytes:
+            patch_gemma4_vllm_k_eq_v_support()
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
