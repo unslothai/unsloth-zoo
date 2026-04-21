@@ -1268,13 +1268,30 @@ class FastMLXModel:
             return model, public_target
         else:
             # Text path via mlx-lm (original behavior)
-            print(f"Unsloth: Loading {model_name} via mlx-lm...")
+            already_quantized = _vlm_config_is_already_quantized(config_data)
+            want_runtime_quant = load_in_4bit and not already_quantized
+
+            if want_runtime_quant:
+                print(f"Unsloth: Loading {model_name} via mlx-lm (runtime 4-bit quantization)...")
+            else:
+                print(f"Unsloth: Loading {model_name} via mlx-lm...")
             _ensure_safe_text_wrapper_sanitize(model_type)
             model, tokenizer, config = mlx_load(
                 model_name,
                 tokenizer_config=extra_kwargs if extra_kwargs else None,
                 return_config=True,
             )
+
+            if want_runtime_quant:
+                import mlx.core as mx
+                from mlx_lm.utils import quantize_model
+                q_bits = kwargs.pop("q_bits", 4)
+                q_group_size = kwargs.pop("q_group_size", 64)
+                model, config = quantize_model(
+                    model, config, q_group_size, q_bits,
+                )
+                mx.eval(model.parameters())
+                print(f"Unsloth: Quantized text model to {q_bits}-bit.")
             from .mlx_utils import normalize_mlx_chat_template
 
             tokenizer = normalize_mlx_chat_template(
@@ -1393,6 +1410,10 @@ class FastMLXModel:
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
         else:
             # Text-only path — filter by target_modules
+            # Fix missing _no_grad on modules that use __new__ without __init__
+            # (e.g. Gemma4 AudioRelativePositionEmbedding loaded via VLM path)
+            _fix_missing_no_grad(model)
+
             num_layers = 0
             if hasattr(model, "model") and hasattr(model.model, "layers"):
                 num_layers = len(model.model.layers)
