@@ -249,6 +249,7 @@ else:
 
     def get_device_type():
         return "cpu"
+
     DEVICE_TYPE = "cpu"
     DEVICE_TYPE_TORCH = "cpu"
     DEVICE_COUNT = 1
