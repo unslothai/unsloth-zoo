@@ -102,11 +102,6 @@ _NO_TORCH_MODE = os.environ.get("UNSLOTH_NO_TORCH", "0").strip().lower() in (
 if (not _HAS_TORCH) and (not _NO_TORCH_MODE):
     _NO_TORCH_MODE = True
     os.environ["UNSLOTH_NO_TORCH"] = "1"
-if (not _HAS_TORCH) and _NO_TORCH_MODE:
-    warnings.warn(
-        "Unsloth: running in no-torch mode. Training and non-GGUF inference features are disabled.",
-        stacklevel = 2,
-    )
 
 # Keep original allocator settings to preserve explicit user config precedence.
 if _HAS_TORCH:
@@ -251,10 +246,9 @@ if _HAS_TORCH:
 else:
     def is_hip():
         return False
-    pass
+
     def get_device_type():
         return "cpu"
-    pass
     DEVICE_TYPE = "cpu"
     DEVICE_TYPE_TORCH = "cpu"
     DEVICE_COUNT = 1
@@ -329,7 +323,6 @@ else:
         raise ImportError(
             "Unsloth: encode_conversations_with_harmony requires torch. Install torch to enable this feature."
         )
-    pass
 from .rl_environments import (
     check_python_modules,
     create_locked_down_function,
