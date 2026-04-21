@@ -1137,8 +1137,11 @@ from ..device_type import DEVICE_TYPE
 
 if DEVICE_TYPE == "xpu":
     device_memory = torch.xpu.memory.mem_get_info(0)[-1]
-else:
+elif DEVICE_TYPE in ("cuda", "hip") and hasattr(torch, "cuda") and torch.cuda.is_available():
     device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+else:
+    # CPU-only and no-accelerator builds should not query CUDA memory.
+    device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
