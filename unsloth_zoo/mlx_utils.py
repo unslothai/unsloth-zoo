@@ -2645,13 +2645,32 @@ def save_pretrained_gguf(
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
         save_merged_model(model, tokenizer, tmp_path)
 
-        # Step 2: Ensure llama.cpp is installed
+        # Step 2: Ensure llama.cpp is installed and gguf package is available
         llama_cpp_folder = "llama.cpp"
         try:
             check_llama_cpp(llama_cpp_folder)
         except Exception:
             print("Unsloth: Installing llama.cpp (this only happens once)...")
             _install_llama_cpp_macos(llama_cpp_folder)
+
+        # Ensure gguf Python package is installed (may be missing if
+        # llama.cpp was built in a different venv)
+        try:
+            import gguf  # noqa: F401
+        except ImportError:
+            import subprocess
+            gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
+            if os.path.exists(gguf_py_dir):
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", gguf_py_dir],
+                    check=True, capture_output=True,
+                )
+            else:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "gguf"],
+                    check=True, capture_output=True,
+                )
+            print("Unsloth: Installed gguf Python package.")
 
         # Step 3: Download and patch convert_hf_to_gguf.py
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
