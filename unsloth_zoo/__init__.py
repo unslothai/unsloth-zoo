@@ -100,10 +100,8 @@ _NO_TORCH_MODE = os.environ.get("UNSLOTH_NO_TORCH", "0").strip().lower() in (
     "on",
 )
 if (not _HAS_TORCH) and (not _NO_TORCH_MODE):
-    raise ImportError(
-        "Unsloth: Pytorch is not installed. Go to https://pytorch.org/.\n"\
-        "We also have some installation instructions on our Github page."
-    )
+    _NO_TORCH_MODE = True
+    os.environ["UNSLOTH_NO_TORCH"] = "1"
 if (not _HAS_TORCH) and _NO_TORCH_MODE:
     warnings.warn(
         "Unsloth: running in no-torch mode. Training and non-GGUF inference features are disabled.",
