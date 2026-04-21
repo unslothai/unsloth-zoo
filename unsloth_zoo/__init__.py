@@ -93,14 +93,6 @@ from importlib.util import find_spec
 if find_spec("unsloth") is None:
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
 _HAS_TORCH = find_spec("torch") is not None
-_NO_TORCH_MODE = os.environ.get("UNSLOTH_NO_TORCH", "0").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-if not _HAS_TORCH:
-    _NO_TORCH_MODE = True
 
 # Keep original allocator settings to preserve explicit user config precedence.
 if _HAS_TORCH:
@@ -344,5 +336,5 @@ try:
 except:
     pass
 
-del _HAS_TORCH, _NO_TORCH_MODE
+del _HAS_TORCH
 del os, warnings, re
