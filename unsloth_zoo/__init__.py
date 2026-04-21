@@ -99,9 +99,8 @@ _NO_TORCH_MODE = os.environ.get("UNSLOTH_NO_TORCH", "0").strip().lower() in (
     "yes",
     "on",
 )
-if (not _HAS_TORCH) and (not _NO_TORCH_MODE):
+if not _HAS_TORCH:
     _NO_TORCH_MODE = True
-    os.environ["UNSLOTH_NO_TORCH"] = "1"
 
 # Keep original allocator settings to preserve explicit user config precedence.
 if _HAS_TORCH:
