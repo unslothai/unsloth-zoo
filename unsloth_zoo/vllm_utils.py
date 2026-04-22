@@ -1190,7 +1190,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
     # hf, vllm
 
     difference = new_state_dict.keys() ^ old_state_dict.keys()
-    difference -= set(("model.lm_head.weight","model.language_model.lm_head.weight", "lm_head.weight"))
+    difference -= set(("model.lm_head.weight", "model.language_model.lm_head.weight", "model.text_model.lm_head.weight", "lm_head.weight"))
     if len(difference) != 0:
         missing_from_hf = new_state_dict.keys() - old_state_dict.keys()
         missing_from_vllm = old_state_dict.keys() - new_state_dict.keys()
