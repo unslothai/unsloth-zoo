@@ -39,6 +39,8 @@ from .utils import (
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
+    select_moe_backend,
+    forward_native_grouped_mm,
 )
 
 
@@ -69,11 +71,31 @@ def _make_qwen_moe_lora_extractor():
 
 
 def _make_qwen_moe_experts_forward(module_name: Optional[str] = None):
+    # Resolve the MoE backend once at patch time. For grouped_mm we bind
+    # ``forward_native_grouped_mm`` directly so the decode hot path has no
+    # per-token ``select_moe_backend()`` dispatch and presents a stable
+    # callable to ``torch.compile`` / CUDA graph capture. Other backends
+    # keep the generic dispatcher (``forward_moe_backend``) which still
+    # benefits from the ``lru_cache`` on ``select_moe_backend``.
+    backend = select_moe_backend()
+    if backend == "grouped_mm":
+        def forward(self, hidden_states, top_k_index, top_k_weights):
+            return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
+        return forward
     return get_forward_moe_backend()
 
 
 def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name: Optional[str] = None):
-    @torch.compiler.disable
+    # The legacy expert-loop path (``forward_native_moe_loop``) uses
+    # ``torch.where`` + a Python for-loop over experts and is genuinely
+    # uncapturable — keep ``@torch.compiler.disable`` when that backend
+    # is selected. On ``grouped_mm`` with pre-merged LoRA the sparse
+    # block is Dynamo-clean (no ``.item()``, no Python loops, no
+    # mutation), so we omit the decorator and let ``torch.compile``
+    # trace through the whole block for prefill.
+    _backend = select_moe_backend()
+    _compile_safe = _backend == "grouped_mm"
+
     def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         use_shared_expert = hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate")
         if hidden_states.dim() == 3:
@@ -115,6 +137,8 @@ def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name
 
     if module_name is not None:
         sparse_moe_block_forward.__module__ = module_name
+    if not _compile_safe:
+        sparse_moe_block_forward = torch.compiler.disable(sparse_moe_block_forward)
     return sparse_moe_block_forward
 
 

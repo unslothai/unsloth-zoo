@@ -800,7 +800,18 @@ def forward_native_grouped_mm(
 
     # 1. Calculate routing
     flat_top_k = top_k_index.view(-1)
-    num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
+    # ``torch.bincount(..., minlength=num_experts)`` produces the correct
+    # result but triggers a CPU→CUDA scalar copy inside CUDA graph
+    # capture (minlength is a Python int, materialised host-side). Use
+    # ``scatter_add_`` on a pre-zeroed device tensor instead — identical
+    # semantics, fully graph-capturable.
+    num_tokens_per_expert = torch.zeros(
+        self.num_experts, dtype=torch.int64, device=flat_top_k.device
+    )
+    num_tokens_per_expert.scatter_add_(
+        0, flat_top_k, torch.ones_like(flat_top_k, dtype=torch.int64)
+    )
+    num_tokens_per_expert = num_tokens_per_expert.int()
 
     # 2. Sort indices to group tokens by expert
     sorted_indices = torch.argsort(flat_top_k, stable=True)
