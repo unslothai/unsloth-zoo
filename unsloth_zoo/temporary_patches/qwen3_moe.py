@@ -45,64 +45,24 @@ from .moe_utils import (
 def _make_qwen_moe_lora_extractor():
     def _qwen_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
         """
-        Robust extractor for Qwen-family MoE that handles PEFT's dimension layout.
+        LoRA extractor for Qwen-family MoE (Qwen3-MoE, Qwen3.5/3.6, Qwen3-Next).
 
-        Expectation for grouped_mm:
-        - first_weight:  (E, in_dim, R)   [Input projection to rank]
-        - second_weight: (E, R, out_dim)  [Rank projection to output]
+        PEFT LoRA shapes are fixed by the linear's in/out dims, independent of
+        raw base-weight storage order, so no model-specific dispatch is needed:
+          weight_A: (E*R, in_dim)  -> (E, in_dim, R)
+          weight_B: (out_dim, E*R) -> (E, R, out_dim)
         """
         total_rank = weight_A.shape[0]
         rank_per_expert = total_rank // num_experts
-
-        dim_A = weight_A.shape[1]
-        dim_B = weight_B.shape[0]
-
-        hidden_dim = None
-        intermediate_dim = None
-        current = wrapper
-        while hasattr(current, "base_layer"):
-            current = current.base_layer
-            if hasattr(current, "hidden_dim"):
-                hidden_dim = current.hidden_dim
-            if hasattr(current, "intermediate_dim"):
-                intermediate_dim = current.intermediate_dim
-            if hasattr(current, "gate_up_proj") and hasattr(current.gate_up_proj, "shape"):
-                shape = current.gate_up_proj.shape
-                if len(shape) == 3:
-                    hidden_dim = shape[2]
-                    intermediate_dim = shape[1] // 2
-
-        param_name = getattr(wrapper, "parameter_name", None)
-
-        if param_name == "down_proj" and intermediate_dim is not None and hidden_dim is not None:
-            first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-            first_weight = first_weight.permute(1, 0, 2).contiguous()
-            second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-            return first_weight, second_weight, scaling, num_experts
-
-        elif param_name == "gate_up_proj" and hidden_dim is not None:
-            first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-            first_weight = first_weight.permute(1, 0, 2).contiguous()
-            second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-            return first_weight, second_weight, scaling, num_experts
-
-        if hidden_dim is not None:
-            if dim_B == hidden_dim:
-                first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-                first_weight = first_weight.permute(1, 0, 2).contiguous()
-                second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-                return first_weight, second_weight, scaling, num_experts
-            elif dim_A == hidden_dim:
-                first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-                first_weight = first_weight.permute(0, 2, 1).contiguous()
-                second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-                second_weight = second_weight.permute(1, 2, 0).contiguous()
-                return first_weight, second_weight, scaling, num_experts
+        dim_A = weight_A.shape[1]   # in_dim
+        dim_B = weight_B.shape[0]   # out_dim
 
         first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
         first_weight = first_weight.permute(0, 2, 1).contiguous()
+
         second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
         second_weight = second_weight.permute(1, 2, 0).contiguous()
+
         return first_weight, second_weight, scaling, num_experts
 
     return _qwen_moe_lora_extractor
