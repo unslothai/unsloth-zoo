@@ -18,6 +18,7 @@ import torch
 import os
 import re
 import ast
+import importlib
 
 __all__ = [
     "patch_compiling_bitsandbytes",
@@ -45,14 +46,18 @@ def patch_compiling_bitsandbytes():
         if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
             print("Unsloth: Bitsandbytes < 0.46.0 does not support torch.compile - disabling.")
         for x in ["bitsandbytes.nn.modules", "peft.tuners.lora.bnb",]:
-            exec(f"import {x}", globals(), locals())
-            layers = dir(eval(x))
+            try:
+                module = importlib.import_module(x)
+            except ImportError:
+                # peft is optional, skip if not installed
+                continue
+            layers = dir(module)
             for fx in layers:
-                try: layer = eval(f"{x}.{fx}")
+                try: layer = getattr(module, fx)
                 except: continue
                 if not hasattr(layer, "forward"): continue
-                if hasattr(eval(f"{x}.{fx}.forward"), "__wrapped__"): continue
-                exec(f"{x}.{fx}.forward = torch._disable_dynamo({x}.{fx}.forward)", globals(), locals())
+                if hasattr(layer.forward, "__wrapped__"): continue
+                layer.forward = torch._disable_dynamo(layer.forward)
             pass
         pass
     pass
