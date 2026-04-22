@@ -121,8 +121,12 @@ def patch_glm4_moe():
         return hidden_states + shared_output
 
     # Apply patches
-    patch_function(Glm4MoeLiteNaiveMoe, "forward", get_forward_moe_backend())
-    patch_function(Glm4MoeLiteMoE,      "forward", moe_block_forward)
+    # Recent transformers wraps the expert forward with use_experts_implementation
+    # and drops some annotations, so strict signature matching rejects the patch.
+    # For GLM4 we want to bypass that wrapper entirely and route into Unsloth's
+    # MoE backend on purpose.
+    patch_function(Glm4MoeLiteNaiveMoe, "forward", get_forward_moe_backend(), force = True)
+    patch_function(Glm4MoeLiteMoE,      "forward", moe_block_forward,          force = True)
 
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: Patched GLM4 MoE for Split LoRA support.")
