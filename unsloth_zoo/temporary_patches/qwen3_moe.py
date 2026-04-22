@@ -75,15 +75,17 @@ def _make_qwen_moe_lora_extractor():
         param_name = getattr(wrapper, "parameter_name", None)
 
         if param_name == "down_proj" and intermediate_dim is not None and hidden_dim is not None:
-            first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-            first_weight = first_weight.permute(1, 0, 2).contiguous()
-            second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+            first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+            first_weight = first_weight.permute(0, 2, 1).contiguous()
+            second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+            second_weight = second_weight.permute(1, 2, 0).contiguous()
             return first_weight, second_weight, scaling, num_experts
 
         elif param_name == "gate_up_proj" and hidden_dim is not None:
-            first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-            first_weight = first_weight.permute(1, 0, 2).contiguous()
-            second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+            first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+            first_weight = first_weight.permute(0, 2, 1).contiguous()
+            second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+            second_weight = second_weight.permute(1, 2, 0).contiguous()
             return first_weight, second_weight, scaling, num_experts
 
         if hidden_dim is not None:
