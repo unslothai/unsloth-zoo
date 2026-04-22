@@ -36,7 +36,12 @@ def patch_compiling_bitsandbytes():
     # All Unsloth Zoo code licensed under LGPLv3
     os.environ["UNSLOTH_PATCHED"] = "1"
 
-    import bitsandbytes
+    try:
+        import bitsandbytes
+    except Exception:
+        # bitsandbytes is optional (eg, AMD ROCm environments). If it's not
+        # installed, just skip this patch.
+        return
     if Version(bitsandbytes.__version__) >= Version("0.46.0"):
         if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
             print("Unsloth: Bitsandbytes >= 0.46.0 supports torch.compile - enabling.")
@@ -307,12 +312,13 @@ def patch_model_and_tokenizer(
     # BnB default dtype seems to be float16!
     try:
         from bitsandbytes.nn  import Linear4bit as Bnb_Linear4bit
-    except:
-        raise ImportError("Unsloth: Please install bitsandbytes via `pip install bitsandbytes`")
+    except Exception:
+        Bnb_Linear4bit = None
     try:
         from peft.tuners.lora import Linear4bit as Peft_Linear4bit
-    except:
-        raise ImportError("Unsloth: Please install peft via `pip install peft`")
+    except Exception:
+        Peft_Linear4bit = None
+    _bnb_types = tuple(t for t in (Bnb_Linear4bit, Peft_Linear4bit) if t is not None)
     pass
 
     # Get most likely the correct data-type of the model
@@ -398,7 +404,7 @@ def patch_model_and_tokenizer(
 
     # Check all params and patch!
     for name, module in model.named_modules():
-        if isinstance(module, (Bnb_Linear4bit, Peft_Linear4bit)):
+        if _bnb_types and isinstance(module, _bnb_types):
             weight = module.weight
             # Check if quant_state exists for vision models like unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit, unsloth/granite-vision-3.2-2b
             if not hasattr(weight, 'quant_state'):
