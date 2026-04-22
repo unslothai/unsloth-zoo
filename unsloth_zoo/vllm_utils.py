@@ -1064,7 +1064,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     pass
 
     # Embedding
-    if hasattr(vllm_internals, "model"): # Standard Language models
+    if hasattr(vllm_internals, "model") and hasattr(vllm_internals.model, "text_model"):
+        # Idefics3, SmolVLM2: model wraps text_model/vision_model/connector
+        vllm_text_model = vllm_internals.model.text_model
+        vllm_text_model_prefix = "model.text_model"
+    elif hasattr(vllm_internals, "model"): # Standard Language models
         vllm_text_model = vllm_internals.model
         vllm_text_model_prefix = "model"
     elif hasattr(vllm_internals, "language_model"):
@@ -1212,8 +1216,8 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
         except Exception as error:
             if key == "lm_head.weight":
                 # Try tied embeddings fallback
-                key1 = next((k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight") if k in old_state_dict), None)
-                key2 = next((k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight") if k in new_state_dict), None)
+                key1 = next((k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight", "model.text_model.embed_tokens.weight") if k in old_state_dict), None)
+                key2 = next((k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight", "model.text_model.embed_tokens.weight") if k in new_state_dict), None)
 
                 if key1 is not None and key2 is not None:
                     try:
