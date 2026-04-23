@@ -2062,9 +2062,21 @@ def load_vllm(
         # In vLLM profiling, each sequence contributes to an image. Which is generally in the order of thousand tokens.
         # We don't want to go beyond 16 sequences for vision models.
         # TODO: In vLLM V1, iirc, the profiling sets a cap on the max seqs based on the budget. Check it out.
-        print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
-        # [TODO] Check this
-        approx_max_num_seqs = 1
+        # The 1-seq cap is correct when the workload includes images (each seq
+        # carries thousands of vision tokens). For text-only workloads on
+        # multimodal models (e.g. Gemma 4 text generation), respect the
+        # caller's explicit max_num_seqs so batching can still scale.
+        _explicit_vllm_max_num_seqs = max_num_seqs not in (None, 256)
+        if _explicit_vllm_max_num_seqs:
+            approx_max_num_seqs = max_num_seqs
+            print(
+                f'Unsloth: Vision model detected; honoring explicit '
+                f'max_num_seqs={max_num_seqs} for text-only use.'
+            )
+        else:
+            print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
+            # [TODO] Check this
+            approx_max_num_seqs = 1
         # Single image would contribute to 6404 tokens in Llama 3.2 for eg. So have some more for text
         # For qwen 2.5 VL, this single image/video contributes to 16Ki tokens
         max_num_batched_tokens = max(8192, max_seq_length)
