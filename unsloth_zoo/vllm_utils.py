@@ -1119,22 +1119,46 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
             get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
             get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
-
-        get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
-
-        proj = layer.mlp.gate_up_proj
-        use_fused_gate_up = _is_fused_module("gate_up_proj")
-        if use_fused_gate_up:
-            # For some model types like phi3 vllm will expect fused gate_up_proj (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
-            # so we should not split them here otherwise there will be a size mismatch when activating the adapter
-            # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
-            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_up_proj", 0, state_dict, proj, slice_weights=False)
+        elif hasattr(layer, "linear_attn"):
+            # Qwen3.5 / Qwen3.6 Gated DeltaNet layer. No q/k/v/o_proj —
+            # linear attention uses in_proj_qkv (fused), in_proj_z,
+            # in_proj_b, in_proj_a, conv1d, out_proj plus A_log, dt_bias,
+            # norm. These are not PEFT LoRA targets by default and have
+            # incompatible shapes for the q_proj/k_proj/v_proj/o_proj
+            # slicing path. Skip attention weight extraction for this
+            # layer type; MLP + layernorms still extracted below.
+            prefix = f"{vllm_text_model_prefix}.layers.{kk}.linear_attn"
+            o_proj = None
         else:
-            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
-            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+            # Unknown layer type; skip attention weights.
+            prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
+            o_proj = None
 
-        proj = layer.mlp.down_proj
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
+        if o_proj is not None:
+            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+
+        # Qwen3.5-MoE / Qwen3.6-35B-A3B and similar MoE-on-Qwen3Next blocks
+        # replace the dense MLP with a Qwen3NextSparseMoeBlock that has
+        # `.gate`, `.shared_expert`, `.experts` instead of gate_up_proj /
+        # down_proj. The standard dense extraction below cannot handle
+        # fused expert weights. Skip MLP weight extraction for MoE blocks
+        # and let vLLM's own weights drive inference; layernorms are still
+        # extracted below so the converted HF shell is structurally valid.
+        _is_moe_block = not hasattr(layer.mlp, "gate_up_proj")
+        if not _is_moe_block:
+            proj = layer.mlp.gate_up_proj
+            use_fused_gate_up = _is_fused_module("gate_up_proj")
+            if use_fused_gate_up:
+                # For some model types like phi3 vllm will expect fused gate_up_proj (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
+                # so we should not split them here otherwise there will be a size mismatch when activating the adapter
+                # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
+                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_up_proj", 0, state_dict, proj, slice_weights=False)
+            else:
+                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
+                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+
+            proj = layer.mlp.down_proj
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
 
         # Use layernorms from the layer configuration
         layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
@@ -1518,7 +1542,15 @@ def approximate_vllm_memory_usage(
     vocab_size = config.vocab_size
     hd = config.hidden_size
     context_length = config.max_position_embeddings
-    mlp_size = config.intermediate_size
+    # Qwen3.5-MoE / Qwen3.6-35B-A3B expose `moe_intermediate_size` on the
+    # text config and leave `intermediate_size` unset. Use moe size when the
+    # dense field is missing so the VRAM estimator picks a sensible number
+    # (active-expert MLP is the right proxy for the per-token cost).
+    mlp_size = getattr(config, "intermediate_size", None)
+    if mlp_size is None:
+        mlp_size = getattr(config, "moe_intermediate_size", None)
+    if mlp_size is None:
+        mlp_size = 4 * hd  # conservative fallback
     n_layers = config.num_hidden_layers
     n_kv_heads = getattr(config, "num_key_value_heads", 1)
     n_heads    = getattr(config, "num_attention_heads", 1)
@@ -1780,6 +1812,34 @@ def load_vllm(
     assert(config is not None)
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
+
+    # Invoke per-arch vLLM LoRA patches before vLLM builds the LoRA manager.
+    # why: vLLM's MoE + LoRA path (vllm.lora.utils.process_packed_modules_mapping
+    # + lora_model_manager.LoRAModelManager.__init__) calls
+    # ``get_expert_mapping`` on the top-level model and its first-level
+    # children. The multimodal outer wrappers
+    # (Gemma4ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)
+    # do not ship this method upstream, and the inner *ForCausalLM only
+    # ships it for some archs. Patch before manager construction so we
+    # don't hit AttributeError inside __init__.
+    _gemma4_model_types = ("gemma4", "gemma4_text")
+    _qwen3_5_model_types = ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text")
+    _outer_model_type = getattr(config, "model_type", None)
+    _text_model_type = getattr(getattr(config, "text_config", None), "model_type", None)
+    if _outer_model_type in _gemma4_model_types or _text_model_type in _gemma4_model_types:
+        # why: Gemma4 E2B/E4B release checkpoints carry audio_config even for text/image inference.
+        # audio_tower weights are not extracted, so deepcopy+strip audio_config prevents the
+        # rebuilt HF model from instantiating a silently-uninitialized audio_tower.
+        if _outer_model_type == "gemma4" and getattr(config, "audio_config", None) is not None:
+            if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+                print("Unsloth: Gemma4 audio_tower weights are not extracted; audio-capable inference is not supported. Stripping audio_config to prevent a silently-uninitialized audio_tower.")
+            config = deepcopy(config)
+            config.audio_config = None
+        if is_vision_model and _outer_model_type == "gemma4":
+            patch_gemma4_vllm_lora_support()
+            patch_gemma4_vllm_k_eq_v_support()
+    if _outer_model_type in _qwen3_5_model_types or _text_model_type in _qwen3_5_model_types:
+        patch_qwen3_5_vllm_lora_support()
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
