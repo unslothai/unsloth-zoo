@@ -911,8 +911,18 @@ def forward_native_grouped_mm(
             mm1_out = mm1_out + lora_delta * scaling
 
         if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
-            num_repeats = num_tokens_per_expert.to(self.gate_up_proj_bias.device)
-            bias_expanded = self.gate_up_proj_bias.repeat_interleave(num_repeats, dim=0)
+            # ``repeat_interleave(counts_tensor)`` forces a GPU→CPU sync
+            # (output size depends on ``counts.sum().item()``) which
+            # breaks CUDA graph capture on gpt-oss's bias path. Gather
+            # per-token from the already-computed permutation instead:
+            # after ``sorted_indices = argsort(flat_top_k)``, the expert
+            # id for each permuted position is just
+            # ``flat_top_k[sorted_indices]``. ``index_select`` is
+            # capturable.
+            sorted_expert_ids = flat_top_k[sorted_indices].to(torch.long)
+            bias_expanded = self.gate_up_proj_bias.index_select(
+                0, sorted_expert_ids.to(self.gate_up_proj_bias.device),
+            )
             mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
         if "GptOssExperts" in self.__class__.__name__:
@@ -1042,8 +1052,10 @@ def forward_native_grouped_mm(
             mm2_out = mm2_out + lora_delta * scaling
 
         if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
-            bias_expanded = self.down_proj_bias.repeat_interleave(
-                num_tokens_per_expert.to(self.down_proj_bias.device), dim=0
+            # Capture-safe gather; see comment on gate_up_proj_bias above.
+            sorted_expert_ids = flat_top_k[sorted_indices].to(torch.long)
+            bias_expanded = self.down_proj_bias.index_select(
+                0, sorted_expert_ids.to(self.down_proj_bias.device),
             ).to(mm2_out.device)
             mm2_out = mm2_out + bias_expanded.to(mm2_out.dtype)
 
