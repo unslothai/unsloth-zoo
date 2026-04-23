@@ -263,7 +263,7 @@ if IS_TORCH_2_9_OR_NEWER:
     delete_key("PYTORCH_HIP_ALLOC_CONF")
 
 # Specify PYTORCH_CUDA_ALLOC_CONF or PYTORCH_HIP_ALLOC_CONF
-if _HAS_TORCH and IS_HIP_RUNTIME:
+if IS_HIP_RUNTIME:
     if IS_TORCH_2_9_OR_NEWER:
         # PyTorch >= 2.9 uses PYTORCH_ALLOC_CONF. expandable_segments is unsupported on HIP.
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
