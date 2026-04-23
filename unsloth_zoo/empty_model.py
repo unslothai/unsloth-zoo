@@ -333,6 +333,57 @@ def patch_gemma4_vllm_lora_support():
     Gemma4ForConditionalGeneration.supports_lora = True
     Gemma4ForConditionalGeneration.embedding_modules = {}
 
+    # vLLM's MoE-LoRA path (vllm.lora.utils.process_packed_modules_mapping)
+    # requires ``get_expert_mapping`` on either the top-level model or a
+    # direct child. Gemma4ForConditionalGeneration routes through its
+    # ``language_model`` child (Gemma4ForCausalLM), which upstream has no
+    # such method, so vLLM raises ``AttributeError`` before create_lora_manager
+    # even runs. Install the method on both: the outer wrapper delegates to
+    # the inner causal LM, and the inner causal LM builds the mapping from
+    # its FusedMoE experts via ``FusedMoE.make_expert_params_mapping``.
+    try:
+        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+    except ImportError:
+        Gemma4ForCausalLM = None
+        FusedMoE = None
+
+    if Gemma4ForCausalLM is not None and FusedMoE is not None and \
+            not hasattr(Gemma4ForCausalLM, "get_expert_mapping"):
+
+        def _gemma4_causal_lm_get_expert_mapping(self):
+            # Gemma 4 MoE checkpoints expose per-expert entries named
+            # gate_proj / up_proj / down_proj after the HF-to-vLLM remap
+            # in Gemma4ForCausalLM.load_weights. Mirror Qwen3 / deepseek_v2.
+            num_experts = getattr(self.config, "num_experts", 0)
+            if not num_experts:
+                return []
+            num_redundant_experts = getattr(self, "num_redundant_experts", 0)
+            return FusedMoE.make_expert_params_mapping(
+                self,
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=num_experts,
+                num_redundant_experts=num_redundant_experts,
+            )
+
+        Gemma4ForCausalLM.get_expert_mapping = _gemma4_causal_lm_get_expert_mapping
+
+    if not hasattr(Gemma4ForConditionalGeneration, "get_expert_mapping"):
+        def _gemma4_cond_get_expert_mapping(self):
+            language_model = getattr(self, "language_model", None)
+            if language_model is None:
+                return []
+            inner = getattr(language_model, "get_expert_mapping", None)
+            if inner is None:
+                return []
+            return inner()
+
+        Gemma4ForConditionalGeneration.get_expert_mapping = (
+            _gemma4_cond_get_expert_mapping
+        )
+
     if not hasattr(vllm_model_interfaces.supports_lora, "_unsloth_gemma4_patch"):
         original_supports_lora = vllm_model_interfaces.supports_lora
 
