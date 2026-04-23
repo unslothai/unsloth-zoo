@@ -1109,6 +1109,7 @@ def create_standalone_class(
     add_loss_kwargs=False,
     new_init=None,
     new_methods=None,
+    supports_return_hidden_states=False,
 ) -> str:
     """
     new_methods: dict[str, str] = {
@@ -1331,6 +1332,10 @@ def create_standalone_class(
 
     # Combine all into file
     source = source + full_class
+    if supports_return_hidden_states:
+        source += (
+            f"\\n{module}.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True\\n"
+        )
 
     # Remove @auto_docstring
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
@@ -1744,6 +1749,7 @@ ce_finders = [
 def apply_fused_lm_head(forward, module=None):
     # All Unsloth Zoo code licensed under LGPLv3
     UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+    supports_return_hidden_states = False
     for jj, (cross_entropy_find, cross_entropy_replacement) in enumerate(ce_finders):
         cross_entropy_find = (
             cross_entropy_find.strip()
@@ -1972,9 +1978,16 @@ def apply_fused_lm_head(forward, module=None):
         forward = forward.replace(",**)", ")")
         forward = forward.replace(",** )", ")")
         # print(forward)
-        return forward
+        supports_return_hidden_states = (
+            "UNSLOTH_RETURN_HIDDEN_STATES" in forward
+            and (
+                "logits = hidden_states" in forward
+                or "logits=hidden_states" in forward
+            )
+        )
+        return forward, supports_return_hidden_states
     pass
-    return forward
+    return forward, supports_return_hidden_states
 
 
 pass
@@ -2064,7 +2077,7 @@ def test_apply_fused_lm_head():
     for name, forward in forwards:
         # print("=" * 30)
         # print(name)
-        forward = apply_fused_lm_head(forward, name)
+        forward, _ = apply_fused_lm_head(forward, name)
         if "NOT_RETURN_LOGITS" not in forward:
             print(f"Failed patching fast CE forward for {name}")
         if "loss = outputs.loss" in forward:
@@ -3717,7 +3730,9 @@ def unsloth_compile_transformers(
                 # Fix some arguments up like for Gemma 3N
                 new_source = fixup_fused_lm_head(source)
                 # Apply fused LM transforms
-                new_source = apply_fused_lm_head(new_source, module)
+                new_source, supports_return_hidden_states = apply_fused_lm_head(
+                    new_source, module
+                )
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:
@@ -3730,6 +3745,7 @@ def unsloth_compile_transformers(
                             disable=True,
                             forward_source=new_source,
                             add_loss_kwargs=True,
+                            supports_return_hidden_states=supports_return_hidden_states,
                         )
                         print(
                             f"Unsloth: Fast fused linear cross entropy patch for {module}."
