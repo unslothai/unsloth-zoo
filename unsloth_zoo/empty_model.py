@@ -21,6 +21,9 @@ __all__ = [
     "get_model_layer_config",
     "compare_attributes",
     "copy_attributes",
+    "patch_gemma4_vllm_lora_support",
+    "patch_gemma4_vllm_k_eq_v_support",
+    "patch_qwen3_5_vllm_lora_support",
 ]
 
 import torch
@@ -298,6 +301,379 @@ def _set_config_attrs(config_obj, attrs_to_set):
             setattr(config_obj, attr, value)
 pass
 
+def _get_model_device(model):
+    for tensor in model.parameters():
+        return tensor.device
+    for tensor in model.buffers():
+        return tensor.device
+    return torch.device("cpu")
+pass
+
+def patch_gemma4_vllm_lora_support():
+    from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
+    from vllm.model_executor.models import interfaces as vllm_model_interfaces
+    from vllm.lora import model_manager as vllm_lora_model_manager
+    try:
+        from vllm.v1.worker import lora_model_runner_mixin
+    except ImportError:
+        lora_model_runner_mixin = None
+    from unsloth_zoo import vllm_lora_worker_manager
+
+    Gemma4ForConditionalGeneration.supports_lora = True
+    Gemma4ForConditionalGeneration.embedding_modules = {}
+
+    # vLLM's MoE-LoRA path (vllm.lora.utils.process_packed_modules_mapping)
+    # requires ``get_expert_mapping`` on either the top-level model or a
+    # direct child. Gemma4ForConditionalGeneration routes through its
+    # ``language_model`` child (Gemma4ForCausalLM), which upstream has no
+    # such method, so vLLM raises ``AttributeError`` before create_lora_manager
+    # even runs. Install the method on both: the outer wrapper delegates to
+    # the inner causal LM, and the inner causal LM builds the mapping from
+    # its FusedMoE experts via ``FusedMoE.make_expert_params_mapping``.
+    try:
+        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+    except ImportError:
+        Gemma4ForCausalLM = None
+        FusedMoE = None
+
+    if Gemma4ForCausalLM is not None and FusedMoE is not None and \
+            not hasattr(Gemma4ForCausalLM, "get_expert_mapping"):
+
+        def _gemma4_causal_lm_get_expert_mapping(self):
+            # Gemma 4 MoE checkpoints expose per-expert entries named
+            # gate_proj / up_proj / down_proj after the HF-to-vLLM remap
+            # in Gemma4ForCausalLM.load_weights. Mirror Qwen3 / deepseek_v2.
+            num_experts = getattr(self.config, "num_experts", 0)
+            if not num_experts:
+                return []
+            num_redundant_experts = getattr(self, "num_redundant_experts", 0)
+            return FusedMoE.make_expert_params_mapping(
+                self,
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=num_experts,
+                num_redundant_experts=num_redundant_experts,
+            )
+
+        Gemma4ForCausalLM.get_expert_mapping = _gemma4_causal_lm_get_expert_mapping
+
+    if not hasattr(Gemma4ForConditionalGeneration, "get_expert_mapping"):
+        def _gemma4_cond_get_expert_mapping(self):
+            language_model = getattr(self, "language_model", None)
+            if language_model is None:
+                return []
+            inner = getattr(language_model, "get_expert_mapping", None)
+            if inner is None:
+                return []
+            return inner()
+
+        Gemma4ForConditionalGeneration.get_expert_mapping = (
+            _gemma4_cond_get_expert_mapping
+        )
+
+    if not hasattr(vllm_model_interfaces.supports_lora, "_unsloth_gemma4_patch"):
+        original_supports_lora = vllm_model_interfaces.supports_lora
+
+        def patched_supports_lora(model):
+            if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
+                return True
+            return original_supports_lora(model)
+
+        patched_supports_lora._unsloth_gemma4_patch = True
+        vllm_model_interfaces.supports_lora = patched_supports_lora
+        if lora_model_runner_mixin is not None:
+            lora_model_runner_mixin.supports_lora = patched_supports_lora
+
+    if not hasattr(vllm_lora_model_manager.create_lora_manager, "_unsloth_gemma4_patch"):
+        original_create_lora_manager = vllm_lora_model_manager.create_lora_manager
+
+        def patched_create_lora_manager(model, *args, **kwargs):
+            if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
+                lora_manager_cls = kwargs.pop("lora_manager_cls", vllm_lora_model_manager.LoRAModelManager)
+                return lora_manager_cls(model = model, *args, **kwargs)
+            return original_create_lora_manager(model, *args, **kwargs)
+
+        patched_create_lora_manager._unsloth_gemma4_patch = True
+        vllm_lora_model_manager.create_lora_manager = patched_create_lora_manager
+        vllm_lora_worker_manager.create_lora_manager = patched_create_lora_manager
+pass
+
+# vLLM's Gemma4 k_eq_v path now expects qkv_proj to always expose q+k+v.
+# For prequantized bitsandbytes checkpoints, the synthetic v shard is still
+# missing from the quant-state dict on full-attention k_eq_v layers, so we
+# materialize it during loader-side quant-state stacking instead of patching
+# the runtime attention forward.
+def patch_gemma4_vllm_k_eq_v_support():
+    try:
+        from vllm.model_executor.model_loader.bitsandbytes_loader import (
+            BitsAndBytesModelLoader,
+        )
+    except ImportError:
+        return
+
+    if hasattr(
+        BitsAndBytesModelLoader._stack_quantization_states,
+        "_unsloth_gemma4_k_eq_v_patch",
+    ):
+        return
+
+    original_stack_quantization_states = (
+        BitsAndBytesModelLoader._stack_quantization_states
+    )
+
+    def _get_gemma4_text_config(model):
+        config = getattr(model, "config", None)
+        if config is None:
+            return None
+
+        text_config = getattr(config, "text_config", config)
+        model_type = getattr(config, "model_type", None)
+        text_model_type = getattr(text_config, "model_type", None)
+        if model_type != "gemma4" and text_model_type not in ("gemma4", "gemma4_text"):
+            return None
+        return text_config
+
+    def _get_gemma4_k_eq_v_qkv_param_names(model):
+        text_config = _get_gemma4_text_config(model)
+        if text_config is None or not getattr(text_config, "attention_k_eq_v", False):
+            return ()
+
+        param_names = set(name for name, _ in model.named_parameters())
+        qkv_param_names = []
+        for layer_idx, layer_type in enumerate(getattr(text_config, "layer_types", ())):
+            if layer_type != "full_attention":
+                continue
+
+            for prefix in ("language_model.model", "model"):
+                qkv_param_name = (
+                    f"{prefix}.layers.{layer_idx}.self_attn.qkv_proj.weight"
+                )
+                if qkv_param_name in param_names:
+                    qkv_param_names.append(qkv_param_name)
+                    break
+        return tuple(qkv_param_names)
+
+    def patched_stack_quantization_states(self, model, quant_state_dict):
+        stacked_quant_state_dict = original_stack_quantization_states(
+            self, model, quant_state_dict
+        )
+
+        for qkv_param_name in _get_gemma4_k_eq_v_qkv_param_names(model):
+            quant_states = stacked_quant_state_dict.get(qkv_param_name)
+            if not isinstance(quant_states, dict) or 2 in quant_states or 1 not in quant_states:
+                continue
+
+            # Gemma4 full-attention k_eq_v layers reuse K as V. The raw weight
+            # loader already duplicates k_proj -> v_proj; prequant BnB needs the
+            # same duplication for shard-local QuantState metadata.
+            quant_states[2] = deepcopy(quant_states[1])
+
+        return stacked_quant_state_dict
+
+    patched_stack_quantization_states._unsloth_gemma4_k_eq_v_patch = True
+    BitsAndBytesModelLoader._stack_quantization_states = (
+        patched_stack_quantization_states
+    )
+pass
+
+
+def patch_qwen3_5_vllm_lora_support():
+    """
+    Mirror of ``patch_gemma4_vllm_lora_support`` for Qwen3.5 / Qwen3.6.
+
+    vLLM's MoE-LoRA path calls ``get_expert_mapping`` on the top model or
+    its direct child. ``Qwen3_5MoeForConditionalGeneration`` routes through
+    ``model.language_model`` (``Qwen3_5MoeModel`` in text, its ``.model``
+    decoder stack holds ``FusedMoE`` / ``SharedFusedMoE`` experts).
+    Dense ``Qwen3_5ForConditionalGeneration`` has no expert mapping;
+    install a stub returning ``[]`` so the LoRA manager instantiates
+    without errors.
+
+    Also forces ``supports_lora = True`` + patches
+    ``vllm.model_executor.models.interfaces.supports_lora`` so the outer
+    multimodal wrapper is recognised as LoRA-capable even though vLLM's
+    inspector only checks attributes on the registered ``*ForCausalLM``.
+    """
+    # Both dense (Qwen3_5) and MoE (Qwen3_5Moe) classes live in the
+    # single ``vllm.model_executor.models.qwen3_5`` module (vLLM 0.19+).
+    try:
+        from vllm.model_executor.models.qwen3_5 import (
+            Qwen3_5ForConditionalGeneration,
+        )
+    except ImportError:
+        Qwen3_5ForConditionalGeneration = None
+    try:
+        from vllm.model_executor.models.qwen3_5 import (
+            Qwen3_5MoeForConditionalGeneration,
+        )
+    except ImportError:
+        Qwen3_5MoeForConditionalGeneration = None
+
+    if Qwen3_5ForConditionalGeneration is None and Qwen3_5MoeForConditionalGeneration is None:
+        return
+
+    from vllm.model_executor.models import interfaces as vllm_model_interfaces
+    from vllm.lora import model_manager as vllm_lora_model_manager
+    try:
+        from vllm.v1.worker import lora_model_runner_mixin
+    except ImportError:
+        lora_model_runner_mixin = None
+    from unsloth_zoo import vllm_lora_worker_manager
+
+    try:
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+    except ImportError:
+        FusedMoE = None
+
+    def _lookup_inner_causal_lm(cond_cls):
+        # vLLM ships the inner text causal LM under ``language_model`` on
+        # the multimodal wrapper's ``__init__``. Resolve lazily (class
+        # may not exist for dense qwen3_5) and install the mapping there.
+        return cond_cls
+
+    # ---- Qwen3.5 MoE ------------------------------------------------------
+    if Qwen3_5MoeForConditionalGeneration is not None:
+        Qwen3_5MoeForConditionalGeneration.supports_lora = True
+        Qwen3_5MoeForConditionalGeneration.embedding_modules = {}
+
+        try:
+            from vllm.model_executor.models.qwen3_5 import (
+                Qwen3_5MoeForCausalLM,
+            )
+        except ImportError:
+            Qwen3_5MoeForCausalLM = None
+
+        if (
+            Qwen3_5MoeForCausalLM is not None
+            and FusedMoE is not None
+            and not hasattr(Qwen3_5MoeForCausalLM, "get_expert_mapping")
+        ):
+            def _qwen3_5_moe_causal_lm_get_expert_mapping(self):
+                num_experts = getattr(self.config, "num_experts", 0)
+                if not num_experts:
+                    return []
+                num_redundant_experts = getattr(self, "num_redundant_experts", 0)
+                return FusedMoE.make_expert_params_mapping(
+                    self,
+                    ckpt_gate_proj_name="gate_proj",
+                    ckpt_down_proj_name="down_proj",
+                    ckpt_up_proj_name="up_proj",
+                    num_experts=num_experts,
+                    num_redundant_experts=num_redundant_experts,
+                )
+            Qwen3_5MoeForCausalLM.get_expert_mapping = (
+                _qwen3_5_moe_causal_lm_get_expert_mapping
+            )
+
+        if not hasattr(Qwen3_5MoeForConditionalGeneration, "get_expert_mapping"):
+            def _qwen3_5_moe_cond_get_expert_mapping(self):
+                language_model = getattr(self, "language_model", None)
+                if language_model is None:
+                    return []
+                inner = getattr(language_model, "get_expert_mapping", None)
+                if inner is None:
+                    return []
+                return inner()
+            Qwen3_5MoeForConditionalGeneration.get_expert_mapping = (
+                _qwen3_5_moe_cond_get_expert_mapping
+            )
+
+    # ---- Qwen3.5 dense ----------------------------------------------------
+    if Qwen3_5ForConditionalGeneration is not None:
+        Qwen3_5ForConditionalGeneration.supports_lora = True
+        Qwen3_5ForConditionalGeneration.embedding_modules = {}
+
+        if not hasattr(Qwen3_5ForConditionalGeneration, "get_expert_mapping"):
+            def _qwen3_5_dense_get_expert_mapping(self):
+                # Dense Qwen3.5 has no experts; vLLM still calls
+                # ``get_expert_mapping`` during LoRA manager init so
+                # provide an empty list.
+                return []
+            Qwen3_5ForConditionalGeneration.get_expert_mapping = (
+                _qwen3_5_dense_get_expert_mapping
+            )
+
+    # ---- supports_lora whitelist patch -----------------------------------
+    _classnames = set()
+    if Qwen3_5ForConditionalGeneration is not None:
+        _classnames.add("Qwen3_5ForConditionalGeneration")
+    if Qwen3_5MoeForConditionalGeneration is not None:
+        _classnames.add("Qwen3_5MoeForConditionalGeneration")
+
+    if _classnames and not hasattr(
+        vllm_model_interfaces.supports_lora, "_unsloth_qwen3_5_patch"
+    ):
+        _prior = vllm_model_interfaces.supports_lora
+
+        def _patched_supports_lora_qwen3_5(model):
+            if model.__class__.__name__ in _classnames:
+                return True
+            return _prior(model)
+
+        _patched_supports_lora_qwen3_5._unsloth_qwen3_5_patch = True
+        vllm_model_interfaces.supports_lora = _patched_supports_lora_qwen3_5
+        if lora_model_runner_mixin is not None:
+            lora_model_runner_mixin.supports_lora = _patched_supports_lora_qwen3_5
+
+    # ---- create_lora_manager whitelist patch -----------------------------
+    # The patched function MUST declare ``vllm_config`` as a named parameter:
+    # unsloth_zoo.vllm_lora_worker_manager._call_create_lora_manager inspects
+    # ``create_lora_manager``'s signature and only forwards vllm_config when
+    # it appears in ``sig.parameters``. A generic ``(model, *args, **kwargs)``
+    # wrapper loses vllm_config in translation and blows up the original
+    # vLLM create_lora_manager (which requires vllm_config positionally).
+    if _classnames and not hasattr(
+        vllm_lora_model_manager.create_lora_manager, "_unsloth_qwen3_5_patch"
+    ):
+        _prior_clm = vllm_lora_model_manager.create_lora_manager
+
+        def _patched_create_lora_manager_qwen3_5(
+            model,
+            max_num_seqs=None,
+            max_num_batched_tokens=None,
+            vocab_size=None,
+            lora_config=None,
+            vllm_config=None,
+            device=None,
+            lora_manager_cls=None,
+            **kwargs,
+        ):
+            if lora_manager_cls is None:
+                lora_manager_cls = vllm_lora_model_manager.LoRAModelManager
+            if model.__class__.__name__ in _classnames:
+                return lora_manager_cls(
+                    model=model,
+                    max_num_seqs=max_num_seqs,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                    vocab_size=vocab_size,
+                    lora_config=lora_config,
+                    vllm_config=vllm_config,
+                    device=device,
+                    **kwargs,
+                )
+            return _prior_clm(
+                model,
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
+                vocab_size=vocab_size,
+                lora_config=lora_config,
+                vllm_config=vllm_config,
+                device=device,
+                lora_manager_cls=lora_manager_cls,
+                **kwargs,
+            )
+
+        _patched_create_lora_manager_qwen3_5._unsloth_qwen3_5_patch = True
+        vllm_lora_model_manager.create_lora_manager = (
+            _patched_create_lora_manager_qwen3_5
+        )
+        vllm_lora_worker_manager.create_lora_manager = (
+            _patched_create_lora_manager_qwen3_5
+        )
+pass
+
 
 @torch.inference_mode
 def create_empty_vision_model(config, dtype = torch.float16):
@@ -402,6 +778,12 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
 def set_additional_modules(new_model, quant_state_dict, config):
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
+        language_model_prefix = "model.language_model"
+    elif hasattr(new_model, "model") and hasattr(new_model.model, "language_model"):
+        # Qwen3.5 / Qwen3.6: outer container Qwen3_5Model wraps .visual +
+        # .language_model. Dereference one more level so we land on the
+        # text backbone with embed_tokens/layers/norm.
+        language_model = new_model.model.language_model
         language_model_prefix = "model.language_model"
     else:
         language_model_prefix = "model"

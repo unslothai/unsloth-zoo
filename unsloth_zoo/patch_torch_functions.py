@@ -166,11 +166,38 @@ def cross_entropy(
 pass
 
 
+def _dynamo_safe_layer_norm(
+    input: Tensor,
+    normalized_shape: List[int],
+    weight: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    eps: float = 1e-5,
+) -> Tensor:
+    # ``layer_norm`` above is a torch.compile-wrapped function. When another
+    # compile/AOT-autograd/fx pass (e.g. vLLM's inductor compile of
+    # Gemma4AudioSubSampleConvProjectionLayer.forward) traces through
+    # F.layer_norm, it recurses into this nested compile and raises
+    # "Detected that you are using FX to symbolically trace a
+    # dynamo-optimized function" / FakeTensor.data_ptr errors. Always route
+    # through the original torch.layer_norm C++ op — that's what the
+    # @torch_compile wrapper ultimately calls anyway, and Dynamo is free to
+    # fuse the naked op when it shows up inside a user compile region.
+    return torch.layer_norm(
+        input,
+        normalized_shape,
+        weight,
+        bias,
+        eps,
+        torch.backends.cudnn.enabled,
+    ).to(input.dtype)
+pass
+
+
 def patch_torch_functions():
     # All Unsloth Zoo code licensed under LGPLv3
     if not hasattr(torch.nn.functional, "_uncompiled_layer_norm"):
         torch.nn.functional._uncompiled_layer_norm = torch.nn.functional.layer_norm
-        torch.nn.functional.layer_norm = layer_norm
+        torch.nn.functional.layer_norm = _dynamo_safe_layer_norm
     # Remove compiling cross_entropy since too many errors
     # We already compile this most likely anyways
     # if not hasattr(torch.nn.functional, "_uncompiled_cross_entropy"):

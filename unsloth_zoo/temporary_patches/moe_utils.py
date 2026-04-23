@@ -800,7 +800,18 @@ def forward_native_grouped_mm(
 
     # 1. Calculate routing
     flat_top_k = top_k_index.view(-1)
-    num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
+    # ``torch.bincount(..., minlength=num_experts)`` produces the correct
+    # result but triggers a CPU→CUDA scalar copy inside CUDA graph
+    # capture (minlength is a Python int, materialised host-side). Use
+    # ``scatter_add_`` on a pre-zeroed device tensor instead — identical
+    # semantics, fully graph-capturable.
+    num_tokens_per_expert = torch.zeros(
+        self.num_experts, dtype=torch.int64, device=flat_top_k.device
+    )
+    num_tokens_per_expert.scatter_add_(
+        0, flat_top_k, torch.ones_like(flat_top_k, dtype=torch.int64)
+    )
+    num_tokens_per_expert = num_tokens_per_expert.int()
 
     # 2. Sort indices to group tokens by expert
     sorted_indices = torch.argsort(flat_top_k, stable=True)
@@ -900,8 +911,18 @@ def forward_native_grouped_mm(
             mm1_out = mm1_out + lora_delta * scaling
 
         if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
-            num_repeats = num_tokens_per_expert.to(self.gate_up_proj_bias.device)
-            bias_expanded = self.gate_up_proj_bias.repeat_interleave(num_repeats, dim=0)
+            # ``repeat_interleave(counts_tensor)`` forces a GPU→CPU sync
+            # (output size depends on ``counts.sum().item()``) which
+            # breaks CUDA graph capture on gpt-oss's bias path. Gather
+            # per-token from the already-computed permutation instead:
+            # after ``sorted_indices = argsort(flat_top_k)``, the expert
+            # id for each permuted position is just
+            # ``flat_top_k[sorted_indices]``. ``index_select`` is
+            # capturable.
+            sorted_expert_ids = flat_top_k[sorted_indices].to(torch.long)
+            bias_expanded = self.gate_up_proj_bias.index_select(
+                0, sorted_expert_ids.to(self.gate_up_proj_bias.device),
+            )
             mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
         if "GptOssExperts" in self.__class__.__name__:
@@ -1031,8 +1052,10 @@ def forward_native_grouped_mm(
             mm2_out = mm2_out + lora_delta * scaling
 
         if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
-            bias_expanded = self.down_proj_bias.repeat_interleave(
-                num_tokens_per_expert.to(self.down_proj_bias.device), dim=0
+            # Capture-safe gather; see comment on gate_up_proj_bias above.
+            sorted_expert_ids = flat_top_k[sorted_indices].to(torch.long)
+            bias_expanded = self.down_proj_bias.index_select(
+                0, sorted_expert_ids.to(self.down_proj_bias.device),
             ).to(mm2_out.device)
             mm2_out = mm2_out + bias_expanded.to(mm2_out.dtype)
 

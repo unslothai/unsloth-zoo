@@ -108,6 +108,36 @@ class _Gemma4KVSharedSafeProxy:
     def __init__(self, real):
         object.__setattr__(self, "_real", real)
 
+    def __setattr__(self, name, value):
+        # Forward writes to the wrapped config so callers like vLLM's
+        # ``VllmConfig.with_hf_config`` (which assigns
+        # ``tie_word_embeddings`` onto ``get_text_config()``) do not hit
+        # ``AttributeError: ... no __dict__ for setting new attributes``.
+        # Allow writes to our own ``_real`` slot (used by deepcopy /
+        # ``__init__``) to go through object.__setattr__.
+        if name == "_real":
+            object.__setattr__(self, name, value)
+            return
+        try:
+            real = object.__getattribute__(self, "_real")
+        except AttributeError:
+            # Instance still being initialized (e.g. deepcopy sets slots
+            # after __new__). Fall back to the slot.
+            object.__setattr__(self, name, value)
+            return
+        setattr(real, name, value)
+
+    def __delattr__(self, name):
+        if name == "_real":
+            object.__delattr__(self, name)
+            return
+        try:
+            real = object.__getattribute__(self, "_real")
+        except AttributeError:
+            object.__delattr__(self, name)
+            return
+        delattr(real, name)
+
     def __getattr__(self, name):
         # Only invoked when normal attribute lookup fails (i.e. not a slot
         # and not a method of this proxy class).

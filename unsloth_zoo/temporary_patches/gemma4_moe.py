@@ -16,9 +16,8 @@
 
 import os
 import torch
-import torch.nn as nn
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
-from .utils import patch_function, raise_error, logger
+from .utils import patch_function, logger
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
@@ -27,71 +26,67 @@ from .moe_utils import (
 
 def patch_gemma4_moe():
     """
-    Patches Gemma4 MoE to support Split LoRA using grouped GEMM.
-    Gemma4 uses 128 experts with top_k=8 and a unique per_expert_scale parameter.
+    Patches Gemma4 MoE (26B-A4B and any other MoE-enabled Gemma 4 variant)
+    for Split LoRA + grouped GEMM backend + text-only GRPO training.
+
+    Compatible with transformers >= 5.5.0 (first PyPI release with Gemma 4
+    support). The stacked expert tensor layout
+    ``Gemma4TextExperts.gate_up_proj (E, 2*I, H)`` / ``down_proj (E, H, I)``
+    matches Qwen3-MoE, so the default ``_extract_lora_from_wrapper`` + the
+    generic ``get_forward_moe_backend`` cover LoRA extraction and MoE
+    forward without arch-specific branches.
+
+    The router's ``per_expert_scale`` is already folded into
+    ``top_k_weights`` natively by ``Gemma4TextRouter.forward`` since
+    transformers 5.5.0, so this patch does NOT need to fold it.
     """
-    # Patch PEFT ParamWrapper for separated LoRA weights
+    # Patch PEFT ParamWrapper for separated LoRA weights (idempotent).
     patch_param_wrapper_for_moe()
 
-    # Try to import Gemma4 MoE classes
+    # Gemma 4 available only on transformers >= 5.5.0. Bail cleanly on
+    # older installs (training code elsewhere errors out with a clearer
+    # version-pin message).
     try:
         from transformers.models.gemma4.modeling_gemma4 import (
-            Gemma4TextMoEBlock,
-            Gemma4TextDecoderLayer,
+            Gemma4TextExperts,
         )
     except Exception:
         return  # Gemma4 not available in this transformers version
 
-    # Check if already patched
-    if hasattr(Gemma4TextMoEBlock, "_unsloth_already_patched"):
+    if getattr(Gemma4TextExperts, "_unsloth_already_patched", False):
         return
 
     # ====================================================================
-    # Remap decoder layer module names to match checkpoint key layout:
-    #   moe.{gate_up_proj,down_proj} -> experts.{...}
-    #   moe.per_expert_scale         -> router.per_expert_scale
-    # ====================================================================
-    _original_decoder_init = Gemma4TextDecoderLayer.__init__
-
-    def _patched_decoder_init(self, config, layer_idx):
-        _original_decoder_init(self, config, layer_idx)
-        if getattr(self, "enable_moe_block", False) and "moe" in self._modules:
-            moe_block = self._modules.pop("moe")
-            self._modules["experts"] = moe_block
-            object.__setattr__(self, "moe", moe_block)
-
-            per_expert_scale_data = moe_block.per_expert_scale.data
-            del moe_block._parameters["per_expert_scale"]
-            self.router.per_expert_scale = nn.Parameter(per_expert_scale_data)
-            # Non-persistent buffer keeps _init_weights happy without appearing in state_dict
-            moe_block.register_buffer("per_expert_scale", torch.ones(config.num_experts), persistent=False)
-            object.__setattr__(moe_block, "_router_ref", self.router)
-
-    Gemma4TextDecoderLayer.__init__ = _patched_decoder_init
-
-    # Gemma4 uses standard F.linear format (E, out_dim, in_dim), same as Qwen3MoE.
-    # The default _extract_lora_from_wrapper handles this correctly — no custom extractor needed.
-
-    # ====================================================================
-    # Patch Gemma4TextMoEBlock.forward with optimized grouped GEMM backend.
-    # Pre-multiply per_expert_scale into routing weights so the generic
-    # grouped_mm forward doesn't need per_expert_scale special-casing.
+    # Replace Gemma4TextExperts.forward with the grouped-GEMM backend.
+    # The stock forward (modeling_gemma4.py) is a Python loop over active
+    # experts — not CUDA-graph capturable and slow at inference / decode.
+    # The generic forward_native_grouped_mm handles:
+    #   - act_fn (Gemma 4 sets self.act_fn to gelu_pytorch_tanh natively)
+    #   - the (E, 2*I, H) / (E, H, I) expert layout via `chunk(2, -1)`
+    # so no arch-specific branches are needed in moe_utils.py.
     # ====================================================================
     _moe_backend = get_forward_moe_backend()
 
-    def _gemma4_moe_forward(self, hidden_states, top_k_index, top_k_weights):
-        # Fold per_expert_scale into routing weights before grouped_mm
-        router_ref = getattr(self, "_router_ref", None)
-        if router_ref is not None:
-            pes = router_ref.per_expert_scale
-            top_k_weights = top_k_weights * pes[top_k_index].to(top_k_weights.dtype)
+    def _gemma4_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights):
+        # per_expert_scale is already applied on `top_k_weights` by
+        # Gemma4TextRouter.forward since transformers 5.5.0 — do not
+        # re-apply here.
         return _moe_backend(self, hidden_states, top_k_index, top_k_weights)
 
-    patch_function(Gemma4TextMoEBlock, "forward", _gemma4_moe_forward, force=True)
+    patch_function(
+        Gemma4TextExperts, "forward", _gemma4_moe_experts_forward, force=True
+    )
 
     # ====================================================================
-    # Patch Gemma4ForConditionalGeneration.forward for GRPO training
-    # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
+    # Patch Gemma4ForConditionalGeneration.forward for text-only GRPO /
+    # SFT: inject a zero-filled ``mm_token_type_ids`` when the caller
+    # (TRL GRPOTrainer, standard Trainer, etc.) doesn't supply one in
+    # training mode. Without this, ``create_causal_mask_mapping``
+    # (modeling_gemma4.py) raises
+    # ``ValueError: mm_token_type_ids is required as a model input when
+    # training`` on every text-only train step.
+    #
+    # Also supports UNSLOTH_RETURN_HIDDEN_STATES=1 (GRPO rollout path).
     # ====================================================================
     try:
         from transformers.models.gemma4.modeling_gemma4 import (
@@ -120,7 +115,7 @@ def patch_gemma4_moe():
             logits_to_keep=0,
             **kwargs,
         ):
-            # Inject mm_token_type_ids=0 for text-only SFT
+            # Inject mm_token_type_ids=0 for text-only SFT / GRPO.
             if mm_token_type_ids is None and self.training:
                 _ids = input_ids if input_ids is not None else inputs_embeds
                 if _ids is not None:
@@ -128,7 +123,8 @@ def patch_gemma4_moe():
                         _ids.shape[:2], dtype=torch.long, device=_ids.device
                     )
 
-            # Drop stale mm_token_type_ids during KV cache generation
+            # Drop stale mm_token_type_ids during KV cache generation when
+            # the sequence length no longer matches.
             _seq_ref = input_ids if input_ids is not None else inputs_embeds
             if mm_token_type_ids is not None and _seq_ref is not None:
                 if mm_token_type_ids.shape[1] != _seq_ref.shape[1]:
@@ -159,7 +155,11 @@ def patch_gemma4_moe():
                     **kwargs,
                 )
 
-            # RETURN_HIDDEN_STATES mode - return hidden_states instead of logits
+            # RETURN_HIDDEN_STATES mode — return hidden states instead of
+            # logits. Used by GRPO rollout to stream forward features.
+            # Drop return_dict from kwargs if TRL/caller pre-set it to avoid
+            # "got multiple values for keyword argument 'return_dict'".
+            kwargs.pop("return_dict", None)
             outputs = self.model(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
@@ -200,7 +200,8 @@ def patch_gemma4_moe():
         Gemma4ForConditionalGeneration.forward = _patched_causal_lm_forward
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(
-                "Unsloth: Patched Gemma4ForConditionalGeneration.forward for GRPO hidden states."
+                "Unsloth: Patched Gemma4ForConditionalGeneration.forward for "
+                "text-only training + GRPO hidden states."
             )
     except Exception as e:
         if UNSLOTH_ENABLE_LOGGING:
@@ -208,10 +209,10 @@ def patch_gemma4_moe():
                 f"Unsloth: Could not patch Gemma4ForConditionalGeneration.forward: {e}"
             )
 
-    Gemma4TextMoEBlock._unsloth_already_patched = True
+    Gemma4TextExperts._unsloth_already_patched = True
 
     if UNSLOTH_ENABLE_LOGGING:
-        logger.info("Unsloth: Patched Gemma4 MoE for Split LoRA support.")
+        logger.info("Unsloth: Patched Gemma4 MoE for Split LoRA + grouped GEMM.")
 
 
 TEMPORARY_PATCHES.append(patch_gemma4_moe)
