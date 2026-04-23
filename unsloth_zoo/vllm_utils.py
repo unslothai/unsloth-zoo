@@ -1513,6 +1513,16 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 # LayerNorms (including vision norms)
                 weight_param = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad=False)
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
+                # Some Gemma 4 variants (E2B / E4B with num_kv_shared_layers > 0)
+                # drop k_norm on shared-KV layers — the HF empty model doesn't
+                # register the attribute at all, so a blind exec() AttributeErrors
+                # out. Check the parent actually has the attribute before setting.
+                _ns = {"new_model": new_model}
+                try:
+                    _target = eval(f"new_model.{layer_name_br}", _ns)
+                except AttributeError:
+                    skipped_layernorms.append(layer_name.split(".")[-1])
+                    continue
                 # Set weight
                 exec(f"new_model.{layer_name_br}.weight = None")
                 exec(f"new_model.{layer_name_br}.weight = weight_param")
