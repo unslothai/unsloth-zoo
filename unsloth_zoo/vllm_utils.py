@@ -1474,9 +1474,18 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
     text_config = getattr(config, "text_config", config) #try using text config for VLMs
     vision_config = getattr(config, "vision_config", None)
+    # why: Gemma 4's Gemma4TextRotaryEmbedding stores rope_parameters as a
+    # nested dict keyed by layer_type ({full_attention: {...},
+    # sliding_attention: {...}}). Its ``__init__`` expects a ``layer_type``
+    # kwarg to pick the right sub-dict; without it the class falls back to
+    # ``config.rope_parameters["rope_type"]`` and raises KeyError. Skip the
+    # rotary re-init for gemma4 — the rotary buffer is already loaded
+    # correctly from the vLLM weights.
+    _text_model_type = getattr(text_config, "model_type", None)
+    _skip_rotary_reinit = _text_model_type in ("gemma4", "gemma4_text")
     # Fix up rotary_emb by re-initing them
     for module in new_model.modules():
-        if hasattr(module, "rotary_emb"):
+        if hasattr(module, "rotary_emb") and not _skip_rotary_reinit:
             module.rotary_emb = module.rotary_emb.__class__(
                 config = text_config,
                 device = get_target_device(),
