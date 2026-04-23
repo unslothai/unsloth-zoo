@@ -248,7 +248,7 @@ else:
 IS_HIP_RUNTIME = (DEVICE_TYPE == "hip") or bool(is_hip())
 
 # Torch >= 2.9 uses PYTORCH_ALLOC_CONF and treats legacy per-backend vars as deprecated.
-if _HAS_TORCH and IS_TORCH_2_9_OR_NEWER:
+if IS_TORCH_2_9_OR_NEWER:
     # Preserve explicit legacy allocator settings when user did not directly set PYTORCH_ALLOC_CONF.
     if not _HAS_ORIGINAL_PYTORCH_ALLOC_CONF:
         promoted = _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF
