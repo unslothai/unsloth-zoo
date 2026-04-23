@@ -279,6 +279,27 @@ class WorkerLoRAManager(AbstractWorkerManager):
         else:
             return set(self._adapter_manager.list_adapters())
 
+    def get_dummy_lora_warmup_rank(self, default_rank: int) -> int:
+        # vLLM v1 (lora_model_runner_mixin.maybe_setup_dummy_loras) calls
+        # this during cudagraph warmup; delegate to the adapter manager,
+        # fall back to default_rank if the underlying implementation
+        # predates this helper.
+        manager_fn = getattr(
+            self._adapter_manager, "get_dummy_lora_warmup_rank", None
+        )
+        if manager_fn is not None:
+            return manager_fn(default_rank)
+        return default_rank
+
+    def supports_tower_connector_lora(self) -> bool:
+        # New v1 call; match upstream WorkerLoRAManager semantics.
+        return (
+            getattr(self._adapter_manager, "supports_mm", False)
+            and getattr(
+                self._adapter_manager, "supports_tower_connector_lora", False
+            )
+        )
+
 
 # from vllm try to import WorkerLoRAManager
 try:
