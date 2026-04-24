@@ -221,11 +221,11 @@ def _patch_gemma4_moe_legacy():
             )
             object.__setattr__(moe_block, "_router_ref", self.router)
 
-    init_ok = patch_function(
-        Gemma4TextDecoderLayer, "__init__", _patched_decoder_init, force=True,
-    )
-    if not init_ok:
-        return False
+    if getattr(Gemma4TextDecoderLayer, "_unsloth_init_patched", False): init_ok = True
+    else:
+        init_ok = patch_function(Gemma4TextDecoderLayer, "__init__", _patched_decoder_init, force=True,)
+        if init_ok: Gemma4TextDecoderLayer._unsloth_init_patched = True
+    if not init_ok: return False
 
     _moe_backend = get_forward_moe_backend()
 
