@@ -128,52 +128,25 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
-    # Transformers 5.x moved the MXFP4 load path from the function-based
-    # ``load_and_swizzle_mxfp4`` (4.56.x) to the WeightConverter-based
-    # ``Mxfp4Deserialize`` class. That converter does not actually fire when
-    # the checkpoint's key names already match the module's registered
-    # parameters (``gate_up_proj_blocks`` / ``_scales``) — so under 5.x,
-    # MXFP4 models load with raw blocks + scales left on the module and the
-    # swizzle-to-triton step never runs. Post-load the ``gate_up_proj``
-    # property's fallback trips the ``dequantize(blocks, scales)`` signature
-    # mismatch (``dequantize`` is the loader-flavour in 5.x).
-    #
-    # Fix: wrap ``_process_model_after_weight_loading`` to walk the model
-    # after weight load, detect any ``Mxfp4GptOssExperts`` still holding
-    # raw blocks/scales, and invoke ``swizzle_mxfp4_convertops`` on them.
-    # This mirrors what the pre-5.x ``load_and_swizzle_mxfp4`` did.
+    # transformers 5.x moved MXFP4 loading from ``load_and_swizzle_mxfp4``
+    # (4.56.x) to the ``Mxfp4Deserialize`` WeightConverter, which is skipped
+    # whenever checkpoint key names already match registered parameters --
+    # so MXFP4 models load with raw blocks/scales still on the module and
+    # the swizzle step never runs. 5.x ``Mxfp4Dequantize.convert`` also
+    # drops the transpose that 4.x baked into ``convert_moe_packed_tensors``,
+    # so gate_up_proj ends up as (E, 2I, H) vs the (E, H, 2I) the stock
+    # forward expects. Fix both in a post-load walker.
     try:
         _Mxfp4Q = transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer
         if not getattr(_Mxfp4Q, "_unsloth_post_swizzle_patched", False):
             _orig_post_load = _Mxfp4Q._process_model_after_weight_loading
 
             def _patched_post_load(self, model, **kwargs):
-                # Always let the original post-load hook run first: on 5.x it
-                # performs ``torch.cuda.empty_cache()`` and may grow to carry
-                # additional logic in future point releases. Skipping it
-                # leaks VRAM and risks silently bypassing upstream fixes.
                 _orig_post_load(self, model, **kwargs)
                 import torch as _torch
                 import warnings as _warnings
                 dq = getattr(self.quantization_config, "dequantize", False)
                 if dq:
-                    # transformers 5.x ``Mxfp4Dequantize.convert`` returns
-                    # the tensor in dequantize layout -- gate_up_proj:
-                    # ``(E, 2I, H)``, down_proj: ``(E, H, I)``. The stock
-                    # ``GptOssExperts`` expects gate_up_proj as
-                    # ``(E, H, 2I)`` (see modeling_gpt_oss.py:75) and
-                    # down_proj as ``(E, I, H)`` (modeling_gpt_oss.py:77).
-                    # In transformers 4.x the transpose was baked into
-                    # ``convert_moe_packed_tensors``; in 5.x it was
-                    # removed and not restored elsewhere.
-                    #
-                    # Per-projection shape check: guards against a future
-                    # transformers release producing either weight already
-                    # in the correct orientation. For gpt-oss-20b
-                    # (``H == I == 2880``) ``down_proj``'s shape alone is
-                    # ambiguous, so we additionally use ``gate_up_proj``'s
-                    # unambiguous ``(E, 2I, H)`` as an indicator that the
-                    # whole module came out of the 5.x dequantize path.
                     for mod in model.modules():
                         if type(mod).__name__ != "GptOssExperts":
                             continue
@@ -185,8 +158,10 @@ def patch_gpt_oss():
                         if gup is None or gup.dim() != 3:
                             continue
                         _, D1, D2 = gup.shape
-                        needs_transpose = (D1 == 2 * I and D2 == H)
-                        if not needs_transpose:
+                        # gate_up_proj shape is unambiguous (2I != H);
+                        # down_proj shape is ambiguous when I == H
+                        # (gpt-oss-20b: 2880 / 2880).
+                        if not (D1 == 2 * I and D2 == H):
                             continue
                         expected_wrong = {
                             "gate_up_proj": (2 * I, H),
@@ -207,14 +182,7 @@ def patch_gpt_oss():
                                 _warnings.warn(
                                     f"[unsloth] Unexpected MXFP4-dequantize "
                                     f"layout for {type(mod).__name__}.{proj}: "
-                                    f"got {tuple(p.shape)}, expected "
-                                    f"(..., {expected_wrong[proj][0]}, "
-                                    f"{expected_wrong[proj][1]}) or (..., "
-                                    f"{expected_right[proj][0]}, "
-                                    f"{expected_right[proj][1]}). Skipping "
-                                    f"transpose; forward may fail. This "
-                                    f"usually means your transformers "
-                                    f"version changed the dequantize layout."
+                                    f"got {tuple(p.shape)}. Skipping transpose."
                                 )
                                 continue
                             new_p = p.data.transpose(-2, -1).contiguous()
@@ -223,19 +191,9 @@ def patch_gpt_oss():
                             ))
                     return
 
-                # Native MXFP4 (dequantize=False) path.
-                # The 4.x loader path swizzled during weight load and
-                # already dropped blocks/scales -- so this walker finds
-                # nothing to do and is a no-op there. Under 5.x the
-                # WeightConverter dispatch does not fire for matching
-                # parameter names, leaving raw blocks/scales behind; we
-                # invoke the tensor-level swizzle here to mirror 4.x.
                 import transformers.integrations.mxfp4 as _mx_mod
                 swizzle_fn = getattr(_mx_mod, "swizzle_mxfp4_convertops", None)
                 if swizzle_fn is None:
-                    # Check whether any module still needs swizzling before
-                    # raising; if 4.x swizzled during load, there is nothing
-                    # to do and we can silently no-op.
                     for mod in model.modules():
                         if type(mod).__name__ != "Mxfp4GptOssExperts":
                             continue
@@ -243,24 +201,15 @@ def patch_gpt_oss():
                             continue
                         if getattr(mod, "gate_up_proj_blocks", None) is not None:
                             raise RuntimeError(
-                                "[unsloth] MXFP4 model has raw "
-                                "gate_up_proj_blocks / _scales post-load but "
-                                "transformers.integrations.mxfp4."
-                                "swizzle_mxfp4_convertops is not available. "
-                                "Either upgrade transformers to >=4.56 (with "
-                                "load_and_swizzle_mxfp4) or to a 5.x that "
-                                "exposes swizzle_mxfp4_convertops, or pass "
-                                "Mxfp4Config(dequantize=True) to fall back "
-                                "to bf16."
+                                "[unsloth] MXFP4 model has raw blocks/scales "
+                                "post-load but swizzle_mxfp4_convertops is "
+                                "not available; pass Mxfp4Config(dequantize="
+                                "True) to fall back to bf16."
                             )
                     return
                 try:
                     import triton_kernels as _tk
                 except Exception as _tk_err:
-                    # Non-Hopper users hit the pre-load Hopper gate and get
-                    # ``dequantize=True``, so they never reach here. Hopper
-                    # users without triton_kernels genuinely cannot run the
-                    # native MXFP4 path and need a clear error.
                     for mod in model.modules():
                         if type(mod).__name__ != "Mxfp4GptOssExperts":
                             continue
@@ -269,20 +218,15 @@ def patch_gpt_oss():
                         if getattr(mod, "gate_up_proj_blocks", None) is not None:
                             raise RuntimeError(
                                 "[unsloth] Native MXFP4 requires "
-                                "triton_kernels, but it is not installed. "
-                                "Install via `pip install git+https://"
-                                "github.com/triton-lang/triton.git@"
-                                "0add68262ab0a2e33b84524346cb27cbb2787356"
-                                "#subdirectory=python/triton_kernels`, "
-                                "or pass Mxfp4Config(dequantize=True) to "
-                                "fall back to bf16."
+                                "triton_kernels; install it or pass "
+                                "Mxfp4Config(dequantize=True) for bf16."
                             ) from _tk_err
                     return
                 for mod in model.modules():
                     if type(mod).__name__ != "Mxfp4GptOssExperts":
                         continue
                     if "_gate_up_proj" in mod.__dict__:
-                        continue  # already swizzled
+                        continue
                     blocks = getattr(mod, "gate_up_proj_blocks", None)
                     scales = getattr(mod, "gate_up_proj_scales", None)
                     if blocks is None or scales is None:
@@ -299,14 +243,9 @@ def patch_gpt_oss():
                         except Exception as _sw_err:
                             raise RuntimeError(
                                 f"[unsloth] MXFP4 swizzle failed on "
-                                f"{type(mod).__name__}.{proj} "
-                                f"(shape={tuple(b.shape)}). This usually "
-                                f"means triton_kernels has drifted out of "
-                                f"sync with transformers; install the "
-                                f"pinned build per the gpt-oss notebook."
+                                f"{type(mod).__name__}.{proj}; likely "
+                                f"triton_kernels / transformers drift."
                             ) from _sw_err
-                        # Drop the now-consumed raw parameters so the
-                        # property short-circuits to ``_gate_up_proj``.
                         if f"{proj}_blocks" in mod._parameters:
                             del mod._parameters[f"{proj}_blocks"]
                         if f"{proj}_scales" in mod._parameters:
@@ -315,55 +254,28 @@ def patch_gpt_oss():
             _Mxfp4Q._process_model_after_weight_loading = _patched_post_load
             _Mxfp4Q._unsloth_post_swizzle_patched = True
 
-        # Native triton_kernels MXFP4 matmul is Hopper-only
-        # (``tl.static_assert(SWIZZLE_MX_VALUE == "HOPPER_VALUE" or None)``
-        # inside matmul_ogs). On Ampere/Ada/Blackwell the kernel aborts
-        # compilation with "Only Hopper swizzling is supported". Force
-        # ``dequantize=True`` on non-Hopper CUDA devices before
-        # ``_process_model_before_weight_loading`` builds the module
-        # replacement plan, so these users transparently land on the
-        # bf16 path instead of a confusing kernel-level crash.
+        # triton_kernels MXFP4 matmul is Hopper-only; Ampere/Ada/Blackwell
+        # abort with "Only Hopper swizzling is supported". Force dequantize
+        # on any non-Hopper (or CPU-only) environment before load.
         if not getattr(_Mxfp4Q, "_unsloth_hopper_gate_patched", False):
             _orig_before_load = _Mxfp4Q._process_model_before_weight_loading
 
             def _patched_before_load(self, model, **kwargs):
                 try:
                     import torch as _torch
-                    if (
-                        _torch.cuda.is_available()
-                        and not getattr(self.quantization_config, "dequantize", False)
-                    ):
-                        # Inspect every visible CUDA device rather than
-                        # hard-coding index 0: on a multi-GPU setup the
-                        # user may be placing the model on a non-default
-                        # device (``device_map``, ``CUDA_VISIBLE_DEVICES``).
-                        # If ANY target device is non-Hopper, the native
-                        # MXFP4 matmul would crash at kernel compile time
-                        # with ``Only Hopper swizzling is supported``.
-                        # Conservative fallback: if any visible device is
-                        # non-Hopper (sm_90), route everyone to bf16.
-                        n = _torch.cuda.device_count()
-                        # Hopper = sm_90 (H100, H200); native MXFP4 ok.
-                        # Ampere/Ada = sm_80/sm_86/sm_89 -- unsupported.
-                        # Blackwell = sm_100 (B200) -- unsupported by
-                        # triton_kernels MXFP4 path as of commit 0add68262a.
-                        # When a future triton_kernels release adds
-                        # additional architectures, extend this set.
-                        HOPPER_COMPATIBLE = {9}
-                        non_hopper = False
-                        for i in range(n):
-                            major, _minor = _torch.cuda.get_device_capability(i)
-                            if major not in HOPPER_COMPATIBLE:
-                                non_hopper = True
-                                break
-                        if non_hopper:
-                            self.quantization_config.dequantize = True
+                    if getattr(self.quantization_config, "dequantize", False):
+                        pass
                     elif not _torch.cuda.is_available():
-                        # CPU-only environments cannot run native MXFP4 at
-                        # all (triton_kernels needs CUDA). Force dequantize
-                        # so users at least get a runnable bf16 model.
-                        if not getattr(self.quantization_config, "dequantize", False):
-                            self.quantization_config.dequantize = True
+                        self.quantization_config.dequantize = True
+                    else:
+                        # Scan every visible device so multi-GPU /
+                        # device_map setups do not misread index 0.
+                        HOPPER_COMPATIBLE = {9}
+                        for i in range(_torch.cuda.device_count()):
+                            major, _ = _torch.cuda.get_device_capability(i)
+                            if major not in HOPPER_COMPATIBLE:
+                                self.quantization_config.dequantize = True
+                                break
                 except Exception:
                     pass
                 return _orig_before_load(self, model, **kwargs)
