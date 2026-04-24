@@ -118,6 +118,18 @@ class _Gemma4KVSharedSafeProxy:
             )
         return getattr(object.__getattribute__(self, "_real"), name)
 
+    def __setattr__(self, name, value):
+        if name == "_real":
+            object.__setattr__(self, name, value)
+            return
+        setattr(object.__getattribute__(self, "_real"), name, value)
+
+    def __delattr__(self, name):
+        if name == "_real":
+            object.__delattr__(self, name)
+            return
+        delattr(object.__getattribute__(self, "_real"), name)
+
     def get_text_config(self, decoder=None, encoder=None):
         # If upstream recursively calls get_text_config on the proxy, return
         # self so the proxy is not unwrapped back into a raw config.

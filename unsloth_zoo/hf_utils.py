@@ -50,15 +50,39 @@ def dtype_from_config(config):
     return dtype
 
 def set_dtype_in_config(config, dtype):
-    try:
-        # if dtype is not a string, convert it to a string
-        string_dtype = str(dtype).split(".")[-1] if isinstance(dtype, torch.dtype) else dtype
-        if HAS_TORCH_DTYPE:
-            setattr(config, "torch_dtype", string_dtype)
-        else:
-            setattr(config, "dtype", string_dtype)
-    except:
-        set_dtype_in_config_fallback(config, string_dtype)
+    if isinstance(dtype, str) and dtype.startswith("torch."):
+        dtype = dtype.split(".", 1)[1]
+    runtime_dtype = getattr(torch, dtype, dtype) if isinstance(dtype, str) else dtype
+    string_dtype = str(runtime_dtype).split(".")[-1] if isinstance(runtime_dtype, torch.dtype) else runtime_dtype
+    target_fields = []
+
+    if hasattr(config, "dtype"):
+        target_fields.append("dtype")
+    if hasattr(config, "torch_dtype"):
+        target_fields.append("torch_dtype")
+
+    if len(target_fields) == 0:
+        target_fields.append("torch_dtype" if HAS_TORCH_DTYPE else "dtype")
+
+    success = False
+    # why: transformers 5.x keeps config.dtype as torch.dtype at runtime; Qwen3_5GatedDeltaNet reads config.dtype and passes it into FusedRMSNormGated which rejects strings. Write torch_dtype first (its setter aliases to dtype), then overwrite dtype with the runtime torch.dtype object.
+    ordered_fields = sorted(target_fields, key=lambda f: 0 if f == "torch_dtype" else 1)
+    for field in ordered_fields:
+        value = runtime_dtype if field == "dtype" else string_dtype
+        field_set = False
+        try:
+            setattr(config, field, value)
+            field_set = True
+        except Exception:
+            try:
+                config.__dict__[field] = value
+                field_set = True
+            except Exception:
+                pass
+        success = success or field_set
+
+    if not success:
+        set_dtype_in_config_fallback(config, dtype)
 
 def set_dtype_in_config_fallback(config, dtype):
     try:

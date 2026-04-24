@@ -17,6 +17,10 @@
 __all__ = [
     "create_empty_model",
     "set_additional_modules",
+    "finalize_huggingface_model",
+    "patch_gemma4_vllm_lora_support",
+    "patch_gemma4_vllm_k_eq_v_support",
+    "extract_gdn_layers",
     "extract_vision_layers",
     "get_model_layer_config",
     "compare_attributes",
@@ -29,7 +33,7 @@ import os
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
-from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config
+from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
 
 def is_comparable(val):
     # Don't treat tensors as comparable, only basic types
@@ -280,6 +284,16 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     new_config.vocab_size = 1
     new_config.pad_token_id = 0
 
+    _set_config_attrs(new_config, {
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 1,
+        "linear_key_head_dim": 1,
+        "linear_value_head_dim": 1,
+        "linear_conv_kernel_dim": 1,
+        "hidden_size_per_layer_input": 1,
+        "vocab_size_per_layer_input": 8,
+    })
+
     # Set attention module head_dim
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})
@@ -296,6 +310,183 @@ def _set_config_attrs(config_obj, attrs_to_set):
     for attr, value in attrs_to_set.items():
         if hasattr(config_obj, attr):
             setattr(config_obj, attr, value)
+pass
+
+def _get_model_device(model):
+    for tensor in model.parameters():
+        return tensor.device
+    for tensor in model.buffers():
+        return tensor.device
+    return torch.device("cpu")
+pass
+
+def patch_gemma4_vllm_lora_support():
+    from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
+    from vllm.model_executor.models import interfaces as vllm_model_interfaces
+    from vllm.lora import model_manager as vllm_lora_model_manager
+    try:
+        from vllm.v1.worker import lora_model_runner_mixin
+    except ImportError:
+        lora_model_runner_mixin = None
+    from unsloth_zoo import vllm_lora_worker_manager
+
+    Gemma4ForConditionalGeneration.supports_lora = True
+    Gemma4ForConditionalGeneration.embedding_modules = {}
+
+    # vLLM's MoE-LoRA path (vllm.lora.utils.process_packed_modules_mapping)
+    # requires ``get_expert_mapping`` on either the top-level model or a
+    # direct child. Gemma4ForConditionalGeneration routes through its
+    # ``language_model`` child (Gemma4ForCausalLM), which upstream has no
+    # such method, so vLLM raises ``AttributeError`` before create_lora_manager
+    # even runs. Install the method on both: the outer wrapper delegates to
+    # the inner causal LM, and the inner causal LM builds the mapping from
+    # its FusedMoE experts via ``FusedMoE.make_expert_params_mapping``.
+    try:
+        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+    except ImportError:
+        Gemma4ForCausalLM = None
+        FusedMoE = None
+
+    if Gemma4ForCausalLM is not None and FusedMoE is not None and \
+            not hasattr(Gemma4ForCausalLM, "get_expert_mapping"):
+
+        def _gemma4_causal_lm_get_expert_mapping(self):
+            # Gemma 4 MoE checkpoints expose per-expert entries named
+            # gate_proj / up_proj / down_proj after the HF-to-vLLM remap
+            # in Gemma4ForCausalLM.load_weights. Mirror Qwen3 / deepseek_v2.
+            num_experts = getattr(self.config, "num_experts", 0)
+            if not num_experts:
+                return []
+            num_redundant_experts = getattr(self, "num_redundant_experts", 0)
+            return FusedMoE.make_expert_params_mapping(
+                self,
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=num_experts,
+                num_redundant_experts=num_redundant_experts,
+            )
+
+        Gemma4ForCausalLM.get_expert_mapping = _gemma4_causal_lm_get_expert_mapping
+
+    if not hasattr(Gemma4ForConditionalGeneration, "get_expert_mapping"):
+        def _gemma4_cond_get_expert_mapping(self):
+            language_model = getattr(self, "language_model", None)
+            if language_model is None:
+                return []
+            inner = getattr(language_model, "get_expert_mapping", None)
+            if inner is None:
+                return []
+            return inner()
+
+        Gemma4ForConditionalGeneration.get_expert_mapping = (
+            _gemma4_cond_get_expert_mapping
+        )
+
+    if not hasattr(vllm_model_interfaces.supports_lora, "_unsloth_gemma4_patch"):
+        original_supports_lora = vllm_model_interfaces.supports_lora
+
+        def patched_supports_lora(model):
+            if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
+                return True
+            return original_supports_lora(model)
+
+        patched_supports_lora._unsloth_gemma4_patch = True
+        vllm_model_interfaces.supports_lora = patched_supports_lora
+        if lora_model_runner_mixin is not None:
+            lora_model_runner_mixin.supports_lora = patched_supports_lora
+
+    if not hasattr(vllm_lora_model_manager.create_lora_manager, "_unsloth_gemma4_patch"):
+        original_create_lora_manager = vllm_lora_model_manager.create_lora_manager
+
+        def patched_create_lora_manager(model, *args, **kwargs):
+            if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
+                lora_manager_cls = kwargs.pop("lora_manager_cls", vllm_lora_model_manager.LoRAModelManager)
+                return lora_manager_cls(model = model, *args, **kwargs)
+            return original_create_lora_manager(model, *args, **kwargs)
+
+        patched_create_lora_manager._unsloth_gemma4_patch = True
+        vllm_lora_model_manager.create_lora_manager = patched_create_lora_manager
+        vllm_lora_worker_manager.create_lora_manager = patched_create_lora_manager
+pass
+
+# vLLM's Gemma4 k_eq_v path now expects qkv_proj to always expose q+k+v.
+# For prequantized bitsandbytes checkpoints, the synthetic v shard is still
+# missing from the quant-state dict on full-attention k_eq_v layers, so we
+# materialize it during loader-side quant-state stacking instead of patching
+# the runtime attention forward.
+def patch_gemma4_vllm_k_eq_v_support():
+    try:
+        from vllm.model_executor.model_loader.bitsandbytes_loader import (
+            BitsAndBytesModelLoader,
+        )
+    except ImportError:
+        return
+
+    if hasattr(
+        BitsAndBytesModelLoader._stack_quantization_states,
+        "_unsloth_gemma4_k_eq_v_patch",
+    ):
+        return
+
+    original_stack_quantization_states = (
+        BitsAndBytesModelLoader._stack_quantization_states
+    )
+
+    def _get_gemma4_text_config(model):
+        config = getattr(model, "config", None)
+        if config is None:
+            return None
+
+        text_config = getattr(config, "text_config", config)
+        model_type = getattr(config, "model_type", None)
+        text_model_type = getattr(text_config, "model_type", None)
+        if model_type != "gemma4" and text_model_type not in ("gemma4", "gemma4_text"):
+            return None
+        return text_config
+
+    def _get_gemma4_k_eq_v_qkv_param_names(model):
+        text_config = _get_gemma4_text_config(model)
+        if text_config is None or not getattr(text_config, "attention_k_eq_v", False):
+            return ()
+
+        param_names = set(name for name, _ in model.named_parameters())
+        qkv_param_names = []
+        for layer_idx, layer_type in enumerate(getattr(text_config, "layer_types", ())):
+            if layer_type != "full_attention":
+                continue
+
+            for prefix in ("language_model.model", "model"):
+                qkv_param_name = (
+                    f"{prefix}.layers.{layer_idx}.self_attn.qkv_proj.weight"
+                )
+                if qkv_param_name in param_names:
+                    qkv_param_names.append(qkv_param_name)
+                    break
+        return tuple(qkv_param_names)
+
+    def patched_stack_quantization_states(self, model, quant_state_dict):
+        stacked_quant_state_dict = original_stack_quantization_states(
+            self, model, quant_state_dict
+        )
+
+        for qkv_param_name in _get_gemma4_k_eq_v_qkv_param_names(model):
+            quant_states = stacked_quant_state_dict.get(qkv_param_name)
+            if not isinstance(quant_states, dict) or 2 in quant_states or 1 not in quant_states:
+                continue
+
+            # Gemma4 full-attention k_eq_v layers reuse K as V. The raw weight
+            # loader already duplicates k_proj -> v_proj; prequant BnB needs the
+            # same duplication for shard-local QuantState metadata.
+            quant_states[2] = deepcopy(quant_states[1])
+
+        return stacked_quant_state_dict
+
+    patched_stack_quantization_states._unsloth_gemma4_k_eq_v_patch = True
+    BitsAndBytesModelLoader._stack_quantization_states = (
+        patched_stack_quantization_states
+    )
 pass
 
 
@@ -351,6 +542,16 @@ def create_empty_vision_model(config, dtype = torch.float16):
         "intermediate_size": 1,
         "head_dim": 1,
         "pad_token_id": 1,
+        "hidden_size_per_layer_input": 1,
+        "vocab_size_per_layer_input": 8,
+    })
+    # Qwen 3.5 or GDN related attrs
+    _set_config_attrs(new_config.text_config, {
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 1,
+        "linear_key_head_dim": 1,
+        "linear_value_head_dim": 1,
+        "linear_conv_kernel_dim": 1,
     })
 
     # Common vision attributes
@@ -369,12 +570,8 @@ def create_empty_vision_model(config, dtype = torch.float16):
     text_layers = config.text_config.num_hidden_layers
     vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
 
-    # Set minimal sizes for different model types
-    if model_type == "qwen2_5_vl":
+    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
         new_config.vision_config.out_hidden_size = 1
-    elif model_type == "qwen3_vl":
-        new_config.vision_config.out_hidden_size = 1
-
 
     num_layers = max(text_layers, vision_layers)
     new_model = model_cls(new_config)
@@ -400,8 +597,14 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
 
 @torch.inference_mode
 def set_additional_modules(new_model, quant_state_dict, config):
+    def _unwrap_tensor(val):
+        return getattr(val, "data", val)
+
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
+        language_model_prefix = "model.language_model"
+    elif hasattr(new_model, "model") and hasattr(new_model.model, "language_model"):
+        language_model = new_model.model.language_model
         language_model_prefix = "model.language_model"
     else:
         language_model_prefix = "model"
@@ -425,7 +628,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
     # we cannot use the normal embedding init because gemma3 uses Gemma3TextScaledWordEmbedding which wraps around nn.Embedding and has a scaling factor. This new init ensures that we respect the forward from original model.
     def set_embedding(module, embed_tokens_key, pad_token_id, requires_grad=False):
         num_embeddings, embedding_dim = quant_state_dict[embed_tokens_key].shape
-        embeddings = quant_state_dict[embed_tokens_key]
+        embeddings = _unwrap_tensor(quant_state_dict[embed_tokens_key])
         if isinstance(embeddings, torch.Tensor):
             # in the newer vLLM versions, this seems to return a tensor which can't be assigned to embedding weight
             # we need to convert that to nn.Paramter and then pass it on
@@ -444,6 +647,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
     # Norm
     norm_key = f"{language_model_prefix}.norm.weight"
     norm = quant_state_dict[norm_key]
+    norm = _unwrap_tensor(norm)
     norm = torch.nn.Parameter(norm, requires_grad = False)
     language_model.norm.weight = norm
 
@@ -458,7 +662,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
 
     # Check if lm_head exists in the state dict
     if lmhead_key in quant_state_dict:
-        weight = quant_state_dict[lmhead_key]
+        weight = _unwrap_tensor(quant_state_dict[lmhead_key])
         from torch.nn import Linear
 
         # Create Linear layer with zero dimensions to avoid any weight allocation
@@ -493,14 +697,18 @@ def set_additional_modules(new_model, quant_state_dict, config):
         x for x in quant_state_dict.keys()
         if not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list"))
     )
-    print(f'Performing substitution for {additional_keys=}')
+    if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+        print(f'Performing substitution for {additional_keys=}')
 
+    _new_model_buffer_names = {name for name, _ in new_model.named_buffers()}
     for key in additional_keys:
         # sometimes it can be in new_model.model. instead of new_model.
         for prefix in ['new_', 'new_model.']:
             try:
                 val = quant_state_dict[key]
-                if isinstance(val, torch.Tensor):
+                val = _unwrap_tensor(val)
+                # why: upstream may register e.g. Gemma4VisionModel.std_bias/std_scale as buffers, so preserve buffer vs parameter semantics.
+                if isinstance(val, torch.Tensor) and key not in _new_model_buffer_names:
                     val = torch.nn.Parameter(val,requires_grad=False)
                 exec(f"{prefix}{key} = val")
                 break
@@ -508,6 +716,112 @@ def set_additional_modules(new_model, quant_state_dict, config):
                 continue
 
     pass
+pass
+
+@torch.inference_mode
+def finalize_huggingface_model(
+    new_model,
+    original_meta_model,
+    config,
+    dtype,
+    quantization_config = None,
+    bnb_config = None,
+):
+    if original_meta_model is not None:
+        copy_attributes(original_meta_model, new_model)
+
+    _inner_model = getattr(new_model, "model", None)
+    _layer_owners = [getattr(_inner_model, "language_model", None), _inner_model]
+    for _layers_owner in _layer_owners:
+        if _layers_owner is None or not hasattr(_layers_owner, "layers"):
+            continue
+        for layer_idx, layer in enumerate(_layers_owner.layers):
+            if hasattr(layer, "layer_idx"):
+                layer.layer_idx = layer_idx
+            for attr_name in ("self_attn", "cross_attn", "mlp", "linear_attn"):
+                submodule = getattr(layer, attr_name, None)
+                if submodule is not None and hasattr(submodule, "layer_idx"):
+                    submodule.layer_idx = layer_idx
+
+    for module in new_model.modules():
+        module_config = getattr(module, "config", None)
+        if module_config is not None:
+            set_dtype_in_config(module_config, dtype)
+
+    target_device = _get_model_device(new_model)
+    text_config = getattr(config, "text_config", config)
+    vision_config = getattr(config, "vision_config", None)
+
+    for module in new_model.modules():
+        if hasattr(module, "rotary_emb"):
+            rotary_config = text_config
+            current_rotary_config = getattr(module.rotary_emb, "config", None)
+            is_vision_rotary = (
+                vision_config is not None and
+                current_rotary_config is not None and
+                current_rotary_config.__class__ == vision_config.__class__
+            )
+            if is_vision_rotary:
+                rotary_config = vision_config
+            if not (getattr(config, "model_type", None) == "gemma4" and is_vision_rotary):
+                module.rotary_emb = module.rotary_emb.__class__(
+                    config = rotary_config,
+                    device = target_device,
+                )
+            for buffer_name in ("inv_freq", "original_inv_freq"):
+                buffer = getattr(module.rotary_emb, buffer_name, None)
+                if torch.is_tensor(buffer) and buffer.is_floating_point():
+                    module.rotary_emb._buffers[buffer_name] = buffer.to(
+                        device = target_device,
+                        dtype = dtype,
+                    )
+        if hasattr(module, "rotary_pos_emb"):
+            if vision_config is None:
+                raise ValueError("Unsloth: vision_config is required for models with vision rotary_pos_emb")
+            head_dim = vision_config.hidden_size // vision_config.num_heads
+            module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)
+        if hasattr(module, "rotary_emb_local"):
+            local_rope_config = deepcopy(text_config)
+            local_rope_config.rope_theta = text_config.rope_local_base_freq
+            local_rope_config.rope_scaling = {"rope_type": "default"}
+            module.rotary_emb_local = module.rotary_emb_local.__class__(
+                config = local_rope_config,
+                device = target_device,
+            )
+            del local_rope_config
+
+    if (quantization_config or {}) == {} and bnb_config is None:
+        new_model = new_model.to(device = target_device, dtype = dtype)
+
+    if getattr(config, "model_type", None) == "gemma4":
+        for module in new_model.modules():
+            rotary_emb = getattr(module, "rotary_emb", None)
+            if rotary_emb is None:
+                continue
+            rotary_cfg = getattr(rotary_emb, "config", None)
+            if rotary_cfg is None:
+                continue
+            # why: rotary_emb.config was the shrunken stub from create_empty_vision_model; use the outer real vision_config for vision rotary.
+            if vision_config is not None and rotary_cfg.__class__ == vision_config.__class__:
+                rotary_cfg = vision_config
+                rotary_emb.config = vision_config
+            fresh_rotary_emb = rotary_emb.__class__(
+                config = rotary_cfg,
+                device = target_device,
+            )
+            for attr_name in ("max_seq_len_cached", "original_max_seq_len"):
+                if hasattr(fresh_rotary_emb, attr_name):
+                    setattr(rotary_emb, attr_name, getattr(fresh_rotary_emb, attr_name))
+            for attr_name, attr_value in fresh_rotary_emb.__dict__.items():
+                if attr_name == "attention_scaling" or attr_name.endswith("_attention_scaling"):
+                    setattr(rotary_emb, attr_name, attr_value)
+            for buffer_name, buffer in fresh_rotary_emb._buffers.items():
+                if torch.is_tensor(buffer) and buffer.is_floating_point():
+                    rotary_emb._buffers[buffer_name] = buffer.to(
+                        device = target_device,
+                        dtype = torch.float32,
+                    )
+    return new_model
 pass
 
 def get_model_layer_config(return_non_layered=True):
@@ -520,6 +834,7 @@ def get_model_layer_config(return_non_layered=True):
     """
     layer_templates = {
         'standard_layers': {
+            "model.language_model.layers.{kk}.layer_scalar",
             "model.language_model.layers.{kk}.self_attn.q_proj",
             "model.language_model.layers.{kk}.self_attn.k_proj",
             "model.language_model.layers.{kk}.self_attn.v_proj",
@@ -530,6 +845,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.language_model.layers.{kk}.mlp.down_proj",
 
+            "model.layers.{kk}.layer_scalar",
             "model.layers.{kk}.self_attn.q_proj",
             "model.layers.{kk}.self_attn.k_proj",
             "model.layers.{kk}.self_attn.v_proj",
@@ -539,6 +855,29 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.up_proj",
             "model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.layers.{kk}.mlp.down_proj",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_qkv",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_z",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_b",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_a",
+            "model.language_model.layers.{kk}.linear_attn.conv1d",
+            "model.language_model.layers.{kk}.linear_attn.out_proj",
+            "model.language_model.layers.{kk}.linear_attn.dt_bias",
+            "model.language_model.layers.{kk}.linear_attn.A_log",
+
+            "model.layers.{kk}.linear_attn.in_proj_qkv",
+            "model.layers.{kk}.linear_attn.in_proj_z",
+            "model.layers.{kk}.linear_attn.in_proj_b",
+            "model.layers.{kk}.linear_attn.in_proj_a",
+            "model.layers.{kk}.linear_attn.conv1d",
+            "model.layers.{kk}.linear_attn.out_proj",
+            "model.layers.{kk}.linear_attn.dt_bias",
+            "model.layers.{kk}.linear_attn.A_log",
+
+            # Gemma4 per-layer text projections
+            "model.language_model.layers.{kk}.per_layer_input_gate",
+            "model.language_model.layers.{kk}.per_layer_projection",
+            "model.layers.{kk}.per_layer_input_gate",
+            "model.layers.{kk}.per_layer_projection",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
@@ -560,6 +899,12 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.vision_model.encoder.layers.{kk}.post_layernorm",
             "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm1",
             "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm2",
+            "model.vision_tower.encoder.layers.{kk}.input_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.post_attention_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.pre_feedforward_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.post_feedforward_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.q_norm",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.k_norm",
 
             # Mistral3 vision norms
             "model.vision_tower.transformer.layers.{kk}.attention_norm",
@@ -567,6 +912,12 @@ def get_model_layer_config(return_non_layered=True):
 
             # qwen3 vl
             "model.visual.deepstack_merger_list.{kk}.norm",
+            "model.language_model.layers.{kk}.linear_attn.norm",
+            "model.layers.{kk}.linear_attn.norm",
+
+            # Gemma4 per-layer text projection norm
+            "model.language_model.layers.{kk}.post_per_layer_input_norm",
+            "model.layers.{kk}.post_per_layer_input_norm",
         },
         'vision_layers': {
 
@@ -610,6 +961,13 @@ def get_model_layer_config(return_non_layered=True):
 
             "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc1",
             "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc2",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.q_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.k_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.v_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.o_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.mlp.gate_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.mlp.up_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.mlp.down_proj.linear",
 
             # qwen2.5_vl style
             "model.visual.blocks.{kk}.attn.qkv",
@@ -685,6 +1043,11 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.patch_positional_embedding",
             "model.vision_tower.patch_conv",
             "model.vision_tower.ln_pre",
+            "model.vision_tower.std_bias",
+            "model.vision_tower.std_scale",
+            "model.vision_tower.patch_embedder.position_embedding_table",
+            "model.vision_tower.patch_embedder.input_proj",
+            "model.embed_vision.embedding_projection",
 
             # qwen 3 vl
             "model.visual.pos_embed",
@@ -732,6 +1095,11 @@ def get_model_layer_counts(config):
             "vision_layers": getattr(config.vision_config, "depth", 27),
             "deepstack_layers": getattr(config.vision_config, "deepstack_depth", 3),
         }
+    elif model_type == "gemma4":
+        return {
+            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+        }
     elif model_type == "gemma3":
         return {
             "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
@@ -757,6 +1125,73 @@ def _get_nested_attr(obj, attr_path: str):
     except (AttributeError, IndexError):
         return None
     return None
+
+
+def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_state_dict):
+    gdn = gdn_module
+
+    def store(name, value):
+        state_dict[name] = value
+        quant_state_dict[name] = value
+
+    if hasattr(gdn, "in_proj_qkvz"):
+        proj = getattr(gdn.in_proj_qkvz, "base_layer", gdn.in_proj_qkvz)
+        weight = proj.weight
+        if getattr(weight, "bnb_quant_state", None) is not None:
+            raise NotImplementedError(
+                "Unsloth: BnB 4-bit fused Qwen3.5 in_proj_qkvz conversion is not "
+                "yet supported; the split projections require preserved per-shard "
+                "quant_state metadata."
+            )
+        output_sizes = list(proj.output_sizes)
+        if len(output_sizes) < 4:
+            raise ValueError(
+                f"Unsloth: expected in_proj_qkvz to have >=4 output shards (q,k,v,z), "
+                f"got {len(output_sizes)}: {output_sizes}"
+            )
+        offsets = [0]
+        for s in output_sizes:
+            offsets.append(offsets[-1] + s)
+        qkv_weight = weight[offsets[0]:offsets[3]]
+        z_weight = weight[offsets[3]:offsets[4]]
+        store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
+        store(f"{prefix}.in_proj_z.weight", z_weight)
+        if weight.dtype == torch.float8_e4m3fn:
+            scale_suffix = None
+            if hasattr(proj, 'weight_scale'):
+                ws = proj.weight_scale
+                scale_suffix = '.weight_scale'
+            elif hasattr(proj, 'weight_scale_inv'):
+                ws = proj.weight_scale_inv
+                scale_suffix = '.weight_scale_inv'
+            else:
+                ws = None
+            if ws is not None:
+                if ws.ndim == 2:
+                    if ws.shape[1] > 1:
+                        block_size = proj.weight_block_size[0]
+                        scale_offsets = [x // block_size for x in offsets]
+                    else:
+                        scale_offsets = offsets
+                else:
+                    scale_offsets = offsets
+                qkv_scale = ws[scale_offsets[0]:scale_offsets[3]]
+                z_scale = ws[scale_offsets[3]:scale_offsets[4]]
+                store(f"{prefix}.in_proj_qkv{scale_suffix}", qkv_scale)
+                store(f"{prefix}.in_proj_z{scale_suffix}", z_scale)
+    else:
+        get_state_dict(f"{prefix}.in_proj_qkv", 0, state_dict, gdn.in_proj_qkv, slice_weights=False)
+        get_state_dict(f"{prefix}.in_proj_z", 0, state_dict, gdn.in_proj_z, slice_weights=False)
+
+    get_state_dict(f"{prefix}.in_proj_b", 0, state_dict, gdn.in_proj_ba)
+    get_state_dict(f"{prefix}.in_proj_a", 1, state_dict, gdn.in_proj_ba)
+
+    store(f"{prefix}.conv1d.weight", gdn.conv1d.weight.data)
+    store(f"{prefix}.dt_bias", gdn.dt_bias.data)
+    store(f"{prefix}.A_log", gdn.A_log.data)
+
+    get_state_dict(f"{prefix}.out_proj", 0, state_dict, gdn.out_proj)
+pass
 
 
 def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict):
@@ -790,7 +1225,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
             if layer_module is not None:
                 if "qkv" in layer_path:
-                    if model_type in ("qwen2_5_vl", "qwen3_vl"):
+                    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
                         # If the HF model too prefers having merged qkv, we do this
                         # This is evident in qwen-2.5-vl and qwen-3-vl so far.
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
@@ -809,7 +1244,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                     if isinstance(layer_module, torch.nn.Module):
                         if hasattr(layer_module, 'weight'):
                             get_state_dict(layer_path, 0, state_dict, layer_module)
-                    elif isinstance(layer_module, torch.nn.Parameter):
+                    elif isinstance(layer_module, torch.Tensor):
                         state_dict[f"{layer_path}"] = layer_module.data
                         quant_state_dict[f"{layer_path}"] = state_dict[f"{layer_path}"]
                     else:
@@ -824,7 +1259,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
             if hasattr(component, 'weight'):
                 # Prefer using get_state_dict when possible
                 get_state_dict(component_path, 0, state_dict, component)
-            elif isinstance(component, torch.nn.Parameter):
+            elif isinstance(component, torch.Tensor):
                 state_dict[component_path] = component.data
                 quant_state_dict[component_path] = component.data
             elif isinstance(component, torch.nn.Module):

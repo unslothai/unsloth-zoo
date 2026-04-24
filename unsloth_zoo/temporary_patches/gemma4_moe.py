@@ -159,7 +159,10 @@ def patch_gemma4_moe():
                     **kwargs,
                 )
 
-            # RETURN_HIDDEN_STATES mode - return hidden_states instead of logits
+            # RETURN_HIDDEN_STATES mode - return hidden_states instead of logits.
+            # Drop return_dict from kwargs if TRL/caller pre-set it to avoid
+            # "got multiple values for keyword argument 'return_dict'".
+            kwargs.pop("return_dict", None)
             outputs = self.model(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
