@@ -257,31 +257,23 @@ def patch_gpt_oss():
         # triton_kernels MXFP4 matmul is Hopper-only; Ampere/Ada/Blackwell
         # abort with "Only Hopper swizzling is supported". Force dequantize
         # on any non-Hopper (or CPU-only) environment before load.
-        if not getattr(_Mxfp4Q, "_unsloth_hopper_gate_patched", False):
+        if not getattr(_Mxfp4Q, "_unsloth_cpu_gate_patched", False):
             _orig_before_load = _Mxfp4Q._process_model_before_weight_loading
 
             def _patched_before_load(self, model, **kwargs):
                 try:
                     import torch as _torch
-                    if getattr(self.quantization_config, "dequantize", False):
-                        pass
-                    elif not _torch.cuda.is_available():
+                    if (
+                        not _torch.cuda.is_available()
+                        and not getattr(self.quantization_config, "dequantize", False)
+                    ):
                         self.quantization_config.dequantize = True
-                    else:
-                        # Scan every visible device so multi-GPU /
-                        # device_map setups do not misread index 0.
-                        HOPPER_COMPATIBLE = {9}
-                        for i in range(_torch.cuda.device_count()):
-                            major, _ = _torch.cuda.get_device_capability(i)
-                            if major not in HOPPER_COMPATIBLE:
-                                self.quantization_config.dequantize = True
-                                break
                 except Exception:
                     pass
                 return _orig_before_load(self, model, **kwargs)
 
             _Mxfp4Q._process_model_before_weight_loading = _patched_before_load
-            _Mxfp4Q._unsloth_hopper_gate_patched = True
+            _Mxfp4Q._unsloth_cpu_gate_patched = True
     except Exception as e:
         return raise_error(
             "transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer post-load swizzle patch", e,
