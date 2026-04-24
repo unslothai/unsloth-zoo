@@ -540,6 +540,10 @@ class MLXTrainer:
             apply_gradient_checkpointing(model)
             print("Unsloth: Using gradient checkpointing to reduce memory.")
 
+        # Apply compile patches (fixes cache/offset issues for Qwen3.5, etc.)
+        from .mlx_compile import install_mlx_compile_patches
+        install_mlx_compile_patches()
+
         # Patch GatedDeltaNet (Qwen3.5) with memory-efficient custom VJP
         config = getattr(model, "_config", {})
         model_type = config.get("model_type", "") if isinstance(config, dict) else ""
