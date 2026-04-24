@@ -198,6 +198,43 @@ def _fix_gemma4_kv_sharing(model):
           f"({n_shared} shared layers now read correct K/V).")
 
 
+def _fix_qwen35_attention_cache(model):
+    """Fix Qwen3.5 attention crash when cache=None during training.
+
+    mlx-vlm's Qwen3.5 attention does `cache.offset + 1` without checking
+    if cache is None. During training cache is always None. Patch the
+    attention __call__ to handle cache=None by computing position_ids
+    from scratch.
+    """
+    try:
+        import importlib
+        mod = importlib.import_module("mlx_vlm.models.qwen3_5.language")
+        attn_cls = getattr(mod, "Qwen3_5Attention", None)
+        if attn_cls is None:
+            return
+    except (ImportError, AttributeError):
+        return
+
+    if getattr(attn_cls, "_unsloth_cache_patched", False):
+        return
+
+    original_attn_call = attn_cls.__call__
+
+    def patched_attn_call(self, x, mask=None, cache=None, position_ids=None):
+        # When training (cache=None) and position_ids=None, compute them
+        if cache is None and position_ids is None:
+            import mlx.core as mx
+            L = x.shape[1]
+            position_ids = mx.arange(L)
+            position_ids = mx.expand_dims(position_ids, axis=0)
+            position_ids = mx.tile(position_ids, (3, 1, 1))
+        return original_attn_call(self, x, mask=mask, cache=cache, position_ids=position_ids)
+
+    attn_cls.__call__ = patched_attn_call
+    attn_cls._unsloth_cache_patched = True
+    print("Unsloth: Fixed Qwen3.5 attention for training (cache=None).")
+
+
 def _safe_getsource(obj) -> str:
     try:
         return inspect.getsource(obj)
