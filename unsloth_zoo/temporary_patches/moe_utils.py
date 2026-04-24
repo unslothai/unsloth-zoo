@@ -232,7 +232,7 @@ def _check_grouped_gemm_available():
         from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
         _GROUPED_GEMM_AVAILABLE = True
         _init_triton_allocator()
-    except (ImportError, ModuleNotFoundError):
+    except Exception:
         _GROUPED_GEMM_AVAILABLE = False
     return _GROUPED_GEMM_AVAILABLE
 
