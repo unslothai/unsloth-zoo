@@ -398,6 +398,38 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     return new_model, original_meta_model, num_layers, layer_names
 
 
+def _set_lfm2_modules(language_model, language_model_prefix, quant_state_dict, config):
+    """Handle LFM2-specific modules: embedding_norm and conv.conv weights."""
+    # LFM2 uses embedding_norm instead of norm
+    embedding_norm_key = f"{language_model_prefix}.embedding_norm.weight"
+    if embedding_norm_key in quant_state_dict:
+        norm = quant_state_dict[embedding_norm_key]
+        norm = torch.nn.Parameter(norm, requires_grad=False)
+        language_model.embedding_norm.weight = norm
+
+    # Conv1d weights — must be assigned directly to preserve nn.Conv1d module type
+    # (standard_layers uses nn.Linear for all entries, which would break Conv1d)
+    text_config_tmp = getattr(config, "text_config", config)
+    num_hidden_layers = getattr(text_config_tmp, "num_hidden_layers", 0)
+    for kk in range(num_hidden_layers):
+        conv_weight_key = f"{language_model_prefix}.layers.{kk}.conv.conv.weight"
+        if conv_weight_key not in quant_state_dict:
+            continue
+        conv_layer = language_model.layers[kk].conv.conv
+        # vLLM wraps weights as ModelWeightParameter; unwrap via .data
+        w = quant_state_dict[conv_weight_key]
+        conv_layer.weight = torch.nn.Parameter(
+            getattr(w, 'data', w), requires_grad=False
+        )
+        conv_bias_key = f"{language_model_prefix}.layers.{kk}.conv.conv.bias"
+        if conv_bias_key in quant_state_dict:
+            b = quant_state_dict[conv_bias_key]
+            conv_layer.bias = torch.nn.Parameter(
+                getattr(b, 'data', b), requires_grad=False
+            )
+pass
+
+
 @torch.inference_mode
 def set_additional_modules(new_model, quant_state_dict, config):
     if hasattr(new_model, "language_model"):
@@ -443,9 +475,13 @@ def set_additional_modules(new_model, quant_state_dict, config):
 
     # Norm
     norm_key = f"{language_model_prefix}.norm.weight"
-    norm = quant_state_dict[norm_key]
-    norm = torch.nn.Parameter(norm, requires_grad = False)
-    language_model.norm.weight = norm
+    if norm_key in quant_state_dict:
+        norm = quant_state_dict[norm_key]
+        norm = torch.nn.Parameter(norm, requires_grad = False)
+        language_model.norm.weight = norm
+
+    # LFM2-specific modules (embedding_norm, conv.conv weights)
+    _set_lfm2_modules(language_model, language_model_prefix, quant_state_dict, config)
 
     # LM Head. Do note that for some models, like Mistral3ForConditionalGeneration,
     # there can be mismatch in the value of tie_word_embeddings between config and text_config
@@ -539,6 +575,15 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.up_proj",
             "model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.layers.{kk}.mlp.down_proj",
+
+            # LFM2 hybrid model layers (attention + short convolution)
+            "model.layers.{kk}.self_attn.out_proj",  # LFM2 attention uses out_proj instead of o_proj
+            "model.layers.{kk}.conv.in_proj",
+            "model.layers.{kk}.conv.out_proj",
+            # NOTE: conv.conv is nn.Conv1d, NOT nn.Linear — handled in set_additional_modules
+            "model.layers.{kk}.feed_forward.w1",
+            "model.layers.{kk}.feed_forward.w3",
+            "model.layers.{kk}.feed_forward.w2",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
@@ -555,6 +600,13 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.post_feedforward_layernorm",
             "model.layers.{kk}.self_attn.q_norm",
             "model.layers.{kk}.self_attn.k_norm",
+
+            # LFM2 hybrid model norms
+            "model.layers.{kk}.operator_norm",       # pre-block norm (replaces input_layernorm)
+            "model.layers.{kk}.ffn_norm",             # post-block norm (replaces post_attention_layernorm)
+            "model.layers.{kk}.self_attn.q_layernorm",  # QK norm inside attention
+            "model.layers.{kk}.self_attn.k_layernorm",  # QK norm inside attention
+
             "model.visual.blocks.{kk}.norm1",
             "model.visual.blocks.{kk}.norm2",
             "model.vision_tower.vision_model.encoder.layers.{kk}.post_layernorm",
