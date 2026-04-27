@@ -32,4 +32,5 @@ from .pixtral import *
 from .ministral import *
 from .mxfp4 import *
 from .bitsandbytes import *
+from .moe_bnb_transformers import *
 from .flex_attention_bwd import *

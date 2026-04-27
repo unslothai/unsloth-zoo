@@ -1317,6 +1317,65 @@ pass
 TEMPORARY_PATCHES.append(patch_peft_dispatch_bnb_4bit)
 
 
+class _ParamShapeProxy:
+    """
+    Wrapper class so that attributes for 4bit MoE params are exposed correctly for compatibility with PEFT LoRA, everything else delegates.
+    """
+
+    def __init__(self, param, shape):
+        self._param = param
+        self._shape = shape
+        self._ndim = len(shape)
+
+    @property
+    def shape(self):
+        return self._shape
+    
+    @property
+    def ndim(self) -> int:
+        return self._ndim
+
+    def __getattr__(self, name):
+        return getattr(self._param, name)
+
+
+def patch_peft_param_wrapper_4bit_expert_shape():
+    """
+    ParamWrapper.get_param() derives shape from param.shape, which is incorrect for Params4bit parameters.
+    Patch ParamWrapper.get_param() to return a proxy that exposes .shape = _original_shape for 4bit MoE params.
+    """
+    try:
+        from peft.tuners.lora.layer import ParamWrapper
+        from peft.utils.integrations import get_bnb_param_type
+    except (ImportError, AttributeError):
+        return
+
+    if getattr(ParamWrapper.get_param, "_unsloth_4bit_expert_patched", False):
+        return
+
+    _original_get_param = ParamWrapper.get_param
+
+    def _patched_get_param(self):
+        param = _original_get_param(self)
+        if get_bnb_param_type(param) == "4bit":
+            shape = getattr(param, "_original_shape", None)
+            if shape is not None and len(shape) == 3:
+                num_experts, in_features, out_features = shape
+                self.num_experts = num_experts
+                self.in_features = in_features
+                self.out_features = out_features
+                return _ParamShapeProxy(param, shape)
+            else:
+                # TODO: Can we raise an error here?
+                pass
+        return param
+
+    _patched_get_param._unsloth_4bit_expert_patched = True
+    patch_function(ParamWrapper, "get_param", _patched_get_param)
+pass
+TEMPORARY_PATCHES.append(patch_peft_param_wrapper_4bit_expert_shape)
+
+
 def patch_trl_push_to_hub_token():
     """Ensure to_dict() always includes push_to_hub_token for TRL compat.
 
