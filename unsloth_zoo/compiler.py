@@ -1562,7 +1562,7 @@ $LOGITSCALINGMULTIPLY$
 $LOGITSCALINGDIVISION$
 $LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$SPACES$loss = self.loss_function($NEWLINES$$LOGITS$, $LABELS$, $VOCABSIZE$$KWARGS$$NEWLINES$)
+if labels is not None:$SPACES$loss = self.loss_function($NEWLINES$$LOGITS$,$NEWLINES$$LABELS$,$NEWLINES$$VOCABSIZE$$KWARGS$,?$NEWLINES$)
 """
 
 cross_entropy_replacement_2 = """
@@ -1782,7 +1782,7 @@ def apply_fused_lm_head(forward, module=None):
                 r"self\.config\.get_text_config\(\)\.vocab_size"
                 ")",
             )
-            .replace("$KWARGS$", r"(?:, \*\*(loss_kwargs|kwargs))?")
+            .replace("$KWARGS$", r"(?:,[\s\n]{0,}\*\*(loss_kwargs|kwargs))?")
             .replace("$LOGITSUPCAST$", r"(?:logits = logits\.float\(\))?")
             .replace("$LABELSDEVICE$", r"(?:labels = labels\.to\([^\)]{1,}\))?")
             .replace(
@@ -1992,6 +1992,9 @@ def test_apply_fused_lm_head():
     from transformers.models.granite.modeling_granite import GraniteForCausalLM
 
     forwards.append(GraniteForCausalLM)
+    from transformers.models.granitemoehybrid.modeling_granitemoehybrid import GraniteMoeHybridForCausalLM
+
+    forwards.append(GraniteMoeHybridForCausalLM)
     from transformers.models.gemma2.modeling_gemma2 import Gemma2ForCausalLM
 
     forwards.append(Gemma2ForCausalLM)
