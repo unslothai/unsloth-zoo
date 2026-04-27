@@ -1334,7 +1334,7 @@ def create_standalone_class(
     source = source + full_class
     if supports_return_hidden_states:
         source += (
-            f"\\n{module}.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True\\n"
+            f"\n{module}.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True\n"
         )
 
     # Remove @auto_docstring
