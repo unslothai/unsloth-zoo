@@ -51,6 +51,20 @@ _MULTIMODAL_STRIP_KEYS = (
 )
 
 
+def _convert_mlx_dtype(model, target_dtype) -> None:
+    """Cast floating-point params to target_dtype (preserves quantized ints)
+    while honoring the model's optional path-based ``cast_predicate``."""
+    import mlx.core as mx
+    from mlx.utils import tree_map_with_path
+    cast_pred = getattr(model, "cast_predicate", lambda _: True)
+    model.update(tree_map_with_path(
+        lambda k, v: v.astype(target_dtype)
+        if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) else v,
+        model.parameters(),
+    ))
+    mx.eval(model.parameters())
+
+
 def _is_vlm(config: dict) -> bool:
     """Detect whether a model config describes a VLM.
 
@@ -1078,6 +1092,7 @@ class FastMLXModel:
     def from_pretrained(
         model_name="mlx-community/Llama-3.2-1B-Instruct-4bit",
         max_seq_length=2048,
+        dtype=None,
         load_in_4bit=True,
         token=None,
         trust_remote_code=False,
@@ -1090,6 +1105,12 @@ class FastMLXModel:
         Args:
             model_name: Any HuggingFace repo name.
             max_seq_length: Maximum sequence length for training.
+            dtype: Target floating-point dtype. ``None`` (default) keeps the
+                model's native dtype. Accepts ``"float16"``, ``"bfloat16"``,
+                ``"float32"`` or the corresponding ``mx.*`` constants.
+                Quantized integer weights are preserved regardless. On M1/M2,
+                bf16 is emulated and ~40-70%% slower in prefill — fp16 is
+                recommended on those chips.
             load_in_4bit: Accepted for API compat with CUDA unsloth.
             token: HuggingFace token for gated models.
             text_only: Loading mode:
@@ -1097,6 +1118,26 @@ class FastMLXModel:
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
         """
+        target_dtype = None
+        if dtype is not None:
+            import mlx.core as mx
+            if isinstance(dtype, str):
+                target_dtype = getattr(mx, dtype, None)
+            elif dtype in (mx.float16, mx.bfloat16, mx.float32):
+                target_dtype = dtype
+            if target_dtype not in (mx.float16, mx.bfloat16, mx.float32):
+                raise ValueError(
+                    f"Unsloth: Unsupported dtype {dtype!r}. "
+                    f"Use 'float16', 'bfloat16', or 'float32'."
+                )
+            chip = mx.device_info().get("device_name", "") or ""
+            if target_dtype == mx.bfloat16 and chip.startswith(("Apple M1", "Apple M2")):
+                warnings.warn(
+                    f"Unsloth: {chip} lacks native bf16 GPU support — "
+                    f"bf16 will be emulated (~40-70%% slower prefill). "
+                    f"Pass dtype='float16' on M1/M2.",
+                    stacklevel=2,
+                )
         try:
             from mlx_lm import load as mlx_load
             from mlx_lm.utils import _download
@@ -1253,7 +1294,15 @@ class FastMLXModel:
                 )
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
-                model, processor = vlm_load(model_name, **extra_kwargs)
+                # Lazy-load when we need to convert dtype so weights are
+                # only materialized once in the target dtype.
+                vlm_kwargs = dict(extra_kwargs)
+                if target_dtype is not None:
+                    vlm_kwargs["lazy"] = True
+                model, processor = vlm_load(model_name, **vlm_kwargs)
+
+            if target_dtype is not None:
+                _convert_mlx_dtype(model, target_dtype)
 
             from .mlx_utils import (
                 normalize_mlx_chat_template,
@@ -1313,11 +1362,14 @@ class FastMLXModel:
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-lm...")
             _ensure_safe_text_wrapper_sanitize(model_type)
-            model, tokenizer, config = mlx_load(
-                model_name,
+
+            mlx_load_kwargs = dict(
                 tokenizer_config=extra_kwargs if extra_kwargs else None,
                 return_config=True,
             )
+            if target_dtype is not None and not want_runtime_quant:
+                mlx_load_kwargs["lazy"] = True
+            model, tokenizer, config = mlx_load(model_name, **mlx_load_kwargs)
 
             if want_runtime_quant:
                 import mlx.core as mx
@@ -1329,6 +1381,9 @@ class FastMLXModel:
                 )
                 mx.eval(model.parameters())
                 print(f"Unsloth: Quantized text model to {q_bits}-bit.")
+
+            if target_dtype is not None:
+                _convert_mlx_dtype(model, target_dtype)
             from .mlx_utils import normalize_mlx_chat_template
 
             tokenizer = normalize_mlx_chat_template(
