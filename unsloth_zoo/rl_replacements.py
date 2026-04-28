@@ -341,6 +341,11 @@ def grpo_compute_loss(
     get_sapo_token_loss = kwargs.get("get_sapo_token_loss", None)
     sapo_temperature_pos = kwargs.get("sapo_temperature_pos", 1.0)
     sapo_temperature_neg = kwargs.get("sapo_temperature_neg", 1.05)
+    get_gamma_weights = kwargs.get("get_gamma_weights", None)
+    vespo_k_pos = kwargs.get("vespo_k_pos", 2.0)
+    vespo_lambda_pos = kwargs.get("vespo_lambda_pos", 3.0)
+    vespo_k_neg = kwargs.get("vespo_k_neg", 3.0)
+    vespo_lambda_neg = kwargs.get("vespo_lambda_neg", 2.0)
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
     input_ids = input_ids.unsqueeze(-1)
@@ -432,6 +437,20 @@ def grpo_compute_loss(
                 coef_1[~positive_advantages_mask], sapo_temperature_neg
             )
         loss_i = -loss_i * advantages
+    elif loss_type == "vespo":
+        if get_gamma_weights is None:
+            raise Exception("vespo is only available in TRL 0.26.0+")
+        phi_seq = get_gamma_weights(
+            advantages=advantages,
+            log_ratio_per_token=log_ratio,
+            mask=mask,
+            importance_sampling_ratio=kwargs.get("importance_sampling_ratio"),
+            k_pos=vespo_k_pos,
+            lambda_pos=vespo_lambda_pos,
+            k_neg=vespo_k_neg,
+            lambda_neg=vespo_lambda_neg,
+        )
+        loss_i = -phi_seq * advantages * new
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -464,7 +483,7 @@ def grpo_compute_loss(
     elif loss_type == "dr_grpo":
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
-    elif loss_type in ["cispo", "dapo"]:
+    elif loss_type in ["cispo", "dapo", "vespo"]:
         normalizer = num_items_in_batch/ num_processes
         loss = (loss_i * mask).sum() / normalizer
     else:
@@ -679,6 +698,11 @@ def grpo_accumulated_loss(
     kwargs["get_sapo_token_loss"] = trainer.get_sapo_token_loss if hasattr(trainer, "get_sapo_token_loss") else None
     kwargs["sapo_temperature_pos"] = trainer.args.sapo_temperature_pos if hasattr(trainer.args, "sapo_temperature_pos") else None
     kwargs["sapo_temperature_neg"] = trainer.args.sapo_temperature_neg if hasattr(trainer.args, "sapo_temperature_neg") else None
+    kwargs["get_gamma_weights"] = trainer.get_gamma_weights if hasattr(trainer, "get_gamma_weights") else None
+    kwargs["vespo_k_pos"] = trainer.args.vespo_k_pos if hasattr(trainer.args, "vespo_k_pos") else 2.0
+    kwargs["vespo_k_neg"] = trainer.args.vespo_k_neg if hasattr(trainer.args, "vespo_k_neg") else 3.0
+    kwargs["vespo_lambda_pos"] = trainer.args.vespo_lambda_pos if hasattr(trainer.args, "vespo_lambda_pos") else 3.0
+    kwargs["vespo_lambda_neg"] = trainer.args.vespo_lambda_neg if hasattr(trainer.args, "vespo_lambda_neg") else 2.0
     kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
     kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
     kwargs["use_vllm"] = trainer.use_vllm
