@@ -229,7 +229,7 @@ def _check_grouped_gemm_available():
     if _GROUPED_GEMM_AVAILABLE is not None: return _GROUPED_GEMM_AVAILABLE
 
     try:
-        from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
+        from unsloth_zoo.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
         _GROUPED_GEMM_AVAILABLE = True
         _init_triton_allocator()
     except (ImportError, ModuleNotFoundError):
@@ -400,6 +400,8 @@ def _extract_lora_from_wrapper(
 
         # Check for model-specific LoRA extractor attached to the experts module
         extractor_fn = getattr(experts_module, "_unsloth_lora_extractor_fn", None)
+        if hasattr(extractor_fn, "__func__"):
+            extractor_fn = extractor_fn.__func__
 
         if extractor_fn is not None:
             return extractor_fn(wrapper, weight_A, weight_B, scaling, num_experts)
@@ -1088,10 +1090,10 @@ def forward_triton_grouped_gemm(
     # This Unsloth Zoo code section is licensed under AGPL3
 
     # Import grouped GEMM interface
-    from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
+    from unsloth_zoo.kernels.moe.grouped_gemm.interface import grouped_gemm
 
     # Import autotune cache
-    from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
+    from unsloth_zoo.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
 
     # Helper to check TMA support - assumes helper function or just check directly
     # In original: it was a cached closure. Here we can use _supports_tma() directly
