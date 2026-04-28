@@ -1094,6 +1094,7 @@ class FastMLXModel:
         max_seq_length=2048,
         dtype=None,
         load_in_4bit=True,
+        full_finetuning=False,
         token=None,
         trust_remote_code=False,
         text_only=None,
@@ -1112,12 +1113,22 @@ class FastMLXModel:
                 bf16 is emulated and ~40-70%% slower in prefill — fp16 is
                 recommended on those chips.
             load_in_4bit: Accepted for API compat with CUDA unsloth.
+            full_finetuning: When True, force-disable runtime quantization
+                (``load_in_4bit`` etc.) so the full-precision weights are
+                trainable. ``get_peft_model`` becomes a no-op for models
+                loaded this way.
             token: HuggingFace token for gated models.
             text_only: Loading mode:
                 None  — auto-detect from config (default)
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
         """
+        if full_finetuning and load_in_4bit:
+            print(
+                "Unsloth: full_finetuning=True — disabling load_in_4bit "
+                "(quantized weights cannot be trained directly)."
+            )
+            load_in_4bit = False
         target_dtype = None
         if dtype is not None:
             import mlx.core as mx
@@ -1184,6 +1195,7 @@ class FastMLXModel:
                     model._src_path = base_local
                     model._is_vlm_model = False
                     model.max_seq_length = max_seq_length
+                    model._unsloth_full_finetuning = bool(full_finetuning)
                     _patch_mlx_saving(model, tokenizer)
                     return model, tokenizer
             except Exception as e:
@@ -1230,6 +1242,7 @@ class FastMLXModel:
             model._src_path = local_path
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
+            model._unsloth_full_finetuning = bool(full_finetuning)
             _patch_mlx_saving(model, tokenizer_or_processor)
             return model, tokenizer_or_processor
 
@@ -1331,6 +1344,7 @@ class FastMLXModel:
             model._src_path = local_path
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
+            model._unsloth_full_finetuning = bool(full_finetuning)
             model._unsloth_compile_trait_report = get_compile_trait_report(model)
             model._unsloth_compile_qualification = get_compile_qualification(model)
             model._unsloth_compile_backend_qualifications = get_backend_compile_qualifications(model)
@@ -1401,6 +1415,7 @@ class FastMLXModel:
             model._src_path = local_path
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
+            model._unsloth_full_finetuning = bool(full_finetuning)
             _patch_mixed_precision_set_dtype(model)
 
             _patch_mlx_saving(model, tokenizer)
@@ -1425,7 +1440,17 @@ class FastMLXModel:
 
         For VLMs, applies LoRA to the language model and optionally to the
         vision tower (train_vision=True) and projector (train_projector=True).
+
+        When the model was loaded with ``full_finetuning=True``, this is a
+        no-op: the full-precision parameters stay trainable and the model
+        is returned as-is.
         """
+        if getattr(model, "_unsloth_full_finetuning", False):
+            print(
+                "Unsloth: full_finetuning=True — skipping LoRA, training "
+                "all model parameters directly."
+            )
+            return model
         try:
             from mlx_lm.tuner.utils import linear_to_lora_layers
         except ImportError:
