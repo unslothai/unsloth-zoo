@@ -165,6 +165,9 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
         if getattr(backbone, "lm_head", None) is not None and _has_hidden_stack(backbone):
             return _run_hidden_stack(backbone, inputs, inputs_embeds=inputs_embeds, **kwargs)
         embed_kwarg = _get_backbone_embed_kwarg(backbone)
+
+        if "attention_mask_4d" in kwargs and "mask" not in kwargs:
+            kwargs["mask"] = kwargs.pop("attention_mask_4d")
         backbone_kwargs = _filter_backbone_kwargs(backbone, kwargs)
         if inputs_embeds is not None:
             backbone_kwargs[embed_kwarg] = inputs_embeds
@@ -525,6 +528,10 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
         # Standard causal LM shift
         inputs = input_ids[:, :-1]
 
+        fwd_mask = attention_mask
+        if attention_mask is not None and attention_mask.shape[-1] == input_ids.shape[-1]:
+            fwd_mask = attention_mask[:, :-1]
+
         # Forward pass — let the model create its own causal mask.
         # Pass extra keys (e.g. image_grid_thw for Qwen) that some models need.
         fwd_kwargs = {
@@ -532,7 +539,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
             if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
             and v is not None
         }
-        output = model(inputs, pixel_values=pixel_values, mask=attention_mask, **fwd_kwargs)
+        output = model(inputs, pixel_values=pixel_values, mask=fwd_mask, **fwd_kwargs)
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits.astype(mx.float32)
 
@@ -673,6 +680,12 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     labels = batch_dict.get("labels")
 
     inputs = input_ids[:, :-1]
+    # Shift attention_mask so any 4D causal/image mask the embedder builds
+    # has q/kv dims matching the (shifted) inputs. Otherwise models like
+    # Gemma3 see (B,1,S,S-1) vs (B,H,S-1,S-1) at SDPA and crash.
+    fwd_attn_mask = attention_mask
+    if attention_mask is not None and attention_mask.shape[-1] == input_ids.shape[-1]:
+        fwd_attn_mask = attention_mask[:, :-1]
 
     # Collect extra keys (e.g. image_grid_thw for Qwen) that some models need.
     extra_kwargs = {
@@ -689,7 +702,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     embed_result = model.get_input_embeddings(
         inputs,
         pixel_values,
-        mask=attention_mask,
+        mask=fwd_attn_mask,
         **extra_kwargs,
     )
     merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
@@ -1984,8 +1997,6 @@ def _extract_vlm_images(item, messages, image_size):
 def _format_vlm_images_for_processor(all_images):
     if not any(all_images):
         return None
-    if all(len(images) == 1 for images in all_images):
-        return [images[0] for images in all_images]
     return all_images
 
 
