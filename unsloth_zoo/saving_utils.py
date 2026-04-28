@@ -159,8 +159,10 @@ import os, shutil, re, functools
 
 def _merge_lora(W, lora_stats, name):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
-    index = W.device.index if W.device.index is not None else 0
-    device = torch.device(DEVICE_TYPE_TORCH, index)
+    if W.device.index is None:
+        device = torch.device(DEVICE_TYPE_TORCH)
+    else:
+        device = torch.device(DEVICE_TYPE_TORCH, W.device.index)
     W = W.to(device, dtype = torch.float32, non_blocking = True)
     lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
     lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
