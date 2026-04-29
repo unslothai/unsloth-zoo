@@ -954,9 +954,9 @@ def _ensure_vlm_prompt_utils_patched():
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
-    from .mlx_utils import save_merged_model
+    from .mlx_utils import save_pretrained_merged
     tokenizer = tokenizer or self._tokenizer
-    save_merged_model(self, tokenizer, save_directory)
+    save_pretrained_merged(self, tokenizer, save_directory, **kwargs)
 
 
 def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,

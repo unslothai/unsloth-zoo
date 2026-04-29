@@ -2809,7 +2809,7 @@ def push_to_hub_merged(
         private: Whether repo should be private.
         tags: Additional tags.
     """
-    from mlx_lm.utils import upload_to_hub
+    from huggingface_hub import HfApi
 
     save_directory = Path(save_directory)
 
@@ -2820,7 +2820,31 @@ def push_to_hub_merged(
     if repo_id is None:
         repo_id = save_directory.name
 
-    upload_to_hub(str(save_directory), repo_id)
+    api = HfApi(token=token)
+    api.create_repo(
+        repo_id=repo_id,
+        private=bool(private) if private is not None else False,
+        exist_ok=True,
+    )
+
+    if tags:
+        try:
+            from huggingface_hub import ModelCard
+            card_path = save_directory / "README.md"
+            if card_path.exists():
+                card = ModelCard.load(card_path)
+                existing = list(getattr(card.data, "tags", None) or [])
+                merged = list(dict.fromkeys(existing + list(tags) + ["mlx", "unsloth"]))
+                card.data.tags = merged
+                card.save(card_path)
+        except Exception as exc:
+            print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
+
+    api.upload_large_folder(
+        folder_path=str(save_directory),
+        repo_id=repo_id,
+        repo_type="model",
+    )
     print(f"Unsloth: Pushed to https://huggingface.co/{repo_id}")
 
 
