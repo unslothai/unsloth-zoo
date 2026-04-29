@@ -1099,6 +1099,8 @@ class FastMLXModel:
         trust_remote_code=False,
         text_only=None,
         patch_mode="patched",
+        revision=None,
+        random_state=3407,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -1161,9 +1163,17 @@ class FastMLXModel:
         chat_template = kwargs.pop("chat_template", None)
         patch_mode = normalize_mlx_patch_mode(kwargs.pop("patch_mode", patch_mode))
 
+        # Seed mlx random state so any randomness during model construction
+        # (e.g. layer init for runtime-quantized models) is reproducible.
+        try:
+            import mlx.core as mx
+            mx.random.seed(int(random_state))
+        except Exception:
+            pass
+
         # Step 1: Download config to decide loading path
         try:
-            local_path = str(_download(model_name))
+            local_path = str(_download(model_name, revision=revision))
             config_path = local_path + "/config.json"
             with open(config_path, "r") as f:
                 config_data = json.load(f)
@@ -1303,6 +1313,7 @@ class FastMLXModel:
                       f"runtime {q_bits}-bit quantization)...")
                 model, processor = vlm_load(
                     model_name, q_bits=q_bits, q_group_size=q_group_size,
+                    revision=revision,
                     **extra_kwargs,
                 )
             else:
@@ -1310,6 +1321,7 @@ class FastMLXModel:
                 # Lazy-load when we need to convert dtype so weights are
                 # only materialized once in the target dtype.
                 vlm_kwargs = dict(extra_kwargs)
+                vlm_kwargs["revision"] = revision
                 if target_dtype is not None:
                     vlm_kwargs["lazy"] = True
                 model, processor = vlm_load(model_name, **vlm_kwargs)
@@ -1380,6 +1392,7 @@ class FastMLXModel:
             mlx_load_kwargs = dict(
                 tokenizer_config=extra_kwargs if extra_kwargs else None,
                 return_config=True,
+                revision=revision,
             )
             if target_dtype is not None and not want_runtime_quant:
                 mlx_load_kwargs["lazy"] = True
@@ -1458,6 +1471,14 @@ class FastMLXModel:
                 "Unsloth: mlx-lm is required for LoRA on Apple Silicon. "
                 "Install via: pip install unsloth-zoo[mlx]"
             )
+
+        # Seed mlx random state so LoRA matrix init (lora_b is zero, lora_a
+        # is random Gaussian) is reproducible across runs.
+        try:
+            import mlx.core as mx
+            mx.random.seed(int(random_state))
+        except Exception:
+            pass
 
         if target_modules is None:
             target_modules = [
