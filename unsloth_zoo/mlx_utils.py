@@ -2427,7 +2427,7 @@ def _get_src_path(model):
     return getattr(model, "_src_path", None)
 
 
-def save_merged_model(model, tokenizer, path):
+def save_merged_model(model, tokenizer, path, dequantize=False):
     """Fuse LoRA weights and save the full merged model.
 
     Produces an HF-compatible directory with sharded safetensors,
@@ -2438,6 +2438,10 @@ def save_merged_model(model, tokenizer, path):
         model: MLX model with LoRA layers.
         tokenizer: Tokenizer to save alongside.
         path: Directory to save merged model.
+        dequantize: If True, dequantize quantized layers when fusing
+            (saves as fp16/bf16 — needed for GGUF). If False, keep the
+            base quantization (smaller checkpoint, only meaningful when
+            the base was quantized).
     """
     from mlx_lm.utils import save_model, save_config, create_model_card
     from mlx.utils import tree_unflatten
@@ -2448,12 +2452,19 @@ def save_merged_model(model, tokenizer, path):
     # Fuse LoRA weights into base model using mlx-lm's pattern
     model.eval()
     fused_linears = [
-        (n, m.fuse())
+        (n, m.fuse(dequantize=dequantize))
         for n, m in model.named_modules()
         if hasattr(m, "fuse")
     ]
     if fused_linears:
         model.update_modules(tree_unflatten(fused_linears))
+
+    if dequantize:
+        cfg = getattr(model, "_config", None)
+        if isinstance(cfg, dict) and "quantization" in cfg:
+            cfg = {k: v for k, v in cfg.items() if k != "quantization"}
+            model._config = cfg
+
     de_lora_model = model
 
     # Save sharded safetensors + index.json
@@ -2494,26 +2505,58 @@ def save_pretrained_merged(
     model,
     tokenizer,
     save_directory,
+    save_method="lora",
     push_to_hub=False,
     token=None,
     private=None,
     tags=None,
 ):
-    """Save LoRA-fused model in HF-compatible format.
+    """Save the model in HF-compatible format using the requested method.
 
-    This is the user-facing API matching the CUDA path's
-    ``model.save_pretrained_merged()``.
+    This mirrors the CUDA path's ``model.save_pretrained_merged()``.
 
     Args:
-        model: MLX model with LoRA layers.
+        model: MLX model (with optional LoRA layers).
         tokenizer: Tokenizer to save alongside.
         save_directory: Output directory path.
+        save_method: One of:
+            - ``"lora"``: save adapter weights only (smallest, default).
+            - ``"merged_16bit"``: fuse LoRA into base, dequantize, save full
+              fp16/bf16 model. Needed for GGUF / llama.cpp downstream.
+            - ``"merged_4bit"``: fuse LoRA into base while keeping the
+              base's 4-bit quantization. Only meaningful for QLoRA.
         push_to_hub: If True, upload to HuggingFace Hub after saving.
         token: HuggingFace token for pushing.
         private: Whether the HF repo should be private.
         tags: Additional tags for the model card.
     """
-    save_merged_model(model, tokenizer, save_directory)
+    method = (save_method or "lora").lower().replace(" ", "_")
+    if method not in ("lora", "merged_16bit", "merged_4bit"):
+        raise ValueError(
+            f"Unsloth: Unknown save_method {save_method!r}. "
+            f"Use 'lora', 'merged_16bit', or 'merged_4bit'."
+        )
+
+    has_lora = any(hasattr(m, "fuse") for _, m in model.named_modules())
+
+    if method == "lora":
+        if not has_lora:
+            raise ValueError(
+                "Unsloth: save_method='lora' but the model has no LoRA "
+                "layers — there's nothing to save. Use 'merged_16bit' instead."
+            )
+        save_lora_adapters(model, save_directory)
+        try:
+            tokenizer.save_pretrained(str(save_directory))
+        except Exception:
+            pass
+    else:
+        # merged_16bit → dequantize fused weights to fp16/bf16
+        # merged_4bit  → keep base quantization (LoRA absorbed)
+        save_merged_model(
+            model, tokenizer, save_directory,
+            dequantize=(method == "merged_16bit"),
+        )
 
     if push_to_hub:
         push_to_hub_merged(
