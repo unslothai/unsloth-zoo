@@ -2969,6 +2969,10 @@ def push_to_hub_merged(
     token=None,
     private=None,
     tags=None,
+    commit_message="Trained with Unsloth",
+    commit_description="Upload model trained with Unsloth 2x faster",
+    create_pr=False,
+    revision=None,
 ):
     """Push merged model to HuggingFace Hub.
 
@@ -2980,7 +2984,11 @@ def push_to_hub_merged(
             If None, uses save_directory as repo_id.
         token: HuggingFace token.
         private: Whether repo should be private.
-        tags: Additional tags.
+        tags: Additional tags appended to the model card.
+        commit_message: Commit title for the upload.
+        commit_description: Optional longer commit body.
+        create_pr: If True, push to a PR branch instead of main.
+        revision: Target branch (defaults to main).
     """
     from huggingface_hub import HfApi
 
@@ -2993,12 +3001,35 @@ def push_to_hub_merged(
     if repo_id is None:
         repo_id = save_directory.name
 
+    # Match the GPU path's "(Trained with Unsloth)" suffix convention so
+    # the commit history is recognizable across both backends.
+    if commit_message is None:
+        commit_message = ""
+    if "Unsloth" not in commit_message:
+        commit_message = (commit_message + " (Trained with Unsloth)").lstrip()
+    if commit_description is None:
+        commit_description = "Upload model trained with Unsloth 2x faster"
+    elif "Unsloth 2x faster" not in commit_description:
+        commit_description += " (Trained with Unsloth 2x faster)"
+
     api = HfApi(token=token)
     api.create_repo(
         repo_id=repo_id,
         private=bool(private) if private is not None else False,
         exist_ok=True,
     )
+    # create_repo(exist_ok=True) is a no-op when the repo already exists,
+    # so toggling `private` on a re-push wouldn't change visibility unless
+    # we update it explicitly.
+    if private is not None:
+        try:
+            api.update_repo_settings(
+                repo_id=repo_id,
+                private=bool(private),
+                repo_type="model",
+            )
+        except Exception as exc:
+            print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
 
     if tags:
         try:
@@ -3013,10 +3044,14 @@ def push_to_hub_merged(
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
-    api.upload_large_folder(
+    api.upload_folder(
         folder_path=str(save_directory),
         repo_id=repo_id,
         repo_type="model",
+        commit_message=commit_message,
+        commit_description=commit_description,
+        create_pr=create_pr,
+        revision=revision,
     )
     print(f"Unsloth: Pushed to https://huggingface.co/{repo_id}")
 
