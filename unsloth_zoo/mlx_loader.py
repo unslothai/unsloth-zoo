@@ -853,8 +853,21 @@ def _validate_mlx_adapter_base(model, adapter_cfg):
     expected_config = adapter_cfg.get("base_quantization_config")
     if isinstance(expected_config, dict) and {"bits", "group_size"} <= set(expected_config):
         expected = _global_quant_params(expected_config)
-        live = _global_quant_params(getattr(model, "_unsloth_quantization_config", None))
-        if live is not None and expected is not None and live != expected:
+        live = (
+            _global_quant_params(getattr(model, "_unsloth_quantization_config", None))
+            or _global_quant_params(
+                _get_existing_mlx_quantization(getattr(model, "_config", None))
+            )
+        )
+        if expected is not None and live is None and not expected_map:
+            raise ValueError(
+                "Unsloth: This MLX adapter was saved with base quantization "
+                f"{expected!r}, but the reloaded base has no verifiable MLX "
+                "quantization config. Reload the adapter with the exact saved "
+                "base and quantization settings, or export a standalone "
+                "merged/quantized model."
+            )
+        if expected is not None and live is not None and live != expected:
             raise ValueError(
                 "Unsloth: This MLX adapter was saved with base quantization "
                 f"{expected!r}, but the reloaded base has {live!r}."
@@ -884,6 +897,14 @@ def _quant_config_from_resolved_map(resolved_map):
         "mode": mode,
         "quantize_modules": sorted(resolved_map),
     }
+
+
+def _adapter_actual_quant_config(adapter_cfg, resolved_map):
+    expected = _global_quant_params(adapter_cfg.get("base_quantization_config"))
+    if expected is not None:
+        expected["quantize_modules"] = None
+        return expected
+    return _quant_config_from_resolved_map(resolved_map)
 
 
 def _adapter_base_revision(adapter_cfg):
@@ -2008,7 +2029,12 @@ class FastMLXModel:
                         adapter_cfg,
                         adapter_quant_policy,
                     )
-                    if adapter_quant_policy.get("enabled"):
+                    adapter_has_quant_metadata = (
+                        adapter_quant_policy.get("enabled")
+                        or adapter_quant_map
+                        or adapter_cfg.get("base_quantization_config") is not None
+                    )
+                    if adapter_has_quant_metadata:
                         adapter_mlx_quant_config = None
                         if adapter_requires_runtime_quant and adapter_quant_map:
                             adapter_mlx_quant_config = _quant_config_from_resolved_map(
@@ -2037,8 +2063,13 @@ class FastMLXModel:
                                 "quantize_modules": adapter_quant_policy.get("quantize_modules"),
                             }
                         if caller_supplied_quant_config:
+                            actual_quant_config = _adapter_actual_quant_config(
+                                adapter_cfg, adapter_quant_map
+                            )
                             expected_quantize_modules = None
-                            if adapter_mlx_quant_config is not None:
+                            if actual_quant_config is not None:
+                                expected_quantize_modules = actual_quant_config.get("quantize_modules")
+                            elif adapter_mlx_quant_config is not None:
                                 expected_quantize_modules = adapter_mlx_quant_config.get("quantize_modules")
                             elif adapter_quant_policy.get("quantize_modules") is not None:
                                 expected_quantize_modules = adapter_quant_policy.get("quantize_modules")
@@ -2048,22 +2079,15 @@ class FastMLXModel:
                                 "mode": quantization_spec.mode,
                                 "quantize_modules": quantization_spec.quantize_modules,
                             }
+                            expected_source = (
+                                actual_quant_config
+                                or adapter_mlx_quant_config
+                                or adapter_quant_policy
+                            )
                             expected_adapter_config = {
-                                "bits": (
-                                    adapter_mlx_quant_config.get("bits")
-                                    if adapter_mlx_quant_config is not None
-                                    else adapter_quant_policy.get("bits")
-                                ),
-                                "group_size": (
-                                    adapter_mlx_quant_config.get("group_size")
-                                    if adapter_mlx_quant_config is not None
-                                    else adapter_quant_policy.get("group_size")
-                                ),
-                                "mode": (
-                                    adapter_mlx_quant_config.get("mode")
-                                    if adapter_mlx_quant_config is not None
-                                    else adapter_quant_policy.get("mode")
-                                ),
+                                "bits": expected_source.get("bits"),
+                                "group_size": expected_source.get("group_size"),
+                                "mode": expected_source.get("mode"),
                                 "quantize_modules": (
                                     tuple(expected_quantize_modules)
                                     if expected_quantize_modules is not None

@@ -2509,6 +2509,13 @@ def _strip_mlx_quantization_metadata(config):
     return stripped
 
 
+def _get_mlx_config_quantization(model):
+    config = getattr(model, "_config", None)
+    if not isinstance(config, dict):
+        return None
+    return config.get("quantization") or config.get("quantization_config")
+
+
 def _enrich_mlx_adapter_config(model, adapter_config):
     adapter_config = dict(adapter_config or {})
     hf_repo = getattr(model, "_hf_repo", None) or adapter_config.get("base_model_name_or_path")
@@ -2533,6 +2540,11 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     quant_config = getattr(model, "_unsloth_quantization_config", None)
     quant_policy = getattr(model, "_unsloth_quantization_policy", None)
     quant_source = getattr(model, "_unsloth_quantized_source", None)
+    config_quantization = _get_mlx_config_quantization(model)
+    if quant_config is None and config_quantization is not None:
+        quant_config = config_quantization
+    if quant_source is None and config_quantization is not None:
+        quant_source = "mlx_config"
     if quant_config is not None:
         adapter_config["base_quantization_config"] = quant_config
     else:
