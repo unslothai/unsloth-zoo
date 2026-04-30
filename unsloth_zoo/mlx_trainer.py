@@ -89,11 +89,11 @@ class MLXTrainingConfig:
     num_train_epochs: int = -1  # -1 means use max_steps instead
     warmup_steps: int = 5
     learning_rate: float = 2e-4
-    lr_scheduler_type: str = "cosine"  # "cosine", "linear", "constant"
+    lr_scheduler_type: str = "linear"  # "cosine", "linear", "constant"
 
     # Optimization
-    optim: str = "adafactor"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
-    weight_decay: float = 0.01
+    optim: str = "adamw"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
+    weight_decay: float = 0.001
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
@@ -355,13 +355,9 @@ class MLXTrainer:
         elif opt_name == "lion":
             optimizer = optim.Lion(learning_rate=schedule, weight_decay=wd)
         else:
-            print(f"Unknown optimizer '{opt_name}', falling back to Adafactor.")
-            opt_name = "adafactor"
-            optimizer = optim.Adafactor(
-                learning_rate=schedule,
-                relative_step=False,
-                scale_parameter=False,
-            )
+            print(f"Unknown optimizer '{opt_name}', falling back to AdamW.")
+            opt_name = "adamw"
+            optimizer = optim.AdamW(learning_rate=schedule, weight_decay=wd)
 
         self._resolved_optimizer_name = opt_name
         return optimizer
