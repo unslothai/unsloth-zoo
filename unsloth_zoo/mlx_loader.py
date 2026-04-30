@@ -1790,7 +1790,11 @@ def _lora_walk_module(
     except ImportError:
         return
 
-    target_modules = set(target_modules or ())
+    if target_modules is None:
+        match_all_linear = True
+        target_modules = set()
+    else:
+        target_modules = set(target_modules or ())
 
     replacements = 0
 
@@ -1801,7 +1805,7 @@ def _lora_walk_module(
 
         def _walk(module):
             nonlocal replacements
-            for name, child in module.named_modules():
+            for name, child in list(module.named_modules()):
                 if not match_all_linear and not _lora_name_matches_target(name, target_modules):
                     continue
                 if isinstance(child, (nn.Linear, nn.QuantizedLinear)):
@@ -1812,6 +1816,9 @@ def _lora_walk_module(
                         scale=lora_config["scale"],
                     )
                     replacements += 1
+                    if name == "":
+                        setattr(model, attr_name, lora_layer)
+                        continue
                     # Navigate to parent and replace
                     parts = name.split(".")
                     parent = root
