@@ -49,6 +49,8 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 _PAD_MULTIPLE = 32
+SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
+SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
 
 from .mlx_utils import (
     make_cce_loss_fn,
@@ -76,6 +78,28 @@ from .mlx_compile import (
     resolve_training_compile,
     trace_compile_application,
 )
+
+
+def _normalize_mlx_optimizer_name(name):
+    opt_name = str(name or "adamw").strip().lower()
+    if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
+        supported = ", ".join(SUPPORTED_MLX_OPTIMIZERS)
+        raise ValueError(
+            f"Unsloth: Unsupported MLX optimizer {name!r}. "
+            f"Supported optimizers: {supported}."
+        )
+    return opt_name
+
+
+def _normalize_mlx_scheduler_type(name):
+    sched_type = str(name or "linear").strip().lower()
+    if sched_type not in SUPPORTED_MLX_LR_SCHEDULERS:
+        supported = ", ".join(SUPPORTED_MLX_LR_SCHEDULERS)
+        raise ValueError(
+            f"Unsloth: Unsupported MLX lr_scheduler_type {name!r}. "
+            f"Supported schedulers: {supported}."
+        )
+    return sched_type
 
 
 @dataclass
@@ -283,7 +307,7 @@ class MLXTrainer:
         """Build LR schedule from config. Returns a callable or float."""
         lr = self.args.learning_rate
         warmup = self.args.warmup_steps
-        sched_type = self.args.lr_scheduler_type.lower()
+        sched_type = _normalize_mlx_scheduler_type(self.args.lr_scheduler_type)
 
         if sched_type == "constant" and warmup == 0:
             return lr
@@ -322,7 +346,7 @@ class MLXTrainer:
         schedule = self._build_schedule(total_steps)
         wd = self.args.weight_decay
 
-        opt_name = self.args.optim.lower()
+        opt_name = _normalize_mlx_optimizer_name(self.args.optim)
         if opt_name == "adafactor":
             unsupported = self._adafactor_unsupported_parameters(self.model)
             if unsupported:
@@ -354,11 +378,6 @@ class MLXTrainer:
             optimizer = optim.Muon(learning_rate=schedule, weight_decay=wd)
         elif opt_name == "lion":
             optimizer = optim.Lion(learning_rate=schedule, weight_decay=wd)
-        else:
-            print(f"Unknown optimizer '{opt_name}', falling back to AdamW.")
-            opt_name = "adamw"
-            optimizer = optim.AdamW(learning_rate=schedule, weight_decay=wd)
-
         self._resolved_optimizer_name = opt_name
         return optimizer
 
