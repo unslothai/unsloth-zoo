@@ -29,6 +29,7 @@ import math
 import os
 import types
 import warnings
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
 
@@ -52,6 +53,32 @@ _MULTIMODAL_STRIP_KEYS = (
     "multi_modal_projector",
     "mm_projector",
 )
+
+
+@contextmanager
+def _temporary_hf_token_env(token):
+    """Expose an explicit HF token to libraries that only read auth from env.
+
+    mlx-lm / mlx-vlm do not consistently thread a ``token=`` argument through
+    every internal download path. Keep explicit token loads local to this call
+    without mutating persistent Hugging Face login state.
+    """
+    if not token or not isinstance(token, str):
+        yield
+        return
+
+    env_names = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+    previous = {name: os.environ.get(name) for name in env_names}
+    try:
+        for name in env_names:
+            os.environ[name] = token
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _convert_mlx_dtype(model, target_dtype) -> None:
@@ -149,6 +176,7 @@ def _load_mlx_lm_with_strict_fallback(
     model_type,
     mlx_load,
     mlx_load_kwargs,
+    hf_token=None,
 ):
     """Load text models through mlx-lm, retrying strict=False for known safe mismatches.
 
@@ -158,7 +186,8 @@ def _load_mlx_lm_with_strict_fallback(
     mismatch signatures.
     """
     try:
-        return mlx_load(model_name, **mlx_load_kwargs)
+        with _temporary_hf_token_env(hf_token):
+            return mlx_load(model_name, **mlx_load_kwargs)
     except ValueError as error:
         message = str(error)
         rule = _KNOWN_MLX_LM_STRICT_FALLBACKS.get(model_type)
@@ -168,7 +197,8 @@ def _load_mlx_lm_with_strict_fallback(
         print(rule["notice"])
         from mlx_lm.utils import _download, load_model, load_tokenizer
 
-        model_path = _download(model_name, revision=mlx_load_kwargs.get("revision"))
+        with _temporary_hf_token_env(hf_token):
+            model_path = _download(model_name, revision=mlx_load_kwargs.get("revision"))
         model, config = load_model(
             model_path,
             lazy=mlx_load_kwargs.get("lazy", False),
@@ -190,6 +220,7 @@ def _load_mlx_vlm_with_extra_weight_filter(
     model_type,
     vlm_load,
     vlm_kwargs,
+    hf_token=None,
 ):
     """Load VLMs, filtering known extra checkpoint tensors on retry.
 
@@ -199,7 +230,8 @@ def _load_mlx_vlm_with_extra_weight_filter(
     registered mismatch signatures and exact allow-listed keys.
     """
     try:
-        return vlm_load(model_name, **vlm_kwargs)
+        with _temporary_hf_token_env(hf_token):
+            return vlm_load(model_name, **vlm_kwargs)
     except ValueError as error:
         message = str(error)
         rule = _KNOWN_VLM_EXTRA_WEIGHT_FILTERS.get(model_type)
@@ -223,7 +255,8 @@ def _load_mlx_vlm_with_extra_weight_filter(
 
         nn.Module.load_weights = _load_weights_without_projection_quant_state
         try:
-            return vlm_load(model_name, **vlm_kwargs)
+            with _temporary_hf_token_env(hf_token):
+                return vlm_load(model_name, **vlm_kwargs)
         finally:
             nn.Module.load_weights = original_load_weights
 
@@ -2034,7 +2067,8 @@ class FastMLXModel:
 
         # Step 1: Download config to decide loading path
         try:
-            local_path = str(_download(model_name, revision=revision))
+            with _temporary_hf_token_env(token):
+                local_path = str(_download(model_name, revision=revision))
             config_path = local_path + "/config.json"
             with open(config_path, "r") as f:
                 config_data = json.load(f)
@@ -2161,17 +2195,19 @@ class FastMLXModel:
                         model = load_adapters(model, local_path)
                         loaded_model_config = getattr(model, "_config", None)
                     else:
-                        model, tokenizer = mlx_load(
-                            base_model_id,
-                            adapter_path=local_path,
-                            tokenizer_config={"token": token} if token else None,
-                            revision=adapter_base_revision,
-                        )
+                        with _temporary_hf_token_env(token):
+                            model, tokenizer = mlx_load(
+                                base_model_id,
+                                adapter_path=local_path,
+                                tokenizer_config={"token": token} if token else None,
+                                revision=adapter_base_revision,
+                            )
                         loaded_model_config = None
                     is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
                     processor = getattr(model, "_processor", None)
 
-                    base_local = str(_download(base_model_id, revision=adapter_base_revision))
+                    with _temporary_hf_token_env(token):
+                        base_local = str(_download(base_model_id, revision=adapter_base_revision))
                     base_config_path = os.path.join(base_local, "config.json")
                     if os.path.exists(base_config_path):
                         with open(base_config_path, "r") as f:
@@ -2216,9 +2252,10 @@ class FastMLXModel:
             custom_loader = None
 
         if custom_loader is not None:
-            model, tokenizer_or_processor = custom_loader(
-                model_name, config_data, max_seq_length=max_seq_length, token=token
-            )
+            with _temporary_hf_token_env(token):
+                model, tokenizer_or_processor = custom_loader(
+                    model_name, config_data, max_seq_length=max_seq_length, token=token
+                )
             if text_only is False or _is_vlm(config_data):
                 from .mlx_utils import normalize_vlm_processor_chat_template
 
@@ -2310,13 +2347,14 @@ class FastMLXModel:
                 from mlx_vlm.utils import load_config as _vlm_load_config
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
                       f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")
-                model, processor = vlm_load(
-                    model_name,
-                    lazy=True,
-                    revision=revision,
-                    **extra_kwargs,
-                )
-                vlm_cfg = _vlm_load_config(local_path or model_name)
+                with _temporary_hf_token_env(token):
+                    model, processor = vlm_load(
+                        model_name,
+                        lazy=True,
+                        revision=revision,
+                        **extra_kwargs,
+                    )
+                    vlm_cfg = _vlm_load_config(local_path or model_name)
                 model, vlm_cfg = _apply_mlx_quantization(
                     model, vlm_cfg, quantization_spec,
                     is_vlm=True, user_predicate=quant_predicate,
@@ -2336,6 +2374,7 @@ class FastMLXModel:
                     model_type,
                     vlm_load,
                     vlm_kwargs,
+                    hf_token=token,
                 )
 
             if target_dtype is not None:
@@ -2433,6 +2472,7 @@ class FastMLXModel:
                 model_type,
                 mlx_load,
                 mlx_load_kwargs,
+                hf_token=token,
             )
 
             if want_runtime_quant:
