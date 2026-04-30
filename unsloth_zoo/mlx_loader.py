@@ -28,6 +28,8 @@ import inspect
 import os
 import types
 import warnings
+from dataclasses import asdict, dataclass
+from fnmatch import fnmatch
 
 from .mlx_compile import (
     explain_compile_support,
@@ -75,6 +77,12 @@ def _is_vlm(config: dict) -> bool:
     if "vision_config" in config:
         return True
 
+    architectures = config.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    if any(str(arch).endswith("ForCausalLM") for arch in architectures):
+        return False
+
     model_type = config.get("model_type", "")
     if not model_type:
         return False
@@ -84,6 +92,99 @@ def _is_vlm(config: dict) -> bool:
         _vlm_model_types_cache = _build_vlm_model_types()
 
     return model_type in _vlm_model_types_cache
+
+
+def _load_mlx_lm_with_gemma4_text_fallback(
+    model_name,
+    model_type,
+    mlx_load,
+    mlx_load_kwargs,
+):
+    """Load text models through mlx-lm, with one narrow Gemma4 workaround.
+
+    Some Gemma4 text checkpoints include K/V tensors for KV-shared layers that
+    mlx-lm's gemma4_text module intentionally does not instantiate. mlx-lm's
+    public load() does not expose strict=False, so use the internal loader only
+    for that known mismatch.
+    """
+    try:
+        return mlx_load(model_name, **mlx_load_kwargs)
+    except ValueError as error:
+        message = str(error)
+        if (
+            model_type != "gemma4_text"
+            or "parameters not in model" not in message
+            or "self_attn.k_proj" not in message
+            or "self_attn.v_proj" not in message
+        ):
+            raise
+
+        print(
+            "Unsloth: Gemma4 text checkpoint has extra KV-sharing weights - "
+            "loading with mlx-lm strict=False."
+        )
+        from mlx_lm.utils import _download, load_model, load_tokenizer
+
+        model_path = _download(model_name, revision=mlx_load_kwargs.get("revision"))
+        model, config = load_model(
+            model_path,
+            lazy=mlx_load_kwargs.get("lazy", False),
+            strict=False,
+            model_config=mlx_load_kwargs.get("model_config"),
+        )
+        tokenizer = load_tokenizer(
+            model_path,
+            mlx_load_kwargs.get("tokenizer_config"),
+            eos_token_ids=config.get("eos_token_id", None),
+        )
+        if mlx_load_kwargs.get("return_config", False):
+            return model, tokenizer, config
+        return model, tokenizer
+
+
+def _load_mlx_vlm_with_gemma4_projection_fallback(
+    model_name,
+    model_type,
+    vlm_load,
+    vlm_kwargs,
+):
+    """Load VLMs, allowing one known Gemma4 quantized projection mismatch.
+
+    Some Gemma4 MLX checkpoints include quantization state for
+    per_layer_model_projection, while the current mlx-vlm Gemma4 class keeps
+    that projection non-quantized or absent. mlx-vlm does not expose strict=False
+    through load(), so retry with a temporary load_weights shim only for this
+    narrow mismatch.
+    """
+    try:
+        return vlm_load(model_name, **vlm_kwargs)
+    except ValueError as error:
+        message = str(error)
+        if (
+            model_type != "gemma4"
+            or "parameters not in model" not in message
+            or "per_layer_model_projection" not in message
+            or "scales" not in message
+            or "biases" not in message
+        ):
+            raise
+
+        print(
+            "Unsloth: Gemma4 VLM checkpoint has extra quantized "
+            "per-layer projection state - loading with MLX strict=False."
+        )
+        import mlx.nn as nn
+
+        original_load_weights = nn.Module.load_weights
+
+        def _load_weights_strict_false(self, file_or_weights, strict=True):
+            return original_load_weights(self, file_or_weights, strict=False)
+
+        nn.Module.load_weights = _load_weights_strict_false
+        try:
+            return vlm_load(model_name, **vlm_kwargs)
+        finally:
+            nn.Module.load_weights = original_load_weights
 
 
 def _build_vlm_model_types():
@@ -457,15 +558,44 @@ _ROLE_PROMPT_NAMES = {
     "system": "System",
 }
 
+# Fragments that identify text modules skipped by default for both LLMs and VLMs.
+_DEFAULT_QUANT_SKIP_FRAGMENTS = (
+    "lm_head", "embed_tokens",
+)
+
 # Fragments that identify multimodal sub-networks we must *never* quantize.
 _MULTIMODAL_SKIP_FRAGMENTS = (
-    "lm_head", "embed_tokens",
     "multi_modal_projector", "mm_projector", "connector", "aligner",
     "projector",
     "vision_tower", "vision_model", "vision_encoder", "visual",
     "embed_vision", "vision_embed_tokens", "img_processor", "img_projection",
     "audio_encoder", "audio_projection", "embed_audio",
 )
+
+_MLX_QUANT_MODE_DEFAULTS = {
+    "affine": (64, 4),
+    "mxfp4": (32, 4),
+    "nvfp4": (16, 4),
+    "mxfp8": (32, 8),
+}
+
+
+@dataclass
+class _MLXQuantizationSpec:
+    enabled: bool = False
+    bits: int | None = None
+    group_size: int | None = None
+    mode: str | None = None
+    source: str = "none"
+    quantize_modules: tuple[str, ...] | None = None
+    has_callable_predicate: bool = False
+    force_requantize: bool = False
+
+    def to_metadata(self):
+        data = asdict(self)
+        if self.quantize_modules is not None:
+            data["quantize_modules"] = list(self.quantize_modules)
+        return data
 
 _LORA_TARGET_ALIASES = {
     "q_proj": {"qkv", "qkv_proj", "query_key_value", "Wqkv"},
@@ -498,14 +628,624 @@ def _lora_name_matches_target(name, target_modules):
     )
 
 
+def _get_existing_mlx_quantization(config_data: dict):
+    if not isinstance(config_data, dict):
+        return None
+    quantization = config_data.get("quantization", None)
+    if quantization:
+        return quantization
+    quantization_config = config_data.get("quantization_config", None)
+    if quantization_config:
+        return quantization_config
+    return None
+
+
 def _vlm_config_is_already_quantized(config_data: dict) -> bool:
-    """Return True when the HF config indicates the model is pre-quantized."""
-    if "quantization" in config_data:
-        return True
-    qc = config_data.get("quantization_config", {})
-    if qc.get("quant_method"):
+    """Return True when config indicates pre-quantized MLX/HF weights."""
+    quantization = _get_existing_mlx_quantization(config_data)
+    if quantization:
         return True
     return False
+
+
+def _quant_config_to_dict(quantization_config):
+    if quantization_config is None:
+        return {}
+    if isinstance(quantization_config, dict):
+        return dict(quantization_config)
+    if hasattr(quantization_config, "to_dict"):
+        return dict(quantization_config.to_dict())
+    data = {}
+    for key in (
+        "load_in_4bit", "load_in_8bit", "bnb_4bit_compute_dtype",
+        "bnb_4bit_quant_type", "bnb_4bit_use_double_quant",
+        "llm_int8_threshold", "llm_int8_skip_modules",
+    ):
+        if hasattr(quantization_config, key):
+            data[key] = getattr(quantization_config, key)
+    return data
+
+
+def _reject_unsupported_hf_quantization_fields(config_dict):
+    unsupported = []
+    allowed_defaults = {
+        "bnb_4bit_compute_dtype": ("float32", None),
+        "bnb_4bit_quant_type": ("fp4", None),
+        "bnb_4bit_use_double_quant": (False, None),
+        "bnb_4bit_quant_storage": ("uint8", None),
+        "llm_int8_threshold": (6.0, None),
+        "llm_int8_skip_modules": (None, [], {}),
+        "llm_int8_enable_fp32_cpu_offload": (False, None),
+        "llm_int8_has_fp16_weight": (False, None),
+    }
+    for key in (
+        "bnb_4bit_compute_dtype", "bnb_4bit_quant_type",
+        "bnb_4bit_use_double_quant", "bnb_4bit_quant_storage",
+        "llm_int8_threshold", "llm_int8_skip_modules",
+        "llm_int8_enable_fp32_cpu_offload", "llm_int8_has_fp16_weight",
+    ):
+        value = config_dict.get(key, None)
+        if value not in allowed_defaults[key]:
+            unsupported.append(key)
+    if unsupported:
+        raise ValueError(
+            "Unsloth: MLX quantization does not support these "
+            f"BitsAndBytesConfig fields: {', '.join(sorted(unsupported))}. "
+            "Use mlx_quantization_config/q_bits/q_group_size/q_mode instead."
+        )
+
+
+def _normalize_quantize_modules(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return tuple(str(x) for x in value)
+    raise TypeError("Unsloth: quantize_modules must be a string or list of strings.")
+
+
+def _infer_snapshot_commit(path):
+    if not path:
+        return None
+    parts = os.path.normpath(str(path)).split(os.sep)
+    try:
+        index = parts.index("snapshots")
+    except ValueError:
+        return None
+    if index + 1 >= len(parts):
+        return None
+    commit = parts[index + 1]
+    return commit or None
+
+
+def _effective_mlx_quantization_map(model):
+    quantized = {}
+    quantized.update(_quantization_config_to_path_map(
+        _get_existing_mlx_quantization(getattr(model, "_config", None))
+    ))
+    quantized.update(_quantization_config_to_path_map(
+        getattr(model, "_unsloth_quantization_config", None)
+    ))
+    for path, module in model.named_modules():
+        if not path:
+            continue
+        if type(module).__name__ not in {"QuantizedLinear", "QuantizedEmbedding"}:
+            continue
+        path = _canonical_mlx_quantization_path(path)
+        entry = {}
+        for key in ("bits", "group_size", "mode"):
+            if hasattr(module, key):
+                value = getattr(module, key)
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    pass
+                entry[key] = value
+        quantized[path] = entry
+    return quantized
+
+
+def _quantization_config_to_path_map(config):
+    if not isinstance(config, dict):
+        return {}
+    defaults = {
+        key: config.get(key)
+        for key in ("bits", "group_size", "mode")
+        if config.get(key) is not None
+    }
+    if defaults and "mode" not in defaults:
+        defaults["mode"] = "affine"
+    reserved = {
+        "bits", "group_size", "mode", "quant_method", "skip_vision",
+        "skip_projector", "skip_lm_head",
+    }
+    quantized = {}
+    for path, value in config.items():
+        if path in reserved or not isinstance(value, dict):
+            continue
+        entry = dict(defaults)
+        entry.update(value)
+        if "bits" not in entry or "group_size" not in entry:
+            continue
+        if "mode" not in entry:
+            entry["mode"] = "affine"
+        quantized[_canonical_mlx_quantization_path(str(path))] = {
+            key: int(item) if key in ("bits", "group_size") else item
+            for key, item in entry.items()
+            if key in ("bits", "group_size", "mode")
+        }
+    return quantized
+
+
+def _canonical_mlx_quantization_path(path):
+    # mlx-lm LoRALinear stores the wrapped base layer under ".linear".
+    # Adapter metadata must describe the underlying base path so validation can
+    # run before load_adapters re-wraps the module.
+    if path.endswith(".linear"):
+        return path[:-len(".linear")]
+    return path
+
+
+def _normalize_quantization_map(value):
+    if not value:
+        return {}
+    normalized = {}
+    for path, config in dict(value).items():
+        path = _canonical_mlx_quantization_path(str(path))
+        if not isinstance(config, dict):
+            normalized[path] = config
+            continue
+        entry = {}
+        for key in ("bits", "group_size", "mode"):
+            if key not in config:
+                continue
+            item = config[key]
+            try:
+                item = int(item)
+            except (TypeError, ValueError):
+                pass
+            entry[key] = item
+        normalized[path] = entry
+    return normalized
+
+
+def _validate_mlx_adapter_base(model, adapter_cfg):
+    expected_map = _normalize_quantization_map(
+        adapter_cfg.get("base_resolved_quantization_map")
+        or adapter_cfg.get("base_quantization_map")
+    )
+    if expected_map:
+        live_map = _normalize_quantization_map(_effective_mlx_quantization_map(model))
+        if live_map != expected_map:
+            missing = sorted(set(expected_map) - set(live_map))
+            extra = sorted(set(live_map) - set(expected_map))
+            changed = sorted(
+                path for path in set(expected_map) & set(live_map)
+                if expected_map[path] != live_map[path]
+            )
+            details = []
+            if missing:
+                details.append(f"missing quantized modules: {missing[:5]!r}")
+            if extra:
+                details.append(f"unexpected quantized modules: {extra[:5]!r}")
+            if changed:
+                details.append(f"changed quantized modules: {changed[:5]!r}")
+            detail_text = "; ".join(details) if details else "quantization map differs"
+            raise ValueError(
+                "Unsloth: This MLX adapter was saved for a base model with a "
+                f"different resolved quantization map ({detail_text}). Reload "
+                "the adapter with the exact saved base and quantization settings, "
+                "or export a standalone merged/quantized model."
+            )
+
+    expected_config = adapter_cfg.get("base_quantization_config")
+    if isinstance(expected_config, dict) and {"bits", "group_size"} <= set(expected_config):
+        expected = _global_quant_params(expected_config)
+        live = _global_quant_params(getattr(model, "_unsloth_quantization_config", None))
+        if live is not None and expected is not None and live != expected:
+            raise ValueError(
+                "Unsloth: This MLX adapter was saved with base quantization "
+                f"{expected!r}, but the reloaded base has {live!r}."
+            )
+
+
+def _quant_config_from_resolved_map(resolved_map):
+    resolved_map = _normalize_quantization_map(resolved_map)
+    if not resolved_map:
+        return None
+    configs = {
+        (
+            config.get("bits"),
+            config.get("group_size"),
+            config.get("mode", "affine"),
+        )
+        for config in resolved_map.values()
+    }
+    if len(configs) != 1:
+        return None
+    bits, group_size, mode = next(iter(configs))
+    if bits is None or group_size is None:
+        return None
+    return {
+        "bits": bits,
+        "group_size": group_size,
+        "mode": mode,
+        "quantize_modules": sorted(resolved_map),
+    }
+
+
+def _adapter_base_revision(adapter_cfg):
+    return (
+        adapter_cfg.get("base_model_commit_hash")
+        or adapter_cfg.get("base_model_revision")
+    )
+
+
+def _adapter_needs_runtime_quantization(adapter_cfg, quant_policy):
+    if adapter_cfg.get("requires_unsloth_mlx_runtime_quantization") is not None:
+        return bool(adapter_cfg.get("requires_unsloth_mlx_runtime_quantization"))
+    source = adapter_cfg.get("base_quantized_source")
+    if source is not None:
+        return source == "runtime"
+    return bool(quant_policy.get("enabled"))
+
+
+def _resolve_mlx_quantization_spec(
+    *,
+    load_in_4bit,
+    load_in_8bit,
+    load_in_16bit,
+    load_in_fp8,
+    full_finetuning,
+    q_bits,
+    q_group_size,
+    q_mode,
+    mlx_quantization_config,
+    quantization_config,
+    quant_predicate,
+    quantize_modules,
+    force_requantize,
+):
+    if full_finetuning:
+        load_in_4bit = load_in_8bit = load_in_fp8 = False
+        load_in_16bit = True
+
+    mlx_config = dict(mlx_quantization_config or {})
+    if "quantize_modules" in mlx_config and quantize_modules is None:
+        quantize_modules = mlx_config.get("quantize_modules")
+    if "modules" in mlx_config and quantize_modules is None:
+        quantize_modules = mlx_config.get("modules")
+
+    hf_config = _quant_config_to_dict(quantization_config)
+    if hf_config:
+        if not mlx_config and any(
+            key in hf_config
+            for key in (
+                "bits", "q_bits", "group_size", "q_group_size", "mode", "q_mode",
+                "quantize_modules", "modules",
+            )
+        ):
+            mlx_config = dict(hf_config)
+        _reject_unsupported_hf_quantization_fields(hf_config)
+        if hf_config.get("load_in_4bit"):
+            load_in_4bit = True
+        if hf_config.get("load_in_8bit"):
+            load_in_8bit = True
+        if quantize_modules is None:
+            if "quantize_modules" in hf_config:
+                quantize_modules = hf_config.get("quantize_modules")
+            elif "modules" in hf_config:
+                quantize_modules = hf_config.get("modules")
+
+    explicit_mlx_quant_config = bool(mlx_config) or q_bits is not None or q_mode is not None
+    if explicit_mlx_quant_config and load_in_4bit and not any((load_in_8bit, load_in_fp8, load_in_16bit)):
+        # FastMLXModel defaults load_in_4bit=True for CUDA API parity, but
+        # explicit MLX quantization knobs should not be silently shadowed by
+        # that implicit default.
+        if not hf_config.get("load_in_4bit"):
+            print(
+                "Unsloth: Explicit MLX quantization settings detected - "
+                "disabling the default load_in_4bit=True."
+            )
+            load_in_4bit = False
+
+    load_flags = {
+        "load_in_4bit": bool(load_in_4bit),
+        "load_in_8bit": bool(load_in_8bit),
+        "load_in_fp8": bool(load_in_fp8),
+        "load_in_16bit": bool(load_in_16bit),
+    }
+    if load_flags["load_in_4bit"] and any(
+        load_flags[x] for x in ("load_in_8bit", "load_in_fp8", "load_in_16bit")
+    ):
+        # FastMLXModel keeps CUDA Unsloth's load_in_4bit=True default. Let
+        # explicit non-4bit flags override that default for ergonomic calls like
+        # from_pretrained(..., load_in_8bit=True).
+        load_flags["load_in_4bit"] = False
+        load_in_4bit = False
+    active = [name for name, enabled in load_flags.items() if enabled]
+    if len([x for x in active if x != "load_in_16bit"]) > 1:
+        raise ValueError(
+            "Unsloth: pass only one MLX quantization load flag among "
+            "load_in_4bit, load_in_8bit, and load_in_fp8."
+        )
+    if load_in_16bit and any(load_flags[x] for x in ("load_in_4bit", "load_in_8bit", "load_in_fp8")):
+        raise ValueError("Unsloth: load_in_16bit conflicts with quantized load flags.")
+
+    if load_in_16bit:
+        return _MLXQuantizationSpec(
+            enabled=False,
+            source="load_in_16bit",
+            quantize_modules=_normalize_quantize_modules(quantize_modules),
+            has_callable_predicate=quant_predicate is not None,
+            force_requantize=bool(force_requantize),
+        )
+
+    source = "none"
+    if load_in_4bit:
+        bits, mode, source = 4, "affine", "load_in_4bit"
+    elif load_in_8bit:
+        bits, mode, source = 8, "mxfp8", "load_in_8bit"
+    elif load_in_fp8:
+        bits, mode, source = 8, "mxfp8", "load_in_fp8"
+    elif mlx_config:
+        bits = mlx_config.get("bits", mlx_config.get("q_bits", q_bits))
+        mode = mlx_config.get("mode", mlx_config.get("q_mode", q_mode))
+        if bits is None and mode is None:
+            bits, mode = 4, "affine"
+        source = "mlx_quantization_config"
+    else:
+        bits, mode = q_bits, q_mode
+        source = "q_args" if bits is not None or mode is not None else "none"
+
+    if source.startswith("load_in"):
+        # q_group_size is the only low-level override intentionally allowed
+        # for Unsloth-style load flags.
+        group_size = q_group_size
+    else:
+        group_size = mlx_config.get("group_size", mlx_config.get("q_group_size", q_group_size))
+
+    if mode is None and bits is not None:
+        mode = "mxfp8" if bits == 8 else "affine"
+    if mode is not None:
+        if mode not in _MLX_QUANT_MODE_DEFAULTS:
+            raise ValueError(
+                f"Unsloth: Unsupported MLX q_mode={mode!r}. "
+                f"Supported modes: {sorted(_MLX_QUANT_MODE_DEFAULTS)}"
+            )
+        default_group, default_bits = _MLX_QUANT_MODE_DEFAULTS[mode]
+        bits = bits or default_bits
+        group_size = group_size or default_group
+
+    enabled = bits is not None or mode is not None
+    return _MLXQuantizationSpec(
+        enabled=bool(enabled),
+        bits=int(bits) if bits is not None else None,
+        group_size=int(group_size) if group_size is not None else None,
+        mode=mode,
+        source=source,
+        quantize_modules=_normalize_quantize_modules(quantize_modules),
+        has_callable_predicate=quant_predicate is not None,
+        force_requantize=bool(force_requantize),
+    )
+
+
+def _global_quant_params(quantization):
+    if not isinstance(quantization, dict):
+        return None
+    if {"bits", "group_size"} <= set(quantization):
+        return {
+            "bits": quantization.get("bits"),
+            "group_size": quantization.get("group_size"),
+            "mode": quantization.get("mode", "affine"),
+        }
+    return None
+
+
+def _ensure_quantization_compatible(config_data, spec: _MLXQuantizationSpec, model_name):
+    existing = _get_existing_mlx_quantization(config_data)
+    if not existing or not spec.enabled:
+        return "none"
+    existing_global = _global_quant_params(existing)
+    requested = {
+        "bits": spec.bits,
+        "group_size": spec.group_size,
+        "mode": spec.mode,
+    }
+    is_full_model_request = spec.quantize_modules is None and not spec.has_callable_predicate
+    if existing_global == requested and is_full_model_request:
+        return "compatible"
+    if (
+        is_full_model_request
+        and spec.source in ("load_in_4bit", "load_in_8bit", "load_in_fp8")
+        and existing_global is not None
+        and existing_global.get("bits") == spec.bits
+    ):
+        return "compatible"
+    if (
+        is_full_model_request
+        and spec.source == "load_in_4bit"
+        and existing_global is not None
+    ):
+        return "compatible"
+    if spec.force_requantize:
+        warnings.warn(
+            f"Unsloth: '{model_name}' is already quantized but force_requantize=True; "
+            "attempting requested MLX requantization.",
+            stacklevel=2,
+        )
+        return "force"
+    if existing_global is None and isinstance(existing, dict):
+        raise ValueError(
+            f"Unsloth: '{model_name}' has per-module MLX quantization metadata "
+            f"{existing!r}, but requested {requested!r}. Unsloth cannot treat "
+            "a partial quantization config as a globally quantized model. Load "
+            "without additional quantization, request matching per-module "
+            "quantization, or pass force_requantize=True if you intend to "
+            "replace the existing quantized modules."
+        )
+    raise ValueError(
+        f"Unsloth: '{model_name}' is already quantized with {existing!r}, "
+        f"but requested incompatible MLX quantization {requested!r}. "
+        "Load without quantization, request matching quantization, or pass "
+        "force_requantize=True to explicitly attempt requantization."
+    )
+
+
+def _path_matches_any(path, patterns):
+    if patterns is None:
+        return True
+    if not patterns:
+        return False
+    parts = path.split(".")
+    return any(
+        path == p
+        or path.endswith(f".{p}")
+        or p in parts
+        or fnmatch(path, p)
+        for p in patterns
+    )
+
+
+def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
+    model_predicate = getattr(model, "quant_predicate", None)
+    include_patterns = spec.quantize_modules
+    try:
+        from mlx_vlm.utils import skip_multimodal_module
+    except ImportError:
+        skip_multimodal_module = None
+
+    def predicate(path: str, module):
+        path_parts = path.split(".")
+        explicitly_included = (
+            include_patterns is not None and _path_matches_any(path, include_patterns)
+        )
+
+        if is_vlm:
+            if skip_multimodal_module is not None and skip_multimodal_module(path):
+                return False
+            if any(fragment in path_parts for fragment in _MULTIMODAL_SKIP_FRAGMENTS):
+                return False
+
+        if not explicitly_included:
+            if any(fragment in path_parts for fragment in _DEFAULT_QUANT_SKIP_FRAGMENTS):
+                return False
+            if type(module).__name__ in {"Embedding", "QuantizedEmbedding"}:
+                return False
+
+        if include_patterns is not None and not _path_matches_any(path, include_patterns):
+            return False
+        if model_predicate is not None:
+            model_result = model_predicate(path, module)
+            if model_result is False:
+                return False
+            if isinstance(model_result, dict):
+                return model_result
+        if user_predicate is not None:
+            user_result = user_predicate(path, module)
+            if user_result is not True:
+                return user_result
+        return True
+
+    return predicate
+
+
+def _dequantize_selected_mlx_modules(model, predicate):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_unflatten
+
+    replacements = []
+    for path, module in model.named_modules():
+        if not predicate(path, module):
+            continue
+        if isinstance(module, nn.QuantizedLinear):
+            weight = mx.dequantize(
+                module.weight,
+                module.scales,
+                module.biases,
+                group_size=module.group_size,
+                bits=module.bits,
+                mode=module.mode,
+            )
+            output_dims, input_dims = weight.shape
+            replacement = nn.Linear(input_dims, output_dims, bias="bias" in module)
+            replacement.weight = weight
+            if "bias" in module:
+                replacement.bias = module.bias
+            replacements.append((path, replacement))
+        elif isinstance(module, nn.QuantizedEmbedding):
+            weight = mx.dequantize(
+                module.weight,
+                module.scales,
+                module.biases,
+                group_size=module.group_size,
+                bits=module.bits,
+                mode=module.mode,
+            )
+            num_embeddings, dims = weight.shape
+            replacement = nn.Embedding(num_embeddings, dims)
+            replacement.weight = weight
+            replacements.append((path, replacement))
+
+    if replacements:
+        model.update_modules(tree_unflatten(replacements))
+        mx.eval(model.parameters())
+    return len(replacements)
+
+
+def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
+    if not spec.enabled:
+        model._unsloth_quantization_config = None
+        model._unsloth_quantization_policy = spec.to_metadata()
+        model._unsloth_quantized_source = "none"
+        return model, config
+
+    from mlx_lm.utils import quantize_model
+
+    predicate = _compose_mlx_quant_predicate(
+        model, spec, is_vlm=is_vlm, user_predicate=user_predicate,
+    )
+    if spec.force_requantize:
+        existing_quantization = _get_existing_mlx_quantization(config)
+        is_selective = is_vlm or spec.quantize_modules is not None or user_predicate is not None
+        if is_selective and _global_quant_params(existing_quantization):
+            raise ValueError(
+                "Unsloth: selective force_requantize=True on a globally quantized "
+                "MLX model is unsupported because MLX config metadata cannot "
+                "safely express dequantized exceptions. Load a non-quantized base "
+                "model first, or force-requantize the full model."
+            )
+        n_dequantized = _dequantize_selected_mlx_modules(model, predicate)
+        if n_dequantized == 0 and _get_existing_mlx_quantization(config):
+            raise ValueError(
+                "Unsloth: force_requantize=True was requested for an already "
+                "quantized model, but no selected MLX quantized modules could "
+                "be dequantized for requantization."
+            )
+        if not is_vlm and spec.quantize_modules is None and user_predicate is None:
+            config = dict(config or {})
+            config.pop("quantization", None)
+            config.pop("quantization_config", None)
+    if is_vlm or spec.quantize_modules is not None or user_predicate is not None:
+        config = dict(config or {})
+        config.setdefault("quantization", {})
+    model, updated_config = quantize_model(
+        model,
+        config,
+        group_size=spec.group_size,
+        bits=spec.bits,
+        mode=spec.mode or "affine",
+        quant_predicate=predicate,
+    )
+    model._config = updated_config
+    model._unsloth_quantization_config = updated_config.get(
+        "quantization_config", updated_config.get("quantization")
+    )
+    model._unsloth_quantization_policy = spec.to_metadata()
+    model._unsloth_quantized_source = "runtime"
+    return model, updated_config
 
 
 def _build_vlm_quant_predicate(model):
@@ -544,20 +1284,37 @@ def _patched_vlm_load_model(model_path, lazy=False, **kwargs):
     """Drop-in replacement for mlx_vlm.utils.load_model with runtime quantization."""
     import mlx.core as mx
 
+    quantization_spec = kwargs.pop("quantization_spec", None)
+    user_quant_predicate = kwargs.pop("quant_predicate", None)
     q_bits = kwargs.pop("q_bits", None)
     q_group_size = kwargs.pop("q_group_size", 64)
+    q_mode = kwargs.pop("q_mode", None)
+    quantize_modules = kwargs.pop("quantize_modules", None)
 
     # Load float weights (always lazy so quantization runs on lazy arrays)
     model = _original_vlm_load_model(model_path, lazy=True, **kwargs)
 
-    if q_bits is not None:
-        from mlx_lm.utils import quantize_model
+    if quantization_spec is None and q_bits is not None:
+        quantization_spec = _MLXQuantizationSpec(
+            enabled=True,
+            bits=q_bits,
+            group_size=q_group_size,
+            mode=q_mode or ("mxfp8" if q_bits == 8 else "affine"),
+            source="q_args",
+            quantize_modules=_normalize_quantize_modules(quantize_modules),
+            has_callable_predicate=user_quant_predicate is not None,
+        )
+
+    if quantization_spec is not None and quantization_spec.enabled:
         from mlx_vlm.utils import load_config
 
         config = load_config(model_path)
-        predicate = _build_vlm_quant_predicate(model)
-        model, updated_config = quantize_model(
-            model, config, q_group_size, q_bits, quant_predicate=predicate,
+        model, updated_config = _apply_mlx_quantization(
+            model,
+            config,
+            quantization_spec,
+            is_vlm=True,
+            user_predicate=user_quant_predicate,
         )
         model._config = updated_config
 
@@ -1094,6 +1851,9 @@ class FastMLXModel:
         max_seq_length=2048,
         dtype=None,
         load_in_4bit=True,
+        load_in_8bit=False,
+        load_in_16bit=False,
+        load_in_fp8=False,
         full_finetuning=False,
         token=None,
         trust_remote_code=False,
@@ -1125,12 +1885,15 @@ class FastMLXModel:
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
         """
-        if full_finetuning and load_in_4bit:
+        if full_finetuning and (load_in_4bit or load_in_8bit or load_in_fp8):
             print(
-                "Unsloth: full_finetuning=True — disabling load_in_4bit "
+                "Unsloth: full_finetuning=True — disabling quantized loads "
                 "(quantized weights cannot be trained directly)."
             )
             load_in_4bit = False
+            load_in_8bit = False
+            load_in_fp8 = False
+            load_in_16bit = True
         target_dtype = None
         if dtype is not None:
             import mlx.core as mx
@@ -1162,6 +1925,41 @@ class FastMLXModel:
 
         chat_template = kwargs.pop("chat_template", None)
         patch_mode = normalize_mlx_patch_mode(kwargs.pop("patch_mode", patch_mode))
+        q_bits = kwargs.pop("q_bits", None)
+        q_group_size = kwargs.pop("q_group_size", None)
+        q_mode = kwargs.pop("q_mode", None)
+        mlx_quantization_config = kwargs.pop("mlx_quantization_config", None)
+        quantization_config = kwargs.pop("quantization_config", None)
+        caller_supplied_quant_config = (
+            mlx_quantization_config is not None
+            or quantization_config is not None
+            or q_bits is not None
+            or q_group_size is not None
+            or q_mode is not None
+            or load_in_8bit
+            or load_in_fp8
+        )
+        quant_predicate = kwargs.pop("quant_predicate", None)
+        quantize_modules = kwargs.pop(
+            "quantize_modules",
+            kwargs.pop("modules_to_quantize", kwargs.pop("mlx_quantize_modules", None)),
+        )
+        force_requantize = bool(kwargs.pop("force_requantize", False))
+        quantization_spec = _resolve_mlx_quantization_spec(
+            load_in_4bit=load_in_4bit,
+            load_in_8bit=load_in_8bit,
+            load_in_16bit=load_in_16bit,
+            load_in_fp8=load_in_fp8,
+            full_finetuning=full_finetuning,
+            q_bits=q_bits,
+            q_group_size=q_group_size,
+            q_mode=q_mode,
+            mlx_quantization_config=mlx_quantization_config,
+            quantization_config=quantization_config,
+            quant_predicate=quant_predicate,
+            quantize_modules=quantize_modules,
+            force_requantize=force_requantize,
+        )
 
         # Seed mlx random state so any randomness during model construction
         # (e.g. layer init for runtime-quantized models) is reproducible.
@@ -1189,26 +1987,156 @@ class FastMLXModel:
                 base_model_id = adapter_cfg.get("base_model_name_or_path", "")
                 if base_model_id:
                     print(f"Unsloth: Detected LoRA adapter, loading base model '{base_model_id}'...")
-                    model, tokenizer = mlx_load(
-                        base_model_id,
-                        adapter_path=local_path,
-                        tokenizer_config={"token": token} if token else None,
+                    adapter_quant_policy = adapter_cfg.get("base_quantization_policy") or {}
+                    adapter_quant_map = (
+                        adapter_cfg.get("base_resolved_quantization_map")
+                        or adapter_cfg.get("base_quantization_map")
                     )
+                    adapter_base_revision = _adapter_base_revision(adapter_cfg)
+                    adapter_requires_runtime_quant = _adapter_needs_runtime_quantization(
+                        adapter_cfg,
+                        adapter_quant_policy,
+                    )
+                    if adapter_quant_policy.get("enabled"):
+                        adapter_mlx_quant_config = None
+                        if adapter_requires_runtime_quant and adapter_quant_map:
+                            adapter_mlx_quant_config = _quant_config_from_resolved_map(
+                                adapter_quant_map
+                            )
+                        if adapter_requires_runtime_quant and adapter_quant_policy.get("has_callable_predicate") and adapter_mlx_quant_config is None:
+                            raise ValueError(
+                                "Unsloth: This adapter was saved after loading with a "
+                                "custom quant_predicate and its resolved quantization "
+                                "map cannot be replayed exactly. Reload the matching "
+                                "base model with the same quant_predicate and apply the "
+                                "adapter manually, or export a standalone merged model."
+                            )
+                        if full_finetuning or load_in_16bit:
+                            raise ValueError(
+                                "Unsloth: This adapter was saved against a quantized "
+                                "base model. load_in_16bit=True/full_finetuning=True "
+                                "would change the adapter base weights; load without "
+                                "those overrides or retrain the adapter."
+                            )
+                        if adapter_requires_runtime_quant and adapter_mlx_quant_config is None:
+                            adapter_mlx_quant_config = {
+                                "bits": adapter_quant_policy.get("bits"),
+                                "group_size": adapter_quant_policy.get("group_size"),
+                                "mode": adapter_quant_policy.get("mode"),
+                                "quantize_modules": adapter_quant_policy.get("quantize_modules"),
+                            }
+                        if caller_supplied_quant_config:
+                            expected_quantize_modules = None
+                            if adapter_mlx_quant_config is not None:
+                                expected_quantize_modules = adapter_mlx_quant_config.get("quantize_modules")
+                            elif adapter_quant_policy.get("quantize_modules") is not None:
+                                expected_quantize_modules = adapter_quant_policy.get("quantize_modules")
+                            requested_adapter_config = {
+                                "bits": quantization_spec.bits,
+                                "group_size": quantization_spec.group_size,
+                                "mode": quantization_spec.mode,
+                                "quantize_modules": quantization_spec.quantize_modules,
+                            }
+                            expected_adapter_config = {
+                                "bits": (
+                                    adapter_mlx_quant_config.get("bits")
+                                    if adapter_mlx_quant_config is not None
+                                    else adapter_quant_policy.get("bits")
+                                ),
+                                "group_size": (
+                                    adapter_mlx_quant_config.get("group_size")
+                                    if adapter_mlx_quant_config is not None
+                                    else adapter_quant_policy.get("group_size")
+                                ),
+                                "mode": (
+                                    adapter_mlx_quant_config.get("mode")
+                                    if adapter_mlx_quant_config is not None
+                                    else adapter_quant_policy.get("mode")
+                                ),
+                                "quantize_modules": (
+                                    tuple(expected_quantize_modules)
+                                    if expected_quantize_modules is not None
+                                    else None
+                                ),
+                            }
+                            if requested_adapter_config != expected_adapter_config:
+                                raise ValueError(
+                                    "Unsloth: This adapter was saved with base "
+                                    f"quantization {expected_adapter_config!r}, but "
+                                    f"the load request resolved to {requested_adapter_config!r}. "
+                                    "Use the saved base quantization policy or retrain "
+                                    "the adapter for the requested base quantization."
+                                )
+                        model, tokenizer = FastMLXModel.from_pretrained(
+                            base_model_id,
+                            max_seq_length=max_seq_length,
+                            dtype=dtype,
+                            load_in_4bit=False,
+                            load_in_8bit=False,
+                            load_in_16bit=False,
+                            load_in_fp8=False,
+                            full_finetuning=full_finetuning,
+                            token=token,
+                            trust_remote_code=trust_remote_code,
+                            text_only=text_only,
+                            patch_mode=patch_mode,
+                            revision=adapter_base_revision,
+                            random_state=random_state,
+                            **(
+                                {"mlx_quantization_config": adapter_mlx_quant_config}
+                                if adapter_mlx_quant_config is not None
+                                else {}
+                            ),
+                        )
+                        _validate_mlx_adapter_base(model, adapter_cfg)
+                        from mlx_lm.tuner.utils import load_adapters
+                        model = load_adapters(model, local_path)
+                        loaded_model_config = getattr(model, "_config", None)
+                    else:
+                        model, tokenizer = mlx_load(
+                            base_model_id,
+                            adapter_path=local_path,
+                            tokenizer_config={"token": token} if token else None,
+                            revision=adapter_base_revision,
+                        )
+                        loaded_model_config = None
+                    is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
+                    processor = getattr(model, "_processor", None)
 
-                    base_local = str(_download(base_model_id))
+                    base_local = str(_download(base_model_id, revision=adapter_base_revision))
                     base_config_path = os.path.join(base_local, "config.json")
                     if os.path.exists(base_config_path):
                         with open(base_config_path, "r") as f:
                             config_data = json.load(f)
-                    model._config = config_data
+                    if loaded_model_config is not None:
+                        model._config = loaded_model_config
+                    else:
+                        model._config = config_data
                     model._hf_repo = base_model_id
                     model._src_path = base_local
-                    model._is_vlm_model = False
+                    model._unsloth_base_revision = adapter_base_revision
+                    model._unsloth_base_commit_hash = (
+                        adapter_cfg.get("base_model_commit_hash")
+                        or _infer_snapshot_commit(base_local)
+                    )
+                    model._is_vlm_model = is_vlm_model
+                    if processor is not None:
+                        model._processor = processor
                     model.max_seq_length = max_seq_length
                     model._unsloth_full_finetuning = bool(full_finetuning)
+                    if adapter_quant_policy:
+                        model._unsloth_quantization_policy = adapter_quant_policy
+                        model._unsloth_quantization_config = adapter_cfg.get(
+                            "base_quantization_config"
+                        )
+                        model._unsloth_quantized_source = adapter_cfg.get(
+                            "base_quantized_source"
+                        )
                     _patch_mlx_saving(model, tokenizer)
                     return model, tokenizer
             except Exception as e:
+                if isinstance(e, ValueError) and "Unsloth:" in str(e):
+                    raise
                 print(f"Unsloth: LoRA adapter detection failed ({e}), falling back to standard load.")
 
         # Step 2: Check unsloth custom loader registry
@@ -1250,6 +2178,8 @@ class FastMLXModel:
             model._config = config_data
             model._hf_repo = model_name
             model._src_path = local_path
+            model._unsloth_base_revision = revision
+            model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
             model._unsloth_full_finetuning = bool(full_finetuning)
@@ -1295,24 +2225,27 @@ class FastMLXModel:
                 install_mlx_compile_patches()
             _ensure_vlm_prompt_utils_patched()
 
-            already_quantized = _vlm_config_is_already_quantized(config_data)
-            q_bits = kwargs.pop("q_bits", 4)
-            q_group_size = kwargs.pop("q_group_size", 64)
-            want_runtime_quant = load_in_4bit and not already_quantized
+            quant_state = _ensure_quantization_compatible(
+                config_data, quantization_spec, model_name,
+            )
+            want_runtime_quant = quantization_spec.enabled and quant_state != "compatible"
 
-            if load_in_4bit and already_quantized:
+            if quantization_spec.enabled and quant_state == "compatible":
                 warnings.warn(
                     f"Unsloth: '{model_name}' is already quantized — "
-                    f"ignoring load_in_4bit.",
+                    "using existing compatible MLX quantization.",
                     stacklevel=2,
                 )
 
             if want_runtime_quant:
                 _ensure_vlm_load_model_patched()
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
-                      f"runtime {q_bits}-bit quantization)...")
+                      f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")
                 model, processor = vlm_load(
-                    model_name, q_bits=q_bits, q_group_size=q_group_size,
+                    model_name,
+                    quantization_spec=quantization_spec,
+                    quant_predicate=quant_predicate,
+                    lazy=True,
                     revision=revision,
                     **extra_kwargs,
                 )
@@ -1324,10 +2257,18 @@ class FastMLXModel:
                 vlm_kwargs["revision"] = revision
                 if target_dtype is not None:
                     vlm_kwargs["lazy"] = True
-                model, processor = vlm_load(model_name, **vlm_kwargs)
+                model, processor = _load_mlx_vlm_with_gemma4_projection_fallback(
+                    model_name,
+                    model_type,
+                    vlm_load,
+                    vlm_kwargs,
+                )
 
             if target_dtype is not None:
                 _convert_mlx_dtype(model, target_dtype)
+            elif want_runtime_quant:
+                import mlx.core as mx
+                mx.eval(model.parameters())
 
             from .mlx_utils import (
                 normalize_mlx_chat_template,
@@ -1354,9 +2295,15 @@ class FastMLXModel:
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name
             model._src_path = local_path
+            model._unsloth_base_revision = revision
+            model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
             model._unsloth_full_finetuning = bool(full_finetuning)
+            if quant_state == "compatible":
+                model._unsloth_quantization_config = _get_existing_mlx_quantization(config_data)
+                model._unsloth_quantization_policy = quantization_spec.to_metadata()
+                model._unsloth_quantized_source = "mlx_config"
             model._unsloth_compile_trait_report = get_compile_trait_report(model)
             model._unsloth_compile_qualification = get_compile_qualification(model)
             model._unsloth_compile_backend_qualifications = get_backend_compile_qualifications(model)
@@ -1380,13 +2327,24 @@ class FastMLXModel:
             return model, public_target
         else:
             # Text path via mlx-lm (original behavior)
-            already_quantized = _vlm_config_is_already_quantized(config_data)
-            want_runtime_quant = load_in_4bit and not already_quantized
+            quant_state = _ensure_quantization_compatible(
+                config_data, quantization_spec, model_name,
+            )
+            want_runtime_quant = quantization_spec.enabled and quant_state != "compatible"
 
             if want_runtime_quant:
-                print(f"Unsloth: Loading {model_name} via mlx-lm (runtime 4-bit quantization)...")
+                print(
+                    f"Unsloth: Loading {model_name} via mlx-lm "
+                    f"(runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)..."
+                )
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-lm...")
+                if quantization_spec.enabled and quant_state == "compatible":
+                    warnings.warn(
+                        f"Unsloth: '{model_name}' is already quantized — "
+                        "using existing compatible MLX quantization.",
+                        stacklevel=2,
+                    )
             _ensure_safe_text_wrapper_sanitize(model_type)
 
             mlx_load_kwargs = dict(
@@ -1394,23 +2352,33 @@ class FastMLXModel:
                 return_config=True,
                 revision=revision,
             )
-            if target_dtype is not None and not want_runtime_quant:
+            if target_dtype is not None or want_runtime_quant:
                 mlx_load_kwargs["lazy"] = True
-            model, tokenizer, config = mlx_load(model_name, **mlx_load_kwargs)
+            model, tokenizer, config = _load_mlx_lm_with_gemma4_text_fallback(
+                model_name,
+                model_type,
+                mlx_load,
+                mlx_load_kwargs,
+            )
 
             if want_runtime_quant:
-                import mlx.core as mx
-                from mlx_lm.utils import quantize_model
-                q_bits = kwargs.pop("q_bits", 4)
-                q_group_size = kwargs.pop("q_group_size", 64)
-                model, config = quantize_model(
-                    model, config, q_group_size, q_bits,
+                model, config = _apply_mlx_quantization(
+                    model,
+                    config,
+                    quantization_spec,
+                    is_vlm=False,
+                    user_predicate=quant_predicate,
                 )
-                mx.eval(model.parameters())
-                print(f"Unsloth: Quantized text model to {q_bits}-bit.")
+                print(
+                    f"Unsloth: Quantized text model to "
+                    f"{quantization_spec.bits}-bit {quantization_spec.mode}."
+                )
 
             if target_dtype is not None:
                 _convert_mlx_dtype(model, target_dtype)
+            elif want_runtime_quant:
+                import mlx.core as mx
+                mx.eval(model.parameters())
             from .mlx_utils import normalize_mlx_chat_template
 
             tokenizer = normalize_mlx_chat_template(
@@ -1426,9 +2394,15 @@ class FastMLXModel:
             model._config = config
             model._hf_repo = model_name
             model._src_path = local_path
+            model._unsloth_base_revision = revision
+            model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
             model._unsloth_full_finetuning = bool(full_finetuning)
+            if quant_state == "compatible":
+                model._unsloth_quantization_config = _get_existing_mlx_quantization(config_data)
+                model._unsloth_quantization_policy = quantization_spec.to_metadata()
+                model._unsloth_quantized_source = "mlx_config"
             _patch_mixed_precision_set_dtype(model)
 
             _patch_mlx_saving(model, tokenizer)
