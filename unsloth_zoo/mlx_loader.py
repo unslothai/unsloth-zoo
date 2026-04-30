@@ -948,6 +948,8 @@ def _resolve_mlx_quantization_spec(
     load_in_8bit,
     load_in_16bit,
     load_in_fp8,
+    load_in_mxfp4,
+    load_in_nvfp4,
     full_finetuning,
     q_bits,
     q_group_size,
@@ -960,6 +962,7 @@ def _resolve_mlx_quantization_spec(
 ):
     if full_finetuning:
         load_in_4bit = load_in_8bit = load_in_fp8 = False
+        load_in_mxfp4 = load_in_nvfp4 = False
         load_in_16bit = True
 
     mlx_config = dict(mlx_quantization_config or {})
@@ -983,6 +986,10 @@ def _resolve_mlx_quantization_spec(
             load_in_4bit = True
         if hf_config.get("load_in_8bit"):
             load_in_8bit = True
+        if hf_config.get("load_in_mxfp4"):
+            load_in_mxfp4 = True
+        if hf_config.get("load_in_nvfp4"):
+            load_in_nvfp4 = True
         if quantize_modules is None:
             if "quantize_modules" in hf_config:
                 quantize_modules = hf_config.get("quantize_modules")
@@ -990,7 +997,9 @@ def _resolve_mlx_quantization_spec(
                 quantize_modules = hf_config.get("modules")
 
     explicit_mlx_quant_config = bool(mlx_config) or q_bits is not None or q_mode is not None
-    if explicit_mlx_quant_config and load_in_4bit and not any((load_in_8bit, load_in_fp8, load_in_16bit)):
+    if explicit_mlx_quant_config and load_in_4bit and not any((
+        load_in_8bit, load_in_fp8, load_in_mxfp4, load_in_nvfp4, load_in_16bit,
+    )):
         # FastMLXModel defaults load_in_4bit=True for CUDA API parity, but
         # explicit MLX quantization knobs should not be silently shadowed by
         # that implicit default.
@@ -1005,10 +1014,15 @@ def _resolve_mlx_quantization_spec(
         "load_in_4bit": bool(load_in_4bit),
         "load_in_8bit": bool(load_in_8bit),
         "load_in_fp8": bool(load_in_fp8),
+        "load_in_mxfp4": bool(load_in_mxfp4),
+        "load_in_nvfp4": bool(load_in_nvfp4),
         "load_in_16bit": bool(load_in_16bit),
     }
     if load_flags["load_in_4bit"] and any(
-        load_flags[x] for x in ("load_in_8bit", "load_in_fp8", "load_in_16bit")
+        load_flags[x] for x in (
+            "load_in_8bit", "load_in_fp8", "load_in_mxfp4",
+            "load_in_nvfp4", "load_in_16bit",
+        )
     ):
         # FastMLXModel keeps CUDA Unsloth's load_in_4bit=True default. Let
         # explicit non-4bit flags override that default for ergonomic calls like
@@ -1019,9 +1033,13 @@ def _resolve_mlx_quantization_spec(
     if len([x for x in active if x != "load_in_16bit"]) > 1:
         raise ValueError(
             "Unsloth: pass only one MLX quantization load flag among "
-            "load_in_4bit, load_in_8bit, and load_in_fp8."
+            "load_in_4bit, load_in_8bit, load_in_fp8, load_in_mxfp4, "
+            "and load_in_nvfp4."
         )
-    if load_in_16bit and any(load_flags[x] for x in ("load_in_4bit", "load_in_8bit", "load_in_fp8")):
+    if load_in_16bit and any(load_flags[x] for x in (
+        "load_in_4bit", "load_in_8bit", "load_in_fp8",
+        "load_in_mxfp4", "load_in_nvfp4",
+    )):
         raise ValueError("Unsloth: load_in_16bit conflicts with quantized load flags.")
 
     if load_in_16bit:
@@ -1037,9 +1055,13 @@ def _resolve_mlx_quantization_spec(
     if load_in_4bit:
         bits, mode, source = 4, "affine", "load_in_4bit"
     elif load_in_8bit:
-        bits, mode, source = 8, "mxfp8", "load_in_8bit"
+        bits, mode, source = 8, "affine", "load_in_8bit"
     elif load_in_fp8:
         bits, mode, source = 8, "mxfp8", "load_in_fp8"
+    elif load_in_mxfp4:
+        bits, mode, source = 4, "mxfp4", "load_in_mxfp4"
+    elif load_in_nvfp4:
+        bits, mode, source = 4, "nvfp4", "load_in_nvfp4"
     elif mlx_config:
         bits = mlx_config.get("bits", mlx_config.get("q_bits", q_bits))
         mode = mlx_config.get("mode", mlx_config.get("q_mode", q_mode))
@@ -1058,7 +1080,7 @@ def _resolve_mlx_quantization_spec(
         group_size = mlx_config.get("group_size", mlx_config.get("q_group_size", q_group_size))
 
     if mode is None and bits is not None:
-        mode = "mxfp8" if bits == 8 else "affine"
+        mode = "affine"
     if mode is not None:
         if mode not in _MLX_QUANT_MODE_DEFAULTS:
             raise ValueError(
@@ -1106,13 +1128,6 @@ def _ensure_quantization_compatible(config_data, spec: _MLXQuantizationSpec, mod
     }
     is_full_model_request = spec.quantize_modules is None and not spec.has_callable_predicate
     if existing_global == requested and is_full_model_request:
-        return "compatible"
-    if (
-        is_full_model_request
-        and spec.source in ("load_in_4bit", "load_in_8bit", "load_in_fp8")
-        and existing_global is not None
-        and existing_global.get("bits") == spec.bits
-    ):
         return "compatible"
     if (
         is_full_model_request
@@ -1350,7 +1365,7 @@ def _patched_vlm_load_model(model_path, lazy=False, **kwargs):
             enabled=True,
             bits=q_bits,
             group_size=q_group_size,
-            mode=q_mode or ("mxfp8" if q_bits == 8 else "affine"),
+            mode=q_mode or "affine",
             source="q_args",
             quantize_modules=_normalize_quantize_modules(quantize_modules),
             has_callable_predicate=user_quant_predicate is not None,
@@ -1905,6 +1920,8 @@ class FastMLXModel:
         load_in_8bit=False,
         load_in_16bit=False,
         load_in_fp8=False,
+        load_in_mxfp4=False,
+        load_in_nvfp4=False,
         full_finetuning=False,
         token=None,
         trust_remote_code=False,
@@ -1936,7 +1953,10 @@ class FastMLXModel:
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
         """
-        if full_finetuning and (load_in_4bit or load_in_8bit or load_in_fp8):
+        if full_finetuning and (
+            load_in_4bit or load_in_8bit or load_in_fp8
+            or load_in_mxfp4 or load_in_nvfp4
+        ):
             print(
                 "Unsloth: full_finetuning=True — disabling quantized loads "
                 "(quantized weights cannot be trained directly)."
@@ -1944,6 +1964,8 @@ class FastMLXModel:
             load_in_4bit = False
             load_in_8bit = False
             load_in_fp8 = False
+            load_in_mxfp4 = False
+            load_in_nvfp4 = False
             load_in_16bit = True
         target_dtype = None
         if dtype is not None:
@@ -1989,6 +2011,8 @@ class FastMLXModel:
             or q_mode is not None
             or load_in_8bit
             or load_in_fp8
+            or load_in_mxfp4
+            or load_in_nvfp4
         )
         quant_predicate = kwargs.pop("quant_predicate", None)
         quantize_modules = kwargs.pop(
@@ -2001,6 +2025,8 @@ class FastMLXModel:
             load_in_8bit=load_in_8bit,
             load_in_16bit=load_in_16bit,
             load_in_fp8=load_in_fp8,
+            load_in_mxfp4=load_in_mxfp4,
+            load_in_nvfp4=load_in_nvfp4,
             full_finetuning=full_finetuning,
             q_bits=q_bits,
             q_group_size=q_group_size,
@@ -2129,6 +2155,8 @@ class FastMLXModel:
                             load_in_8bit=False,
                             load_in_16bit=False,
                             load_in_fp8=False,
+                            load_in_mxfp4=False,
+                            load_in_nvfp4=False,
                             full_finetuning=full_finetuning,
                             token=token,
                             trust_remote_code=trust_remote_code,
