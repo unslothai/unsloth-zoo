@@ -1227,6 +1227,15 @@ class MLXTrainer:
                 "max_steps": self.args.max_steps,
                 "max_seq_length": self.args.max_seq_length,
                 "use_cce": self.args.use_cce,
+                "base_quantization_config": getattr(
+                    self.model, "_unsloth_quantization_config", None,
+                ),
+                "base_quantization_policy": getattr(
+                    self.model, "_unsloth_quantization_policy", None,
+                ),
+                "base_quantized_source": getattr(
+                    self.model, "_unsloth_quantized_source", None,
+                ),
             })
             self.tokenizer.save_pretrained(output_dir)
 

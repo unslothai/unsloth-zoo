@@ -508,6 +508,21 @@ def _align_logits_with_labels(logits, labels):
     return logits, labels
 
 
+def _trim_sequence_aligned_vlm_kwargs(extra_kwargs, seq_len):
+    """Trim auxiliary VLM tensors that track token sequence length.
+
+    Some VLMs, notably Qwen3-VL, pass position_ids through the batch. The loss
+    function shifts input_ids for causal LM training, so these auxiliary tensors
+    must be shifted to the same token length before the model builds rotary
+    embeddings.
+    """
+    position_ids = extra_kwargs.get("position_ids")
+    if position_ids is not None and hasattr(position_ids, "shape"):
+        if position_ids.shape[-1] != seq_len:
+            extra_kwargs["position_ids"] = position_ids[..., :seq_len]
+    return extra_kwargs
+
+
 def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
     """Create a standard cross-entropy loss function for VLMs.
 
@@ -539,6 +554,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
             if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
             and v is not None
         }
+        fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
         output = model(inputs, pixel_values=pixel_values, mask=fwd_mask, **fwd_kwargs)
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits.astype(mx.float32)
@@ -693,11 +709,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
         and v is not None
     }
-    position_ids = extra_kwargs.get("position_ids")
-    if position_ids is not None and hasattr(position_ids, "shape"):
-        seq_len = inputs.shape[1]
-        if position_ids.shape[-1] != seq_len:
-            extra_kwargs["position_ids"] = position_ids[..., :seq_len]
+    extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
 
     embed_result = model.get_input_embeddings(
         inputs,
@@ -2398,9 +2410,171 @@ def save_lora_adapters(model, path, adapter_config=None):
     if trainable:
         mx.save_safetensors(str(path / "adapters.safetensors"), trainable)
 
+    adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
     if adapter_config:
         with open(path / "adapter_config.json", "w") as f:
             json.dump(adapter_config, f, indent=2)
+
+
+def _infer_snapshot_commit(path):
+    if not path:
+        return None
+    parts = os.path.normpath(str(path)).split(os.sep)
+    try:
+        index = parts.index("snapshots")
+    except ValueError:
+        return None
+    if index + 1 >= len(parts):
+        return None
+    return parts[index + 1] or None
+
+
+def _effective_mlx_quantization_map(model):
+    quantized = {}
+    config = getattr(model, "_config", None)
+    if isinstance(config, dict):
+        quantized.update(_quantization_config_to_path_map(
+            config.get("quantization") or config.get("quantization_config")
+        ))
+    quantized.update(_quantization_config_to_path_map(
+        getattr(model, "_unsloth_quantization_config", None)
+    ))
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        if type(module).__name__ not in {"QuantizedLinear", "QuantizedEmbedding"}:
+            continue
+        name = _canonical_mlx_quantization_path(name)
+        entry = {}
+        for key in ("bits", "group_size", "mode"):
+            if hasattr(module, key):
+                value = getattr(module, key)
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    pass
+                entry[key] = value
+        quantized[name] = entry
+    return quantized
+
+
+def _quantization_config_to_path_map(config):
+    if not isinstance(config, dict):
+        return {}
+    defaults = {
+        key: config.get(key)
+        for key in ("bits", "group_size", "mode")
+        if config.get(key) is not None
+    }
+    if defaults and "mode" not in defaults:
+        defaults["mode"] = "affine"
+    reserved = {
+        "bits", "group_size", "mode", "quant_method", "skip_vision",
+        "skip_projector", "skip_lm_head",
+    }
+    quantized = {}
+    for name, value in config.items():
+        if name in reserved or not isinstance(value, dict):
+            continue
+        entry = dict(defaults)
+        entry.update(value)
+        if "bits" not in entry or "group_size" not in entry:
+            continue
+        if "mode" not in entry:
+            entry["mode"] = "affine"
+        quantized[_canonical_mlx_quantization_path(str(name))] = {
+            key: int(item) if key in ("bits", "group_size") else item
+            for key, item in entry.items()
+            if key in ("bits", "group_size", "mode")
+        }
+    return quantized
+
+
+def _canonical_mlx_quantization_path(path):
+    if path.endswith(".linear"):
+        return path[:-len(".linear")]
+    return path
+
+
+def _strip_mlx_quantization_metadata(config):
+    if not isinstance(config, dict):
+        return config
+    stripped = {}
+    for key, value in config.items():
+        if key in {"quantization", "quantization_config"}:
+            continue
+        if isinstance(value, dict):
+            value = _strip_mlx_quantization_metadata(value)
+        stripped[key] = value
+    return stripped
+
+
+def _get_mlx_config_quantization(model):
+    config = getattr(model, "_config", None)
+    if not isinstance(config, dict):
+        return None
+    return config.get("quantization") or config.get("quantization_config")
+
+
+def _enrich_mlx_adapter_config(model, adapter_config):
+    adapter_config = dict(adapter_config or {})
+    hf_repo = getattr(model, "_hf_repo", None) or adapter_config.get("base_model_name_or_path")
+    if hf_repo:
+        adapter_config["base_model_name_or_path"] = hf_repo
+
+    base_revision = getattr(model, "_unsloth_base_revision", None)
+    if base_revision is not None:
+        adapter_config["base_model_revision"] = base_revision
+    else:
+        adapter_config.pop("base_model_revision", None)
+
+    base_commit = (
+        getattr(model, "_unsloth_base_commit_hash", None)
+        or _infer_snapshot_commit(getattr(model, "_src_path", None))
+    )
+    if base_commit is not None:
+        adapter_config["base_model_commit_hash"] = base_commit
+    else:
+        adapter_config.pop("base_model_commit_hash", None)
+
+    quant_config = getattr(model, "_unsloth_quantization_config", None)
+    quant_policy = getattr(model, "_unsloth_quantization_policy", None)
+    quant_source = getattr(model, "_unsloth_quantized_source", None)
+    config_quantization = _get_mlx_config_quantization(model)
+    if quant_config is None and config_quantization is not None:
+        quant_config = config_quantization
+    if quant_source is None and config_quantization is not None:
+        quant_source = "mlx_config"
+    if quant_config is not None:
+        adapter_config["base_quantization_config"] = quant_config
+    else:
+        adapter_config.pop("base_quantization_config", None)
+    if quant_policy is not None:
+        adapter_config["base_quantization_policy"] = quant_policy
+    else:
+        adapter_config.pop("base_quantization_policy", None)
+    if quant_source is not None:
+        adapter_config["base_quantized_source"] = quant_source
+    else:
+        adapter_config.pop("base_quantized_source", None)
+
+    resolved_map = _effective_mlx_quantization_map(model)
+    if resolved_map:
+        adapter_config["base_resolved_quantization_map"] = resolved_map
+        adapter_config.pop("base_quantization_map", None)
+    else:
+        adapter_config.pop("base_resolved_quantization_map", None)
+        adapter_config.pop("base_quantization_map", None)
+
+    requires_runtime = False
+    if quant_source == "runtime":
+        requires_runtime = True
+    if isinstance(quant_policy, dict) and quant_policy.get("has_callable_predicate"):
+        requires_runtime = True
+    if resolved_map and quant_source != "mlx_config":
+        requires_runtime = True
+    adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
+    return adapter_config
 
 
 def _get_model_config(model):
@@ -2461,9 +2635,8 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
 
     if dequantize:
         cfg = getattr(model, "_config", None)
-        if isinstance(cfg, dict) and "quantization" in cfg:
-            cfg = {k: v for k, v in cfg.items() if k != "quantization"}
-            model._config = cfg
+        if isinstance(cfg, dict):
+            model._config = _strip_mlx_quantization_metadata(cfg)
 
     de_lora_model = model
 
