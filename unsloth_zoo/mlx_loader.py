@@ -2320,17 +2320,23 @@ class FastMLXModel:
                 )
 
             if want_runtime_quant:
-                _ensure_vlm_load_model_patched()
+                import mlx.core as mx
+                from mlx_vlm.utils import load_config as _vlm_load_config
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
                       f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")
                 model, processor = vlm_load(
                     model_name,
-                    quantization_spec=quantization_spec,
-                    quant_predicate=quant_predicate,
                     lazy=True,
                     revision=revision,
                     **extra_kwargs,
                 )
+                vlm_cfg = _vlm_load_config(local_path or model_name)
+                model, vlm_cfg = _apply_mlx_quantization(
+                    model, vlm_cfg, quantization_spec,
+                    is_vlm=True, user_predicate=quant_predicate,
+                )
+                model._config = vlm_cfg
+                mx.eval(model.parameters())
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
                 # Lazy-load when we need to convert dtype so weights are
