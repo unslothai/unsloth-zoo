@@ -94,35 +94,67 @@ def _is_vlm(config: dict) -> bool:
     return model_type in _vlm_model_types_cache
 
 
-def _load_mlx_lm_with_gemma4_text_fallback(
+_KNOWN_MLX_LM_STRICT_FALLBACKS = {
+    "gemma4_text": {
+        "message_tokens": (
+            "parameters not in model",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+        ),
+        "notice": (
+            "Unsloth: Gemma4 text checkpoint has extra KV-sharing weights - "
+            "loading with mlx-lm strict=False."
+        ),
+    },
+}
+
+
+_KNOWN_VLM_EXTRA_WEIGHT_FILTERS = {
+    "gemma4": {
+        "message_tokens": (
+            "parameters not in model",
+            "per_layer_model_projection",
+            "scales",
+            "biases",
+        ),
+        "notice": (
+            "Unsloth: Gemma4 VLM checkpoint has extra quantized "
+            "per-layer projection state - ignoring only those known keys."
+        ),
+        "allowed_extra": frozenset({
+            "language_model.model.per_layer_model_projection.biases",
+            "language_model.model.per_layer_model_projection.scales",
+        }),
+    },
+}
+
+
+def _message_matches_known_fallback(message, rule):
+    return all(token in message for token in rule.get("message_tokens", ()))
+
+
+def _load_mlx_lm_with_strict_fallback(
     model_name,
     model_type,
     mlx_load,
     mlx_load_kwargs,
 ):
-    """Load text models through mlx-lm, with one narrow Gemma4 workaround.
+    """Load text models through mlx-lm, retrying strict=False for known safe mismatches.
 
-    Some Gemma4 text checkpoints include K/V tensors for KV-shared layers that
-    mlx-lm's gemma4_text module intentionally does not instantiate. mlx-lm's
-    public load() does not expose strict=False, so use the internal loader only
-    for that known mismatch.
+    Some upstream checkpoints contain extra tensors that the current mlx-lm
+    implementation intentionally does not instantiate. mlx-lm's public load()
+    does not expose strict=False, so use the internal loader only for registered
+    mismatch signatures.
     """
     try:
         return mlx_load(model_name, **mlx_load_kwargs)
     except ValueError as error:
         message = str(error)
-        if (
-            model_type != "gemma4_text"
-            or "parameters not in model" not in message
-            or "self_attn.k_proj" not in message
-            or "self_attn.v_proj" not in message
-        ):
+        rule = _KNOWN_MLX_LM_STRICT_FALLBACKS.get(model_type)
+        if rule is None or not _message_matches_known_fallback(message, rule):
             raise
 
-        print(
-            "Unsloth: Gemma4 text checkpoint has extra KV-sharing weights - "
-            "loading with mlx-lm strict=False."
-        )
+        print(rule["notice"])
         from mlx_lm.utils import _download, load_model, load_tokenizer
 
         model_path = _download(model_name, revision=mlx_load_kwargs.get("revision"))
@@ -142,45 +174,32 @@ def _load_mlx_lm_with_gemma4_text_fallback(
         return model, tokenizer
 
 
-def _load_mlx_vlm_with_gemma4_projection_fallback(
+def _load_mlx_vlm_with_extra_weight_filter(
     model_name,
     model_type,
     vlm_load,
     vlm_kwargs,
 ):
-    """Load VLMs, allowing one known Gemma4 quantized projection mismatch.
+    """Load VLMs, filtering known extra checkpoint tensors on retry.
 
-    Some Gemma4 MLX checkpoints include quantization state for
-    per_layer_model_projection, while the current mlx-vlm Gemma4 class keeps
-    that projection non-quantized or absent. mlx-vlm does not expose strict=False
-    through load(), so retry with a temporary load_weights shim only for this
-    narrow mismatch.
+    Some upstream VLM checkpoints include tensors for modules that the current
+    mlx-vlm class does not instantiate. mlx-vlm does not expose strict=False
+    through load(), so retry with a temporary load_weights shim only for
+    registered mismatch signatures and exact allow-listed keys.
     """
     try:
         return vlm_load(model_name, **vlm_kwargs)
     except ValueError as error:
         message = str(error)
-        if (
-            model_type != "gemma4"
-            or "parameters not in model" not in message
-            or "per_layer_model_projection" not in message
-            or "scales" not in message
-            or "biases" not in message
-        ):
+        rule = _KNOWN_VLM_EXTRA_WEIGHT_FILTERS.get(model_type)
+        if rule is None or not _message_matches_known_fallback(message, rule):
             raise
 
-        print(
-            "Unsloth: Gemma4 VLM checkpoint has extra quantized "
-            "per-layer projection state - ignoring only those known keys."
-        )
+        print(rule["notice"])
         import mlx.nn as nn
 
         original_load_weights = nn.Module.load_weights
-
-        allowed_extra = {
-            "language_model.model.per_layer_model_projection.biases",
-            "language_model.model.per_layer_model_projection.scales",
-        }
+        allowed_extra = rule["allowed_extra"]
 
         def _load_weights_without_projection_quant_state(self, file_or_weights, strict=True):
             if isinstance(file_or_weights, list):
@@ -2292,7 +2311,7 @@ class FastMLXModel:
                 vlm_kwargs["revision"] = revision
                 if target_dtype is not None:
                     vlm_kwargs["lazy"] = True
-                model, processor = _load_mlx_vlm_with_gemma4_projection_fallback(
+                model, processor = _load_mlx_vlm_with_extra_weight_filter(
                     model_name,
                     model_type,
                     vlm_load,
@@ -2389,7 +2408,7 @@ class FastMLXModel:
             )
             if target_dtype is not None or want_runtime_quant:
                 mlx_load_kwargs["lazy"] = True
-            model, tokenizer, config = _load_mlx_lm_with_gemma4_text_fallback(
+            model, tokenizer, config = _load_mlx_lm_with_strict_fallback(
                 model_name,
                 model_type,
                 mlx_load,
