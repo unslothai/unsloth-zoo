@@ -2801,6 +2801,7 @@ def save_pretrained_gguf(
     tokenizer,
     save_directory,
     quantization_method="fast_quantized",
+    first_conversion=None,
 ):
     """Save LoRA-fused model in GGUF format for llama.cpp inference.
 
@@ -2821,6 +2822,10 @@ def save_pretrained_gguf(
             "quantized" - q4_k_m (small, fast inference)
             Or any llama.cpp quant type: q2_k, q3_k_m, q4_k_m, q5_k_m,
             q6_k, q8_0, f16, bf16, f32, etc.
+        first_conversion: Optional override for the intermediate GGUF
+            dtype produced by convert_hf_to_gguf before llama-quantize
+            compresses it to ``quantization_method``. Pass ``"f32"`` /
+            ``"f16"`` / ``"bf16"`` to force a specific intermediate
     """
     from .llama_cpp import (
         convert_to_gguf,
@@ -2846,15 +2851,15 @@ def save_pretrained_gguf(
     model_dtype = "bf16"
 
     # Determine first_conversion (intermediate GGUF format before quantizing)
-    # Same logic as unsloth CUDA path's save_to_gguf()
-    if quant_type in ("bf16", "f16", "f32"):
-        first_conversion = quant_type
-    elif quant_type == "q8_0":
-        # q8_0 can be done directly by convert_hf_to_gguf.py
-        first_conversion = "None"
-    else:
-        # For all other quant types, first convert to bf16 then quantize
-        first_conversion = "bf16"
+    if first_conversion is None:
+        if quant_type in ("bf16", "f16", "f32"):
+            first_conversion = quant_type
+        elif quant_type == "q8_0":
+            # q8_0 can be done directly by convert_hf_to_gguf.py
+            first_conversion = "None"
+        else:
+            # For all other quant types, first convert to bf16 then quantize
+            first_conversion = "bf16"
 
     # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
     try:
