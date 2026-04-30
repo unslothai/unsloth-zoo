@@ -1967,9 +1967,13 @@ class FastMLXModel:
             load_in_mxfp4 = False
             load_in_nvfp4 = False
             load_in_16bit = True
+        import mlx.core as mx
+        chip = mx.device_info().get("device_name", "") or ""
+        bf16_supported = not chip.startswith(("Apple M1", "Apple M2"))
         target_dtype = None
-        if dtype is not None:
-            import mlx.core as mx
+        if dtype is None:
+            target_dtype = mx.bfloat16 if bf16_supported else mx.float16
+        else:
             if isinstance(dtype, str):
                 target_dtype = getattr(mx, dtype, None)
             elif dtype in (mx.float16, mx.bfloat16, mx.float32):
@@ -1979,8 +1983,7 @@ class FastMLXModel:
                     f"Unsloth: Unsupported dtype {dtype!r}. "
                     f"Use 'float16', 'bfloat16', or 'float32'."
                 )
-            chip = mx.device_info().get("device_name", "") or ""
-            if target_dtype == mx.bfloat16 and chip.startswith(("Apple M1", "Apple M2")):
+            if target_dtype == mx.bfloat16 and not bf16_supported:
                 warnings.warn(
                     f"Unsloth: {chip} lacks native bf16 GPU support — "
                     f"bf16 will be emulated (~40-70%% slower prefill). "
