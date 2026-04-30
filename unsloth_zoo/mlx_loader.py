@@ -171,16 +171,27 @@ def _load_mlx_vlm_with_gemma4_projection_fallback(
 
         print(
             "Unsloth: Gemma4 VLM checkpoint has extra quantized "
-            "per-layer projection state - loading with MLX strict=False."
+            "per-layer projection state - ignoring only those known keys."
         )
         import mlx.nn as nn
 
         original_load_weights = nn.Module.load_weights
 
-        def _load_weights_strict_false(self, file_or_weights, strict=True):
-            return original_load_weights(self, file_or_weights, strict=False)
+        allowed_extra = {
+            "language_model.model.per_layer_model_projection.biases",
+            "language_model.model.per_layer_model_projection.scales",
+        }
 
-        nn.Module.load_weights = _load_weights_strict_false
+        def _load_weights_without_projection_quant_state(self, file_or_weights, strict=True):
+            if isinstance(file_or_weights, list):
+                file_or_weights = [
+                    (key, value)
+                    for key, value in file_or_weights
+                    if key not in allowed_extra
+                ]
+            return original_load_weights(self, file_or_weights, strict=strict)
+
+        nn.Module.load_weights = _load_weights_without_projection_quant_state
         try:
             return vlm_load(model_name, **vlm_kwargs)
         finally:

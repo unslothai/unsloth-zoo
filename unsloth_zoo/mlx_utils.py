@@ -2496,36 +2496,63 @@ def _canonical_mlx_quantization_path(path):
     return path
 
 
+def _strip_mlx_quantization_metadata(config):
+    if not isinstance(config, dict):
+        return config
+    stripped = {}
+    for key, value in config.items():
+        if key in {"quantization", "quantization_config"}:
+            continue
+        if isinstance(value, dict):
+            value = _strip_mlx_quantization_metadata(value)
+        stripped[key] = value
+    return stripped
+
+
 def _enrich_mlx_adapter_config(model, adapter_config):
     adapter_config = dict(adapter_config or {})
     hf_repo = getattr(model, "_hf_repo", None) or adapter_config.get("base_model_name_or_path")
     if hf_repo:
-        adapter_config.setdefault("base_model_name_or_path", hf_repo)
+        adapter_config["base_model_name_or_path"] = hf_repo
 
     base_revision = getattr(model, "_unsloth_base_revision", None)
     if base_revision is not None:
-        adapter_config.setdefault("base_model_revision", base_revision)
+        adapter_config["base_model_revision"] = base_revision
+    else:
+        adapter_config.pop("base_model_revision", None)
 
     base_commit = (
         getattr(model, "_unsloth_base_commit_hash", None)
         or _infer_snapshot_commit(getattr(model, "_src_path", None))
     )
     if base_commit is not None:
-        adapter_config.setdefault("base_model_commit_hash", base_commit)
+        adapter_config["base_model_commit_hash"] = base_commit
+    else:
+        adapter_config.pop("base_model_commit_hash", None)
 
     quant_config = getattr(model, "_unsloth_quantization_config", None)
     quant_policy = getattr(model, "_unsloth_quantization_policy", None)
     quant_source = getattr(model, "_unsloth_quantized_source", None)
     if quant_config is not None:
-        adapter_config.setdefault("base_quantization_config", quant_config)
+        adapter_config["base_quantization_config"] = quant_config
+    else:
+        adapter_config.pop("base_quantization_config", None)
     if quant_policy is not None:
-        adapter_config.setdefault("base_quantization_policy", quant_policy)
+        adapter_config["base_quantization_policy"] = quant_policy
+    else:
+        adapter_config.pop("base_quantization_policy", None)
     if quant_source is not None:
-        adapter_config.setdefault("base_quantized_source", quant_source)
+        adapter_config["base_quantized_source"] = quant_source
+    else:
+        adapter_config.pop("base_quantized_source", None)
 
     resolved_map = _effective_mlx_quantization_map(model)
     if resolved_map:
-        adapter_config.setdefault("base_resolved_quantization_map", resolved_map)
+        adapter_config["base_resolved_quantization_map"] = resolved_map
+        adapter_config.pop("base_quantization_map", None)
+    else:
+        adapter_config.pop("base_resolved_quantization_map", None)
+        adapter_config.pop("base_quantization_map", None)
 
     requires_runtime = False
     if quant_source == "runtime":
@@ -2534,10 +2561,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     if resolved_map and quant_source != "mlx_config":
         requires_runtime = True
-    adapter_config.setdefault(
-        "requires_unsloth_mlx_runtime_quantization",
-        bool(requires_runtime),
-    )
+    adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
     return adapter_config
 
 
@@ -2599,9 +2623,8 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
 
     if dequantize:
         cfg = getattr(model, "_config", None)
-        if isinstance(cfg, dict) and "quantization" in cfg:
-            cfg = {k: v for k, v in cfg.items() if k != "quantization"}
-            model._config = cfg
+        if isinstance(cfg, dict):
+            model._config = _strip_mlx_quantization_metadata(cfg)
 
     de_lora_model = model
 
