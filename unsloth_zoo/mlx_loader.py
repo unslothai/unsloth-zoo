@@ -25,9 +25,11 @@ This avoids importing unsloth.models (which pulls in CUDA kernels).
 import json
 import importlib
 import inspect
+import math
 import os
 import types
 import warnings
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
 
@@ -53,6 +55,32 @@ _MULTIMODAL_STRIP_KEYS = (
 )
 
 
+@contextmanager
+def _temporary_hf_token_env(token):
+    """Expose an explicit HF token to libraries that only read auth from env.
+
+    mlx-lm / mlx-vlm do not consistently thread a ``token=`` argument through
+    every internal download path. Keep explicit token loads local to this call
+    without mutating persistent Hugging Face login state.
+    """
+    if not token or not isinstance(token, str):
+        yield
+        return
+
+    env_names = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+    previous = {name: os.environ.get(name) for name in env_names}
+    try:
+        for name in env_names:
+            os.environ[name] = token
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _convert_mlx_dtype(model, target_dtype) -> None:
     """Cast floating-point params to target_dtype (preserves quantized ints)
     while honoring the model's optional path-based ``cast_predicate``."""
@@ -65,6 +93,16 @@ def _convert_mlx_dtype(model, target_dtype) -> None:
         model.parameters(),
     ))
     mx.eval(model.parameters())
+
+
+def _seed_mlx_random_state(random_state):
+    try:
+        seed = int(random_state)
+    except (TypeError, ValueError):
+        raise TypeError("Unsloth: random_state must be an integer.")
+
+    import mlx.core as mx
+    mx.random.seed(seed)
 
 
 def _is_vlm(config: dict) -> bool:
@@ -138,6 +176,7 @@ def _load_mlx_lm_with_strict_fallback(
     model_type,
     mlx_load,
     mlx_load_kwargs,
+    hf_token=None,
 ):
     """Load text models through mlx-lm, retrying strict=False for known safe mismatches.
 
@@ -147,7 +186,8 @@ def _load_mlx_lm_with_strict_fallback(
     mismatch signatures.
     """
     try:
-        return mlx_load(model_name, **mlx_load_kwargs)
+        with _temporary_hf_token_env(hf_token):
+            return mlx_load(model_name, **mlx_load_kwargs)
     except ValueError as error:
         message = str(error)
         rule = _KNOWN_MLX_LM_STRICT_FALLBACKS.get(model_type)
@@ -157,7 +197,8 @@ def _load_mlx_lm_with_strict_fallback(
         print(rule["notice"])
         from mlx_lm.utils import _download, load_model, load_tokenizer
 
-        model_path = _download(model_name, revision=mlx_load_kwargs.get("revision"))
+        with _temporary_hf_token_env(hf_token):
+            model_path = _download(model_name, revision=mlx_load_kwargs.get("revision"))
         model, config = load_model(
             model_path,
             lazy=mlx_load_kwargs.get("lazy", False),
@@ -179,6 +220,7 @@ def _load_mlx_vlm_with_extra_weight_filter(
     model_type,
     vlm_load,
     vlm_kwargs,
+    hf_token=None,
 ):
     """Load VLMs, filtering known extra checkpoint tensors on retry.
 
@@ -188,7 +230,8 @@ def _load_mlx_vlm_with_extra_weight_filter(
     registered mismatch signatures and exact allow-listed keys.
     """
     try:
-        return vlm_load(model_name, **vlm_kwargs)
+        with _temporary_hf_token_env(hf_token):
+            return vlm_load(model_name, **vlm_kwargs)
     except ValueError as error:
         message = str(error)
         rule = _KNOWN_VLM_EXTRA_WEIGHT_FILTERS.get(model_type)
@@ -212,7 +255,8 @@ def _load_mlx_vlm_with_extra_weight_filter(
 
         nn.Module.load_weights = _load_weights_without_projection_quant_state
         try:
-            return vlm_load(model_name, **vlm_kwargs)
+            with _temporary_hf_token_env(hf_token):
+                return vlm_load(model_name, **vlm_kwargs)
         finally:
             nn.Module.load_weights = original_load_weights
 
@@ -564,10 +608,8 @@ def _patch_mixed_precision_set_dtype(model):
 
 
 # ---------------------------------------------------------------------------
-# Runtime VLM quantization via monkey-patching mlx_vlm.utils.load_model
+# VLM prompt/template compatibility patches
 # ---------------------------------------------------------------------------
-_vlm_load_model_patched = False
-_original_vlm_load_model = None
 _vlm_prompt_utils_patched = False
 _original_vlm_apply_chat_template = None
 
@@ -1314,96 +1356,6 @@ def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm
     return model, updated_config
 
 
-def _build_vlm_quant_predicate(model):
-    """Build a quant_predicate for mlx_lm.utils.quantize_model.
-
-    Two layers of filtering:
-    1. Hard-skip multimodal modules (vision tower, projectors, embeddings, …)
-    2. Delegate to model.quant_predicate for model-specific rules (MoE gates, …)
-    """
-    try:
-        from mlx_vlm.utils import skip_multimodal_module
-    except ImportError:
-        skip_multimodal_module = None
-
-    # Trigger model-specific setup (e.g. phi4mm LoRA merge side-effect)
-    model_predicate = getattr(model, "quant_predicate", None)
-
-    def predicate(path: str, module):
-        # 1. Hard skip — mlx_vlm's own multimodal check
-        if skip_multimodal_module is not None and skip_multimodal_module(path):
-            return False
-        # 2. Hard skip — extra fragments (embeddings, projectors, …)
-        path_parts = path.split(".")
-        for frag in _MULTIMODAL_SKIP_FRAGMENTS:
-            if frag in path_parts:
-                return False
-        # 3. Model-specific predicate (MoE gates → 8-bit, phi4mm exclusions, …)
-        if model_predicate is not None:
-            return model_predicate(path, module)
-        return True
-
-    return predicate
-
-
-def _patched_vlm_load_model(model_path, lazy=False, **kwargs):
-    """Drop-in replacement for mlx_vlm.utils.load_model with runtime quantization."""
-    import mlx.core as mx
-
-    quantization_spec = kwargs.pop("quantization_spec", None)
-    user_quant_predicate = kwargs.pop("quant_predicate", None)
-    q_bits = kwargs.pop("q_bits", None)
-    q_group_size = kwargs.pop("q_group_size", 64)
-    q_mode = kwargs.pop("q_mode", None)
-    quantize_modules = kwargs.pop("quantize_modules", None)
-
-    # Load float weights (always lazy so quantization runs on lazy arrays)
-    model = _original_vlm_load_model(model_path, lazy=True, **kwargs)
-
-    if quantization_spec is None and q_bits is not None:
-        quantization_spec = _MLXQuantizationSpec(
-            enabled=True,
-            bits=q_bits,
-            group_size=q_group_size,
-            mode=q_mode or "affine",
-            source="q_args",
-            quantize_modules=_normalize_quantize_modules(quantize_modules),
-            has_callable_predicate=user_quant_predicate is not None,
-        )
-
-    if quantization_spec is not None and quantization_spec.enabled:
-        from mlx_vlm.utils import load_config
-
-        config = load_config(model_path)
-        model, updated_config = _apply_mlx_quantization(
-            model,
-            config,
-            quantization_spec,
-            is_vlm=True,
-            user_predicate=user_quant_predicate,
-        )
-        model._config = updated_config
-
-    if not lazy:
-        mx.eval(model.parameters())
-
-    return model
-
-
-def _ensure_vlm_load_model_patched():
-    """Idempotent installer — patches mlx_vlm.utils.load_model on first call."""
-    global _vlm_load_model_patched, _original_vlm_load_model
-
-    if _vlm_load_model_patched:
-        return
-
-    import mlx_vlm.utils as _vlm_utils
-
-    _original_vlm_load_model = _vlm_utils.load_model
-    _vlm_utils.load_model = _patched_vlm_load_model
-    _vlm_load_model_patched = True
-
-
 def _content_has_structured_multimodal_markers(content):
     """Return True when content already contains explicit image/audio/video items."""
     if isinstance(content, list):
@@ -1838,7 +1790,13 @@ def _lora_walk_module(
     except ImportError:
         return
 
-    target_modules = set(target_modules or ())
+    if target_modules is None:
+        match_all_linear = True
+        target_modules = set()
+    else:
+        target_modules = set(target_modules or ())
+
+    replacements = 0
 
     for attr_name in attr_names:
         root = getattr(model, attr_name, None)
@@ -1846,7 +1804,8 @@ def _lora_walk_module(
             continue
 
         def _walk(module):
-            for name, child in module.named_modules():
+            nonlocal replacements
+            for name, child in list(module.named_modules()):
                 if not match_all_linear and not _lora_name_matches_target(name, target_modules):
                     continue
                 if isinstance(child, (nn.Linear, nn.QuantizedLinear)):
@@ -1856,6 +1815,10 @@ def _lora_walk_module(
                         dropout=lora_config.get("dropout", 0.0),
                         scale=lora_config["scale"],
                     )
+                    replacements += 1
+                    if name == "":
+                        setattr(model, attr_name, lora_layer)
+                        continue
                     # Navigate to parent and replace
                     parts = name.split(".")
                     parent = root
@@ -1868,6 +1831,7 @@ def _lora_walk_module(
 
         _walk(root)
         break  # These are alternative names for the same component — stop after first hit
+    return replacements
 
 
 def _resolve_lora_keys(model, target_modules):
@@ -1895,6 +1859,72 @@ def _resolve_lora_keys(model, target_modules):
                 keys.add(name)
 
     return keys
+
+
+def _raise_no_lora_targets(target_modules):
+    raise ValueError(
+        "Unsloth: No MLX LoRA target modules were found for "
+        f"target_modules={target_modules!r}. Check the module names or use "
+        "target_modules='all-linear'."
+    )
+
+
+def _validate_mlx_init_lora_weights(init_lora_weights):
+    if (
+        type(init_lora_weights) is bool
+        or init_lora_weights == "gaussian"
+    ):
+        return
+    peft_only_initializers = ("eva", "olora", "pissa", "corda", "loftq", "orthogonal")
+    if (
+        init_lora_weights in peft_only_initializers
+        or (
+            isinstance(init_lora_weights, str)
+            and init_lora_weights.startswith("pissa_niter_")
+        )
+    ):
+        raise NotImplementedError(
+            f"Unsloth: init_lora_weights={init_lora_weights!r} is not "
+            "supported for MLX LoRA yet."
+        )
+    raise ValueError(
+        'Unsloth: init_lora_weights must be one of [True, False, "gaussian"]. '
+        "MLX does not support PEFT-only data-driven or quantization-aware "
+        "initializers yet."
+    )
+
+
+def _apply_mlx_lora_initialization(model, init_lora_weights):
+    """Match PEFT LoRA initialization for MLX LoRA modules."""
+    if init_lora_weights is True:
+        # mlx-lm LoRA constructors already use Linear-style A init and zero B.
+        return
+
+    import mlx.core as mx
+
+    for _, module in model.named_modules():
+        if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
+            continue
+        a_shape = module.lora_a.shape
+        b_shape = module.lora_b.shape
+        if init_lora_weights == "gaussian":
+            if hasattr(module, "embedding"):
+                module.lora_a = mx.zeros(a_shape)
+                module.lora_b = mx.random.normal(shape=b_shape)
+            else:
+                module.lora_a = mx.random.normal(shape=a_shape) * (1.0 / b_shape[0])
+                module.lora_b = mx.zeros(b_shape)
+        elif init_lora_weights is False:
+            module.lora_a = mx.random.uniform(
+                low=-1.0 / math.sqrt(a_shape[0]),
+                high=1.0 / math.sqrt(a_shape[0]),
+                shape=a_shape,
+            )
+            module.lora_b = mx.random.uniform(
+                low=-1.0 / math.sqrt(b_shape[0]),
+                high=1.0 / math.sqrt(b_shape[0]),
+                shape=b_shape,
+            )
 
 
 class FastMLXModel:
@@ -2043,15 +2073,12 @@ class FastMLXModel:
 
         # Seed mlx random state so any randomness during model construction
         # (e.g. layer init for runtime-quantized models) is reproducible.
-        try:
-            import mlx.core as mx
-            mx.random.seed(int(random_state))
-        except Exception:
-            pass
+        _seed_mlx_random_state(random_state)
 
         # Step 1: Download config to decide loading path
         try:
-            local_path = str(_download(model_name, revision=revision))
+            with _temporary_hf_token_env(token):
+                local_path = str(_download(model_name, revision=revision))
             config_path = local_path + "/config.json"
             with open(config_path, "r") as f:
                 config_data = json.load(f)
@@ -2178,17 +2205,19 @@ class FastMLXModel:
                         model = load_adapters(model, local_path)
                         loaded_model_config = getattr(model, "_config", None)
                     else:
-                        model, tokenizer = mlx_load(
-                            base_model_id,
-                            adapter_path=local_path,
-                            tokenizer_config={"token": token} if token else None,
-                            revision=adapter_base_revision,
-                        )
+                        with _temporary_hf_token_env(token):
+                            model, tokenizer = mlx_load(
+                                base_model_id,
+                                adapter_path=local_path,
+                                tokenizer_config={"token": token} if token else None,
+                                revision=adapter_base_revision,
+                            )
                         loaded_model_config = None
                     is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
                     processor = getattr(model, "_processor", None)
 
-                    base_local = str(_download(base_model_id, revision=adapter_base_revision))
+                    with _temporary_hf_token_env(token):
+                        base_local = str(_download(base_model_id, revision=adapter_base_revision))
                     base_config_path = os.path.join(base_local, "config.json")
                     if os.path.exists(base_config_path):
                         with open(base_config_path, "r") as f:
@@ -2233,9 +2262,10 @@ class FastMLXModel:
             custom_loader = None
 
         if custom_loader is not None:
-            model, tokenizer_or_processor = custom_loader(
-                model_name, config_data, max_seq_length=max_seq_length, token=token
-            )
+            with _temporary_hf_token_env(token):
+                model, tokenizer_or_processor = custom_loader(
+                    model_name, config_data, max_seq_length=max_seq_length, token=token
+                )
             if text_only is False or _is_vlm(config_data):
                 from .mlx_utils import normalize_vlm_processor_chat_template
 
@@ -2327,13 +2357,14 @@ class FastMLXModel:
                 from mlx_vlm.utils import load_config as _vlm_load_config
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
                       f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")
-                model, processor = vlm_load(
-                    model_name,
-                    lazy=True,
-                    revision=revision,
-                    **extra_kwargs,
-                )
-                vlm_cfg = _vlm_load_config(local_path or model_name)
+                with _temporary_hf_token_env(token):
+                    model, processor = vlm_load(
+                        model_name,
+                        lazy=True,
+                        revision=revision,
+                        **extra_kwargs,
+                    )
+                    vlm_cfg = _vlm_load_config(local_path or model_name)
                 model, vlm_cfg = _apply_mlx_quantization(
                     model, vlm_cfg, quantization_spec,
                     is_vlm=True, user_predicate=quant_predicate,
@@ -2353,6 +2384,7 @@ class FastMLXModel:
                     model_type,
                     vlm_load,
                     vlm_kwargs,
+                    hf_token=token,
                 )
 
             if target_dtype is not None:
@@ -2450,6 +2482,7 @@ class FastMLXModel:
                 model_type,
                 mlx_load,
                 mlx_load_kwargs,
+                hf_token=token,
             )
 
             if want_runtime_quant:
@@ -2507,6 +2540,8 @@ class FastMLXModel:
         lora_alpha=16,
         lora_dropout=0,
         bias="none",
+        use_rslora=False,
+        init_lora_weights=True,
         use_gradient_checkpointing="mlx",
         random_state=3407,
         max_seq_length=2048,
@@ -2523,6 +2558,25 @@ class FastMLXModel:
         no-op: the full-precision parameters stay trainable and the model
         is returned as-is.
         """
+        loftq_config = kwargs.pop("loftq_config", None)
+        if loftq_config is not None:
+            raise NotImplementedError(
+                "Unsloth: loftq_config is not supported for MLX LoRA yet."
+            )
+        qat_scheme = kwargs.pop("qat_scheme", None)
+        if qat_scheme is not None:
+            raise NotImplementedError(
+                "Unsloth: qat_scheme is not supported for MLX LoRA yet."
+            )
+        if bias not in (None, False, "none"):
+            print(
+                "Unsloth: bias is not supported for MLX LoRA yet - "
+                "ignoring bias={!r}.".format(bias)
+            )
+        if type(use_rslora) is not bool:
+            raise TypeError("Unsloth: use_rslora must be True or False.")
+        _validate_mlx_init_lora_weights(init_lora_weights)
+
         if getattr(model, "_unsloth_full_finetuning", False):
             print(
                 "Unsloth: full_finetuning=True — skipping LoRA, training "
@@ -2539,11 +2593,7 @@ class FastMLXModel:
 
         # Seed mlx random state so LoRA matrix init (lora_b is zero, lora_a
         # is random Gaussian) is reproducible across runs.
-        try:
-            import mlx.core as mx
-            mx.random.seed(int(random_state))
-        except Exception:
-            pass
+        _seed_mlx_random_state(random_state)
 
         if target_modules is None:
             target_modules = [
@@ -2560,7 +2610,7 @@ class FastMLXModel:
             "rank": r,
             "alpha": lora_alpha,
             "dropout": lora_dropout,
-            "scale": lora_alpha / r,
+            "scale": lora_alpha / (math.sqrt(r) if use_rslora else r),
         }
 
         is_vlm = getattr(model, "_is_vlm_model", False)
@@ -2577,25 +2627,34 @@ class FastMLXModel:
             if hasattr(lm, "model") and hasattr(lm.model, "layers"):
                 num_layers = len(lm.model.layers)
             language_lora_keys = _resolve_lora_keys(lm, target_modules)
-            linear_to_lora_layers(
-                lm,
-                num_layers=num_layers,
-                config={**lora_config, "keys": language_lora_keys},
-                use_dora=False,
-            )
+            language_lora_count = 0 if language_lora_keys is not None else None
+            if language_lora_keys is None or len(language_lora_keys) > 0:
+                linear_to_lora_layers(
+                    lm,
+                    num_layers=num_layers,
+                    config={**lora_config, "keys": language_lora_keys},
+                    use_dora=False,
+                )
+                if language_lora_keys is not None:
+                    language_lora_count = len(language_lora_keys)
 
             # Optionally apply LoRA to vision tower
+            vision_lora_count = 0
             if train_vision:
-                _lora_walk_module(model, lora_config, target_modules,
-                                  attr_names=("vision_tower", "vision_model",
-                                              "vision_encoder"))
+                vision_lora_count = _lora_walk_module(
+                    model,
+                    lora_config,
+                    target_modules,
+                    attr_names=("vision_tower", "vision_model", "vision_encoder"),
+                )
 
             # Optionally train the multimodal projector / connector. Prefer
             # projector LoRA over unfreezing raw weights because many MLX VLM
             # checkpoints expose projector layers as QuantizedLinear, and MLX
             # does not backprop into quantized weights directly.
+            projector_lora_count = 0
             if train_projector:
-                _lora_walk_module(
+                projector_lora_count = _lora_walk_module(
                     model,
                     lora_config,
                     target_modules=(),
@@ -2609,6 +2668,13 @@ class FastMLXModel:
                     match_all_linear=True,
                 )
 
+            if (
+                language_lora_count == 0
+                and vision_lora_count == 0
+                and projector_lora_count == 0
+            ):
+                _raise_no_lora_targets(target_modules)
+
             # Unfreeze all LoRA params across the entire tree
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
         else:
@@ -2621,6 +2687,8 @@ class FastMLXModel:
             if hasattr(model, "model") and hasattr(model.model, "layers"):
                 num_layers = len(model.model.layers)
             language_lora_keys = _resolve_lora_keys(model, target_modules)
+            if language_lora_keys is not None and len(language_lora_keys) == 0:
+                _raise_no_lora_targets(target_modules)
             linear_to_lora_layers(
                 model,
                 num_layers=num_layers,
@@ -2630,6 +2698,8 @@ class FastMLXModel:
 
             model.freeze()
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+
+        _apply_mlx_lora_initialization(model, init_lora_weights)
 
         # Apply gradient checkpointing if requested
         # "mlx" (default) or True → apply; False or "none" → skip
