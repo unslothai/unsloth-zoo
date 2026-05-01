@@ -19,30 +19,31 @@ import torch
 def test_fused_ce_loss(
     compute_fused_ce_loss,
     unsloth_fused_ce_loss,
-    bszs = [1, 2, 1, 2,],
-    qlens = [123, 323, 123, 323,],
-    hds = [513, 1023, 877, 1111,],
-    vocab_sizes = [16 * 1024, 32 * 1024, 32 * 1024, 64 * 1024,],
-    dtypes = [torch.float32, torch.float32, torch.float32, torch.float32,],
-    devices = ["cuda", "cuda", "cuda", "cuda",],
-    scalings = [1.0, 16.0, 2.0, 4.0,],
-    logit_scale_multiplys = [0.0, 1.0, 0.0, 0.0,],
-    logit_scale_divides = [0.0, 0.0, 2.0, 0.0,],
-    logit_softcappings = [10.0, 0.0, 0.0, 50.0,],
-    seeds = [3407, 3408, 3409, 3410,],
-    mask_ratios = [0.0, 0.1, 0.2, 0.3,],
+    bszs = [1, 2, 1, 2, 2,],
+    qlens = [123, 323, 123, 323, 256,],
+    hds = [513, 1023, 877, 1111, 128,],
+    vocab_sizes = [16 * 1024, 32 * 1024, 32 * 1024, 64 * 1024, 2048,],
+    dtypes = [torch.float32, torch.float32, torch.float32, torch.float32, torch.float32,],
+    devices = ["cuda", "cuda", "cuda", "cuda", "cuda",],
+    scalings = [1.0, 16.0, 2.0, 4.0, 1.0,],
+    logit_scale_multiplys = [0.0, 1.0, 0.0, 0.0, 0.0,],
+    logit_scale_divides = [0.0, 0.0, 2.0, 0.0, 0.0,],
+    logit_softcappings = [10.0, 0.0, 0.0, 50.0, 0.0,],
+    seeds = [3407, 3408, 3409, 3410, 5230,],
+    mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.0,],
+    suffix_masks = [False, False, False, False, True,],
     lm_head_requires_grads = [False, False, True, True,],
     lm_bias_requires_grads = [False, True, False, True,],
 ):
     for (
         bsz, qlen, hd, vocab_size, dtype, device, scaling,
         logit_scale_multiply, logit_scale_divide, logit_softcapping,
-        seed, mask_ratio,
+        seed, mask_ratio, suffix_mask,
         lm_head_requires_grad, lm_bias_requires_grad,
     ) in zip(
         bszs, qlens, hds, vocab_sizes, dtypes, devices, scalings,
         logit_scale_multiplys, logit_scale_divides, logit_softcappings,
-        seeds, mask_ratios,
+        seeds, mask_ratios, suffix_masks,
         lm_head_requires_grads, lm_bias_requires_grads,
     ):
         kwargs = {}
@@ -58,12 +59,16 @@ def test_fused_ce_loss(
         if lm_head_requires_grad: lm_head_weight.requires_grad_(True)
         if lm_bias_requires_grad: lm_head_bias.requires_grad_(True)
 
-        # Mask out total ratio
-        mask = torch.zeros(input_ids.numel(), dtype = torch.bool, device = device)
-        mask[:int(mask.numel()*mask_ratio)] = 1
-        permutation = torch.randperm(mask.numel())
-        mask = mask[permutation]
-        input_ids.ravel()[mask] = -100
+        if suffix_mask:
+            input_ids.fill_(-100)
+            input_ids[:, -33:-1] = torch.randint(low = 0, high = vocab_size, size = (bsz, 32), device = device)
+        else:
+            # Mask out total ratio
+            mask = torch.zeros(input_ids.numel(), dtype = torch.bool, device = device)
+            mask[:int(mask.numel()*mask_ratio)] = 1
+            permutation = torch.randperm(mask.numel())
+            mask = mask[permutation]
+            input_ids.ravel()[mask] = -100
 
         n_items = (input_ids != -100).sum()
         old_loss = compute_fused_ce_loss(
