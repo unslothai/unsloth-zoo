@@ -83,10 +83,20 @@ def _temporary_hf_token_env(token):
 
 def _convert_mlx_dtype(model, target_dtype) -> None:
     """Cast floating-point params to target_dtype (preserves quantized ints)
-    while honoring the model's optional path-based ``cast_predicate``."""
+    while honoring the model's optional path-based ``cast_predicate``.
+    """
     import mlx.core as mx
-    from mlx.utils import tree_map_with_path
+    from mlx.utils import tree_flatten, tree_map_with_path
     cast_pred = getattr(model, "cast_predicate", lambda _: True)
+
+    needs_cast = False
+    for k, v in tree_flatten(model.parameters()):
+        if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) and v.dtype != target_dtype:
+            needs_cast = True
+            break
+    if not needs_cast:
+        return
+
     model.update(tree_map_with_path(
         lambda k, v: v.astype(target_dtype)
         if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) else v,
@@ -1819,7 +1829,9 @@ def _lora_walk_module(
                     if name == "":
                         setattr(model, attr_name, lora_layer)
                         continue
-                    # Navigate to parent and replace
+                    # Navigate to parent and replace. The final segment can
+                    # be a numeric string (list index) for some VLM trees
+                    # like Qwen2.5-VL's vision merger.
                     parts = name.split(".")
                     parent = root
                     for p in parts[:-1]:
@@ -1827,7 +1839,11 @@ def _lora_walk_module(
                             parent = parent[int(p)]
                         except (ValueError, TypeError):
                             parent = getattr(parent, p)
-                    setattr(parent, parts[-1], lora_layer)
+                    leaf = parts[-1]
+                    try:
+                        parent[int(leaf)] = lora_layer
+                    except (ValueError, TypeError):
+                        setattr(parent, leaf, lora_layer)
 
         _walk(root)
         break  # These are alternative names for the same component — stop after first hit

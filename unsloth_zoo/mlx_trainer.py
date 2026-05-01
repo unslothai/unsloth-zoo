@@ -664,16 +664,13 @@ class MLXTrainer:
             max_grad_norm <= 0
         )
 
-        def _grad_leaf_scale(name, safe_toks_f, clip_scale=None):
+        def _grad_leaf_scale(name, safe_toks_f, clip_scale=None, dtype=None):
             """Return the exact scalar applied to one grad leaf before update.
 
-            The final update semantics are intentionally unchanged:
-            1. divide by supervised-token count
-            2. apply LoRA+/embedding LR multipliers
-            3. apply one global clip scalar when enabled
-
-            Keeping this in one helper ensures the norm pass and the final
-            update pass stay in lockstep.
+            Pass ``dtype`` (the leaf grad's dtype) to keep the final
+            ``value * scale`` in the leaf's native dtype — otherwise an fp32
+            scale promotes a bf16/fp16 grad tree to fp32, which then forces
+            optimizer.update to promote params/m/v to fp32 too.
             """
             scale = mx.array(1.0, dtype=mx.float32) / safe_toks_f
             if use_lora_plus and "lora_b" in name:
@@ -682,6 +679,8 @@ class MLXTrainer:
                 scale = scale * embedding_lr_ratio
             if clip_scale is not None:
                 scale = scale * clip_scale
+            if dtype is not None and scale.dtype != dtype:
+                scale = scale.astype(dtype)
             return scale
 
         def _apply_update(grad, toks_f):
@@ -717,7 +716,7 @@ class MLXTrainer:
             final_grad = tree_unflatten([
                 (
                     name,
-                    value * _grad_leaf_scale(name, safe_toks_f, clip_scale),
+                    value * _grad_leaf_scale(name, safe_toks_f, clip_scale, value.dtype),
                 )
                 for name, value in flat_grad
             ])
@@ -765,12 +764,23 @@ class MLXTrainer:
                 return lvalue, toks, None
 
             toks_f = toks.astype(mx.float32)
-            grad = tree_map(lambda g: g * toks_f, grad)
 
+            # Scale-and-accumulate in a single tree_map per micro-batch, casting
+            # the scalar to each leaf's dtype so bf16/fp16 grad trees stay in
+            # their native dtype (avoids fp32 promotion that 3xs grad memory
+            # and forces optimizer.update to promote params/m/v to fp32).
             if prev_state is not None:
                 prev_grad, prev_toks = prev_state
-                grad = tree_map(lambda x, y: x + y, grad, prev_grad)
+                grad = tree_map(
+                    lambda g, p: p + g * toks_f.astype(g.dtype),
+                    grad, prev_grad,
+                )
                 toks_f = toks_f + prev_toks
+            else:
+                grad = tree_map(
+                    lambda g: g * toks_f.astype(g.dtype),
+                    grad,
+                )
 
             if do_update:
                 grad_norm = _apply_update(grad, toks_f)

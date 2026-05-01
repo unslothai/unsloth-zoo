@@ -54,19 +54,33 @@ def _get_transformer_layers(model):
     return getattr(m, 'layers', None)
 
 
-def apply_gradient_checkpointing(model):
-    """Apply gradient checkpointing to all transformer layers.
+def _get_vision_encoder_layers(model):
+    """Find vision tower encoder layers (e.g. SigLIP for Gemma3).
 
-    Patches the layer class's __call__ to use mx.checkpoint, which
-    recomputes activations during backward instead of storing them.
-    Trades ~30% more compute for significant memory savings.
-
-    Follows the same pattern as mlx_lm.tuner.trainer.grad_checkpoint.
+    Walks ``model.vision_tower.vision_model.encoder.layers`` and a few
+    fallback paths used by other VLM families.
     """
-    layers = _get_transformer_layers(model)
-    if layers is None or len(layers) == 0:
-        return
-    layer_cls = type(layers[0])
+    vt = getattr(model, "vision_tower", None) or getattr(model, "vision_model", None)
+    if vt is None:
+        return None
+    for path in (
+        ("vision_model", "encoder", "layers"),  # Gemma3 SigLIP
+        ("blocks",),                             # Qwen2.5-VL ViT
+        ("encoder", "layers"),
+        ("vision_model", "layers"),
+        ("layers",),
+    ):
+        cur = vt
+        for name in path:
+            cur = getattr(cur, name, None)
+            if cur is None:
+                break
+        if cur is not None and hasattr(cur, "__len__") and len(cur) > 0:
+            return cur
+    return None
+
+
+def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already applied
     layer_cls._orig_call = layer_cls.__call__
@@ -81,16 +95,39 @@ def apply_gradient_checkpointing(model):
     layer_cls.__call__ = checkpointed_fn
 
 
-def remove_gradient_checkpointing(model):
-    """Remove gradient checkpointing, restoring original layer __call__."""
-    layers = _get_transformer_layers(model)
-    if layers is None or len(layers) == 0:
-        return
-    layer_cls = type(layers[0])
+def _unpatch_layer_class_gc(layer_cls):
     orig = getattr(layer_cls, '_orig_call', None)
     if orig is not None:
         layer_cls.__call__ = orig
         del layer_cls._orig_call
+
+
+def apply_gradient_checkpointing(model):
+    """Apply gradient checkpointing to language and vision tower layers.
+
+    Patches each layer class's ``__call__`` with ``mx.checkpoint`` so MLX
+    recomputes the layer's forward during backward instead of storing
+    activations. Trades ~30% extra compute for substantial memory savings —
+    critical for VLMs where vision tower backward at native image
+    resolution can otherwise materialize tens of GB of activation tape.
+    """
+    lm_layers = _get_transformer_layers(model)
+    if lm_layers is not None and len(lm_layers) > 0:
+        _patch_layer_class_for_gc(type(lm_layers[0]))
+
+    vt_layers = _get_vision_encoder_layers(model)
+    if vt_layers is not None and len(vt_layers) > 0:
+        _patch_layer_class_for_gc(type(vt_layers[0]))
+
+
+def remove_gradient_checkpointing(model):
+    """Remove gradient checkpointing, restoring original layer __call__."""
+    lm_layers = _get_transformer_layers(model)
+    if lm_layers is not None and len(lm_layers) > 0:
+        _unpatch_layer_class_gc(type(lm_layers[0]))
+    vt_layers = _get_vision_encoder_layers(model)
+    if vt_layers is not None and len(vt_layers) > 0:
+        _unpatch_layer_class_gc(type(vt_layers[0]))
 
 
 def _get_text_model(model):
@@ -1456,21 +1493,32 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
 def _get_vlm_image_size(config, processor):
     """Get target image size for uniform resizing, matching GPU collator.
 
-    Tries vision_config.image_size, then processor.image_processor.size,
-    falls back to 512.
+    Tries vision_config.image_size (dict OR dataclass), then
+    processor.image_processor.size, falls back to 512.
+
+    Note: Qwen2.5-VL's processor.image_processor.size has
+    {'shortest_edge': 3136, 'longest_edge': 12845056} — those are
+    *area pixel counts* (min_pixels / max_pixels), not dimensions.
+    Reading them as "height" produces a 3136x3136 upsample → 50k patches
+    per image → OOM. Skip area-style ``size`` dicts.
     """
-    vc = config.get("vision_config", {})
-    if isinstance(vc, dict):
-        sz = vc.get("image_size")
+    vc = config.get("vision_config") if isinstance(config, dict) else getattr(config, "vision_config", None)
+    if vc is not None:
+        sz = vc.get("image_size") if isinstance(vc, dict) else getattr(vc, "image_size", None)
         if isinstance(sz, int) and sz > 0:
             return sz
     ip = getattr(processor, "image_processor", None)
     if ip is not None:
         sz = getattr(ip, "size", None)
         if isinstance(sz, dict):
-            h = sz.get("height", sz.get("shortest_edge", 0))
-            if isinstance(h, int) and h > 0:
-                return h
+            # Skip area-pixel-count dicts (Qwen2.5-VL style) — those use
+            # {shortest_edge, longest_edge} as area bounds, not dimensions.
+            if "longest_edge" in sz and sz.get("longest_edge", 0) > 1_000_000:
+                pass  # area-count form, fall through to default
+            else:
+                h = sz.get("height", sz.get("shortest_edge", 0))
+                if isinstance(h, int) and 0 < h < 4096:
+                    return h
         elif isinstance(sz, int) and sz > 0:
             return sz
     return 512
@@ -2036,8 +2084,6 @@ def _to_mx_vlm_batch(inputs):
         batch["attention_mask"] = batch["attention_mask"].astype(mx.int32)
     if "labels" in batch:
         batch["labels"] = batch["labels"].astype(mx.int32)
-    if "pixel_values" in batch and batch["pixel_values"] is not None:
-        batch["pixel_values"] = batch["pixel_values"].astype(mx.float32)
 
     return batch
 
