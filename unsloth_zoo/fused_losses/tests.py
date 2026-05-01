@@ -32,8 +32,8 @@ def test_fused_ce_loss(
     seeds = [3407, 3408, 3409, 3410, 5230,],
     mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.0,],
     suffix_masks = [False, False, False, False, True,],
-    lm_head_requires_grads = [False, False, True, True,],
-    lm_bias_requires_grads = [False, True, False, True,],
+    lm_head_requires_grads = [False, False, True, True, False,],
+    lm_bias_requires_grads = [False, True, False, True, False,],
 ):
     for (
         bsz, qlen, hd, vocab_size, dtype, device, scaling,

@@ -332,6 +332,11 @@ class UnslothFusedLoss(torch.autograd.Function):
             else:
                 grad_inputs_j.zero_()
         pass
+        if len(chunks) == 0:
+            ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
+            ctx.scaling = scaling
+            return accumulated_loss
+        pass
 
         if torch_compile and _FUSED_CE_COMPILE_SUPPORTED is not False:
             try:
@@ -350,66 +355,62 @@ class UnslothFusedLoss(torch.autograd.Function):
             accumulate_chunk is not uncompiled_accumulate_chunk:
 
             _iter = iter(chunks)
+            grad_inputs_j, hidden_states_j, labels_j = next(_iter)
             try:
-                grad_inputs_j, hidden_states_j, labels_j = next(_iter)
-            except StopIteration:
+                accumulate_chunk(
+                    n_chunks = n_chunks,
+                    grad_inputs_j = grad_inputs_j,
+                    grad_lm_head = grad_lm_head,
+                    grad_lm_head_bias = grad_lm_head_bias,
+                    hidden_states_j = hidden_states_j,
+                    lm_head_weight = lm_head_weight,
+                    lm_head_bias = lm_head_bias,
+                    labels_j = labels_j,
+                    divisor = divisor,
+                    scaling = scaling,
+                    shift_labels = shift_labels,
+                    **extra_kwargs,
+                )
                 _FUSED_CE_COMPILE_SUPPORTED = True
-            else:
-                try:
-                    accumulate_chunk(
-                        n_chunks = n_chunks,
-                        grad_inputs_j = grad_inputs_j,
-                        grad_lm_head = grad_lm_head,
-                        grad_lm_head_bias = grad_lm_head_bias,
-                        hidden_states_j = hidden_states_j,
-                        lm_head_weight = lm_head_weight,
-                        lm_head_bias = lm_head_bias,
-                        labels_j = labels_j,
-                        divisor = divisor,
-                        scaling = scaling,
-                        shift_labels = shift_labels,
-                        **extra_kwargs,
-                    )
-                    _FUSED_CE_COMPILE_SUPPORTED = True
-                except Exception:
-                    _FUSED_CE_COMPILE_SUPPORTED = False
-                    torch._dynamo.reset()
-                    accumulated_loss.zero_()
-                    if not overwrite:
-                        grad_inputs.zero_()
-                    if grad_lm_head is not None: grad_lm_head.zero_()
-                    if grad_lm_head_bias is not None: grad_lm_head_bias.zero_()
-                    accumulate_chunk = uncompiled_accumulate_chunk
-                    accumulate_chunk(
-                        n_chunks = n_chunks,
-                        grad_inputs_j = grad_inputs_j,
-                        grad_lm_head = grad_lm_head,
-                        grad_lm_head_bias = grad_lm_head_bias,
-                        hidden_states_j = hidden_states_j,
-                        lm_head_weight = lm_head_weight,
-                        lm_head_bias = lm_head_bias,
-                        labels_j = labels_j,
-                        divisor = divisor,
-                        scaling = scaling,
-                        shift_labels = shift_labels,
-                        **extra_kwargs,
-                    )
-                # Process remaining chunks via fast path
-                for (grad_inputs_j, hidden_states_j, labels_j,) in _iter:
-                    accumulate_chunk(
-                        n_chunks = n_chunks,
-                        grad_inputs_j = grad_inputs_j,
-                        grad_lm_head = grad_lm_head,
-                        grad_lm_head_bias = grad_lm_head_bias,
-                        hidden_states_j = hidden_states_j,
-                        lm_head_weight = lm_head_weight,
-                        lm_head_bias = lm_head_bias,
-                        labels_j = labels_j,
-                        divisor = divisor,
-                        scaling = scaling,
-                        shift_labels = shift_labels,
-                        **extra_kwargs,
-                    )
+            except Exception:
+                _FUSED_CE_COMPILE_SUPPORTED = False
+                torch._dynamo.reset()
+                accumulated_loss.zero_()
+                if not overwrite:
+                    grad_inputs.zero_()
+                if grad_lm_head is not None: grad_lm_head.zero_()
+                if grad_lm_head_bias is not None: grad_lm_head_bias.zero_()
+                accumulate_chunk = uncompiled_accumulate_chunk
+                accumulate_chunk(
+                    n_chunks = n_chunks,
+                    grad_inputs_j = grad_inputs_j,
+                    grad_lm_head = grad_lm_head,
+                    grad_lm_head_bias = grad_lm_head_bias,
+                    hidden_states_j = hidden_states_j,
+                    lm_head_weight = lm_head_weight,
+                    lm_head_bias = lm_head_bias,
+                    labels_j = labels_j,
+                    divisor = divisor,
+                    scaling = scaling,
+                    shift_labels = shift_labels,
+                    **extra_kwargs,
+                )
+            # Process remaining chunks via fast path
+            for (grad_inputs_j, hidden_states_j, labels_j,) in _iter:
+                accumulate_chunk(
+                    n_chunks = n_chunks,
+                    grad_inputs_j = grad_inputs_j,
+                    grad_lm_head = grad_lm_head,
+                    grad_lm_head_bias = grad_lm_head_bias,
+                    hidden_states_j = hidden_states_j,
+                    lm_head_weight = lm_head_weight,
+                    lm_head_bias = lm_head_bias,
+                    labels_j = labels_j,
+                    divisor = divisor,
+                    scaling = scaling,
+                    shift_labels = shift_labels,
+                    **extra_kwargs,
+                )
         else:
             # Fast path: compile status already known, original main branch loop
             for (grad_inputs_j, hidden_states_j, labels_j,) in chunks:
