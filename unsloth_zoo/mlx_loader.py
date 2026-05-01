@@ -2563,6 +2563,10 @@ class FastMLXModel:
         max_seq_length=2048,
         train_vision=False,
         train_projector=False,
+        finetune_vision_layers=None,
+        finetune_language_layers=True,
+        finetune_attention_modules=True,
+        finetune_mlp_modules=True,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Apply LoRA via mlx-lm on Apple Silicon.
@@ -2611,6 +2615,10 @@ class FastMLXModel:
         # is random Gaussian) is reproducible across runs.
         _seed_mlx_random_state(random_state)
 
+        # finetune_vision_layers (None = use train_vision arg; bool overrides it)
+        if finetune_vision_layers is not None:
+            train_vision = bool(finetune_vision_layers)
+
         if target_modules is None:
             target_modules = [
                 "q_proj", "k_proj", "v_proj", "o_proj",
@@ -2621,6 +2629,21 @@ class FastMLXModel:
         # _resolve_lora_keys handles None target_modules → discovers all.
         if target_modules == ["all-linear"] or target_modules == "all-linear":
             target_modules = None
+
+        # Filter target_modules by finetune_attention_modules / finetune_mlp_modules.
+        # Applies whether target_modules came from the user as an explicit list or
+        # was built from defaults — so toggling these flags always has effect.
+        if isinstance(target_modules, list) and len(target_modules) > 0:
+            _ATTN = {"q_proj", "k_proj", "v_proj", "o_proj"}
+            _MLP = {"gate_proj", "up_proj", "down_proj"}
+            filtered = []
+            for m in target_modules:
+                if m in _ATTN and not finetune_attention_modules:
+                    continue
+                if m in _MLP and not finetune_mlp_modules:
+                    continue
+                filtered.append(m)
+            target_modules = filtered
 
         lora_config = {
             "rank": r,
@@ -2638,21 +2661,25 @@ class FastMLXModel:
             model.freeze()
 
             # Apply LoRA to the language model (filtered by target_modules)
-            lm = model.language_model
-            num_layers = 0
-            if hasattr(lm, "model") and hasattr(lm.model, "layers"):
-                num_layers = len(lm.model.layers)
-            language_lora_keys = _resolve_lora_keys(lm, target_modules)
-            language_lora_count = 0 if language_lora_keys is not None else None
-            if language_lora_keys is None or len(language_lora_keys) > 0:
-                linear_to_lora_layers(
-                    lm,
-                    num_layers=num_layers,
-                    config={**lora_config, "keys": language_lora_keys},
-                    use_dora=False,
-                )
-                if language_lora_keys is not None:
-                    language_lora_count = len(language_lora_keys)
+            language_lora_count = 0 if finetune_language_layers else None
+            if finetune_language_layers and (
+                target_modules is None or (isinstance(target_modules, list) and len(target_modules) > 0)
+            ):
+                lm = model.language_model
+                num_layers = 0
+                if hasattr(lm, "model") and hasattr(lm.model, "layers"):
+                    num_layers = len(lm.model.layers)
+                language_lora_keys = _resolve_lora_keys(lm, target_modules)
+                language_lora_count = 0 if language_lora_keys is not None else None
+                if language_lora_keys is None or len(language_lora_keys) > 0:
+                    linear_to_lora_layers(
+                        lm,
+                        num_layers=num_layers,
+                        config={**lora_config, "keys": language_lora_keys},
+                        use_dora=False,
+                    )
+                    if language_lora_keys is not None:
+                        language_lora_count = len(language_lora_keys)
 
             # Optionally apply LoRA to vision tower
             vision_lora_count = 0
@@ -2699,18 +2726,25 @@ class FastMLXModel:
             # (e.g. Gemma4 AudioRelativePositionEmbedding loaded via VLM path)
             _fix_missing_no_grad(model)
 
-            num_layers = 0
-            if hasattr(model, "model") and hasattr(model.model, "layers"):
-                num_layers = len(model.model.layers)
-            language_lora_keys = _resolve_lora_keys(model, target_modules)
-            if language_lora_keys is not None and len(language_lora_keys) == 0:
-                _raise_no_lora_targets(target_modules)
-            linear_to_lora_layers(
-                model,
-                num_layers=num_layers,
-                config={**lora_config, "keys": language_lora_keys},
-                use_dora=False,
-            )
+            if not finetune_language_layers:
+                warnings.warn(
+                    "Unsloth: finetune_language_layers=False on a text-only model — "
+                    "no LoRA will be applied; the model has no trainable parameters.",
+                    stacklevel=2,
+                )
+            else:
+                num_layers = 0
+                if hasattr(model, "model") and hasattr(model.model, "layers"):
+                    num_layers = len(model.model.layers)
+                language_lora_keys = _resolve_lora_keys(model, target_modules)
+                if language_lora_keys is not None and len(language_lora_keys) == 0:
+                    _raise_no_lora_targets(target_modules)
+                linear_to_lora_layers(
+                    model,
+                    num_layers=num_layers,
+                    config={**lora_config, "keys": language_lora_keys},
+                    use_dora=False,
+                )
 
             model.freeze()
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
