@@ -43,19 +43,52 @@ from .moe_utils import (
 
 
 def _make_qwen_moe_lora_extractor():
+    def _get_qwen_moe_lora_dims(wrapper):
+        if wrapper is None or not hasattr(wrapper, "get_base_layer"):
+            return None, None
+
+        base = wrapper.get_base_layer()
+        param_name = getattr(wrapper, "parameter_name", None)
+        if param_name == "gate_up_proj":
+            input_dim = getattr(base, "hidden_dim", None)
+            output_dim = getattr(base, "intermediate_dim", None)
+            return input_dim, None if output_dim is None else 2 * output_dim
+        if param_name == "down_proj":
+            return getattr(base, "intermediate_dim", None), getattr(base, "hidden_dim", None)
+
+        return None, None
+
     def _qwen_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
         """
         LoRA extractor for Qwen-family MoE (Qwen3-MoE, Qwen3.5/3.6, Qwen3-Next).
-
-        PEFT LoRA shapes are fixed by the linear's in/out dims, independent of
-        raw base-weight storage order, so no model-specific dispatch is needed:
-          weight_A: (E*R, in_dim)  -> (E, in_dim, R)
-          weight_B: (out_dim, E*R) -> (E, R, out_dim)
         """
         total_rank = weight_A.shape[0]
         rank_per_expert = total_rank // num_experts
-        dim_A = weight_A.shape[1]   # in_dim
-        dim_B = weight_B.shape[0]   # out_dim
+        dim_A = weight_A.shape[1]
+        dim_B = weight_B.shape[0]
+
+        input_dim, output_dim = _get_qwen_moe_lora_dims(wrapper)
+
+        # PEFT 0.18 used raw 3D parameter dims for ParamWrapper LoRA:
+        # https://github.com/huggingface/peft/blob/v0.18.0/src/peft/tuners/lora/layer.py#L1928-L1931
+        # PEFT 0.19 swaps non-transposed 3D params before creating lora_A/B:
+        # https://github.com/huggingface/peft/blob/v0.19.1/src/peft/tuners/lora/layer.py#L2201-L2205
+        if dim_A == input_dim and dim_B == output_dim:
+            first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+            first_weight = first_weight.permute(0, 2, 1).contiguous()
+
+            second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+            second_weight = second_weight.permute(1, 2, 0).contiguous()
+
+            return first_weight, second_weight, scaling, num_experts
+
+        if dim_A == output_dim and dim_B == input_dim:
+            first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+            first_weight = first_weight.permute(1, 0, 2).contiguous()
+
+            second_weight = weight_A.view(num_experts, rank_per_expert, dim_A).contiguous()
+
+            return first_weight, second_weight, scaling, num_experts
 
         first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
         first_weight = first_weight.permute(0, 2, 1).contiguous()

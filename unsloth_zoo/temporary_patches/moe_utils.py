@@ -1306,6 +1306,31 @@ def forward_native_moe_loop(
     """
     # This Unsloth Zoo code section is licensed under AGPL3
     final_hidden_states = torch.zeros_like(hidden_states)
+    use_separated_lora = _should_use_separated_lora()
+
+    gate_up_lora = getattr(self, "_unsloth_lora_gate_up_proj", None)
+    if gate_up_lora is not None:
+        gate_up_lora = gate_up_lora[:3]
+    elif (
+        use_separated_lora
+        and hasattr(self, "gate_up_proj")
+        and _has_lora_adapters(self.gate_up_proj)
+    ):
+        gate_up_lora = _extract_lora_weights(
+            self.gate_up_proj, num_experts=self.num_experts, experts_module=self
+        )
+
+    down_lora = getattr(self, "_unsloth_lora_down_proj", None)
+    if down_lora is not None:
+        down_lora = down_lora[:3]
+    elif (
+        use_separated_lora
+        and hasattr(self, "down_proj")
+        and _has_lora_adapters(self.down_proj)
+    ):
+        down_lora = _extract_lora_weights(
+            self.down_proj, num_experts=self.num_experts, experts_module=self
+        )
 
     # Create expert mask and find which experts have tokens
     with torch.no_grad():
@@ -1326,9 +1351,16 @@ def forward_native_moe_loop(
         # Compute gate_up projection for this expert only
         # Handle 'gate_up_proj' or 'w1'/'w3'
         if hasattr(self, "gate_up_proj"):
-            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(
-                2, dim=-1
-            )
+            gate_up_weight = self.gate_up_proj[expert_idx]
+            if gate_up_weight.shape[-1] != current_state.shape[-1]:
+                gate_up_weight = gate_up_weight.T
+            gate_up = F.linear(current_state, gate_up_weight)
+            if gate_up_lora is not None:
+                first_weight, second_weight, scaling = gate_up_lora
+                lora_delta = current_state @ first_weight[expert_idx].to(current_state.dtype)
+                lora_delta = lora_delta @ second_weight[expert_idx].to(current_state.dtype)
+                gate_up = gate_up + lora_delta * scaling
+            gate, up = gate_up.chunk(2, dim=-1)
         else:
             gate = F.linear(current_state, self.w1[expert_idx])
             up = F.linear(current_state, self.w3[expert_idx])
@@ -1337,9 +1369,13 @@ def forward_native_moe_loop(
 
         # Compute down projection for this expert only
         if hasattr(self, "down_proj"):
-            current_hidden_states = F.linear(
-                current_hidden_states, self.down_proj[expert_idx]
-            )
+            down = F.linear(current_hidden_states, self.down_proj[expert_idx])
+            if down_lora is not None:
+                first_weight, second_weight, scaling = down_lora
+                lora_delta = current_hidden_states @ first_weight[expert_idx].to(current_hidden_states.dtype)
+                lora_delta = lora_delta @ second_weight[expert_idx].to(current_hidden_states.dtype)
+                down = down + lora_delta * scaling
+            current_hidden_states = down
         else:
             current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])
 
