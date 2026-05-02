@@ -2619,20 +2619,20 @@ class FastMLXModel:
         if finetune_vision_layers is not None:
             train_vision = bool(finetune_vision_layers)
 
+
+        if target_modules == ["all-linear"] or target_modules == "all-linear":
+            target_modules = None
+
         if target_modules is None:
             target_modules = [
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
             ]
 
-        # "all-linear" is a PEFT special keyword meaning all linear layers.
-        # _resolve_lora_keys handles None target_modules → discovers all.
-        if target_modules == ["all-linear"] or target_modules == "all-linear":
-            target_modules = None
-
         # Filter target_modules by finetune_attention_modules / finetune_mlp_modules.
-        # Applies whether target_modules came from the user as an explicit list or
-        # was built from defaults — so toggling these flags always has effect.
+        # Applies whether target_modules came from the user as an explicit list,
+        # was built from defaults, or was normalized from "all-linear" — so
+        # toggling these flags always has effect.
         if isinstance(target_modules, list) and len(target_modules) > 0:
             _ATTN = {"q_proj", "k_proj", "v_proj", "o_proj"}
             _MLP = {"gate_proj", "up_proj", "down_proj"}
@@ -2661,7 +2661,7 @@ class FastMLXModel:
             model.freeze()
 
             # Apply LoRA to the language model (filtered by target_modules)
-            language_lora_count = 0 if finetune_language_layers else None
+            language_lora_count = 0
             if finetune_language_layers and (
                 target_modules is None or (isinstance(target_modules, list) and len(target_modules) > 0)
             ):
@@ -2670,7 +2670,6 @@ class FastMLXModel:
                 if hasattr(lm, "model") and hasattr(lm.model, "layers"):
                     num_layers = len(lm.model.layers)
                 language_lora_keys = _resolve_lora_keys(lm, target_modules)
-                language_lora_count = 0 if language_lora_keys is not None else None
                 if language_lora_keys is None or len(language_lora_keys) > 0:
                     linear_to_lora_layers(
                         lm,
@@ -2678,8 +2677,7 @@ class FastMLXModel:
                         config={**lora_config, "keys": language_lora_keys},
                         use_dora=False,
                     )
-                    if language_lora_keys is not None:
-                        language_lora_count = len(language_lora_keys)
+                    language_lora_count = len(language_lora_keys) if language_lora_keys is not None else num_layers
 
             # Optionally apply LoRA to vision tower
             vision_lora_count = 0
@@ -2716,6 +2714,21 @@ class FastMLXModel:
                 and vision_lora_count == 0
                 and projector_lora_count == 0
             ):
+                if not finetune_language_layers and not train_vision and not train_projector:
+                    raise ValueError(
+                        "Unsloth: no trainable LoRA targets — every layer-group "
+                        "flag is off (finetune_language_layers=False, "
+                        "finetune_vision_layers=False, train_projector=False). "
+                        "Enable at least one. To LoRA only MLP modules of the "
+                        "language model, set finetune_language_layers=True, "
+                        "finetune_attention_modules=False, finetune_mlp_modules=True."
+                    )
+                if isinstance(target_modules, list) and len(target_modules) == 0:
+                    raise ValueError(
+                        "Unsloth: target_modules became empty after filtering by "
+                        "finetune_attention_modules / finetune_mlp_modules. Enable "
+                        "at least one of these flags."
+                    )
                 _raise_no_lora_targets(target_modules)
 
             # Unfreeze all LoRA params across the entire tree
