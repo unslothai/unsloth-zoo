@@ -1111,6 +1111,31 @@ def restore_gpt_oss_original():
         pass
     return False
 
+def _should_use_gpt_oss_bnb4bit() -> bool:
+    """
+    Decide if GPT-OSS should use BnB-compatible 4-bit experts.
+    Default: True when load_in_4bit is active.
+    Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to force BF16 path.
+    """
+    if "gpt_oss" not in _normalized_unsloth_model_name():
+        return False
+    if "_load_in_4bit_" not in _normalized_unsloth_model_name():
+        return False
+    return os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_DISABLE", "0") != "1"
+
+
+def _is_gpt_oss_4bit_load() -> bool:
+    return "_load_in_4bit_" in _normalized_unsloth_model_name()
+
+
+def _normalized_unsloth_model_name() -> str:
+    return os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
+
+
+def _is_transformers_v5() -> bool:
+    return transformers_version >= Version("5.0.0.dev0")
+
+
 def patch_gpt_oss_bnb4bit_auto():
     """
     Auto-patch GPT-OSS for BnB 4-bit when load_in_4bit is active.
@@ -1346,31 +1371,6 @@ from .moe_utils import (
     forward_native_grouped_mm,
     # torch_native_forward,
 )
-
-
-def _should_use_gpt_oss_bnb4bit() -> bool:
-    """
-    Decide if GPT-OSS should use BnB-compatible 4-bit experts.
-    Default: True when load_in_4bit is active.
-    Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to force BF16 path.
-    """
-    if "gpt_oss" not in _normalized_unsloth_model_name():
-        return False
-    if "_load_in_4bit_" not in _normalized_unsloth_model_name():
-        return False
-    return os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_DISABLE", "0") != "1"
-
-
-def _is_gpt_oss_4bit_load() -> bool:
-    return "_load_in_4bit_" in _normalized_unsloth_model_name()
-
-
-def _normalized_unsloth_model_name() -> str:
-    return os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
-
-
-def _is_transformers_v5() -> bool:
-    return transformers_version >= Version("5.0.0.dev0")
 
 
 def patch_gpt_oss_moe_for_lora():
