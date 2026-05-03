@@ -1752,10 +1752,14 @@ def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                          quantization_method=quantization_method)
 
 
-def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, **kwargs):
+def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, **kwargs):
     from .mlx_utils import push_to_hub_merged
     tokenizer = tokenizer or self._tokenizer
-    push_to_hub_merged(self, tokenizer, repo_id, repo_id=repo_id, **kwargs)
+    # If save_directory wasn't given, fall back to repo_id (relative dir
+    # named after the repo). Callers that already saved locally should
+    # pass save_directory= to avoid a redundant re-save.
+    save_directory = save_directory or repo_id
+    push_to_hub_merged(self, tokenizer, save_directory, repo_id=repo_id, **kwargs)
 
 
 def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
@@ -2125,8 +2129,8 @@ class FastMLXModel:
                         or adapter_quant_map
                         or adapter_cfg.get("base_quantization_config") is not None
                     )
+                    adapter_mlx_quant_config = None
                     if adapter_has_quant_metadata:
-                        adapter_mlx_quant_config = None
                         if adapter_requires_runtime_quant and adapter_quant_map:
                             adapter_mlx_quant_config = _quant_config_from_resolved_map(
                                 adapter_quant_map
@@ -2193,42 +2197,37 @@ class FastMLXModel:
                                     "Use the saved base quantization policy or retrain "
                                     "the adapter for the requested base quantization."
                                 )
-                        model, tokenizer = FastMLXModel.from_pretrained(
-                            base_model_id,
-                            max_seq_length=max_seq_length,
-                            dtype=dtype,
-                            load_in_4bit=False,
-                            load_in_8bit=False,
-                            load_in_16bit=False,
-                            load_in_fp8=False,
-                            load_in_mxfp4=False,
-                            load_in_nvfp4=False,
-                            full_finetuning=full_finetuning,
-                            token=token,
-                            trust_remote_code=trust_remote_code,
-                            text_only=text_only,
-                            patch_mode=patch_mode,
-                            revision=adapter_base_revision,
-                            random_state=random_state,
-                            **(
-                                {"mlx_quantization_config": adapter_mlx_quant_config}
-                                if adapter_mlx_quant_config is not None
-                                else {}
-                            ),
-                        )
-                        _validate_mlx_adapter_base(model, adapter_cfg)
-                        from mlx_lm.tuner.utils import load_adapters
-                        model = load_adapters(model, local_path)
-                        loaded_model_config = getattr(model, "_config", None)
-                    else:
-                        with _temporary_hf_token_env(token):
-                            model, tokenizer = mlx_load(
-                                base_model_id,
-                                adapter_path=local_path,
-                                tokenizer_config={"token": token} if token else None,
-                                revision=adapter_base_revision,
-                            )
-                        loaded_model_config = None
+                    # Always reload the base via FastMLXModel.from_pretrained
+                    # (works for both text and VLM); the previous mlx_lm.load
+                    # fallback for non-quant-metadata adapters silently broke
+                    # VLM adapters because mlx-lm's load is text-only.
+                    model, tokenizer = FastMLXModel.from_pretrained(
+                        base_model_id,
+                        max_seq_length=max_seq_length,
+                        dtype=dtype,
+                        load_in_4bit=False,
+                        load_in_8bit=False,
+                        load_in_16bit=False,
+                        load_in_fp8=False,
+                        load_in_mxfp4=False,
+                        load_in_nvfp4=False,
+                        full_finetuning=full_finetuning,
+                        token=token,
+                        trust_remote_code=trust_remote_code,
+                        text_only=text_only,
+                        patch_mode=patch_mode,
+                        revision=adapter_base_revision,
+                        random_state=random_state,
+                        **(
+                            {"mlx_quantization_config": adapter_mlx_quant_config}
+                            if adapter_mlx_quant_config is not None
+                            else {}
+                        ),
+                    )
+                    _validate_mlx_adapter_base(model, adapter_cfg)
+                    from mlx_lm.tuner.utils import load_adapters
+                    model = load_adapters(model, local_path)
+                    loaded_model_config = getattr(model, "_config", None)
                     is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
                     processor = getattr(model, "_processor", None)
 
