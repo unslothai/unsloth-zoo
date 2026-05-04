@@ -1,5 +1,6 @@
 import os
 import sys
+import warnings
 import torch
 import pytest
 
@@ -29,7 +30,7 @@ class _Model:
 
     is_quantized = True
 
-    def __init__(self, mods):
+    def __init__(self, mods=()):
         self._mods = mods
 
     def modules(self):
@@ -90,8 +91,6 @@ def hide_swizzle_fn():
 
 
 def test_zero_placeholders_do_not_raise_when_swizzle_fn_missing(hide_swizzle_fn):
-    """Freshly-init Mxfp4GptOssExperts with zero placeholders should be
-    treated as not-loaded and skipped, not raised on."""
     mod = _make_module(blocks_zero=True, scales_zero=True,
                        down_blocks_zero=True, down_scales_zero=True)
     q = _make_quantizer(dequantize=False)
@@ -99,7 +98,6 @@ def test_zero_placeholders_do_not_raise_when_swizzle_fn_missing(hide_swizzle_fn)
 
 
 def test_loaded_blocks_raise_when_swizzle_fn_missing(hide_swizzle_fn):
-    """When real blocks are present, the missing-swizzle branch must still raise."""
     mod = _make_module(blocks_zero=False, scales_zero=False)
     q = _make_quantizer(dequantize=False)
     with pytest.raises(RuntimeError, match="raw blocks/scales"):
@@ -107,7 +105,6 @@ def test_loaded_blocks_raise_when_swizzle_fn_missing(hide_swizzle_fn):
 
 
 def test_meta_scales_treated_as_not_loaded(hide_swizzle_fn):
-    """Real blocks + meta scales should be skipped, not crash."""
     mod = _make_module(blocks_zero=False, scales_meta=True,
                        down_blocks_zero=True, down_scales_zero=True)
     q = _make_quantizer(dequantize=False)
@@ -115,19 +112,14 @@ def test_meta_scales_treated_as_not_loaded(hide_swizzle_fn):
 
 
 def test_per_projection_skip_repairs_uncached_down_proj():
-    """If _gate_up_proj is cached early (e.g. property accessed) but
-    down_proj is still raw and loaded, the active swizzle path must
-    repair down_proj instead of skipping the whole module."""
     mod = _make_module(blocks_zero=True, scales_zero=True,
                        down_blocks_zero=False, down_scales_zero=False)
-    # Simulate gate_up_proj cached
     mod.__dict__["_gate_up_proj"] = torch.zeros(2, 4, 8)
 
     swizzle_calls = []
 
     def fake_swizzle(b, s, mod, proj, dev, tk):
         swizzle_calls.append(proj)
-        # mimic upstream cleanup: remove the raw params
         if f"{proj}_blocks" in mod._parameters:
             del mod._parameters[f"{proj}_blocks"]
         if f"{proj}_scales" in mod._parameters:
@@ -136,7 +128,6 @@ def test_per_projection_skip_repairs_uncached_down_proj():
     saved = getattr(_mx_mod, "swizzle_mxfp4_convertops", None)
     _mx_mod.swizzle_mxfp4_convertops = fake_swizzle
     try:
-        # provide a fake top-level triton_kernels module so the import succeeds
         import types as _types
         sys.modules.setdefault("triton_kernels", _types.ModuleType("triton_kernels"))
         q = _make_quantizer(dequantize=False)
@@ -149,8 +140,6 @@ def test_per_projection_skip_repairs_uncached_down_proj():
 
 
 def test_per_projection_skip_skips_both_when_both_cached():
-    """If both projections are cached (post-load already ran), the
-    active swizzle path must be a no-op."""
     mod = _make_module(blocks_zero=False, scales_zero=False,
                        down_blocks_zero=False, down_scales_zero=False)
     mod.__dict__["_gate_up_proj"] = torch.zeros(2, 4, 8)
@@ -176,10 +165,85 @@ def test_per_projection_skip_skips_both_when_both_cached():
 
 
 def test_partial_load_one_projection_loaded(hide_swizzle_fn):
-    """Module has gate_up_proj loaded but down_proj still zero. Missing
-    swizzle_fn branch must raise (since some weights are loaded)."""
     mod = _make_module(blocks_zero=False, scales_zero=False,
                        down_blocks_zero=True, down_scales_zero=True)
     q = _make_quantizer(dequantize=False)
     with pytest.raises(RuntimeError, match="raw blocks/scales"):
         _QCLS._process_model_after_weight_loading(q, _Model([mod]))
+
+
+def _stub_orig_noop():
+    fn = _QCLS._process_model_before_weight_loading
+    fn.__closure__[0].cell_contents = lambda self, model, **kwargs: None
+
+
+def _patch_devices(monkeypatch, *, cuda=False, xpu=False):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    if not hasattr(torch, "xpu"):
+        torch.xpu = type("xpu", (), {"is_available": staticmethod(lambda: xpu)})
+    monkeypatch.setattr(torch.xpu, "is_available", lambda: xpu)
+
+
+def test_cpu_use_kernels_true_keeps_dequantize_false(monkeypatch):
+    _patch_devices(monkeypatch, cuda=False, xpu=False)
+    _stub_orig_noop()
+    q = _make_quantizer(dequantize=False)
+    _QCLS._process_model_before_weight_loading(q, _Model(), use_kernels=True)
+    assert q.quantization_config.dequantize is False
+
+
+def test_cpu_use_kernels_false_forces_dequantize(monkeypatch):
+    _patch_devices(monkeypatch, cuda=False, xpu=False)
+    _stub_orig_noop()
+    q = _make_quantizer(dequantize=False)
+    _QCLS._process_model_before_weight_loading(q, _Model(), use_kernels=False)
+    assert q.quantization_config.dequantize is True
+
+
+def test_cpu_default_call_forces_dequantize(monkeypatch):
+    _patch_devices(monkeypatch, cuda=False, xpu=False)
+    _stub_orig_noop()
+    q = _make_quantizer(dequantize=False)
+    _QCLS._process_model_before_weight_loading(q, _Model())
+    assert q.quantization_config.dequantize is True
+
+
+def test_positional_use_kernels_does_not_raise(monkeypatch):
+    _patch_devices(monkeypatch, cuda=False, xpu=False)
+    _stub_orig_noop()
+    q = _make_quantizer(dequantize=False)
+    _QCLS._process_model_before_weight_loading(q, _Model(), True)
+    assert q.quantization_config.dequantize is False
+
+
+def test_use_kernels_forwarded_to_orig(monkeypatch):
+    _patch_devices(monkeypatch, cuda=True, xpu=False)
+    seen = {}
+
+    def fake_orig(self, model, **kwargs):
+        seen["use_kernels"] = kwargs.get("use_kernels")
+
+    fn = _QCLS._process_model_before_weight_loading
+    fn.__closure__[0].cell_contents = fake_orig
+    q = _make_quantizer(dequantize=False)
+    _QCLS._process_model_before_weight_loading(q, _Model(), use_kernels=True)
+    assert seen.get("use_kernels") is True
+
+
+def test_detection_failure_warns_and_proceeds(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: (_ for _ in ()).throw(RuntimeError("driver gone")))
+    called = {"orig": False}
+
+    def fake_orig(self, model, **kwargs):
+        called["orig"] = True
+
+    fn = _QCLS._process_model_before_weight_loading
+    fn.__closure__[0].cell_contents = fake_orig
+    q = _make_quantizer(dequantize=False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _QCLS._process_model_before_weight_loading(q, _Model())
+    assert called["orig"] is True
+    assert any(
+        "MXFP4 pre-load device detection failed" in str(w.message) for w in caught
+    ), [str(w.message) for w in caught]
