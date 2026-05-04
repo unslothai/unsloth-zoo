@@ -176,9 +176,14 @@ def patch_gpt_oss():
                             if p is None or p.dim() != 3:
                                 continue
                             shape = tuple(p.shape[-2:])
-                            if shape == expected_right[proj]:
+                            # When H == I, down_proj wrong (H, I) and right
+                            # (I, H) shapes are identical; the outer guard
+                            # already proved this module is in the wrong
+                            # layout, so transpose unconditionally.
+                            ambiguous = (proj == "down_proj" and H == I)
+                            if shape == expected_right[proj] and not ambiguous:
                                 continue
-                            if shape != expected_wrong[proj]:
+                            if shape != expected_wrong[proj] and not ambiguous:
                                 _warnings.warn(
                                     f"[unsloth] Unexpected MXFP4-dequantize "
                                     f"layout for {type(mod).__name__}.{proj}: "
@@ -233,10 +238,21 @@ def patch_gpt_oss():
                         continue
                     if blocks.device.type == "meta":
                         continue
+                    # Mirror the Mxfp4GptOssExperts.gate_up_proj property
+                    # invariant: zero placeholders mean weights never loaded;
+                    # swizzling them silently produces zero experts.
+                    if blocks.numel() == 0 or not bool(blocks.any()):
+                        continue
                     for proj in ("gate_up_proj", "down_proj"):
                         b = getattr(mod, f"{proj}_blocks", None)
                         s = getattr(mod, f"{proj}_scales", None)
                         if b is None or s is None:
+                            continue
+                        if (
+                            b.device.type == "meta"
+                            or b.numel() == 0
+                            or not bool(b.any())
+                        ):
                             continue
                         try:
                             swizzle_fn(b.data, s.data, mod, proj, b.device, _tk)
@@ -254,20 +270,34 @@ def patch_gpt_oss():
             _Mxfp4Q._process_model_after_weight_loading = _patched_post_load
             _Mxfp4Q._unsloth_post_swizzle_patched = True
 
-        # triton_kernels MXFP4 matmul is Hopper-only; Ampere/Ada/Blackwell
-        # abort with "Only Hopper swizzling is supported". Force dequantize
-        # on any non-Hopper (or CPU-only) environment before load.
+        # triton_kernels MXFP4 needs CUDA; native MXFP4 itself works across
+        # CUDA compute capabilities (StridedLayout / HopperMXValueLayout /
+        # BlackwellMXValueLayout) and XPU has its own native path. Only
+        # force dequantize when no supported accelerator is visible.
         if not getattr(_Mxfp4Q, "_unsloth_cpu_gate_patched", False):
             _orig_before_load = _Mxfp4Q._process_model_before_weight_loading
 
             def _patched_before_load(self, model, **kwargs):
                 try:
                     import torch as _torch
+                    cuda_ok = _torch.cuda.is_available()
+                    xpu_ok = (
+                        hasattr(_torch, "xpu") and _torch.xpu.is_available()
+                    )
                     if (
-                        not _torch.cuda.is_available()
+                        not cuda_ok
+                        and not xpu_ok
                         and not getattr(self.quantization_config, "dequantize", False)
                     ):
-                        self.quantization_config.dequantize = True
+                        try:
+                            self.quantization_config.dequantize = True
+                        except Exception as _cfg_err:
+                            import warnings as _w
+                            _w.warn(
+                                f"[unsloth] Could not force MXFP4 dequantize "
+                                f"on CPU-only host: {_cfg_err!r}; native "
+                                f"MXFP4 path may crash without triton_kernels."
+                            )
                 except Exception:
                     pass
                 return _orig_before_load(self, model, **kwargs)
