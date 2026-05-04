@@ -20,7 +20,7 @@ __all__ = [
     "process_return",
     "process_output_options",
     "KWARGS_TYPE",
-    "raise_error"
+    "raise_error",
     "Unpack",
     "Cache",
     "DynamicCache",
