@@ -1333,9 +1333,7 @@ def create_standalone_class(
     # Combine all into file
     source = source + full_class
     if supports_return_hidden_states:
-        source += (
-            f"\n{module}.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True\n"
-        )
+        source += f"\n{module}.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True\n"
 
     # Remove @auto_docstring
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
@@ -1749,7 +1747,6 @@ ce_finders = [
 def apply_fused_lm_head(forward, module=None):
     # All Unsloth Zoo code licensed under LGPLv3
     UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
-    supports_return_hidden_states = False
     for jj, (cross_entropy_find, cross_entropy_replacement) in enumerate(ce_finders):
         cross_entropy_find = (
             cross_entropy_find.strip()
@@ -1978,16 +1975,9 @@ def apply_fused_lm_head(forward, module=None):
         forward = forward.replace(",**)", ")")
         forward = forward.replace(",** )", ")")
         # print(forward)
-        supports_return_hidden_states = (
-            "UNSLOTH_RETURN_HIDDEN_STATES" in forward
-            and (
-                "logits = hidden_states" in forward
-                or "logits=hidden_states" in forward
-            )
-        )
-        return forward, supports_return_hidden_states
+        return forward, True
     pass
-    return forward, supports_return_hidden_states
+    return forward, False
 
 
 pass
