@@ -286,7 +286,8 @@ def device_empty_cache():
             torch.cuda.empty_cache()
     elif DEVICE_TYPE == "xpu":
         if hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.empty_cache()
+            if hasattr(torch.xpu, "empty_cache"):
+                torch.xpu.empty_cache()
 pass
 
 def device_is_bf16_supported():
