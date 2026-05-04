@@ -21,6 +21,7 @@ __all__ = [
     "ALLOW_PREQUANTIZED_MODELS",
     "ALLOW_BITSANDBYTES",
     "device_synchronize",
+    "device_empty_cache",
 ]
 
 import torch
@@ -272,4 +273,17 @@ def device_synchronize():
     elif DEVICE_TYPE == "xpu":
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.synchronize()
+pass
+
+def device_empty_cache():
+    """
+    Empty the active device cache (CUDA, XPU, or HIP).
+    Cross-platform replacement for torch.cuda.empty_cache().
+    """
+    if DEVICE_TYPE in ("cuda", "hip"):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    elif DEVICE_TYPE == "xpu":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.empty_cache()
 pass
