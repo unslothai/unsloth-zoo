@@ -119,6 +119,29 @@ LLAMA_CPP_DEFAULT_DIR = os.environ.get(
 )
 
 
+def _resolve_local_convert_script():
+    """Returns absolute path to a local convert_hf_to_gguf.py if UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
+    points at a directory containing one, else None."""
+    scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+    if not scripts_dir:
+        return None
+    if not os.path.isdir(scripts_dir):
+        logger.warning(
+            f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' is not a directory; "
+            f"falling back to network download."
+        )
+        return None
+    for name in ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py"):
+        candidate = os.path.join(scripts_dir, name)
+        if os.path.exists(candidate):
+            return candidate
+    logger.warning(
+        f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' has no convert_hf_to_gguf.py; "
+        f"falling back to network download."
+    )
+    return None
+
+
 @contextlib.contextmanager
 def use_local_gguf():
     """Context manager to temporarily use llama.cpp's local gguf-py"""
@@ -863,12 +886,18 @@ def _load_module_from_path(filepath, module_name):
 pass
 
 
-@lru_cache(1)
-def _download_convert_hf_to_gguf(
-    name = "unsloth_convert_hf_to_gguf",
-):
+def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
+    # Resolve the env var on every call so changes between calls are honored;
+    # the resolved value is part of the cache key on the implementation below.
+    return _download_convert_hf_to_gguf_cached(name, _resolve_local_convert_script())
+
+
+@lru_cache(2)
+def _download_convert_hf_to_gguf_cached(name, _local_script):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Downloads from llama.cpp's Github report
+    # Downloads from llama.cpp's Github report (or reads a local copy if
+    # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points at one — _local_script is resolved
+    # by the wrapper above before the cache lookup)
 
     # Ensure llama.cpp directory exists
     os.makedirs(LLAMA_CPP_DEFAULT_DIR, exist_ok=True)
@@ -877,10 +906,15 @@ def _download_convert_hf_to_gguf(
     temp_original_file_path = None # Initialize for finally block
 
     try:
-        # 1. Download the file
-        response = requests.get(LLAMA_CPP_CONVERT_FILE)
-        response.raise_for_status()
-        original_content = response.content
+        # 1. Obtain the file (local override takes precedence over network)
+        if _local_script is not None:
+            print(f"Unsloth: Using local convert_hf_to_gguf.py from {_local_script}")
+            with open(_local_script, "rb") as f:
+                original_content = f.read()
+        else:
+            response = requests.get(LLAMA_CPP_CONVERT_FILE)
+            response.raise_for_status()
+            original_content = response.content
 
         # 2. Introspect Original Script for Supported Architectures
         logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
