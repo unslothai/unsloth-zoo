@@ -273,7 +273,8 @@ def device_synchronize():
             torch.cuda.synchronize()
     elif DEVICE_TYPE == "xpu":
         if hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.synchronize()
+            if hasattr(torch.xpu, "synchronize"):
+                torch.xpu.synchronize()
 pass
 
 def device_empty_cache():
