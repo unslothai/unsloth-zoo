@@ -198,13 +198,31 @@ def patch_gpt_oss():
 
                 import transformers.integrations.mxfp4 as _mx_mod
                 swizzle_fn = getattr(_mx_mod, "swizzle_mxfp4_convertops", None)
+
+                def _has_loaded_raw(mod, proj):
+                    b = getattr(mod, f"{proj}_blocks", None)
+                    s = getattr(mod, f"{proj}_scales", None)
+                    if b is None or s is None:
+                        return False
+                    if b.device.type == "meta" or s.device.type == "meta":
+                        return False
+                    if b.numel() == 0 or s.numel() == 0:
+                        return False
+                    return bool(b.any())
+
+                def _module_has_loaded_raw(mod):
+                    for proj in ("gate_up_proj", "down_proj"):
+                        if f"_{proj}" in mod.__dict__:
+                            continue
+                        if _has_loaded_raw(mod, proj):
+                            return True
+                    return False
+
                 if swizzle_fn is None:
                     for mod in model.modules():
                         if type(mod).__name__ != "Mxfp4GptOssExperts":
                             continue
-                        if "_gate_up_proj" in mod.__dict__:
-                            continue
-                        if getattr(mod, "gate_up_proj_blocks", None) is not None:
+                        if _module_has_loaded_raw(mod):
                             raise RuntimeError(
                                 "[unsloth] MXFP4 model has raw blocks/scales "
                                 "post-load but swizzle_mxfp4_convertops is "
@@ -218,9 +236,7 @@ def patch_gpt_oss():
                     for mod in model.modules():
                         if type(mod).__name__ != "Mxfp4GptOssExperts":
                             continue
-                        if "_gate_up_proj" in mod.__dict__:
-                            continue
-                        if getattr(mod, "gate_up_proj_blocks", None) is not None:
+                        if _module_has_loaded_raw(mod):
                             raise RuntimeError(
                                 "[unsloth] Native MXFP4 requires "
                                 "triton_kernels; install it or pass "
@@ -230,30 +246,13 @@ def patch_gpt_oss():
                 for mod in model.modules():
                     if type(mod).__name__ != "Mxfp4GptOssExperts":
                         continue
-                    if "_gate_up_proj" in mod.__dict__:
-                        continue
-                    blocks = getattr(mod, "gate_up_proj_blocks", None)
-                    scales = getattr(mod, "gate_up_proj_scales", None)
-                    if blocks is None or scales is None:
-                        continue
-                    if blocks.device.type == "meta":
-                        continue
-                    # Mirror the Mxfp4GptOssExperts.gate_up_proj property
-                    # invariant: zero placeholders mean weights never loaded;
-                    # swizzling them silently produces zero experts.
-                    if blocks.numel() == 0 or not bool(blocks.any()):
-                        continue
                     for proj in ("gate_up_proj", "down_proj"):
-                        b = getattr(mod, f"{proj}_blocks", None)
-                        s = getattr(mod, f"{proj}_scales", None)
-                        if b is None or s is None:
+                        if f"_{proj}" in mod.__dict__:
                             continue
-                        if (
-                            b.device.type == "meta"
-                            or b.numel() == 0
-                            or not bool(b.any())
-                        ):
+                        if not _has_loaded_raw(mod, proj):
                             continue
+                        b = getattr(mod, f"{proj}_blocks")
+                        s = getattr(mod, f"{proj}_scales")
                         try:
                             swizzle_fn(b.data, s.data, mod, proj, b.device, _tk)
                         except Exception as _sw_err:
@@ -277,7 +276,7 @@ def patch_gpt_oss():
         if not getattr(_Mxfp4Q, "_unsloth_cpu_gate_patched", False):
             _orig_before_load = _Mxfp4Q._process_model_before_weight_loading
 
-            def _patched_before_load(self, model, **kwargs):
+            def _patched_before_load(self, model, use_kernels=False, **kwargs):
                 try:
                     import torch as _torch
                     cuda_ok = _torch.cuda.is_available()
@@ -287,6 +286,7 @@ def patch_gpt_oss():
                     if (
                         not cuda_ok
                         and not xpu_ok
+                        and not use_kernels
                         and not getattr(self.quantization_config, "dequantize", False)
                     ):
                         try:
@@ -298,9 +298,15 @@ def patch_gpt_oss():
                                 f"on CPU-only host: {_cfg_err!r}; native "
                                 f"MXFP4 path may crash without triton_kernels."
                             )
-                except Exception:
-                    pass
-                return _orig_before_load(self, model, **kwargs)
+                except Exception as _det_err:
+                    import warnings as _w
+                    _w.warn(
+                        f"[unsloth] MXFP4 pre-load device detection failed: "
+                        f"{_det_err!r}; falling back to upstream."
+                    )
+                return _orig_before_load(
+                    self, model, use_kernels=use_kernels, **kwargs,
+                )
 
             _Mxfp4Q._process_model_before_weight_loading = _patched_before_load
             _Mxfp4Q._unsloth_cpu_gate_patched = True
