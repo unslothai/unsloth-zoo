@@ -1355,6 +1355,13 @@ def forward_native_moe_loop(
         expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
+    # Some patches (Qwen3-VL-MoE) store experts in grouped_mm-friendly layout
+    # (E, in_dim, out_dim) rather than F.linear's (E, out_dim, in_dim). The
+    # patched __init__ sets `_unsloth_grouped_mm_format = True` to advertise
+    # this. Prefer it over the shape-only check below: the shape check is
+    # unsafe when intermediate_dim == hidden_dim (square dims).
+    grouped_mm_format = bool(getattr(self, "_unsloth_grouped_mm_format", False))
+
     # Only loop over experts that actually have tokens routed to them
     for expert_idx_t in expert_hit:
         expert_idx = expert_idx_t.item()
@@ -1369,7 +1376,7 @@ def forward_native_moe_loop(
         # Handle 'gate_up_proj' or 'w1'/'w3'
         if hasattr(self, "gate_up_proj"):
             gate_up_weight = self.gate_up_proj[expert_idx]
-            if gate_up_weight.shape[-1] != current_state.shape[-1]:
+            if grouped_mm_format or gate_up_weight.shape[-1] != current_state.shape[-1]:
                 gate_up_weight = gate_up_weight.T
             gate_up = F.linear(current_state, gate_up_weight)
             if gate_up_lora is not None:
@@ -1387,10 +1394,10 @@ def forward_native_moe_loop(
         # Compute down projection for this expert only
         if hasattr(self, "down_proj"):
             down_weight = self.down_proj[expert_idx]
-            # Mirror the gate_up shape check: some MoE patches store the
-            # down weight in transposed (in_dim, out_dim) layout for
-            # grouped_mm, but F.linear needs (out_dim, in_dim).
-            if down_weight.shape[-1] != current_hidden_states.shape[-1]:
+            # Mirror the gate_up handling: prefer the explicit
+            # `_unsloth_grouped_mm_format` flag over the shape heuristic, which
+            # is unsafe when intermediate_dim == hidden_dim.
+            if grouped_mm_format or down_weight.shape[-1] != current_hidden_states.shape[-1]:
                 down_weight = down_weight.T
             down = F.linear(current_hidden_states, down_weight)
             if down_lora is not None:

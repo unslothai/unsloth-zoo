@@ -179,6 +179,60 @@ def test_forward_native_moe_loop_no_lora_matches_naive(transposed_storage):
     torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
 
 
+def test_forward_native_moe_loop_square_dim_uses_grouped_mm_flag():
+    """When `intermediate_dim == hidden_dim`, the shape-based transpose check
+    cannot tell which orientation the per-expert weight is stored in. The
+    explicit `_unsloth_grouped_mm_format` flag must take precedence so that
+    transposed storage is detected even at square dims.
+    """
+    torch.manual_seed(13)
+    num_experts = 3
+    dim = 16  # hidden == intermediate, so 2*intermediate == 2*hidden
+    rank = 2
+    num_tokens = 5
+    top_k = 2
+
+    # Use intermediate = dim so that down_proj is (E, dim, dim) — square.
+    # gate_up_proj is (E, 2*dim, dim) which is non-square so easy.
+    intermediate = dim
+    hidden = dim
+
+    experts = nn.Module()
+    experts.num_experts = num_experts
+    # Transposed (grouped_mm) storage:
+    experts.gate_up_proj = nn.Parameter(
+        torch.randn(num_experts, hidden, 2 * intermediate, dtype=torch.float32)
+    )
+    experts.down_proj = nn.Parameter(
+        torch.randn(num_experts, intermediate, hidden, dtype=torch.float32)
+    )
+    experts.act_fn = F.silu
+    experts._unsloth_grouped_mm_format = True
+
+    hidden_states = torch.randn(num_tokens, hidden, dtype=torch.float32)
+    top_k_index = torch.randint(0, num_experts, (num_tokens, top_k))
+    top_k_weights = torch.softmax(torch.randn(num_tokens, top_k), dim=-1)
+
+    out = forward_native_moe_loop(experts, hidden_states, top_k_index, top_k_weights)
+
+    # Reference manually transposes both weights regardless of shape.
+    ref = torch.zeros_like(hidden_states)
+    expert_mask = F.one_hot(top_k_index, num_classes=num_experts).permute(2, 1, 0)
+    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+    for ei_t in expert_hit:
+        ei = ei_t.item()
+        top_k_pos, token_idx = torch.where(expert_mask[ei])
+        x = hidden_states[token_idx]
+        gu = F.linear(x, experts.gate_up_proj[ei].T)
+        g, u = gu.chunk(2, dim=-1)
+        h = experts.act_fn(g) * u
+        d = F.linear(h, experts.down_proj[ei].T)
+        d = d * top_k_weights[token_idx, top_k_pos, None]
+        ref.index_add_(0, token_idx, d.to(ref.dtype))
+
+    torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16],
                          ids=["fp32", "bf16", "fp16"])
 def test_forward_native_moe_loop_lora_dtype_precast_no_loop_alloc(dtype):

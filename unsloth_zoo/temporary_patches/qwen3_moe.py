@@ -58,9 +58,40 @@ def _make_qwen_moe_lora_extractor():
 
         return None, None
 
+    def _canonical(weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B):
+        # PEFT 0.18 raw 3D parameter dims layout
+        first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+        first_weight = first_weight.permute(0, 2, 1).contiguous()
+        second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+        second_weight = second_weight.permute(1, 2, 0).contiguous()
+        return first_weight, second_weight
+
+    def _reversed_(weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B):
+        # PEFT 0.19 swapped 3D parameter dims layout
+        first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+        first_weight = first_weight.permute(1, 0, 2).contiguous()
+        second_weight = weight_A.view(num_experts, rank_per_expert, dim_A).contiguous()
+        return first_weight, second_weight
+
     def _qwen_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
         """
-        LoRA extractor for Qwen-family MoE (Qwen3-MoE, Qwen3.5/3.6, Qwen3-Next).
+        LoRA extractor for Qwen-family MoE (Qwen3-MoE, Qwen3.5/3.6, Qwen3-Next, Qwen3-VL-MoE).
+
+        Handles both PEFT layouts on the same MoE 3D parameter:
+          PEFT 0.18 keeps raw param.shape  (https://github.com/huggingface/peft/blob/v0.18.0/src/peft/tuners/lora/layer.py#L1928-L1931)
+          PEFT 0.19 swaps in/out features  (https://github.com/huggingface/peft/blob/v0.19.1/src/peft/tuners/lora/layer.py#L2201-L2205)
+
+        Dispatch order:
+          1. PEFT 0.19 sets `wrapper._did_swap_in_out_features = True` when it
+             actually swapped. That is the cleanest signal and is preferred over
+             any shape-based check, which can be ambiguous when input_dim ==
+             output_dim (e.g. tiny synthetic configs, or `gate_up_proj` with
+             hidden_dim == 2*intermediate_dim).
+          2. Otherwise compare (dim_A, dim_B) against the runtime
+             (input_dim, output_dim) read from the experts module.
+          3. If neither matches, warn loudly and fall through to the canonical
+             permutation. This used to be silent and was the exact failure mode
+             of PR #601 — so make it visible.
         """
         total_rank = weight_A.shape[0]
         rank_per_expert = total_rank // num_experts
@@ -68,34 +99,37 @@ def _make_qwen_moe_lora_extractor():
         dim_B = weight_B.shape[0]
 
         input_dim, output_dim = _get_qwen_moe_lora_dims(wrapper)
+        peft_swapped = bool(getattr(wrapper, "_did_swap_in_out_features", False))
 
-        # PEFT 0.18 used raw 3D parameter dims for ParamWrapper LoRA:
-        # https://github.com/huggingface/peft/blob/v0.18.0/src/peft/tuners/lora/layer.py#L1928-L1931
-        # PEFT 0.19 swaps non-transposed 3D params before creating lora_A/B:
-        # https://github.com/huggingface/peft/blob/v0.19.1/src/peft/tuners/lora/layer.py#L2201-L2205
+        if peft_swapped and input_dim is not None and dim_A == output_dim and dim_B == input_dim:
+            first_weight, second_weight = _reversed_(
+                weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B,
+            )
+            return first_weight, second_weight, scaling, num_experts
+
         if dim_A == input_dim and dim_B == output_dim:
-            first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-            first_weight = first_weight.permute(0, 2, 1).contiguous()
-
-            second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-            second_weight = second_weight.permute(1, 2, 0).contiguous()
-
+            first_weight, second_weight = _canonical(
+                weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B,
+            )
             return first_weight, second_weight, scaling, num_experts
 
         if dim_A == output_dim and dim_B == input_dim:
-            first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-            first_weight = first_weight.permute(1, 0, 2).contiguous()
-
-            second_weight = weight_A.view(num_experts, rank_per_expert, dim_A).contiguous()
-
+            first_weight, second_weight = _reversed_(
+                weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B,
+            )
             return first_weight, second_weight, scaling, num_experts
 
-        first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-        first_weight = first_weight.permute(0, 2, 1).contiguous()
-
-        second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-        second_weight = second_weight.permute(1, 2, 0).contiguous()
-
+        if UNSLOTH_ENABLE_LOGGING and (input_dim is not None or output_dim is not None):
+            logger.warning(
+                "Unsloth: Qwen MoE LoRA extractor could not match either layout "
+                f"(weight_A={tuple(weight_A.shape)}, weight_B={tuple(weight_B.shape)}, "
+                f"expected input_dim={input_dim}, output_dim={output_dim}, "
+                f"num_experts={num_experts}). Falling back to canonical layout. "
+                "If this is a new PEFT version, the LoRA delta may be wrong."
+            )
+        first_weight, second_weight = _canonical(
+            weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B,
+        )
         return first_weight, second_weight, scaling, num_experts
 
     return _qwen_moe_lora_extractor

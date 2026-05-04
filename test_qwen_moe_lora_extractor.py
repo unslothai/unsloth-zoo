@@ -153,6 +153,97 @@ def test_shared_factory_used_by_qwen3_5_and_next():
     assert qnx._make_qwen_moe_lora_extractor is _make_qwen_moe_lora_extractor
 
 
+class _SquareWrapper:
+    """Wrapper for the input_dim == output_dim ambiguity test.
+
+    Sets `_did_swap_in_out_features` to mimic what PEFT 0.19 sets after the
+    swap, so the extractor can disambiguate.
+    """
+    def __init__(self, parameter_name, dim, did_swap):
+        self.parameter_name = parameter_name
+        self.base_layer = type("_Base", (), {})()
+        if parameter_name == "down_proj":
+            # down_proj: (E, hidden_dim, intermediate_dim). Force in == out by
+            # setting intermediate_dim == hidden_dim.
+            self.base_layer.intermediate_dim = dim
+            self.base_layer.hidden_dim = dim
+        elif parameter_name == "gate_up_proj":
+            # gate_up_proj: input_dim = hidden_dim, output_dim = 2*intermediate_dim.
+            # Make square by intermediate_dim = hidden_dim/2.
+            self.base_layer.hidden_dim = dim
+            self.base_layer.intermediate_dim = dim // 2
+        self._did_swap_in_out_features = did_swap
+
+    def get_base_layer(self):
+        return self.base_layer
+
+
+@pytest.mark.parametrize("did_swap", [False, True], ids=["peft018", "peft019_swapped"])
+def test_extractor_disambiguates_square_dims_via_did_swap(did_swap):
+    """When input_dim == output_dim both branch predicates match. The extractor
+    must use `_did_swap_in_out_features` to pick the correct branch.
+    """
+    ext = _make_qwen_moe_lora_extractor()
+    E, R, dim = 4, 3, 16
+    torch.manual_seed(7)
+    wA = torch.randn(E * R, dim)
+    wB = torch.randn(dim, E * R)
+    wrapper = _SquareWrapper("down_proj", dim, did_swap=did_swap)
+    first, second, scaling, num_experts = ext(wrapper, wA, wB, 1.0, E)
+    assert first.shape == (E, dim, R)
+    assert second.shape == (E, R, dim)
+
+    # Reference: under PEFT 0.18 the reshape is the canonical permutation;
+    # under PEFT 0.19 swapped, weight_A and weight_B roles are flipped.
+    x = torch.randn(5, dim)
+    for e in range(E):
+        Ae = wA[e * R : (e + 1) * R]
+        Be = wB[:, e * R : (e + 1) * R]
+        if did_swap:
+            naive = x @ Be @ Ae   # PEFT 0.19 reversed
+        else:
+            naive = x @ Ae.T @ Be.T  # PEFT 0.18 canonical
+        via = (x @ first[e]) @ second[e]
+        torch.testing.assert_close(via, naive, atol=1e-4, rtol=1e-4)
+
+
+def test_extractor_fallback_warns_when_dims_mismatch(caplog):
+    """When neither branch matches, the extractor must warn before falling
+    through to the canonical permutation. Guards against the silent PR #601
+    failure mode resurfacing.
+    """
+    import logging
+
+    ext = _make_qwen_moe_lora_extractor()
+    E, R, in_dim, out_dim = 4, 3, 16, 24
+    torch.manual_seed(11)
+
+    # Build a wrapper that reports plausible dims but supplies LoRA factors
+    # whose shapes match neither branch (simulates a future PEFT layout).
+    wrapper = _Wrapper("gate_up_proj", (E, 2 * 16, in_dim))
+    weird_dim = 99
+    wA = torch.randn(E * R, weird_dim)
+    wB = torch.randn(weird_dim, E * R)
+
+    # The warning is gated on UNSLOTH_ENABLE_LOGGING; force-enable for the test.
+    import unsloth_zoo.temporary_patches.qwen3_moe as qwen3_moe_mod
+    prev = qwen3_moe_mod.UNSLOTH_ENABLE_LOGGING
+    try:
+        qwen3_moe_mod.UNSLOTH_ENABLE_LOGGING = True
+        with caplog.at_level(logging.WARNING):
+            first, second, *_ = ext(wrapper, wA, wB, 1.0, E)
+    finally:
+        qwen3_moe_mod.UNSLOTH_ENABLE_LOGGING = prev
+
+    assert first.shape == (E, weird_dim, R)
+    assert second.shape == (E, R, weird_dim)
+    # At least one warning record mentions the extractor.
+    assert any(
+        "Qwen MoE LoRA extractor could not match either layout" in rec.getMessage()
+        for rec in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
 def test_extractor_output_not_aliasing_input():
     ext = _make_qwen_moe_lora_extractor()
     E, R, in_dim, out_dim = 2, 2, 8, 16
