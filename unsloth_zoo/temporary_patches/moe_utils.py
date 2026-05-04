@@ -1319,6 +1319,16 @@ def forward_native_moe_loop(
         gate_up_lora = _extract_lora_weights(
             self.gate_up_proj, num_experts=self.num_experts, experts_module=self
         )
+    # Pre-cast LoRA factors to the activation dtype once (avoid per-expert .to()
+    # inside the loop). Casting `scaling` is a no-op when it's a Python float;
+    # if it's a tensor, leave it alone — the multiply broadcasts.
+    if gate_up_lora is not None:
+        _gate_up_first, _gate_up_second, _gate_up_scaling = gate_up_lora
+        gate_up_lora = (
+            _gate_up_first.to(hidden_states.dtype),
+            _gate_up_second.to(hidden_states.dtype),
+            _gate_up_scaling,
+        )
 
     down_lora = getattr(self, "_unsloth_lora_down_proj", None)
     if down_lora is not None:
@@ -1330,6 +1340,13 @@ def forward_native_moe_loop(
     ):
         down_lora = _extract_lora_weights(
             self.down_proj, num_experts=self.num_experts, experts_module=self
+        )
+    if down_lora is not None:
+        _down_first, _down_second, _down_scaling = down_lora
+        down_lora = (
+            _down_first.to(hidden_states.dtype),
+            _down_second.to(hidden_states.dtype),
+            _down_scaling,
         )
 
     # Create expert mask and find which experts have tokens
@@ -1357,8 +1374,8 @@ def forward_native_moe_loop(
             gate_up = F.linear(current_state, gate_up_weight)
             if gate_up_lora is not None:
                 first_weight, second_weight, scaling = gate_up_lora
-                lora_delta = current_state @ first_weight[expert_idx].to(current_state.dtype)
-                lora_delta = lora_delta @ second_weight[expert_idx].to(current_state.dtype)
+                lora_delta = current_state @ first_weight[expert_idx]
+                lora_delta = lora_delta @ second_weight[expert_idx]
                 gate_up = gate_up + lora_delta * scaling
             gate, up = gate_up.chunk(2, dim=-1)
         else:
@@ -1369,11 +1386,17 @@ def forward_native_moe_loop(
 
         # Compute down projection for this expert only
         if hasattr(self, "down_proj"):
-            down = F.linear(current_hidden_states, self.down_proj[expert_idx])
+            down_weight = self.down_proj[expert_idx]
+            # Mirror the gate_up shape check: some MoE patches store the
+            # down weight in transposed (in_dim, out_dim) layout for
+            # grouped_mm, but F.linear needs (out_dim, in_dim).
+            if down_weight.shape[-1] != current_hidden_states.shape[-1]:
+                down_weight = down_weight.T
+            down = F.linear(current_hidden_states, down_weight)
             if down_lora is not None:
                 first_weight, second_weight, scaling = down_lora
-                lora_delta = current_hidden_states @ first_weight[expert_idx].to(current_hidden_states.dtype)
-                lora_delta = lora_delta @ second_weight[expert_idx].to(current_hidden_states.dtype)
+                lora_delta = current_hidden_states @ first_weight[expert_idx]
+                lora_delta = lora_delta @ second_weight[expert_idx]
                 down = down + lora_delta * scaling
             current_hidden_states = down
         else:
