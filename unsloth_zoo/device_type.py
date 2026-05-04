@@ -21,6 +21,8 @@ __all__ = [
     "ALLOW_PREQUANTIZED_MODELS",
     "ALLOW_BITSANDBYTES",
     "device_synchronize",
+    "device_empty_cache",
+    "device_is_bf16_supported",
 ]
 
 import torch
@@ -271,5 +273,35 @@ def device_synchronize():
             torch.cuda.synchronize()
     elif DEVICE_TYPE == "xpu":
         if hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.synchronize()
+            if hasattr(torch.xpu, "synchronize"):
+                torch.xpu.synchronize()
+pass
+
+def device_empty_cache():
+    """
+    Empty the active device cache (CUDA, XPU, or HIP).
+    Cross-platform replacement for torch.cuda.empty_cache().
+    """
+    if DEVICE_TYPE in ("cuda", "hip"):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    elif DEVICE_TYPE == "xpu":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            if hasattr(torch.xpu, "empty_cache"):
+                torch.xpu.empty_cache()
+pass
+
+def device_is_bf16_supported():
+    """
+    Whether the active device (CUDA, XPU, or HIP) supports bfloat16.
+    Cross-platform replacement for torch.cuda.is_bf16_supported().
+    """
+    if DEVICE_TYPE in ("cuda", "hip"):
+        if torch.cuda.is_available():
+            return torch.cuda.is_bf16_supported()
+    elif DEVICE_TYPE == "xpu":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            if hasattr(torch.xpu, "is_bf16_supported"):
+                return torch.xpu.is_bf16_supported()
+    return False
 pass
