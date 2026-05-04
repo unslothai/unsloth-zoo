@@ -165,6 +165,56 @@ pass
 RL_REPLACEMENTS["create_completion_attention_mask"] = create_completion_attention_mask
 
 
+# Rebuild Qwen-style mm_token_type_ids from full input_ids after GRPO generation changes sequence length.
+# This is primarily towards VLMs that use MRoPE
+def _unsloth_get_mm_token_id(processing_class, attr_name, token):
+    tokenizer = getattr(processing_class, "tokenizer", processing_class)
+    token_id = getattr(processing_class, attr_name, None)
+    if token_id is None:
+        token_id = getattr(tokenizer, attr_name, None)
+
+    convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if token_id is None and convert_tokens_to_ids is not None:
+        token_id = convert_tokens_to_ids(token)
+
+    if type(token_id) is int and token_id >= 0:
+        if token_id != getattr(tokenizer, "unk_token_id", None):
+            return token_id
+    return None
+pass
+
+
+def _unsloth_fix_mm_token_type_ids(
+    processing_class, input_ids, mm_token_type_ids = None, completion_ids = None
+):
+    image_token_id = _unsloth_get_mm_token_id(
+        processing_class, "image_token_id", "<|image_pad|>"
+    )
+    video_token_id = _unsloth_get_mm_token_id(
+        processing_class, "video_token_id", "<|video_pad|>"
+    )
+
+    if image_token_id is not None or video_token_id is not None:
+        rebuilt = input_ids.new_zeros(input_ids.shape)
+        if image_token_id is not None:
+            rebuilt = rebuilt.masked_fill(input_ids == image_token_id, 1)
+        if video_token_id is not None:
+            rebuilt = rebuilt.masked_fill(input_ids == video_token_id, 2)
+        return rebuilt
+
+    if (
+        mm_token_type_ids is not None
+        and completion_ids is not None
+        and mm_token_type_ids.shape[0] == input_ids.shape[0]
+        and mm_token_type_ids.shape[1] + completion_ids.shape[1] == input_ids.shape[1]
+    ):
+        return torch.cat(
+            [mm_token_type_ids, mm_token_type_ids.new_zeros(completion_ids.shape)],
+            dim = 1,
+        )
+    return mm_token_type_ids
+pass
+
 def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
     """
     Moves all padding tokens in each sequence of a batch to the right.
@@ -665,6 +715,10 @@ def grpo_accumulated_loss(
     # Transformers 5.x requires token_type_ids/mm_token_type_ids for some vision models
     token_type_ids = kwargs.get('token_type_ids',None)
     mm_token_type_ids = kwargs.get('mm_token_type_ids',None)
+    if mm_token_type_ids is not None or image_grid_thw is not None:
+        mm_token_type_ids = _unsloth_fix_mm_token_type_ids(
+            trainer.processing_class, input_ids, mm_token_type_ids
+        )
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if getattr(trainer, "vllm_importance_sampling_correction", False) else None
     temperature = kwargs.get("temperature", 1.0)
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
