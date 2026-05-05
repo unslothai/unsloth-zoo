@@ -111,16 +111,18 @@ else:
     _SKIP_GPU_INIT = False
     del _is_mlx_only, _check_platform
 
-if not _SKIP_GPU_INIT:
-    # Inject triton & bitsandbytes stubs on Apple Silicon with MLX
-    import platform as _platform
-    if _platform.system() == "Darwin" and _platform.machine() == "arm64" and find_spec("mlx"):
-        from .stubs.triton_stub import install_triton_stub
-        install_triton_stub()
-        from .stubs.bitsandbytes_stub import install_bitsandbytes_stub
-        install_bitsandbytes_stub()
-    del _platform
+# Inject triton & bitsandbytes stubs on Apple Silicon with MLX so unsloth's
+# CUDA-only imports don't error at startup. _SKIP_GPU_INIT=True is set only
+# when we're on Darwin/arm64 with mlx installed (the exact MLX case where
+# stubs are needed), so gate on that directly.
+if _SKIP_GPU_INIT:
+    from .stubs.triton_stub import inject_into_sys_modules as _inject_triton
+    _inject_triton()
+    from .stubs.bitsandbytes_stub import inject_into_sys_modules as _inject_bnb
+    _inject_bnb()
+    del _inject_triton, _inject_bnb
 
+if not _SKIP_GPU_INIT:
     if find_spec("unsloth") is None:
         raise ImportError("Please install Unsloth via `pip install unsloth`!")
     if find_spec("torch") is None:

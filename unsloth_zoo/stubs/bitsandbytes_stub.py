@@ -34,8 +34,20 @@ class _PermissiveModule(types.ModuleType):
         return _Noop(f"{self.__name__}.{name}")
 
 class _Noop:
+    """Permissive attribute-only stub. Calling it raises loudly so silent
+    None-returns can't corrupt downstream tensors (e.g. a previous version
+    let ``bnb.functional.quantize_4bit(weight, ...)`` produce ``None``).
+    Optional-feature probes that use ``hasattr`` or ``if bnb.foo`` still
+    work via ``__getattr__`` and ``__bool__``.
+    """
     def __init__(self, name="stub"): self._name = name
-    def __call__(self, *a, **kw): return None
+    def __call__(self, *a, **kw):
+        raise NotImplementedError(
+            f"Unsloth: '{self._name}' was called on Apple Silicon / MLX, "
+            f"where bitsandbytes is stubbed out. This usually means the "
+            f"caller hit a CUDA-only code path that should be guarded by "
+            f"a device check before reaching here."
+        )
     def __getattr__(self, name):
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)

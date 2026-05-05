@@ -41,11 +41,22 @@ class _PermissiveModule(types.ModuleType):
 
 
 class _Noop:
-    """Callable no-op that supports chained attribute access and use as base class."""
+    """Permissive attribute-only stub that supports chained access and use
+    as a base class. Calling it raises loudly: anything triton actually
+    needs at module-load time (``triton.jit``, ``cdiv``, ``autotune``,
+    decorators, dtypes) is defined explicitly elsewhere in this file and
+    won't hit ``_Noop``. A call landing here means an unexpected CUDA
+    code path was reached on Apple Silicon — fail loudly instead of
+    returning ``None``.
+    """
     def __init__(self, name="stub"):
         self._name = name
     def __call__(self, *a, **kw):
-        return None
+        raise NotImplementedError(
+            f"Unsloth: '{self._name}' was called on Apple Silicon / MLX, "
+            f"where triton is stubbed out. The caller likely hit a CUDA-only "
+            f"kernel path that should be guarded before reaching here."
+        )
     def __getattr__(self, name):
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
