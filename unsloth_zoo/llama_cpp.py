@@ -123,31 +123,35 @@ def _resolve_local_convert_script():
     """Returns (abs_path, mtime_ns, size) for a local convert_hf_to_gguf.py if
     UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points at a directory containing one, else None.
     The mtime_ns and size are part of the cache key on the cached implementation
-    so in-place updates to the same path are honored."""
+    so in-place updates to the same path are honored. When the env var is set
+    but invalid, this raises RuntimeError so an explicit pin fails closed
+    instead of silently falling back to the network."""
     scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
     if not scripts_dir:
         return None
     scripts_dir = os.path.abspath(os.path.expanduser(scripts_dir))
     if not os.path.isdir(scripts_dir):
-        logger.warning(
-            f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' is not a directory; "
-            f"falling back to network download."
+        raise RuntimeError(
+            f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' is not a directory. "
+            f"Unset UNSLOTH_LLAMA_CPP_SCRIPTS_DIR to use the network converter, "
+            f"or point it at a directory containing convert_hf_to_gguf.py."
         )
-        return None
     for name in ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py"):
         candidate = os.path.join(scripts_dir, name)
         try:
             if not os.path.isfile(candidate):
                 continue
             stat = os.stat(candidate)
-        except OSError:
-            continue
+        except OSError as exc:
+            raise RuntimeError(
+                f"Unsloth: Could not inspect local llama.cpp converter at '{candidate}': {exc}"
+            ) from exc
         return (candidate, stat.st_mtime_ns, stat.st_size)
-    logger.warning(
-        f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' has no convert_hf_to_gguf.py or convert-hf-to-gguf.py; "
-        f"falling back to network download."
+    raise RuntimeError(
+        f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' has no "
+        f"convert_hf_to_gguf.py or convert-hf-to-gguf.py. Unset the env var "
+        f"to use the network converter."
     )
-    return None
 
 
 @contextlib.contextmanager
@@ -900,13 +904,15 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     return _download_convert_hf_to_gguf_cached(name, _resolve_local_convert_script())
 
 
-@lru_cache(8)
+@lru_cache(1)
 def _download_convert_hf_to_gguf_cached(name, _local_script_info):
     # All Unsloth Zoo code licensed under LGPLv3
     # Downloads from llama.cpp's GitHub repository, or reads a local copy when
     # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is set. _local_script_info is
     # (path, mtime_ns, size); mtime/size in the cache key invalidate stale
-    # entries on in-place updates.
+    # entries on in-place updates. Cache size is 1 because the patched script
+    # is written to a single shared on-disk path, so a second cache entry
+    # would always read stale bytes off disk.
 
     # Ensure llama.cpp directory exists
     os.makedirs(LLAMA_CPP_DEFAULT_DIR, exist_ok=True)
@@ -925,7 +931,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
             with open(_local_script, "rb") as f:
                 original_content = f.read()
         else:
-            response = requests.get(LLAMA_CPP_CONVERT_FILE)
+            response = requests.get(LLAMA_CPP_CONVERT_FILE, timeout = 30)
             response.raise_for_status()
             original_content = response.content
 
@@ -1122,11 +1128,12 @@ pass
 
 
 # Preserve the pre-split lru_cache surface (cache_clear, cache_info,
-# cache_parameters, __wrapped__) so external callers and inspect.unwrap keep working.
+# cache_parameters) so external callers keep working. __wrapped__ is not
+# forwarded because the inner function takes a private (name, _local_script_info)
+# pair while the public wrapper is a single-arg callable.
 _download_convert_hf_to_gguf.cache_clear = _download_convert_hf_to_gguf_cached.cache_clear
 _download_convert_hf_to_gguf.cache_info = _download_convert_hf_to_gguf_cached.cache_info
 _download_convert_hf_to_gguf.cache_parameters = _download_convert_hf_to_gguf_cached.cache_parameters
-_download_convert_hf_to_gguf.__wrapped__ = _download_convert_hf_to_gguf_cached.__wrapped__
 
 
 def _split_str_to_n_bytes(split_str: str) -> int:
