@@ -475,12 +475,12 @@ class MLXTrainer:
         elif memory_limit_gb <= 0:
             memory_limit_gb = None
         if memory_limit_gb is not None:
-            mx.metal.set_memory_limit(int(memory_limit_gb * 1e9))
+            mx.set_memory_limit(int(memory_limit_gb * 1e9))
             configured["memory_limit_gb"] = float(memory_limit_gb)
 
         cache_limit_gb = getattr(args, "cache_limit_gb", None)
         if cache_limit_gb is not None and cache_limit_gb > 0:
-            mx.metal.set_cache_limit(int(cache_limit_gb * 1e9))
+            mx.set_cache_limit(int(cache_limit_gb * 1e9))
             configured["cache_limit_gb"] = float(cache_limit_gb)
 
         wired_limit_gb = getattr(args, "wired_limit_gb", None)

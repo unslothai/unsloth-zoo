@@ -156,11 +156,30 @@ from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
 
 
+@functools.lru_cache(maxsize=1)
+def _active_merge_device():
+    """Pick the active accelerator for LoRA merge math.
+
+    Hardcoding ``"cuda"`` here breaks ROCm (AMD) and XPU (Intel) backends —
+    ``tensor.to("cuda", ...)`` either errors or silently lands on CPU on
+    those systems. Use the device family that's actually available; fall
+    back to CPU if nothing is.
+    """
+    if torch.cuda.is_available():
+        return "cuda"  # also covers ROCm: PyTorch ROCm exposes the cuda API
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def _merge_lora(W, lora_stats, name):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
-    W = W.to("cuda", dtype = torch.float32, non_blocking = True)
-    lora_B = lora_stats.lora_B.to("cuda", dtype = torch.float32, non_blocking = True)
-    lora_A = lora_stats.lora_A.to("cuda", dtype = torch.float32, non_blocking = True)
+    device = _active_merge_device()
+    W = W.to(device, dtype = torch.float32, non_blocking = True)
+    lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
+    lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
     # Handle vocab resize: LoRA may have more rows than base safetensors weight
     if lora_B.shape[0] != W.shape[0]:
         new_size = lora_B.shape[0]
