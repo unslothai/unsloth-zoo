@@ -468,6 +468,9 @@ class MLXTrainer:
             return {}
 
         configured = {}
+        # why: capture prior limits so restore_memory_limits can put them back
+        # after training; otherwise a process-global cap leaks into later work.
+        self._prior_metal_limits = {}
 
         memory_limit_gb = getattr(args, "memory_limit_gb", None)
         if memory_limit_gb is None:
@@ -475,12 +478,14 @@ class MLXTrainer:
         elif memory_limit_gb <= 0:
             memory_limit_gb = None
         if memory_limit_gb is not None:
-            mx.set_memory_limit(int(memory_limit_gb * 1e9))
+            prev = mx.set_memory_limit(int(memory_limit_gb * 1e9))
+            self._prior_metal_limits["memory"] = prev
             configured["memory_limit_gb"] = float(memory_limit_gb)
 
         cache_limit_gb = getattr(args, "cache_limit_gb", None)
         if cache_limit_gb is not None and cache_limit_gb > 0:
-            mx.set_cache_limit(int(cache_limit_gb * 1e9))
+            prev = mx.set_cache_limit(int(cache_limit_gb * 1e9))
+            self._prior_metal_limits["cache"] = prev
             configured["cache_limit_gb"] = float(cache_limit_gb)
 
         wired_limit_gb = getattr(args, "wired_limit_gb", None)
@@ -492,11 +497,27 @@ class MLXTrainer:
         elif wired_limit_gb <= 0:
             wired_limit_gb = None
         if wired_limit_gb is not None:
-            mx.set_wired_limit(int(wired_limit_gb * 1e9))
+            prev = mx.set_wired_limit(int(wired_limit_gb * 1e9))
+            self._prior_metal_limits["wired"] = prev
             configured["wired_limit_gb"] = float(wired_limit_gb)
 
         configured["recommended_working_set_gb"] = float(recommended_gb)
         return configured
+
+    def _restore_memory_limits(self):
+        prior = getattr(self, "_prior_metal_limits", None)
+        if not prior or not mx.metal.is_available():
+            return
+        try:
+            if "memory" in prior and prior["memory"] is not None:
+                mx.set_memory_limit(int(prior["memory"]))
+            if "cache" in prior and prior["cache"] is not None:
+                mx.set_cache_limit(int(prior["cache"]))
+            if "wired" in prior and prior["wired"] is not None:
+                mx.set_wired_limit(int(prior["wired"]))
+        except Exception:
+            pass
+        self._prior_metal_limits = {}
 
     def train(self):
         """Run MLX-native training loop.
@@ -579,6 +600,7 @@ class MLXTrainer:
         finally:
             if args.gradient_checkpointing:
                 remove_gradient_checkpointing(model)
+            self._restore_memory_limits()
 
     def _train_inner(self):
         """Inner training loop, separated for GC cleanup in finally block."""
@@ -824,6 +846,11 @@ class MLXTrainer:
         compile_policy = build_compile_policy(args=args)
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = compile_policy.mode != "eager"
+        # why: text MLX training has no qualification/decision pipeline yet, so
+        # leave it eager by default. The runtime fallback below still catches
+        # any compile failures if a user opts in via UNSLOTH_MLX_TEXT_COMPILE=1.
+        if not is_vlm and _use_compile and os.environ.get("UNSLOTH_MLX_TEXT_COMPILE", "0") != "1":
+            _use_compile = False
         if is_vlm and _use_compile:
             qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
             if qual is not None:
@@ -883,6 +910,7 @@ class MLXTrainer:
                     max_seq_length=args.max_seq_length,
                     seed=args.seed,
                     response_mask_fn=_vlm_mask_fn,
+                    formatting_func=self.formatting_func,
                 )
             else:
                 eval_batches = create_batches(
@@ -966,8 +994,15 @@ class MLXTrainer:
                 lvalue, toks, grad_accum_state = step_fn(
                     batch_data, grad_accum_state, do_update,
                 )
-            except ValueError as e:
-                if _use_compile and "eval" in str(e).lower():
+            except (ValueError, RuntimeError) as e:
+                _msg = str(e).lower()
+                _is_compile_failure = _use_compile and (
+                    "compile" in _msg
+                    or "primitive" in _msg
+                    or "trace" in _msg
+                    or "eval" in _msg
+                )
+                if _is_compile_failure:
                     if _compile_decision is not None and not _compile_decision.fallback_allowed:
                         raise RuntimeError(
                             "Unsloth: strict mx.compile was enabled for this VLM "
@@ -1271,7 +1306,15 @@ class MLXTrainer:
                     self.model, "_unsloth_quantized_source", None,
                 ),
             })
-            self.tokenizer.save_pretrained(output_dir)
+            # why: VLM processors include the inner tokenizer; saving both
+            # writes the same files twice and the second write wins. Skip the
+            # tokenizer save when a processor will cover it.
+            _processor = self.processor or getattr(self.model, "_processor", None)
+            _processor_saves_tokenizer = (
+                _processor is not None and hasattr(_processor, "save_pretrained")
+            )
+            if not _processor_saves_tokenizer:
+                self.tokenizer.save_pretrained(output_dir)
 
             # Copy base model's config.json so the checkpoint is loadable
             src_path = getattr(self.model, "_src_path", None)
@@ -1283,10 +1326,7 @@ class MLXTrainer:
                 if src_config.exists() and not dst_config.exists():
                     shutil.copy(str(src_config), str(dst_config))
 
-            # VLMs: also save the processor (image preprocessor config)
-            # so the adapter directory is complete for inference.
-            _processor = self.processor or getattr(self.model, "_processor", None)
-            if _processor is not None and hasattr(_processor, "save_pretrained"):
+            if _processor_saves_tokenizer:
                 _processor.save_pretrained(output_dir)
             print(f"Unsloth: LoRA adapters saved to {output_dir}")
         else:

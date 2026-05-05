@@ -52,11 +52,14 @@ try:
     from .device_type import device_is_bf16_supported
 except ImportError:
     # device_type unconditionally imports torch; on MLX-only builds (macOS
-    # arm64 without torch installed) the import fails. The bf16 helper is
-    # only consulted on GPU GGUF conversion paths, which are unreachable
-    # without torch, so a False fallback is safe.
+    # arm64 without torch installed) the import fails. The Apple Silicon
+    # MPS / Metal stack natively supports bf16, so default to True there.
+    import platform as _platform
+    _IS_APPLE_SILICON = (
+        _platform.system() == "Darwin" and _platform.machine() == "arm64"
+    )
     def device_is_bf16_supported():
-        return False
+        return _IS_APPLE_SILICON
 
 # Get a logger instance
 logger = logging.getLogger(__name__)

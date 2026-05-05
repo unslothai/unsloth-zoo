@@ -69,13 +69,14 @@ def gated_delta_ops_efficient(
     num_chunks = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
 
     @mx.custom_function
-    def _chunked_forward(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, state_in):
+    def _chunked_forward(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, state_in, mask_chunk):
         """Process one chunk of timesteps."""
         chunk_T = q_chunk.shape[1]
+        _has_mask = mask_chunk is not None and mask_chunk.shape[-1] >= chunk_T
         ys = []
         s = state_in
         for t in range(chunk_T):
-            m = None if mask is None else mask[:, t:t+1].squeeze(1)
+            m = mask_chunk[:, t:t+1].squeeze(1) if _has_mask else None
             y, s = _gated_delta_step(
                 q_chunk[:, t], k_chunk[:, t], v_chunk[:, t],
                 g_chunk[:, t], beta_chunk[:, t], s, m,
@@ -85,9 +86,10 @@ def gated_delta_ops_efficient(
 
     @_chunked_forward.vjp
     def _chunked_vjp(primals, cotangents, outputs):
-        q_c, k_c, v_c, g_c, beta_c, state_in = primals
+        q_c, k_c, v_c, g_c, beta_c, state_in, mask_chunk = primals
         dy, d_state_out = cotangents
         chunk_T = q_c.shape[1]
+        _has_mask = mask_chunk is not None and mask_chunk.shape[-1] >= chunk_T
 
         # Recompute the chunk's RETURNED states (post-mask). At step t the
         # returned state is `where(mask, state_new, state_prev)` — so for
@@ -97,7 +99,7 @@ def gated_delta_ops_efficient(
         states = [state_in]
         s = state_in
         for t in range(chunk_T):
-            m = None if mask is None else mask[:, t:t+1].squeeze(1)
+            m = mask_chunk[:, t:t+1].squeeze(1) if _has_mask else None
             _, s = _gated_delta_step(
                 q_c[:, t], k_c[:, t], v_c[:, t],
                 g_c[:, t], beta_c[:, t], s, m,
@@ -143,8 +145,8 @@ def gated_delta_ops_efficient(
             # Backward splits d_state_returned into:
             #   d_state_new path (recurrence backward): only when mask=True
             #   d_state_prev passthrough:               only when mask=False
-            if mask is not None:
-                m = mask[:, t]
+            if _has_mask:
+                m = mask_chunk[:, t]
                 m_exp = mx.expand_dims(m, axis=(1, 2, 3))
                 zero = mx.zeros_like(d_state_returned)
                 d_state_new_from_returned = mx.where(m_exp, d_state_returned, zero)
@@ -199,7 +201,8 @@ def gated_delta_ops_efficient(
             # d_state_prev = recurrence-derived gradient + mask passthrough.
             d_state = d_state_prev_via_recurrence + d_state_prev_passthrough
 
-        return d_q, d_k, d_v, d_g, d_beta, d_state
+        d_mask = mx.zeros_like(mask_chunk) if mask_chunk is not None else None
+        return d_q, d_k, d_v, d_g, d_beta, d_state, d_mask
 
     # Run chunked forward
     all_ys = []
@@ -212,7 +215,14 @@ def gated_delta_ops_efficient(
         v_c = v[:, t_start:t_end]
         g_c = g[:, t_start:t_end]
         beta_c = beta[:, t_start:t_end]
-        chunk_y, s = _chunked_forward(q_c, k_c, v_c, g_c, beta_c, s)
+        # why: pass per-chunk mask explicitly so chunk-local t indexes the
+        # right timesteps; the prior closure-captured `mask[:, t]` read
+        # mask[:, 0:CHUNK_SIZE] for every chunk and corrupted training.
+        if mask is None:
+            mask_c = mx.ones((q_c.shape[0], q_c.shape[1]), dtype=mx.bool_)
+        else:
+            mask_c = mask[:, t_start:t_end]
+        chunk_y, s = _chunked_forward(q_c, k_c, v_c, g_c, beta_c, s, mask_c)
         all_ys.append(chunk_y)
 
     y = mx.concatenate(all_ys, axis=1)
@@ -223,7 +233,8 @@ def patch_gated_delta():
     """Monkey-patch mlx_lm's gated_delta module to use our efficient VJP."""
     from mlx_lm.models import gated_delta
 
-    original_ops = gated_delta.gated_delta_ops
+    if getattr(gated_delta, "_unsloth_gated_delta_patched", False):
+        return
 
     def patched_gated_delta_update(
         q, k, v, a, b, A_log, dt_bias,
@@ -256,4 +267,5 @@ def patch_gated_delta():
         return gated_delta.gated_delta_kernel(q, k, v, g, beta, state, mask)
 
     gated_delta.gated_delta_update = patched_gated_delta_update
+    gated_delta._unsloth_gated_delta_patched = True
     print("Unsloth: Patched GatedDeltaNet with memory-efficient custom VJP.")

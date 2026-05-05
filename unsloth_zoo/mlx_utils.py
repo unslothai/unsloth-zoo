@@ -523,12 +523,10 @@ def _mask_prompt_tokens(targets, assistant_token_id):
     """
     if assistant_token_id <= 0:
         return targets
-    # Find the first occurrence of assistant_token_id in each row
     is_assistant = (targets == assistant_token_id)
-    # cumsum along seq dim: positions after first assistant token have cumsum > 0
     cumulative = mx.cumsum(is_assistant.astype(mx.int32), axis=1)
-    # Mask everything before first assistant token (cumsum == 0)
-    prompt_mask = (cumulative == 0)
+    has_assistant = mx.any(is_assistant, axis=1, keepdims=True)
+    prompt_mask = mx.logical_and(has_assistant, cumulative == 0)
     return mx.where(prompt_mask, -100, targets)
 
 
@@ -881,6 +879,7 @@ def _expand_image_token_sequences(
     attention_mask,
     image_token_id,
     repeat_count,
+    labels=None,
 ):
     input_ids_np = np.asarray(input_ids)
     attention_mask_np = (
@@ -888,31 +887,49 @@ def _expand_image_token_sequences(
         if attention_mask is not None
         else np.ones_like(input_ids_np, dtype=np.int32)
     )
+    labels_np = np.asarray(labels) if labels is not None else None
 
     expanded_ids = []
     expanded_masks = []
+    expanded_labels = [] if labels_np is not None else None
     max_len = 0
-    for row_ids, row_mask in zip(input_ids_np, attention_mask_np):
+    for row_idx, (row_ids, row_mask) in enumerate(zip(input_ids_np, attention_mask_np)):
         new_ids = []
         new_mask = []
-        for token_id, mask_value in zip(row_ids.tolist(), row_mask.tolist()):
+        new_labels = [] if labels_np is not None else None
+        row_labels_list = labels_np[row_idx].tolist() if labels_np is not None else None
+        for pos, (token_id, mask_value) in enumerate(zip(row_ids.tolist(), row_mask.tolist())):
             if int(token_id) == int(image_token_id):
                 new_ids.extend([int(image_token_id)] * int(repeat_count))
                 new_mask.extend([int(mask_value)] * int(repeat_count))
+                if new_labels is not None:
+                    new_labels.extend([-100] * int(repeat_count))
             else:
                 new_ids.append(int(token_id))
                 new_mask.append(int(mask_value))
+                if new_labels is not None:
+                    new_labels.append(int(row_labels_list[pos]))
         expanded_ids.append(new_ids)
         expanded_masks.append(new_mask)
+        if expanded_labels is not None:
+            expanded_labels.append(new_labels)
         max_len = max(max_len, len(new_ids))
 
     padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
     padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
+    padded_labels = (
+        np.full((len(expanded_labels), max_len), -100, dtype=np.int32)
+        if expanded_labels is not None else None
+    )
     for row_idx, (row_ids, row_mask) in enumerate(zip(expanded_ids, expanded_masks)):
         row_len = len(row_ids)
         padded_ids[row_idx, :row_len] = row_ids
         padded_masks[row_idx, :row_len] = row_mask
+        if padded_labels is not None:
+            padded_labels[row_idx, :row_len] = expanded_labels[row_idx]
 
+    if padded_labels is not None:
+        return mx.array(padded_ids), mx.array(padded_masks), mx.array(padded_labels)
     return mx.array(padded_ids), mx.array(padded_masks)
 
 
@@ -920,6 +937,7 @@ def _expand_token_runs(
     input_ids,
     attention_mask,
     replacements_by_batch,
+    labels=None,
 ):
     input_ids_np = np.asarray(input_ids)
     attention_mask_np = (
@@ -927,18 +945,22 @@ def _expand_token_runs(
         if attention_mask is not None
         else np.ones_like(input_ids_np, dtype=np.int32)
     )
+    labels_np = np.asarray(labels) if labels is not None else None
 
     expanded_ids = []
     expanded_masks = []
+    expanded_labels = [] if labels_np is not None else None
     max_len = 0
-    for row_ids, row_mask, replacements in zip(
+    for row_idx, (row_ids, row_mask, replacements) in enumerate(zip(
         input_ids_np,
         attention_mask_np,
         replacements_by_batch,
-    ):
+    )):
         replacements = sorted(replacements, key=lambda item: item[0])
         new_ids = []
         new_mask = []
+        new_labels = [] if labels_np is not None else None
+        row_labels_list = labels_np[row_idx].tolist() if labels_np is not None else None
         prev = 0
         row_ids_list = row_ids.tolist()
         row_mask_list = row_mask.tolist()
@@ -946,24 +968,40 @@ def _expand_token_runs(
             if start > prev:
                 new_ids.extend(row_ids_list[prev:start])
                 new_mask.extend(row_mask_list[prev:start])
+                if new_labels is not None:
+                    new_labels.extend(row_labels_list[prev:start])
             new_ids.extend([int(token_id)] * int(repeat))
             fill_mask = int(row_mask_list[start]) if start < len(row_mask_list) else 1
             new_mask.extend([fill_mask] * int(repeat))
+            if new_labels is not None:
+                new_labels.extend([-100] * int(repeat))
             prev = int(end)
         if prev < len(row_ids_list):
             new_ids.extend(row_ids_list[prev:])
             new_mask.extend(row_mask_list[prev:])
+            if new_labels is not None:
+                new_labels.extend(row_labels_list[prev:])
         expanded_ids.append(new_ids)
         expanded_masks.append(new_mask)
+        if expanded_labels is not None:
+            expanded_labels.append(new_labels)
         max_len = max(max_len, len(new_ids))
 
     padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
     padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
+    padded_labels = (
+        np.full((len(expanded_labels), max_len), -100, dtype=np.int32)
+        if expanded_labels is not None else None
+    )
     for row_idx, (row_ids, row_mask) in enumerate(zip(expanded_ids, expanded_masks)):
         row_len = len(row_ids)
         padded_ids[row_idx, :row_len] = row_ids
         padded_masks[row_idx, :row_len] = row_mask
+        if padded_labels is not None:
+            padded_labels[row_idx, :row_len] = expanded_labels[row_idx]
 
+    if padded_labels is not None:
+        return mx.array(padded_ids), mx.array(padded_masks), mx.array(padded_labels)
     return mx.array(padded_ids), mx.array(padded_masks)
 
 
@@ -1280,14 +1318,18 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
     if model_type == "multi_modality":
         input_ids = batch_dict.get("input_ids")
         if input_ids is not None:
-            expanded_ids, expanded_mask = _expand_image_token_sequences(
+            _labels = batch_dict.get("labels")
+            _expanded = _expand_image_token_sequences(
                 input_ids=input_ids,
                 attention_mask=batch_dict.get("attention_mask"),
                 image_token_id=int(_config_get(config, "image_token_index")),
                 repeat_count=int(_config_get(config, "num_image_tokens")),
+                labels=_labels,
             )
-            batch_dict["input_ids"] = expanded_ids
-            batch_dict["attention_mask"] = expanded_mask
+            if _labels is not None:
+                batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+            else:
+                batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
     if model_type in {"phi4-siglip", "phi4_siglip"}:
         input_ids = batch_dict.get("input_ids")
@@ -1317,13 +1359,17 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                         batch_replacements.append((pos, pos + 1, -200, repeat))
                         image_idx += 1
                     replacements.append(tuple(batch_replacements))
-                expanded_ids, expanded_mask = _expand_token_runs(
+                _labels = batch_dict.get("labels")
+                _expanded = _expand_token_runs(
                     input_ids=input_ids,
                     attention_mask=batch_dict.get("attention_mask"),
                     replacements_by_batch=tuple(replacements),
+                    labels=_labels,
                 )
-                batch_dict["input_ids"] = expanded_ids
-                batch_dict["attention_mask"] = expanded_mask
+                if _labels is not None:
+                    batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                else:
+                    batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
     if model_type == "phi4mm":
         input_ids = batch_dict.get("input_ids")
@@ -1385,13 +1431,17 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                     audio_idx += 1
                 replacements.append(tuple(batch_replacements))
             if replacements:
-                expanded_ids, expanded_mask = _expand_token_runs(
+                _labels = batch_dict.get("labels")
+                _expanded = _expand_token_runs(
                     input_ids=input_ids,
                     attention_mask=batch_dict.get("attention_mask"),
                     replacements_by_batch=tuple(replacements),
+                    labels=_labels,
                 )
-                batch_dict["input_ids"] = expanded_ids
-                batch_dict["attention_mask"] = expanded_mask
+                if _labels is not None:
+                    batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                else:
+                    batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
     return batch_dict
 
@@ -2277,7 +2327,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
 
     batch_indices = [
         indices[i : i + batch_size]
-        for i in range(0, len(indices) - batch_size + 1, batch_size)
+        for i in range(0, len(indices), batch_size)
     ]
 
     batch_list = []
@@ -2319,24 +2369,44 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
 
     image_size = _get_vlm_image_size(config, processor)
 
-    indices = list(range(len(dataset)))
-    batch_indices = [
-        indices[i : i + batch_size]
-        for i in range(0, len(indices) - batch_size + 1, batch_size)
-    ]
+    def _emit(items):
+        batch_dict = _collate_vlm_batch(
+            items, processor, max_seq_length, image_size,
+            formatting_func=formatting_func,
+        )
+        batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
+        if response_mask_fn is not None:
+            batch_dict = _apply_response_mask_to_vlm_batch(batch_dict, response_mask_fn)
+        return batch_dict
 
-    while True:
-        order = np.random.permutation(len(batch_indices))
-        for b in order:
-            items = [dataset[idx] for idx in batch_indices[b]]
-            batch_dict = _collate_vlm_batch(
-                items, processor, max_seq_length, image_size,
-                formatting_func=formatting_func,
-            )
-            batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
-            if response_mask_fn is not None:
-                batch_dict = _apply_response_mask_to_vlm_batch(batch_dict, response_mask_fn)
-            yield batch_dict
+    if hasattr(dataset, "__len__"):
+        indices = list(range(len(dataset)))
+        batch_indices = [
+            indices[i : i + batch_size]
+            for i in range(0, len(indices), batch_size)
+        ]
+        if not batch_indices:
+            raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
+        while True:
+            order = np.random.permutation(len(batch_indices))
+            for b in order:
+                items = [dataset[idx] for idx in batch_indices[b]]
+                yield _emit(items)
+    else:
+        while True:
+            pending = []
+            yielded = False
+            for item in dataset:
+                pending.append(item)
+                if len(pending) >= batch_size:
+                    yielded = True
+                    yield _emit(pending)
+                    pending = []
+            if pending:
+                yielded = True
+                yield _emit(pending)
+            if not yielded:
+                raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
 
 
 def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
@@ -2645,6 +2715,19 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     if resolved_map and quant_source != "mlx_config":
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
+
+    # why: record the exact module paths where LoRA was applied so reload can
+    # recreate vision/projector LoRA layers, not just the language tower that
+    # mlx-lm.tuner.utils.load_adapters knows about.
+    try:
+        lora_paths = []
+        for name, module in model.named_modules():
+            if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
+                lora_paths.append(name)
+        if lora_paths:
+            adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
+    except Exception:
+        pass
     return adapter_config
 
 
@@ -2925,11 +3008,8 @@ def save_pretrained_gguf(
     if first_conversion is None:
         if quant_type in ("bf16", "f16", "f32"):
             first_conversion = quant_type
-        elif quant_type == "q8_0":
-            # q8_0 can be done directly by convert_hf_to_gguf.py
-            first_conversion = "None"
         else:
-            # For all other quant types, first convert to bf16 then quantize
+            # All k-quants and q8_0 go through bf16 intermediate then llama-quantize
             first_conversion = "bf16"
 
     # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
@@ -2946,7 +3026,7 @@ def save_pretrained_gguf(
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir) / "merged"
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
-        save_merged_model(model, tokenizer, tmp_path)
+        save_merged_model(model, tokenizer, tmp_path, dequantize=True)
 
         # Step 2: Ensure llama.cpp is installed and gguf package is available
         llama_cpp_folder = "llama.cpp"
@@ -2975,14 +3055,17 @@ def save_pretrained_gguf(
                 )
             print("Unsloth: Installed gguf Python package.")
 
-        # Step 3: Download and patch convert_hf_to_gguf.py
+        # Step 3: Download and patch convert_hf_to_gguf.py.
+        # why: always go through the wrapper so UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
+        # explicit pins are honored even when a stale cached converter exists.
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
         supported_text_archs = None
         supported_vision_archs = None
-        if not os.path.exists(converter):
-            result = _download_convert_hf_to_gguf()  # no args — uses defaults
-            if isinstance(result, tuple) and len(result) >= 3:
-                converter, supported_text_archs, supported_vision_archs = result[:3]
+        result = _download_convert_hf_to_gguf()  # no args — uses defaults
+        if isinstance(result, tuple) and len(result) >= 3:
+            converter, supported_text_archs, supported_vision_archs = result[:3]
+        elif isinstance(result, str):
+            converter = result
 
         # Step 4: Get model name for output filename
         hf_repo = getattr(model, "_hf_repo", None)
@@ -2995,13 +3078,14 @@ def save_pretrained_gguf(
 
         # Step 5: Convert HF -> GGUF
         print(f"Unsloth: Converting to GGUF format...")
+        is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
         kwargs = dict(
             model_name=output_base,
             input_folder=str(tmp_path),
             model_dtype=model_dtype,
             quantization_type=first_conversion,
             converter_location=converter,
-            is_vlm=False,
+            is_vlm=is_vlm_model,
             is_gpt_oss=False,
             print_output=True,
         )
@@ -3011,7 +3095,7 @@ def save_pretrained_gguf(
         convert_to_gguf(**kwargs)
 
         # Step 6: Quantize if the target quant differs from first_conversion
-        if quant_type not in ("bf16", "f16", "f32") and first_conversion != "None":
+        if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
             quantizer = os.path.join(llama_cpp_folder, "llama-quantize")
             base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
             final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
@@ -3120,15 +3204,25 @@ def push_to_hub_merged(
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
-    api.upload_folder(
-        folder_path=str(save_directory),
-        repo_id=repo_id,
-        repo_type="model",
-        commit_message=commit_message,
-        commit_description=commit_description,
-        create_pr=create_pr,
-        revision=revision,
-    )
+    # why: upload_large_folder handles resume + chunking; merged VLM checkpoints
+    # frequently exceed upload_folder's single-shot limits and fail mid-push.
+    try:
+        api.upload_large_folder(
+            folder_path=str(save_directory),
+            repo_id=repo_id,
+            repo_type="model",
+            revision=revision,
+        )
+    except (AttributeError, TypeError):
+        api.upload_folder(
+            folder_path=str(save_directory),
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            commit_description=commit_description,
+            create_pr=create_pr,
+            revision=revision,
+        )
     print(f"Unsloth: Pushed to https://huggingface.co/{repo_id}")
 
 

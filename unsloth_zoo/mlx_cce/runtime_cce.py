@@ -601,7 +601,7 @@ def make_runtime_cce_loss_fused_finalize(
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
     chunk_plan_cache: dict[
-        tuple[int, int],
+        tuple,
         tuple[int, list[int], list[mx.array], list[mx.array]],
     ] = {}
 
@@ -611,7 +611,9 @@ def make_runtime_cce_loss_fused_finalize(
     ) -> tuple[int, list[int], list[mx.array], list[mx.array]]:
         n_tokens = hidden.shape[0]
         vocab_size = weight.shape[0]
-        key = (n_tokens, vocab_size)
+        # why: chunk size depends on dtype-derived compute_bytes; without dtype
+        # in the key, a bf16-cached plan is reused for fp32 and OOMs.
+        key = (n_tokens, vocab_size, hidden.dtype)
         if key in chunk_plan_cache:
             return chunk_plan_cache[key]
 

@@ -1931,7 +1931,9 @@ def _install_safe_fused_sdpa_mask_patches():
 
     original_fast_sdpa = current
 
-    @mx.compile
+    # why: not @mx.compile — this is reached from inside the trainer's already
+    # compiled step_fn; nesting mx.compile around a **kwargs function is
+    # unstable and has been observed to corrupt gradients on VLM training.
     def safe_scaled_dot_product_attention(q, k, v, scale=1.0, mask=None, **kwargs):
         row_all_masked = None
         if mask is not None and hasattr(mask, "dtype") and mx.issubdtype(mask.dtype, mx.floating):

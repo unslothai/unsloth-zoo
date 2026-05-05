@@ -95,7 +95,8 @@ import platform as _check_platform
 # Detect Apple Silicon MLX mode:
 # Either torch is absent (pure MLX), or unsloth already detected MLX
 _is_mlx_only = (
-    _check_platform.system() == "Darwin"
+    os.environ.get("UNSLOTH_FORCE_GPU_PATH", "0") != "1"
+    and _check_platform.system() == "Darwin"
     and _check_platform.machine() == "arm64"
     and find_spec("mlx") is not None
 )

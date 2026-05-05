@@ -55,6 +55,11 @@ _MULTIMODAL_STRIP_KEYS = (
 )
 
 
+import threading
+_HF_TOKEN_ENV_LOCK = threading.RLock()
+_LOAD_WEIGHTS_PATCH_LOCK = threading.RLock()
+
+
 @contextmanager
 def _temporary_hf_token_env(token):
     """Expose an explicit HF token to libraries that only read auth from env.
@@ -68,17 +73,18 @@ def _temporary_hf_token_env(token):
         return
 
     env_names = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
-    previous = {name: os.environ.get(name) for name in env_names}
-    try:
-        for name in env_names:
-            os.environ[name] = token
-        yield
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+    with _HF_TOKEN_ENV_LOCK:
+        previous = {name: os.environ.get(name) for name in env_names}
+        try:
+            for name in env_names:
+                os.environ[name] = token
+            yield
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def _convert_mlx_dtype(model, target_dtype) -> None:
@@ -227,34 +233,47 @@ def _load_mlx_lm_with_strict_fallback(
     does not expose strict=False, so use the internal loader only for registered
     mismatch signatures.
     """
+    # why: mlx-lm 0.22.0 (declared minimum) does not accept return_config or
+    # revision on load(); call the lower-level helpers directly so we work on
+    # both old and new mlx-lm releases without depending on signature drift.
+    from mlx_lm.utils import _download, load_model, load_tokenizer
+
+    tokenizer_config = mlx_load_kwargs.get("tokenizer_config") or {}
+    model_config = mlx_load_kwargs.get("model_config") or {}
+    lazy = mlx_load_kwargs.get("lazy", False)
+    revision = mlx_load_kwargs.get("revision")
+    want_config = mlx_load_kwargs.get("return_config", False)
+
+    with _temporary_hf_token_env(hf_token):
+        model_path = _download(model_name, revision=revision)
+
     try:
-        with _temporary_hf_token_env(hf_token):
-            return mlx_load(model_name, **mlx_load_kwargs)
+        model, config = load_model(
+            model_path,
+            lazy=lazy,
+            model_config=model_config,
+        )
     except ValueError as error:
         message = str(error)
         rule = _KNOWN_MLX_LM_STRICT_FALLBACKS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
             raise
-
         print(rule["notice"])
-        from mlx_lm.utils import _download, load_model, load_tokenizer
-
-        with _temporary_hf_token_env(hf_token):
-            model_path = _download(model_name, revision=mlx_load_kwargs.get("revision"))
         model, config = load_model(
             model_path,
-            lazy=mlx_load_kwargs.get("lazy", False),
+            lazy=lazy,
             strict=False,
-            model_config=mlx_load_kwargs.get("model_config"),
+            model_config=model_config,
         )
-        tokenizer = load_tokenizer(
-            model_path,
-            mlx_load_kwargs.get("tokenizer_config"),
-            eos_token_ids=config.get("eos_token_id", None),
-        )
-        if mlx_load_kwargs.get("return_config", False):
-            return model, tokenizer, config
-        return model, tokenizer
+
+    tokenizer = load_tokenizer(
+        model_path,
+        tokenizer_config,
+        eos_token_ids=config.get("eos_token_id", None),
+    )
+    if want_config:
+        return model, tokenizer, config
+    return model, tokenizer
 
 
 def _load_mlx_vlm_with_extra_weight_filter(
@@ -283,24 +302,29 @@ def _load_mlx_vlm_with_extra_weight_filter(
         print(rule["notice"])
         import mlx.nn as nn
 
-        original_load_weights = nn.Module.load_weights
         allowed_extra = rule["allowed_extra"]
 
-        def _load_weights_without_projection_quant_state(self, file_or_weights, strict=True):
-            if isinstance(file_or_weights, list):
-                file_or_weights = [
-                    (key, value)
-                    for key, value in file_or_weights
-                    if key not in allowed_extra
-                ]
-            return original_load_weights(self, file_or_weights, strict=strict)
+        # why: nn.Module.load_weights is monkey-patched process-globally; the
+        # lock prevents a concurrent load in another thread from seeing the
+        # filtered version while this VLM retry is active.
+        with _LOAD_WEIGHTS_PATCH_LOCK:
+            original_load_weights = nn.Module.load_weights
 
-        nn.Module.load_weights = _load_weights_without_projection_quant_state
-        try:
-            with _temporary_hf_token_env(hf_token):
-                return vlm_load(model_name, **vlm_kwargs)
-        finally:
-            nn.Module.load_weights = original_load_weights
+            def _load_weights_without_projection_quant_state(self, file_or_weights, strict=True):
+                if isinstance(file_or_weights, list):
+                    file_or_weights = [
+                        (key, value)
+                        for key, value in file_or_weights
+                        if key not in allowed_extra
+                    ]
+                return original_load_weights(self, file_or_weights, strict=strict)
+
+            nn.Module.load_weights = _load_weights_without_projection_quant_state
+            try:
+                with _temporary_hf_token_env(hf_token):
+                    return vlm_load(model_name, **vlm_kwargs)
+            finally:
+                nn.Module.load_weights = original_load_weights
 
 
 def _build_vlm_model_types():
@@ -409,14 +433,17 @@ def _fix_gemma4_kv_sharing(model):
         return  # Already patched
 
     original_call = cls.__call__
-    n_stores = first_shared  # number of store-layer cache slots
 
     def patched_call(self, inputs=None, inputs_embeds=None, mask=None,
                      cache=None, per_layer_inputs=None, **kwargs):
         if cache is None:
-            # Objects created once under mx.compile tracing; data flow through
-            # update_and_fetch/state is captured in the computation graph.
-            cache = [_TrainingKVStore() for _ in range(n_stores)]
+            # why: read n_stores from the live instance so a second Gemma4
+            # variant with a different first_kv_shared_layer_idx loaded later
+            # in the same process gets its own count, not the first model's.
+            n_stores = getattr(self, "first_kv_shared_layer_idx", None)
+            if n_stores is None:
+                n_stores = 0
+            cache = [_TrainingKVStore() for _ in range(int(n_stores))]
         return original_call(
             self, inputs=inputs, inputs_embeds=inputs_embeds, mask=mask,
             cache=cache, per_layer_inputs=per_layer_inputs, **kwargs,
@@ -1000,6 +1027,41 @@ def _quant_config_from_resolved_map(resolved_map):
         "mode": mode,
         "quantize_modules": sorted(resolved_map),
     }
+
+
+def _apply_lora_at_paths(model, module_paths, adapter_cfg):
+    """Recreate LoRA layers at exact module paths recorded by save_lora_adapters.
+
+    why: mlx_lm.tuner.utils.load_adapters builds LoRA only on the language tower
+    via linear_to_lora_layers; when save_lora_adapters recorded vision /
+    projector / connector LoRA modules, we re-attach LoRA at those exact paths
+    so model.load_weights restores their trained tensors.
+    """
+    import mlx.nn as nn
+    from mlx_lm.tuner.lora import LoRALinear
+
+    lora_params = adapter_cfg.get("lora_parameters") or {}
+    rank = int(lora_params.get("rank", adapter_cfg.get("rank", 8)))
+    scale = float(lora_params.get("scale", adapter_cfg.get("scale", 1.0)))
+    dropout = float(lora_params.get("dropout", adapter_cfg.get("dropout", 0.0)))
+
+    wanted = set(module_paths)
+    by_name = dict(model.named_modules())
+    linear_types = (nn.Linear, nn.QuantizedLinear)
+    for name in module_paths:
+        module = by_name.get(name)
+        if module is None or not isinstance(module, linear_types):
+            continue
+        try:
+            wrapped = LoRALinear.from_base(
+                module, r=rank, scale=scale, dropout=dropout,
+            )
+        except TypeError:
+            wrapped = LoRALinear.from_base(module)
+        parent_path, _, leaf = name.rpartition(".")
+        parent = by_name.get(parent_path, model) if parent_path else model
+        if hasattr(parent, leaf):
+            setattr(parent, leaf, wrapped)
 
 
 def _adapter_actual_quant_config(adapter_cfg, resolved_map):
@@ -2280,8 +2342,27 @@ class FastMLXModel:
                         ),
                     )
                     _validate_mlx_adapter_base(model, adapter_cfg)
-                    from mlx_lm.tuner.utils import load_adapters
-                    model = load_adapters(model, local_path)
+                    # why: mlx_lm.tuner.utils.load_adapters only recreates LoRA
+                    # on the language tower. If the saved adapter applied LoRA
+                    # to vision / projector / connector modules (train_vision /
+                    # train_projector), recreate the layers at the recorded
+                    # paths first so load_weights doesn't drop them as missing.
+                    _saved_lora_paths = adapter_cfg.get("unsloth_mlx_lora_module_paths") or []
+                    if _saved_lora_paths:
+                        try:
+                            _apply_lora_at_paths(model, _saved_lora_paths, adapter_cfg)
+                            adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
+                            if os.path.exists(adapter_weights_file):
+                                model.load_weights(adapter_weights_file, strict=False)
+                            else:
+                                from mlx_lm.tuner.utils import load_adapters
+                                model = load_adapters(model, local_path)
+                        except Exception:
+                            from mlx_lm.tuner.utils import load_adapters
+                            model = load_adapters(model, local_path)
+                    else:
+                        from mlx_lm.tuner.utils import load_adapters
+                        model = load_adapters(model, local_path)
                     loaded_model_config = getattr(model, "_config", None)
                     is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
                     processor = getattr(model, "_processor", None)
@@ -2702,8 +2783,15 @@ class FastMLXModel:
         # was built from defaults, or was normalized from "all-linear" — so
         # toggling these flags always has effect.
         if isinstance(target_modules, list) and len(target_modules) > 0:
-            _ATTN = {"q_proj", "k_proj", "v_proj", "o_proj"}
-            _MLP = {"gate_proj", "up_proj", "down_proj"}
+            _ATTN = {
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "qkv", "qkv_proj", "Wqkv", "in_proj",
+                "c_attn", "out_proj",
+            }
+            _MLP = {
+                "gate_proj", "up_proj", "down_proj",
+                "fc1", "fc2", "w1", "w2", "w3",
+            }
             filtered = []
             for m in target_modules:
                 if m in _ATTN and not finetune_attention_modules:
