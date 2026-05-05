@@ -325,6 +325,19 @@ class UnslothFusedLoss(torch.autograd.Function):
         global _FUSED_CE_COMPILE_SUPPORTED
         uncompiled_accumulate_chunk = accumulate_chunk
 
+        chunks = []
+        for grad_inputs_j, hidden_states_j, labels_j in zip(__grad_inputs, __shift_states, __shift_labels):
+            if bool((labels_j != -100).any().item()):
+                chunks.append((grad_inputs_j, hidden_states_j, labels_j,))
+            else:
+                grad_inputs_j.zero_()
+        pass
+        if len(chunks) == 0:
+            ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
+            ctx.scaling = scaling
+            return accumulated_loss
+        pass
+
         if torch_compile and _FUSED_CE_COMPILE_SUPPORTED is not False:
             try:
                 accumulate_chunk = torch.compile(
@@ -341,7 +354,7 @@ class UnslothFusedLoss(torch.autograd.Function):
         if _FUSED_CE_COMPILE_SUPPORTED is None and torch_compile and \
             accumulate_chunk is not uncompiled_accumulate_chunk:
 
-            _iter = iter(zip(__grad_inputs, __shift_states, __shift_labels))
+            _iter = iter(chunks)
             grad_inputs_j, hidden_states_j, labels_j = next(_iter)
             try:
                 accumulate_chunk(
@@ -400,8 +413,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                 )
         else:
             # Fast path: compile status already known, original main branch loop
-            for (grad_inputs_j, hidden_states_j, labels_j,) in \
-                zip(__grad_inputs, __shift_states, __shift_labels,):
+            for (grad_inputs_j, hidden_states_j, labels_j,) in chunks:
                 accumulate_chunk(
                     n_chunks = n_chunks,
                     grad_inputs_j = grad_inputs_j,
