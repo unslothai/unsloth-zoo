@@ -903,10 +903,10 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
 @lru_cache(8)
 def _download_convert_hf_to_gguf_cached(name, _local_script_info):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Downloads from llama.cpp's GitHub repository (or reads a local copy if
-    # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points at one — _local_script_info is
-    # resolved by the wrapper above as (path, mtime_ns, size); mtime_ns/size
-    # are part of the cache key so in-place updates invalidate the cache)
+    # Downloads from llama.cpp's GitHub repository, or reads a local copy when
+    # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is set. _local_script_info is
+    # (path, mtime_ns, size); mtime/size in the cache key invalidate stale
+    # entries on in-place updates.
 
     # Ensure llama.cpp directory exists
     os.makedirs(LLAMA_CPP_DEFAULT_DIR, exist_ok=True)
@@ -1121,9 +1121,8 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
 pass
 
 
-# Preserve the public lru_cache surface (cache_clear, cache_info,
-# cache_parameters, __wrapped__) that existed before the wrapper/cached split,
-# so external callers, inspect.unwrap, and tests keep working.
+# Preserve the pre-split lru_cache surface (cache_clear, cache_info,
+# cache_parameters, __wrapped__) so external callers and inspect.unwrap keep working.
 _download_convert_hf_to_gguf.cache_clear = _download_convert_hf_to_gguf_cached.cache_clear
 _download_convert_hf_to_gguf.cache_info = _download_convert_hf_to_gguf_cached.cache_info
 _download_convert_hf_to_gguf.cache_parameters = _download_convert_hf_to_gguf_cached.cache_parameters
