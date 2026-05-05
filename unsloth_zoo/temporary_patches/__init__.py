@@ -20,6 +20,7 @@ from .gemma import *
 from .misc import *
 from .gemma3n import *
 from .gemma4 import *
+from .gemma4_init_weights import *
 from .gpt_oss import *
 from .qwen3_moe import *
 from .qwen3_vl_moe import *

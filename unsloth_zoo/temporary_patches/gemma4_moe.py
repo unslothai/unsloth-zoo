@@ -17,12 +17,49 @@
 import os
 import torch
 import torch.nn as nn
-from .common import TEMPORARY_PATCHES
+from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
 from .utils import patch_function, process_return, raise_error, logger
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
 )
+# Reuse the Qwen-MoE standard-layout LoRA extractor. Gemma4TextExperts has the
+# same (E, out, in) layout, the same hidden_dim / intermediate_dim attribute
+# names, and per_expert_scale is folded into top_k_weights upstream by
+# Gemma4TextRouter.forward, so no Gemma-4-specific scale handling is needed
+# inside the extractor itself.
+from .qwen3_moe import _make_qwen_moe_lora_extractor
+
+
+def _register_gemma4_lora_extractor(experts_cls):
+    """Attach _unsloth_lora_extractor_fn to a Gemma-4 experts class.
+
+    Idempotent and safe if experts_cls is None. Without this registration,
+    moe_utils._extract_lora_from_wrapper falls through to the default
+    canonical-permutation branch, which can produce shapes whose contraction
+    dimensions do not match for torch._grouped_mm on PEFT 0.19+ swapped
+    layouts. The crash surfaces as
+        RuntimeError: contraction dimension of mat_a and mat_b must match
+    on the first training step. Gemma-4 experts share the Qwen-MoE standard
+    layout, so the Qwen extractor handles both PEFT 0.18 and 0.19 cleanly.
+    """
+    if experts_cls is None:
+        return False
+    if getattr(experts_cls, "_unsloth_lora_extractor_registered", False):
+        return True
+    try:
+        extractor = _make_qwen_moe_lora_extractor()
+        experts_cls._unsloth_lora_extractor_fn = staticmethod(extractor)
+        experts_cls._unsloth_model_type = "gemma4_moe"
+        experts_cls._unsloth_lora_extractor_registered = True
+        return True
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(
+                f"Unsloth: Could not register Gemma-4 MoE LoRA extractor on "
+                f"{getattr(experts_cls, '__name__', experts_cls)}: {e}"
+            )
+        return False
 
 
 def patch_gemma4_grpo_hidden_states():
@@ -171,6 +208,10 @@ def _patch_gemma4_moe_current():
         return False
 
     if getattr(Gemma4TextExperts, "_unsloth_already_patched", False):
+        # Even when forward is already patched, make sure the extractor is
+        # registered. Guards against an older unsloth-zoo that patched
+        # forward but lacked the extractor registration.
+        _register_gemma4_lora_extractor(Gemma4TextExperts)
         return True
 
     _moe_backend = get_forward_moe_backend()
@@ -184,6 +225,9 @@ def _patch_gemma4_moe_current():
     ok = patch_function(Gemma4TextExperts, "forward", _gemma4_experts_forward, force=True)
     if ok:
         Gemma4TextExperts._unsloth_already_patched = True
+        # Register the Qwen-MoE-style standard-layout extractor so that the
+        # grouped-mm LoRA path produces correct contraction dimensions.
+        _register_gemma4_lora_extractor(Gemma4TextExperts)
     return ok
 
 
@@ -198,6 +242,8 @@ def _patch_gemma4_moe_legacy():
         return False
 
     if getattr(Gemma4TextMoEBlock, "_unsloth_already_patched", False):
+        # Same defensive re-registration as in the current-layout path.
+        _register_gemma4_lora_extractor(Gemma4TextMoEBlock)
         return True
 
     # Remap decoder layer module names to match checkpoint key layout:
@@ -244,6 +290,9 @@ def _patch_gemma4_moe_legacy():
         return False
 
     Gemma4TextMoEBlock._unsloth_already_patched = True
+    # Legacy MoE block has the same parameter layout (E, out, in). Register
+    # the same standard-layout extractor.
+    _register_gemma4_lora_extractor(Gemma4TextMoEBlock)
     return True
 
 
