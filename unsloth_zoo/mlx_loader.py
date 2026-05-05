@@ -115,6 +115,38 @@ def _seed_mlx_random_state(random_state):
     mx.random.seed(seed)
 
 
+def _collect_all_linear_target_names(model):
+    """Return suffix names of every Linear / QuantizedLinear leaf in `model`.
+
+    Mirrors PEFT's ``target_modules="all-linear"``: discover every
+    ``nn.Linear`` (and quantized variant) in the live module tree, and
+    return the leaf-suffix name of each. Numeric tokens (list indices like
+    ``experts.0``) are skipped — we want the semantic name (e.g. ``w1``,
+    ``router``, ``q_proj``, ``qkv_proj``, ``lm_head``).
+
+    The result is the set of names against which mlx-lm's
+    ``linear_to_lora_layers`` matches, so applying LoRA to this set covers
+    every Linear in the model — including fused-QKV archs, MoE
+    routers/experts, multimodal projector, and untied LM heads.
+    """
+    import mlx.nn as nn
+    linear_types = (nn.Linear, nn.QuantizedLinear)
+    names = set()
+    try:
+        for path, mod in model.named_modules():
+            if not isinstance(mod, linear_types):
+                continue
+            for token in reversed(str(path).split(".")):
+                if token and not token.isdigit():
+                    names.add(token)
+                    break
+    except Exception:
+        # Defensive: never let target-module discovery raise during LoRA
+        # setup. Caller will fall back to the canonical 7-name default.
+        return []
+    return sorted(names)
+
+
 def _is_vlm(config: dict) -> bool:
     """Detect whether a model config describes a VLM.
 
@@ -2619,8 +2651,22 @@ class FastMLXModel:
             train_vision = bool(finetune_vision_layers)
 
 
+        # PEFT/CUDA semantics: target_modules="all-linear" means literally
+        # every nn.Linear in the model — fused QKV (qkv_proj), MoE routers
+        # and experts, vision tower linears, multimodal projector, untied
+        # lm_head, etc. Walk the model tree and collect those names instead
+        # of silently collapsing to the canonical 7-name list (which would
+        # leave fused-attention archs and MoEs with no LoRA on most of
+        # their linears).
         if target_modules == ["all-linear"] or target_modules == "all-linear":
-            target_modules = None
+            target_modules = _collect_all_linear_target_names(model)
+            if not target_modules:
+                # No Linear modules discovered (shouldn't happen on a real
+                # model). Fall back to the canonical default.
+                target_modules = [
+                    "q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj",
+                ]
 
         if target_modules is None:
             target_modules = [
