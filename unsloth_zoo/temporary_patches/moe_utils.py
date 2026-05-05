@@ -1306,12 +1306,61 @@ def forward_native_moe_loop(
     """
     # This Unsloth Zoo code section is licensed under AGPL3
     final_hidden_states = torch.zeros_like(hidden_states)
+    use_separated_lora = _should_use_separated_lora()
+
+    gate_up_lora = getattr(self, "_unsloth_lora_gate_up_proj", None)
+    if gate_up_lora is not None:
+        gate_up_lora = gate_up_lora[:3]
+    elif (
+        use_separated_lora
+        and hasattr(self, "gate_up_proj")
+        and _has_lora_adapters(self.gate_up_proj)
+    ):
+        gate_up_lora = _extract_lora_weights(
+            self.gate_up_proj, num_experts=self.num_experts, experts_module=self
+        )
+    # Pre-cast LoRA factors to the activation dtype once (avoid per-expert .to()
+    # inside the loop). Casting `scaling` is a no-op when it's a Python float;
+    # if it's a tensor, leave it alone — the multiply broadcasts.
+    if gate_up_lora is not None:
+        _gate_up_first, _gate_up_second, _gate_up_scaling = gate_up_lora
+        gate_up_lora = (
+            _gate_up_first.to(hidden_states.dtype),
+            _gate_up_second.to(hidden_states.dtype),
+            _gate_up_scaling,
+        )
+
+    down_lora = getattr(self, "_unsloth_lora_down_proj", None)
+    if down_lora is not None:
+        down_lora = down_lora[:3]
+    elif (
+        use_separated_lora
+        and hasattr(self, "down_proj")
+        and _has_lora_adapters(self.down_proj)
+    ):
+        down_lora = _extract_lora_weights(
+            self.down_proj, num_experts=self.num_experts, experts_module=self
+        )
+    if down_lora is not None:
+        _down_first, _down_second, _down_scaling = down_lora
+        down_lora = (
+            _down_first.to(hidden_states.dtype),
+            _down_second.to(hidden_states.dtype),
+            _down_scaling,
+        )
 
     # Create expert mask and find which experts have tokens
     with torch.no_grad():
         expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
         expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+    # Some patches (Qwen3-VL-MoE) store experts in grouped_mm-friendly layout
+    # (E, in_dim, out_dim) rather than F.linear's (E, out_dim, in_dim). The
+    # patched __init__ sets `_unsloth_grouped_mm_format = True` to advertise
+    # this. Prefer it over the shape-only check below: the shape check is
+    # unsafe when intermediate_dim == hidden_dim (square dims).
+    grouped_mm_format = bool(getattr(self, "_unsloth_grouped_mm_format", False))
 
     # Only loop over experts that actually have tokens routed to them
     for expert_idx_t in expert_hit:
@@ -1326,9 +1375,16 @@ def forward_native_moe_loop(
         # Compute gate_up projection for this expert only
         # Handle 'gate_up_proj' or 'w1'/'w3'
         if hasattr(self, "gate_up_proj"):
-            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(
-                2, dim=-1
-            )
+            gate_up_weight = self.gate_up_proj[expert_idx]
+            if grouped_mm_format or gate_up_weight.shape[-1] != current_state.shape[-1]:
+                gate_up_weight = gate_up_weight.T
+            gate_up = F.linear(current_state, gate_up_weight)
+            if gate_up_lora is not None:
+                first_weight, second_weight, scaling = gate_up_lora
+                lora_delta = current_state @ first_weight[expert_idx]
+                lora_delta = lora_delta @ second_weight[expert_idx]
+                gate_up = gate_up + lora_delta * scaling
+            gate, up = gate_up.chunk(2, dim=-1)
         else:
             gate = F.linear(current_state, self.w1[expert_idx])
             up = F.linear(current_state, self.w3[expert_idx])
@@ -1337,9 +1393,19 @@ def forward_native_moe_loop(
 
         # Compute down projection for this expert only
         if hasattr(self, "down_proj"):
-            current_hidden_states = F.linear(
-                current_hidden_states, self.down_proj[expert_idx]
-            )
+            down_weight = self.down_proj[expert_idx]
+            # Mirror the gate_up handling: prefer the explicit
+            # `_unsloth_grouped_mm_format` flag over the shape heuristic, which
+            # is unsafe when intermediate_dim == hidden_dim.
+            if grouped_mm_format or down_weight.shape[-1] != current_hidden_states.shape[-1]:
+                down_weight = down_weight.T
+            down = F.linear(current_hidden_states, down_weight)
+            if down_lora is not None:
+                first_weight, second_weight, scaling = down_lora
+                lora_delta = current_hidden_states @ first_weight[expert_idx]
+                lora_delta = lora_delta @ second_weight[expert_idx]
+                down = down + lora_delta * scaling
+            current_hidden_states = down
         else:
             current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])
 
