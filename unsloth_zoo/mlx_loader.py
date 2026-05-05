@@ -233,9 +233,8 @@ def _load_mlx_lm_with_strict_fallback(
     does not expose strict=False, so use the internal loader only for registered
     mismatch signatures.
     """
-    # why: mlx-lm 0.22.0 (declared minimum) does not accept return_config or
-    # revision on load(); call the lower-level helpers directly so we work on
-    # both old and new mlx-lm releases without depending on signature drift.
+    # why: mlx-lm 0.22.0 load() rejects return_config / revision; bypass it
+    # so signature drift between mlx-lm releases doesn't break loading.
     from mlx_lm.utils import _download, load_model, load_tokenizer
 
     tokenizer_config = mlx_load_kwargs.get("tokenizer_config") or {}
@@ -304,9 +303,8 @@ def _load_mlx_vlm_with_extra_weight_filter(
 
         allowed_extra = rule["allowed_extra"]
 
-        # why: nn.Module.load_weights is monkey-patched process-globally; the
-        # lock prevents a concurrent load in another thread from seeing the
-        # filtered version while this VLM retry is active.
+        # why: nn.Module.load_weights is patched process-globally; lock so
+        # a concurrent load doesn't see the filtered version.
         with _LOAD_WEIGHTS_PATCH_LOCK:
             original_load_weights = nn.Module.load_weights
 
@@ -438,8 +436,8 @@ def _fix_gemma4_kv_sharing(model):
                      cache=None, per_layer_inputs=None, **kwargs):
         if cache is None:
             # why: read n_stores from the live instance so a second Gemma4
-            # variant with a different first_kv_shared_layer_idx loaded later
-            # in the same process gets its own count, not the first model's.
+            # variant with a different first_kv_shared_layer_idx isn't given
+            # the first model's count.
             n_stores = getattr(self, "first_kv_shared_layer_idx", None)
             if n_stores is None:
                 n_stores = 0
@@ -1030,13 +1028,8 @@ def _quant_config_from_resolved_map(resolved_map):
 
 
 def _apply_lora_at_paths(model, module_paths, adapter_cfg):
-    """Recreate LoRA layers at exact module paths recorded by save_lora_adapters.
-
-    why: mlx_lm.tuner.utils.load_adapters builds LoRA only on the language tower
-    via linear_to_lora_layers; when save_lora_adapters recorded vision /
-    projector / connector LoRA modules, we re-attach LoRA at those exact paths
-    so model.load_weights restores their trained tensors.
-    """
+    """Recreate LoRA layers at saved module paths so vision/projector LoRA
+    survives reload (mlx-lm's load_adapters only rebuilds the language tower)."""
     import mlx.nn as nn
     from mlx_lm.tuner.lora import LoRALinear
 
@@ -2342,11 +2335,9 @@ class FastMLXModel:
                         ),
                     )
                     _validate_mlx_adapter_base(model, adapter_cfg)
-                    # why: mlx_lm.tuner.utils.load_adapters only recreates LoRA
-                    # on the language tower. If the saved adapter applied LoRA
-                    # to vision / projector / connector modules (train_vision /
-                    # train_projector), recreate the layers at the recorded
-                    # paths first so load_weights doesn't drop them as missing.
+                    # why: load_adapters only rebuilds language-tower LoRA;
+                    # vision/projector LoRA must be re-attached at the saved
+                    # paths first so load_weights binds the trained tensors.
                     _saved_lora_paths = adapter_cfg.get("unsloth_mlx_lora_module_paths") or []
                     if _saved_lora_paths:
                         try:

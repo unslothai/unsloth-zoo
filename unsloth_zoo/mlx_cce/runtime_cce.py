@@ -611,8 +611,8 @@ def make_runtime_cce_loss_fused_finalize(
     ) -> tuple[int, list[int], list[mx.array], list[mx.array]]:
         n_tokens = hidden.shape[0]
         vocab_size = weight.shape[0]
-        # why: chunk size depends on dtype-derived compute_bytes; without dtype
-        # in the key, a bf16-cached plan is reused for fp32 and OOMs.
+        # why: dtype drives compute_bytes; key must include it or a bf16
+        # plan is reused for fp32 and OOMs.
         key = (n_tokens, vocab_size, hidden.dtype)
         if key in chunk_plan_cache:
             return chunk_plan_cache[key]

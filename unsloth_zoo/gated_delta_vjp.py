@@ -215,9 +215,9 @@ def gated_delta_ops_efficient(
         v_c = v[:, t_start:t_end]
         g_c = g[:, t_start:t_end]
         beta_c = beta[:, t_start:t_end]
-        # why: pass per-chunk mask explicitly so chunk-local t indexes the
-        # right timesteps; the prior closure-captured `mask[:, t]` read
-        # mask[:, 0:CHUNK_SIZE] for every chunk and corrupted training.
+        # why: pass per-chunk mask as a primal so chunk-local t maps to the
+        # right timesteps. Closure-captured `mask[:, t]` read mask[:,0:CHUNK]
+        # for every chunk.
         if mask is None:
             mask_c = mx.ones((q_c.shape[0], q_c.shape[1]), dtype=mx.bool_)
         else:

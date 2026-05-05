@@ -51,9 +51,8 @@ import psutil
 try:
     from .device_type import device_is_bf16_supported
 except ImportError:
-    # device_type unconditionally imports torch; on MLX-only builds (macOS
-    # arm64 without torch installed) the import fails. The Apple Silicon
-    # MPS / Metal stack natively supports bf16, so default to True there.
+    # device_type imports torch; on MLX-only macOS arm64 builds torch is
+    # absent. Apple Silicon Metal natively supports bf16.
     import platform as _platform
     _IS_APPLE_SILICON = (
         _platform.system() == "Darwin" and _platform.machine() == "arm64"

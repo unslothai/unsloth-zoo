@@ -2716,9 +2716,8 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
-    # why: record the exact module paths where LoRA was applied so reload can
-    # recreate vision/projector LoRA layers, not just the language tower that
-    # mlx-lm.tuner.utils.load_adapters knows about.
+    # why: record LoRA module paths so reload recreates vision/projector LoRA
+    # layers (mlx-lm.load_adapters only knows the language tower).
     try:
         lora_paths = []
         for name, module in model.named_modules():
@@ -3057,7 +3056,7 @@ def save_pretrained_gguf(
 
         # Step 3: Download and patch convert_hf_to_gguf.py.
         # why: always go through the wrapper so UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
-        # explicit pins are honored even when a stale cached converter exists.
+        # is honored even when a cached converter file exists.
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
         supported_text_archs = None
         supported_vision_archs = None
@@ -3204,8 +3203,8 @@ def push_to_hub_merged(
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
-    # why: upload_large_folder handles resume + chunking; merged VLM checkpoints
-    # frequently exceed upload_folder's single-shot limits and fail mid-push.
+    # why: upload_large_folder resumes and chunks; upload_folder fails
+    # mid-push on large VLM merges.
     try:
         api.upload_large_folder(
             folder_path=str(save_directory),

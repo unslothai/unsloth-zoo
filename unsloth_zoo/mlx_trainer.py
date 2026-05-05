@@ -468,8 +468,8 @@ class MLXTrainer:
             return {}
 
         configured = {}
-        # why: capture prior limits so restore_memory_limits can put them back
-        # after training; otherwise a process-global cap leaks into later work.
+        # why: prior values must be restored after training; otherwise the
+        # process-global cap leaks into later operations.
         self._prior_metal_limits = {}
 
         memory_limit_gb = getattr(args, "memory_limit_gb", None)
@@ -846,9 +846,8 @@ class MLXTrainer:
         compile_policy = build_compile_policy(args=args)
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = compile_policy.mode != "eager"
-        # why: text MLX training has no qualification/decision pipeline yet, so
-        # leave it eager by default. The runtime fallback below still catches
-        # any compile failures if a user opts in via UNSLOTH_MLX_TEXT_COMPILE=1.
+        # why: text MLX has no compile qualification pipeline; stay eager
+        # unless UNSLOTH_MLX_TEXT_COMPILE=1.
         if not is_vlm and _use_compile and os.environ.get("UNSLOTH_MLX_TEXT_COMPILE", "0") != "1":
             _use_compile = False
         if is_vlm and _use_compile:
@@ -1306,9 +1305,8 @@ class MLXTrainer:
                     self.model, "_unsloth_quantized_source", None,
                 ),
             })
-            # why: VLM processors include the inner tokenizer; saving both
-            # writes the same files twice and the second write wins. Skip the
-            # tokenizer save when a processor will cover it.
+            # why: VLM processors include the inner tokenizer; double-save
+            # rewrites the same files. Skip when the processor will cover it.
             _processor = self.processor or getattr(self.model, "_processor", None)
             _processor_saves_tokenizer = (
                 _processor is not None and hasattr(_processor, "save_pretrained")
