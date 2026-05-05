@@ -92,26 +92,34 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 from importlib.util import find_spec
 if find_spec("unsloth") is None:
     raise ImportError("Please install Unsloth via `pip install unsloth`!")
-if find_spec("torch") is None:
-    raise ImportError(
-        "Unsloth: Pytorch is not installed. Go to https://pytorch.org/.\n"\
-        "We also have some installation instructions on our Github page."
-    )
+_HAS_TORCH = find_spec("torch") is not None
 
 # Keep original allocator settings to preserve explicit user config precedence.
-_ORIGINAL_PYTORCH_CUDA_ALLOC_CONF = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
-_ORIGINAL_PYTORCH_HIP_ALLOC_CONF = os.environ.get("PYTORCH_HIP_ALLOC_CONF")
-_HAS_ORIGINAL_PYTORCH_ALLOC_CONF = "PYTORCH_ALLOC_CONF" in os.environ
+if _HAS_TORCH:
+    _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+    _ORIGINAL_PYTORCH_HIP_ALLOC_CONF = os.environ.get("PYTORCH_HIP_ALLOC_CONF")
+    _HAS_ORIGINAL_PYTORCH_ALLOC_CONF = "PYTORCH_ALLOC_CONF" in os.environ
+else:
+    _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF = None
+    _ORIGINAL_PYTORCH_HIP_ALLOC_CONF = None
+    _HAS_ORIGINAL_PYTORCH_ALLOC_CONF = False
 
 # We support Pytorch 2
 # Fixes https://github.com/unslothai/unsloth/issues/38
 from importlib.metadata import version as importlib_version
-torch_version_raw = str(importlib_version("torch"))
-torch_version = str(re.match(r"[0-9\.]{3,}", torch_version_raw).group(0)).split(".")
-major_torch, minor_torch = torch_version[0], torch_version[1]
-major_torch, minor_torch = int(major_torch), int(minor_torch)
-IS_TORCH_2_9_OR_NEWER = (major_torch > 2) or (major_torch == 2 and minor_torch >= 9)
-IS_TORCH_ROCM_BUILD = "+rocm" in torch_version_raw.lower()
+if _HAS_TORCH:
+    torch_version_raw = str(importlib_version("torch"))
+    torch_version = str(re.match(r"[0-9\.]{3,}", torch_version_raw).group(0)).split(".")
+    major_torch, minor_torch = torch_version[0], torch_version[1]
+    major_torch, minor_torch = int(major_torch), int(minor_torch)
+    IS_TORCH_2_9_OR_NEWER = (major_torch > 2) or (major_torch == 2 and minor_torch >= 9)
+    IS_TORCH_ROCM_BUILD = "+rocm" in torch_version_raw.lower()
+else:
+    torch_version_raw = ""
+    torch_version = ["0", "0"]
+    major_torch, minor_torch = 0, 0
+    IS_TORCH_2_9_OR_NEWER = False
+    IS_TORCH_ROCM_BUILD = False
 
 # Reduce VRAM usage by reducing fragmentation
 # And optimize pinning of memory
@@ -175,20 +183,20 @@ def clean_expandable_segments_value(value):
     return ",".join(parts) if len(parts) else None
 
 
-if (major_torch < 2):
+if _HAS_TORCH and (major_torch < 2):
     raise ImportError("Unsloth only supports Pytorch 2 for now. Please update your Pytorch to 2.1.\n"\
                       "We have some installation instructions on our Github page.")
-elif (major_torch == 2) and (minor_torch < 2):
+elif _HAS_TORCH and (major_torch == 2) and (minor_torch < 2):
     # Disable expandable_segments
     delete_key("PYTORCH_CUDA_ALLOC_CONF")
     delete_key("PYTORCH_HIP_ALLOC_CONF")
     delete_key("PYTORCH_ALLOC_CONF")
-elif bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")):
+elif _HAS_TORCH and bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")):
     # Expandable segments does NOT work on WSL
     delete_key("PYTORCH_CUDA_ALLOC_CONF")
     delete_key("PYTORCH_HIP_ALLOC_CONF")
     delete_key("PYTORCH_ALLOC_CONF")
-elif os.name == 'nt':
+elif _HAS_TORCH and os.name == 'nt':
     # Expandable segments does NOT work on Windows
     delete_key("PYTORCH_CUDA_ALLOC_CONF")
     delete_key("PYTORCH_HIP_ALLOC_CONF")
@@ -196,7 +204,7 @@ elif os.name == 'nt':
 
 # IMPORTANT: run ROCm cleanup before importing device_type (which imports torch).
 # HIP allocator settings can be read during torch initialization.
-if IS_TORCH_ROCM_BUILD:
+if _HAS_TORCH and IS_TORCH_ROCM_BUILD:
     remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
     remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
     remove_expandable_segments("PYTORCH_ALLOC_CONF")
@@ -217,14 +225,26 @@ torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
 del logging, torchao_logger, HideLoggingMessage
 
 # Get device types and other variables
-from .device_type import (
-    is_hip,
-    get_device_type,
-    DEVICE_TYPE,
-    DEVICE_TYPE_TORCH,
-    DEVICE_COUNT,
-    ALLOW_PREQUANTIZED_MODELS,
-)
+if _HAS_TORCH:
+    from .device_type import (
+        is_hip,
+        get_device_type,
+        DEVICE_TYPE,
+        DEVICE_TYPE_TORCH,
+        DEVICE_COUNT,
+        ALLOW_PREQUANTIZED_MODELS,
+    )
+else:
+    def is_hip():
+        return False
+
+    def get_device_type():
+        return "cpu"
+
+    DEVICE_TYPE = "cpu"
+    DEVICE_TYPE_TORCH = "cpu"
+    DEVICE_COUNT = 1
+    ALLOW_PREQUANTIZED_MODELS = False
 IS_HIP_RUNTIME = (DEVICE_TYPE == "hip") or bool(is_hip())
 
 # Torch >= 2.9 uses PYTORCH_ALLOC_CONF and treats legacy per-backend vars as deprecated.
@@ -260,13 +280,13 @@ if IS_HIP_RUNTIME:
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
         delete_key("PYTORCH_CUDA_ALLOC_CONF")
-elif DEVICE_TYPE == "cuda" and not IS_HIP_RUNTIME and not IS_TORCH_2_9_OR_NEWER:
+elif _HAS_TORCH and DEVICE_TYPE == "cuda" and not IS_HIP_RUNTIME and not IS_TORCH_2_9_OR_NEWER:
     delete_key("PYTORCH_HIP_ALLOC_CONF")
     delete_key("PYTORCH_ALLOC_CONF")
 
 # CCE fails on Torch 2.8 and above
 # OutOfResources: out of resource: shared memory, Required: 98304, Hardware limit: 65536. Reducing block sizes or `num_stages`
-if (major_torch >= 2 and minor_torch >= 8) or (major_torch > 2):
+if _HAS_TORCH and ((major_torch >= 2 and minor_torch >= 8) or (major_torch > 2)):
     os.environ["UNSLOTH_ENABLE_CCE"] = "0"
 elif DEVICE_TYPE == "hip":
     # CCE also fails in HIP / AMD
@@ -286,9 +306,15 @@ except:
 # Log Unsloth-Zoo Utilities
 os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 
-from .temporary_patches import (
-    encode_conversations_with_harmony,
-)
+if _HAS_TORCH:
+    from .temporary_patches import (
+        encode_conversations_with_harmony,
+    )
+else:
+    def encode_conversations_with_harmony(*args, **kwargs):
+        raise ImportError(
+            "Unsloth: encode_conversations_with_harmony requires torch. Install torch to enable this feature."
+        )
 from .rl_environments import (
     check_python_modules,
     create_locked_down_function,
@@ -310,4 +336,5 @@ try:
 except:
     pass
 
+del _HAS_TORCH
 del os, warnings, re
