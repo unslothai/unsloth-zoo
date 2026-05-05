@@ -56,6 +56,8 @@ if not logger.hasHandlers():
 LLAMA_CPP_CONVERT_FILE = \
     "https://github.com/ggerganov/llama.cpp/raw/refs/heads/master/convert_hf_to_gguf.py"
 
+LLAMA_CPP_CONVERTER_FILENAMES = ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py")
+
 COMMANDS_NOT_FOUND = (
     "command not found",
     "not found",
@@ -136,7 +138,7 @@ def _resolve_local_convert_script():
             f"Unset UNSLOTH_LLAMA_CPP_SCRIPTS_DIR to use the network converter, "
             f"or point it at a directory containing convert_hf_to_gguf.py."
         )
-    for name in ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py"):
+    for name in LLAMA_CPP_CONVERTER_FILENAMES:
         candidate = os.path.join(scripts_dir, name)
         try:
             if not os.path.isfile(candidate):
@@ -571,9 +573,9 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
     pass
 
     # Check for converter script
-    for converter in ["convert-hf-to-gguf.py", "convert_hf_to_gguf.py"]:
+    for converter in LLAMA_CPP_CONVERTER_FILENAMES:
         location = os.path.join(llama_cpp_folder, converter)
-        if os.path.exists(location):
+        if os.path.isfile(location):
             converter_location = location
             break
     pass
@@ -931,7 +933,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
             with open(_local_script, "rb") as f:
                 original_content = f.read()
         else:
-            response = requests.get(LLAMA_CPP_CONVERT_FILE, timeout = 30)
+            response = requests.get(LLAMA_CPP_CONVERT_FILE, timeout = (5, 30))
             response.raise_for_status()
             original_content = response.content
 
@@ -1011,11 +1013,11 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
              del sys.modules[original_module_name]
 
     except Exception as e:
-         logger.error(f"Unsloth: Error during download or introspection of original script: {e}", exc_info=True)
+         logger.error(f"Unsloth: Error during loading or introspecting the original script: {e}", exc_info=True)
          if temp_original_file_path and os.path.exists(temp_original_file_path):
              try: os.remove(temp_original_file_path)
              except OSError as remove_error: logger.warning(f"Could not remove temp file {temp_original_file_path}: {remove_error}")
-         raise RuntimeError(f"Failed during download/introspection of original script: {e}") from e
+         raise RuntimeError(f"Failed during loading/introspection of original script: {e}") from e
     finally:
         if temp_original_file_path and os.path.exists(temp_original_file_path):
             try:
