@@ -17,6 +17,10 @@
 __all__ = [
     "create_empty_model",
     "set_additional_modules",
+    "finalize_huggingface_model",
+    "patch_gemma4_vllm_lora_support",
+    "patch_gemma4_vllm_k_eq_v_support",
+    "extract_gdn_layers",
     "extract_vision_layers",
     "get_model_layer_config",
     "compare_attributes",
@@ -29,7 +33,16 @@ import os
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
-from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config
+from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
+
+def _is_gemma4_config(config):
+    if config is None:
+        return False
+    model_type = getattr(config, "model_type", None)
+    text_config = getattr(config, "text_config", config)
+    text_model_type = getattr(text_config, "model_type", None)
+    return model_type == "gemma4" or text_model_type in ("gemma4", "gemma4_text")
+pass
 
 def is_comparable(val):
     # Don't treat tensors as comparable, only basic types
@@ -280,6 +293,14 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     new_config.vocab_size = 1
     new_config.pad_token_id = 0
 
+    _set_config_attrs(new_config, {
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 1,
+        "linear_key_head_dim": 1,
+        "linear_value_head_dim": 1,
+        "linear_conv_kernel_dim": 1,
+    })
+
     # Set attention module head_dim
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})
@@ -296,6 +317,150 @@ def _set_config_attrs(config_obj, attrs_to_set):
     for attr, value in attrs_to_set.items():
         if hasattr(config_obj, attr):
             setattr(config_obj, attr, value)
+pass
+
+def _get_model_device(model):
+    for tensor in model.parameters():
+        return tensor.device
+    for tensor in model.buffers():
+        return tensor.device
+    return torch.device("cpu")
+pass
+
+def patch_gemma4_vllm_lora_support():
+    from functools import wraps
+    from vllm.model_executor.models import interfaces as vllm_model_interfaces
+    from vllm.lora import model_manager as vllm_lora_model_manager
+    try:
+        from vllm.v1.worker import lora_model_runner_mixin
+    except ImportError:
+        lora_model_runner_mixin = None
+    from unsloth_zoo import vllm_lora_worker_manager
+
+    gemma4_lora_classes = []
+    classes_to_patch = []
+    try:
+        from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
+        classes_to_patch.append(Gemma4ForConditionalGeneration)
+        gemma4_lora_classes.append("Gemma4ForConditionalGeneration")
+    except Exception:
+        pass
+    try:
+        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+        classes_to_patch.append(Gemma4ForCausalLM)
+        gemma4_lora_classes.append("Gemma4ForCausalLM")
+    except Exception:
+        pass
+    if not classes_to_patch:
+        return
+    gemma4_lora_classes = set(gemma4_lora_classes)
+
+    for cls in classes_to_patch:
+        if not getattr(cls, "_unsloth_gemma4_class_patched", False):
+            cls.supports_lora = True
+            if not hasattr(cls, "embedding_modules"):
+                cls.embedding_modules = {}
+            cls._unsloth_gemma4_class_patched = True
+
+    original_supports_lora = getattr(
+        lora_model_runner_mixin, "supports_lora", vllm_model_interfaces.supports_lora
+    )
+    if not hasattr(original_supports_lora, "_unsloth_gemma4_patch"):
+        def patched_supports_lora(model):
+            if model.__class__.__name__ in gemma4_lora_classes:
+                return True
+            return original_supports_lora(model)
+
+        patched_supports_lora._unsloth_gemma4_patch = True
+        if lora_model_runner_mixin is not None:
+            lora_model_runner_mixin.supports_lora = patched_supports_lora
+        vllm_model_interfaces.supports_lora = patched_supports_lora
+
+    if not hasattr(vllm_lora_model_manager.create_lora_manager, "_unsloth_gemma4_patch"):
+        original_create_lora_manager = vllm_lora_model_manager.create_lora_manager
+
+        @wraps(original_create_lora_manager)
+        def patched_create_lora_manager(model, *args, **kwargs):
+            if model.__class__.__name__ in gemma4_lora_classes:
+                kwargs.setdefault("lora_manager_cls", vllm_lora_model_manager.LoRAModelManager)
+            return original_create_lora_manager(model, *args, **kwargs)
+
+        patched_create_lora_manager._unsloth_gemma4_patch = True
+        vllm_lora_model_manager.create_lora_manager = patched_create_lora_manager
+        vllm_lora_worker_manager.create_lora_manager = patched_create_lora_manager
+pass
+
+# Prequantized BnB Gemma4 k_eq_v layers lack a synthetic v quant-state shard;
+# we duplicate K -> V at loader-side quant-state stacking time.
+def patch_gemma4_vllm_k_eq_v_support():
+    from vllm.model_executor.model_loader.bitsandbytes_loader import (
+        BitsAndBytesModelLoader,
+    )
+
+    stack_quantization_states = getattr(
+        BitsAndBytesModelLoader, "_stack_quantization_states", None,
+    )
+    if stack_quantization_states is None:
+        return
+    if hasattr(stack_quantization_states, "_unsloth_gemma4_k_eq_v_patch"):
+        return
+
+    original_stack_quantization_states = stack_quantization_states
+
+    def _get_gemma4_text_config(model):
+        config = getattr(model, "config", None)
+        if not _is_gemma4_config(config):
+            return None
+        return getattr(config, "text_config", config)
+
+    def _get_gemma4_k_eq_v_pairs(model):
+        text_config = _get_gemma4_text_config(model)
+        if text_config is None or not getattr(text_config, "attention_k_eq_v", False):
+            return ()
+
+        param_names = set(name for name, _ in model.named_parameters())
+        pairs = []
+        for layer_idx, layer_type in enumerate(getattr(text_config, "layer_types", ())):
+            if layer_type != "full_attention":
+                continue
+
+            for prefix in ("model.language_model", "language_model.model", "model"):
+                k_name = f"{prefix}.layers.{layer_idx}.self_attn.k_proj.weight"
+                v_name = f"{prefix}.layers.{layer_idx}.self_attn.v_proj.weight"
+                qkv_name = f"{prefix}.layers.{layer_idx}.self_attn.qkv_proj.weight"
+                if k_name in param_names:
+                    pairs.append(("split", k_name, v_name))
+                    break
+                if qkv_name in param_names:
+                    pairs.append(("packed", qkv_name, None))
+                    break
+        return tuple(pairs)
+
+    def patched_stack_quantization_states(self, model, quant_state_dict):
+        stacked_quant_state_dict = original_stack_quantization_states(
+            self, model, quant_state_dict
+        )
+
+        for kind, source, target in _get_gemma4_k_eq_v_pairs(model):
+            quant_states = stacked_quant_state_dict.get(source)
+            if quant_states is None:
+                continue
+
+            # k_eq_v reuses K as V: the raw-weight loader already duplicates
+            # k_proj -> v_proj, so prequant BnB needs the matching QuantState.
+            if kind == "packed":
+                if isinstance(quant_states, dict) and 2 not in quant_states and 1 in quant_states:
+                    quant_states[2] = deepcopy(quant_states[1])
+            elif kind == "split":
+                if target not in stacked_quant_state_dict:
+                    stacked_quant_state_dict[target] = deepcopy(quant_states)
+
+        return stacked_quant_state_dict
+
+    patched_stack_quantization_states._unsloth_gemma4_k_eq_v_patch = True
+    BitsAndBytesModelLoader._stack_quantization_states = (
+        patched_stack_quantization_states
+    )
 pass
 
 
@@ -352,6 +517,14 @@ def create_empty_vision_model(config, dtype = torch.float16):
         "head_dim": 1,
         "pad_token_id": 1,
     })
+    # Qwen 3.5 or GDN related attrs
+    _set_config_attrs(new_config.text_config, {
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 1,
+        "linear_key_head_dim": 1,
+        "linear_value_head_dim": 1,
+        "linear_conv_kernel_dim": 1,
+    })
 
     # Common vision attributes
     _set_config_attrs(new_config.vision_config, {
@@ -369,12 +542,8 @@ def create_empty_vision_model(config, dtype = torch.float16):
     text_layers = config.text_config.num_hidden_layers
     vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
 
-    # Set minimal sizes for different model types
-    if model_type == "qwen2_5_vl":
+    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
         new_config.vision_config.out_hidden_size = 1
-    elif model_type == "qwen3_vl":
-        new_config.vision_config.out_hidden_size = 1
-
 
     num_layers = max(text_layers, vision_layers)
     new_model = model_cls(new_config)
@@ -400,16 +569,21 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
 
 @torch.inference_mode
 def set_additional_modules(new_model, quant_state_dict, config):
+    def _unwrap_tensor(val):
+        return getattr(val, "data", val)
+
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
+        language_model_prefix = "model.language_model"
+    elif hasattr(new_model, "model") and hasattr(new_model.model, "language_model"):
+        language_model = new_model.model.language_model
         language_model_prefix = "model.language_model"
     else:
         language_model_prefix = "model"
         language_model = new_model.model
 
-    # Embeddings
     embed_tokens_key = f"{language_model_prefix}.embed_tokens.weight"
-    # Use explicit None check since pad_token_id=0 is valid (0 is falsy in Python)
+    # Explicit None check since pad_token_id=0 is valid.
     pad_token_id = getattr(config, "pad_token_id", None)
     if pad_token_id is None:
         text_config = getattr(config, "text_config", None)
@@ -417,18 +591,13 @@ def set_additional_modules(new_model, quant_state_dict, config):
             pad_token_id = getattr(text_config, "pad_token_id", None)
     if pad_token_id is not None: assert pad_token_id < quant_state_dict[embed_tokens_key].shape[0], f"Pad token id {pad_token_id} out of bounds for vocab size {quant_state_dict[embed_tokens_key].shape[0]}"
 
-    # language_model.embed_tokens = torch.nn.Embedding.from_pretrained(
-    #     quant_state_dict[embed_tokens_key],
-    #     freeze = True,
-    #     padding_idx = pad_token_id,
-    # )
-    # we cannot use the normal embedding init because gemma3 uses Gemma3TextScaledWordEmbedding which wraps around nn.Embedding and has a scaling factor. This new init ensures that we respect the forward from original model.
+    # gemma3 uses Gemma3TextScaledWordEmbedding (nn.Embedding subclass with
+    # an embed_scale); in-place weight assignment preserves its forward.
     def set_embedding(module, embed_tokens_key, pad_token_id, requires_grad=False):
         num_embeddings, embedding_dim = quant_state_dict[embed_tokens_key].shape
-        embeddings = quant_state_dict[embed_tokens_key]
+        embeddings = _unwrap_tensor(quant_state_dict[embed_tokens_key])
         if isinstance(embeddings, torch.Tensor):
-            # in the newer vLLM versions, this seems to return a tensor which can't be assigned to embedding weight
-            # we need to convert that to nn.Paramter and then pass it on
+            # Newer vLLM returns a plain tensor; wrap it so it can be assigned.
             embeddings = torch.nn.Parameter(embeddings, requires_grad = requires_grad)
         module.weight = embeddings
         module.padding_idx = pad_token_id
@@ -441,9 +610,9 @@ def set_additional_modules(new_model, quant_state_dict, config):
         # This is to handle visual embeddings in Qwen 3 VL
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
-    # Norm
     norm_key = f"{language_model_prefix}.norm.weight"
     norm = quant_state_dict[norm_key]
+    norm = _unwrap_tensor(norm)
     norm = torch.nn.Parameter(norm, requires_grad = False)
     language_model.norm.weight = norm
 
@@ -456,42 +625,38 @@ def set_additional_modules(new_model, quant_state_dict, config):
     else:
         lmhead_key = "lm_head.weight"
 
-    # Check if lm_head exists in the state dict
     if lmhead_key in quant_state_dict:
-        weight = quant_state_dict[lmhead_key]
+        weight = _unwrap_tensor(quant_state_dict[lmhead_key])
         from torch.nn import Linear
 
-        # Create Linear layer with zero dimensions to avoid any weight allocation
+        # Zero-dim Linear skips default weight allocation before we assign the real one.
         layer = Linear(0, 0, device=weight.device, bias=False)
-        # Set correct dimensions
         layer.in_features = weight.shape[1]
         layer.out_features = weight.shape[0]
-        # Assign the weight directly (no deletion needed since no weight was allocated)
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
 
-        # Set lm_head at the correct level
         if hasattr(new_model, "lm_head"):
             new_model.lm_head = layer
+        elif hasattr(language_model, "lm_head"):
+            language_model.lm_head = layer
         else:
-            # For multimodal models, check if language_model has lm_head
-            if hasattr(language_model, "lm_head"):
-                language_model.lm_head = layer
-            else:
-                new_model.lm_head = layer
+            new_model.lm_head = layer
 
         if getattr(config, "tie_word_embeddings", False):
-            # For tied embeddings, tie the weights properly
             if hasattr(new_model, "tie_weights"):
                 new_model.tie_weights()
             elif hasattr(language_model, "tie_weights"):
                 language_model.tie_weights()
 
-    # Process additional keys
-    # For any layers that are potentially in non layered components.
-    # Preferably norms, embeddings and convolution type layers.
+    # Non-layered components (norms, embeddings, conv-style layers).
+    non_layered_components = get_model_layer_config()["non_layered_components"]
+    exact_non_layered = {n for n in non_layered_components if "{kk}" not in n}
     additional_keys = set(
         x for x in quant_state_dict.keys()
-        if not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list"))
+        if (
+            any(x == n or x.startswith(n + ".") for n in exact_non_layered)
+            or not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list"))
+        )
     )
     print(f'Performing substitution for {additional_keys=}')
 
@@ -500,6 +665,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
         for prefix in ['new_', 'new_model.']:
             try:
                 val = quant_state_dict[key]
+                val = _unwrap_tensor(val)
                 if isinstance(val, torch.Tensor):
                     val = torch.nn.Parameter(val,requires_grad=False)
                 exec(f"{prefix}{key} = val")
@@ -508,6 +674,122 @@ def set_additional_modules(new_model, quant_state_dict, config):
                 continue
 
     pass
+pass
+
+@torch.inference_mode
+def finalize_huggingface_model(
+    new_model,
+    original_meta_model,
+    config,
+    dtype,
+    quantization_config = None,
+    bnb_config = None,
+):
+    if original_meta_model is not None:
+        copy_attributes(original_meta_model, new_model)
+
+    if hasattr(new_model, "language_model"):
+        lm_root = new_model.language_model
+    elif hasattr(new_model, "model") and hasattr(new_model.model, "language_model"):
+        lm_root = new_model.model.language_model
+    else:
+        lm_root = getattr(new_model, "model", None)
+
+    if lm_root is not None and hasattr(lm_root, "layers"):
+        for layer_idx, layer in enumerate(lm_root.layers):
+            if hasattr(layer, "layer_idx"):
+                layer.layer_idx = layer_idx
+            for attr_name in ("self_attn", "cross_attn", "mlp", "linear_attn"):
+                submodule = getattr(layer, attr_name, None)
+                if submodule is not None and hasattr(submodule, "layer_idx"):
+                    submodule.layer_idx = layer_idx
+
+    known_configs = {id(config)}
+    for sub_name in ("text_config", "vision_config", "audio_config"):
+        sub_cfg = getattr(config, sub_name, None)
+        if sub_cfg is not None:
+            known_configs.add(id(sub_cfg))
+
+    live_root = getattr(new_model, "config", None)
+    if live_root is not None and id(live_root) not in known_configs:
+        set_dtype_in_config(live_root, dtype)
+        known_configs.add(id(live_root))
+        for sub_name in ("text_config", "vision_config", "audio_config"):
+            sub_cfg = getattr(live_root, sub_name, None)
+            if sub_cfg is not None and id(sub_cfg) not in known_configs:
+                set_dtype_in_config(sub_cfg, dtype)
+                known_configs.add(id(sub_cfg))
+
+    for module in new_model.modules():
+        module_config = getattr(module, "config", None)
+        if module_config is not None and id(module_config) in known_configs:
+            set_dtype_in_config(module_config, dtype)
+
+    target_device = _get_model_device(new_model)
+    text_config = getattr(config, "text_config", config)
+    vision_config = getattr(config, "vision_config", None)
+
+    vision_config_ids = set()
+    if vision_config is not None:
+        vision_config_ids.add(id(vision_config))
+    live_vision_config = getattr(live_root, "vision_config", None) if live_root is not None else None
+    if live_vision_config is not None:
+        vision_config_ids.add(id(live_vision_config))
+
+    local_rope_config = None
+    for module_name, module in new_model.named_modules():
+        if hasattr(module, "rotary_emb"):
+            current_rotary_config = getattr(module.rotary_emb, "config", None)
+            is_vision_rotary = vision_config is not None and (
+                "vision_tower" in module_name
+                or "vision_model" in module_name
+                or (current_rotary_config is not None and id(current_rotary_config) in vision_config_ids)
+            )
+            rotary_config = vision_config if is_vision_rotary else text_config
+            reinit_ok = True
+            try:
+                module.rotary_emb = module.rotary_emb.__class__(
+                    config = rotary_config,
+                    device = target_device,
+                )
+            except Exception as rotary_reinit_error:
+                reinit_ok = False
+                logger.warning(
+                    f"Unsloth: skipped rotary_emb reinit for {module_name}: {rotary_reinit_error}"
+                )
+            if reinit_ok:
+                for buffer_name, buffer in list(module.rotary_emb._buffers.items()):
+                    if torch.is_tensor(buffer) and buffer.is_floating_point():
+                        module.rotary_emb._buffers[buffer_name] = buffer.to(
+                            device = target_device,
+                            dtype = torch.float32,
+                        )
+        if hasattr(module, "rotary_pos_emb") and vision_config is not None:
+            head_dim = vision_config.hidden_size // vision_config.num_heads
+            module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)
+        if hasattr(module, "rotary_emb_local"):
+            if local_rope_config is None:
+                local_rope_config = deepcopy(text_config)
+                local_rope_config.rope_theta = text_config.rope_local_base_freq
+                local_rope_config.rope_scaling = {"rope_type": "default"}
+            module.rotary_emb_local = module.rotary_emb_local.__class__(
+                config = local_rope_config,
+                device = target_device,
+            )
+
+    if (quantization_config or {}) == {} and bnb_config is None:
+        new_model = new_model.to(device = target_device, dtype = dtype)
+        for module in new_model.modules():
+            rotary_emb = getattr(module, "rotary_emb", None)
+            if rotary_emb is None:
+                continue
+            for buffer_name, buffer in list(rotary_emb._buffers.items()):
+                if torch.is_tensor(buffer) and buffer.is_floating_point():
+                    rotary_emb._buffers[buffer_name] = buffer.to(
+                        device = target_device,
+                        dtype = torch.float32,
+                    )
+    return new_model
 pass
 
 def get_model_layer_config(return_non_layered=True):
@@ -520,6 +802,7 @@ def get_model_layer_config(return_non_layered=True):
     """
     layer_templates = {
         'standard_layers': {
+            "model.language_model.layers.{kk}.layer_scalar",
             "model.language_model.layers.{kk}.self_attn.q_proj",
             "model.language_model.layers.{kk}.self_attn.k_proj",
             "model.language_model.layers.{kk}.self_attn.v_proj",
@@ -530,6 +813,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.language_model.layers.{kk}.mlp.down_proj",
 
+            "model.layers.{kk}.layer_scalar",
             "model.layers.{kk}.self_attn.q_proj",
             "model.layers.{kk}.self_attn.k_proj",
             "model.layers.{kk}.self_attn.v_proj",
@@ -539,6 +823,29 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.up_proj",
             "model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.layers.{kk}.mlp.down_proj",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_qkv",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_z",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_b",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_a",
+            "model.language_model.layers.{kk}.linear_attn.conv1d",
+            "model.language_model.layers.{kk}.linear_attn.out_proj",
+            "model.language_model.layers.{kk}.linear_attn.dt_bias",
+            "model.language_model.layers.{kk}.linear_attn.A_log",
+
+            "model.layers.{kk}.linear_attn.in_proj_qkv",
+            "model.layers.{kk}.linear_attn.in_proj_z",
+            "model.layers.{kk}.linear_attn.in_proj_b",
+            "model.layers.{kk}.linear_attn.in_proj_a",
+            "model.layers.{kk}.linear_attn.conv1d",
+            "model.layers.{kk}.linear_attn.out_proj",
+            "model.layers.{kk}.linear_attn.dt_bias",
+            "model.layers.{kk}.linear_attn.A_log",
+
+            # Gemma4 per-layer input modules
+            "model.language_model.layers.{kk}.per_layer_input_gate",
+            "model.language_model.layers.{kk}.per_layer_projection",
+            "model.layers.{kk}.per_layer_input_gate",
+            "model.layers.{kk}.per_layer_projection",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
@@ -560,6 +867,12 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.vision_model.encoder.layers.{kk}.post_layernorm",
             "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm1",
             "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm2",
+            "model.vision_tower.encoder.layers.{kk}.input_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.post_attention_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.pre_feedforward_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.post_feedforward_layernorm",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.q_norm",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.k_norm",
 
             # Mistral3 vision norms
             "model.vision_tower.transformer.layers.{kk}.attention_norm",
@@ -567,6 +880,12 @@ def get_model_layer_config(return_non_layered=True):
 
             # qwen3 vl
             "model.visual.deepstack_merger_list.{kk}.norm",
+            "model.language_model.layers.{kk}.linear_attn.norm",
+            "model.layers.{kk}.linear_attn.norm",
+
+            # Gemma4 per-layer input norm
+            "model.language_model.layers.{kk}.post_per_layer_input_norm",
+            "model.layers.{kk}.post_per_layer_input_norm",
         },
         'vision_layers': {
 
@@ -610,6 +929,13 @@ def get_model_layer_config(return_non_layered=True):
 
             "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc1",
             "model.vision_tower.vision_model.encoder.layers.{kk}.mlp.fc2",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.q_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.k_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.v_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.self_attn.o_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.mlp.gate_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.mlp.up_proj.linear",
+            "model.vision_tower.encoder.layers.{kk}.mlp.down_proj.linear",
 
             # qwen2.5_vl style
             "model.visual.blocks.{kk}.attn.qkv",
@@ -654,12 +980,13 @@ def get_model_layer_config(return_non_layered=True):
             # qwen 3 vl
             "model.visual.deepstack_merger_list.{kk}.linear_fc1",
             "model.visual.deepstack_merger_list.{kk}.linear_fc2",
-            "model.visual.merger.linear_fc{kk}",
 
         },
         "non_layered_components":{
             # we do not handle quantization for these layers yet
             # the set_additional_modules would process these layers
+            "model.visual.merger.linear_fc1",
+            "model.visual.merger.linear_fc2",
             "model.multi_modal_projector",
             "model.language_model.norm",
             'model.vision_model.layernorm_pre',
@@ -685,10 +1012,20 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_tower.patch_positional_embedding",
             "model.vision_tower.patch_conv",
             "model.vision_tower.ln_pre",
+            "model.vision_tower.std_bias",
+            "model.vision_tower.std_scale",
+            "model.vision_tower.patch_embedder.position_embedding_table",
+            "model.vision_tower.patch_embedder.input_proj",
+            "model.embed_vision.embedding_projection",
 
             # qwen 3 vl
             "model.visual.pos_embed",
             "model.visual.merger.norm",
+
+            # Gemma4 top-level per-layer-input modules
+            "model.language_model.embed_tokens_per_layer",
+            "model.language_model.per_layer_model_projection",
+            "model.language_model.per_layer_projection_norm",
         }
     }
 
@@ -732,6 +1069,11 @@ def get_model_layer_counts(config):
             "vision_layers": getattr(config.vision_config, "depth", 27),
             "deepstack_layers": getattr(config.vision_config, "deepstack_depth", 3),
         }
+    elif model_type == "gemma4":
+        return {
+            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+        }
     elif model_type == "gemma3":
         return {
             "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
@@ -757,6 +1099,152 @@ def _get_nested_attr(obj, attr_path: str):
     except (AttributeError, IndexError):
         return None
     return None
+
+
+def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_state_dict):
+    gdn = gdn_module
+
+    def _unwrap(v):
+        return getattr(v, "data", v)
+
+    def store(name, value):
+        state_dict[name] = value
+        quant_state_dict[name] = value
+
+    def _store_quant_state(name, quant_state):
+        if quant_state is None:
+            return
+        quant_state_dict[f"{name}.weight.quant_state"] = quant_state
+        try:
+            for k, v in quant_state.as_dict(packed=True).items():
+                state_dict[f"{name}.weight.{k}"] = v
+        except Exception:
+            pass
+
+    if hasattr(gdn, "in_proj_qkvz"):
+        proj = getattr(gdn.in_proj_qkvz, "base_layer", gdn.in_proj_qkvz)
+        raw_weight = proj.weight
+        weight = _unwrap(raw_weight)
+
+        output_sizes = getattr(proj, "output_sizes", None)
+        if output_sizes is None:
+            key_dim = getattr(gdn, "key_dim", None)
+            value_dim = getattr(gdn, "value_dim", None)
+            if key_dim is None or value_dim is None:
+                raise RuntimeError(
+                    "Unsloth: cannot infer GDN in_proj_qkvz shards without "
+                    "proj.output_sizes or gdn.key_dim / gdn.value_dim"
+                )
+            output_sizes = [key_dim, key_dim, value_dim, value_dim]
+        output_sizes = list(output_sizes)
+        offsets = [0]
+        for s in output_sizes:
+            offsets.append(offsets[-1] + s)
+        if len(offsets) < 5:
+            raise RuntimeError(
+                f"Unsloth: GDN in_proj_qkvz expected 4 shards (q,k,v,z); got sizes={output_sizes}"
+            )
+
+        qkv_weight = weight[offsets[0]:offsets[3]]
+        z_weight = weight[offsets[3]:offsets[4]]
+
+        qs_attr = getattr(raw_weight, "bnb_quant_state", getattr(weight, "bnb_quant_state", None))
+        qkv_states = [qs_attr.get(i) for i in (0, 1, 2)] if isinstance(qs_attr, dict) else [None, None, None]
+        if sum(qs is not None for qs in qkv_states) > 1:
+            try:
+                from bitsandbytes.functional import dequantize_4bit
+            except Exception:
+                raise RuntimeError(
+                    "Unsloth: prequantized BnB Qwen3.5 GDN requires bitsandbytes for fused in_proj_qkv reconstruction."
+                )
+            parts = []
+            for i, qs in enumerate(qkv_states):
+                shard = weight[offsets[i]:offsets[i + 1]]
+                parts.append(dequantize_4bit(shard, quant_state=qs) if qs is not None else shard)
+            store(f"{prefix}.in_proj_qkv.weight", torch.cat(parts, dim=0))
+        else:
+            store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
+            if isinstance(qs_attr, dict):
+                _store_quant_state(f"{prefix}.in_proj_qkv", qkv_states[0])
+        store(f"{prefix}.in_proj_z.weight", z_weight)
+        if isinstance(qs_attr, dict):
+            _store_quant_state(f"{prefix}.in_proj_z", qs_attr.get(3))
+
+        if weight.dtype == torch.float8_e4m3fn:
+            scale_attr = None
+            if hasattr(proj, "weight_scale"):
+                scale_attr = "weight_scale"
+            elif hasattr(proj, "weight_scale_inv"):
+                scale_attr = "weight_scale_inv"
+            ws = _unwrap(getattr(proj, scale_attr)) if scale_attr is not None else None
+            if ws is not None:
+                if ws.ndim == 2 and ws.shape[1] > 1:
+                    block_size = proj.weight_block_size[0]
+                    scale_offsets = [x // block_size for x in offsets]
+                    qkv_scale = ws[scale_offsets[0]:scale_offsets[3]]
+                    z_scale = ws[scale_offsets[3]:scale_offsets[4]]
+                else:
+                    qkv_scale = ws[offsets[0]:offsets[3]]
+                    z_scale = ws[offsets[3]:offsets[4]]
+                store(f"{prefix}.in_proj_qkv.{scale_attr}", qkv_scale)
+                store(f"{prefix}.in_proj_z.{scale_attr}", z_scale)
+    else:
+        get_state_dict(f"{prefix}.in_proj_qkv", 0, state_dict, gdn.in_proj_qkv, slice_weights=False)
+        get_state_dict(f"{prefix}.in_proj_z", 0, state_dict, gdn.in_proj_z, slice_weights=False)
+
+    ba_layer = getattr(gdn.in_proj_ba, "base_layer", gdn.in_proj_ba)
+    raw_ba_weight = ba_layer.weight
+    ba_weight = _unwrap(raw_ba_weight)
+    mid = ba_weight.shape[0] // 2
+
+    ba_qs = getattr(raw_ba_weight, "bnb_quant_state", getattr(ba_weight, "bnb_quant_state", None))
+    ba_states = [ba_qs.get(i) for i in (0, 1)] if isinstance(ba_qs, dict) else [None, None]
+    if isinstance(ba_qs, dict) and ba_states[0] is not None and ba_states[1] is None:
+        try:
+            from bitsandbytes.functional import dequantize_4bit
+        except Exception:
+            raise RuntimeError(
+                "Unsloth: prequantized BnB Qwen3.5 GDN requires bitsandbytes for in_proj_ba split."
+            )
+        full = dequantize_4bit(ba_weight, quant_state=ba_states[0])
+        full_mid = full.shape[0] // 2
+        store(f"{prefix}.in_proj_b.weight", full[:full_mid])
+        store(f"{prefix}.in_proj_a.weight", full[full_mid:])
+    else:
+        store(f"{prefix}.in_proj_b.weight", ba_weight[:mid])
+        store(f"{prefix}.in_proj_a.weight", ba_weight[mid:])
+        if isinstance(ba_qs, dict):
+            _store_quant_state(f"{prefix}.in_proj_b", ba_states[0])
+            _store_quant_state(f"{prefix}.in_proj_a", ba_states[1])
+
+    if ba_weight.dtype == torch.float8_e4m3fn:
+        scale_attr = None
+        if hasattr(ba_layer, "weight_scale"):
+            scale_attr = "weight_scale"
+        elif hasattr(ba_layer, "weight_scale_inv"):
+            scale_attr = "weight_scale_inv"
+        ws = _unwrap(getattr(ba_layer, scale_attr)) if scale_attr is not None else None
+        if ws is not None:
+            if ws.ndim == 2 and ws.shape[1] > 1:
+                block_size = ba_layer.weight_block_size[0]
+                scale_mid = mid // block_size
+                b_scale = ws[:scale_mid]
+                a_scale = ws[scale_mid:]
+            else:
+                b_scale = ws[:mid]
+                a_scale = ws[mid:]
+            store(f"{prefix}.in_proj_b.{scale_attr}", b_scale)
+            store(f"{prefix}.in_proj_a.{scale_attr}", a_scale)
+
+    store(f"{prefix}.conv1d.weight", gdn.conv1d.weight.data)
+    store(f"{prefix}.dt_bias", gdn.dt_bias.data)
+    store(f"{prefix}.A_log", gdn.A_log.data)
+
+    if hasattr(gdn, "norm") and hasattr(gdn.norm, "weight"):
+        store(f"{prefix}.norm.weight", gdn.norm.weight.data)
+
+    get_state_dict(f"{prefix}.out_proj", 0, state_dict, gdn.out_proj)
+pass
 
 
 def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict):
@@ -790,7 +1278,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
             if layer_module is not None:
                 if "qkv" in layer_path:
-                    if model_type in ("qwen2_5_vl", "qwen3_vl"):
+                    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
                         # If the HF model too prefers having merged qkv, we do this
                         # This is evident in qwen-2.5-vl and qwen-3-vl so far.
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
@@ -809,7 +1297,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                     if isinstance(layer_module, torch.nn.Module):
                         if hasattr(layer_module, 'weight'):
                             get_state_dict(layer_path, 0, state_dict, layer_module)
-                    elif isinstance(layer_module, torch.nn.Parameter):
+                    elif isinstance(layer_module, torch.Tensor):
                         state_dict[f"{layer_path}"] = layer_module.data
                         quant_state_dict[f"{layer_path}"] = state_dict[f"{layer_path}"]
                     else:
@@ -824,7 +1312,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
             if hasattr(component, 'weight'):
                 # Prefer using get_state_dict when possible
                 get_state_dict(component_path, 0, state_dict, component)
-            elif isinstance(component, torch.nn.Parameter):
+            elif isinstance(component, torch.Tensor):
                 state_dict[component_path] = component.data
                 quant_state_dict[component_path] = component.data
             elif isinstance(component, torch.nn.Module):
