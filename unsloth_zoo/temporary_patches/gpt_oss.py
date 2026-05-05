@@ -128,6 +128,193 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
+    # transformers 5.x moved MXFP4 loading from ``load_and_swizzle_mxfp4``
+    # (4.56.x) to the ``Mxfp4Deserialize`` WeightConverter, which is skipped
+    # whenever checkpoint key names already match registered parameters --
+    # so MXFP4 models load with raw blocks/scales still on the module and
+    # the swizzle step never runs. 5.x ``Mxfp4Dequantize.convert`` also
+    # drops the transpose that 4.x baked into ``convert_moe_packed_tensors``,
+    # so gate_up_proj ends up as (E, 2I, H) vs the (E, H, 2I) the stock
+    # forward expects. Fix both in a post-load walker.
+    try:
+        _Mxfp4Q = transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer
+        if not getattr(_Mxfp4Q, "_unsloth_post_swizzle_patched", False):
+            _orig_post_load = _Mxfp4Q._process_model_after_weight_loading
+
+            def _patched_post_load(self, model, **kwargs):
+                _orig_post_load(self, model, **kwargs)
+                import torch as _torch
+                import warnings as _warnings
+                dq = getattr(self.quantization_config, "dequantize", False)
+                if dq:
+                    for mod in model.modules():
+                        if type(mod).__name__ != "GptOssExperts":
+                            continue
+                        H = getattr(mod, "hidden_size", None)
+                        I = getattr(mod, "intermediate_size", None)
+                        if H is None or I is None:
+                            continue
+                        gup = getattr(mod, "gate_up_proj", None)
+                        if gup is None or gup.dim() != 3:
+                            continue
+                        _, D1, D2 = gup.shape
+                        # gate_up_proj shape is unambiguous (2I != H);
+                        # down_proj shape is ambiguous when I == H
+                        # (gpt-oss-20b: 2880 / 2880).
+                        if not (D1 == 2 * I and D2 == H):
+                            continue
+                        expected_wrong = {
+                            "gate_up_proj": (2 * I, H),
+                            "down_proj":    (H, I),
+                        }
+                        expected_right = {
+                            "gate_up_proj": (H, 2 * I),
+                            "down_proj":    (I, H),
+                        }
+                        for proj in ("gate_up_proj", "down_proj"):
+                            p = getattr(mod, proj, None)
+                            if p is None or p.dim() != 3:
+                                continue
+                            shape = tuple(p.shape[-2:])
+                            # When H == I, down_proj wrong (H, I) and right
+                            # (I, H) shapes are identical; the outer guard
+                            # already proved this module is in the wrong
+                            # layout, so transpose unconditionally.
+                            ambiguous = (proj == "down_proj" and H == I)
+                            if shape == expected_right[proj] and not ambiguous:
+                                continue
+                            if shape != expected_wrong[proj] and not ambiguous:
+                                _warnings.warn(
+                                    f"[unsloth] Unexpected MXFP4-dequantize "
+                                    f"layout for {type(mod).__name__}.{proj}: "
+                                    f"got {tuple(p.shape)}. Skipping transpose."
+                                )
+                                continue
+                            new_p = p.data.transpose(-2, -1).contiguous()
+                            setattr(mod, proj, _torch.nn.Parameter(
+                                new_p, requires_grad=p.requires_grad,
+                            ))
+                    return
+
+                import transformers.integrations.mxfp4 as _mx_mod
+                swizzle_fn = getattr(_mx_mod, "swizzle_mxfp4_convertops", None)
+
+                def _has_loaded_raw(mod, proj):
+                    b = getattr(mod, f"{proj}_blocks", None)
+                    s = getattr(mod, f"{proj}_scales", None)
+                    if b is None or s is None:
+                        return False
+                    if b.device.type == "meta" or s.device.type == "meta":
+                        return False
+                    if b.numel() == 0 or s.numel() == 0:
+                        return False
+                    return bool(b.any())
+
+                def _module_has_loaded_raw(mod):
+                    for proj in ("gate_up_proj", "down_proj"):
+                        if f"_{proj}" in mod.__dict__:
+                            continue
+                        if _has_loaded_raw(mod, proj):
+                            return True
+                    return False
+
+                if swizzle_fn is None:
+                    for mod in model.modules():
+                        if type(mod).__name__ != "Mxfp4GptOssExperts":
+                            continue
+                        if _module_has_loaded_raw(mod):
+                            raise RuntimeError(
+                                "[unsloth] MXFP4 model has raw blocks/scales "
+                                "post-load but swizzle_mxfp4_convertops is "
+                                "not available; pass Mxfp4Config(dequantize="
+                                "True) to fall back to bf16."
+                            )
+                    return
+                try:
+                    import triton_kernels as _tk
+                except Exception as _tk_err:
+                    for mod in model.modules():
+                        if type(mod).__name__ != "Mxfp4GptOssExperts":
+                            continue
+                        if _module_has_loaded_raw(mod):
+                            raise RuntimeError(
+                                "[unsloth] Native MXFP4 requires "
+                                "triton_kernels; install it or pass "
+                                "Mxfp4Config(dequantize=True) for bf16."
+                            ) from _tk_err
+                    return
+                for mod in model.modules():
+                    if type(mod).__name__ != "Mxfp4GptOssExperts":
+                        continue
+                    for proj in ("gate_up_proj", "down_proj"):
+                        if f"_{proj}" in mod.__dict__:
+                            continue
+                        if not _has_loaded_raw(mod, proj):
+                            continue
+                        b = getattr(mod, f"{proj}_blocks")
+                        s = getattr(mod, f"{proj}_scales")
+                        try:
+                            swizzle_fn(b.data, s.data, mod, proj, b.device, _tk)
+                        except Exception as _sw_err:
+                            raise RuntimeError(
+                                f"[unsloth] MXFP4 swizzle failed on "
+                                f"{type(mod).__name__}.{proj}; likely "
+                                f"triton_kernels / transformers drift."
+                            ) from _sw_err
+                        if f"{proj}_blocks" in mod._parameters:
+                            del mod._parameters[f"{proj}_blocks"]
+                        if f"{proj}_scales" in mod._parameters:
+                            del mod._parameters[f"{proj}_scales"]
+
+            _Mxfp4Q._process_model_after_weight_loading = _patched_post_load
+            _Mxfp4Q._unsloth_post_swizzle_patched = True
+
+        # triton_kernels MXFP4 needs CUDA; native MXFP4 itself works across
+        # CUDA compute capabilities (StridedLayout / HopperMXValueLayout /
+        # BlackwellMXValueLayout) and XPU has its own native path. Only
+        # force dequantize when no supported accelerator is visible.
+        if not getattr(_Mxfp4Q, "_unsloth_cpu_gate_patched", False):
+            _orig_before_load = _Mxfp4Q._process_model_before_weight_loading
+
+            def _patched_before_load(self, model, use_kernels=False, **kwargs):
+                try:
+                    import torch as _torch
+                    cuda_ok = _torch.cuda.is_available()
+                    xpu_ok = (
+                        hasattr(_torch, "xpu") and _torch.xpu.is_available()
+                    )
+                    if (
+                        not cuda_ok
+                        and not xpu_ok
+                        and not use_kernels
+                        and not getattr(self.quantization_config, "dequantize", False)
+                    ):
+                        try:
+                            self.quantization_config.dequantize = True
+                        except Exception as _cfg_err:
+                            import warnings as _w
+                            _w.warn(
+                                f"[unsloth] Could not force MXFP4 dequantize "
+                                f"on CPU-only host: {_cfg_err!r}; native "
+                                f"MXFP4 path may crash without triton_kernels."
+                            )
+                except Exception as _det_err:
+                    import warnings as _w
+                    _w.warn(
+                        f"[unsloth] MXFP4 pre-load device detection failed: "
+                        f"{_det_err!r}; falling back to upstream."
+                    )
+                return _orig_before_load(
+                    self, model, use_kernels=use_kernels, **kwargs,
+                )
+
+            _Mxfp4Q._process_model_before_weight_loading = _patched_before_load
+            _Mxfp4Q._unsloth_cpu_gate_patched = True
+    except Exception as e:
+        return raise_error(
+            "transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer post-load swizzle patch", e,
+        )
+
     if HAS_TRITON_KERNELS:
         # Only override is_kernels_available when triton_kernels IS available
         try:
