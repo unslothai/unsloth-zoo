@@ -89,7 +89,11 @@ def gated_delta_ops_efficient(
         dy, d_state_out = cotangents
         chunk_T = q_c.shape[1]
 
-        # Recompute forward states for this chunk
+        # Recompute the chunk's RETURNED states (post-mask). At step t the
+        # returned state is `where(mask, state_new, state_prev)` — so for
+        # masked steps `states[t+1] == states[t]`. We don't use these for
+        # the y-path backward (that needs state_new, recomputed below); we
+        # only need them as the entry point `state_prev` for each step.
         states = [state_in]
         s = state_in
         for t in range(chunk_T):
@@ -100,7 +104,10 @@ def gated_delta_ops_efficient(
             )
             states.append(s)
 
-        # BPTT: backward through time
+        # BPTT: backward through time. `d_state` holds the cotangent w.r.t.
+        # the RETURNED state at the current step's output (= input to step
+        # t+1). At chunk boundary it's d_state_out; subsequent iterations
+        # propagate it through the recurrence + mask.
         d_q = mx.zeros_like(q_c)
         d_k = mx.zeros_like(k_c)
         d_v = mx.zeros_like(v_c)
@@ -110,7 +117,6 @@ def gated_delta_ops_efficient(
 
         for t in range(chunk_T - 1, -1, -1):
             state_prev = states[t]
-            state_cur = states[t + 1]
             q_t = q_c[:, t]
             k_t = k_c[:, t]
             v_t = v_c[:, t]
@@ -118,38 +124,48 @@ def gated_delta_ops_efficient(
             beta_t = beta_c[:, t]
             dy_t = dy[:, t]
 
-            # y = (state_cur * q_t[..., None, :]).sum(-1)
-            # d_state from y: d_state += dy_t[..., None] * q_t[..., None, :]
-            d_state = d_state + dy_t[..., None].astype(mx.float32) * q_t[..., None, :].astype(mx.float32)
-            # d_q from y: d_q_t = (state_cur * dy_t[..., None]).sum(-2)... no
-            # y = sum over Dk: state[..., dv, dk] * q[..., dk]  → y[..., dv]
-            # dy/dq = state summed over dv? No.
-            # y[b,h,dv] = sum_dk state[b,h,dv,dk] * q[b,h,dk]
-            # dy/dq[b,h,dk] = sum_dv dy[b,h,dv] * state[b,h,dv,dk]
-            d_q_t = (dy_t[..., None].astype(mx.float32) * state_cur).sum(axis=-2)
-            d_q = d_q.at[:, t].add(d_q_t.astype(d_q.dtype))
+            # Cotangent flowing into step t's output (state_returned).
+            d_state_returned = d_state
 
-            # state_cur = state_decayed + k * delta[..., None]
-            # state_decayed = state_prev * decay
-            # delta = (v - kv_mem) * beta[..., None]
-            # kv_mem = (state_decayed * k[..., None, :]).sum(-1)
-
+            # Recompute state_new (pre-mask). y always depends on state_new
+            # regardless of mask; using states[t+1] would be wrong when
+            # mask=False because states[t+1] equals state_prev there.
             if g_t.ndim == 2:
                 decay = g_t[..., None, None]
             else:
                 decay = g_t[..., None, :]
-
             state_decayed = state_prev * decay
             kv_mem = (state_decayed * k_t[..., None, :]).sum(axis=-1)
             delta = (v_t - kv_mem) * beta_t[..., None]
+            state_new = state_decayed + k_t[..., None, :] * delta[..., None]
 
-            # d_state → d_state_decayed + d from k*delta term
-            # state_cur = state_decayed + k[...,None,:] * delta[...,None]
-            d_kd = d_state  # gradient through the sum
-            d_state_decayed = mx.array(d_state)
+            # Forward had: state_returned = where(mask, state_new, state_prev).
+            # Backward splits d_state_returned into:
+            #   d_state_new path (recurrence backward): only when mask=True
+            #   d_state_prev passthrough:               only when mask=False
+            if mask is not None:
+                m = mask[:, t]
+                m_exp = mx.expand_dims(m, axis=(1, 2, 3))
+                zero = mx.zeros_like(d_state_returned)
+                d_state_new_from_returned = mx.where(m_exp, d_state_returned, zero)
+                d_state_prev_passthrough = mx.where(m_exp, zero, d_state_returned)
+            else:
+                d_state_new_from_returned = d_state_returned
+                d_state_prev_passthrough = mx.zeros_like(d_state_returned)
 
-            # d_k from k[...,None,:] * delta[...,None]
-            # shape: [B, H, Dv, Dk] = k[B,H,1,Dk] * delta[B,H,Dv,1]
+            # y = (state_new * q).sum(-1) — y is unmasked, contributes always.
+            d_state_new = (
+                d_state_new_from_returned
+                + dy_t[..., None].astype(mx.float32) * q_t[..., None, :].astype(mx.float32)
+            )
+            d_q_t = (dy_t[..., None].astype(mx.float32) * state_new).sum(axis=-2)
+            d_q = d_q.at[:, t].add(d_q_t.astype(d_q.dtype))
+
+            # state_new = state_decayed + k[..., None, :] * delta[..., None]
+            d_kd = d_state_new
+            d_state_decayed = mx.array(d_state_new)
+
+            # d_k / d_delta from the k*delta term
             d_k_t_from_update = (d_kd * delta[..., None].astype(mx.float32)).sum(axis=-2)
             d_delta = (d_kd * k_t[..., None, :].astype(mx.float32)).sum(axis=-1)
 
@@ -160,19 +176,19 @@ def gated_delta_ops_efficient(
             d_kv_mem = -d_v_minus_kv
 
             # kv_mem = (state_decayed * k[..., None, :]).sum(-1)
-            # d_state_decayed += d_kv_mem[..., None] * k[..., None, :]
-            d_state_decayed = d_state_decayed + d_kv_mem[..., None].astype(mx.float32) * k_t[..., None, :].astype(mx.float32)
+            d_state_decayed = (
+                d_state_decayed
+                + d_kv_mem[..., None].astype(mx.float32) * k_t[..., None, :].astype(mx.float32)
+            )
             d_k_t_from_kv = (d_kv_mem[..., None].astype(mx.float32) * state_decayed).sum(axis=-2)
 
             # state_decayed = state_prev * decay
-            # d_state_prev = d_state_decayed * decay
-            d_state = d_state_decayed * decay.astype(mx.float32)
-            # d_decay = d_state_decayed * state_prev
-            d_decay = (d_state_decayed * state_prev).sum(axis=-2)  # sum over Dv
+            d_state_prev_via_recurrence = d_state_decayed * decay.astype(mx.float32)
+            d_decay = (d_state_decayed * state_prev).sum(axis=-2)
             if g_t.ndim == 2:
-                d_g_t = d_decay.sum(axis=-1)  # sum over Dk too
+                d_g_t = d_decay.sum(axis=-1)
             else:
-                d_g_t = d_decay  # [B, H, Dk]
+                d_g_t = d_decay
 
             d_k_t = d_k_t_from_update + d_k_t_from_kv
             d_k = d_k.at[:, t].add(d_k_t.astype(d_k.dtype))
@@ -180,11 +196,8 @@ def gated_delta_ops_efficient(
             d_g = d_g.at[:, t].add(d_g_t.astype(d_g.dtype))
             d_beta = d_beta.at[:, t].add(d_beta_t.astype(d_beta.dtype))
 
-            # Handle mask
-            if mask is not None:
-                m = mask[:, t]
-                m_exp = mx.expand_dims(m, axis=(1, 2, 3))
-                d_state = mx.where(m_exp, d_state, d_state + d_state_out)
+            # d_state_prev = recurrence-derived gradient + mask passthrough.
+            d_state = d_state_prev_via_recurrence + d_state_prev_passthrough
 
         return d_q, d_k, d_v, d_g, d_beta, d_state
 
@@ -216,6 +229,14 @@ def patch_gated_delta():
         q, k, v, a, b, A_log, dt_bias,
         state=None, mask=None, use_kernel=True,
     ):
+        # Heuristic: training calls enter with state=None (start of sequence,
+        # no cache); inference with KV cache passes the cached state in.
+        # Route training through gated_delta_ops_efficient so the
+        # memory-efficient custom VJP actually runs — gated_delta_kernel
+        # has no custom VJP, so going through it forces mlx to keep all T
+        # intermediate states alive in the autograd graph and defeats the
+        # whole point of this module.
+        is_training_call = state is None
         beta = mx.sigmoid(b)
         g = gated_delta.compute_g(A_log, a, dt_bias)
         if state is None:
@@ -223,8 +244,13 @@ def patch_gated_delta():
             Hv, Dv = v.shape[-2:]
             state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-        # Always use our efficient ops path for training (use_kernel=False)
-        # and for inference when kernel isn't available
+        # Training (or any call without an incoming state cache): always
+        # use the efficient ops path so backward is memory-efficient.
+        if is_training_call:
+            return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
+
+        # Inference with cached state: prefer the kernel for speed when
+        # available; fall back to efficient ops otherwise.
         if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
             return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
         return gated_delta.gated_delta_kernel(q, k, v, g, beta, state, mask)
