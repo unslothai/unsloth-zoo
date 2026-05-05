@@ -314,6 +314,20 @@ def make_cce_loss_fn(model):
         return backbone.embed_tokens
 
     if use_quantized:
+        # Backstop: the quantized CCE backward returns mx.zeros for the
+        # weight gradient (dequant→grad→requant is not implemented). That's
+        # fine when the LM head is frozen (LoRA on a quantized base — the
+        # gradient flows through grad_hidden into the LoRA adapters), but
+        # full fine-tuning would silently skip the LM head update. The
+        # loader rejects this combination earlier; this is a safety net.
+        if getattr(model, "_unsloth_full_finetuning", False):
+            raise ValueError(
+                "Unsloth: full_finetuning=True with a quantized LM head is "
+                "not supported. The CCE backward zeros the quantized weight "
+                "gradient, so the LM head would never update. Load the "
+                "unquantized base model for full fine-tuning, or use LoRA "
+                "(full_finetuning=False) on this quantized base."
+            )
         group_size = getattr(lm_layer, "group_size", 64)
         bits = getattr(lm_layer, "bits", 4)
         print(f"Unsloth: CCE using quantized matmul (group_size={group_size}, bits={bits})")
@@ -1435,6 +1449,17 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
         print(f"Unsloth: Completion-only training (assistant_token_id={_assistant_token_id}).")
 
     if use_quantized:
+        # Backstop: same as the text CCE path — full FT against a quantized
+        # LM head silently skips the LM head update. Reject loudly here in
+        # case the loader-level check is bypassed.
+        if getattr(model, "_unsloth_full_finetuning", False):
+            raise ValueError(
+                "Unsloth: full_finetuning=True with a quantized VLM LM head "
+                "is not supported. The CCE backward zeros the quantized "
+                "weight gradient, so the LM head would never update. Load "
+                "the unquantized base model for full fine-tuning, or use "
+                "LoRA on this quantized base."
+            )
         group_size = getattr(lm_layer, "group_size", 64)
         bits = getattr(lm_layer, "bits", 4)
 

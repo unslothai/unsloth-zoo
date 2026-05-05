@@ -2138,6 +2138,29 @@ class FastMLXModel:
             config_data = {}
             local_path = None
 
+        # Reject full_finetuning against a pre-quantized repo. The weights on
+        # disk are int4/int8 packed; full FT would need them in a trainable
+        # float dtype, and our CCE backward returns mx.zeros for the quantized
+        # weight gradient (since dequant→grad→requant is not implemented).
+        # Without this check the user would silently train only the
+        # non-quantized params (LayerNorms, biases) while the bulk of the
+        # model's quantized linears never updated.
+        if full_finetuning and _get_existing_mlx_quantization(config_data):
+            raise ValueError(
+                f"Unsloth: full_finetuning=True was requested against "
+                f"'{model_name}', which is a pre-quantized repo. The "
+                "quantized weights on disk cannot be trained directly: our "
+                "CCE backward zeros the weight gradient for quantized "
+                "linears, so full FT would silently update only the "
+                "non-quantized params (LayerNorms, biases) and leave every "
+                "quantized linear unchanged. Either:\n"
+                "  - load the unquantized base (drop the '-4bit' / '-8bit' "
+                "suffix from the repo name) for full fine-tuning, or\n"
+                "  - keep this quantized base and use LoRA "
+                "(full_finetuning=False, the default) which trains only the "
+                "adapter matrices."
+            )
+
         adapter_cfg_path = os.path.join(local_path, "adapter_config.json") if local_path else None
         if adapter_cfg_path and os.path.exists(adapter_cfg_path):
             try:
