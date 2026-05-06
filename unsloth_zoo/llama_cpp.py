@@ -42,10 +42,23 @@ import tempfile
 import logging
 import shlex
 import shutil
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 from pathlib import Path
 import psutil
-from .device_type import device_is_bf16_supported
+try:
+    from .device_type import device_is_bf16_supported
+except ImportError:
+    # device_type imports torch; on MLX-only macOS arm64 builds torch is
+    # absent. Apple Silicon Metal natively supports bf16.
+    import platform as _platform
+    _IS_APPLE_SILICON = (
+        _platform.system() == "Darwin" and _platform.machine() == "arm64"
+    )
+    def device_is_bf16_supported():
+        return _IS_APPLE_SILICON
 
 # Get a logger instance
 logger = logging.getLogger(__name__)

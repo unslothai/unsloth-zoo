@@ -157,17 +157,28 @@ from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
 
 
-def _active_merge_device(W):
-    if getattr(W.device, "type", None) == DEVICE_TYPE_TORCH:
-        return W.device
-    if W.device.index is None:
-        return torch.device(DEVICE_TYPE_TORCH)
-    return torch.device(DEVICE_TYPE_TORCH, W.device.index)
+@functools.lru_cache(maxsize = 1)
+def _active_merge_device():
+    """Pick the active accelerator family for LoRA merge math.
+
+    Hardcoding ``"cuda"`` breaks ROCm (AMD), XPU (Intel), and MPS (Apple
+    Silicon) backends. Routing through ``DEVICE_TYPE_TORCH`` only covers
+    cuda/xpu/hip and silently drops MPS, which the MLX backend relies on
+    for the on-host LoRA merge step. Probe the available accelerator
+    family at first call and cache the result.
+    """
+    if torch.cuda.is_available():
+        return "cuda"  # PyTorch ROCm aliases the cuda API, so this also covers HIP
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 pass
 
 def _merge_lora(W, lora_stats, name):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
-    device = _active_merge_device(W)
+    device = _active_merge_device()
     W = W.to(device, dtype = torch.float32, non_blocking = True)
     lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
     lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
@@ -939,7 +950,7 @@ def _merge_moe_gate_expert(gate_W, lora_stats, expert_idx, num_experts, output_d
         # gate_proj corresponds to first half of A
         gate_a = a_slice[:, :inter_dim]                    # (r, I)
 
-        device = _active_merge_device(gate_W)
+        device = _active_merge_device()
         gate_delta = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ gate_a.to(device, dtype = torch.float32, non_blocking = True)
 
         gate_merged = gate_W.to(device, dtype = torch.float32, non_blocking = True)
@@ -982,7 +993,7 @@ def _merge_moe_up_expert(up_W, lora_stats, expert_idx, num_experts, output_dtype
         # up_proj corresponds to second half of A
         up_a   = a_slice[:, inter_dim:]                    # (r, I)
 
-        device = _active_merge_device(up_W)
+        device = _active_merge_device()
         up_delta   = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ up_a.to(device, dtype = torch.float32, non_blocking = True)
 
         up_merged = up_W.to(device, dtype = torch.float32, non_blocking = True)
@@ -1023,7 +1034,7 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
         a_slice = lora_stats.lora_A[start:end, :]     # (r, H_out)
         b_slice = lora_stats.lora_B[:, start:end]     # (I_in, r)
 
-        device = _active_merge_device(down_W)
+        device = _active_merge_device()
         delta = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ a_slice.to(device, dtype = torch.float32, non_blocking = True)
         merged = down_W.to(device, dtype = torch.float32, non_blocking = True)
         merged = merged.add(delta.transpose(0, 1), alpha = lora_stats.alpha)
@@ -1328,7 +1339,7 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
         else:
             return gate_up_W
 
-        device = _active_merge_device(gate_up_W)
+        device = _active_merge_device()
         gate_up_merged = gate_up_W.to(device, dtype=torch.float32, non_blocking=True)
 
         for expert_idx in range(num_experts):
@@ -1380,7 +1391,7 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
         else:
             return down_W
 
-        device = _active_merge_device(down_W)
+        device = _active_merge_device()
         down_merged = down_W.to(device, dtype=torch.float32, non_blocking=True)
 
         for expert_idx in range(num_experts):

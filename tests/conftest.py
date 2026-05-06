@@ -1,36 +1,53 @@
-"""GPU-free test harness.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-`unsloth_zoo.__init__` calls `device_type.get_device_type()` at import time,
-which raises `NotImplementedError("Unsloth cannot find any torch accelerator")`
-on CI runners without CUDA / XPU / HIP visible. This makes any test that
-imports `unsloth_zoo` un-runnable on a GPU-free CI.
+"""pytest conftest: GPU-free harness + MLX simulation suite path.
 
-Most tests in this directory only exercise CPU-only logic (LoRA extractor
-shape parity, registration coverage, dtype helpers). They do not need a real
-accelerator. To unblock GPU-free CI, this conftest pre-installs a stub
-`unsloth_zoo.device_type` into `sys.modules` BEFORE the package is imported,
-exposing every name `unsloth_zoo/__init__.py` reads from it.
+Combines two pieces of test setup:
 
-Behavior:
-  - When a real accelerator is available (CUDA / XPU / HIP), the stub is
-    NOT installed; the real `device_type.py` runs and reports the actual
-    accelerator. CI on GPU runners still gets full fidelity.
-  - When no accelerator is available, the stub claims `cuda` so the import
-    chain in `__init__.py` does not raise. Downstream code that tries to
-    call `torch.cuda.*` will still fail at *runtime*, but at *import* the
-    package loads cleanly. Tests that stay on CPU run; tests that need
-    GPU compute would fail on their own kernel calls and should be marked
-    `@pytest.mark.skipif` separately.
-  - The stub is a no-op when `unsloth_zoo` is already imported (some
-    upstream pytest harness already loaded it).
+1. GPU-free harness for the CPU-only tests already in this directory
+   (LoRA extractor shape parity, registration coverage, dtype helpers).
+   ``unsloth_zoo.__init__`` calls ``device_type.get_device_type()`` at
+   import time, which raises ``NotImplementedError`` on CI runners
+   without CUDA / XPU / HIP visible. We pre-load the real
+   ``unsloth_zoo.device_type`` under a temporarily-True
+   ``torch.cuda.is_available()`` so the @cache permanently captures
+   ``"cuda"`` and the package import chain succeeds. When a real
+   accelerator IS available the pre-load is skipped and the real
+   detection runs.
+
+2. ``tests/`` is added to ``sys.path`` so the bundled MLX-on-torch
+   simulation suite can ``from mlx_simulation import ...``. The shim is
+   opt-in test infrastructure: it activates only when a test calls
+   ``simulate_mlx_on_torch()`` and never touches production imports of
+   ``unsloth_zoo``.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import pathlib
 import sys
 import types
 
+
+# ---------------------------------------------------------------------------
+# 1. GPU-free harness: pre-load device_type so importing unsloth_zoo
+#    without CUDA / XPU / HIP visible doesn't raise.
+# ---------------------------------------------------------------------------
 
 def _has_real_accelerator() -> bool:
     try:
@@ -56,25 +73,10 @@ def _has_real_accelerator() -> bool:
 
 
 def _preload_real_device_type() -> bool:
-    """Pre-load the REAL `unsloth_zoo.device_type` module under a
-    temporarily-mocked `torch.cuda.is_available()` so its
-    `DEVICE_TYPE = get_device_type()` initialization succeeds without a
-    real accelerator. Returns True on success.
-
-    We need the real module (not a stub) so tests like
-    `test_device_synchronize_xpu_calls_synchronize_when_present` keep
-    exercising the real `device_synchronize` body.
-
-    Strategy: build the minimal `unsloth_zoo` namespace package skeleton
-    (so the relative `from .utils import Version` works), pre-load
-    `unsloth_zoo.utils`, then pre-load `unsloth_zoo.device_type` with
-    `torch.cuda.is_available` patched to True for the duration. The
-    `@functools.cache` on `get_device_type` permanently captures the
-    "cuda" result, so subsequent calls return "cuda" without needing
-    the patch. Finally we drop the `unsloth_zoo` skeleton so the real
-    `__init__.py` runs on the next `import unsloth_zoo`; it will find
-    the already-loaded `device_type` and `utils` in `sys.modules` and
-    skip re-execution.
+    """Pre-load the REAL ``unsloth_zoo.device_type`` module under a
+    temporarily-mocked ``torch.cuda.is_available()`` so its
+    ``DEVICE_TYPE = get_device_type()`` initialization succeeds without
+    a real accelerator. Returns True on success.
     """
     if "unsloth_zoo.device_type" in sys.modules:
         return True
@@ -94,7 +96,6 @@ def _preload_real_device_type() -> bool:
         sys.modules["unsloth_zoo"] = zoo_pkg
 
     try:
-        # Pre-load utils (device_type does `from .utils import Version`).
         if "unsloth_zoo.utils" not in sys.modules:
             utils_path = os.path.join(pkg_path, "utils.py")
             utils_spec = importlib.util.spec_from_file_location(
@@ -104,7 +105,6 @@ def _preload_real_device_type() -> bool:
             sys.modules["unsloth_zoo.utils"] = utils_mod
             utils_spec.loader.exec_module(utils_mod)
 
-        # Pre-load device_type with a temporarily-True is_available.
         device_type_path = os.path.join(pkg_path, "device_type.py")
         dt_spec = importlib.util.spec_from_file_location(
             "unsloth_zoo.device_type", device_type_path,
@@ -121,26 +121,14 @@ def _preload_real_device_type() -> bool:
             torch.cuda.is_available = _orig_is_avail
     finally:
         if not skeleton_already:
-            # Drop our skeleton so the real package __init__.py executes
-            # on the next `import unsloth_zoo`. The pre-loaded submodules
-            # remain in sys.modules and will be reused by __init__.
             sys.modules.pop("unsloth_zoo", None)
 
     return True
 
 
 def _patch_torch_cuda_for_import() -> None:
-    """Monkey-patch concrete `torch.cuda.*` calls that other parts of
-    `unsloth_zoo.temporary_patches.*` make at module IMPORT time. After
-    this conftest finishes, `torch.cuda.is_available()` is back to its
-    real value (False on a GPU-free CI), so transitive deps like torchao
-    / dynamo correctly skip CUDA init when they are imported by other
-    test modules.
-
-    Specifically guards:
-      gpt_oss.py:1141 -> torch.cuda.memory.mem_get_info(0)
-    which runs at module top-level after `unsloth_zoo.device_type`'s
-    `DEVICE_TYPE` is already "cuda" (cached above).
+    """Guard concrete ``torch.cuda.*`` calls that
+    ``unsloth_zoo.temporary_patches.*`` modules make at IMPORT time.
     """
     try:
         import torch.cuda.memory as _cuda_memory  # type: ignore
@@ -151,8 +139,6 @@ def _patch_torch_cuda_for_import() -> None:
 
 if not _has_real_accelerator():
     if not _preload_real_device_type():
-        # Fallback: if we cannot find the real device_type source (eg.
-        # zipped install), fall back to a stub so tests at least import.
         stub = types.ModuleType("unsloth_zoo.device_type")
         stub.DEVICE_TYPE = "cuda"
         stub.DEVICE_TYPE_TORCH = "cuda"
@@ -166,3 +152,13 @@ if not _has_real_accelerator():
         stub.device_is_bf16_supported = lambda *a, **k: False
         sys.modules["unsloth_zoo.device_type"] = stub
     _patch_torch_cuda_for_import()
+
+
+# ---------------------------------------------------------------------------
+# 2. Make ``tests/mlx_simulation`` importable as ``mlx_simulation`` for
+#    the MLX-on-torch shim suite.
+# ---------------------------------------------------------------------------
+
+_TESTS_DIR = pathlib.Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
