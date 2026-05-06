@@ -2837,6 +2837,22 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
         if (k + ".weight") in sf_key_set:
             remapped[k] = v
             continue
+        aliased_key = None
+        for source_prefix, target_prefix in (
+            ("model.visual.", "visual."),
+            ("model.language_model.", "model."),
+            ("language_model.", "model."),
+        ):
+            if not k.startswith(source_prefix):
+                continue
+            candidate = target_prefix + k[len(source_prefix):]
+            if (candidate + ".weight") in sf_key_set:
+                aliased_key = candidate
+                break
+        if aliased_key is not None:
+            remapped[aliased_key] = v
+            changed = True
+            continue
         # Find all unique non-empty prefix candidates for this key
         suffix = k + ".weight"
         candidates = list(dict.fromkeys(
