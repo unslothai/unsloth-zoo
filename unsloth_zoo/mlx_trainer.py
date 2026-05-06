@@ -164,6 +164,7 @@ class MLXTrainingConfig:
     memory_limit_gb: float | None = None  # None = auto Metal guard (~85% of recommended working set); <= 0 disables
     cache_limit_gb: float | None = None  # Optional MLX Metal cache cap in GB; <= 0 disables override
     wired_limit_gb: float | None = None  # None = min(recommended working set, memory limit); <= 0 disables
+    disable_memory_limits: bool = False
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
@@ -455,11 +456,20 @@ class MLXTrainer:
         into paging or a kernel panic. The default is intentionally conservative:
         cap MLX to ~85% of Apple's recommended working-set size unless the user
         overrides or disables it.
+
+        Disable shortcuts:
+          - args.disable_memory_limits=True  ─► skip every cap (memory, cache, wired)
+          - args.memory_limit_gb <= 0        ─► skip memory_limit AND wired_limit
+          - args.wired_limit_gb  <= 0        ─► skip wired_limit only
+          - args.cache_limit_gb  <= 0        ─► skip cache_limit only
         """
         if not mx.metal.is_available():
             return {}
 
         args = self.args
+        if getattr(args, "disable_memory_limits", False):
+            return {}
+
         info = mx.device_info()
         recommended_gb = self._bytes_to_gb(
             info.get("max_recommended_working_set_size")
@@ -472,10 +482,14 @@ class MLXTrainer:
         # process-global cap leaks into later operations.
         self._prior_metal_limits = {}
 
+        # memory_limit_gb: None → 85% of recommended; <= 0 → disable BOTH this
+        # and the wired cap (the wired default is min(recommended, memory_limit)
+        # so disabling memory should also drop wired unless explicitly set).
         memory_limit_gb = getattr(args, "memory_limit_gb", None)
+        memory_disabled = memory_limit_gb is not None and memory_limit_gb <= 0
         if memory_limit_gb is None:
             memory_limit_gb = recommended_gb * 0.85
-        elif memory_limit_gb <= 0:
+        elif memory_disabled:
             memory_limit_gb = None
         if memory_limit_gb is not None:
             prev = mx.set_memory_limit(int(memory_limit_gb * 1e9))
@@ -490,10 +504,15 @@ class MLXTrainer:
 
         wired_limit_gb = getattr(args, "wired_limit_gb", None)
         if wired_limit_gb is None:
-            wired_limit_gb = min(
-                recommended_gb,
-                configured.get("memory_limit_gb", recommended_gb),
-            )
+            # Inherit "disabled" from memory_limit when the user didn't set one
+            # explicitly, so memory_limit_gb=-1 disables wired too.
+            if memory_disabled:
+                wired_limit_gb = None
+            else:
+                wired_limit_gb = min(
+                    recommended_gb,
+                    configured.get("memory_limit_gb", recommended_gb),
+                )
         elif wired_limit_gb <= 0:
             wired_limit_gb = None
         if wired_limit_gb is not None:
@@ -534,6 +553,8 @@ class MLXTrainer:
         args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
         model._unsloth_patch_mode = args.patch_mode
 
+        self._memory_limits_applied = self._configure_memory_limits()
+
         self._compile_decision = None
         self._compile_trace = None
         self._compile_auto_tune_applied = []
@@ -558,10 +579,7 @@ class MLXTrainer:
                         f"({reason})"
                     )
 
-        # Apply MLX Metal memory limits before building large VLM batches. This
-        # makes runaway multimodal eval/train runs fail with an allocator error
-        # instead of consuming the whole machine.
-        self._memory_limits_applied = self._configure_memory_limits()
+        # (memory limits already applied above; just log what we configured)
         if self._memory_limits_applied:
             parts = []
             if "memory_limit_gb" in self._memory_limits_applied:
