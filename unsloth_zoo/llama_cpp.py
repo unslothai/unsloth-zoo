@@ -947,9 +947,29 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
             with open(_local_script, "rb") as f:
                 original_content = f.read()
         else:
-            response = requests.get(LLAMA_CPP_CONVERT_FILE, timeout = (5, 30))
-            response.raise_for_status()
-            original_content = response.content
+            # github.com hosts the raw file but free CI runners
+            # (especially macos-14) sometimes need >30s for the read,
+            # and the failure mode is opaque -- retry up to 3x with
+            # exponential backoff and a longer per-attempt read timeout.
+            _last_err = None
+            original_content = None
+            for _attempt in range(3):
+                try:
+                    response = requests.get(
+                        LLAMA_CPP_CONVERT_FILE, timeout = (10, 120)
+                    )
+                    response.raise_for_status()
+                    original_content = response.content
+                    break
+                except requests.exceptions.RequestException as _err:
+                    _last_err = _err
+                    logger.warning(
+                        f"Unsloth: convert_hf_to_gguf.py download attempt "
+                        f"{_attempt + 1}/3 failed ({type(_err).__name__}: {_err}); retrying"
+                    )
+                    time.sleep(2 ** _attempt)
+            if original_content is None:
+                raise _last_err  # type: ignore[misc]
 
         # 2. Introspect Original Script for Supported Architectures
         logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
