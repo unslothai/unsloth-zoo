@@ -302,11 +302,62 @@ def test_every_patched_moe_experts_class_has_lora_extractor():
     _apply_all_temporary_patches()
 
     patched = _discover_patched_moe_classes()
-    assert patched, (
-        "Discovery produced zero patched MoE classes. Either no MoE "
-        "transformers module imported on this transformers version, or the "
-        "_unsloth_already_patched marker convention changed. Investigate."
-    )
+    if not patched:
+        # Disambiguate two zero-discovery causes:
+        #   (a) the installed transformers predates every MoE class surface
+        #       unsloth_zoo targets (TEMPORARY_PATCHES entries no-op silently
+        #       when their target submodule is absent) -- legitimate skip; or
+        #   (b) the `_original_<modeling_tail>_<ClassName>_forward` marker
+        #       convention used by `temporary_patches.utils.patch_function`
+        #       (and read by `_has_unsloth_patched_forward` above) drifted --
+        #       a real regression that the test must surface.
+        # Probe a stable canary: if ANY of the known MoE classes the patch
+        # functions target is importable on this transformers, then the
+        # patch surface exists and (a) is ruled out -- a zero discovery
+        # under that condition is (b), and we fail loudly. Otherwise we
+        # genuinely have no patch surface to test and skip.
+        # Structural canary: walk every transformers.models.*.modeling_* module
+        # and ask "does ANY class declare `gate_up_proj` + `down_proj` as 3D
+        # `nn.Parameter`?" That is precisely the surface
+        # `_looks_like_grouped_moe_experts` filters discovery on. If at least
+        # one such class exists anywhere in transformers, the surface this
+        # test guards IS present on this version, and discovery returning 0
+        # is a real regression (either `_has_unsloth_patched_forward`'s marker
+        # convention drifted or every TEMPORARY_PATCHES entry that targets
+        # such a class silently failed before reaching `patch_function`).
+        # Scanning the live tree avoids hard-coding model names that change
+        # as transformers grows new MoE families.
+        importable = [
+            f"{cls.__module__}.{cls.__name__}"
+            for modeling in _iter_modeling_modules()
+            for _, cls in inspect.getmembers(modeling, inspect.isclass)
+            if isinstance(cls, type)
+            and getattr(cls, "__module__", None) == modeling.__name__
+            and _looks_like_grouped_moe_experts(cls)
+        ]
+        if importable:
+            raise AssertionError(
+                "Discovery produced zero patched MoE classes, but transformers "
+                f"ships {len(importable)} class(es) whose `__init__` declares "
+                "`gate_up_proj` + `down_proj` as 3D `nn.Parameter`s -- the "
+                "exact surface this test targets. Examples: "
+                f"{importable[:5]}. That means TEMPORARY_PATCHES entries ran "
+                "without recording the `_original_<modeling_tail>_<ClassName>_"
+                "forward` marker that `_has_unsloth_patched_forward` reads. "
+                "Either `patch_function` no longer stores the original under "
+                "that attribute name, or the patch fn for every grouped-MoE "
+                "family silently failed before reaching `patch_function`. "
+                "This is the regression the test guards against -- do not "
+                "convert this back into a skip without first re-establishing "
+                "the marker convention."
+            )
+        pytest.skip(
+            "No patched MoE classes discovered AND no class anywhere in "
+            "transformers.models.* declares `gate_up_proj` + `down_proj` as "
+            "3D `nn.Parameter`s. The grouped-MoE patch surface this test "
+            "guards is absent on this transformers version; cells running a "
+            "newer transformers exercise the real assertion."
+        )
 
     # Hard contract: extractor must be registered on every patched class.
     missing = [
