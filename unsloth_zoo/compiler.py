@@ -815,7 +815,8 @@ def create_new_function(
     # Fix all softmax low precisions to float32
     new_source = higher_precision_softmax(new_source)
 
-    if new_source[0] == " ":
+    # Empty new_source (e.g. dpr, rag) -> skip dedent (avoids IndexError).
+    if new_source and new_source[0] == " ":
         spaces = new_source.find("def")
         new_source = new_source.split("\n")
         new_source = "\n".join(x[spaces:] for x in new_source)
@@ -844,6 +845,30 @@ def create_new_function(
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
         items += ["SiglipEncoder"]
+    # Detect base-class references whose base isn't defined in new_source.
+    # `functions` is pre-filtered to exclude torch_modules, so a base class
+    # like Sam3LiteTextLayerScaledResidual (no own forward, used only as
+    # a base) drops out of items. Pull it back in by scanning `class X(Y...)`
+    # bases against the full modeling-file dir.
+    try:
+        _modeling_file = eval(model_location)
+        _modeling_dir = set(dir(_modeling_file))
+    except Exception:
+        _modeling_dir = set()
+    if _modeling_dir:
+        for base in re.findall(r"^class\s+\w+\(([^)]*)\)\s*:", new_source, flags=re.MULTILINE):
+            for b in base.split(","):
+                b = b.strip().split(".")[0]
+                if (
+                    b
+                    and b in _modeling_dir
+                    and b not in items
+                    and b != name
+                    and f"class {b}(" not in new_source
+                    and f"class {b}:" not in new_source
+                    and f"def {b}(" not in new_source
+                ):
+                    items.append(b)
     # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
@@ -1339,14 +1364,20 @@ def create_standalone_class(
     # Combine all into file
     source = source + full_class
 
-    # Remove @auto_docstring
-    source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    # Transformers 5.x decorators on forward methods
-    source = re.sub(r"@merge_with_config_defaults[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    source = re.sub(r"@capture_outputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    # source = source.replace("@auto_docstring", "")
+    # Strip decorators that the cache cannot import. `[^\)]*` is unsafe
+    # when the decorator argument is a string with a literal ')' inside
+    # (voxtral / audioflamingo3 etc. use auto_docstring with custom_intro
+    # strings that contain "(a log mel spectrogram)") -- the lazy
+    # close-paren match stopped early and left the rest of the string
+    # in the cache, raising "unterminated string literal". Use a
+    # recursive group so nested parens balance correctly.
+    _PAREN_GROUP = r"(?P<grp>\((?:[^()'\"]|'[^'\\]*(?:\\.[^'\\]*)*'|\"[^\"\\]*(?:\\.[^\"\\]*)*\"|(?P>grp))*\))"
+    for _dec in (
+        "auto_docstring", "use_kernelized_func", "check_model_inputs",
+        # Transformers 5.x decorators on forward methods
+        "merge_with_config_defaults", "capture_outputs",
+    ):
+        source = regex.sub(rf"@{_dec}\s*(?:{_PAREN_GROUP})?", "", source)
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
@@ -1866,13 +1897,22 @@ def apply_fused_lm_head(forward, module=None):
             "$KWARGS$", "locals().get('loss_kwargs', {}) or locals().get('kwargs', {})"
         )
 
-        # Fix Idefics and Idefics3
-        forward = forward.replace(
-            "loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))",
-            "shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)\n"
-            "shift_labels = shift_labels.view(-1)\n"
-            "shift_labels = shift_labels.to(shift_logits.device)\n"
-            "loss = loss_fct(shift_logits, shift_labels)",
+        # Fix Idefics and Idefics3. Anchor to start-of-line + capture leading
+        # whitespace so this doesn't substring-match `lm_loss = loss_fct(...)`
+        # (gpt2 / electra / tapas) or emit unindented lines that the downstream
+        # dedent then chops 4 chars off.
+        forward = re.sub(
+            r"^([ \t]+)loss = loss_fct\("
+            r"shift_logits\.view\(-1, shift_logits\.size\(-1\)\), "
+            r"shift_labels\.view\(-1\)\)$",
+            lambda m: (
+                f"{m.group(1)}shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)\n"
+                f"{m.group(1)}shift_labels = shift_labels.view(-1)\n"
+                f"{m.group(1)}shift_labels = shift_labels.to(shift_logits.device)\n"
+                f"{m.group(1)}loss = loss_fct(shift_logits, shift_labels)"
+            ),
+            forward,
+            flags=re.MULTILINE,
         )
 
         # Find matches
@@ -2116,6 +2156,12 @@ def convert_attention_masks_to_bool(module, old_source):
     all_splits = source.strip().split("\n")
     splits = all_splits[-1].strip()
     if "return" not in splits:
+        return old_source
+    # Skip non-bare returns (e.g. kosmos2 `return x.masked_fill(...)`); the
+    # findall regex below can't parse nested parens and would produce an
+    # unbalanced `final.replace(...)` rewrite.
+    return_body = splits[len("return"):].strip()
+    if "(" in return_body:
         return old_source
     vars = re.findall(r"return[\s]{1,}(?:([^\,]{1,})\,[\s]{0,}){0,}([^\s]{1,})", splits)
     if len(vars) != 1:
@@ -2692,7 +2738,12 @@ def patch_gradient_accumulation(modeling_file, module):
     # All Unsloth Zoo code licensed under LGPLv3
 
     functions = dir(modeling_file)
-    module = eval(f"modeling_file.{module}")
+    # `module` may be a class name from dir() that isn't runtime-accessible
+    # (e.g. modeling_bit.Linear). Skip rather than abort.
+    try:
+        module = eval(f"modeling_file.{module}")
+    except AttributeError:
+        return None
     try:
         forward = module.forward
         source = inspect.getsource(forward)
@@ -2716,7 +2767,10 @@ def patch_gradient_accumulation(modeling_file, module):
 
     total_has_kwargs = False
     for call_class, inner_class in inner_classes:
-        inner_class = eval(f"modeling_file.{inner_class}")
+        try:
+            inner_class = eval(f"modeling_file.{inner_class}")
+        except AttributeError:
+            continue
         has_kwargs = (
             tuple(inspect.signature(inner_class.forward).parameters.values())[-1].kind
             == inspect._VAR_KEYWORD
@@ -3208,9 +3262,23 @@ def unsloth_compile_transformers(
     modeling_file.__UNSLOTH_PATCHED__ = True
     functions = dir(modeling_file)
     full_source = inspect.getsource(modeling_file)
-    # Order functions by ascending order
+
+    # Order by definition position. Bare-name find() hits forward refs
+    # (annotations, docstrings, `Union[..., NAME]`) so subclasses can land
+    # before their base class -- e.g. perceiver PerceiverTextPreprocessor
+    # at offset 26072 (annotation) vs its definition at 111990, raising
+    # NameError on AbstractPreprocessor at cache import.
+    def _def_pos(name):
+        for prefix in (f"class {name}(", f"class {name}:", f"def {name}("):
+            i = full_source.find(prefix)
+            if i != -1:
+                return i
+        # Fallback: bare-name (for module-level aliases without a def/class).
+        i = full_source.find(name)
+        return i if i != -1 else len(full_source)
+
     functions = list(
-        np.array(functions)[np.argsort([full_source.find(x) for x in functions])]
+        np.array(functions)[np.argsort([_def_pos(x) for x in functions])]
     )
     ordered_functions = functions.copy()
 
@@ -3394,7 +3462,11 @@ def unsloth_compile_transformers(
     disabled_scaled_dot_product_attention_modules = []
 
     for module in scaled_dot_product_attention_modules.keys():
-        source = eval(f"{model_location}.{module}")
+        # Skip class names that aren't runtime-accessible (see disable_causal_masks).
+        try:
+            source = eval(f"{model_location}.{module}")
+        except AttributeError:
+            continue
         try:
             source = inspect.getsource(source.forward)
         except:
@@ -3447,7 +3519,14 @@ def unsloth_compile_transformers(
     remove_causal_masks = []
     if disable_causal_masks:
         for module in other_classes:
-            source = eval(f"{model_location}.{module}")
+            # `other_classes` (from dir() / class regex) can include names
+            # that aren't runtime-accessible: e.g. modeling_auto._BaseModelWithGenerate
+            # (in __all__ but unbound) or modeling_{bit,regnet,resnet}.Linear
+            # (nn.Linear alias missing on some transformers versions).
+            try:
+                source = eval(f"{model_location}.{module}")
+            except AttributeError:
+                continue
             if not hasattr(source, "_update_causal_mask"):
                 continue
 
@@ -3473,7 +3552,10 @@ def unsloth_compile_transformers(
     # actively disable certain modules
     disable_modules = set()
     for module, fullgraph in torch_modules.items():
-        source = eval(f"{model_location}.{module}")
+        try:
+            source = eval(f"{model_location}.{module}")
+        except AttributeError:
+            continue
         if not hasattr(source, "forward"):
             continue
         try:
@@ -3754,7 +3836,11 @@ def unsloth_compile_transformers(
     # Allow gradient checkpointing if not enabled
     if gradient_checkpointing:
         for module in other_classes:
-            source = eval(f"{model_location}.{module}")
+            # Skip non-runtime-accessible names (see disable_causal_masks).
+            try:
+                source = eval(f"{model_location}.{module}")
+            except AttributeError:
+                continue
             if "(GradientCheckpointingLayer)" in full_source:
                 if module in FIX_GC_LAYER_CALLER_MODULES:
                     output = patch_gradient_checkpointing_layer_caller(module, source)
@@ -3791,7 +3877,11 @@ def unsloth_compile_transformers(
         if module in all_standalone_classes:
             source = all_standalone_classes[module]
         else:
-            module_cls = eval(f"{model_location}.{module}")
+            # Skip non-runtime-accessible names (see disable_causal_masks).
+            try:
+                module_cls = eval(f"{model_location}.{module}")
+            except AttributeError:
+                continue
             if hasattr(module_cls, "forward"):
                 source = inspect.getsource(module_cls.forward)
             else:
@@ -3824,7 +3914,11 @@ def unsloth_compile_transformers(
 
     if len(router_logit_cast_modules) > 0:
         for module in router_logit_cast_modules:
-            module_cls = eval(f"{model_location}.{module}")
+            # Skip non-runtime-accessible names (see disable_causal_masks).
+            try:
+                module_cls = eval(f"{model_location}.{module}")
+            except AttributeError:
+                continue
             if hasattr(module_cls, "forward"):
                 source = inspect.getsource(module_cls.forward)
             else:
@@ -3977,6 +4071,12 @@ def unsloth_compile_transformers(
                 print(f"Unsloth: Cannot run inspect.getsource on {module} with error = {e}")
                 continue
 
+            # str(inspect.signature) and source can disagree on quote style
+            # ('foo' vs "foo") or fully-qualified annotations, making find()
+            # return -1. Keep OLD `code_section = source[find("\n")+1:]` so
+            # bad_params detection still sees multi-line sig continuations
+            # (e.g. `def f(\n    a: T,\n    b: U,\n):`); only restore the
+            # trailing `:` at rebuild time below.
             where = source.find(str(parameters))
             if where == -1:
                 where = source.find("\n") + 1
@@ -4003,7 +4103,18 @@ def unsloth_compile_transformers(
                     flags=re.DOTALL,
                 )
             pass
-            parameters = f"def {module}" + parameters + code_section
+            sig = f"def {module}{parameters}"
+            # Restore `:` (and `\n` if the find()-fallback consumed it):
+            #  - find() hit:  code_section starts with `:` -> just concat
+            #  - lstrip-newline: append `:` (sig ended cleanly at a newline)
+            #  - else (find()=-1 path): append `:\n` so the body lands as
+            #    a proper indented suite instead of ` def fn(...)    """..."""`
+            if code_section.lstrip(" \t").startswith(":"):
+                parameters = sig + code_section
+            elif code_section.startswith("\n"):
+                parameters = sig + ":" + code_section
+            else:
+                parameters = sig + ":\n" + code_section
             print(f"Unsloth: Fixed up function {module}.")
 
             if module in disable_compile_functions:
@@ -4062,6 +4173,11 @@ def unsloth_compile_transformers(
                     break
             pass
             if not bad:
+                # Functions defined under `if/else` (e.g. xLSTM `soft_cap`)
+                # come back indented from inspect.getsource; dedent before
+                # prepending the decorator to avoid "unexpected indent".
+                if source and source[0] in (" ", "\t"):
+                    source = textwrap.dedent(source)
                 if module in disable_compile_functions:
                     source = re.sub(
                         r"@torch.compile\([^\n]*\)\n",
