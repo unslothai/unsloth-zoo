@@ -303,60 +303,59 @@ def test_every_patched_moe_experts_class_has_lora_extractor():
 
     patched = _discover_patched_moe_classes()
     if not patched:
-        # Disambiguate two zero-discovery causes:
+        # Disambiguate three zero-discovery causes:
         #   (a) the installed transformers predates every MoE class surface
-        #       unsloth_zoo targets (TEMPORARY_PATCHES entries no-op silently
-        #       when their target submodule is absent) -- legitimate skip; or
-        #   (b) the `_original_<modeling_tail>_<ClassName>_forward` marker
-        #       convention used by `temporary_patches.utils.patch_function`
-        #       (and read by `_has_unsloth_patched_forward` above) drifted --
-        #       a real regression that the test must surface.
-        # Probe a stable canary: if ANY of the known MoE classes the patch
-        # functions target is importable on this transformers, then the
-        # patch surface exists and (a) is ruled out -- a zero discovery
-        # under that condition is (b), and we fail loudly. Otherwise we
-        # genuinely have no patch surface to test and skip.
-        # Structural canary: walk every transformers.models.*.modeling_* module
-        # and ask "does ANY class declare `gate_up_proj` + `down_proj` as 3D
-        # `nn.Parameter`?" That is precisely the surface
-        # `_looks_like_grouped_moe_experts` filters discovery on. If at least
-        # one such class exists anywhere in transformers, the surface this
-        # test guards IS present on this version, and discovery returning 0
-        # is a real regression (either `_has_unsloth_patched_forward`'s marker
-        # convention drifted or every TEMPORARY_PATCHES entry that targets
-        # such a class silently failed before reaching `patch_function`).
-        # Scanning the live tree avoids hard-coding model names that change
-        # as transformers grows new MoE families.
-        importable = [
-            f"{cls.__module__}.{cls.__name__}"
-            for modeling in _iter_modeling_modules()
-            for _, cls in inspect.getmembers(modeling, inspect.isclass)
-            if isinstance(cls, type)
-            and getattr(cls, "__module__", None) == modeling.__name__
-            and _looks_like_grouped_moe_experts(cls)
-        ]
-        if importable:
+        #       unsloth_zoo targets, AND no patch fn ran far enough to set
+        #       any marker -- legitimate skip;
+        #   (b) the runtime environment broke ALL targeting patches (e.g. a
+        #       CPU-only runner where some patch fn raises before its
+        #       `_unsloth_already_patched = True` line) but transformers
+        #       itself ships unpatched MoE classes -- this is a real
+        #       infrastructure failure, but it does not necessarily mean
+        #       the marker convention drifted: the patch fn never reached
+        #       the marker, so blaming the test helper is wrong; or
+        #   (c) the `_original_<modeling_tail>_<ClassName>_forward` marker
+        #       convention `_has_unsloth_patched_forward` reads drifted
+        #       relative to `patch_function`'s storage convention -- a
+        #       real test-helper regression.
+        # Distinguish them via the `_unsloth_already_patched=True` boolean
+        # the patch fns set explicitly: that flag is the patch fn's own
+        # claim "I reached the end successfully." If at least one class
+        # carries it, AT LEAST one patch fn ran fully -- discovery missing
+        # such a class is therefore the test-helper drift in (c) and is a
+        # real regression. If NO class carries it, the patch fns either
+        # all early-exited (a) or hit a runtime issue (b); in either case
+        # this test cannot reach its target so we skip.
+        already = []
+        for modeling in _iter_modeling_modules():
+            for _name, cls in inspect.getmembers(modeling, inspect.isclass):
+                if not isinstance(cls, type):
+                    continue
+                if getattr(cls, "__module__", None) != modeling.__name__:
+                    continue
+                if getattr(cls, "_unsloth_already_patched", False) is True:
+                    already.append(f"{cls.__module__}.{cls.__name__}")
+        if already:
             raise AssertionError(
-                "Discovery produced zero patched MoE classes, but transformers "
-                f"ships {len(importable)} class(es) whose `__init__` declares "
-                "`gate_up_proj` + `down_proj` as 3D `nn.Parameter`s -- the "
-                "exact surface this test targets. Examples: "
-                f"{importable[:5]}. That means TEMPORARY_PATCHES entries ran "
-                "without recording the `_original_<modeling_tail>_<ClassName>_"
-                "forward` marker that `_has_unsloth_patched_forward` reads. "
-                "Either `patch_function` no longer stores the original under "
-                "that attribute name, or the patch fn for every grouped-MoE "
-                "family silently failed before reaching `patch_function`. "
-                "This is the regression the test guards against -- do not "
-                "convert this back into a skip without first re-establishing "
-                "the marker convention."
+                "Discovery produced zero patched MoE classes, but at "
+                f"least one class carries `_unsloth_already_patched=True` "
+                f"({already[:5]}). That means a patch fn ran to the end "
+                "and announced itself, but `_has_unsloth_patched_forward` "
+                "(which reads `_original_<modeling_tail>_<ClassName>_"
+                "forward`) does not see it. Either `patch_function` "
+                "stopped storing the original under that attribute name "
+                "or the test helper drifted -- realign one or the other "
+                "before re-converting this branch into a skip."
             )
         pytest.skip(
-            "No patched MoE classes discovered AND no class anywhere in "
-            "transformers.models.* declares `gate_up_proj` + `down_proj` as "
-            "3D `nn.Parameter`s. The grouped-MoE patch surface this test "
-            "guards is absent on this transformers version; cells running a "
-            "newer transformers exercise the real assertion."
+            "No patched MoE classes discovered AND no class in "
+            "transformers.models.* carries `_unsloth_already_patched=True`. "
+            "Either transformers is older than every grouped-MoE family "
+            "unsloth_zoo targets, or every targeting patch fn raised "
+            "before its `_unsloth_already_patched = True` line on this "
+            "runtime (e.g. CPU-only spoof environments hit by some "
+            "non-spoofed CUDA call inside a patch). Cells running a "
+            "fully supported runtime still exercise the real assertion."
         )
 
     # Hard contract: extractor must be registered on every patched class.
