@@ -17,12 +17,26 @@
 import os
 import torch
 import torch.nn as nn
-from .common import TEMPORARY_PATCHES
+from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
 from .utils import patch_function, process_return, raise_error, logger
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
+    extract_moe_lora_weights_for_grouped_mm,
 )
+
+
+def _gemma4_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+    return extract_moe_lora_weights_for_grouped_mm(
+        wrapper,
+        weight_A,
+        weight_B,
+        scaling,
+        num_experts,
+        model_name="Gemma4 MoE",
+        enable_logging=UNSLOTH_ENABLE_LOGGING,
+        logger_obj=logger,
+    )
 
 
 def patch_gemma4_grpo_hidden_states():
@@ -183,6 +197,7 @@ def _patch_gemma4_moe_current():
 
     ok = patch_function(Gemma4TextExperts, "forward", _gemma4_experts_forward, force=True)
     if ok:
+        Gemma4TextExperts._unsloth_lora_extractor_fn = staticmethod(_gemma4_moe_lora_extractor)
         Gemma4TextExperts._unsloth_already_patched = True
     return ok
 
@@ -243,6 +258,7 @@ def _patch_gemma4_moe_legacy():
     if not forward_ok:
         return False
 
+    Gemma4TextMoEBlock._unsloth_lora_extractor_fn = staticmethod(_gemma4_moe_lora_extractor)
     Gemma4TextMoEBlock._unsloth_already_patched = True
     return True
 
