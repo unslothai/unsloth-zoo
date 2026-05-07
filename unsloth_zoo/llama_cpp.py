@@ -50,9 +50,10 @@ from pathlib import Path
 import psutil
 try:
     from .device_type import device_is_bf16_supported
-except ImportError:
-    # device_type imports torch; on MLX-only macOS arm64 builds torch is
-    # absent. Apple Silicon Metal natively supports bf16.
+except (ImportError, NotImplementedError):
+    # Apple Silicon: pure-MLX builds raise ImportError (no torch);
+    # torch-installed builds raise NotImplementedError because
+    # device_type.py runs get_device_type() at import.
     import platform as _platform
     _IS_APPLE_SILICON = (
         _platform.system() == "Darwin" and _platform.machine() == "arm64"

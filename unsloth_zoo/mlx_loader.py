@@ -2182,16 +2182,26 @@ class FastMLXModel:
         # (e.g. layer init for runtime-quantized models) is reproducible.
         _seed_mlx_random_state(random_state)
 
-        # Step 1: Download config to decide loading path
+        # Resolve local_path then read config.json. Keep these split:
+        # LoRA-adapter dirs have adapter_config.json but no config.json,
+        # so a missing config.json must NOT wipe local_path or the
+        # adapter-detection branch below can't find adapter_config.json.
+        local_path = None
         try:
             with _temporary_hf_token_env(token):
                 local_path = str(_download(model_name, revision=revision))
-            config_path = local_path + "/config.json"
-            with open(config_path, "r") as f:
-                config_data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError, KeyError):
-            config_data = {}
+        except Exception:
             local_path = None
+
+        config_data = {}
+        if local_path:
+            config_path = os.path.join(local_path, "config.json")
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, "r") as f:
+                        config_data = json.load(f)
+                except (json.JSONDecodeError, KeyError):
+                    config_data = {}
 
         # Reject full_finetuning against a pre-quantized repo. The weights on
         # disk are int4/int8 packed; full FT would need them in a trainable
