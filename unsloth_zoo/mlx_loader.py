@@ -24,6 +24,7 @@ This avoids importing unsloth.models (which pulls in CUDA kernels).
 
 import json
 import importlib
+import importlib.util
 import inspect
 import math
 import os
@@ -85,6 +86,39 @@ def _temporary_hf_token_env(token):
                     os.environ.pop(name, None)
                 else:
                     os.environ[name] = value
+
+
+def _get_unsloth_custom_mlx_loader(model_type):
+    """Load an optional unsloth/models/mlx.py hook without importing GPU models."""
+    try:
+        unsloth_spec = importlib.util.find_spec("unsloth")
+    except Exception:
+        return None
+    search_locations = getattr(unsloth_spec, "submodule_search_locations", None) or ()
+    for root in search_locations:
+        candidate = os.path.join(root, "models", "mlx.py")
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_unsloth_optional_mlx_loader",
+                candidate,
+            )
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            get_loader = getattr(module, "get_unsloth_loader", None)
+            if get_loader is None:
+                continue
+            return get_loader(model_type)
+        except Exception as exc:
+            warnings.warn(
+                f"Unsloth: optional MLX custom loader probe failed: {exc}",
+                stacklevel=2,
+            )
+            return None
+    return None
 
 
 def _convert_mlx_dtype(model, target_dtype) -> None:
@@ -2397,11 +2431,7 @@ class FastMLXModel:
 
         # Step 2: Check unsloth custom loader registry
         model_type = config_data.get("model_type", "")
-        try:
-            from unsloth.models.mlx import get_unsloth_loader
-            custom_loader = get_unsloth_loader(model_type)
-        except (ImportError, AttributeError, NotImplementedError):
-            custom_loader = None
+        custom_loader = _get_unsloth_custom_mlx_loader(model_type)
 
         if custom_loader is not None:
             with _temporary_hf_token_env(token):

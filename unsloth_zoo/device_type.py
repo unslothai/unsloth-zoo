@@ -25,8 +25,9 @@ __all__ = [
     "device_is_bf16_supported",
 ]
 
-import torch
 import functools
+import importlib.util
+import platform
 from .utils import Version
 import inspect
 import os
@@ -34,6 +35,16 @@ import re
 import shutil
 import subprocess
 import urllib.request
+
+_IS_MLX = (
+    os.environ.get("UNSLOTH_FORCE_GPU_PATH", "0") != "1"
+    and platform.system() == "Darwin"
+    and platform.machine() == "arm64"
+    and importlib.util.find_spec("mlx") is not None
+)
+
+if not _IS_MLX:
+    import torch
 
 _PYTORCH_WHL_BASE_URL = "https://download.pytorch.org/whl"
 
@@ -120,6 +131,8 @@ pass
 
 @functools.cache
 def _detect_rocm_major_minor():
+    if _IS_MLX:
+        return None
     # Preferred sources ordered from most direct to fallback.
     sources = []
     hip_version = getattr(getattr(torch, "version", None), "hip", None)
@@ -200,11 +213,15 @@ pass
 
 @functools.cache
 def is_hip():
+    if _IS_MLX:
+        return False
     return bool(getattr(getattr(torch, "version", None), "hip", None))
 pass
 
 @functools.cache
 def get_device_type():
+    if _IS_MLX:
+        return "mlx"
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if is_hip():
             return "hip"
