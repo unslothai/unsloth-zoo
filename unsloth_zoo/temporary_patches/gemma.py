@@ -36,9 +36,6 @@ from .utils import (
 )
 import inspect
 
-_UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
-
-
 def _make_gemma3_attn_forwards(forward_function, has_cache_position):
     """Build past_key_value / past_key_values forward variants for Gemma3Attention."""
     functions = []
@@ -55,6 +52,59 @@ def _make_gemma3_attn_forwards(forward_function, has_cache_position):
     functions.append(forward_past_key_value)
     functions.append(forward_past_key_values)
     return functions
+
+
+def _prepare_gemma3_sdpa_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    batch_size: int,
+    query_length: int,
+    key_value_length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    sliding_window: Optional[int] = None,
+    is_causal: bool = True,
+) -> Optional[torch.Tensor]:
+    if attention_mask is None:
+        return None
+
+    if attention_mask.dim() == 4:
+        if attention_mask.dtype == torch.bool:
+            return attention_mask.to(device=device)
+        return attention_mask.to(device=device, dtype=dtype)
+
+    if attention_mask.dim() != 2:
+        if attention_mask.dtype == torch.bool:
+            return attention_mask.to(device=device)
+        return attention_mask.to(device=device, dtype=dtype)
+
+    padding_mask = attention_mask.to(device=device)
+    if padding_mask.dtype != torch.bool:
+        padding_mask = padding_mask != 0
+
+    mask_length = padding_mask.shape[-1]
+    if mask_length < key_value_length:
+        prefix = torch.ones(
+            (padding_mask.shape[0], key_value_length - mask_length),
+            dtype=torch.bool,
+            device=device,
+        )
+        padding_mask = torch.cat((prefix, padding_mask), dim=-1)
+    elif mask_length > key_value_length:
+        padding_mask = padding_mask[:, -key_value_length:]
+
+    attention_mask_4d = padding_mask[:, None, None, :]
+    if is_causal or sliding_window is not None:
+        past_key_values_length = max(key_value_length - query_length, 0)
+        query_positions = torch.arange(query_length, device=device) + past_key_values_length
+        key_positions = torch.arange(key_value_length, device=device)
+        causal_mask = key_positions[None, :] <= query_positions[:, None]
+        if sliding_window is not None:
+            causal_mask = causal_mask & (key_positions[None, :] > query_positions[:, None] - sliding_window)
+        attention_mask_4d = attention_mask_4d & causal_mask[None, None, :, :]
+    else:
+        attention_mask_4d = attention_mask_4d.expand(batch_size, 1, query_length, key_value_length)
+
+    return attention_mask_4d
 
 
 def patch_Gemma3Processor():
@@ -514,8 +564,6 @@ def patch_Gemma3Attention():
         """
         # output_attentions = kwargs.get("output_attentions", False)
         attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
-        if _UNSLOTH_FLEX_ATTENTION_DISABLED:
-            attn_impl = "sdpa"
         if attn_impl == "flex_attention":
             attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
             attn_output_fp32, attn_weights = attention_interface(
@@ -530,6 +578,16 @@ def patch_Gemma3Attention():
                 **kwargs,
             )
         else:
+            attn_mask_for_sdpa = _prepare_gemma3_sdpa_attention_mask(
+                attn_mask_for_sdpa,
+                batch_size = bsz,
+                query_length = query_states_fp32.shape[2],
+                key_value_length = key_states_fp32.shape[2],
+                dtype = query_states_fp32.dtype,
+                device = query_states_fp32.device,
+                sliding_window = getattr(self, "sliding_window", None),
+                is_causal = getattr(self, "is_causal", True),
+            )
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
             # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
             # We convert it to a bool for the SDPA kernel that only accepts bools.
@@ -750,8 +808,6 @@ def patch_Gemma3Attention_generic():
         """
         # output_attentions = kwargs.get("output_attentions", False)
         attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
-        if _UNSLOTH_FLEX_ATTENTION_DISABLED:
-            attn_impl = "sdpa"
         if attn_impl == "flex_attention":
             attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
             attn_output_fp32, attn_weights = attention_interface(
@@ -766,6 +822,16 @@ def patch_Gemma3Attention_generic():
                 **kwargs,
             )
         else:
+            attn_mask_for_sdpa = _prepare_gemma3_sdpa_attention_mask(
+                attn_mask_for_sdpa,
+                batch_size = bsz,
+                query_length = query_states_fp32.shape[2],
+                key_value_length = key_states_fp32.shape[2],
+                dtype = query_states_fp32.dtype,
+                device = query_states_fp32.device,
+                sliding_window = getattr(self, "sliding_window", None),
+                is_causal = getattr(self, "is_causal", True),
+            )
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
             # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
             # We convert it to a bool for the SDPA kernel that only accepts bools.
