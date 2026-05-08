@@ -19,7 +19,7 @@ MLXTrainer — drop-in trainer for Apple Silicon, mirroring SFTTrainer's API.
 
 Usage mirrors TRL notebooks:
 
-    from unsloth_zoo.mlx_trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     trainer = MLXTrainer(
         model=model,
@@ -52,7 +52,7 @@ _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
 
-from .mlx_utils import (
+from .utils import (
     make_cce_loss_fn,
     make_baseline_loss_fn,
     make_vlm_cce_loss_fn,
@@ -69,7 +69,7 @@ from .mlx_utils import (
     remove_gradient_checkpointing,
     _is_vlm_model,
 )
-from .mlx_compile import (
+from .compile import (
     build_compile_policy,
     explain_compile_support,
     get_compile_qualification,
@@ -326,15 +326,17 @@ class MLXTrainer:
         decay_steps = max(total_steps - warmup, 1)
 
         if sched_type == "cosine":
-            end_lr = lr * 0.1
-            main_schedule = optim.cosine_decay(lr, decay_steps, end=end_lr)
+            main_schedule = optim.cosine_decay(lr, decay_steps, end=0.0)
         elif sched_type == "linear":
             main_schedule = optim.linear_schedule(lr, 0.0, decay_steps)
         else:  # constant
             main_schedule = lr
 
         if warmup > 0:
-            warmup_fn = optim.linear_schedule(0.0, lr, warmup)
+            def warmup_fn(step):
+                step = mx.array(step)
+                step = mx.minimum(step + 1, mx.array(warmup))
+                return step * (lr / (warmup + 1))
             if callable(main_schedule):
                 return optim.join_schedules(
                     [warmup_fn, main_schedule], [warmup]
@@ -347,6 +349,18 @@ class MLXTrainer:
 
         return main_schedule
 
+    @staticmethod
+    def _schedule_value(schedule, step):
+        if callable(schedule):
+            return schedule(mx.array(step))
+        return schedule
+
+    def _set_optimizer_lr_for_step(self, optimizer, step):
+        schedule = getattr(self, "_lr_schedule", None)
+        if schedule is None:
+            return
+        optimizer.learning_rate = self._schedule_value(schedule, step)
+
     def _build_optimizer(self, total_steps):
         """Create MLX optimizer with LR schedule from config.
 
@@ -355,6 +369,8 @@ class MLXTrainer:
         (matching HuggingFace Trainer behavior).
         """
         schedule = self._build_schedule(total_steps)
+        initial_lr = self._schedule_value(schedule, 0)
+        self._lr_schedule = schedule if callable(schedule) else None
         wd = self.args.weight_decay
 
         opt_name = _normalize_mlx_optimizer_name(self.args.optim)
@@ -375,20 +391,20 @@ class MLXTrainer:
 
         if opt_name == "adafactor":
             optimizer = optim.Adafactor(
-                learning_rate=schedule,
+                learning_rate=initial_lr,
                 relative_step=False,
                 scale_parameter=False,
             )
         elif opt_name == "adamw":
-            optimizer = optim.AdamW(learning_rate=schedule, weight_decay=wd)
+            optimizer = optim.AdamW(learning_rate=initial_lr, weight_decay=wd)
         elif opt_name == "adam":
-            optimizer = optim.Adam(learning_rate=schedule)
+            optimizer = optim.Adam(learning_rate=initial_lr)
         elif opt_name == "sgd":
-            optimizer = optim.SGD(learning_rate=schedule, weight_decay=wd)
+            optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=wd)
         elif opt_name == "muon":
-            optimizer = optim.Muon(learning_rate=schedule, weight_decay=wd)
+            optimizer = optim.Muon(learning_rate=initial_lr, weight_decay=wd)
         elif opt_name == "lion":
-            optimizer = optim.Lion(learning_rate=schedule, weight_decay=wd)
+            optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=wd)
         self._resolved_optimizer_name = opt_name
         return optimizer
 
@@ -608,9 +624,9 @@ class MLXTrainer:
         config = getattr(model, "_config", {})
         model_type = config.get("model_type", "") if isinstance(config, dict) else ""
         if "qwen3_5" in model_type:
-            from .mlx_loader import _fix_qwen35_attention_cache
+            from .loader import _fix_qwen35_attention_cache
             _fix_qwen35_attention_cache(model)
-            from .gated_delta_vjp import patch_gated_delta
+            from ..gated_delta_vjp import patch_gated_delta
             patch_gated_delta()
 
         try:
@@ -864,10 +880,6 @@ class MLXTrainer:
         compile_policy = build_compile_policy(args=args)
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = compile_policy.mode != "eager"
-        # why: text MLX has no compile qualification pipeline; stay eager
-        # unless UNSLOTH_MLX_TEXT_COMPILE=1.
-        if not is_vlm and _use_compile and os.environ.get("UNSLOTH_MLX_TEXT_COMPILE", "0") != "1":
-            _use_compile = False
         if is_vlm and _use_compile:
             qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
             if qual is not None:
@@ -1006,6 +1018,10 @@ class MLXTrainer:
                 batch_idx += 1
 
             do_update = (it % grad_accum == 0)
+            if do_update:
+                # Keep callable scheduler evaluation outside mx.compile. The
+                # compiled step reads the scalar LR already in optimizer state.
+                self._set_optimizer_lr_for_step(optimizer, it // grad_accum - 1)
 
             try:
                 lvalue, toks, grad_accum_state = step_fn(
@@ -1267,7 +1283,7 @@ class MLXTrainer:
 
     def save_model(self, output_dir=None):
         """Save LoRA adapters or full merged model (if no LoRA)."""
-        from .mlx_utils import save_merged_model
+        from .utils import save_merged_model
         output_dir = output_dir or self.args.output_dir
 
         trainable = dict(tree_flatten(self.model.trainable_parameters()))
@@ -1288,7 +1304,7 @@ class MLXTrainer:
                     break
 
 
-            from .mlx_utils import _get_transformer_layers
+            from .utils import _get_transformer_layers
             layers = _get_transformer_layers(self.model)
             _num_layers = len(layers) if layers else -1
 
@@ -1590,7 +1606,7 @@ def train_on_responses_only(
     Returns:
         The trainer (for chaining), or the masking closure if return_function=True.
     """
-    from .dataset_utils import (
+    from ..dataset_utils import (
         train_on_responses_only as _hf_train_on_responses_only,
     )
 

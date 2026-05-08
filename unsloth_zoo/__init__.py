@@ -90,16 +90,11 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 
 
 from importlib.util import find_spec
-import platform as _check_platform
+from .mlx.runtime import is_mlx_available
 
 # Detect Apple Silicon MLX mode:
 # Either torch is absent (pure MLX), or unsloth already detected MLX
-_is_mlx_only = (
-    os.environ.get("UNSLOTH_FORCE_GPU_PATH", "0") != "1"
-    and _check_platform.system() == "Darwin"
-    and _check_platform.machine() == "arm64"
-    and find_spec("mlx") is not None
-)
+_is_mlx_only = is_mlx_available()
 
 if _is_mlx_only:
     # MLX mode: skip all CUDA/torch-specific initialization.
@@ -107,14 +102,14 @@ if _is_mlx_only:
     UNSLOTH_ZOO_IS_PRESENT = True
     DEVICE_TYPE = "mlx"
     DEVICE_TYPE_TORCH = "mps"
-    DEVICE_COUNT = 0
+    DEVICE_COUNT = 1
     ALLOW_PREQUANTIZED_MODELS = True
-    del _is_mlx_only, _check_platform, find_spec
+    del _is_mlx_only, is_mlx_available, find_spec
     # Everything below this point is GPU-only. Use a flag to gate it.
     _SKIP_GPU_INIT = True
 else:
     _SKIP_GPU_INIT = False
-    del _is_mlx_only, _check_platform
+    del _is_mlx_only, is_mlx_available
 
 # Inject triton & bitsandbytes stubs on Apple Silicon with MLX so unsloth's
 # CUDA-only imports don't error at startup. _SKIP_GPU_INIT=True is set only

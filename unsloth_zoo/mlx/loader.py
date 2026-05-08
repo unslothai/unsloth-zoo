@@ -24,7 +24,6 @@ This avoids importing unsloth.models (which pulls in CUDA kernels).
 
 import json
 import importlib
-import importlib.util
 import inspect
 import math
 import os
@@ -34,7 +33,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
 
-from .mlx_compile import (
+from .compile import (
     explain_compile_support,
     get_compile_qualification,
     get_compile_trait_report,
@@ -86,39 +85,6 @@ def _temporary_hf_token_env(token):
                     os.environ.pop(name, None)
                 else:
                     os.environ[name] = value
-
-
-def _get_unsloth_custom_mlx_loader(model_type):
-    """Load an optional unsloth/models/mlx.py hook without importing GPU models."""
-    try:
-        unsloth_spec = importlib.util.find_spec("unsloth")
-    except Exception:
-        return None
-    search_locations = getattr(unsloth_spec, "submodule_search_locations", None) or ()
-    for root in search_locations:
-        candidate = os.path.join(root, "models", "mlx.py")
-        if not os.path.isfile(candidate):
-            continue
-        try:
-            spec = importlib.util.spec_from_file_location(
-                "_unsloth_optional_mlx_loader",
-                candidate,
-            )
-            if spec is None or spec.loader is None:
-                continue
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            get_loader = getattr(module, "get_unsloth_loader", None)
-            if get_loader is None:
-                continue
-            return get_loader(model_type)
-        except Exception as exc:
-            warnings.warn(
-                f"Unsloth: optional MLX custom loader probe failed: {exc}",
-                stacklevel=2,
-            )
-            return None
-    return None
 
 
 def _convert_mlx_dtype(model, target_dtype) -> None:
@@ -1860,21 +1826,21 @@ def _ensure_vlm_prompt_utils_patched():
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
-    from .mlx_utils import save_pretrained_merged
+    from .utils import save_pretrained_merged
     tokenizer = tokenizer or self._tokenizer
     save_pretrained_merged(self, tokenizer, save_directory, **kwargs)
 
 
 def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                                quantization_method="fast_quantized", **kwargs):
-    from .mlx_utils import save_pretrained_gguf
+    from .utils import save_pretrained_gguf
     tokenizer = tokenizer or self._tokenizer
     save_pretrained_gguf(self, tokenizer, save_directory,
                          quantization_method=quantization_method)
 
 
 def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, **kwargs):
-    from .mlx_utils import push_to_hub_merged
+    from .utils import push_to_hub_merged
     tokenizer = tokenizer or self._tokenizer
     # If save_directory wasn't given, fall back to repo_id (relative dir
     # named after the repo). Callers that already saved locally should
@@ -1885,14 +1851,14 @@ def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, 
 
 def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                             quantization_method="fast_quantized", **kwargs):
-    from .mlx_utils import push_to_hub_gguf
+    from .utils import push_to_hub_gguf
     tokenizer = tokenizer or self._tokenizer
     push_to_hub_gguf(self, tokenizer, repo_id, repo_id=repo_id,
                      quantization_method=quantization_method, **kwargs)
 
 
 def _mlx_save_lora_adapters(self, path, adapter_config=None):
-    from .mlx_utils import save_lora_adapters
+    from .utils import save_lora_adapters
     save_lora_adapters(self, path, adapter_config=adapter_config)
 
 
@@ -2429,51 +2395,9 @@ class FastMLXModel:
                     raise
                 print(f"Unsloth: LoRA adapter detection failed ({e}), falling back to standard load.")
 
-        # Step 2: Check unsloth custom loader registry
         model_type = config_data.get("model_type", "")
-        custom_loader = _get_unsloth_custom_mlx_loader(model_type)
 
-        if custom_loader is not None:
-            with _temporary_hf_token_env(token):
-                model, tokenizer_or_processor = custom_loader(
-                    model_name, config_data, max_seq_length=max_seq_length, token=token
-                )
-            if text_only is False or _is_vlm(config_data):
-                from .mlx_utils import normalize_vlm_processor_chat_template
-
-                tokenizer_or_processor = normalize_vlm_processor_chat_template(
-                    tokenizer_or_processor,
-                    chat_template=chat_template,
-                    model_name=model_name,
-                    model_type=model_type,
-                    strict=False,
-                )
-                model._is_vlm_model = True
-                model._processor = tokenizer_or_processor
-                _patch_mixed_precision_set_dtype(model)
-            elif chat_template is not None:
-                from .mlx_utils import normalize_mlx_chat_template
-
-                tokenizer_or_processor = normalize_mlx_chat_template(
-                    tokenizer_or_processor,
-                    chat_template=chat_template,
-                    model_name=model_name,
-                    model_type=model_type,
-                    is_vlm=False,
-                    strict=False,
-                )
-            model._config = config_data
-            model._hf_repo = model_name
-            model._src_path = local_path
-            model._unsloth_base_revision = revision
-            model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
-            model.max_seq_length = max_seq_length
-            model._unsloth_patch_mode = patch_mode
-            model._unsloth_full_finetuning = bool(full_finetuning)
-            _patch_mlx_saving(model, tokenizer_or_processor)
-            return model, tokenizer_or_processor
-
-        # Step 3: Route based on text_only
+        # Step 2: Route based on text_only
         is_vlm = False
         force_vlm_text_path = bool(text_only is True and _prefer_vlm_loader_for_text(config_data, model_type))
 
@@ -2565,7 +2489,7 @@ class FastMLXModel:
                 import mlx.core as mx
                 mx.eval(model.parameters())
 
-            from .mlx_utils import (
+            from .utils import (
                 normalize_mlx_chat_template,
                 normalize_vlm_processor_chat_template,
             )
@@ -2675,7 +2599,7 @@ class FastMLXModel:
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
-            from .mlx_utils import normalize_mlx_chat_template
+            from .utils import normalize_mlx_chat_template
 
             tokenizer = normalize_mlx_chat_template(
                 tokenizer,
@@ -2949,7 +2873,7 @@ class FastMLXModel:
             _apply_gc = bool(use_gradient_checkpointing)
 
         if _apply_gc:
-            from .mlx_utils import apply_gradient_checkpointing
+            from .utils import apply_gradient_checkpointing
             apply_gradient_checkpointing(model)
 
         import mlx.utils

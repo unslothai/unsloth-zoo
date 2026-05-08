@@ -23,12 +23,12 @@ __all__ = [
     "device_synchronize",
     "device_empty_cache",
     "device_is_bf16_supported",
+    "is_mlx_available",
 ]
 
 import functools
-import importlib.util
-import platform
 from .utils import Version
+from .mlx.runtime import is_mlx_available
 import inspect
 import os
 import re
@@ -36,12 +36,7 @@ import shutil
 import subprocess
 import urllib.request
 
-_IS_MLX = (
-    os.environ.get("UNSLOTH_FORCE_GPU_PATH", "0") != "1"
-    and platform.system() == "Darwin"
-    and platform.machine() == "arm64"
-    and importlib.util.find_spec("mlx") is not None
-)
+_IS_MLX = is_mlx_available()
 
 if not _IS_MLX:
     import torch
@@ -251,6 +246,7 @@ DEVICE_TYPE : str = get_device_type()
 # HIP fails for autocast and other torch functions. Use CUDA instead
 DEVICE_TYPE_TORCH = DEVICE_TYPE
 if DEVICE_TYPE_TORCH == "hip": DEVICE_TYPE_TORCH = "cuda"
+elif DEVICE_TYPE_TORCH == "mlx": DEVICE_TYPE_TORCH = "mps"
 
 @functools.cache
 def get_device_count():

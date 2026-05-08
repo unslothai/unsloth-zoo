@@ -21,6 +21,7 @@ import sys
 import importlib.util
 from typing import Optional, Tuple
 from torch.autograd import Function
+from unsloth_zoo.mlx.runtime import is_mlx_available
 
 # Get compile location
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
@@ -224,14 +225,7 @@ def _init_triton_allocator():
 def _check_grouped_gemm_available():
     """Check if Unsloth grouped GEMM kernels are available."""
     if os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1": return False
-    if os.environ.get("UNSLOTH_FORCE_GPU_PATH", "0") != "1":
-        import platform
-        if (
-            platform.system() == "Darwin"
-            and platform.machine() == "arm64"
-            and importlib.util.find_spec("mlx") is not None
-        ):
-            return False
+    if is_mlx_available(): return False
 
     global _GROUPED_GEMM_AVAILABLE
     if _GROUPED_GEMM_AVAILABLE is not None: return _GROUPED_GEMM_AVAILABLE

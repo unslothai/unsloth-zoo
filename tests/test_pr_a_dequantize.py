@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-PR-A integration: exercise unsloth_zoo.mlx_loader._dequantize_selected_mlx_modules.
+PR-A integration: exercise unsloth_zoo.mlx.loader._dequantize_selected_mlx_modules.
 
 Builds a synthetic MLX-style model with one QuantizedLinear submodule,
 runs PR-A's dequantize-and-replace helper, verifies the result is
@@ -68,7 +68,7 @@ def test_dequantize_selected_mlx_modules_swap():
     """Build a Module with a QuantizedLinear, dequant-replace, verify swap."""
     import mlx.core as mx
     import mlx.nn as nn
-    from unsloth_zoo.mlx_loader import _dequantize_selected_mlx_modules
+    from unsloth_zoo.mlx.loader import _dequantize_selected_mlx_modules
 
     # 4-bit weight: 8 input dims (one group), 2 output dims, group_size=8.
     bits, group_size = 4, 8
@@ -122,7 +122,7 @@ def test_dequantize_selected_mlx_modules_swap():
 def test_dequantize_predicate_filters():
     """Predicate should let some QuantizedLinear modules through unchanged."""
     import mlx.nn as nn
-    from unsloth_zoo.mlx_loader import _dequantize_selected_mlx_modules
+    from unsloth_zoo.mlx.loader import _dequantize_selected_mlx_modules
 
     bits, group_size = 4, 8
     packed, scales, biases = _make_packed_4bit([0]*8, group_size, bits)
@@ -145,7 +145,7 @@ def test_dequantize_predicate_filters():
 
 def test_dequantize_no_match_returns_zero():
     import mlx.nn as nn
-    from unsloth_zoo.mlx_loader import _dequantize_selected_mlx_modules
+    from unsloth_zoo.mlx.loader import _dequantize_selected_mlx_modules
 
     class Empty(nn.Module):
         def __init__(self):

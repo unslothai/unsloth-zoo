@@ -52,7 +52,7 @@ def _ce_reference(hidden, weight, targets, ignore_index=-100, softcap=0.0):
 
 def test_cce_forward_pure_python_matches_reference():
     """The kernel-less branch of _forward_chunked_fused_finalize."""
-    from unsloth_zoo.mlx_cce.runtime_cce import _forward_chunked_fused_finalize
+    from unsloth_zoo.mlx.cce.runtime_cce import _forward_chunked_fused_finalize
 
     torch.manual_seed(0)
     n, hidden_dim, vocab = 4, 8, 32
@@ -72,7 +72,7 @@ def test_cce_forward_pure_python_matches_reference():
 
 def test_cce_with_softcap():
     """Softcap path matches reference too."""
-    from unsloth_zoo.mlx_cce.runtime_cce import _forward_chunked_fused_finalize
+    from unsloth_zoo.mlx.cce.runtime_cce import _forward_chunked_fused_finalize
 
     torch.manual_seed(0)
     n, hidden_dim, vocab = 4, 8, 32
@@ -93,7 +93,7 @@ def test_cce_with_softcap():
 
 def test_cce_with_ignore_index():
     """Ignore-index zeros out loss for those positions."""
-    from unsloth_zoo.mlx_cce.runtime_cce import _forward_chunked_fused_finalize
+    from unsloth_zoo.mlx.cce.runtime_cce import _forward_chunked_fused_finalize
 
     torch.manual_seed(0)
     n, hidden_dim, vocab = 4, 8, 32
@@ -114,7 +114,7 @@ def test_cce_with_ignore_index():
 
 def test_cce_chunked_matches_unchunked():
     """Chunked online LSE must equal a single-shot computation."""
-    from unsloth_zoo.mlx_cce.runtime_cce import _forward_chunked_fused_finalize
+    from unsloth_zoo.mlx.cce.runtime_cce import _forward_chunked_fused_finalize
 
     torch.manual_seed(0)
     n, hidden_dim, vocab = 4, 8, 64
