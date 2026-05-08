@@ -2066,6 +2066,7 @@ class FastMLXModel:
         patch_mode="patched",
         revision=None,
         random_state=3407,
+        float32_mixed_precision=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -2082,8 +2083,11 @@ class FastMLXModel:
             load_in_4bit: Accepted for API compat with CUDA unsloth.
             full_finetuning: When True, force-disable runtime quantization
                 (``load_in_4bit`` etc.) so the full-precision weights are
-                trainable. ``get_peft_model`` becomes a no-op for models
-                loaded this way.
+                trainable. By default MLX mirrors Unsloth Torch full
+                finetuning and upcasts trainable floating weights to float32;
+                pass ``float32_mixed_precision=False`` to keep native bf16
+                weights on bf16-capable Apple Silicon. ``get_peft_model``
+                becomes a no-op for models loaded this way.
             token: HuggingFace token for gated models.
             text_only: Loading mode:
                 None  — auto-detect from config (default)
@@ -2127,6 +2131,23 @@ class FastMLXModel:
                     f"Pass dtype='float16' on M1/M2.",
                     stacklevel=2,
                 )
+        if full_finetuning:
+            original_target_dtype = target_dtype
+            if target_dtype == mx.bfloat16 and float32_mixed_precision is False:
+                print(
+                    "Unsloth: Using bfloat16 MLX full finetuning. "
+                    "This reduces memory but can differ from Unsloth Torch's "
+                    "default float32 full-finetune path."
+                )
+            else:
+                target_dtype = mx.float32
+                if original_target_dtype != mx.float32:
+                    print(
+                        "Unsloth: Using float32 MLX full finetuning to match "
+                        "Unsloth Torch full-finetune defaults. Pass "
+                        "float32_mixed_precision=False to keep native bf16 "
+                        "weights on supported Apple Silicon."
+                    )
         try:
             from mlx_lm import load as mlx_load
             from mlx_lm.utils import _download
@@ -2328,6 +2349,7 @@ class FastMLXModel:
                         patch_mode=patch_mode,
                         revision=adapter_base_revision,
                         random_state=random_state,
+                        float32_mixed_precision=float32_mixed_precision,
                         **(
                             {"mlx_quantization_config": adapter_mlx_quant_config}
                             if adapter_mlx_quant_config is not None

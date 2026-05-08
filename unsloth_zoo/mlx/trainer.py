@@ -710,10 +710,6 @@ class MLXTrainer:
                   f"(ratio={embedding_lr_ratio:.3f} of main LR {main_lr:.2e}).")
 
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
-        _has_lora_trainables = any(
-            "lora" in name
-            for name, _ in tree_flatten(model.trainable_parameters())
-        )
         _warned_skip_optimizer_state_grad_norm = False
 
         # Build step functions following mlx-lm's pattern
@@ -804,10 +800,7 @@ class MLXTrainer:
             # For Adam-family optimizers, recover ||g|| from the second moment
             # after the update: v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2.
             # This avoids adding a second consumer to the lazy backward graph.
-            # Limit this to LoRA/QLoRA Adam-family updates: full finetuning can
-            # keep bf16 optimizer state, and compiled full finetuning has
-            # produced invalid reconstructed norms.
-            return _has_lora_trainables and getattr(optimizer, "betas", None)
+            return getattr(optimizer, "betas", None)
 
         def _apply_update(grad, toks_f):
             """Common gradient post-processing and optimizer update.
@@ -889,6 +882,12 @@ class MLXTrainer:
             # and forces optimizer.update to promote params/m/v to fp32).
             if prev_state is not None:
                 prev_grad, prev_toks = prev_state
+                # Accumulated gradients are optimizer state, not something to
+                # differentiate through on the next compiled micro-batch. This
+                # keeps custom VJP losses such as CCE from retaining/corrupting
+                # the carried bf16 accumulation graph.
+                prev_grad = tree_map(mx.stop_gradient, prev_grad)
+                prev_toks = mx.stop_gradient(prev_toks)
                 grad = tree_map(
                     lambda g, p: p + g * toks_f.astype(g.dtype),
                     grad, prev_grad,
@@ -904,6 +903,8 @@ class MLXTrainer:
                 grad_norm = _apply_update(grad, toks_f)
                 return lvalue, toks, None, grad_norm
 
+            grad = tree_map(mx.stop_gradient, grad)
+            toks_f = mx.stop_gradient(toks_f)
             return lvalue, toks, (grad, toks_f), None
 
         compile_policy = build_compile_policy(args=args)
