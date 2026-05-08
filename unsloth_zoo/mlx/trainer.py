@@ -120,15 +120,9 @@ class MLXTrainingConfig:
     weight_decay: float = 0.001
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
     # Elementwise clipping (PyTorch's torch.nn.utils.clip_grad_value_).
-    # Clamps every grad value to [-max_grad_value, max_grad_value] leaf-by-leaf —
-    # zero extra memory (no cross-leaf reduction). Mirrors mlx-vlm's defaults:
-    #     None  → auto-pick from trainable param dtype
-    #             bfloat16 → 5.0   (more dynamic range, looser threshold)
-    #             float16  → 1.0   (less dynamic range, tighter threshold)
-    #             else     → 0.0   (off)
-    #     0.0   → disabled
-    #     >0    → explicit threshold
-    max_grad_value: float | None = None
+    # Clamps every grad value to [-max_grad_value, max_grad_value] leaf-by-leaf
+    # with no cross-leaf reduction. Set 0.0 to disable.
+    max_grad_value: float | None = 3.0
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
     embedding_learning_rate: float = 0.0  # 0 = disabled, 5e-5 = recommended
@@ -238,7 +232,8 @@ class MLXTrainer:
     def add_step_callback(self, fn):
         """Register a callback called after each logged step.
 
-        fn(step, total_steps, loss, lr, tokens_sec, peak_gb, elapsed, num_tokens)
+        fn(step, total_steps, loss, lr, tokens_sec, peak_gb, elapsed,
+           num_tokens, grad_norm=None)
         """
         self._step_callbacks.append(fn)
 
@@ -717,29 +712,18 @@ class MLXTrainer:
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
 
         # Build step functions following mlx-lm's pattern
-        max_grad_norm = args.max_grad_norm
+        max_grad_norm = float(args.max_grad_norm or 0.0)
         # Elementwise clip (clip_grad_value_): leaf-local, free memory.
-        # None → auto-pick by trainable dtype (mlx-vlm defaults: bf16=5, fp16=1).
-        _raw_mgv = getattr(args, "max_grad_value", None)
-        if _raw_mgv is None:
-            _trainable_dtype = None
-            for _, _v in tree_flatten(model.trainable_parameters()):
-                if _v.dtype in (mx.bfloat16, mx.float16, mx.float32):
-                    _trainable_dtype = _v.dtype
-                    break
-            if _trainable_dtype == mx.bfloat16:
-                max_grad_value = 5.0
-            elif _trainable_dtype == mx.float16:
-                max_grad_value = 1.0
-            else:
-                max_grad_value = 0.0
-            if max_grad_value > 0:
-                print(
-                    f"Unsloth: auto grad value clip = ±{max_grad_value:g} "
-                    f"(trainable dtype: {_trainable_dtype})."
-                )
-        else:
-            max_grad_value = float(_raw_mgv or 0.0)
+        # Prefer value clipping when both clipping modes are requested; global
+        # norm clipping is exact but materially increases memory on MLX.
+        _raw_mgv = getattr(args, "max_grad_value", 3.0)
+        max_grad_value = 3.0 if _raw_mgv is None else float(_raw_mgv or 0.0)
+        if max_grad_norm > 0 and max_grad_value > 0:
+            print(
+                "Unsloth: max_grad_norm and max_grad_value are both enabled; "
+                "ignoring max_grad_norm in favor of max_grad_value."
+            )
+            max_grad_norm = 0.0
         _clip_grad_value = max_grad_value > 0
         state = [model.state, optimizer.state, mx.random.state]
         # The direct grad_accum==1 fast path delegates clipping to
@@ -771,43 +755,44 @@ class MLXTrainer:
                 scale = scale.astype(dtype)
             return scale
 
+        def _grad_norm_from_flat(flat_grad):
+            norm_sq = mx.array(0.0, dtype=mx.float32)
+            for _, value in flat_grad:
+                value_f = value.astype(mx.float32)
+                norm_sq = norm_sq + mx.sum(value_f * value_f)
+            return mx.sqrt(norm_sq)
+
         def _apply_update(grad, toks_f):
             """Common gradient post-processing and optimizer update.
 
-            This uses a two-pass exact clip path instead of materializing
-            multiple full gradient trees. The resulting update is numerically
-            equivalent to the older implementation while avoiding the extra
-            tree allocation from ``optim.clip_grad_norm`` on large MLX runs.
+            Scale accumulated gradients by supervised-token count, then apply
+            the selected clipping mode. Global norm clipping uses MLX's helper
+            and reports that norm. Otherwise, report a scalar-only norm without
+            materializing an extra globally clipped gradient tree.
             """
             safe_toks_f = mx.maximum(
                 toks_f, mx.array(1.0, dtype=mx.float32)
             )
             flat_grad = tree_flatten(grad)
-            need_norm = max_grad_norm > 0
-            grad_norm = mx.array(0.0, dtype=mx.float32)
-            clip_scale = None
-
-            if need_norm:
-                norm_sq = mx.array(0.0, dtype=mx.float32)
-                for name, value in flat_grad:
-                    scaled = value.astype(mx.float32) * _grad_leaf_scale(
-                        name, safe_toks_f
-                    )
-                    norm_sq = norm_sq + mx.sum(scaled * scaled)
-                grad_norm = mx.sqrt(norm_sq)
-                if max_grad_norm > 0:
-                    clip_scale = mx.minimum(
-                        mx.array(max_grad_norm, dtype=mx.float32) / (grad_norm + 1e-6),
-                        mx.array(1.0, dtype=mx.float32),
-                    )
-
-            final_grad = tree_unflatten([
-                (
-                    name,
-                    value * _grad_leaf_scale(name, safe_toks_f, clip_scale, value.dtype),
+            grad_norm = None
+            final_items = []
+            norm_sq = mx.array(0.0, dtype=mx.float32)
+            report_scalar_norm = max_grad_norm <= 0
+            for name, value in flat_grad:
+                scaled = value * _grad_leaf_scale(
+                    name, safe_toks_f, None, value.dtype
                 )
-                for name, value in flat_grad
-            ])
+                final_items.append((name, scaled))
+                if report_scalar_norm:
+                    scaled_f = scaled.astype(mx.float32)
+                    norm_sq = norm_sq + mx.sum(scaled_f * scaled_f)
+            final_grad = tree_unflatten(final_items)
+            if max_grad_norm > 0:
+                final_grad, grad_norm = optim.clip_grad_norm(
+                    final_grad, max_norm=max_grad_norm
+                )
+            elif report_scalar_norm:
+                grad_norm = mx.sqrt(norm_sq)
             if _clip_grad_value:
                 # Elementwise clip after norm-scaling, before optimizer step.
                 final_grad = tree_map(
@@ -815,6 +800,7 @@ class MLXTrainer:
                     final_grad,
                 )
             optimizer.update(model, final_grad)
+            return grad_norm
 
         def _apply_update_direct(grad):
             """Fast exact path for the common ``grad_accum == 1`` case.
@@ -829,8 +815,11 @@ class MLXTrainer:
             In this case the raw gradients already represent the final
             per-token average, so we can clip/update the original tree directly.
             """
+            grad_norm = None
             if max_grad_norm > 0:
-                grad, _ = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
+                grad, grad_norm = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
+            else:
+                grad_norm = _grad_norm_from_flat(tree_flatten(grad))
             if _clip_grad_value:
                 # Elementwise clip per leaf — free memory (no cross-leaf reduction).
                 grad = tree_map(
@@ -838,6 +827,7 @@ class MLXTrainer:
                     grad,
                 )
             optimizer.update(model, grad)
+            return grad_norm
 
         # Unified step function for both VLM and text training.
         # VLM: batch_data is a dict → loss_and_grad_fn(model, batch_dict)
@@ -849,10 +839,11 @@ class MLXTrainer:
                 (lvalue, toks), grad = loss_and_grad_fn(model, batch_data[0], batch_data[1], batch_data[2])
 
             if _direct_single_step_update:
-                _apply_update_direct(grad)
-                return lvalue, toks, None
+                grad_norm = _apply_update_direct(grad)
+                return lvalue, toks, None, grad_norm
 
             toks_f = toks.astype(mx.float32)
+            grad_norm = mx.array(0.0, dtype=mx.float32)
 
             # Scale-and-accumulate in a single tree_map per micro-batch, casting
             # the scalar to each leaf's dtype so bf16/fp16 grad trees stay in
@@ -872,14 +863,20 @@ class MLXTrainer:
                 )
 
             if do_update:
-                _apply_update(grad, toks_f)
-                return lvalue, toks, None
+                grad_norm = _apply_update(grad, toks_f)
+                return lvalue, toks, None, grad_norm
 
-            return lvalue, toks, (grad, toks_f)
+            return lvalue, toks, (grad, toks_f), None
 
         compile_policy = build_compile_policy(args=args)
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = compile_policy.mode != "eager"
+        if _use_compile and max_grad_norm > 0 and grad_accum > 1:
+            print(
+                "Unsloth: mx.compile disabled because MLX global norm "
+                "clipping is enabled with gradient accumulation."
+            )
+            _use_compile = False
         if is_vlm and _use_compile:
             qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
             if qual is not None:
@@ -1024,7 +1021,7 @@ class MLXTrainer:
                 self._set_optimizer_lr_for_step(optimizer, it // grad_accum - 1)
 
             try:
-                lvalue, toks, grad_accum_state = step_fn(
+                lvalue, toks, grad_accum_state, grad_norm = step_fn(
                     batch_data, grad_accum_state, do_update,
                 )
             except (ValueError, RuntimeError) as e:
@@ -1048,7 +1045,7 @@ class MLXTrainer:
                     step_fn = _uncompiled_step_fn
                     _use_compile = False
                     state = [model.state, optimizer.state, mx.random.state]
-                    lvalue, toks, grad_accum_state = step_fn(
+                    lvalue, toks, grad_accum_state, grad_norm = step_fn(
                         batch_data, grad_accum_state, do_update,
                     )
                 else:
@@ -1058,9 +1055,15 @@ class MLXTrainer:
             n_tokens += toks
             steps += 1
             if grad_accum_state is not None:
-                mx.eval(state, losses, n_tokens, grad_accum_state[0], grad_accum_state[1])
+                if grad_norm is not None:
+                    mx.eval(state, losses, n_tokens, grad_norm, grad_accum_state[0], grad_accum_state[1])
+                else:
+                    mx.eval(state, losses, n_tokens, grad_accum_state[0], grad_accum_state[1])
             else:
-                mx.eval(state, losses, n_tokens)
+                if grad_norm is not None:
+                    mx.eval(state, losses, n_tokens, grad_norm)
+                else:
+                    mx.eval(state, losses, n_tokens)
             if int(toks.item()) == 0:
                 raise ValueError(
                     "Unsloth MLX: a training batch produced zero supervised "
@@ -1086,6 +1089,12 @@ class MLXTrainer:
                 peak_mem = mx.get_peak_memory() / 1e9
 
                 self._train_loss_history.append(train_loss)
+                grad_norm_val = (
+                    float(grad_norm.item())
+                    if grad_norm is not None else None
+                )
+                if grad_norm_val is not None:
+                    self._grad_norm_history.append(grad_norm_val)
                 self._tokens_per_second_history.append(tokens_sec)
                 self._peak_memory_history.append(peak_mem)
                 self._step_times.append(train_time / steps if steps > 0 else 0)
@@ -1098,9 +1107,14 @@ class MLXTrainer:
 
                 elapsed_total = time.perf_counter() - start_time
 
+                grad_text = (
+                    f"Grad: {grad_norm_val:.4f} | "
+                    if grad_norm_val is not None else ""
+                )
                 print(
                     f"  Step {current_step}/{total_steps} | "
                     f"Loss: {train_loss:.4f} | "
+                    f"{grad_text}"
                     f"LR: {lr_val:.2e} | "
                     f"Tok/s: {tokens_sec:.0f} | "
                     f"Peak: {peak_mem:.2f} GB"
@@ -1109,7 +1123,8 @@ class MLXTrainer:
                 for cb in self._step_callbacks:
                     try:
                         cb(current_step, total_steps, train_loss, lr_val,
-                           tokens_sec, peak_mem, elapsed_total, trained_tokens)
+                           tokens_sec, peak_mem, elapsed_total, trained_tokens,
+                           grad_norm_val)
                     except Exception as e:
                         print(f"Unsloth: step callback error: {e}")
 
