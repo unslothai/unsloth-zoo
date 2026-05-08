@@ -815,7 +815,7 @@ def create_new_function(
     # Fix all softmax low precisions to float32
     new_source = higher_precision_softmax(new_source)
 
-    # Empty new_source (e.g. dpr, rag) -> skip dedent (avoids IndexError).
+    # Skip dedent on empty source to avoid IndexError.
     if new_source and new_source[0] == " ":
         spaces = new_source.find("def")
         new_source = new_source.split("\n")
@@ -845,11 +845,9 @@ def create_new_function(
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
         items += ["SiglipEncoder"]
-    # Detect base-class references whose base isn't defined in new_source.
-    # `functions` is pre-filtered to exclude torch_modules, so a base class
-    # like Sam3LiteTextLayerScaledResidual (no own forward, used only as
-    # a base) drops out of items. Pull it back in by scanning `class X(Y...)`
-    # bases against the full modeling-file dir.
+    # Pull back base classes referenced in the emitted source whose
+    # name was filtered out of `items`. Without this the cache imports
+    # a class whose base is undefined.
     try:
         _modeling_file = eval(model_location)
         _modeling_dir = set(dir(_modeling_file))
@@ -1364,17 +1362,12 @@ def create_standalone_class(
     # Combine all into file
     source = source + full_class
 
-    # Strip decorators that the cache cannot import. `[^\)]*` is unsafe
-    # when the decorator argument is a string with a literal ')' inside
-    # (voxtral / audioflamingo3 etc. use auto_docstring with custom_intro
-    # strings that contain "(a log mel spectrogram)") -- the lazy
-    # close-paren match stopped early and left the rest of the string
-    # in the cache, raising "unterminated string literal". Use a
-    # recursive group so nested parens balance correctly.
+    # Strip decorators with a paren-balanced match. A `[^\)]*` group
+    # stops at the first `)` inside a string argument and leaves an
+    # unterminated literal in the emitted source.
     _PAREN_GROUP = r"(?P<grp>\((?:[^()'\"]|'[^'\\]*(?:\\.[^'\\]*)*'|\"[^\"\\]*(?:\\.[^\"\\]*)*\"|(?P>grp))*\))"
     for _dec in (
         "auto_docstring", "use_kernelized_func", "check_model_inputs",
-        # Transformers 5.x decorators on forward methods
         "merge_with_config_defaults", "capture_outputs",
     ):
         source = regex.sub(rf"@{_dec}\s*(?:{_PAREN_GROUP})?", "", source)
@@ -1897,10 +1890,10 @@ def apply_fused_lm_head(forward, module=None):
             "$KWARGS$", "locals().get('loss_kwargs', {}) or locals().get('kwargs', {})"
         )
 
-        # Fix Idefics and Idefics3. Anchor to start-of-line + capture leading
-        # whitespace so this doesn't substring-match `lm_loss = loss_fct(...)`
-        # (gpt2 / electra / tapas) or emit unindented lines that the downstream
-        # dedent then chops 4 chars off.
+        # Idefics-style loss rewrite. Anchor to start-of-line and capture
+        # leading whitespace so the match doesn't fire inside e.g.
+        # `lm_loss = loss_fct(...)` and so emitted lines inherit the
+        # surrounding indent.
         forward = re.sub(
             r"^([ \t]+)loss = loss_fct\("
             r"shift_logits\.view\(-1, shift_logits\.size\(-1\)\), "
@@ -2157,9 +2150,8 @@ def convert_attention_masks_to_bool(module, old_source):
     splits = all_splits[-1].strip()
     if "return" not in splits:
         return old_source
-    # Skip non-bare returns (e.g. kosmos2 `return x.masked_fill(...)`); the
-    # findall regex below can't parse nested parens and would produce an
-    # unbalanced `final.replace(...)` rewrite.
+    # Skip returns whose body contains parens. The findall regex below
+    # cannot parse nested parens and would produce an unbalanced rewrite.
     return_body = splits[len("return"):].strip()
     if "(" in return_body:
         return old_source
@@ -2738,8 +2730,8 @@ def patch_gradient_accumulation(modeling_file, module):
     # All Unsloth Zoo code licensed under LGPLv3
 
     functions = dir(modeling_file)
-    # `module` may be a class name from dir() that isn't runtime-accessible
-    # (e.g. modeling_bit.Linear). Skip rather than abort.
+    # `module` may be a name from dir() that isn't runtime-accessible
+    # (unbound aliases in __all__). Skip rather than abort.
     try:
         module = eval(f"modeling_file.{module}")
     except AttributeError:
@@ -3263,17 +3255,16 @@ def unsloth_compile_transformers(
     functions = dir(modeling_file)
     full_source = inspect.getsource(modeling_file)
 
-    # Order by definition position. Bare-name find() hits forward refs
-    # (annotations, docstrings, `Union[..., NAME]`) so subclasses can land
-    # before their base class -- e.g. perceiver PerceiverTextPreprocessor
-    # at offset 26072 (annotation) vs its definition at 111990, raising
-    # NameError on AbstractPreprocessor at cache import.
+    # Order by definition position. A bare-name find() also matches
+    # forward references in annotations, docstrings and type unions,
+    # which can land subclasses before their base class and raise
+    # NameError at cache import. Match the definition forms first.
     def _def_pos(name):
         for prefix in (f"class {name}(", f"class {name}:", f"def {name}("):
             i = full_source.find(prefix)
             if i != -1:
                 return i
-        # Fallback: bare-name (for module-level aliases without a def/class).
+        # Module-level aliases without a def/class fall back to bare name.
         i = full_source.find(name)
         return i if i != -1 else len(full_source)
 
@@ -3462,7 +3453,7 @@ def unsloth_compile_transformers(
     disabled_scaled_dot_product_attention_modules = []
 
     for module in scaled_dot_product_attention_modules.keys():
-        # Skip class names that aren't runtime-accessible (see disable_causal_masks).
+        # Skip names that aren't runtime-accessible.
         try:
             source = eval(f"{model_location}.{module}")
         except AttributeError:
@@ -3519,10 +3510,10 @@ def unsloth_compile_transformers(
     remove_causal_masks = []
     if disable_causal_masks:
         for module in other_classes:
-            # `other_classes` (from dir() / class regex) can include names
-            # that aren't runtime-accessible: e.g. modeling_auto._BaseModelWithGenerate
-            # (in __all__ but unbound) or modeling_{bit,regnet,resnet}.Linear
-            # (nn.Linear alias missing on some transformers versions).
+            # `other_classes` (from dir() / class regex) can include
+            # names that aren't runtime-accessible: unbound entries in
+            # __all__, or aliases that are missing on some transformers
+            # versions.
             try:
                 source = eval(f"{model_location}.{module}")
             except AttributeError:
@@ -3836,7 +3827,7 @@ def unsloth_compile_transformers(
     # Allow gradient checkpointing if not enabled
     if gradient_checkpointing:
         for module in other_classes:
-            # Skip non-runtime-accessible names (see disable_causal_masks).
+            # Skip names that aren't runtime-accessible.
             try:
                 source = eval(f"{model_location}.{module}")
             except AttributeError:
@@ -3877,7 +3868,7 @@ def unsloth_compile_transformers(
         if module in all_standalone_classes:
             source = all_standalone_classes[module]
         else:
-            # Skip non-runtime-accessible names (see disable_causal_masks).
+            # Skip names that aren't runtime-accessible.
             try:
                 module_cls = eval(f"{model_location}.{module}")
             except AttributeError:
@@ -3914,7 +3905,7 @@ def unsloth_compile_transformers(
 
     if len(router_logit_cast_modules) > 0:
         for module in router_logit_cast_modules:
-            # Skip non-runtime-accessible names (see disable_causal_masks).
+            # Skip names that aren't runtime-accessible.
             try:
                 module_cls = eval(f"{model_location}.{module}")
             except AttributeError:
@@ -4071,12 +4062,10 @@ def unsloth_compile_transformers(
                 print(f"Unsloth: Cannot run inspect.getsource on {module} with error = {e}")
                 continue
 
-            # str(inspect.signature) and source can disagree on quote style
-            # ('foo' vs "foo") or fully-qualified annotations, making find()
-            # return -1. Keep OLD `code_section = source[find("\n")+1:]` so
-            # bad_params detection still sees multi-line sig continuations
-            # (e.g. `def f(\n    a: T,\n    b: U,\n):`); only restore the
-            # trailing `:` at rebuild time below.
+            # str(inspect.signature) can disagree with source on quote
+            # style or fully-qualified annotations, so find() may return
+            # -1. Fall back to the first newline so multi-line signatures
+            # still split correctly; the trailing `:` is restored below.
             where = source.find(str(parameters))
             if where == -1:
                 where = source.find("\n") + 1
@@ -4104,11 +4093,8 @@ def unsloth_compile_transformers(
                 )
             pass
             sig = f"def {module}{parameters}"
-            # Restore `:` (and `\n` if the find()-fallback consumed it):
-            #  - find() hit:  code_section starts with `:` -> just concat
-            #  - lstrip-newline: append `:` (sig ended cleanly at a newline)
-            #  - else (find()=-1 path): append `:\n` so the body lands as
-            #    a proper indented suite instead of ` def fn(...)    """..."""`
+            # Restore the trailing `:` (and a newline when the find()
+            # fallback consumed it) so the body lands as an indented suite.
             if code_section.lstrip(" \t").startswith(":"):
                 parameters = sig + code_section
             elif code_section.startswith("\n"):
@@ -4173,9 +4159,9 @@ def unsloth_compile_transformers(
                     break
             pass
             if not bad:
-                # Functions defined under `if/else` (e.g. xLSTM `soft_cap`)
-                # come back indented from inspect.getsource; dedent before
-                # prepending the decorator to avoid "unexpected indent".
+                # Functions defined inside an if/else come back indented
+                # from inspect.getsource; dedent before prepending the
+                # decorator so the result parses.
                 if source and source[0] in (" ", "\t"):
                     source = textwrap.dedent(source)
                 if module in disable_compile_functions:
