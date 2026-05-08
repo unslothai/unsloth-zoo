@@ -51,9 +51,10 @@ import psutil
 try:
     from .device_type import device_is_bf16_supported
 except (ImportError, NotImplementedError):
-    # Apple Silicon: pure-MLX builds raise ImportError (no torch);
-    # torch-installed builds raise NotImplementedError because
-    # device_type.py runs get_device_type() at import.
+    # device_type can fail two ways: ImportError when torch is
+    # absent, NotImplementedError when get_device_type() runs at
+    # import on an unrecognised platform. Fall through to the
+    # platform probe in either case.
     import platform as _platform
     _IS_APPLE_SILICON = (
         _platform.system() == "Darwin" and _platform.machine() == "arm64"
@@ -947,10 +948,8 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
             with open(_local_script, "rb") as f:
                 original_content = f.read()
         else:
-            # github.com hosts the raw file but free CI runners
-            # (especially macos-14) sometimes need >30s for the read,
-            # and the failure mode is opaque -- retry up to 3x with
-            # exponential backoff and a longer per-attempt read timeout.
+            # Retry with exponential backoff: the upstream host can
+            # exceed the default read timeout on slower networks.
             _last_err = None
             original_content = None
             for _attempt in range(3):

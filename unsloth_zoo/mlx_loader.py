@@ -2182,10 +2182,10 @@ class FastMLXModel:
         # (e.g. layer init for runtime-quantized models) is reproducible.
         _seed_mlx_random_state(random_state)
 
-        # Resolve local_path then read config.json. Keep these split:
-        # LoRA-adapter dirs have adapter_config.json but no config.json,
-        # so a missing config.json must NOT wipe local_path or the
-        # adapter-detection branch below can't find adapter_config.json.
+        # Split download from config-read so a missing config.json
+        # does not clear local_path. LoRA-adapter directories carry
+        # adapter_config.json but no config.json; the adapter branch
+        # below needs local_path either way.
         local_path = None
         try:
             with _temporary_hf_token_env(token):
