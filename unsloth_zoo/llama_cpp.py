@@ -50,9 +50,11 @@ from pathlib import Path
 import psutil
 try:
     from .device_type import device_is_bf16_supported
-except ImportError:
-    # device_type imports torch; on MLX-only macOS arm64 builds torch is
-    # absent. Apple Silicon Metal natively supports bf16.
+except (ImportError, NotImplementedError):
+    # device_type can fail two ways: ImportError when torch is
+    # absent, NotImplementedError when get_device_type() runs at
+    # import on an unrecognised platform. Fall through to the
+    # platform probe in either case.
     import platform as _platform
     _IS_APPLE_SILICON = (
         _platform.system() == "Darwin" and _platform.machine() == "arm64"
@@ -946,9 +948,27 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
             with open(_local_script, "rb") as f:
                 original_content = f.read()
         else:
-            response = requests.get(LLAMA_CPP_CONVERT_FILE, timeout = (5, 30))
-            response.raise_for_status()
-            original_content = response.content
+            # Retry with exponential backoff: the upstream host can
+            # exceed the default read timeout on slower networks.
+            _last_err = None
+            original_content = None
+            for _attempt in range(3):
+                try:
+                    response = requests.get(
+                        LLAMA_CPP_CONVERT_FILE, timeout = (10, 120)
+                    )
+                    response.raise_for_status()
+                    original_content = response.content
+                    break
+                except requests.exceptions.RequestException as _err:
+                    _last_err = _err
+                    logger.warning(
+                        f"Unsloth: convert_hf_to_gguf.py download attempt "
+                        f"{_attempt + 1}/3 failed ({type(_err).__name__}: {_err}); retrying"
+                    )
+                    time.sleep(2 ** _attempt)
+            if original_content is None:
+                raise _last_err  # type: ignore[misc]
 
         # 2. Introspect Original Script for Supported Architectures
         logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
