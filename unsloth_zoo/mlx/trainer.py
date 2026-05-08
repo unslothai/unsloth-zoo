@@ -710,6 +710,11 @@ class MLXTrainer:
                   f"(ratio={embedding_lr_ratio:.3f} of main LR {main_lr:.2e}).")
 
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
+        _has_lora_trainables = any(
+            "lora" in name
+            for name, _ in tree_flatten(model.trainable_parameters())
+        )
+        _warned_skip_optimizer_state_grad_norm = False
 
         # Build step functions following mlx-lm's pattern
         max_grad_norm = float(args.max_grad_norm or 0.0)
@@ -755,20 +760,62 @@ class MLXTrainer:
                 scale = scale.astype(dtype)
             return scale
 
-        def _grad_norm_from_flat(flat_grad):
-            norm_sq = mx.array(0.0, dtype=mx.float32)
-            for _, value in flat_grad:
+        optimizer_v_sum = None
+
+        def _optimizer_v_total():
+            total = mx.array(0.0, dtype=mx.float32)
+            found = False
+            for name, value in tree_flatten(getattr(optimizer, "state", {})):
+                if name != "v" and not name.endswith(".v"):
+                    continue
+                found = True
                 value_f = value.astype(mx.float32)
-                norm_sq = norm_sq + mx.sum(value_f * value_f)
-            return mx.sqrt(norm_sq)
+                total = total + mx.sum(value_f)
+            return total if found else None
+
+        def _grad_norm_from_optimizer_state():
+            nonlocal optimizer_v_sum
+            betas = getattr(optimizer, "betas", None)
+            if not betas or len(betas) < 2:
+                return None
+            current_v_sum = _optimizer_v_total()
+            if current_v_sum is None:
+                return None
+            previous_v_sum = (
+                optimizer_v_sum
+                if optimizer_v_sum is not None
+                else mx.array(0.0, dtype=mx.float32)
+            )
+            beta2 = mx.array(float(betas[1]), dtype=mx.float32)
+            denom = mx.maximum(
+                mx.array(1.0, dtype=mx.float32) - beta2,
+                mx.array(1e-30, dtype=mx.float32),
+            )
+            grad_norm_sq = mx.maximum(
+                (current_v_sum - beta2 * previous_v_sum) / denom,
+                mx.array(0.0, dtype=mx.float32),
+            )
+            grad_norm = mx.sqrt(grad_norm_sq)
+            mx.eval(current_v_sum, grad_norm)
+            optimizer_v_sum = current_v_sum
+            return grad_norm
+
+        def _can_report_optimizer_state_norm():
+            # For Adam-family optimizers, recover ||g|| from the second moment
+            # after the update: v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2.
+            # This avoids adding a second consumer to the lazy backward graph.
+            # Limit this to LoRA/QLoRA Adam-family updates: full finetuning can
+            # keep bf16 optimizer state, and compiled full finetuning has
+            # produced invalid reconstructed norms.
+            return _has_lora_trainables and getattr(optimizer, "betas", None)
 
         def _apply_update(grad, toks_f):
             """Common gradient post-processing and optimizer update.
 
             Scale accumulated gradients by supervised-token count, then apply
             the selected clipping mode. Global norm clipping uses MLX's helper
-            and reports that norm. Otherwise, report a scalar-only norm without
-            materializing an extra globally clipped gradient tree.
+            and reports that norm. Non-global modes report after update from
+            Adam's optimizer state so the backward graph stays single-consumer.
             """
             safe_toks_f = mx.maximum(
                 toks_f, mx.array(1.0, dtype=mx.float32)
@@ -776,23 +823,16 @@ class MLXTrainer:
             flat_grad = tree_flatten(grad)
             grad_norm = None
             final_items = []
-            norm_sq = mx.array(0.0, dtype=mx.float32)
-            report_scalar_norm = max_grad_norm <= 0
             for name, value in flat_grad:
                 scaled = value * _grad_leaf_scale(
                     name, safe_toks_f, None, value.dtype
                 )
                 final_items.append((name, scaled))
-                if report_scalar_norm:
-                    scaled_f = scaled.astype(mx.float32)
-                    norm_sq = norm_sq + mx.sum(scaled_f * scaled_f)
             final_grad = tree_unflatten(final_items)
             if max_grad_norm > 0:
                 final_grad, grad_norm = optim.clip_grad_norm(
                     final_grad, max_norm=max_grad_norm
                 )
-            elif report_scalar_norm:
-                grad_norm = mx.sqrt(norm_sq)
             if _clip_grad_value:
                 # Elementwise clip after norm-scaling, before optimizer step.
                 final_grad = tree_map(
@@ -818,8 +858,6 @@ class MLXTrainer:
             grad_norm = None
             if max_grad_norm > 0:
                 grad, grad_norm = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
-            else:
-                grad_norm = _grad_norm_from_flat(tree_flatten(grad))
             if _clip_grad_value:
                 # Elementwise clip per leaf — free memory (no cross-leaf reduction).
                 grad = tree_map(
@@ -1054,16 +1092,31 @@ class MLXTrainer:
             losses += lvalue * toks
             n_tokens += toks
             steps += 1
+            if grad_norm is not None:
+                mx.eval(grad_norm)
             if grad_accum_state is not None:
-                if grad_norm is not None:
-                    mx.eval(state, losses, n_tokens, grad_norm, grad_accum_state[0], grad_accum_state[1])
-                else:
-                    mx.eval(state, losses, n_tokens, grad_accum_state[0], grad_accum_state[1])
+                mx.eval(state, losses, n_tokens, grad_accum_state[0], grad_accum_state[1])
             else:
-                if grad_norm is not None:
-                    mx.eval(state, losses, n_tokens, grad_norm)
-                else:
-                    mx.eval(state, losses, n_tokens)
+                mx.eval(state, losses, n_tokens)
+            if (
+                do_update
+                and grad_norm is None
+                and max_grad_norm <= 0
+                and _can_report_optimizer_state_norm()
+            ):
+                grad_norm = _grad_norm_from_optimizer_state()
+            elif (
+                do_update
+                and grad_norm is None
+                and max_grad_norm <= 0
+                and not _can_report_optimizer_state_norm()
+                and not _warned_skip_optimizer_state_grad_norm
+            ):
+                print(
+                    "Unsloth: skipping grad norm reporting for this MLX "
+                    "optimizer/mode to avoid materializing the gradient graph."
+                )
+                _warned_skip_optimizer_state_grad_norm = True
             if int(toks.item()) == 0:
                 raise ValueError(
                     "Unsloth MLX: a training batch produced zero supervised "
