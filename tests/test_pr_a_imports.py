@@ -62,6 +62,28 @@ def test_fast_mlx_model_class_exists():
     assert hasattr(FastMLXModel, "from_pretrained")
 
 
+def test_full_finetune_dtype_default_matches_torch_bf16():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.loader import _resolve_full_finetune_dtype
+
+    assert _resolve_full_finetune_dtype(mx.bfloat16, None, mx) == (
+        mx.bfloat16,
+        False,
+    )
+    assert _resolve_full_finetune_dtype(mx.bfloat16, False, mx) == (
+        mx.bfloat16,
+        False,
+    )
+    assert _resolve_full_finetune_dtype(mx.bfloat16, True, mx) == (
+        mx.float32,
+        True,
+    )
+    assert _resolve_full_finetune_dtype(mx.float16, None, mx) == (
+        mx.float32,
+        True,
+    )
+
+
 def test_fast_mlx_model_save_helpers_exist():
     """PR-B calls model.save_pretrained_merged / save_lora_adapters /
     push_to_hub_merged on the FastMLXModel INSTANCE returned by
@@ -184,3 +206,21 @@ def test_trainer_config_smoke():
         # We just want the class to be inspectable.
         ok = dataclasses.is_dataclass(MLXTrainingConfig) or True
     assert ok
+
+
+def test_adam_optimizers_enable_bias_correction():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class DummyModel:
+        def trainable_parameters(self):
+            return {}
+
+    for optim_name in ("adamw", "adam"):
+        trainer = MLXTrainer(
+            model=DummyModel(),
+            tokenizer=None,
+            train_dataset=[],
+            args=MLXTrainingConfig(optim=optim_name),
+        )
+        optimizer = trainer._build_optimizer(total_steps=10)
+        assert optimizer._kw["bias_correction"] is True

@@ -644,6 +644,17 @@ def _fp16_needs_bf16_modules(model):
     return tuple(modules)
 
 
+def _resolve_full_finetune_dtype(target_dtype, float32_mixed_precision, mx):
+    if target_dtype == mx.bfloat16:
+        if type(float32_mixed_precision) is not bool:
+            # Match the Torch post-patch default: bf16 full finetuning stays
+            # bf16 unless float32_mixed_precision=True is explicitly requested.
+            float32_mixed_precision = False
+        if float32_mixed_precision is False:
+            return mx.bfloat16, False
+    return mx.float32, True
+
+
 def _patch_mixed_precision_set_dtype(model):
     """Patch set_dtype so unstable fp16 vision towers keep a safer dtype."""
     if getattr(model, "_unsloth_mixed_precision_set_dtype_patched", False):
@@ -2133,20 +2144,23 @@ class FastMLXModel:
                 )
         if full_finetuning:
             original_target_dtype = target_dtype
-            if target_dtype == mx.bfloat16 and float32_mixed_precision is False:
+            target_dtype, using_float32_full_ft = _resolve_full_finetune_dtype(
+                target_dtype,
+                float32_mixed_precision,
+                mx,
+            )
+            if not using_float32_full_ft:
                 print(
                     "Unsloth: Using bfloat16 MLX full finetuning. "
                     "This reduces memory but can differ from Unsloth Torch's "
-                    "default float32 full-finetune path."
+                    "float32_mixed_precision=True path."
                 )
             else:
-                target_dtype = mx.float32
                 if original_target_dtype != mx.float32:
                     print(
                         "Unsloth: Using float32 MLX full finetuning to match "
-                        "Unsloth Torch full-finetune defaults. Pass "
-                        "float32_mixed_precision=False to keep native bf16 "
-                        "weights on supported Apple Silicon."
+                        "Unsloth Torch's explicit float32_mixed_precision=True "
+                        "path."
                     )
         try:
             from mlx_lm import load as mlx_load

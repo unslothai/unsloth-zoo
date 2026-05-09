@@ -122,7 +122,7 @@ class MLXTrainingConfig:
     # Elementwise clipping (PyTorch's torch.nn.utils.clip_grad_value_).
     # Clamps every grad value to [-max_grad_value, max_grad_value] leaf-by-leaf
     # with no cross-leaf reduction. Set 0.0 to disable.
-    max_grad_value: float | None = 3.0
+    max_grad_value: float | None = 1.0
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
     embedding_learning_rate: float = 0.0  # 0 = disabled, 5e-5 = recommended
@@ -391,9 +391,18 @@ class MLXTrainer:
                 scale_parameter=False,
             )
         elif opt_name == "adamw":
-            optimizer = optim.AdamW(learning_rate=initial_lr, weight_decay=wd)
+            # Match HF/PyTorch AdamW semantics. MLX defaults bias_correction
+            # to False, which makes early warmup updates much larger.
+            optimizer = optim.AdamW(
+                learning_rate=initial_lr,
+                weight_decay=wd,
+                bias_correction=True,
+            )
         elif opt_name == "adam":
-            optimizer = optim.Adam(learning_rate=initial_lr)
+            optimizer = optim.Adam(
+                learning_rate=initial_lr,
+                bias_correction=True,
+            )
         elif opt_name == "sgd":
             optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=wd)
         elif opt_name == "muon":
@@ -717,8 +726,8 @@ class MLXTrainer:
         # Elementwise clip (clip_grad_value_): leaf-local, free memory.
         # Prefer value clipping when both clipping modes are requested; global
         # norm clipping is exact but materially increases memory on MLX.
-        _raw_mgv = getattr(args, "max_grad_value", 3.0)
-        max_grad_value = 3.0 if _raw_mgv is None else float(_raw_mgv or 0.0)
+        _raw_mgv = getattr(args, "max_grad_value", 1.0)
+        max_grad_value = 1.0 if _raw_mgv is None else float(_raw_mgv or 0.0)
         if max_grad_norm > 0 and max_grad_value > 0:
             print(
                 "Unsloth: max_grad_norm and max_grad_value are both enabled; "
