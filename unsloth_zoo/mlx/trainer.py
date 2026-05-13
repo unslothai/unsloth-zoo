@@ -38,7 +38,6 @@ Usage mirrors TRL notebooks:
 
 from dataclasses import asdict, dataclass, is_dataclass
 import concurrent.futures
-import inspect
 import math
 import os
 import random
@@ -101,23 +100,6 @@ def _normalize_mlx_scheduler_type(name):
             f"Supported schedulers: {supported}."
         )
     return sched_type
-
-
-def _step_callback_accepts_grad_norm(fn):
-    try:
-        signature = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return True
-    positional = 0
-    for parameter in signature.parameters.values():
-        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
-            return True
-        if parameter.kind in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        ):
-            positional += 1
-    return positional >= 9
 
 
 @dataclass
@@ -1203,14 +1185,11 @@ class MLXTrainer:
 
                 for cb in self._step_callbacks:
                     try:
-                        step_args = (
+                        cb(
                             current_step, total_steps, train_loss, lr_val,
                             tokens_sec, peak_mem, elapsed_total, trained_tokens,
+                            grad_norm_val,
                         )
-                        if _step_callback_accepts_grad_norm(cb):
-                            cb(*step_args, grad_norm_val)
-                        else:
-                            cb(*step_args)
                     except Exception as e:
                         print(f"Unsloth: step callback error: {e}")
 

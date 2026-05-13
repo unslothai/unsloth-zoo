@@ -122,6 +122,24 @@ if _SKIP_GPU_INIT:
     _inject_bnb()
     del _inject_triton, _inject_bnb
 
+    # Temporary bridge for already-merged Unsloth code that imports the old
+    # flat MLX module names. Remove after the paired Unsloth PR lands and
+    # imports unsloth_zoo.mlx.* everywhere.
+    import importlib as _importlib
+    import sys as _sys
+
+    for _old_name, _new_name in (
+        ("unsloth_zoo.mlx_loader", "unsloth_zoo.mlx.loader"),
+        ("unsloth_zoo.mlx_trainer", "unsloth_zoo.mlx.trainer"),
+        ("unsloth_zoo.mlx_utils", "unsloth_zoo.mlx.utils"),
+        ("unsloth_zoo.mlx_compile", "unsloth_zoo.mlx.compile"),
+        ("unsloth_zoo.mlx_cce", "unsloth_zoo.mlx.cce"),
+        ("unsloth_zoo.mlx_cce.runtime_cce", "unsloth_zoo.mlx.cce.runtime_cce"),
+    ):
+        _sys.modules.setdefault(_old_name, _importlib.import_module(_new_name))
+
+    del _old_name, _new_name, _importlib, _sys
+
 if not _SKIP_GPU_INIT:
     if find_spec("unsloth") is None:
         raise ImportError("Please install Unsloth via `pip install unsloth`!")
