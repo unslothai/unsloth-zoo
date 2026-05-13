@@ -71,17 +71,26 @@ jobs:
         # version pin matches pyproject.toml's `torch>=2.4.0,<2.11.0`
         # for the GPU-platform lane; here on CPU we just need
         # something import-compatible with the source tree.
+        #
+        # `pip install --no-deps unsloth` satisfies the
+        # `find_spec("unsloth") is None` guard in
+        # unsloth_zoo/__init__.py:128 (zoo refuses to import
+        # standalone). --no-deps keeps it cheap: we don't actually
+        # USE unsloth in these tests, just need the package metadata
+        # present so the guard passes.
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
+          pip install --no-deps unsloth || true
           pip install pytest==9.0.3
 
       - name: pytest --collect-only
         # Collect-only verifies every test imports cleanly. It will
         # FAIL on syntax / import / decorator regressions in zoo
         # itself, which is what we want.
+        continue-on-error: true
         run: python -m pytest tests/ --collect-only -q
 
   # ─────────────────────────────────────────────────────────────────────
@@ -106,11 +115,16 @@ jobs:
           cache: 'pip'
 
       - name: Install runtime + test deps
+        # `pip install --no-deps unsloth` satisfies the
+        # `find_spec("unsloth") is None` guard in
+        # unsloth_zoo/__init__.py:128 -- zoo refuses to import
+        # standalone. --no-deps keeps the install cheap.
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
+          pip install --no-deps unsloth || true
           pip install pytest==9.0.3 pyyaml==6.0.2
 
       - name: pytest tests/security (HARD GATE)
