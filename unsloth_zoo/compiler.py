@@ -1139,6 +1139,7 @@ def create_standalone_class(
     add_loss_kwargs=False,
     new_init=None,
     new_methods=None,
+    supports_return_hidden_states=False,
 ) -> str:
     """
     new_methods: dict[str, str] = {
@@ -1361,6 +1362,8 @@ def create_standalone_class(
 
     # Combine all into file
     source = source + full_class
+    if supports_return_hidden_states:
+        source += f"\n{module}.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True\n"
 
     # Strip decorators with a paren-balanced match. A `[^\)]*` group
     # stops at the first `)` inside a string argument and leaves an
@@ -2012,9 +2015,9 @@ def apply_fused_lm_head(forward, module=None):
         forward = forward.replace(",**)", ")")
         forward = forward.replace(",** )", ")")
         # print(forward)
-        return forward
+        return forward, True
     pass
-    return forward
+    return forward, False
 
 
 pass
@@ -2104,7 +2107,7 @@ def test_apply_fused_lm_head():
     for name, forward in forwards:
         # print("=" * 30)
         # print(name)
-        forward = apply_fused_lm_head(forward, name)
+        forward, _ = apply_fused_lm_head(forward, name)
         if "NOT_RETURN_LOGITS" not in forward:
             print(f"Failed patching fast CE forward for {name}")
         if "loss = outputs.loss" in forward:
@@ -3797,7 +3800,9 @@ def unsloth_compile_transformers(
                 # Fix some arguments up like for Gemma 3N
                 new_source = fixup_fused_lm_head(source)
                 # Apply fused LM transforms
-                new_source = apply_fused_lm_head(new_source, module)
+                new_source, supports_return_hidden_states = apply_fused_lm_head(
+                    new_source, module
+                )
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:
@@ -3810,6 +3815,7 @@ def unsloth_compile_transformers(
                             disable=True,
                             forward_source=new_source,
                             add_loss_kwargs=True,
+                            supports_return_hidden_states=supports_return_hidden_states,
                         )
                         print(
                             f"Unsloth: Fast fused linear cross entropy patch for {module}."
