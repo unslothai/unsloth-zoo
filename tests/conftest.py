@@ -76,7 +76,10 @@ def _preload_real_device_type() -> bool:
     """Pre-load the REAL ``unsloth_zoo.device_type`` module under a
     temporarily-mocked ``torch.cuda.is_available()`` so its
     ``DEVICE_TYPE = get_device_type()`` initialization succeeds without
-    a real accelerator. Returns True on success.
+    a real accelerator. Returns True on success; returns False if
+    torch is not importable at all (the security-audit CI job runs
+    tests/security/ without installing torch, and those tests don't
+    need the preload).
     """
     if "unsloth_zoo.device_type" in sys.modules:
         return True
@@ -103,7 +106,20 @@ def _preload_real_device_type() -> bool:
             )
             utils_mod = importlib.util.module_from_spec(utils_spec)
             sys.modules["unsloth_zoo.utils"] = utils_mod
-            utils_spec.loader.exec_module(utils_mod)
+            try:
+                utils_spec.loader.exec_module(utils_mod)
+            except ModuleNotFoundError as exc:
+                # Tests that don't need torch (e.g. the tests/security
+                # subtree which only exercises scanner regex tables and
+                # subprocess invocations) shouldn't be blocked by the
+                # device-type preload when torch isn't installed. Pop
+                # the half-built modules and bail out gracefully.
+                if "torch" in str(exc):
+                    sys.modules.pop("unsloth_zoo.utils", None)
+                    if not skeleton_already:
+                        sys.modules.pop("unsloth_zoo", None)
+                    return False
+                raise
 
         device_type_path = os.path.join(pkg_path, "device_type.py")
         dt_spec = importlib.util.spec_from_file_location(
