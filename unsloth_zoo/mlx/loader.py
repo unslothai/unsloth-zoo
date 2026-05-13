@@ -27,6 +27,7 @@ import importlib
 import inspect
 import math
 import os
+import sys
 import types
 import warnings
 from contextlib import contextmanager
@@ -666,14 +667,30 @@ def _get_unsloth_custom_mlx_loader(model_type):
         candidate = os.path.join(root, "models", "mlx.py")
         if not os.path.isfile(candidate):
             continue
+        module_name = "unsloth.models.mlx"
+        old_modules = {
+            name: sys.modules.get(name)
+            for name in ("unsloth", "unsloth.models", module_name)
+        }
         try:
-            spec = importlib.util.spec_from_file_location(
-                "_unsloth_optional_mlx_loader",
-                candidate,
-            )
+            models_dir = os.path.dirname(candidate)
+            if old_modules["unsloth"] is None:
+                pkg = types.ModuleType("unsloth")
+                pkg.__path__ = [root]
+                pkg.__spec__ = unsloth_spec
+                pkg.__package__ = "unsloth"
+                sys.modules["unsloth"] = pkg
+            if old_modules["unsloth.models"] is None:
+                models_pkg = types.ModuleType("unsloth.models")
+                models_pkg.__path__ = [models_dir]
+                models_pkg.__package__ = "unsloth"
+                sys.modules["unsloth.models"] = models_pkg
+
+            spec = importlib.util.spec_from_file_location(module_name, candidate)
             if spec is None or spec.loader is None:
                 continue
             module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
             spec.loader.exec_module(module)
             get_loader = getattr(module, "get_unsloth_loader", None)
             if get_loader is None:
@@ -685,6 +702,12 @@ def _get_unsloth_custom_mlx_loader(model_type):
                 stacklevel=2,
             )
             return None
+        finally:
+            for name, old_module in old_modules.items():
+                if old_module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = old_module
     return None
 
 

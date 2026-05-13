@@ -89,8 +89,11 @@ def test_optional_unsloth_custom_mlx_loader_probe(tmp_path, monkeypatch):
     models.mkdir(parents=True)
     (pkg / "__init__.py").write_text("")
     (models / "__init__.py").write_text("")
+    (models / "foo.py").write_text("CUSTOM_MODEL_TYPE = 'custom-model'\n")
     (models / "mlx.py").write_text(
+        "from .foo import CUSTOM_MODEL_TYPE\n"
         "def get_unsloth_loader(model_type):\n"
+        "    assert model_type == CUSTOM_MODEL_TYPE\n"
         "    return (lambda *args, **kwargs: (model_type, args, kwargs))\n"
     )
 
