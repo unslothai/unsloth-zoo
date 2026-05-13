@@ -655,6 +655,39 @@ def _resolve_full_finetune_dtype(target_dtype, float32_mixed_precision, mx):
     return mx.float32, True
 
 
+def _get_unsloth_custom_mlx_loader(model_type):
+    """Load optional Unsloth-side MLX model hooks without importing unsloth."""
+    try:
+        unsloth_spec = importlib.util.find_spec("unsloth")
+    except Exception:
+        return None
+    search_locations = getattr(unsloth_spec, "submodule_search_locations", None) or ()
+    for root in search_locations:
+        candidate = os.path.join(root, "models", "mlx.py")
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_unsloth_optional_mlx_loader",
+                candidate,
+            )
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            get_loader = getattr(module, "get_unsloth_loader", None)
+            if get_loader is None:
+                continue
+            return get_loader(model_type)
+        except Exception as exc:
+            warnings.warn(
+                f"Unsloth: optional MLX custom loader probe failed: {exc}",
+                stacklevel=2,
+            )
+            return None
+    return None
+
+
 def _patch_mixed_precision_set_dtype(model):
     """Patch set_dtype so unstable fp16 vision towers keep a safer dtype."""
     if getattr(model, "_unsloth_mixed_precision_set_dtype_patched", False):
@@ -2443,9 +2476,65 @@ class FastMLXModel:
 
         model_type = config_data.get("model_type", "")
 
+        custom_loader = _get_unsloth_custom_mlx_loader(model_type)
+        if custom_loader is not None:
+            with _temporary_hf_token_env(token):
+                model, tokenizer_or_processor = custom_loader(
+                    model_name,
+                    config_data,
+                    max_seq_length=max_seq_length,
+                    token=token,
+                )
+
+            from .utils import (
+                normalize_mlx_chat_template,
+                normalize_vlm_processor_chat_template,
+            )
+
+            if text_only is False or _is_vlm(config_data):
+                tokenizer_or_processor = normalize_vlm_processor_chat_template(
+                    tokenizer_or_processor,
+                    chat_template=chat_template,
+                    model_name=model_name,
+                    model_type=model_type,
+                    strict=False,
+                )
+                model._is_vlm_model = True
+                model._processor = tokenizer_or_processor
+                _patch_mixed_precision_set_dtype(model)
+            elif chat_template is not None:
+                tokenizer_or_processor = normalize_mlx_chat_template(
+                    tokenizer_or_processor,
+                    chat_template=chat_template,
+                    model_name=model_name,
+                    model_type=model_type,
+                    is_vlm=False,
+                    strict=False,
+                )
+
+            model._config = config_data
+            model._hf_repo = model_name
+            model._src_path = local_path
+            model._unsloth_base_revision = revision
+            model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
+            model.max_seq_length = max_seq_length
+            model._unsloth_patch_mode = patch_mode
+            model._unsloth_full_finetuning = bool(full_finetuning)
+            model._unsloth_compile_trait_report = get_compile_trait_report(model)
+            model._unsloth_compile_qualification = get_compile_qualification(model)
+            model._unsloth_compile_backend_qualifications = (
+                get_backend_compile_qualifications(model)
+            )
+            model._unsloth_compile_trace = trace_compile_application(model)
+            model._unsloth_compile_explain = explain_compile_support(model)
+            _patch_mlx_saving(model, tokenizer_or_processor)
+            return model, tokenizer_or_processor
+
         # Step 2: Route based on text_only
         is_vlm = False
-        force_vlm_text_path = bool(text_only is True and _prefer_vlm_loader_for_text(config_data, model_type))
+        force_vlm_text_path = bool(
+            text_only is True and _prefer_vlm_loader_for_text(config_data, model_type)
+        )
 
         if text_only is True and not force_vlm_text_path:
             is_vlm = False

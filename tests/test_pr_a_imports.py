@@ -62,6 +62,56 @@ def test_fast_mlx_model_class_exists():
     assert hasattr(FastMLXModel, "from_pretrained")
 
 
+@pytest.mark.parametrize(
+    "module_path",
+    [
+        "unsloth_zoo.mlx_loader",
+        "unsloth_zoo.mlx_trainer",
+        "unsloth_zoo.mlx_utils",
+        "unsloth_zoo.mlx_compile",
+        "unsloth_zoo.mlx_cce",
+        "unsloth_zoo.mlx_cce.runtime_cce",
+    ],
+)
+def test_legacy_mlx_import_paths(module_path):
+    import importlib
+
+    mod = importlib.import_module(module_path)
+    assert mod is not None
+
+
+def test_optional_unsloth_custom_mlx_loader_probe(tmp_path, monkeypatch):
+    import sys
+    from unsloth_zoo.mlx.loader import _get_unsloth_custom_mlx_loader
+
+    pkg = tmp_path / "unsloth"
+    models = pkg / "models"
+    models.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (models / "__init__.py").write_text("")
+    (models / "mlx.py").write_text(
+        "def get_unsloth_loader(model_type):\n"
+        "    return (lambda *args, **kwargs: (model_type, args, kwargs))\n"
+    )
+
+    old_modules = {
+        name: sys.modules.pop(name)
+        for name in list(sys.modules)
+        if name == "unsloth" or name.startswith("unsloth.")
+    }
+    try:
+        monkeypatch.syspath_prepend(str(tmp_path))
+        loader = _get_unsloth_custom_mlx_loader("custom-model")
+    finally:
+        for name in list(sys.modules):
+            if name == "unsloth" or name.startswith("unsloth."):
+                sys.modules.pop(name, None)
+        sys.modules.update(old_modules)
+
+    assert loader is not None
+    assert loader("repo")[0] == "custom-model"
+
+
 def test_full_finetune_dtype_default_matches_torch_bf16():
     import mlx.core as mx
     from unsloth_zoo.mlx.loader import _resolve_full_finetune_dtype
@@ -224,3 +274,18 @@ def test_adam_optimizers_enable_bias_correction():
         )
         optimizer = trainer._build_optimizer(total_steps=10)
         assert optimizer._kw["bias_correction"] is True
+
+
+def test_step_callback_arity_detection_preserves_legacy_callbacks():
+    from unsloth_zoo.mlx.trainer import _step_callback_accepts_grad_norm
+
+    def legacy(step, total, loss, lr, tok_s, peak_gb, elapsed, num_tokens):
+        return None
+
+    def current(
+        step, total, loss, lr, tok_s, peak_gb, elapsed, num_tokens, grad_norm,
+    ):
+        return None
+
+    assert _step_callback_accepts_grad_norm(legacy) is False
+    assert _step_callback_accepts_grad_norm(current) is True
