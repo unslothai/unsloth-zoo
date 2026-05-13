@@ -21,7 +21,7 @@ import sys
 import importlib.util
 from typing import Optional, Tuple
 from torch.autograd import Function
-from unsloth_zoo.mlx.runtime import is_mlx_available
+from unsloth_zoo.mlx import is_mlx_available
 
 # Get compile location
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
