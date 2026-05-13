@@ -22,6 +22,7 @@ from .utils import patch_function, process_return, raise_error, logger
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
+    extract_moe_lora_weights_for_grouped_mm,
 )
 # Reuse the Qwen-MoE standard-layout LoRA extractor. Gemma4TextExperts has the
 # same (E, out, in) layout, the same hidden_dim / intermediate_dim attribute
@@ -60,6 +61,19 @@ def _register_gemma4_lora_extractor(experts_cls):
                 f"{getattr(experts_cls, '__name__', experts_cls)}: {e}"
             )
         return False
+
+
+def _gemma4_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+    return extract_moe_lora_weights_for_grouped_mm(
+        wrapper,
+        weight_A,
+        weight_B,
+        scaling,
+        num_experts,
+        model_name="Gemma4 MoE",
+        enable_logging=UNSLOTH_ENABLE_LOGGING,
+        logger_obj=logger,
+    )
 
 
 def patch_gemma4_grpo_hidden_states():
@@ -224,6 +238,7 @@ def _patch_gemma4_moe_current():
 
     ok = patch_function(Gemma4TextExperts, "forward", _gemma4_experts_forward, force=True)
     if ok:
+        Gemma4TextExperts._unsloth_lora_extractor_fn = staticmethod(_gemma4_moe_lora_extractor)
         Gemma4TextExperts._unsloth_already_patched = True
         # Register the Qwen-MoE-style standard-layout extractor so that the
         # grouped-mm LoRA path produces correct contraction dimensions.
@@ -289,6 +304,7 @@ def _patch_gemma4_moe_legacy():
     if not forward_ok:
         return False
 
+    Gemma4TextMoEBlock._unsloth_lora_extractor_fn = staticmethod(_gemma4_moe_lora_extractor)
     Gemma4TextMoEBlock._unsloth_already_patched = True
     # Legacy MoE block has the same parameter layout (E, out, in). Register
     # the same standard-layout extractor.
