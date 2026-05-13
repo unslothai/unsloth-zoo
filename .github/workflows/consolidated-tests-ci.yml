@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Python compatibility + repo test gate. Adapted from unsloth's
+# consolidated-tests-ci.yml; trimmed to zoo's actual surface.
+#
+# Zoo's 13 existing test files all import torch and (mostly)
+# unsloth_zoo internals -- they are MoE / LoRA shape tests that
+# assume a torch install. We DO NOT spin up the full unsloth-style
+# `Core (HF=... + TRL=...)` matrix here; that's intrinsic to
+# unsloth's training surface, not zoo's library role.
+#
+# Two jobs:
+#   - python-version-collect:  pytest --collect-only across the
+#     supported Python matrix (3.10-3.13). Catches import / syntax
+#     regressions WITHOUT requiring a GPU. Hard gate.
+#   - repo-tests-cpu:          pytest tests/security + the
+#     CPU-pure tests from tests/test_*.py that the GPU-free harness
+#     in tests/conftest.py can run. Hard gate on tests/security;
+#     other CPU tests are continue-on-error during the CI-bootstrap
+#     phase and tighten later.
+#
+# Heavy GPU tests (test_active_merge_device_matrix.py,
+# test_forward_native_moe_loop_lora.py, etc.) are left as a
+# follow-up: they need a real CUDA runner + LoRA model fixtures
+# that don't exist on free GitHub Actions Linux runners.
+
+name: Tests CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # Python compatibility matrix: pytest --collect-only on every
+  # supported interpreter. Catches imports / syntax / decorator
+  # regressions before they hit a release.
+  # ─────────────────────────────────────────────────────────────────────
+  python-version-collect:
+    name: (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install CPU-only torch + zoo runtime deps
+        # CPU index avoids pulling the multi-GB CUDA wheel set. The
+        # version pin matches pyproject.toml's `torch>=2.4.0,<2.11.0`
+        # for the GPU-platform lane; here on CPU we just need
+        # something import-compatible with the source tree.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.4.0,<2.11.0"
+          pip install -e .[core]
+          pip install pytest==9.0.3
+
+      - name: pytest --collect-only
+        # Collect-only verifies every test imports cleanly. It will
+        # FAIL on syntax / import / decorator regressions in zoo
+        # itself, which is what we want.
+        run: python -m pytest tests/ --collect-only -q
+
+  # ─────────────────────────────────────────────────────────────────────
+  # CPU-only repo tests. Hard gate on tests/security; other CPU-pure
+  # zoo tests are continue-on-error during CI bootstrap.
+  # ─────────────────────────────────────────────────────────────────────
+  repo-tests-cpu:
+    name: Repo tests (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install runtime + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.4.0,<2.11.0"
+          pip install -e .[core]
+          pip install pytest==9.0.3 pyyaml==6.0.2
+
+      - name: pytest tests/security (HARD GATE)
+        run: python -m pytest tests/security -v
+
+      - name: pytest tests/test_pr_a_imports + zoo-specific CPU tests
+        # CPU-pure zoo tests: import smoke (pr_a_imports), the new
+        # rl_replacements CPU unit tests, the new temporary_patches
+        # import smoke, the past-bug regression suite, and the PyPI
+        # version-sync check. All CPU-safe by construction (no
+        # @requires_gpu, no real CUDA call sites). Run as a SEPARATE
+        # pytest invocation from tests/security above: the
+        # tests/security/conftest.py installs a session-scoped
+        # `network_blocker` autouse fixture that replaces
+        # `socket.socket` for the whole pytest session, which would
+        # otherwise prevent test_pypi_version_sync from reaching
+        # pypi.org.
+        continue-on-error: true
+        run: |
+          python -m pytest \
+            tests/test_pr_a_imports.py \
+            tests/test_rl_replacements_cpu.py \
+            tests/test_temporary_patches_imports.py \
+            tests/test_zoo_history_regressions.py \
+            tests/test_pypi_version_sync.py \
+            -v

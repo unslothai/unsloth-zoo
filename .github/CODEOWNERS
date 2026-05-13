@@ -1,0 +1,37 @@
+# Inspired from https://github.com/vllm-project/vllm/blob/main/.github/CODEOWNERS
+# Mirrors unslothai/unsloth's CODEOWNERS shape, scoped to zoo's layout.
+
+/unsloth_zoo/rl_replacements.py @Datta0 @pluesclues @danielhanchen
+/unsloth_zoo/compiler.py @danielhanchen
+/unsloth_zoo/compiler_replacements.py @danielhanchen
+/unsloth_zoo/device_type.py @danielhanchen
+/unsloth_zoo/tokenizer_utils.py @mmathew23 @danielhanchen
+/unsloth_zoo/saving_utils.py @rolandtannous @danielhanchen
+/unsloth_zoo/peft_utils.py @danielhanchen
+/unsloth_zoo/loss_utils.py @danielhanchen
+
+# Temporary model-specific patch subsystem.
+/unsloth_zoo/temporary_patches/*.py @danielhanchen
+/unsloth_zoo/temporary_patches/gemma*.py @danielhanchen
+/unsloth_zoo/temporary_patches/qwen3*.py @danielhanchen
+/unsloth_zoo/temporary_patches/gpt_oss.py @danielhanchen
+/unsloth_zoo/temporary_patches/moe_*.py @Datta0 @danielhanchen
+/unsloth_zoo/temporary_patches/mxfp4.py @Datta0 @danielhanchen
+/unsloth_zoo/temporary_patches/bitsandbytes.py @danielhanchen
+
+# MLX subsystem (macOS arm64 only).
+/unsloth_zoo/mlx_*.py @danielhanchen
+/unsloth_zoo/mlx_cce/*.py @danielhanchen
+
+# MoE / fused / flex attention kernels.
+/unsloth_zoo/fused_losses/*.py @danielhanchen
+/unsloth_zoo/flex_attention/*.py @danielhanchen
+
+# Security + CI infrastructure ported from unsloth via this PR.
+/.github/workflows/security-audit.yml @danielhanchen
+/scripts/scan_packages.py @danielhanchen
+/scripts/lint_workflow_triggers.py @danielhanchen
+/scripts/enforce_kwargs_spacing.py @danielhanchen
+/tests/security/ @danielhanchen
+/.github/dependabot.yml @danielhanchen
+/.github/CODEOWNERS @danielhanchen

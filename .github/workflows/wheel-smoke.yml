@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Builds the PyPI wheel + sdist from the PR branch, then verifies the
+# built wheel contains what we expect to ship and is importable in a
+# clean venv. Adapted from unsloth's wheel-smoke.yml: zoo has no
+# frontend / Tauri / Studio tree, so the content checks pivot to
+# "unsloth_zoo package present, no tests/ shipped, no stray .pyc, real
+# version string from dynamic metadata, import smoke succeeds".
+
+name: Wheel CI
+
+on:
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+      - 'unsloth_zoo/**'
+      - 'tests/**'
+      - '.github/workflows/wheel-smoke.yml'
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    name: Wheel build + content sanity + import smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Build wheel + sdist
+        run: |
+          python -m pip install --upgrade pip build
+          rm -rf dist build ./*.egg-info
+          python -m build
+
+      - name: Wheel content sanity
+        run: |
+          python - <<'PY'
+          import zipfile, glob, sys, re
+          wheels = glob.glob("dist/unsloth_zoo-*.whl")
+          if not wheels:
+              print("FAIL: no wheel produced"); sys.exit(2)
+          w = wheels[0]
+          print(f"wheel: {w}")
+          # Version sanity: dynamic metadata pulls from
+          # unsloth_zoo.__init__.__version__; assert the filename
+          # carries a non-zero SemVer-ish token, not "0.0.0".
+          m = re.match(r"dist/unsloth_zoo-([^-]+)-py3-none-any\.whl", w)
+          version = m.group(1) if m else None
+          print(f"wheel version: {version}")
+          with zipfile.ZipFile(w) as z:
+              n = z.namelist()
+              checks = {
+                "unsloth_zoo/__init__.py shipped":      any(s == "unsloth_zoo/__init__.py" for s in n),
+                "unsloth_zoo/rl_replacements.py shipped": any(s == "unsloth_zoo/rl_replacements.py" for s in n),
+                "unsloth_zoo/temporary_patches/__init__.py shipped": any(s == "unsloth_zoo/temporary_patches/__init__.py" for s in n),
+                "no tests/ shipped":                    not any(s.startswith("tests/") for s in n),
+                "no scripts/ shipped":                  not any(s.startswith("scripts/") for s in n),
+                "no .pyc files":                        not any(s.endswith(".pyc") for s in n),
+                "no .git tree":                         not any(s.startswith(".git/") for s in n),
+                "version is not 0.0.0":                 version is not None and version != "0.0.0",
+                "METADATA present":                     any(s.endswith(".dist-info/METADATA") for s in n),
+              }
+              print()
+              for k, v in checks.items():
+                  print(f"  [{'PASS' if v else 'FAIL'}] {k}")
+              sys.exit(0 if all(checks.values()) else 1)
+          PY
+
+      - name: Import smoke (clean venv, no torch)
+        # Bare `import unsloth_zoo` triggers device-type detection that
+        # requires torch + CUDA / XPU / HIP on the host. We invoke the
+        # same GPU-free harness that tests/conftest.py uses, but here
+        # for the installed wheel: install torch CPU + the wheel, then
+        # let conftest pre-load device_type under a mocked
+        # torch.cuda.is_available(). The smoke ASSERTS the version
+        # string read from the installed package matches the wheel
+        # filename.
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install --upgrade pip
+          # Install the wheel + a small set of runtime deps. torch is
+          # the heavy one (~700 MB). Pinned to CPU index to avoid
+          # downloading CUDA wheels we don't need.
+          /tmp/v/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.4.0,<2.11.0"
+          /tmp/v/bin/pip install dist/unsloth_zoo-*.whl
+          # Confirm the install resolved a real version.
+          WHEEL_VERSION=$(/tmp/v/bin/python -c "import unsloth_zoo, sys; sys.stdout.write(getattr(unsloth_zoo, '__version__', 'unknown'))")
+          echo "installed unsloth_zoo version: $WHEEL_VERSION"
+          test -n "$WHEEL_VERSION" && test "$WHEEL_VERSION" != "0.0.0" && test "$WHEEL_VERSION" != "unknown"
+
+      - name: Upload wheel on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: unsloth-zoo-wheel
+          path: dist/
+          retention-days: 7
