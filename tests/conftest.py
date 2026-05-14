@@ -217,89 +217,30 @@ if str(_TESTS_DIR) not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# 3. Apply zoo-local upstream-drift fixes (triton CompiledKernel attrs,
-#    vLLM GuidedDecodingParams rename, peft transformers_weight_conversion
-#    shim, etc.). The production import path applies these via
-#    ``unsloth_zoo/__init__.py``, but the GPU-free test harness above
-#    deliberately avoids importing the full ``unsloth_zoo`` package
-#    (which requires CUDA / torch device initialization). Load just
-#    the standalone import-fixes module by file path so the drift
-#    detectors in ``test_upstream_import_fixes_drift.py`` see the
-#    same patched state a real zoo install would.
+# 3. Apply upstream-drift fixes (triton CompiledKernel attrs, vLLM
+#    GuidedDecodingParams rename, peft transformers_weight_conversion shim,
+#    etc.) by triggering ``import unsloth``. The fixes are hosted on
+#    ``unsloth/import_fixes.py`` and applied at unsloth import time; zoo
+#    no longer carries a redundant copy of them. The production zoo
+#    import chain requires ``find_spec("unsloth")`` to succeed (see
+#    ``unsloth_zoo/__init__.py``), so unsloth has always already run by
+#    the time anything imports zoo at runtime; this conftest just forces
+#    the same ordering for the CPU-only test harness, which deliberately
+#    avoids triggering the full ``unsloth_zoo`` import chain itself (it
+#    requires CUDA / torch device init). Tests that don't have unsloth
+#    installed (e.g. security-only test runs in CI) keep passing because
+#    we swallow ImportError here.
 # ---------------------------------------------------------------------------
 
-def _apply_zoo_import_fixes_for_tests() -> None:
+def _apply_upstream_import_fixes_for_tests() -> None:
     try:
-        pkg_spec = importlib.util.find_spec("unsloth_zoo")
+        import unsloth  # noqa: F401  # side-effect: runs unsloth/import_fixes.py
     except Exception:
-        return
-    if pkg_spec is None or not pkg_spec.submodule_search_locations:
-        return
-    import os as _os
-    fix_path = _os.path.join(
-        pkg_spec.submodule_search_locations[0], "import_fixes.py",
-    )
-    if not _os.path.exists(fix_path):
-        return
-    mod_name = "unsloth_zoo.import_fixes"
-    # Track whether WE installed the parent-package skeleton, so we can
-    # pop it after loading import_fixes.py. Leaving a half-initialised
-    # ``unsloth_zoo`` in sys.modules confuses other tests (e.g.
-    # test_zoo_history_regressions_deep.py imports submodules off the
-    # real package and relies on the full __init__.py having run).
-    _installed_skeleton = False
-    if mod_name in sys.modules:
-        mod = sys.modules[mod_name]
-    else:
-        # Submodule import requires SOME parent ``unsloth_zoo`` entry in
-        # sys.modules. Reuse one if a sibling conftest step already
-        # installed it (and don't pop in that case); otherwise install a
-        # bare skeleton and pop on the way out.
-        if "unsloth_zoo" not in sys.modules:
-            zoo_pkg = types.ModuleType("unsloth_zoo")
-            zoo_pkg.__path__ = list(pkg_spec.submodule_search_locations)
-            zoo_pkg.__spec__ = pkg_spec
-            zoo_pkg.__package__ = "unsloth_zoo"
-            zoo_pkg.__file__ = _os.path.join(
-                pkg_spec.submodule_search_locations[0], "__init__.py",
-            )
-            sys.modules["unsloth_zoo"] = zoo_pkg
-            _installed_skeleton = True
-        spec = importlib.util.spec_from_file_location(mod_name, fix_path)
-        if spec is None or spec.loader is None:
-            if _installed_skeleton:
-                sys.modules.pop("unsloth_zoo", None)
-            return
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[mod_name] = mod
-        try:
-            spec.loader.exec_module(mod)
-        except Exception:
-            sys.modules.pop(mod_name, None)
-            if _installed_skeleton:
-                sys.modules.pop("unsloth_zoo", None)
-            return
-    apply = getattr(mod, "apply_import_fixes", None)
-    if apply is None:
-        if _installed_skeleton:
-            sys.modules.pop("unsloth_zoo", None)
-        return
-    try:
-        apply()
-    except Exception:
-        # Individual fixes are already wrapped; if the entrypoint itself
-        # blows up, don't take pytest collection down.
+        # unsloth not installed (security-only test suites), or it failed
+        # to import on this stack. Either way we don't want to take pytest
+        # collection down here -- individual drift-detector tests will
+        # surface any pathology that the missing patches would have hidden.
         pass
-    finally:
-        # Drop our scratch skeleton so subsequent ``import unsloth_zoo``
-        # / ``importlib.import_module("unsloth_zoo")`` calls hit the real
-        # package init (or whatever skeleton step 1 of this conftest
-        # installs lazily on demand) rather than our empty placeholder.
-        # The import-fixes module itself stays in sys.modules under
-        # ``unsloth_zoo.import_fixes`` -- python's import machinery is
-        # happy to find a submodule without an active parent entry.
-        if _installed_skeleton:
-            sys.modules.pop("unsloth_zoo", None)
 
 
-_apply_zoo_import_fixes_for_tests()
+_apply_upstream_import_fixes_for_tests()
