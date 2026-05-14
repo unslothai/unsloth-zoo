@@ -416,19 +416,38 @@ def test_triton_compiled_kernel_has_num_ctas_and_cluster_dims():
     tc = pytest.importorskip("triton.compiler.compiler")
 
     ck_cls = tc.CompiledKernel
-    # The fix's own gating: if the CLASS already has num_ctas the
-    # fix is a no-op. Otherwise the fix installs the missing attrs
-    # at instance __init__ time. We can only cheaply observe the
-    # class shape on CPU.
+    # Two healthy shapes:
+    #   * pre-3.6 triton (or a future fix) exposes ``num_ctas`` as a
+    #     class attribute -- the upstream pathology is gone.
+    #   * post-3.6 triton with unsloth's fix applied: the class still
+    #     lacks the attr but ``CompiledKernel.__init__`` has been
+    #     wrapped to install both attrs on each new instance, which is
+    #     enough to satisfy torch Inductor's
+    #     ``hasattr(binary, "num_ctas")`` probe at launch time.
     if hasattr(ck_cls, "num_ctas"):
-        return  # healthy: old-style triton with direct attr
+        return  # healthy: old-style triton with direct class attr
+    # Detect the instance-level wrapped __init__. Unsloth's
+    # ``fix_triton_compiled_kernel_missing_attrs`` rebinds the class's
+    # ``__init__`` to a closure named ``_patched_init`` whose qualname
+    # / source contains the num_ctas + cluster_dims injection. Probing
+    # the closure cells / co_freevars is GPU-free and idempotent.
+    init = getattr(ck_cls, "__init__", None)
+    if init is not None:
+        code = getattr(init, "__code__", None)
+        freevars = set(getattr(code, "co_freevars", ()) or ())
+        co_names = set(getattr(code, "co_names", ()) or ())
+        if "_orig_init" in freevars or {"num_ctas", "cluster_dims"}.issubset(
+            co_names
+        ):
+            return  # healthy: unsloth's __init__ wrapper is installed
 
     pytest.fail(
         "DRIFT DETECTED: triton.CompiledKernel lacks the `num_ctas` "
-        "class attribute; fix_triton_compiled_kernel_missing_attrs "
-        "patches __init__ to inject num_ctas and cluster_dims so "
-        "torch._inductor.runtime.triton_heuristics.make_launcher "
-        "stops crashing under torch.compile."
+        "class attribute and ``__init__`` has not been wrapped by "
+        "fix_triton_compiled_kernel_missing_attrs; torch Inductor's "
+        "``make_launcher`` will crash on the eager "
+        "``binary.metadata.num_ctas, *binary.metadata.cluster_dims`` "
+        "unpack under torch.compile."
     )
 
 
