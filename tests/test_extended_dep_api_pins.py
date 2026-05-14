@@ -14,33 +14,16 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Extended upstream-API pins for the dependencies zoo touches BEYOND
-the transformers / trl / peft / vllm surface covered by the existing
-``tests/test_upstream_pinned_symbols_*.py`` suite and the
-``tests/test_zoo_source_upstream_refs.py`` flat enumeration.
+"""Extended upstream-API pins for ``accelerate.*`` / ``safetensors.*``
+/ ``bitsandbytes.*`` / ``triton.*`` / ``datasets.*`` /
+``huggingface_hub.*`` / ``xformers.*`` references in
+``unsloth_zoo/**/*.py`` not already covered by
+``test_upstream_pinned_symbols_*.py`` or
+``test_zoo_source_upstream_refs.py``.
 
-This file enumerates every ``accelerate.*`` / ``safetensors.*`` /
-``bitsandbytes.*`` / ``triton.*`` / ``datasets.*`` / ``huggingface_hub.*``
-/ ``xformers.*`` dotted reference that survives in
-``unsloth_zoo/**/*.py`` once the existing suites' references are
-subtracted. Each reference is pinned against the INSTALLED version of
-the upstream library (matching the Core-matrix model).
-
-Contract per test:
-
-* CPU-only.
-* ``pytest.importorskip`` for libraries that are optional on this
-  install (xformers, mlx, etc.).
-* DRIFT == ``pytest.fail("DRIFT DETECTED: ...")``. Never ``pytest.skip``
-  when the symbol is referenced unconditionally in zoo and is missing
-  upstream -- that exactly defeats the matrix.
-
-The test file is grouped by library so a regression on (say) bnb 0.50
-lights up the bnb section without polluting the others.
-
-Each test cites the zoo callsite (file:line) it pins, so when a
-maintainer needs to remove the reference the matching test is one grep
-away.
+DRIFT-DETECTED framing: each test cites its zoo callsite. Failure ->
+``pytest.fail("DRIFT DETECTED: ...")``; never SKIP when zoo references
+the symbol unconditionally.
 """
 
 from __future__ import annotations
@@ -54,16 +37,14 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers (intentionally copies of the public surface in
-# test_zoo_source_upstream_refs.py so this file is grep-self-contained).
+# Shared helpers (intentional copies of test_zoo_source_upstream_refs.py
+# helpers so this file is grep-self-contained).
 # ---------------------------------------------------------------------------
 
 
 def _resolve(dotted: str) -> object:
     """``importlib.import_module`` + ``getattr`` chain. Any failure is
-    surfaced as an AssertionError tagged DRIFT DETECTED so the matrix
-    cell goes red rather than green-with-skips.
-    """
+    surfaced as AssertionError tagged DRIFT DETECTED."""
     parts = dotted.split(".")
     obj: object = None
     consumed: list[str] = []
@@ -113,35 +94,18 @@ def _resolve_all(dotted_paths: Iterable[str]) -> None:
 
 
 def _require_module(name: str):
-    """``pytest.importorskip``-style: the library is genuinely optional
-    on this install (xformers, mlx, triton, bitsandbytes on Apple-Silicon).
-    Once the top-level package is present, all subsequent symbol misses
-    are reported as DRIFT.
-    """
     return pytest.importorskip(name)
 
 
 # ===========================================================================
 # accelerate
 # ===========================================================================
-#
-# Existing coverage:
-#   test_zoo_source_upstream_refs.py::test_empty_model_accelerate_init_empty_weights
-#     pins accelerate.init_empty_weights existence.
-#   test_upstream_import_fixes_drift.py:: covers accelerate.utils.imports
-#     .is_wandb_available and accelerate.utils.is_wandb_available.
-#
-# This section adds: signature pin for init_empty_weights, plus the
-# attribute paths zoo's empty_model + saving paths rely on but the
-# existing tests don't shape-pin.
-# ---------------------------------------------------------------------------
 
 
 def test_accelerate_init_empty_weights_signature_shape():
-    """unsloth_zoo/empty_model.py:238, 322 -- `from accelerate import
-    init_empty_weights`. Both callsites use it as a CONTEXT MANAGER with
-    no args (the default include_buffers=None). A pre-3.0 accelerate
-    flipped this to a required first positional; pin the modern shape."""
+    """unsloth_zoo/empty_model.py:238, 322 -- ``with init_empty_weights():``
+    as zero-arg context manager (default include_buffers=None). Pre-3.0
+    flipped this to a required positional; pin the modern shape."""
     _require_module("accelerate")
     fn = _resolve("accelerate.init_empty_weights")
     sig = inspect.signature(fn)
@@ -163,11 +127,9 @@ def test_accelerate_init_empty_weights_signature_shape():
 
 
 def test_accelerate_init_empty_weights_is_context_manager():
-    """Same callsites: `with init_empty_weights():` -- the return value
-    must be a context manager (have __enter__/__exit__). A regression
-    that flips it to a plain function silently constructs a real-CPU
-    state dict instead of meta tensors and OOMs on Llama-70B-class
-    empty-model builds."""
+    """Return value must be a context manager. A regression that flips
+    it to a plain function silently constructs a real-CPU state dict
+    instead of meta tensors and OOMs on Llama-70B-class empty-model builds."""
     _require_module("accelerate")
     accelerate = importlib.import_module("accelerate")
     cm = accelerate.init_empty_weights()
@@ -177,14 +139,12 @@ def test_accelerate_init_empty_weights_is_context_manager():
             "returns a context manager; empty_model.py:238/322 "
             "`with init_empty_weights():` will TypeError at runtime."
         )
-    # Drain the manager so we don't leak state.
     cm.__enter__()
     cm.__exit__(None, None, None)
 
 
 def test_accelerate_utils_imports_module_surface():
-    """unsloth_zoo references accelerate at three layered paths; pin
-    the module-path surface so a restructuring of accelerate.utils
+    """Pin the module-path surface so accelerate.utils restructuring
     surfaces here, not at zoo import time."""
     _require_module("accelerate")
     _resolve_all([
@@ -196,41 +156,25 @@ def test_accelerate_utils_imports_module_surface():
 # ===========================================================================
 # safetensors
 # ===========================================================================
-#
-# Zoo callsites:
-#   saving_utils.py:65   import bitsandbytes as bnb        (covered below)
-#   saving_utils.py:153  from safetensors import safe_open
-#   saving_utils.py:154  from safetensors.torch import save_file
-#   saving_utils.py:506  import safetensors
-#   saving_utils.py:512  SAFETENSORS_DTYPES = safetensors.torch._TYPES
-#
-# Existing coverage: none of the existing test files pin safetensors
-# symbols; the *.py source-ref scan caught only the dataset / accelerate
-# top-levels. This section is the regression net.
-# ---------------------------------------------------------------------------
 
 
 def test_safetensors_safe_open_top_level_exists():
-    """unsloth_zoo/saving_utils.py:153 -- `from safetensors import
-    safe_open`. This is the streamed-read entry point used by every
-    LoRA save / merge / GGUF export path; a rename takes the whole
-    save surface down."""
+    """unsloth_zoo/saving_utils.py:153 -- ``from safetensors import
+    safe_open``. Streamed-read entry point for every LoRA save / merge
+    / GGUF export."""
     _resolve("safetensors.safe_open")
 
 
 def test_safetensors_safe_open_signature_shape():
-    """saving_utils.py uses safe_open(path, framework='pt', device=...).
-    Pin the 2-positional shape so a regression that drops the
-    ``framework`` arg (rare but observed in safetensors 0.4 dev
-    snapshots) crashes here, not in the LoRA merge runtime."""
+    """saving_utils.py uses ``safe_open(path, framework='pt',
+    device=...)``. Pin filename-first."""
     _require_module("safetensors")
     safe_open = _resolve("safetensors.safe_open")
-    # ``safe_open`` is a Rust-backed class in modern safetensors; either
-    # inspect.signature works OR the class has a __init__ we can probe.
+    # ``safe_open`` is a Rust-backed class; either inspect.signature
+    # works OR the class has an __init__ we can probe.
     try:
         sig = inspect.signature(safe_open)
     except (TypeError, ValueError):
-        # PyO3 builtins; fall back to constructor probe.
         if not hasattr(safe_open, "__init__"):
             pytest.fail(
                 "DRIFT DETECTED: safetensors.safe_open has no inspectable "
@@ -239,7 +183,6 @@ def test_safetensors_safe_open_signature_shape():
             )
         return
     params = list(sig.parameters)
-    # filename must be the first parameter, framework second.
     if not params or params[0] not in ("filename", "path"):
         pytest.fail(
             f"DRIFT DETECTED: safetensors.safe_open first parameter is "
@@ -248,15 +191,13 @@ def test_safetensors_safe_open_signature_shape():
 
 
 def test_safetensors_torch_save_file_top_level():
-    """saving_utils.py:154 -- `from safetensors.torch import save_file`.
-    This is the canonical write path for sharded LoRA / merged-model
-    safetensors output."""
+    """saving_utils.py:154 -- ``from safetensors.torch import save_file``.
+    Canonical write path for sharded LoRA / merged-model output."""
     _resolve("safetensors.torch.save_file")
 
 
 def test_safetensors_torch_save_file_signature():
-    """save_file is called with (tensors, filename, metadata=...) at
-    multiple zoo callsites. Pin those 3 parameters."""
+    """save_file is called with ``(tensors, filename, metadata=...)``."""
     _require_module("safetensors")
     save_file = _resolve("safetensors.torch.save_file")
     sig = inspect.signature(save_file)
@@ -271,10 +212,9 @@ def test_safetensors_torch_save_file_signature():
 
 
 def test_safetensors_torch_types_mapping_present():
-    """saving_utils.py:512 -- `SAFETENSORS_DTYPES = safetensors.torch._TYPES`.
-    The fallback branch logs and synthesises a default mapping, but
-    the silent fallback hides real dtype-coverage regressions in shard
-    writes (BF16 vs FP8 etc.). Pin the upstream-provided mapping."""
+    """saving_utils.py:512 -- ``SAFETENSORS_DTYPES = safetensors.torch._TYPES``.
+    Fallback silently mis-types BF16/FP8 weights in sharded save; pin
+    the upstream-provided mapping."""
     _require_module("safetensors")
     st_torch = importlib.import_module("safetensors.torch")
     if not hasattr(st_torch, "_TYPES"):
@@ -285,7 +225,6 @@ def test_safetensors_torch_types_mapping_present():
             "save."
         )
     types_map = st_torch._TYPES
-    # The map MUST cover the dtypes saving_utils.py reads (BF16, F16, F32).
     string_keys = {str(k).lower() for k in types_map.keys()}
     for needed in ("bf16", "f16", "f32"):
         if not any(needed in k for k in string_keys):
@@ -296,10 +235,8 @@ def test_safetensors_torch_types_mapping_present():
 
 
 def test_safetensors_torch_load_file_present():
-    """saving_utils.py's shard-merge codepaths call safetensors.torch
-    .load_file via the same import binding implied by `from safetensors
-    .torch import save_file`. A regression that ships only one direction
-    breaks the round-trip we rely on for delta-LoRA dequant verification."""
+    """saving_utils.py's shard-merge codepaths call ``safetensors.torch
+    .load_file``. Pin the round-trip needed for delta-LoRA dequant verify."""
     _require_module("safetensors")
     _resolve("safetensors.torch.load_file")
 
@@ -307,44 +244,12 @@ def test_safetensors_torch_load_file_present():
 # ===========================================================================
 # bitsandbytes
 # ===========================================================================
-#
-# Zoo callsites (deduplicated):
-#   device_type.py:257    from bitsandbytes.nn.modules import Params4bit
-#   device_type.py:260    import bitsandbytes; bitsandbytes.__version__
-#   patching_utils.py:309 from bitsandbytes.nn import Linear4bit as Bnb_Linear4bit
-#   saving_utils.py:65    import bitsandbytes as bnb; bnb.nn.Linear4bit
-#   temporary_patches/bitsandbytes.py:46
-#     bitsandbytes.nn.modules.Linear4bit
-#   temporary_patches/bitsandbytes.py:47
-#     bitsandbytes.nn.modules.Params4bit
-#   temporary_patches/bitsandbytes.py:48
-#     bitsandbytes.nn.modules.fix_4bit_weight_quant_state_from_module
-#   temporary_patches/bitsandbytes.py:106
-#     bitsandbytes.matmul_4bit
-#   temporary_patches/moe_bnb.py:43
-#     from bitsandbytes.nn import Params4bit
-#   temporary_patches/moe_bnb.py:44
-#     from bitsandbytes.functional import dequantize_4bit
-#   temporary_patches/moe_bnb.py:245
-#     bnb.matmul_4bit
-#   vllm_utils.py:190    from bitsandbytes import matmul_4bit
-#   vllm_utils.py:420    import bitsandbytes.functional
-#   vllm_utils.py:421    from bitsandbytes.utils import pack_dict_to_tensor, unpack_tensor_to_dict
-#   vllm_utils.py:481    import bitsandbytes.nn.modules
-#   vllm_utils.py:495    bitsandbytes.functional.QuantState.from_dict
-#   vllm_utils.py:1285   from bitsandbytes.nn.modules import Linear4bit, Params4bit
-#
-# Existing coverage: peft.tuners.lora.Linear4bit and the
-# transformers.integrations.bitsandbytes module are pinned in
-# test_zoo_source_upstream_refs.py. The bnb-internal surface is
-# untested. This section is the regression net.
-# ---------------------------------------------------------------------------
 
 
 def test_bnb_top_level_import_and_version_attr():
-    """device_type.py:260, saving_utils.py:65, plus every temporary_patches
-    callsite imports `bitsandbytes` and reads `.__version__`. A removal
-    of the dunder breaks the HIP / pre-0.46 cascades."""
+    """device_type.py:260, saving_utils.py:65, every temporary_patches
+    callsite reads ``bitsandbytes.__version__``. Drives HIP / pre-0.46
+    gate cascades."""
     bnb = _require_module("bitsandbytes")
     if not hasattr(bnb, "__version__"):
         pytest.fail(
@@ -355,10 +260,8 @@ def test_bnb_top_level_import_and_version_attr():
 
 
 def test_bnb_nn_linear4bit_top_level():
-    """patching_utils.py:309 -- `from bitsandbytes.nn import Linear4bit`.
-    saving_utils.py:88 isinstance-checks against it. The two import
-    paths (bitsandbytes.nn.Linear4bit and bitsandbytes.nn.modules.Linear4bit)
-    must BOTH resolve because zoo reaches both."""
+    """patching_utils.py:309 + saving_utils.py:88 isinstance-check.
+    Both import paths must resolve because zoo reaches both."""
     _require_module("bitsandbytes")
     _resolve_all([
         "bitsandbytes.nn.Linear4bit",
@@ -367,10 +270,9 @@ def test_bnb_nn_linear4bit_top_level():
 
 
 def test_bnb_linear4bit_constructor_kwargs_preserved():
-    """temporary_patches/bitsandbytes.py and vllm_utils.py:484 both pass
-    `compute_dtype=...` to Linear4bit.__init__. A regression that
-    renames or drops the kwarg silently disables UNSLOTH_bnb_4bit_compute_dtype
-    overrides."""
+    """temporary_patches/bitsandbytes.py + vllm_utils.py:484 pass
+    ``compute_dtype=...``. Regression silently disables
+    UNSLOTH_bnb_4bit_compute_dtype overrides."""
     _require_module("bitsandbytes")
     Linear4bit = _resolve("bitsandbytes.nn.Linear4bit")
     sig = inspect.signature(Linear4bit.__init__)
@@ -383,18 +285,18 @@ def test_bnb_linear4bit_constructor_kwargs_preserved():
 
 
 def test_bnb_nn_modules_params4bit_present():
-    """device_type.py:257 and temporary_patches/bitsandbytes.py:47 both
-    import `Params4bit` from `bitsandbytes.nn.modules`. The HIP-gate
-    blocksize source-inspection lives on the class' source."""
+    """device_type.py:257 + temporary_patches/bitsandbytes.py:47 import
+    Params4bit. HIP-gate blocksize source-inspection lives on the
+    class' source."""
     _require_module("bitsandbytes")
     _resolve("bitsandbytes.nn.modules.Params4bit")
 
 
 def test_bnb_fix_4bit_weight_quant_state_from_module_present():
-    """temporary_patches/bitsandbytes.py:48, 73 -- the helper repacks
-    a bnb-weight's quant_state attribute after transformers 5.x's
-    `weight.shape[-1] == 1` deferred-pack path. A rename takes the
-    whole Linear4bit forward replacement down."""
+    """temporary_patches/bitsandbytes.py:48, 73 -- repacks bnb-weight
+    quant_state after transformers 5.x's ``weight.shape[-1] == 1``
+    deferred-pack path. Rename takes the whole Linear4bit forward
+    replacement down."""
     _require_module("bitsandbytes")
     _resolve(
         "bitsandbytes.nn.modules.fix_4bit_weight_quant_state_from_module",
@@ -402,10 +304,9 @@ def test_bnb_fix_4bit_weight_quant_state_from_module_present():
 
 
 def test_bnb_matmul_4bit_top_level_and_signature():
-    """temporary_patches/bitsandbytes.py:106, temporary_patches/moe_bnb.py:245,
-    vllm_utils.py:190 -- bnb.matmul_4bit is the 4-bit GEMM kernel zoo
-    replaces Linear4bit.forward with. Pin its (A, B, quant_state, bias)
-    parameter shape."""
+    """temporary_patches/bitsandbytes.py:106, moe_bnb.py:245,
+    vllm_utils.py:190 -- ``bnb.matmul_4bit`` is the 4-bit GEMM kernel
+    zoo replaces Linear4bit.forward with. Pin ``(A, B, quant_state, bias)``."""
     _require_module("bitsandbytes")
     matmul_4bit = _resolve("bitsandbytes.matmul_4bit")
     sig = inspect.signature(matmul_4bit)
@@ -421,16 +322,15 @@ def test_bnb_matmul_4bit_top_level_and_signature():
 
 
 def test_bnb_functional_dequantize_4bit_present():
-    """temporary_patches/moe_bnb.py:44 -- the MoE BNB forward
-    pre-dequantizes expert weights via dequantize_4bit. A rename takes
-    out the entire MoE-on-bnb training surface."""
+    """temporary_patches/moe_bnb.py:44 -- pre-dequantizes expert weights
+    via dequantize_4bit. Rename takes out MoE-on-bnb training."""
     _require_module("bitsandbytes")
     _resolve("bitsandbytes.functional.dequantize_4bit")
 
 
 def test_bnb_functional_quantstate_present_and_from_dict():
-    """vllm_utils.py:495 -- monkeys QuantState.from_dict onto
-    bitsandbytes.functional.QuantState. The classmethod must exist
+    """vllm_utils.py:495 -- monkeys ``QuantState.from_dict`` onto
+    ``bitsandbytes.functional.QuantState``. The classmethod must exist
     pre-patch so the override is well-formed."""
     _require_module("bitsandbytes")
     QuantState = _resolve("bitsandbytes.functional.QuantState")
@@ -443,10 +343,9 @@ def test_bnb_functional_quantstate_present_and_from_dict():
 
 
 def test_bnb_utils_pack_unpack_tensor_dict_present():
-    """vllm_utils.py:421 -- `from bitsandbytes.utils import
-    pack_dict_to_tensor, unpack_tensor_to_dict`. Both names must
-    resolve; the vLLM 4-bit serialization path uses them as a matched
-    pair."""
+    """vllm_utils.py:421 -- ``pack_dict_to_tensor`` and
+    ``unpack_tensor_to_dict`` are the matched pair the vLLM 4-bit
+    serialization path uses."""
     _require_module("bitsandbytes")
     _resolve_all([
         "bitsandbytes.utils.pack_dict_to_tensor",
@@ -455,17 +354,16 @@ def test_bnb_utils_pack_unpack_tensor_dict_present():
 
 
 def test_bnb_functional_module_exists():
-    """vllm_utils.py:420 -- `import bitsandbytes.functional`. Module
-    path itself must be importable; some 0.50-dev wheels rearranged
-    bnb.functional into bnb._functional and re-exported under the
-    old name. The re-export is what zoo depends on."""
+    """vllm_utils.py:420 -- ``import bitsandbytes.functional``. 0.50-dev
+    wheels rearranged to ``bnb._functional`` and re-exported under the
+    old name; zoo depends on the re-export."""
     _require_module("bitsandbytes")
     _resolve("bitsandbytes.functional")
 
 
 def test_bnb_nn_modules_module_path_present():
-    """vllm_utils.py:481 -- `import bitsandbytes.nn.modules`. Module
-    path used for in-place class swap (Linear4bit -> custom subclass)."""
+    """vllm_utils.py:481 -- ``import bitsandbytes.nn.modules`` for
+    in-place class swap (Linear4bit -> custom subclass)."""
     _require_module("bitsandbytes")
     _resolve("bitsandbytes.nn.modules")
 
@@ -473,27 +371,11 @@ def test_bnb_nn_modules_module_path_present():
 # ===========================================================================
 # triton
 # ===========================================================================
-#
-# Zoo callsites:
-#   loss_utils.py:24      from triton import __version__ as triton_version
-#   compiler.py:50        import triton
-#   compiler.py:95        triton.__version__
-#   compiler.py:3030      from triton.runtime.autotuner import Autotuner
-#   temporary_patches/moe_utils.py:193 import triton
-#   temporary_patches/moe_utils.py:217 triton.set_allocator(...)
-#
-# Existing coverage:
-#   test_upstream_import_fixes_drift.py covers triton.compiler.compiler
-#   .CompiledKernel.num_ctas.
-# This section pins the version dunder, the autotuner module path, and
-# the set_allocator surface used by zoo PR #618.
-# ---------------------------------------------------------------------------
 
 
 def test_triton_top_level_version_attr():
-    """compiler.py:95 -- `Version(triton.__version__) < Version("3.0.0")`.
-    loss_utils.py:24 takes the same dunder under a rename. Missing dunder
-    -> zoo import-time AttributeError on every CUDA host."""
+    """compiler.py:95 -- ``Version(triton.__version__) < Version("3.0.0")``.
+    loss_utils.py:24 takes the same dunder."""
     triton_mod = _require_module("triton")
     if not hasattr(triton_mod, "__version__"):
         pytest.fail(
@@ -503,17 +385,16 @@ def test_triton_top_level_version_attr():
 
 
 def test_triton_runtime_autotuner_class_present():
-    """compiler.py:3030 -- `from triton.runtime.autotuner import
-    Autotuner`. The compile-rewriter introspects autotuner-decorated
-    kernels via this class; a removal breaks every Unsloth-compiled
-    kernel-replacement path on torch.compile."""
+    """compiler.py:3030 -- ``from triton.runtime.autotuner import
+    Autotuner``. Introspects autotuner-decorated kernels for the
+    compile-rewriter."""
     _require_module("triton")
     _resolve("triton.runtime.autotuner.Autotuner")
 
 
 def test_triton_set_allocator_top_level_present():
-    """temporary_patches/moe_utils.py:217 -- `triton.set_allocator(
-    persistent_alloc_fn)`. Required for the persistent-allocator MoE
+    """temporary_patches/moe_utils.py:217 -- ``triton.set_allocator(
+    persistent_alloc_fn)``. Required for persistent-allocator MoE
     expert-merge fast path."""
     triton_mod = _require_module("triton")
     if not hasattr(triton_mod, "set_allocator"):
@@ -525,9 +406,8 @@ def test_triton_set_allocator_top_level_present():
 
 
 def test_triton_set_allocator_signature_accepts_one_arg():
-    """The hook passes a single positional callable. A regression to
-    `set_allocator(name, fn)` form (proposed but not landed in triton
-    3.x main) breaks the moe_utils.py:217 callsite immediately."""
+    """A regression to ``set_allocator(name, fn)`` form (proposed in
+    triton 3.x main) breaks the single-arg callsite immediately."""
     triton_mod = _require_module("triton")
     set_alloc = triton_mod.set_allocator
     sig = inspect.signature(set_alloc)
@@ -548,17 +428,15 @@ def test_triton_set_allocator_signature_accepts_one_arg():
 
 
 def test_triton_language_namespace_present():
-    """compiler.py and the compiled-cache codegen reference triton.language
-    by attribute for constexpr / tl.constexpr; a removal of the
-    namespace breaks every Unsloth-compiled MoE kernel."""
+    """compiler.py + compiled-cache codegen reference ``triton.language``
+    for ``tl.constexpr``."""
     _require_module("triton")
     _resolve("triton.language")
 
 
 def test_triton_jit_decorator_present():
-    """triton.jit is the decorator zoo's MoE / CCE / RoPE kernels
-    depend on at codegen time; a rename to `triton.compile` (proposed
-    upstream) would break every kernel."""
+    """``triton.jit`` is the decorator zoo's MoE / CCE / RoPE kernels
+    depend on at codegen time."""
     triton_mod = _require_module("triton")
     if not callable(getattr(triton_mod, "jit", None)):
         pytest.fail(
@@ -570,37 +448,20 @@ def test_triton_jit_decorator_present():
 # ===========================================================================
 # datasets
 # ===========================================================================
-#
-# Zoo callsites:
-#   training_utils.py:19   import datasets
-#   training_utils.py:50   isinstance(train_dataset, datasets.IterableDataset)
-#   tokenizer_utils.py:21  import datasets
-#   tokenizer_utils.py:294 isinstance(train_dataset, datasets.IterableDataset)
-#   dataset_utils.py:594   from datasets import (Dataset, IterableDataset,)
-#   dataset_utils.py:873   from datasets.features._torchcodec import AudioDecoder
-#
-# Existing coverage: test_zoo_source_upstream_refs.py pins datasets.Dataset
-# and datasets.IterableDataset.
-# Adds: load_dataset / DatasetDict (used in zoo training paths via duck
-# typing) and the optional _torchcodec audio path (datasets >= 4.0).
-# ---------------------------------------------------------------------------
 
 
 def test_datasets_load_dataset_top_level():
-    """tokenizer_utils.py and training_utils.py instantiate datasets via
-    `datasets.load_dataset`. The function MUST be top-level on the
-    package; a private-rename silently changes the data-loading entry
-    point."""
+    """tokenizer_utils.py + training_utils.py instantiate datasets via
+    ``datasets.load_dataset``."""
     _require_module("datasets")
     _resolve("datasets.load_dataset")
 
 
 def test_datasets_iterable_dataset_classmethod_for_isinstance():
-    """tokenizer_utils.py:294 and training_utils.py:50 isinstance-check
-    against `datasets.IterableDataset`. A rename to `datasets.iterable
-    .IterableDataset` (proposed in datasets 4.x) breaks the streaming-
-    dataset routing silently (the isinstance returns False and the
-    streaming path is dropped)."""
+    """tokenizer_utils.py:294 + training_utils.py:50 isinstance-check
+    against ``datasets.IterableDataset``. A rename to
+    ``datasets.iterable.IterableDataset`` (proposed in 4.x) silently
+    drops the streaming path."""
     datasets = _require_module("datasets")
     ID = getattr(datasets, "IterableDataset", None)
     if ID is None:
@@ -618,43 +479,27 @@ def test_datasets_iterable_dataset_classmethod_for_isinstance():
 
 
 def test_datasets_dataset_dict_top_level():
-    """dataset_utils.py walks DatasetDict-shaped train/eval pairs in the
-    multi-split SFT path (via duck-typed `.column_names` access on
-    a returned object). DatasetDict must stay on the top-level
-    namespace."""
+    """dataset_utils.py walks DatasetDict-shaped train/eval pairs in
+    multi-split SFT via duck-typed ``.column_names``."""
     _require_module("datasets")
     _resolve("datasets.DatasetDict")
 
 
 def test_datasets_torchcodec_audio_decoder_present_or_absent_cleanly():
-    """dataset_utils.py:873 -- `from datasets.features._torchcodec
-    import AudioDecoder`. The whole block is wrapped in try/except so
-    its absence is tolerated, but if the module IS importable, the
-    AudioDecoder class MUST be on it (otherwise the patch silently
-    skips and audio dataset callers get a half-patched type).
+    """dataset_utils.py:873 -- ``from datasets.features._torchcodec
+    import AudioDecoder``. Wrapped in try/except so absence is tolerated;
+    if the module IS importable, AudioDecoder must be on it.
 
-    Note on `torchcodec` (separate package): datasets >=4.x's
-    `_torchcodec.py` does `from torchcodec.decoders import
-    AudioDecoder` at module top. That's a legitimate optional
-    transitive dep -- CI runners without audio support won't have
-    torchcodec, and zoo's call site survives via try/except. Treat
-    that environment as an importorskip, NOT a drift fail; a real
-    drift would be the symbol vanishing AFTER the module imports
-    cleanly."""
+    ``torchcodec`` (separate package) is a legitimate optional
+    transitive dep -- CI without audio support won't have it. Treat
+    that environment as importorskip, NOT drift."""
     _require_module("datasets")
     spec = importlib.util.find_spec("datasets.features._torchcodec")
     if spec is None:
-        # Module path absent on this datasets version. Zoo's
-        # try/except handles it. Healthy state.
         return
     try:
         mod = importlib.import_module("datasets.features._torchcodec")
     except ModuleNotFoundError as exc:
-        # Optional transitive dep (torchcodec itself, not zoo's call
-        # site) not installed on this CI box. zoo's `from
-        # datasets.features._torchcodec import AudioDecoder` is
-        # try/except wrapped at dataset_utils.py:873, so the absence
-        # is a tolerated runtime state, not drift.
         if "torchcodec" in str(exc):
             pytest.skip(
                 f"`datasets.features._torchcodec` requires the optional "
@@ -683,36 +528,12 @@ def test_datasets_torchcodec_audio_decoder_present_or_absent_cleanly():
 # ===========================================================================
 # huggingface_hub
 # ===========================================================================
-#
-# Zoo callsites (deduplicated):
-#   saving_utils.py:67     from huggingface_hub import get_token
-#   saving_utils.py:70     from huggingface_hub.utils import get_token
-#   saving_utils.py:73     from huggingface_hub.utils._token import get_token  (optional fallback)
-#   saving_utils.py:109    from huggingface_hub import ModelCard, HfApi
-#   saving_utils.py:148-152 from huggingface_hub import (snapshot_download,
-#                          hf_hub_download, HfFileSystem,)
-#   saving_utils.py:1602-1606 from huggingface_hub import (
-#                          split_state_dict_into_shards_factory,
-#                          get_torch_storage_size, get_torch_storage_id,)
-#   saving_utils.py:1652   from huggingface_hub.serialization._base import parse_size_to_int
-#   saving_utils.py:2365   from huggingface_hub.errors import LocalEntryNotFoundError
-#   saving_utils.py:3088   from huggingface_hub import hf_hub_download
-#   mlx_utils.py:3152      from huggingface_hub import HfApi
-#   mlx_utils.py:3195      from huggingface_hub import ModelCard
-#   mlx_utils.py:3248      from huggingface_hub import HfApi
-#
-# Existing coverage:
-#   test_upstream_import_fixes_drift.py::test_huggingface_hub_is_offline_mode_or_hf_hub_offline_present
-# covers is_offline_mode / HF_HUB_OFFLINE.
-# Everything else is unprotected. This section is the regression net.
-# ---------------------------------------------------------------------------
 
 
 def test_hf_hub_top_level_save_path_symbols():
-    """saving_utils.py:148-152 -- `from huggingface_hub import (
-    snapshot_download, hf_hub_download, HfFileSystem,)`. ALL THREE must
-    resolve on the top-level namespace; saving_utils does this import
-    at MODULE TOP LEVEL (no try/except)."""
+    """saving_utils.py:148-152 -- ``from huggingface_hub import (
+    snapshot_download, hf_hub_download, HfFileSystem,)`` at MODULE TOP
+    LEVEL (no try/except)."""
     _require_module("huggingface_hub")
     _resolve_all([
         "huggingface_hub.snapshot_download",
@@ -722,9 +543,8 @@ def test_hf_hub_top_level_save_path_symbols():
 
 
 def test_hf_hub_hfapi_and_modelcard_top_level():
-    """saving_utils.py:109 + mlx_utils.py:3152, 3195, 3248 --
-    HfApi and ModelCard are referenced unguardedly. Either rename
-    takes down the upload + model-card paths."""
+    """saving_utils.py:109 + mlx_utils.py:3152, 3195, 3248 -- HfApi and
+    ModelCard referenced unguardedly."""
     _require_module("huggingface_hub")
     _resolve_all([
         "huggingface_hub.HfApi",
@@ -733,9 +553,8 @@ def test_hf_hub_hfapi_and_modelcard_top_level():
 
 
 def test_hf_hub_hfapi_method_surface():
-    """saving_utils.py + mlx_utils.py call HfApi().create_repo /
-    .upload_file / .upload_folder / .create_commit / .file_exists.
-    Pin those method names on the class."""
+    """saving_utils.py + mlx_utils.py call ``HfApi().create_repo /
+    .upload_file / .upload_folder / .create_commit / .file_exists``."""
     _require_module("huggingface_hub")
     HfApi = _resolve("huggingface_hub.HfApi")
     expected = [
@@ -752,10 +571,9 @@ def test_hf_hub_hfapi_method_surface():
 
 
 def test_hf_hub_get_token_top_level_or_utils_fallback():
-    """saving_utils.py:67-73 try-cascade: get_token from top-level, then
-    huggingface_hub.utils, then huggingface_hub.utils._token. AT LEAST
-    ONE must resolve; the cascade exhausting means saving_utils gets
-    NameError on every upload path that needs a Bearer."""
+    """saving_utils.py:67-73 try-cascade: ``get_token`` from top-level,
+    then huggingface_hub.utils, then huggingface_hub.utils._token. At
+    least one must resolve."""
     _require_module("huggingface_hub")
     found = False
     for path in (
@@ -778,10 +596,8 @@ def test_hf_hub_get_token_top_level_or_utils_fallback():
 
 
 def test_hf_hub_split_state_dict_into_shards_factory_present_and_callable():
-    """saving_utils.py:1602-1606 -- imports three serialization helpers
-    at module top level. split_state_dict_into_shards_factory MUST be
-    callable; a removal kills sharded LoRA save (the core 5GB-shard
-    path uses it)."""
+    """saving_utils.py:1602 -- ``split_state_dict_into_shards_factory``
+    drives the core 5GB-shard path."""
     _require_module("huggingface_hub")
     fn = _resolve("huggingface_hub.split_state_dict_into_shards_factory")
     if not callable(fn):
@@ -793,8 +609,8 @@ def test_hf_hub_split_state_dict_into_shards_factory_present_and_callable():
 
 
 def test_hf_hub_get_torch_storage_size_and_id_present():
-    """saving_utils.py:1604-1605 -- get_torch_storage_size and
-    get_torch_storage_id underpin the LoRA delta dedup in sharded save."""
+    """saving_utils.py:1604-1605 -- underpin the LoRA delta dedup in
+    sharded save."""
     _require_module("huggingface_hub")
     _resolve_all([
         "huggingface_hub.get_torch_storage_size",
@@ -803,36 +619,32 @@ def test_hf_hub_get_torch_storage_size_and_id_present():
 
 
 def test_hf_hub_serialization_base_parse_size_to_int():
-    """saving_utils.py:1652 -- `from huggingface_hub.serialization._base
-    import parse_size_to_int`. Private module path; a refactor that
-    moves it out of _base breaks the shard-size CLI string parser."""
+    """saving_utils.py:1652 -- ``from huggingface_hub.serialization._base
+    import parse_size_to_int``. Private module path; refactor breaks
+    shard-size CLI string parser."""
     _require_module("huggingface_hub")
     _resolve("huggingface_hub.serialization._base.parse_size_to_int")
 
 
 def test_hf_hub_errors_local_entry_not_found_error():
-    """saving_utils.py:2365 -- `from huggingface_hub.errors import
-    LocalEntryNotFoundError`. Imported INSIDE an except clause to
-    re-classify a download failure; a removal silently lets the broader
-    Exception leak through."""
+    """saving_utils.py:2365 -- imported INSIDE an except clause to
+    re-classify a download failure."""
     _require_module("huggingface_hub")
     _resolve("huggingface_hub.errors.LocalEntryNotFoundError")
 
 
 def test_hf_hub_constants_module_path():
-    """fix_huggingface_hub from import_fixes.py re-injects
-    is_offline_mode from huggingface_hub.constants.HF_HUB_OFFLINE.
-    The CONSTANT-PATH-AS-MODULE side is exercised in
-    test_upstream_import_fixes_drift.py; pin the symbol HERE too so
-    a typo in either test catches the drift."""
+    """``huggingface_hub.constants.HF_HUB_OFFLINE`` is re-injected by
+    fix_huggingface_hub (import_fixes.py). Also covered in
+    test_upstream_import_fixes_drift.py; double-pin so a typo in either
+    test still catches drift."""
     _require_module("huggingface_hub")
     _resolve("huggingface_hub.constants.HF_HUB_OFFLINE")
 
 
 def test_hf_hub_modelcard_load_method():
-    """mlx_utils.py:3195 -- ModelCard.load(model_id) is the canonical
-    way zoo builds an MLX-derived model card by inheriting the source
-    card. A rename of the classmethod breaks the model-card lineage."""
+    """mlx_utils.py:3195 -- ``ModelCard.load(model_id)`` builds an
+    MLX-derived card by inheriting the source card."""
     _require_module("huggingface_hub")
     ModelCard = _resolve("huggingface_hub.ModelCard")
     if not hasattr(ModelCard, "load"):
@@ -844,10 +656,9 @@ def test_hf_hub_modelcard_load_method():
 
 
 def test_hf_hub_snapshot_download_signature_local_dir():
-    """saving_utils.py and mlx_utils.py call snapshot_download(repo_id,
-    local_dir=..., allow_patterns=...). Pin the local_dir kwarg
-    presence; a regression to local_dir_use_symlinks-only would break
-    every Unsloth offline workflow."""
+    """saving_utils.py + mlx_utils.py call ``snapshot_download(repo_id,
+    local_dir=...)``. Regression to local_dir_use_symlinks-only would
+    break every Unsloth offline workflow."""
     _require_module("huggingface_hub")
     fn = _resolve("huggingface_hub.snapshot_download")
     sig = inspect.signature(fn)
@@ -860,8 +671,8 @@ def test_hf_hub_snapshot_download_signature_local_dir():
 
 
 def test_hf_hub_hf_hub_download_signature_local_dir_and_repo_id():
-    """saving_utils.py:3088 calls hf_hub_download(repo_id=..., filename=...,
-    local_dir=...). Pin those three parameters."""
+    """saving_utils.py:3088 -- ``hf_hub_download(repo_id=..., filename=...,
+    local_dir=...)``."""
     _require_module("huggingface_hub")
     fn = _resolve("huggingface_hub.hf_hub_download")
     sig = inspect.signature(fn)
@@ -878,31 +689,17 @@ def test_hf_hub_hf_hub_download_signature_local_dir_and_repo_id():
 # ===========================================================================
 # xformers
 # ===========================================================================
-#
-# Zoo source has NO direct xformers imports; the only references are
-# in temporary_patches that re-export upstream xformers symbols if they
-# happen to be on the install. The existing
-# test_upstream_import_fixes_drift.py covers the >=0.0.29 num_splits_key
-# fix.
-#
-# Add a single skip-clean smoke that the xformers.ops module path
-# resolves IF xformers is installed, since transformers.modeling_utils
-# (which zoo unconditionally imports) probes xformers.ops at attention-
-# kernel-selection time. A regression in xformers' module layout
-# silently disables the memory-efficient attention dispatch zoo's
-# patches rely on.
-# ---------------------------------------------------------------------------
+# Zoo has no direct xformers imports; only re-exports if installed.
+# transformers.modeling_utils probes xformers.ops at attention-kernel
+# selection time -- a regression in xformers' module layout silently
+# disables the memory-efficient attention dispatch zoo's patches rely on.
 
 
 def test_xformers_ops_module_present_when_installed():
-    """xformers is optional. When installed, xformers.ops.memory_efficient_attention
-    is the symbol transformers.modeling_utils probes at attention-kernel
-    selection time. zoo's compiled-cache MoE / Gemma paths inherit the
-    kernel selection -- a regression in the dispatch path silently
-    falls back to the slow eager attention."""
+    """xformers.ops.memory_efficient_attention is the symbol
+    transformers.modeling_utils probes at attention-kernel selection."""
     if importlib.util.find_spec("xformers") is None:
         pytest.skip("xformers not installed -- nothing to drift-check.")
-    # Now that xformers is present, the .ops submodule MUST resolve.
     try:
         ops = importlib.import_module("xformers.ops")
     except Exception as exc:
@@ -921,14 +718,12 @@ def test_xformers_ops_module_present_when_installed():
 
 def test_xformers_components_module_present_when_installed():
     """xformers.components is the attention-block factory namespace
-    some transformers vision encoders probe at compile time. Skip
-    cleanly when xformers absent, drift-fail when present-but-broken."""
+    some transformers vision encoders probe at compile time."""
     if importlib.util.find_spec("xformers") is None:
         pytest.skip("xformers not installed -- nothing to drift-check.")
     spec = importlib.util.find_spec("xformers.components")
     if spec is None:
         # Some xformers builds (CPU-only) ship without .components.
-        # That's the upstream-supported optional state; pass cleanly.
         return
     try:
         importlib.import_module("xformers.components")
