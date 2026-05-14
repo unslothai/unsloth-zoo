@@ -32,7 +32,7 @@ Contract for each test:
   * If the optional library isn't installed at all, ``importorskip``
     the test (not relevant to this install).
   * If the pathology is currently ACTIVE on this install, surface it
-    as ``pytest.skip("DRIFT ACTIVE: <fix function> needed because
+    as ``pytest.fail("DRIFT DETECTED: <fix function> needed because
     <observation>")`` so CI stays green locally but the drift is loud
     in the verbose log -- exactly the same pattern a maintainer would
     use to triage which fix has stopped being a no-op.
@@ -107,13 +107,13 @@ def test_protobuf_message_factory_get_prototype_or_get_message_class_present():
     )
     has_get_message_class = hasattr(mf, "GetMessageClass")
     if not has_mf_class:
-        pytest.skip(
-            "DRIFT ACTIVE: google.protobuf.message_factory.MessageFactory is "
+        pytest.fail(
+            "DRIFT DETECTED: google.protobuf.message_factory.MessageFactory is "
             "missing entirely -- fix_message_factory_issue would inject a stub."
         )
     if not (has_get_prototype or has_get_message_class):
-        pytest.skip(
-            "DRIFT ACTIVE: neither MessageFactory.GetPrototype nor "
+        pytest.fail(
+            "DRIFT DETECTED: neither MessageFactory.GetPrototype nor "
             "module-level GetMessageClass is present; fix_message_factory_issue "
             "would inject the GetPrototype/GetMessageClass shim."
         )
@@ -203,8 +203,8 @@ def test_trl_is_x_available_returns_bool_not_tuple():
             bad[name] = (type(result).__name__, result)
 
     if bad:
-        pytest.skip(
-            "DRIFT ACTIVE: fix_trl_vllm_ascend coerces these accessors "
+        pytest.fail(
+            "DRIFT DETECTED: fix_trl_vllm_ascend coerces these accessors "
             f"from tuple-cached values to bool: {bad}"
         )
 
@@ -232,8 +232,8 @@ def test_trl_cached_available_flags_are_not_tuples():
         and isinstance(value, tuple)
     }
     if tuple_flags:
-        pytest.skip(
-            "DRIFT ACTIVE: fix_trl_vllm_ascend needs to coerce these tuple-"
+        pytest.fail(
+            "DRIFT DETECTED: fix_trl_vllm_ascend needs to coerce these tuple-"
             f"cached flags to bool: {sorted(tuple_flags)}"
         )
 
@@ -265,8 +265,8 @@ def test_pretrained_model_enable_input_require_grads_uses_old_pattern():
         pytest.skip(f"could not getsource(enable_input_require_grads): {exc!r}")
 
     if "for module in self.modules()" in src:
-        pytest.skip(
-            "DRIFT ACTIVE: PreTrainedModel.enable_input_require_grads now "
+        pytest.fail(
+            "DRIFT DETECTED: PreTrainedModel.enable_input_require_grads now "
             "iterates self.modules() (post HF#41993). "
             "patch_enable_input_require_grads has to install a "
             "NotImplementedError-tolerant replacement."
@@ -308,8 +308,8 @@ def test_transformers_is_causal_conv1d_available_symbol_present():
     ]
     present = [name for name in candidates if hasattr(tf_iu, name)]
     if not present:
-        pytest.skip(
-            "DRIFT ACTIVE: transformers.utils.import_utils dropped every "
+        pytest.fail(
+            "DRIFT DETECTED: transformers.utils.import_utils dropped every "
             f"hook in {candidates}; _disable_transformers_causal_conv1d "
             "can no longer mask a broken causal_conv1d binary."
         )
@@ -376,8 +376,8 @@ def test_peft_transformers_weight_conversion_importable_and_signature():
     try:
         from peft.utils import transformers_weight_conversion as twc
     except Exception as exc:
-        pytest.skip(
-            "DRIFT ACTIVE: peft.utils.transformers_weight_conversion "
+        pytest.fail(
+            "DRIFT DETECTED: peft.utils.transformers_weight_conversion "
             f"is unimportable on this stack ({exc!r}). "
             "patch_peft_weight_converter_compatibility will silently no-op."
         )
@@ -423,8 +423,8 @@ def test_triton_compiled_kernel_has_num_ctas_and_cluster_dims():
     if hasattr(ck_cls, "num_ctas"):
         return  # healthy: old-style triton with direct attr
 
-    pytest.skip(
-        "DRIFT ACTIVE: triton.CompiledKernel lacks the `num_ctas` "
+    pytest.fail(
+        "DRIFT DETECTED: triton.CompiledKernel lacks the `num_ctas` "
         "class attribute; fix_triton_compiled_kernel_missing_attrs "
         "patches __init__ to inject num_ctas and cluster_dims so "
         "torch._inductor.runtime.triton_heuristics.make_launcher "
@@ -507,7 +507,7 @@ def test_installed_torch_torchvision_pair_is_compatible():
 
     required_str = f"{required[0]}.{required[1]}.0"
     assert tv_v >= _PkgVersion(required_str), (
-        f"DRIFT ACTIVE: torch=={torch_raw} requires "
+        f"DRIFT DETECTED: torch=={torch_raw} requires "
         f"torchvision>={required_str}, but torchvision=={tv_raw} is "
         f"installed. torchvision_compatibility_check would raise."
     )
@@ -541,8 +541,8 @@ def test_vllm_guided_decoding_params_or_structured_outputs_present():
         "cannot re-alias. trl import path will break."
     )
     if not has_guided:
-        pytest.skip(
-            "DRIFT ACTIVE: vllm.sampling_params only exposes "
+        pytest.fail(
+            "DRIFT DETECTED: vllm.sampling_params only exposes "
             "StructuredOutputsParams (post PR #22772); "
             "fix_vllm_guided_decoding_params injects a GuidedDecodingParams "
             "alias so trl keeps importing."
@@ -563,8 +563,8 @@ def test_vllm_aimv2_ovis_config_is_past_fix_version():
     vllm_v = _safe_version(importlib_version("vllm"))
     cutoff = _PkgVersion("0.10.1")
     if vllm_v < cutoff:
-        pytest.skip(
-            f"DRIFT ACTIVE: vllm=={vllm_v} < {cutoff}; "
+        pytest.fail(
+            f"DRIFT DETECTED: vllm=={vllm_v} < {cutoff}; "
             "fix_vllm_aimv2_issue rewrites ovis.py to skip the duplicate "
             'AutoConfig.register("aimv2", ...) call.'
         )
@@ -649,8 +649,8 @@ def test_xformers_is_post_num_splits_key_fix_or_not_installed():
     x_v = _safe_version(importlib_version("xformers"))
     cutoff = _PkgVersion("0.0.29")
     if x_v < cutoff:
-        pytest.skip(
-            f"DRIFT ACTIVE: xformers=={x_v} < {cutoff}; "
+        pytest.fail(
+            f"DRIFT DETECTED: xformers=={x_v} < {cutoff}; "
             "fix_xformers_performance_issue rewrites "
             "ops/fmha/cutlass.py num_splits_key=-1 -> None."
         )

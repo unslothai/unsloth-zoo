@@ -326,6 +326,14 @@ jobs:
           # ship a CPU build that imports cleanly on Linux without a
           # CUDA toolchain. Same pin as unsloth's Core matrix.
           pip install 'bitsandbytes>=0.45'
+          # IPython + ipywidgets: zoo's logging_utils.py:50 does
+          # `from transformers.utils.notebook import ...` (try/except
+          # wrapped). The pinned-symbol test for this path needs both
+          # so the import resolves; without them the test would FAIL
+          # with a DRIFT-DETECTED message even though the upstream
+          # API is fine. Install them here so the drift detector
+          # only fires on real drift, not on missing CI deps.
+          pip install 'ipython>=8' 'ipywidgets>=8'
           pip install pytest==9.0.3 packaging
           echo "::group::Installed transformers + trl + peft + torch versions"
           pip show transformers
@@ -385,11 +393,13 @@ jobs:
         # signal we have for catching transformers/trl/peft/vllm
         # drift before users do.
         #
-        # continue-on-error: true during CI bootstrap -- these tests
-        # are fresh and may surface latent zoo-source issues unrelated
-        # to upstream drift; tighten to hard-gate in a follow-up
-        # once the first 5-10 PRs cycle through cleanly.
-        continue-on-error: true
+        # HARD GATE: no continue-on-error. A red cell means real
+        # upstream drift -- transformers/trl/peft/vllm/datasets has
+        # renamed, moved, or removed a symbol zoo references, or one
+        # of the import_fixes pathologies is currently active without
+        # a corresponding zoo-side workaround. The drift signal is
+        # the entire point of the suite; making the cell green-by-
+        # default would defeat it.
         run: |
           python -m pytest -v --tb=short -rs \
             tests/test_upstream_pinned_symbols_transformers.py \

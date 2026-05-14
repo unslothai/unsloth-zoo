@@ -48,25 +48,27 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _resolve(dotted: str) -> object:
-    """``importlib.import_module`` + ``getattr`` chain. Raises an
-    AssertionError naming the broken segment so the failure message
-    points at the actual zoo callsite the symbol unblocks.
+    """``importlib.import_module`` + ``getattr`` chain.
 
-    Distinguishes:
-      * module-file-actually-missing (find_spec returns None) -> FAIL,
-        real upstream drift signal worth surfacing.
-      * module-file-present-but-transitively-broken (find_spec returns
-        a spec but import_module raises ImportError because of a
-        nested optional dep, e.g. transformers.utils.notebook needing
-        IPython) -> SKIP. Zoo's call sites for these paths are already
-        try/except-wrapped (see e.g. logging_utils.py:49-56), so the
-        zoo runtime tolerates the missing dep -- a test failure here
-        would be noise, not signal.
-      * attribute missing on a successfully-imported module -> FAIL.
+    DRIFT-DETECTED policy (matches test_upstream_import_fixes_drift.py):
+    any failure to resolve a dotted path zoo references is reported as
+    an AssertionError -- never a SKIP. The matrix cell goes red when
+    drift is present, which is the whole point of the suite.
+
+    Three failure modes, all surface as AssertionError:
+      * module-file-actually-missing (find_spec returns None).
+      * module-file-present-but-import-raises (transitively-broken
+        optional dep, e.g. transformers.utils.notebook needing
+        IPython). The CI matrix step now installs the deps required
+        so zoo's try/except-wrapped callsites can be properly
+        exercised; if the import still fails the test reports it
+        as drift.
+      * attribute missing on a successfully-imported module.
     """
     parts = dotted.split(".")
     obj: object = None
     consumed: list[str] = []
+    last_import_error: Exception | None = None
     for i in range(len(parts), 0, -1):
         mod_name = ".".join(parts[:i])
         # Probe metadata first; this NEVER executes module code.
@@ -85,27 +87,32 @@ def _resolve(dotted: str) -> object:
             consumed = parts[:i]
             break
         except ImportError as exc:
-            pytest.skip(
-                f"`{mod_name}` exists but its imports fail on this "
-                f"install ({type(exc).__name__}: {exc}); zoo wraps "
-                "this in try/except so absence is not a runtime bug. "
-                "Skipping to avoid false-positive in matrix CI."
+            last_import_error = exc
+            raise AssertionError(
+                f"DRIFT DETECTED: `{mod_name}` exists but its imports "
+                f"fail on this install ({type(exc).__name__}: {exc}). "
+                "zoo references this dotted path -- a transitively-"
+                "missing dep here is exactly the regression class this "
+                "suite catches. Either install the dep in CI or remove "
+                "the zoo reference."
             )
     if obj is None:
         raise AssertionError(
-            f"Could not locate any module prefix of `{dotted}`; "
-            "zoo references this dotted path -- regression at the "
-            "import line (see source comment above the test)."
+            f"DRIFT DETECTED: could not locate any module prefix of "
+            f"`{dotted}`; zoo references this dotted path -- regression "
+            "at the import line (see source comment above the test)."
+            + (f" Last ImportError: {last_import_error!r}"
+               if last_import_error is not None else "")
         )
     # Remaining parts must be attribute accesses on the module.
     for attr in parts[len(consumed):]:
         if not hasattr(obj, attr):
             walked = ".".join(consumed + [attr])
             raise AssertionError(
-                f"`{walked}` missing on installed upstream "
-                f"(walked from `{dotted}`); zoo references this "
-                "exact path -- a rename or removal silently breaks "
-                "the zoo patch site cited in the test comment."
+                f"DRIFT DETECTED: `{walked}` missing on installed "
+                f"upstream (walked from `{dotted}`); zoo references "
+                "this exact path -- a rename or removal silently "
+                "breaks the zoo patch site cited in the test comment."
             )
         obj = getattr(obj, attr)
         consumed.append(attr)
