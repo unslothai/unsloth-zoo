@@ -7,51 +7,20 @@
 # your option) any later version.
 
 """Exhaustive upstream-signature pinning for the (class, method) pairs
-that ``unsloth_zoo/temporary_patches/<file>.py`` rebinds.
+that ``unsloth_zoo/temporary_patches/<file>.py`` rebinds (tail not
+covered by the sibling test_upstream_signatures /
+test_upstream_pinned_symbols_transformers / test_zoo_source_upstream_refs
+/ test_upstream_source_patterns files).
 
-Why this file exists
-====================
-``tests/test_upstream_signatures.py``, ``test_upstream_pinned_symbols_transformers.py``,
-``test_zoo_source_upstream_refs.py``, and ``test_upstream_source_patterns.py`` pin
-roughly 50-70 (class, method) pairs that the ``temporary_patches/`` directory
-monkey-patches. A walk of every file in ``unsloth_zoo/temporary_patches/``
-turned up additional patch sites that no existing test covers. This file
-fills the tail.
+Each (model_class, method) pair below maps 1:1 to a
+``patch_function(...)`` call or attribute reassignment in zoo. Upstream
+rename / drop -> zoo's patch silently no-ops via ``raise_error()``; this
+file makes that drift loud.
 
-Patch-site discovery
-====================
-For every ``temporary_patches/<file>.py``, all of:
-
-    patch_function(target_cls, "name", ...)
-    patch_function_past_key_values(target_cls, "name", ...)
-    target_cls.method = patched_method
-    setattr(modeling_X, "Y", patched_Y)
-
-were extracted. Each (model_class, method) pair below maps 1:1 to a
-``patch_function(...)`` call (or attribute reassignment) in zoo. If
-upstream renames or drops the symbol, zoo's patch silently no-ops via
-``raise_error()`` and the user trains with a stock (unpatched) forward
-that the zoo patch was meant to fix -- exactly the silent-drift class of
-bug these tests catch.
-
-Contract
-========
-* CPU-only -- no GPU, no downloads, no network.
-* Genuinely optional upstream libs (``timm``, ``bitsandbytes``) use
-  ``pytest.importorskip``. ``transformers`` is required at module-level
-  importorskip, matching the rest of the test suite.
-* Version-gated patches (zoo guards a class behind ``if hasattr(...)`` or
-  a try/except ImportError because the class only exists on transformers
-  5.0+) are similarly gated here via ``pytest.skip`` so the test
-  legitimately reports "not on this transformers" instead of false-failing.
-* Drift detection: missing class or signature parameter dropped ->
-  ``pytest.fail("DRIFT DETECTED: zoo temporary_patches/<file>.py expects
-  <class>.<method>(<params>) but installed transformers has
-  <signature>")``.
-* Pairs already pinned in the sibling test files are intentionally
-  skipped here to keep this file focused on the uncovered tail.
-
-Runs under the GPU-free harness in ``tests/conftest.py``.
+CPU-only; ``pytest.importorskip`` for optional libs (timm, bitsandbytes).
+Drift -> ``pytest.fail("DRIFT DETECTED: zoo temporary_patches/<file>.py
+expects <class>.<method>(<params>) but installed transformers has
+<signature>")``.
 """
 
 from __future__ import annotations
@@ -65,25 +34,15 @@ from typing import Iterable
 import pytest
 
 
-# ---------------------------------------------------------------------------
-# Module-level pre-flight: every patch tested here calls into transformers.
-# A single importorskip at module load keeps the failure message useful.
-# ---------------------------------------------------------------------------
-
 pytest.importorskip("transformers")
 import transformers  # noqa: E402
 
 _TX_VERSION = getattr(transformers, "__version__", "0.0.0")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _try_get_class(dotted_module: str, class_name: str):
-    """Import ``dotted_module`` and return ``class_name`` off it, or
-    return ``None`` if either is missing on this transformers. Used to
-    skip 5.0+-gated tests cleanly on a 4.x install."""
+    """Import ``dotted_module`` and return ``class_name`` off it (or None).
+    Used to skip 5.0+-gated tests on a 4.x install."""
     try:
         mod = importlib.import_module(dotted_module)
     except Exception:
@@ -92,10 +51,9 @@ def _try_get_class(dotted_module: str, class_name: str):
 
 
 def _require_class(dotted_module: str, class_name: str, zoo_file: str):
-    """Like ``_try_get_class`` but ``pytest.fail`` with a DRIFT message
-    if the class is missing AND the parent module exists. If the parent
-    module is itself missing (e.g. transformers doesn't ship gemma4 in
-    this version), skip -- that's a legitimate version gate, not drift."""
+    """Like ``_try_get_class`` but DRIFT-fail when the parent module
+    exists but the class is missing. Skip when parent module is missing
+    (legitimate version gate)."""
     try:
         mod = importlib.import_module(dotted_module)
     except Exception as exc:
@@ -122,71 +80,41 @@ def _param_names(func) -> list[str]:
 
 
 def _original_attr_name(cls, attr: str) -> str:
-    """Reconstruct the storage key used by
-    ``unsloth_zoo.temporary_patches.utils.patch_function`` to stash the
-    original method body before it overwrites the class attribute.
-
-    Mirrors ``_get_unique_storage_name`` in that file:
-    ``_original_<last-component-of-module>_<class-name>_<attr>``. We
-    re-derive the name here rather than import it so this test stays
-    importable even on a zoo build where the temporary_patches sub-package
-    can't be imported (e.g. minimal CPU CI).
-    """
+    """Storage key used by patch_function to stash the original method
+    body: ``_original_<last-module-component>_<class>_<attr>``. Mirrors
+    _get_unique_storage_name in temporary_patches/utils.py."""
     module_tail = getattr(cls, "__module__", "").rsplit(".", 1)[-1]
     class_name = getattr(cls, "__name__", "") or cls.__class__.__name__
     return f"_original_{module_tail}_{class_name}_{attr}"
 
 
 def _resolve_upstream_method(cls, method_name: str):
-    """Return the function object representing the UPSTREAM (unpatched)
-    method body for ``cls.method_name``.
+    """Return UPSTREAM (unpatched) method body for cls.method_name.
 
-    ``apply_import_fixes()`` and the ``temporary_patches`` runner both
-    monkey-patch classes at import time, so a naive ``cls.method_name``
-    lookup later in the test session returns the zoo-patched function
-    instead of the upstream one. That makes signature drift tests false-
-    positive on the patched ``(self, *args, **kwargs)`` wrapper rather
-    than the real upstream API.
-
-    Resolution order:
-      1. If ``cls`` has ``_original_<module>_<class>_<method>`` set by
-         ``patch_function``, return that. This is the authoritative source.
-      2. If the live attribute's ``__qualname__`` indicates a zoo patch
-         wrapper (``patch_<X>.<locals>.<method>``) but no original is
-         stashed, fall through to (3) to load the source from the module
-         file directly.
-      3. Otherwise return the live attribute -- upstream isn't patched
-         on this stack.
+    apply_import_fixes() and temporary_patches runner monkey-patch at
+    import time, so naive ``cls.method_name`` returns zoo's
+    ``(self, *args, **kwargs)`` wrapper. Resolution order:
+      1. ``_original_<module>_<class>_<method>`` stash from patch_function.
+      2. Live attribute (caller checks _maybe_skip_if_patched if needed).
     """
     if not hasattr(cls, method_name):
         return None
     live = getattr(cls, method_name)
-    # (1) explicit storage key from patch_function.
     storage_key = _original_attr_name(cls, method_name)
     original = getattr(cls, storage_key, None)
     if original is not None:
         return original
-    # (2) wrapper-by-qualname fallback.
     qualname = getattr(live, "__qualname__", "") or ""
     if ".<locals>." in qualname and qualname.split(".", 1)[0].startswith("patch_"):
-        # zoo patch wrapper, but no _original_ stash on the class. This
-        # is rare (force=True + store_original=False) but possible. Fall
-        # through; caller will skip cleanly via _maybe_skip_if_patched.
+        # zoo patch wrapper with no _original_ stash (rare: force=True +
+        # store_original=False); _maybe_skip_if_patched handles cleanly.
         return live
     return live
 
 
 def _maybe_skip_if_patched(cls, method_name: str, zoo_file: str) -> None:
-    """If the live ``cls.method_name`` is a zoo patch wrapper AND we
-    have no stored original to inspect, skip the test with a clear
-    "already-patched" reason rather than false-fail on the wrapper's
-    ``(self, *args, **kwargs)`` signature.
-
-    Used by signature-pin tests against classes that zoo replaces
-    wholesale via ``patch_function``. The skip is loud: the message
-    surfaces which zoo file did the patching so a future maintainer
-    can re-anchor the test if upstream's shape genuinely changes.
-    """
+    """Skip when live method is a zoo patch wrapper with no original
+    stash (avoid false-failing on ``(self, *args, **kwargs)``)."""
     if not hasattr(cls, method_name):
         return
     live = getattr(cls, method_name)
@@ -214,7 +142,6 @@ def _assert_method_exists(cls, method_name: str, zoo_file: str):
             f"{cls.__module__}.{cls.__name__}.{method_name} but installed "
             f"transformers {_TX_VERSION} has no such method on the class"
         )
-    # Prefer the upstream-original stash if zoo has patched the method.
     return _resolve_upstream_method(cls, method_name)
 
 
@@ -248,21 +175,13 @@ def _has_var_keyword(func) -> bool:
     )
 
 
-# ===========================================================================
-# bitsandbytes.py
-# ---------------------------------------------------------------------------
-# Patches: bitsandbytes.nn.modules.Linear4bit.forward (covered by
-# test_upstream_signatures::test_bnb_Linear4bit_forward_signature), AND a
-# second optional patch at bitsandbytes.nn.Linear4bit.forward (the
-# top-level re-export). The second one is wrapped in try/except in zoo,
-# but if the alias goes away without zoo noticing, the import-time guard
-# `bitsandbytes.nn.modules.Linear4bit` would mask the alias drift.
-# ===========================================================================
+# bitsandbytes.py: patches bitsandbytes.nn.modules.Linear4bit.forward
+# (covered elsewhere) + bitsandbytes.nn.Linear4bit.forward top-level
+# re-export alias.
 
 def test_bitsandbytes_top_level_Linear4bit_alias():
-    """bitsandbytes.py:110 wraps a patch on the top-level
-    ``bitsandbytes.nn.Linear4bit`` alias. Pin its presence and that it
-    has a forward method matching the modules.Linear4bit forward."""
+    """bitsandbytes.py:110 patches top-level ``bitsandbytes.nn.Linear4bit``
+    alias; pin presence + .forward method."""
     bnb = pytest.importorskip("bitsandbytes")
     top_level = getattr(bnb.nn, "Linear4bit", None)
     inner = getattr(bnb.nn.modules, "Linear4bit", None)
@@ -280,10 +199,8 @@ def test_bitsandbytes_top_level_Linear4bit_alias():
 
 
 def test_bitsandbytes_Params4bit_class_present():
-    """bitsandbytes.py:47 reads ``bitsandbytes.nn.modules.Params4bit`` and
-    line 65-67 conditionally deletes its ``__torch_function__``. If the
-    class disappears entirely, the patch ``raise_error()``-s silently and
-    the torch.compile infinite-recursion fix never applies."""
+    """bitsandbytes.py:47-67 reads ``Params4bit`` and conditionally
+    deletes ``__torch_function__`` (torch.compile recursion fix)."""
     bnb = pytest.importorskip("bitsandbytes")
     p4 = getattr(bnb.nn.modules, "Params4bit", None)
     if p4 is None:
@@ -294,10 +211,8 @@ def test_bitsandbytes_Params4bit_class_present():
 
 
 def test_bitsandbytes_fix_4bit_weight_quant_state_from_module_present():
-    """bitsandbytes.py:48 looks up
-    ``bitsandbytes.nn.modules.fix_4bit_weight_quant_state_from_module``
-    and passes ``self`` to it inside the patched forward. If this
-    function disappears, the patched forward NameErrors at runtime."""
+    """bitsandbytes.py:48 / :73 calls
+    ``fix_4bit_weight_quant_state_from_module(self)``."""
     bnb = pytest.importorskip("bitsandbytes")
     fn = getattr(bnb.nn.modules, "fix_4bit_weight_quant_state_from_module", None)
     if fn is None:
@@ -306,7 +221,7 @@ def test_bitsandbytes_fix_4bit_weight_quant_state_from_module_present():
             "bitsandbytes.nn.modules.fix_4bit_weight_quant_state_from_module "
             "but it is missing"
         )
-    # Patched forward calls fn(self) -- 1 positional. Reject zero-arity.
+    # Patched forward calls fn(self); reject zero-arity.
     sig = inspect.signature(fn)
     params = [
         p for p in sig.parameters.values()
@@ -323,9 +238,7 @@ def test_bitsandbytes_fix_4bit_weight_quant_state_from_module_present():
 
 
 def test_bitsandbytes_matmul_4bit_present():
-    """bitsandbytes.py:106 calls ``bitsandbytes.matmul_4bit(...)``. Pin
-    that the top-level function exists. If it moves, the patched forward
-    AttributeErrors at runtime."""
+    """bitsandbytes.py:106 calls top-level ``bitsandbytes.matmul_4bit(...)``."""
     bnb = pytest.importorskip("bitsandbytes")
     if not hasattr(bnb, "matmul_4bit"):
         pytest.fail(
@@ -334,20 +247,11 @@ def test_bitsandbytes_matmul_4bit_present():
         )
 
 
-# ===========================================================================
-# deepseek_v3_moe.py
-# ---------------------------------------------------------------------------
-# Patches: DeepseekV3NaiveMoe.forward (5.x), DeepseekV3MoE.forward
-# (covered), DeepseekV3ForCausalLM.forward (covered). The NaiveMoe class
-# is also used as a key for `_unsloth_already_patched` / `_unsloth_model_type`
-# attribute attachment.
-# ===========================================================================
+# deepseek_v3_moe.py: patches DeepseekV3{NaiveMoe,MoE,ForCausalLM}.forward.
 
 def test_deepseek_v3_naive_moe_class_gated_5x():
-    """deepseek_v3_moe.py:56-61 imports DeepseekV3NaiveMoe at the top of
-    patch_deepseek_v3 and bails via try/except when it's missing. This
-    class is transformers 5.x-only (added when the MoE forward was
-    factored out of DeepseekV3MoE). Skip on older transformers."""
+    """deepseek_v3_moe.py:56-61 imports DeepseekV3NaiveMoe (5.x-only;
+    bails via try/except on 4.x)."""
     cls = _try_get_class(
         "transformers.models.deepseek_v3.modeling_deepseek_v3",
         "DeepseekV3NaiveMoe",
@@ -361,9 +265,8 @@ def test_deepseek_v3_naive_moe_class_gated_5x():
 
 
 def test_deepseek_v3_topk_router_class_present():
-    """deepseek_v3_moe.py:59 imports DeepseekV3TopkRouter inside the same
-    try/except guard. The class is referenced (not patched) but if it
-    disappears, the whole patch entry silently no-ops."""
+    """deepseek_v3_moe.py:59 imports DeepseekV3TopkRouter as a gate;
+    missing -> whole patch entry silently no-ops."""
     mod = importlib.import_module(
         "transformers.models.deepseek_v3.modeling_deepseek_v3"
     )
@@ -390,10 +293,8 @@ def test_deepseek_v3_config_class_present():
 
 
 def test_deepseek_v3_moe_forward_single_positional():
-    """deepseek_v3_moe.py:125 patches DeepseekV3MoE.forward with
-    ``def patched_moe_forward(self, hidden_states)``. Re-pin here as the
-    sibling test only asserts param-superset; this asserts single-arg
-    shape (no extra required positionals)."""
+    """deepseek_v3_moe.py:125 patches DeepseekV3MoE.forward(self,
+    hidden_states); pin single required positional."""
     cls = _try_get_class(
         "transformers.models.deepseek_v3.modeling_deepseek_v3",
         "DeepseekV3MoE",
@@ -419,12 +320,9 @@ def test_deepseek_v3_moe_forward_single_positional():
 
 def test_deepseek_v3_for_causal_lm_forward_named_params():
     """deepseek_v3_moe.py:142 patches DeepseekV3ForCausalLM.forward with
-    a wrapper that forwards by name: input_ids, attention_mask,
-    position_ids, past_key_values, inputs_embeds, labels, use_cache,
-    output_router_logits, cache_position, logits_to_keep. Pin those names
-    are still accepted. ``output_router_logits`` may have been folded
-    into **kwargs upstream (TransformersKwargs catch-all), so we allow
-    either an explicit param OR a VAR_KEYWORD catch-all."""
+    by-name kwargs (input_ids, attention_mask, ..., output_router_logits,
+    cache_position, logits_to_keep); output_router_logits may be in
+    **kwargs (TransformersKwargs catch-all)."""
     cls = _try_get_class(
         "transformers.models.deepseek_v3.modeling_deepseek_v3",
         "DeepseekV3ForCausalLM",
@@ -432,7 +330,6 @@ def test_deepseek_v3_for_causal_lm_forward_named_params():
     if cls is None:
         pytest.skip(f"DeepseekV3ForCausalLM absent on transformers {_TX_VERSION}")
     fwd = _assert_method_exists(cls, "forward", "deepseek_v3_moe.py")
-    # Hard-required params (always part of an LM forward).
     _assert_params_superset(
         fwd,
         required=[
@@ -443,10 +340,7 @@ def test_deepseek_v3_for_causal_lm_forward_named_params():
         zoo_file="deepseek_v3_moe.py",
         label="DeepseekV3ForCausalLM.forward",
     )
-    # output_router_logits is forwarded by name from zoo's wrapper, but
-    # upstream folded it into **kwargs in 4.57. Pin that the upstream
-    # has SOME kwarg passthrough so zoo's by-name forwarding still
-    # reaches the underlying model.
+    # output_router_logits: explicit param OR **kwargs passthrough.
     if "output_router_logits" not in _param_names(fwd) and not _has_var_keyword(fwd):
         pytest.fail(
             "DRIFT DETECTED: zoo temporary_patches/deepseek_v3_moe.py:171 "
@@ -457,24 +351,12 @@ def test_deepseek_v3_for_causal_lm_forward_named_params():
         )
 
 
-# ===========================================================================
-# gemma.py
-# ---------------------------------------------------------------------------
-# Most of gemma.py is covered. The UNSLOTH_FORCE_FLOAT32-gated
-# Gemma3Model._update_causal_mask patch (gemma.py:308) is the only
-# remaining uncovered site. Upstream removed _update_causal_mask in
-# transformers 4.55+, so the patch is a no-op on modern installs.
-# ===========================================================================
+# gemma.py: UNSLOTH_FORCE_FLOAT32-gated Gemma3Model._update_causal_mask
+# patch (gemma.py:308); upstream removed in 4.55+, patch no-op on modern.
 
 def test_gemma3_force_fp32_update_causal_mask_gated():
-    """gemma.py:308-310 patches Gemma3Model._update_causal_mask and
-    Gemma3ForConditionalGeneration._update_causal_mask ONLY when
-    UNSLOTH_FORCE_FLOAT32=1. Upstream removed the method in 4.55+, so on
-    modern installs the gate-guarded import line will succeed (classes
-    still exist) but the method won't. Test that EITHER both classes
-    exist AND have the method (drift if class is here without method
-    while gate is active) OR the method is gone (legitimately upstream-
-    refactored)."""
+    """gemma.py:308-310 patches Gemma3{Model,ForConditionalGeneration}.
+    _update_causal_mask under UNSLOTH_FORCE_FLOAT32=1."""
     mod = importlib.import_module(
         "transformers.models.gemma3.modeling_gemma3"
     )
@@ -486,9 +368,7 @@ def test_gemma3_force_fp32_update_causal_mask_gated():
             "Gemma3Model and Gemma3ForConditionalGeneration but at least one is "
             f"missing on transformers {_TX_VERSION}"
         )
-    # Both classes must still exist. The method is allowed to have been
-    # removed: zoo's patch_function silently no-ops when the attribute
-    # isn't there. We just confirm the class survival here.
+    # Class presence required; method removal OK (zoo's patch_function no-ops).
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
         if not hasattr(model, "_update_causal_mask"):
             pytest.fail(
@@ -499,18 +379,11 @@ def test_gemma3_force_fp32_update_causal_mask_gated():
             )
 
 
-# ===========================================================================
-# gemma3n.py
-# ---------------------------------------------------------------------------
-# Existing tests cover Gemma3nMultimodalEmbedder, Gemma3nTextAltUp.predict
-# /correct, Gemma3nModel.get_placeholder_mask. Missing: AltUp's
-# scale_corrected_output and the gemma3n module surface.
-# ===========================================================================
+# gemma3n.py: AltUp.scale_corrected_output (tail not covered by siblings).
 
 def test_gemma3n_text_alt_up_scale_corrected_output_signature():
     """gemma3n.py:148 patches Gemma3nTextAltUp.scale_corrected_output
-    with fullgraph=True. The original is ``(self, corrected)`` -- a
-    single-tensor method. Pin that shape."""
+    (fullgraph=True); shape: ``(self, corrected)``."""
     cls = _require_class(
         "transformers.models.gemma3n.modeling_gemma3n",
         "Gemma3nTextAltUp",
@@ -536,10 +409,8 @@ def test_gemma3n_text_alt_up_scale_corrected_output_signature():
 
 
 def test_gemma3n_text_alt_up_three_methods_present():
-    """gemma3n.py:143-148 inspects ``hasattr`` for predict / correct /
-    scale_corrected_output before patching. The hasattr guard masks a
-    full method-set rename: this test fails LOUDLY when all three are
-    simultaneously gone (i.e. the AltUp class was restructured)."""
+    """gemma3n.py:143-148 hasattr-guards predict / correct /
+    scale_corrected_output; loud-fail when ALL three are gone."""
     cls = _require_class(
         "transformers.models.gemma3n.modeling_gemma3n",
         "Gemma3nTextAltUp",
@@ -559,11 +430,10 @@ def test_gemma3n_text_alt_up_three_methods_present():
 
 
 def test_gemma3n_RMSNorm_helper_target_present():
-    """gemma3n.py:53 defines a module-level torch_compile'd
-    ``Gemma3nRMSNorm_forward`` that is then called by the patched
-    Multimodal embedder / AltUp.predict on ``self.soft_embedding_norm``,
-    ``self.router_norm``, etc. Those attributes must exist on
-    ``Gemma3nMultimodalEmbedder`` / ``Gemma3nTextAltUp``."""
+    """gemma3n.py:53-85 Gemma3nRMSNorm_forward helper dereferences
+    self.soft_embedding_norm / self.hard_embedding_norm /
+    self.embedding_projection / self.embedding_post_projection_norm on
+    Gemma3nMultimodalEmbedder."""
     embedder = _require_class(
         "transformers.models.gemma3n.modeling_gemma3n",
         "Gemma3nMultimodalEmbedder",
@@ -577,7 +447,7 @@ def test_gemma3n_RMSNorm_helper_target_present():
     except (OSError, TypeError):
         pytest.skip("Cannot read Gemma3nMultimodalEmbedder.__init__ source")
     for attr in ("soft_embedding_norm", "hard_embedding_norm",
-                 "embedding_projection", "embedding_post_projection_norm"):
+                  "embedding_projection", "embedding_post_projection_norm"):
         if attr not in src:
             pytest.fail(
                 f"DRIFT DETECTED: zoo temporary_patches/gemma3n.py:74-85 "
@@ -587,15 +457,11 @@ def test_gemma3n_RMSNorm_helper_target_present():
             )
 
 
-# ===========================================================================
-# gemma4.py
-# ---------------------------------------------------------------------------
-# Patches: Gemma4TextMLP.forward (gemma4.py:655). Gemma4 is 5.0+-only.
-# ===========================================================================
+# gemma4.py: Gemma4TextMLP.forward (gemma4.py:655); 5.0+-only.
 
 def test_gemma4_text_mlp_forward_signature():
-    """gemma4.py:655 patches Gemma4TextMLP.forward with
-    ``def forward(self, x)``. Pin a single positional arg."""
+    """gemma4.py:655 patches Gemma4TextMLP.forward(self, x); single
+    positional arg."""
     cls = _try_get_class(
         "transformers.models.gemma4.modeling_gemma4", "Gemma4TextMLP",
     )
@@ -620,9 +486,8 @@ def test_gemma4_text_mlp_forward_signature():
 
 
 def test_gemma4_text_mlp_has_required_attrs():
-    """gemma4.py:644-652 patched forward dereferences self.gate_proj,
-    self.up_proj, self.down_proj, self.act_fn. Pin those exist in the
-    __init__ source."""
+    """gemma4.py:644-652 patched forward dereferences self.{gate_proj,
+    up_proj, down_proj, act_fn}; pin presence in __init__ source."""
     cls = _try_get_class(
         "transformers.models.gemma4.modeling_gemma4", "Gemma4TextMLP",
     )
@@ -642,17 +507,12 @@ def test_gemma4_text_mlp_has_required_attrs():
             )
 
 
-# ===========================================================================
-# gemma4_moe.py
-# ---------------------------------------------------------------------------
-# Patches: Gemma4TextExperts.forward, Gemma4TextDecoderLayer.__init__,
-# Gemma4TextMoEBlock.forward, Gemma4ForConditionalGeneration.forward.
-# All transformers 5.0+-gated.
-# ===========================================================================
+# gemma4_moe.py: Gemma4Text{Experts,DecoderLayer,MoEBlock}{.forward,
+# .__init__}, Gemma4ForConditionalGeneration.forward. 5.0+-gated.
 
 def test_gemma4_text_experts_forward_signature():
-    """gemma4_moe.py:239 patches Gemma4TextExperts.forward with
-    ``forward(self, hidden_states, top_k_index, top_k_weights)``."""
+    """gemma4_moe.py:239 patches Gemma4TextExperts.forward(self,
+    hidden_states, top_k_index, top_k_weights)."""
     cls = _try_get_class(
         "transformers.models.gemma4.modeling_gemma4", "Gemma4TextExperts",
     )
@@ -671,8 +531,8 @@ def test_gemma4_text_experts_forward_signature():
 
 
 def test_gemma4_text_decoder_layer_init_signature():
-    """gemma4_moe.py:287 patches Gemma4TextDecoderLayer.__init__ with
-    ``def __init__(self, config, layer_idx)``. Pin those param names."""
+    """gemma4_moe.py:287 patches Gemma4TextDecoderLayer.__init__(self,
+    config, layer_idx)."""
     cls = _try_get_class(
         "transformers.models.gemma4.modeling_gemma4", "Gemma4TextDecoderLayer",
     )
@@ -690,8 +550,8 @@ def test_gemma4_text_decoder_layer_init_signature():
 
 
 def test_gemma4_text_moe_block_forward_signature():
-    """gemma4_moe.py:301 patches Gemma4TextMoEBlock.forward with
-    ``forward(self, hidden_states, top_k_index, top_k_weights)``."""
+    """gemma4_moe.py:301 patches Gemma4TextMoEBlock.forward(self,
+    hidden_states, top_k_index, top_k_weights)."""
     cls = _try_get_class(
         "transformers.models.gemma4.modeling_gemma4", "Gemma4TextMoEBlock",
     )
@@ -710,12 +570,9 @@ def test_gemma4_text_moe_block_forward_signature():
 
 
 def test_gemma4_for_conditional_generation_forward_named_params():
-    """gemma4_moe.py:208 patches Gemma4ForConditionalGeneration.forward
-    with a wrapper that forwards by name: input_ids, pixel_values,
-    pixel_values_videos, input_features, attention_mask,
-    input_features_mask, position_ids, image_position_ids,
-    video_position_ids, past_key_values, mm_token_type_ids,
-    inputs_embeds, labels, use_cache, logits_to_keep. Pin the names."""
+    """gemma4_moe.py:208 patches
+    Gemma4ForConditionalGeneration.forward; pin by-name kwargs
+    (input_ids, attention_mask, ..., logits_to_keep)."""
     cls = _try_get_class(
         "transformers.models.gemma4.modeling_gemma4",
         "Gemma4ForConditionalGeneration",
@@ -738,9 +595,8 @@ def test_gemma4_for_conditional_generation_forward_named_params():
 
 
 def test_gemma4_causal_lm_output_with_past_kwargs():
-    """gemma4_moe.py:189 constructs Gemma4CausalLMOutputWithPast(loss,
-    logits, past_key_values, hidden_states, attentions,
-    image_hidden_states, audio_hidden_states). Pin those kwarg names."""
+    """gemma4_moe.py:189 constructs Gemma4CausalLMOutputWithPast (loss,
+    logits, past_key_values, hidden_states, attentions, ...)."""
     mod = _try_get_class("transformers.models.gemma4", "modeling_gemma4")
     if mod is None:
         pytest.skip(f"gemma4 absent on transformers {_TX_VERSION}")
@@ -764,17 +620,11 @@ def test_gemma4_causal_lm_output_with_past_kwargs():
             )
 
 
-# ===========================================================================
-# glm4_moe.py
-# ---------------------------------------------------------------------------
-# Patches: Glm4MoeLiteNaiveMoe.forward, Glm4MoeLiteMoE.forward.
-# 5.0+-gated (the entire glm4_moe_lite module is 5.0+).
-# ===========================================================================
+# glm4_moe.py: Glm4MoeLite{NaiveMoe,MoE}.forward (5.0+-only).
 
 def test_glm4_moe_lite_naive_moe_forward_signature():
     """glm4_moe.py:97 patches Glm4MoeLiteNaiveMoe.forward via
-    ``get_forward_moe_backend()``. The backend forward signature is
-    ``(self, hidden_states, top_k_index, top_k_weights)``."""
+    ``get_forward_moe_backend()`` (self, hidden_states, ...)."""
     cls = _try_get_class(
         "transformers.models.glm4_moe_lite.modeling_glm4_moe_lite",
         "Glm4MoeLiteNaiveMoe",
@@ -794,8 +644,8 @@ def test_glm4_moe_lite_naive_moe_forward_signature():
 
 
 def test_glm4_moe_lite_moe_forward_signature():
-    """glm4_moe.py:98 patches Glm4MoeLiteMoE.forward with
-    ``moe_block_forward(self, hidden_states)``."""
+    """glm4_moe.py:98 patches Glm4MoeLiteMoE.forward(self,
+    hidden_states)."""
     cls = _try_get_class(
         "transformers.models.glm4_moe_lite.modeling_glm4_moe_lite",
         "Glm4MoeLiteMoE",
@@ -814,21 +664,13 @@ def test_glm4_moe_lite_moe_forward_signature():
     )
 
 
-# ===========================================================================
-# gpt_oss.py
-# ---------------------------------------------------------------------------
-# Patches: swizzle_mxfp4 (covered), Mxfp4GptOssExperts (NOT covered as a
-# signature test), mlp_forward (covered), load_and_swizzle_mxfp4 (covered),
-# replace_with_mxfp4_linear (covered), GptOssAttention.forward (covered),
-# GptOssModel.forward (covered), GptOssConfig (NOT covered, source-only
-# patch), GptOssPreTrainedModel._init_weights (covered),
-# GptOssForCausalLM.forward (NOT covered).
-# ===========================================================================
+# gpt_oss.py: Mxfp4GptOssExperts, GptOssConfig (source-only),
+# GptOssForCausalLM.forward (tail not covered by siblings).
 
 def test_mxfp4_gpt_oss_experts_class_present_and_init_signature():
-    """gpt_oss.py:433 replaces transformers.integrations.mxfp4
-    .Mxfp4GptOssExperts with a custom class. Pin that the upstream class
-    exists and its __init__ accepts (self, config)."""
+    """gpt_oss.py:433 replaces
+    transformers.integrations.mxfp4.Mxfp4GptOssExperts; pin class +
+    __init__(self, config)."""
     cls = _try_get_class(
         "transformers.integrations.mxfp4", "Mxfp4GptOssExperts",
     )
@@ -846,14 +688,8 @@ def test_mxfp4_gpt_oss_experts_class_present_and_init_signature():
 
 
 def test_gpt_oss_config_class_construction_signature():
-    """gpt_oss.py:2813 conditionally replaces
-    transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig with
-    Old_GptOssConfig. The replacement uses kwargs num_hidden_layers,
-    num_local_experts, vocab_size, hidden_size, intermediate_size,
-    head_dim, num_attention_heads, num_key_value_heads, sliding_window,
-    rope_theta, etc. Pin those names exist on the installed class so the
-    replacement (and any user constructing the config by kwarg) doesn't
-    silently miss a renamed param."""
+    """gpt_oss.py:2813 replaces GptOssConfig with Old_GptOssConfig; pin
+    kwarg names (num_hidden_layers, num_local_experts, vocab_size, ...)."""
     cls = _try_get_class(
         "transformers.models.gpt_oss.configuration_gpt_oss", "GptOssConfig",
     )
@@ -878,20 +714,16 @@ def test_gpt_oss_config_class_construction_signature():
 
 
 def test_gpt_oss_for_causal_lm_forward_named_params():
-    """gpt_oss.py:2890 patches GptOssForCausalLM.forward with a wrapper
-    that forwards by name: input_ids, attention_mask, position_ids,
-    past_key_values, inputs_embeds, labels, use_cache, output_attentions,
-    output_hidden_states, cache_position, logits_to_keep."""
+    """gpt_oss.py:2890 patches GptOssForCausalLM.forward with by-name
+    kwargs (input_ids, attention_mask, ..., logits_to_keep)."""
     cls = _try_get_class(
         "transformers.models.gpt_oss.modeling_gpt_oss", "GptOssForCausalLM",
     )
     if cls is None:
         pytest.skip(f"GptOssForCausalLM absent on transformers {_TX_VERSION}")
     fwd = _assert_method_exists(cls, "forward", "gpt_oss.py")
-    # Newer transformers may have already dropped output_attentions and
-    # output_hidden_states from forward signatures. Zoo's wrapper still
-    # accepts them as kwargs that go into **kwargs. Pin only the params
-    # that are guaranteed to remain.
+    # output_attentions / output_hidden_states may be folded into
+    # **kwargs on newer transformers; pin only guaranteed-stable params.
     _assert_params_superset(
         fwd,
         required=[
@@ -905,9 +737,8 @@ def test_gpt_oss_for_causal_lm_forward_named_params():
 
 
 def test_gpt_oss_moe_causal_lm_output_kwargs():
-    """gpt_oss.py:2949 constructs MoeCausalLMOutputWithPast(loss,
-    aux_loss, logits, past_key_values, hidden_states, attentions,
-    router_logits). Pin those kwarg names."""
+    """gpt_oss.py:2949 constructs MoeCausalLMOutputWithPast (loss,
+    aux_loss, logits, past_key_values, ...)."""
     cls = _try_get_class(
         "transformers.models.gpt_oss.modeling_gpt_oss",
         "MoeCausalLMOutputWithPast",
@@ -930,16 +761,13 @@ def test_gpt_oss_moe_causal_lm_output_kwargs():
 
 
 def test_gpt_oss_dynamic_cache_re_export():
-    """gpt_oss.py:2126 imports DynamicCache from
-    transformers.models.gpt_oss.modeling_gpt_oss as a soft try/except. If
-    the re-export goes away the patch still works (via the fallback
-    lambda), but pinning here surfaces the rename loudly."""
+    """gpt_oss.py:2126 imports DynamicCache from modeling_gpt_oss (soft
+    try/except). Zoo falls back to a no-op lambda silently; surface
+    rename loudly."""
     mod = importlib.import_module(
         "transformers.models.gpt_oss.modeling_gpt_oss"
     )
     if not hasattr(mod, "DynamicCache"):
-        # The fallback in zoo silently substitutes a no-op. Surface this
-        # so we know to land a real fix.
         pytest.fail(
             "DRIFT DETECTED: zoo temporary_patches/gpt_oss.py:2126 expects "
             "transformers.models.gpt_oss.modeling_gpt_oss.DynamicCache but "
@@ -950,8 +778,8 @@ def test_gpt_oss_dynamic_cache_re_export():
 
 
 def test_gpt_oss_apply_rotary_pos_emb_re_export():
-    """gpt_oss.py:2122 imports apply_rotary_pos_emb from the gpt_oss
-    modeling module. Re-export pin."""
+    """gpt_oss.py:2122 imports apply_rotary_pos_emb from
+    modeling_gpt_oss; re-export pin."""
     mod = importlib.import_module(
         "transformers.models.gpt_oss.modeling_gpt_oss"
     )
@@ -964,8 +792,8 @@ def test_gpt_oss_apply_rotary_pos_emb_re_export():
 
 
 def test_gpt_oss_moe_model_output_with_past_present():
-    """gpt_oss.py:2121 imports MoeModelOutputWithPast. The patched
-    GptOssModel.forward returns this output class."""
+    """gpt_oss.py:2121 imports MoeModelOutputWithPast (patched
+    GptOssModel.forward return type)."""
     mod = importlib.import_module(
         "transformers.models.gpt_oss.modeling_gpt_oss"
     )
@@ -977,29 +805,13 @@ def test_gpt_oss_moe_model_output_with_past_present():
         )
 
 
-# ===========================================================================
-# misc.py
-# ---------------------------------------------------------------------------
-# Patches:
-#   - AutoHfQuantizer.merge_quantization_configs (covered)
-#   - CsmDepthDecoderForCausalLM.forward (NOT covered)
-#   - CsmForConditionalGeneration.forward (NOT covered as forward; only
-#     _merge_input_ids_with_input_values is pinned)
-#   - GraniteMoeHybridMambaLayer.cuda_kernels_forward (covered)
-#   - SiglipEncoderLayer.forward (covered)
-#   - MllamaVisionEncoderLayer.forward (covered)
-# ===========================================================================
+# misc.py: CsmDepthDecoderForCausalLM.forward,
+# CsmForConditionalGeneration.forward (tail not covered by siblings).
 
 def test_csm_depth_decoder_for_causal_lm_forward_named_params():
     """misc.py:239 patches CsmDepthDecoderForCausalLM.forward with named
-    params: input_ids, backbone_last_hidden_state, attention_mask,
-    position_ids, past_key_values, inputs_embeds, labels, use_cache,
-    cache_position, logits_to_keep.
-
-    Resolves through the ``_original_*`` stash so we inspect the genuine
-    upstream signature even after zoo's TEMPORARY_PATCHES have replaced
-    the live ``forward`` with a ``(self, *args, **kwargs)`` wrapper.
-    """
+    params (input_ids, backbone_last_hidden_state, ..., logits_to_keep).
+    Resolves via ``_original_*`` stash past zoo's wrapper."""
     cls = _try_get_class(
         "transformers.models.csm.modeling_csm",
         "CsmDepthDecoderForCausalLM",
@@ -1023,15 +835,9 @@ def test_csm_depth_decoder_for_causal_lm_forward_named_params():
 
 
 def test_csm_for_conditional_generation_forward_named_params():
-    """misc.py:373 patches CsmForConditionalGeneration.forward. The
-    replacement forwards: input_ids, input_values, attention_mask,
-    input_values_cutoffs, position_ids, past_key_values, inputs_embeds,
-    labels, use_cache, cache_position, logits_to_keep.
-
-    Resolves through the ``_original_*`` stash so we inspect the genuine
-    upstream signature even after zoo's TEMPORARY_PATCHES have replaced
-    the live ``forward`` with a ``(self, *args, **kwargs)`` wrapper.
-    """
+    """misc.py:373 patches CsmForConditionalGeneration.forward (input_ids,
+    input_values, ..., logits_to_keep). Resolves via ``_original_*``
+    stash past zoo's wrapper."""
     cls = _try_get_class(
         "transformers.models.csm.modeling_csm",
         "CsmForConditionalGeneration",
@@ -1056,8 +862,7 @@ def test_csm_for_conditional_generation_forward_named_params():
 
 
 def test_csm_output_with_past_kwargs():
-    """misc.py constructs CausalLMOutputWithPast / CsmOutputWithPast.
-    Pin CsmOutputWithPast field set."""
+    """misc.py constructs CsmOutputWithPast; pin field set."""
     cls = _try_get_class(
         "transformers.models.csm.modeling_csm", "CsmOutputWithPast",
     )
@@ -1076,7 +881,7 @@ def test_csm_output_with_past_kwargs():
 
 def test_csm_for_causal_lm_loss_signature():
     """misc.py:221 calls ForCausalLMLoss(logits, labels, vocab_size,
-    shift_labels). Pin those keyword names accepted."""
+    shift_labels)."""
     fn = None
     try:
         from transformers.loss.loss_utils import ForCausalLMLoss
@@ -1096,9 +901,8 @@ def test_csm_for_causal_lm_loss_signature():
 
 
 def test_csm_merge_input_ids_with_input_values_param_count_realistic():
-    """misc.py:770 patches CsmForConditionalGeneration._merge_input_ids
-    _with_input_values. The sibling test pins by-name params; here we
-    pin that the method exists on the class regardless of name shuffles."""
+    """misc.py:770 patches CsmForConditionalGeneration.
+    _merge_input_ids_with_input_values; pin method existence."""
     cls = _try_get_class(
         "transformers.models.csm.modeling_csm",
         "CsmForConditionalGeneration",
@@ -1109,8 +913,7 @@ def test_csm_merge_input_ids_with_input_values_param_count_realistic():
 
 
 def test_misc_quantizers_auto_module_present():
-    """misc.py:153 patches transformers.quantizers.auto.AutoHfQuantizer.
-    Pin the dotted path."""
+    """misc.py:153 patches transformers.quantizers.auto.AutoHfQuantizer."""
     try:
         mod = importlib.import_module("transformers.quantizers.auto")
     except Exception as exc:
@@ -1126,10 +929,7 @@ def test_misc_quantizers_auto_module_present():
 
 
 def test_misc_granitemoehybrid_class_present():
-    """misc.py:1061 patches
-    transformers.models.granitemoehybrid.modeling_granitemoehybrid
-    .GraniteMoeHybridMambaLayer. Pin the dotted path; the sibling test
-    pins the cuda_kernels_forward signature."""
+    """misc.py:1061 patches GraniteMoeHybridMambaLayer; pin class."""
     cls = _try_get_class(
         "transformers.models.granitemoehybrid.modeling_granitemoehybrid",
         "GraniteMoeHybridMambaLayer",
@@ -1141,9 +941,7 @@ def test_misc_granitemoehybrid_class_present():
 
 
 def test_misc_siglip_encoder_layer_class_present():
-    """misc.py:1228 patches
-    transformers.models.siglip.modeling_siglip.SiglipEncoderLayer.
-    Pin the dotted path."""
+    """misc.py:1228 patches SiglipEncoderLayer."""
     cls = _try_get_class(
         "transformers.models.siglip.modeling_siglip", "SiglipEncoderLayer",
     )
@@ -1156,9 +954,8 @@ def test_misc_siglip_encoder_layer_class_present():
 
 
 def test_misc_mllama_vision_classes_present():
-    """misc.py:1116-1119 imports MllamaVisionConfig / MllamaVisionAttention
-    / MllamaVisionMLP / MllamaVisionEncoder from
-    transformers.models.mllama.modeling_mllama. Pin them as a set."""
+    """misc.py:1116-1119 imports MllamaVision{Config,Attention,MLP,Encoder,
+    EncoderLayer}."""
     mod_name = "transformers.models.mllama.modeling_mllama"
     try:
         mod = importlib.import_module(mod_name)
@@ -1179,20 +976,12 @@ def test_misc_mllama_vision_classes_present():
         )
 
 
-# ===========================================================================
-# mxfp4.py
-# ---------------------------------------------------------------------------
-# Patches: convert_moe_packed_tensors, dequantize (both at
-# transformers.integrations.mxfp4 module level). The sibling
-# test_mxfp4_swizzle_mxfp4_signature and test_mxfp4_replace_with_mxfp4
-# _linear_signature pin OTHER mxfp4 functions but NOT these two.
-# ===========================================================================
+# mxfp4.py: convert_moe_packed_tensors, dequantize (tail).
 
 def test_mxfp4_convert_moe_packed_tensors_signature():
     """mxfp4.py:173 patches
-    transformers.integrations.mxfp4.convert_moe_packed_tensors. The
-    replacement signature is ``(blocks, scales, *, dtype=torch.bfloat16,
-    rows_per_chunk=...)``. Pin the positional+kwonly names."""
+    ``transformers.integrations.mxfp4.convert_moe_packed_tensors``
+    (blocks, scales, *, dtype, rows_per_chunk)."""
     mod_name = "transformers.integrations.mxfp4"
     try:
         mod = importlib.import_module(mod_name)
@@ -1214,10 +1003,8 @@ def test_mxfp4_convert_moe_packed_tensors_signature():
 
 
 def test_mxfp4_dequantize_signature():
-    """mxfp4.py:220 patches
-    transformers.integrations.mxfp4.dequantize. The replacement signature
-    is ``(module, param_name, param_value, target_device, dq_param_name,
-    **kwargs)``."""
+    """mxfp4.py:220 patches ``mxfp4.dequantize`` (module, param_name,
+    param_value, target_device, dq_param_name, **kwargs)."""
     mod_name = "transformers.integrations.mxfp4"
     try:
         mod = importlib.import_module(mod_name)
@@ -1250,8 +1037,7 @@ def test_mxfp4_dequantize_signature():
 
 
 def test_mxfp4_fp4_values_constant_present():
-    """mxfp4.py:113 / 227 imports FP4_VALUES from
-    transformers.integrations.mxfp4. Pin the constant."""
+    """mxfp4.py:113 / :227 imports ``FP4_VALUES`` constant."""
     try:
         mod = importlib.import_module("transformers.integrations.mxfp4")
     except Exception as exc:
@@ -1264,16 +1050,10 @@ def test_mxfp4_fp4_values_constant_present():
 
 
 def test_mxfp4_shard_and_distribute_module_present():
-    """mxfp4.py:181 imports shard_and_distribute_module from
-    transformers.integrations.tensor_parallel. The patched dequantize
-    delegates to this when device_mesh is non-None.
-
-    Note: zoo's call site at mxfp4.py:196 passes ``set_param=False`` --
-    a kwarg added in transformers 5.x. On 4.x stacks this kwarg is
-    legitimately absent and the TP code path raises TypeError at call
-    time. The TP code path is only exercised when ``device_mesh is not
-    None``, so non-TP users are unaffected. Pin function existence here;
-    the set_param compatibility is gated in the separate test below."""
+    """mxfp4.py:181 imports
+    ``transformers.integrations.tensor_parallel.shard_and_distribute_module``;
+    patched dequantize delegates when device_mesh != None. Positional
+    arity must be 8 for zoo's call to land."""
     try:
         mod = importlib.import_module("transformers.integrations.tensor_parallel")
     except Exception as exc:
@@ -1288,11 +1068,8 @@ def test_mxfp4_shard_and_distribute_module_present():
             "shard_and_distribute_module but it is missing on transformers "
             f"{_TX_VERSION}"
         )
-    # Positional arity the call site uses (model, param_value,
-    # empty_param, dq_param_name, casting_dtype, to_contiguous, rank,
-    # device_mesh). Upstream renames between 4.x and 5.x (param ->
-    # param_value, parameter_name -> dq_param_name, etc.), but the
-    # POSITIONAL arity must remain at 8 for zoo's call to land.
+    # 8 positionals: model, param_value, empty_param, dq_param_name,
+    # casting_dtype, to_contiguous, rank, device_mesh.
     params = [
         p for p in inspect.signature(fn).parameters.values()
         if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
@@ -1308,24 +1085,14 @@ def test_mxfp4_shard_and_distribute_module_present():
 
 
 def test_mxfp4_shard_and_distribute_set_param_kwarg_or_4x_compat():
-    """mxfp4.py:196 passes ``set_param=False`` to
-    shard_and_distribute_module. This kwarg was added in transformers
-    5.x; on 4.x it doesn't exist and the call TypeErrors. The TP path is
-    only hit when device_mesh is not None, so most users are unaffected,
-    but we surface the version-skew explicitly so a future zoo PR can
-    decide whether to drop the kwarg conditionally on transformers
-    version."""
+    """mxfp4.py:196 passes ``set_param=False`` (5.x kwarg). 4.x without
+    **kwargs catch-all TypeErrors on the TP path; surface as skip."""
     mod = importlib.import_module("transformers.integrations.tensor_parallel")
     fn = mod.shard_and_distribute_module
     if "set_param" in _param_names(fn):
-        return  # 5.x; zoo's call site works
+        return  # 5.x
     if _has_var_keyword(fn):
-        return  # **kwargs catch-all swallows set_param
-    # 4.x without **kwargs: zoo's TP path will TypeError. This is a
-    # well-known version-skew limitation -- zoo expects users running
-    # mxfp4 + TP to be on transformers 5.x. Skip rather than fail so the
-    # general suite passes on 4.x dev installs; the explicit message
-    # makes the skew loud.
+        return  # **kwargs swallows set_param
     pytest.skip(
         f"transformers {_TX_VERSION} predates set_param kwarg on "
         "shard_and_distribute_module; zoo's TP path (device_mesh != None) "
@@ -1334,8 +1101,7 @@ def test_mxfp4_shard_and_distribute_set_param_kwarg_or_4x_compat():
 
 
 def test_mxfp4_mxfp4_config_top_level_class():
-    """mxfp4.py:93 imports Mxfp4Config from top-level transformers. Pin
-    it. Used as the quantization_config kwarg for AutoModelForCausalLM."""
+    """mxfp4.py:93 imports top-level ``transformers.Mxfp4Config``."""
     if not hasattr(transformers, "Mxfp4Config"):
         pytest.fail(
             "DRIFT DETECTED: zoo temporary_patches/mxfp4.py:93 expects "
@@ -1344,16 +1110,10 @@ def test_mxfp4_mxfp4_config_top_level_class():
         )
 
 
-# ===========================================================================
-# pixtral.py
-# ---------------------------------------------------------------------------
-# Patches: PixtralAttention.__init__ (pixtral.py:91), PixtralAttention.forward
-# (pixtral.py:97). Neither covered by existing tests.
-# ===========================================================================
+# pixtral.py: PixtralAttention.{__init__, forward}.
 
 def test_pixtral_attention_init_signature():
-    """pixtral.py:91 patches PixtralAttention.__init__ with
-    ``def __init__(self, config)``. Pin the single-config init."""
+    """pixtral.py:91 patches PixtralAttention.__init__(self, config)."""
     cls = _require_class(
         "transformers.models.pixtral.modeling_pixtral",
         "PixtralAttention",
@@ -1368,18 +1128,9 @@ def test_pixtral_attention_init_signature():
 
 
 def test_pixtral_attention_forward_signature():
-    """pixtral.py:97 patches PixtralAttention.forward with
-    ``forward(self, hidden_states, attention_mask, position_embeddings,
-    output_attentions=False, **kwargs)``. Pin those names.
-
-    Once apply_import_fixes / TEMPORARY_PATCHES have run, the live
-    ``PixtralAttention.forward`` is zoo's patch wrapper with signature
-    ``(self, *args, **kwargs)``; reading that signature would false-fail
-    the upstream-shape pin. We instead resolve through
-    ``_original_<module>_<class>_<attr>`` (stashed by zoo's
-    ``patch_function``) to read the genuine upstream signature, or skip
-    loudly with the patch-wrapper detail if no stash is available.
-    """
+    """pixtral.py:97 patches PixtralAttention.forward(self,
+    hidden_states, attention_mask, position_embeddings, ...). Resolves
+    via ``_original_*`` stash to read upstream past zoo's wrapper."""
     cls = _require_class(
         "transformers.models.pixtral.modeling_pixtral",
         "PixtralAttention",
@@ -1396,9 +1147,8 @@ def test_pixtral_attention_forward_signature():
 
 
 def test_pixtral_apply_rotary_pos_emb_present():
-    """pixtral.py:30 imports apply_rotary_pos_emb from the pixtral
-    modeling module. Re-export pin -- if it moves, the patch raises and
-    PixtralAttention falls back to the (broken) stock forward."""
+    """pixtral.py:30 imports apply_rotary_pos_emb from modeling_pixtral;
+    re-export pin."""
     mod = importlib.import_module(
         "transformers.models.pixtral.modeling_pixtral"
     )
@@ -1411,9 +1161,8 @@ def test_pixtral_apply_rotary_pos_emb_present():
 
 
 def test_pixtral_attention_init_attrs_present():
-    """pixtral.py:36-47 patched __init__ sets self.embed_dim, num_heads,
-    head_dim, scale, dropout, k_proj, v_proj, q_proj, o_proj. The config
-    must expose hidden_size, num_attention_heads, attention_dropout."""
+    """pixtral.py:36-47 patched __init__ reads self.config.{hidden_size,
+    num_attention_heads, attention_dropout}."""
     cls = _require_class(
         "transformers.models.pixtral.configuration_pixtral",
         "PixtralVisionConfig",
@@ -1431,13 +1180,8 @@ def test_pixtral_attention_init_attrs_present():
             )
 
 
-# ===========================================================================
-# qwen3_5_moe.py
-# ---------------------------------------------------------------------------
-# Patches: Qwen3_5MoeExperts.forward, Qwen3_5MoeSparseMoeBlock.forward,
-# Qwen3_5MoeForCausalLM.forward. All 5.0+-gated -- the module
-# qwen3_5_moe only exists on transformers 5.x.
-# ===========================================================================
+# qwen3_5_moe.py: Qwen3_5Moe{Experts,SparseMoeBlock,ForCausalLM}.forward
+# (5.0+-only).
 
 def test_qwen3_5_moe_sparse_moe_block_forward_signature():
     """qwen3_5_moe.py:66 patches Qwen3_5MoeSparseMoeBlock.forward."""
@@ -1480,8 +1224,8 @@ def test_qwen3_5_moe_experts_forward_signature():
 
 
 def test_qwen3_5_moe_for_causal_lm_class_present():
-    """qwen3_5_moe.py:77 reads Qwen3_5MoeForCausalLM and MoeCausalLMOutput
-    WithPast for the GRPO hidden-states patch. Pin those classes."""
+    """qwen3_5_moe.py:77-78 reads Qwen3_5MoeForCausalLM +
+    MoeCausalLMOutputWithPast (GRPO hidden-states patch)."""
     mod = _try_get_class(
         "transformers.models.qwen3_5_moe", "modeling_qwen3_5_moe",
     )
@@ -1510,19 +1254,12 @@ def test_qwen3_5_moe_for_causal_lm_class_present():
         )
 
 
-# ===========================================================================
-# qwen3_moe.py
-# ---------------------------------------------------------------------------
-# Patches: Qwen3MoeSparseMoeBlock.forward (covered), Qwen3MoeExperts.forward
-# (5.0+-gated, NOT covered with signature), Qwen3MoeForCausalLM.forward
-# (NOT covered).
-# ===========================================================================
+# qwen3_moe.py: Qwen3MoeExperts.forward (5.0+),
+# Qwen3MoeForCausalLM.forward (tail).
 
 def test_qwen3_moe_experts_forward_signature_5x():
-    """qwen3_moe.py:339 patches Qwen3MoeExperts.forward via
-    ``patch_function(...)`` on the 5.0+ stacked-experts branch. The
-    sibling test pins class EXISTENCE; this test pins the forward
-    signature accepts (hidden_states, top_k_index, top_k_weights)."""
+    """qwen3_moe.py:339 patches Qwen3MoeExperts.forward(hidden_states,
+    top_k_index, top_k_weights) on 5.0+ stacked-experts branch."""
     cls = _try_get_class(
         "transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeExperts",
     )
@@ -1541,11 +1278,8 @@ def test_qwen3_moe_experts_forward_signature_5x():
 
 
 def test_qwen3_moe_for_causal_lm_forward_named_params():
-    """qwen3_moe.py:351 indirectly patches Qwen3MoeForCausalLM.forward via
-    ``_patch_causal_lm_forward_for_hidden_states`` (qwen3_moe.py:138).
-    Patched signature is (input_ids, attention_mask, position_ids,
-    past_key_values, inputs_embeds, labels, use_cache,
-    output_router_logits, cache_position, logits_to_keep, **kwargs)."""
+    """qwen3_moe.py:351 patches Qwen3MoeForCausalLM.forward via
+    ``_patch_causal_lm_forward_for_hidden_states`` (qwen3_moe.py:138)."""
     cls = _try_get_class(
         "transformers.models.qwen3_moe.modeling_qwen3_moe",
         "Qwen3MoeForCausalLM",
@@ -1568,8 +1302,8 @@ def test_qwen3_moe_for_causal_lm_forward_named_params():
 
 
 def test_qwen3_moe_for_causal_lm_output_class_present():
-    """qwen3_moe.py:349 imports MoeCausalLMOutputWithPast from the same
-    qwen3_moe modeling module. Pin re-export."""
+    """qwen3_moe.py:349 imports MoeCausalLMOutputWithPast from
+    modeling_qwen3_moe."""
     mod = importlib.import_module(
         "transformers.models.qwen3_moe.modeling_qwen3_moe"
     )
@@ -1582,18 +1316,11 @@ def test_qwen3_moe_for_causal_lm_output_class_present():
         )
 
 
-# ===========================================================================
-# qwen3_next_moe.py
-# ---------------------------------------------------------------------------
-# Patches: Qwen3NextExperts.forward, Qwen3NextSparseMoeBlock.forward
-# (covered), Qwen3NextForCausalLM.forward (via the shared
-# _patch_causal_lm_forward_for_hidden_states helper).
-# ===========================================================================
+# qwen3_next_moe.py: Qwen3Next{Experts,ForCausalLM}.forward tail.
 
 def test_qwen3_next_experts_forward_signature():
-    """qwen3_next_moe.py:57 patches Qwen3NextExperts.forward (5.0+-only).
-    Pin signature accepts (hidden_states, ...) on installs where the
-    class is present."""
+    """qwen3_next_moe.py:57 patches Qwen3NextExperts.forward(self,
+    hidden_states, ...) on 5.0+."""
     cls = _try_get_class(
         "transformers.models.qwen3_next.modeling_qwen3_next",
         "Qwen3NextExperts",
@@ -1613,9 +1340,8 @@ def test_qwen3_next_experts_forward_signature():
 
 
 def test_qwen3_next_for_causal_lm_forward_named_params():
-    """qwen3_next_moe.py:79 indirectly patches Qwen3NextForCausalLM.forward
-    via ``_patch_causal_lm_forward_for_hidden_states``. Pin the named
-    params zoo's wrapper passes."""
+    """qwen3_next_moe.py:79 patches Qwen3NextForCausalLM.forward via
+    ``_patch_causal_lm_forward_for_hidden_states``."""
     cls = _try_get_class(
         "transformers.models.qwen3_next.modeling_qwen3_next",
         "Qwen3NextForCausalLM",
@@ -1637,20 +1363,12 @@ def test_qwen3_next_for_causal_lm_forward_named_params():
     )
 
 
-# ===========================================================================
-# qwen3_vl_moe.py
-# ---------------------------------------------------------------------------
-# Patches: Qwen3VLMoeTextSparseMoeBlock.forward (covered), Qwen3VLMoe
-# TextExperts.forward/__init__ (covered), Qwen3VLMoeForConditional
-# Generation.forward (NOT covered).
-# ===========================================================================
+# qwen3_vl_moe.py: Qwen3VLMoeForConditionalGeneration.forward (tail).
 
 def test_qwen3_vl_moe_for_conditional_generation_forward_named_params():
-    """qwen3_vl_moe.py:401 patches Qwen3VLMoeForConditionalGeneration.
-    forward. Patched signature forwards input_ids, attention_mask,
-    position_ids, past_key_values, inputs_embeds, labels, pixel_values,
-    pixel_values_videos, image_grid_thw, video_grid_thw, cache_position,
-    logits_to_keep."""
+    """qwen3_vl_moe.py:401 patches
+    Qwen3VLMoeForConditionalGeneration.forward with by-name kwargs
+    (input_ids, attention_mask, ..., logits_to_keep)."""
     cls = _try_get_class(
         "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
         "Qwen3VLMoeForConditionalGeneration",
@@ -1676,8 +1394,7 @@ def test_qwen3_vl_moe_for_conditional_generation_forward_named_params():
 
 def test_qwen3_vl_moe_causal_lm_output_with_past_kwargs():
     """qwen3_vl_moe.py:466 constructs Qwen3VLMoeCausalLMOutputWithPast
-    (loss, aux_loss, logits, past_key_values, hidden_states, attentions,
-    rope_deltas). Pin kwarg names."""
+    (loss, aux_loss, ..., rope_deltas)."""
     cls = _try_get_class(
         "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
         "Qwen3VLMoeCausalLMOutputWithPast",
@@ -1701,16 +1418,14 @@ def test_qwen3_vl_moe_causal_lm_output_with_past_kwargs():
 
 
 def test_qwen3_vl_moe_text_top_k_router_class_present():
-    """qwen3_vl_moe.py:326 expects ``self.gate`` to be
-    Qwen3VLMoeTextTopKRouter on the new (5.x) layout. The router returns
-    (router_logits, router_scores, router_indices). Pin the class."""
+    """qwen3_vl_moe.py:326 expects ``self.gate ==
+    Qwen3VLMoeTextTopKRouter`` on 5.x; tuple-unpack fallback otherwise."""
     cls = _try_get_class(
         "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
         "Qwen3VLMoeTextTopKRouter",
     )
     if cls is None:
-        # The class is 5.x-only; if absent, zoo's tuple-unpack fallback
-        # at qwen3_vl_moe.py:333 still works. Don't fail here.
+        # 5.x-only; zoo's tuple-unpack fallback (qwen3_vl_moe.py:333) handles.
         pytest.skip(
             f"Qwen3VLMoeTextTopKRouter absent on transformers {_TX_VERSION} "
             "(zoo gracefully falls back to old-style logit gate)"
@@ -1718,9 +1433,7 @@ def test_qwen3_vl_moe_text_top_k_router_class_present():
 
 
 def test_qwen3_vl_moe_text_experts_class_present():
-    """qwen3_vl_moe.py:73 imports Qwen3VLMoeTextExperts. The sibling test
-    pins forward / __init__ signatures; this test gates the module
-    presence so a missing parent module surfaces clearly."""
+    """qwen3_vl_moe.py:73 imports Qwen3VLMoeTextExperts."""
     cls = _try_get_class(
         "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
         "Qwen3VLMoeTextExperts",
@@ -1732,11 +1445,9 @@ def test_qwen3_vl_moe_text_experts_class_present():
 
 
 def test_qwen3_vl_moe_act2fn_dict_present():
-    """qwen3_vl_moe.py:201 imports ACT2FN from transformers.activations.
-    The patched __init__ does ``self.act_fn = ACT2FN[config.hidden_act]``.
-    Pin the import path."""
+    """qwen3_vl_moe.py:201 imports ACT2FN; patched __init__ does
+    ``self.act_fn = ACT2FN[config.hidden_act]``."""
     from transformers.activations import ACT2FN  # noqa: F401
-    # If hidden_act default is silu, ACT2FN must accept that key.
     if "silu" not in ACT2FN:
         pytest.fail(
             "DRIFT DETECTED: zoo temporary_patches/qwen3_vl_moe.py:236 expects "
@@ -1744,20 +1455,12 @@ def test_qwen3_vl_moe_act2fn_dict_present():
         )
 
 
-# ===========================================================================
-# moe_utils.py / moe_bnb.py / flex_attention_bwd.py
-# ---------------------------------------------------------------------------
-# These helper modules don't directly patch transformers (no
-# patch_function call sites). moe_utils provides helpers consumed by the
-# other temporary_patches/ files, and moe_bnb / flex_attention_bwd are
-# utility shims. Skip patch-site enumeration here; existing tests cover
-# the consumer sites already.
-# ===========================================================================
+# moe_utils.py / moe_bnb.py / flex_attention_bwd.py: helper modules
+# (no patch_function call sites); consumer sites covered elsewhere.
 
 def test_moe_utils_param_wrapper_target_present():
-    """moe_utils.py registers patches against peft.tuners.lora.layer
-    .ParamWrapper. If PEFT renames the class, zoo's split-LoRA grouped-GEMM
-    code path silently falls back to the unwrapped layout."""
+    """moe_utils.py registers patches against
+    peft.tuners.lora.layer.ParamWrapper (split-LoRA grouped-GEMM)."""
     peft = pytest.importorskip("peft")
     try:
         from peft.tuners.lora.layer import ParamWrapper  # noqa: F401
@@ -1768,20 +1471,13 @@ def test_moe_utils_param_wrapper_target_present():
         )
 
 
-# ===========================================================================
-# misc.py (additional patch sites)
-# ---------------------------------------------------------------------------
-# misc.py contains 19 separate ``patch_X`` entries. The existing tests
-# cover ~6 of them. The remainder fall into config-mapping, tokenizer
-# attribute, mask-utils wrap, modernbert mask-strides, lfm2 projector,
-# peft dispatch, trl push-to-hub, vllm chat-template, and qwen2-vl
-# image-processor compat shims. Pin upstream targets for each.
-# ===========================================================================
+# misc.py additional patch sites: config-mapping, tokenizer attrs,
+# mask-utils, modernbert, lfm2, peft dispatch, trl, vllm, qwen2-vl shims.
 
 def test_misc_config_mapping_present_for_ministral3_register():
-    """misc.py:47 imports CONFIG_MAPPING from
-    transformers.models.auto.configuration_auto and calls .register(...)
-    on it. Pin the import path and the mapping has a register method."""
+    """misc.py:47-53 imports CONFIG_MAPPING from
+    transformers.models.auto.configuration_auto + calls
+    ``.register(...)``."""
     try:
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     except Exception as exc:
@@ -1800,8 +1496,8 @@ def test_misc_config_mapping_present_for_ministral3_register():
 
 
 def test_misc_ministral_config_top_level_import():
-    """misc.py:48 imports MinistralConfig from top-level transformers as
-    the value side of the ``ministral3`` -> MinistralConfig alias."""
+    """misc.py:48 imports top-level ``transformers.MinistralConfig``
+    (ministral3 alias target)."""
     if not hasattr(transformers, "MinistralConfig"):
         pytest.fail(
             "DRIFT DETECTED: zoo temporary_patches/misc.py:48 expects "
@@ -1811,8 +1507,8 @@ def test_misc_ministral_config_top_level_import():
 
 
 def test_misc_pretrained_tokenizer_base_convert_added_tokens_method():
-    """misc.py:67 expects PreTrainedTokenizerBase.convert_added_tokens
-    to be a classmethod. The patch reassigns it. Pin the attr name."""
+    """misc.py:67 expects
+    ``PreTrainedTokenizerBase.convert_added_tokens`` classmethod."""
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     if not hasattr(PreTrainedTokenizerBase, "convert_added_tokens"):
         pytest.fail(
@@ -1823,12 +1519,10 @@ def test_misc_pretrained_tokenizer_base_convert_added_tokens_method():
 
 
 def test_misc_added_token_class_present():
-    """misc.py:63 imports AddedToken from
-    transformers.tokenization_utils_base. The patched
-    convert_added_tokens constructs AddedToken(**obj)."""
+    """misc.py:63 / :75 imports AddedToken; patched convert_added_tokens
+    constructs ``AddedToken(content=...)``."""
     from transformers.tokenization_utils_base import AddedToken
     sig = inspect.signature(AddedToken)
-    # Pin a couple of expected fields so a rename surfaces here.
     field_names = list(sig.parameters.keys())
     for req in ("content",):
         if req not in field_names:
@@ -1840,8 +1534,8 @@ def test_misc_added_token_class_present():
 
 
 def test_misc_pretrained_tokenizer_base_init_takes_kwargs():
-    """misc.py:97 wraps PreTrainedTokenizerBase.__init__ and rejects /
-    coerces extra_special_tokens. Pin __init__ accepts **kwargs."""
+    """misc.py:97 wraps PreTrainedTokenizerBase.__init__(self, **kwargs)
+    (rejects / coerces extra_special_tokens)."""
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     if not _has_var_keyword(PreTrainedTokenizerBase.__init__):
         pytest.fail(
@@ -1853,11 +1547,9 @@ def test_misc_pretrained_tokenizer_base_init_takes_kwargs():
 
 
 def test_misc_masking_utils_create_block_mask_available_or_compile_flag():
-    """misc.py:391-409 imports BlockMask / create_block_mask from
-    torch.nn.attention.flex_attention and rewrites the masks function on
-    transformers.masking_utils. Pin the upstream masking_utils module
-    has create_causal_mask / create_sliding_window_causal_mask /
-    create_masks_for_generate (all consumed by the patch)."""
+    """misc.py:391-445 imports BlockMask / create_block_mask and rewrites
+    masking_utils.{create_causal_mask, create_sliding_window_causal_mask,
+    create_masks_for_generate}."""
     masking = importlib.import_module("transformers.masking_utils")
     for name in ("create_causal_mask", "create_sliding_window_causal_mask",
                  "create_masks_for_generate"):
@@ -1871,8 +1563,7 @@ def test_misc_masking_utils_create_block_mask_available_or_compile_flag():
 
 def test_misc_generation_utils_create_masks_for_generate():
     """misc.py:447 reassigns
-    transformers.generation.utils.create_masks_for_generate. Pin the
-    attribute exists pre-patch."""
+    ``transformers.generation.utils.create_masks_for_generate``."""
     gu = importlib.import_module("transformers.generation.utils")
     if not hasattr(gu, "create_masks_for_generate"):
         pytest.fail(
@@ -1883,9 +1574,8 @@ def test_misc_generation_utils_create_masks_for_generate():
 
 
 def test_misc_masking_utils_padding_and_packed_helpers():
-    """misc.py:472 / 490 conditionally wraps padding_mask_function and
-    packed_sequence_mask_function on masking_utils. The wraps are
-    gated by hasattr so absence isn't drift, but pin them when present."""
+    """misc.py:472 / :490 wraps padding_mask_function /
+    packed_sequence_mask_function on masking_utils (hasattr-gated)."""
     masking = importlib.import_module("transformers.masking_utils")
     if hasattr(masking, "padding_mask_function"):
         if not callable(masking.padding_mask_function):
@@ -1903,8 +1593,8 @@ def test_misc_masking_utils_padding_and_packed_helpers():
 
 
 def test_misc_sdpa_attention_forward_present():
-    """misc.py:525 patches
-    transformers.integrations.sdpa_attention.sdpa_attention_forward."""
+    """misc.py:525-530 patches
+    ``transformers.integrations.sdpa_attention.sdpa_attention_forward``."""
     try:
         mod = importlib.import_module("transformers.integrations.sdpa_attention")
     except Exception as exc:
@@ -1921,8 +1611,8 @@ def test_misc_sdpa_attention_forward_present():
 
 
 def test_misc_all_attention_functions_modeling_utils_top_level():
-    """misc.py:526 imports ALL_ATTENTION_FUNCTIONS from
-    transformers.modeling_utils. Pin the symbol presence."""
+    """misc.py:526 imports
+    ``transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS``."""
     mu = importlib.import_module("transformers.modeling_utils")
     if not hasattr(mu, "ALL_ATTENTION_FUNCTIONS"):
         pytest.fail(
@@ -1933,9 +1623,8 @@ def test_misc_all_attention_functions_modeling_utils_top_level():
 
 
 def test_misc_modernbert_model_update_attention_mask_present():
-    """misc.py:662 patches ModernBertModel._update_attention_mask. The
-    patch is gated by hasattr; pin the method when ModernBertModel is
-    present so a rename surfaces."""
+    """misc.py:662 patches
+    ``ModernBertModel._update_attention_mask`` (SDPA-stride fix)."""
     cls = _try_get_class(
         "transformers.models.modernbert.modeling_modernbert",
         "ModernBertModel",
@@ -1959,9 +1648,8 @@ def test_misc_modernbert_model_update_attention_mask_present():
 
 def test_misc_csm_for_conditional_generation_merge_input_ids_target_present():
     """misc.py:687 patches
-    CsmForConditionalGeneration._merge_input_ids_with_input_values with
-    a 4-arg replacement (input_ids, input_values, input_values_cutoffs,
-    labels). Pin the upstream method accepts the same names."""
+    ``CsmForConditionalGeneration._merge_input_ids_with_input_values``
+    (input_ids, input_values, input_values_cutoffs, labels)."""
     cls = _try_get_class(
         "transformers.models.csm.modeling_csm", "CsmForConditionalGeneration",
     )
@@ -1979,9 +1667,8 @@ def test_misc_csm_for_conditional_generation_merge_input_ids_target_present():
 
 
 def test_misc_lfm2_vl_multimodal_projector_class_present():
-    """misc.py:1247 patches Lfm2VlMultiModalProjector.__init__ /
-    .forward. Pin class presence; the patch is gated on transformers
-    pre-5.0.0."""
+    """misc.py:1247 patches Lfm2VlMultiModalProjector.{__init__,
+    forward}; transformers pre-5.0.0-gated."""
     cls = _try_get_class(
         "transformers.models.lfm2_vl.modeling_lfm2_vl",
         "Lfm2VlMultiModalProjector",
@@ -1990,7 +1677,6 @@ def test_misc_lfm2_vl_multimodal_projector_class_present():
         pytest.skip(
             f"Lfm2VlMultiModalProjector absent on transformers {_TX_VERSION}"
         )
-    # Patched __init__: def patched_init(self, config, *args, **kwargs)
     _assert_params_superset(
         cls.__init__,
         required=["config"],
@@ -2000,8 +1686,8 @@ def test_misc_lfm2_vl_multimodal_projector_class_present():
 
 
 def test_misc_peft_dispatch_bnb_4bit_target_present():
-    """misc.py:1290 patches peft.tuners.lora.bnb.dispatch_bnb_4bit. Pin
-    the function exists in the installed PEFT."""
+    """misc.py:1289-1290 patches
+    ``peft.tuners.lora.bnb.dispatch_bnb_4bit`` (target, adapter_name)."""
     peft = pytest.importorskip("peft")
     try:
         import peft.tuners.lora.bnb as peft_bnb
@@ -2025,8 +1711,7 @@ def test_misc_peft_dispatch_bnb_4bit_target_present():
 
 
 def test_misc_trl_push_to_hub_target_training_arguments_to_dict():
-    """misc.py:1334 patches TrainingArguments.to_dict on transformers
-    5.0+. Pin the to_dict() target exists."""
+    """misc.py:1333-1334 patches ``TrainingArguments.to_dict`` on 5.0+."""
     if not hasattr(transformers, "TrainingArguments"):
         pytest.fail(
             "DRIFT DETECTED: zoo temporary_patches/misc.py:1333 expects "
@@ -2041,10 +1726,9 @@ def test_misc_trl_push_to_hub_target_training_arguments_to_dict():
 
 
 def test_misc_trl_vision_model_mapping_target_module_present():
-    """misc.py:1363 reads / writes
-    transformers.models.auto.modeling_auto.MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
-    (the 5.0+ name) and
-    MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES (the legacy name). At least one
+    """misc.py:1363-1371 reads
+    ``MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES`` (5.0+) or
+    ``MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES`` (legacy); at least one
     must exist."""
     auto_mod = importlib.import_module(
         "transformers.models.auto.modeling_auto"
@@ -2065,9 +1749,9 @@ def test_misc_trl_vision_model_mapping_target_module_present():
 
 
 def test_misc_apply_chat_template_signature_has_return_dict():
-    """misc.py:1446 checks ``return_dict`` is in
-    PreTrainedTokenizerBase.apply_chat_template signature on
-    transformers 5.0+. Pin the kwarg in the installed signature."""
+    """misc.py:1446-1455 sets ``kwargs['return_dict']=False`` when
+    tokenize=True; needs ``return_dict`` in
+    PreTrainedTokenizerBase.apply_chat_template signature."""
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     sig = inspect.signature(PreTrainedTokenizerBase.apply_chat_template)
     if "return_dict" not in sig.parameters and not _has_var_keyword(
@@ -2082,8 +1766,8 @@ def test_misc_apply_chat_template_signature_has_return_dict():
 
 
 def test_misc_qwen2_vl_image_processor_class_present():
-    """misc.py:1485 imports Qwen2VLImageProcessor and conditionally
-    attaches max_pixels / min_pixels properties. Pin the class."""
+    """misc.py:1485 imports Qwen2VLImageProcessor (max_pixels /
+    min_pixels properties)."""
     cls = _try_get_class(
         "transformers.models.qwen2_vl.image_processing_qwen2_vl",
         "Qwen2VLImageProcessor",
@@ -2094,14 +1778,11 @@ def test_misc_qwen2_vl_image_processor_class_present():
         )
 
 
-# ===========================================================================
-# gpt_oss.py (additional patch sites beyond the existing tests)
-# ===========================================================================
+# gpt_oss.py additional patch sites (beyond existing tests).
 
 def test_gpt_oss_mxfp4_quantizer_class_present():
-    """gpt_oss.py:127 monkey-patches
-    transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable.
-    Pin the class exists. Without it, the patch silently no-ops."""
+    """gpt_oss.py:124-127 patches
+    ``transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable``."""
     try:
         mod = importlib.import_module("transformers.quantizers.quantizer_mxfp4")
     except Exception as exc:
@@ -2119,8 +1800,7 @@ def test_gpt_oss_mxfp4_quantizer_class_present():
 
 def test_gpt_oss_mxfp4_quantizer_is_kernels_available_present():
     """gpt_oss.py:136 reassigns
-    transformers.quantizers.quantizer_mxfp4.is_kernels_available. Pin
-    the symbol."""
+    ``transformers.quantizers.quantizer_mxfp4.is_kernels_available``."""
     mod = importlib.import_module("transformers.quantizers.quantizer_mxfp4")
     if not hasattr(mod, "is_kernels_available"):
         pytest.fail(
@@ -2131,9 +1811,8 @@ def test_gpt_oss_mxfp4_quantizer_is_kernels_available_present():
 
 
 def test_gpt_oss_modeling_module_top_level_classes_present():
-    """gpt_oss.py:1060-1063 reassigns GptOssExperts and GptOssTopKRouter
-    via attribute setting on the modeling module. Pin both class names
-    exist as module attributes (they are the patch targets)."""
+    """gpt_oss.py:1060-1063 reassigns ``modeling_gpt_oss.GptOssExperts``
+    and ``.GptOssTopKRouter`` (BnB 4-bit GPT-OSS shim)."""
     mod = importlib.import_module(
         "transformers.models.gpt_oss.modeling_gpt_oss"
     )
@@ -2148,9 +1827,8 @@ def test_gpt_oss_modeling_module_top_level_classes_present():
 
 
 def test_gpt_oss_layer_type_validation_module_path():
-    """gpt_oss.py near the config patch reads ``layer_type_validation``
-    via the rope_utils path used by configuration_gpt_oss.py. Pin
-    via configuration module symbol."""
+    """gpt_oss.py:2801-2803 reads
+    ``transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig``."""
     try:
         cfg_mod = importlib.import_module(
             "transformers.models.gpt_oss.configuration_gpt_oss"
@@ -2170,9 +1848,8 @@ def test_gpt_oss_layer_type_validation_module_path():
 
 
 def test_gpt_oss_pretrained_model_present():
-    """gpt_oss.py:2832 reads
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssPreTrainedModel
-    as the patch target for _init_weights."""
+    """gpt_oss.py:2832 reads ``GptOssPreTrainedModel`` for
+    _init_weights patch."""
     mod = importlib.import_module(
         "transformers.models.gpt_oss.modeling_gpt_oss"
     )
@@ -2185,9 +1862,8 @@ def test_gpt_oss_pretrained_model_present():
 
 
 def test_gpt_oss_model_module_dynamic_cache_present():
-    """gpt_oss.py:2126 imports DynamicCache from gpt_oss modeling.
-    Already pinned by sibling test; here we pin from
-    transformers.cache_utils as the canonical fallback path."""
+    """gpt_oss.py:2126 fallback path pins
+    ``transformers.cache_utils.DynamicCache``."""
     cu = importlib.import_module("transformers.cache_utils")
     if not hasattr(cu, "DynamicCache"):
         pytest.fail(
@@ -2198,9 +1874,8 @@ def test_gpt_oss_model_module_dynamic_cache_present():
 
 
 def test_gpt_oss_attention_apply_rotary_pos_emb_imported_at_attention():
-    """gpt_oss.py:1875+ imports apply_rotary_pos_emb from the gpt_oss
-    modeling module for GptOssAttention.forward. Pin via separate
-    re-export check at a different line than the existing sibling test."""
+    """gpt_oss.py:1875 imports ``apply_rotary_pos_emb(q, k, cos, sin)``
+    (4 positionals) from modeling_gpt_oss."""
     mod = importlib.import_module(
         "transformers.models.gpt_oss.modeling_gpt_oss"
     )
@@ -2210,8 +1885,6 @@ def test_gpt_oss_attention_apply_rotary_pos_emb_imported_at_attention():
             "DRIFT DETECTED: zoo temporary_patches/gpt_oss.py:1875 expects "
             "modeling_gpt_oss.apply_rotary_pos_emb but it is missing"
         )
-    # apply_rotary_pos_emb is called as
-    #   apply_rotary_pos_emb(q, k, cos, sin) -> 4 positional args.
     params = [
         p for p in inspect.signature(apply).parameters.values()
         if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
@@ -2227,9 +1900,8 @@ def test_gpt_oss_attention_apply_rotary_pos_emb_imported_at_attention():
 
 
 def test_gpt_oss_eager_attention_forward_present():
-    """gpt_oss.py:2063 calls eager_attention_forward(self, q, k, v,
-    mask, dropout=..., scaling=..., sliding_window=..., s_aux=...,
-    **kwargs). Pin those by-name params on the upstream helper."""
+    """gpt_oss.py:2063 calls ``eager_attention_forward(self, q, k, v,
+    mask, ...)`` (5+ positionals)."""
     mod = importlib.import_module(
         "transformers.models.gpt_oss.modeling_gpt_oss"
     )
@@ -2240,8 +1912,7 @@ def test_gpt_oss_eager_attention_forward_present():
             "modeling_gpt_oss.eager_attention_forward but it is missing on "
             f"transformers {_TX_VERSION}"
         )
-    # Be lenient: only require the positional arity since the kwarg names
-    # change across transformers releases.
+    # Lenient: only positional arity (kwarg names change across releases).
     params = [
         p for p in inspect.signature(fn).parameters.values()
         if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
@@ -2256,15 +1927,12 @@ def test_gpt_oss_eager_attention_forward_present():
         )
 
 
-# ===========================================================================
-# gemma.py (Gemma3DecoderLayer, Gemma3TextModel survival as transitive
-# patch dependencies)
-# ===========================================================================
+# gemma.py transitive deps: Gemma3DecoderLayer, Gemma3TextModel,
+# Gemma3PreTrainedModel.
 
 def test_gemma3_decoder_layer_class_present():
-    """gemma.py imports Gemma3Attention from modeling_gemma3 and patches
-    Gemma3Attention.forward. The decoder layer is the parent and must
-    exist as a sibling pin so a rename surfaces."""
+    """gemma.py imports Gemma3Attention; the decoder-layer parent
+    Gemma3DecoderLayer must exist."""
     cls = _try_get_class(
         "transformers.models.gemma3.modeling_gemma3", "Gemma3DecoderLayer",
     )
@@ -2276,9 +1944,8 @@ def test_gemma3_decoder_layer_class_present():
 
 
 def test_gemma3_text_model_class_present():
-    """gemma.py:233 references Gemma3Model (the multimodal model). The
-    underlying text-only model Gemma3TextModel is the LM head's
-    backbone; pin it."""
+    """gemma.py:233 references Gemma3Model; pin Gemma3TextModel
+    (LM head backbone)."""
     cls = _try_get_class(
         "transformers.models.gemma3.modeling_gemma3", "Gemma3TextModel",
     )
@@ -2290,8 +1957,7 @@ def test_gemma3_text_model_class_present():
 
 
 def test_gemma3_pre_trained_model_class_present():
-    """gemma.py touches Gemma3 model surfaces -- Gemma3PreTrainedModel
-    is the base class. Pin its existence."""
+    """gemma.py touches Gemma3 surfaces; pin Gemma3PreTrainedModel base."""
     cls = _try_get_class(
         "transformers.models.gemma3.modeling_gemma3", "Gemma3PreTrainedModel",
     )
@@ -2303,9 +1969,8 @@ def test_gemma3_pre_trained_model_class_present():
 
 
 def test_gemma3_processor_kwargs_class_present():
-    """gemma.py:218 reads
-    transformers.models.gemma3.processing_gemma3.Gemma3ProcessorKwargs as
-    an Unpack type for __call__."""
+    """gemma.py:218 reads ``Gemma3ProcessorKwargs`` (Unpack type for
+    __call__)."""
     mod = importlib.import_module(
         "transformers.models.gemma3.processing_gemma3"
     )
@@ -2317,13 +1982,11 @@ def test_gemma3_processor_kwargs_class_present():
         )
 
 
-# ===========================================================================
-# gemma3n.py (additional pins)
-# ===========================================================================
+# gemma3n.py additional pins.
 
 def test_gemma3n_for_conditional_generation_class_present():
-    """gemma3n.py patches Gemma3nModel.get_placeholder_mask. The
-    conditional-generation head pins its existence."""
+    """gemma3n.py patches Gemma3nModel.get_placeholder_mask; pin
+    Gemma3nForConditionalGeneration."""
     cls = _try_get_class(
         "transformers.models.gemma3n.modeling_gemma3n",
         "Gemma3nForConditionalGeneration",
@@ -2336,10 +1999,8 @@ def test_gemma3n_for_conditional_generation_class_present():
 
 
 def test_gemma3n_RMSNorm_class_present():
-    """gemma3n.py:53 defines a Gemma3nRMSNorm_forward helper that the
-    patched MultimodalEmbedder forward delegates to. The actual upstream
-    class must exist so the patched forward's call to self.weight,
-    self._norm continues to compile."""
+    """gemma3n.py:53 Gemma3nRMSNorm_forward delegate needs upstream
+    Gemma3nRMSNorm class (self.weight / self._norm references)."""
     cls = _try_get_class(
         "transformers.models.gemma3n.modeling_gemma3n", "Gemma3nRMSNorm",
     )
@@ -2350,14 +2011,11 @@ def test_gemma3n_RMSNorm_class_present():
         )
 
 
-# ===========================================================================
-# qwen3_moe.py / qwen3_5_moe.py / qwen3_next_moe.py shared deps
-# ===========================================================================
+# qwen3_moe.py / qwen3_5_moe.py / qwen3_next_moe.py shared deps.
 
 def test_qwen3_moe_rms_norm_class_present():
-    """qwen3_moe.py's patched forward calls .gate(...) and .experts(...)
-    -- the parent module sets these as Linear / ModuleList. Pin a
-    well-known sibling class so a wholesale namespace rename surfaces."""
+    """qwen3_moe.py patched forward calls .gate / .experts; pin
+    Qwen3MoeRMSNorm sibling so namespace rename surfaces."""
     cls = _try_get_class(
         "transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeRMSNorm",
     )
@@ -2369,9 +2027,8 @@ def test_qwen3_moe_rms_norm_class_present():
 
 
 def test_qwen3_moe_pre_trained_model_present():
-    """qwen3_moe.py patches Qwen3MoeForCausalLM.forward -- the base
-    Qwen3MoePreTrainedModel must exist as a sibling class so the heads
-    inherit from a stable parent."""
+    """qwen3_moe.py patches Qwen3MoeForCausalLM.forward; pin
+    Qwen3MoePreTrainedModel base."""
     cls = _try_get_class(
         "transformers.models.qwen3_moe.modeling_qwen3_moe",
         "Qwen3MoePreTrainedModel",
@@ -2384,8 +2041,8 @@ def test_qwen3_moe_pre_trained_model_present():
 
 
 def test_qwen3_moe_model_present():
-    """qwen3_moe.py:170-179 inside _patch_causal_lm_forward_for_hidden_states
-    calls self.model(input_ids=..., ...). self.model is Qwen3MoeModel."""
+    """qwen3_moe.py:170-179 calls self.model(...); self.model is
+    Qwen3MoeModel."""
     cls = _try_get_class(
         "transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeModel",
     )
@@ -2398,8 +2055,7 @@ def test_qwen3_moe_model_present():
 
 
 def test_qwen3_next_model_class_present():
-    """qwen3_next_moe.py imports Qwen3NextForCausalLM. Its inner model
-    Qwen3NextModel must exist."""
+    """qwen3_next_moe.py needs inner ``Qwen3NextModel``."""
     cls = _try_get_class(
         "transformers.models.qwen3_next.modeling_qwen3_next", "Qwen3NextModel",
     )
@@ -2411,8 +2067,8 @@ def test_qwen3_next_model_class_present():
 
 
 def test_qwen3_vl_moe_text_model_class_present():
-    """qwen3_vl_moe.py patches Qwen3VLMoeTextSparseMoeBlock. The text
-    model Qwen3VLMoeTextModel is the parent stack -- pin it."""
+    """qwen3_vl_moe.py patches Qwen3VLMoeTextSparseMoeBlock; pin parent
+    Qwen3VLMoeTextModel."""
     cls = _try_get_class(
         "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
         "Qwen3VLMoeTextModel",
@@ -2424,15 +2080,12 @@ def test_qwen3_vl_moe_text_model_class_present():
         )
 
 
-# ===========================================================================
-# Cache-output-class signature pins (zoo constructs these by kwarg in
-# several patch wrappers)
-# ===========================================================================
+# Cache-output-class signature pins (constructed by zoo patch wrappers).
 
 def test_modeling_outputs_causal_lm_output_with_past_kwargs():
-    """deepseek_v3_moe.py:200 and qwen3_next_moe.py construct
-    transformers.modeling_outputs.CausalLMOutputWithPast(loss, logits,
-    past_key_values, hidden_states, attentions). Pin the field set."""
+    """deepseek_v3_moe.py:200 + qwen3_next_moe.py construct
+    ``transformers.modeling_outputs.CausalLMOutputWithPast(loss, logits,
+    past_key_values, hidden_states, attentions)``."""
     from transformers.modeling_outputs import CausalLMOutputWithPast
     sig = inspect.signature(CausalLMOutputWithPast)
     field_names = list(sig.parameters.keys())
@@ -2446,9 +2099,9 @@ def test_modeling_outputs_causal_lm_output_with_past_kwargs():
 
 
 def test_modeling_outputs_moe_causal_lm_output_with_past_kwargs():
-    """qwen3_moe.py:191 constructs MoeCausalLMOutputWithPast(loss,
+    """qwen3_moe.py:191 constructs ``MoeCausalLMOutputWithPast(loss,
     logits, past_key_values, hidden_states, attentions, aux_loss,
-    router_logits). Pin top-level transformers.modeling_outputs path."""
+    router_logits)`` via top-level modeling_outputs."""
     from transformers.modeling_outputs import MoeCausalLMOutputWithPast
     sig = inspect.signature(MoeCausalLMOutputWithPast)
     field_names = list(sig.parameters.keys())
@@ -2461,12 +2114,10 @@ def test_modeling_outputs_moe_causal_lm_output_with_past_kwargs():
             )
 
 
-# ===========================================================================
-# Caches the patches require (zoo passes past_key_values=Cache())
-# ===========================================================================
+# Caches the patches require.
 
 def test_static_cache_class_present():
-    """gemma.py:255 isinstance(past_key_values, StaticCache). Pin."""
+    """gemma.py:255 isinstance(past_key_values, StaticCache)."""
     cu = importlib.import_module("transformers.cache_utils")
     if not hasattr(cu, "StaticCache"):
         pytest.fail(
@@ -2477,7 +2128,7 @@ def test_static_cache_class_present():
 
 
 def test_hybrid_cache_class_present():
-    """gemma.py:260 isinstance(past_key_values, HybridCache). Pin."""
+    """gemma.py:260 isinstance(past_key_values, HybridCache)."""
     cu = importlib.import_module("transformers.cache_utils")
     if not hasattr(cu, "HybridCache"):
         pytest.fail(
@@ -2487,15 +2138,13 @@ def test_hybrid_cache_class_present():
         )
 
 
-# ===========================================================================
-# bitsandbytes.py: process_output_options / utils.py helpers consumed
-# ===========================================================================
+# bitsandbytes.py: Linear4bit __init__ signature pin.
 
 def test_bitsandbytes_linear4bit_init_signature():
-    """bitsandbytes.py:46-47 looks up
-    bitsandbytes.nn.modules.Linear4bit. Pin __init__ accepts at least
-    the input_features / output_features positional args zoo's patched
-    forward implicitly assumes (self.weight, self.bias, etc.)."""
+    """bitsandbytes.py:46-47 needs
+    ``bitsandbytes.nn.modules.Linear4bit.__init__(input_features,
+    output_features, ...)`` (zoo's patched forward dereferences
+    self.weight / self.bias)."""
     bnb = pytest.importorskip("bitsandbytes")
     cls = getattr(bnb.nn.modules, "Linear4bit", None)
     if cls is None:
@@ -2511,14 +2160,10 @@ def test_bitsandbytes_linear4bit_init_signature():
     )
 
 
-# ===========================================================================
-# pixtral.py: PixtralVisionConfig + module-level apply_rotary_pos_emb pin
-# (additional)
-# ===========================================================================
+# pixtral.py: PixtralVisionConfig.
 
 def test_pixtral_vision_config_class_present():
-    """pixtral.py reads self.config.hidden_size etc on the patched
-    __init__ -- PixtralVisionConfig is the upstream config."""
+    """pixtral.py:36 reads self.config attrs; pin PixtralVisionConfig."""
     cls = _try_get_class(
         "transformers.models.pixtral.configuration_pixtral",
         "PixtralVisionConfig",
@@ -2531,13 +2176,11 @@ def test_pixtral_vision_config_class_present():
         )
 
 
-# ===========================================================================
-# gemma3n.py: gemma3n_TextConfig pin (used by config typing of AltUp)
-# ===========================================================================
+# gemma3n.py: Gemma3nTextConfig pin (AltUp.predict config typing).
 
 def test_gemma3n_text_config_class_present():
-    """gemma3n.py reads self.config.altup_active_idx etc inside the
-    patched AltUp.predict. Gemma3nTextConfig is the upstream config."""
+    """gemma3n.py:101-114 reads
+    self.config.{altup_num_inputs, altup_active_idx} in AltUp.predict."""
     cls = _try_get_class(
         "transformers.models.gemma3n.configuration_gemma3n",
         "Gemma3nTextConfig",
@@ -2559,14 +2202,11 @@ def test_gemma3n_text_config_class_present():
             )
 
 
-# ===========================================================================
-# Auto-attention function dictionary for the gemma3 patch chain
-# ===========================================================================
+# Auto-attention function dictionary for gemma3 patch chain.
 
 def test_gemma3_eager_attention_forward_kwargs_supported():
-    """gemma.py:407 calls eager_attention_forward(...,
-    dropout=..., scaling=..., sliding_window=..., **kwargs).
-    Pin those kwargs by-name."""
+    """gemma.py:407-412 calls ``eager_attention_forward(...,
+    dropout, scaling, sliding_window, **kwargs)``."""
     from transformers.models.gemma3.modeling_gemma3 import eager_attention_forward
     if not _has_var_keyword(eager_attention_forward):
         pytest.fail(
@@ -2577,14 +2217,10 @@ def test_gemma3_eager_attention_forward_kwargs_supported():
         )
 
 
-# ===========================================================================
-# Sanity: at least one TEMPORARY_PATCHES entry per file is registered
-# ===========================================================================
+# Sanity: temporary_patches/ inventory.
 
 def test_temporary_patches_directory_has_expected_files():
-    """Pin the set of patch files. If a file is added/removed, the
-    suite should adapt -- this test surfaces drift in the patch-file
-    inventory itself."""
+    """Pin the floor set of patch files; new files OK, missing -> DRIFT."""
     pkg_spec = importlib.util.find_spec("unsloth_zoo.temporary_patches")
     if pkg_spec is None or not pkg_spec.submodule_search_locations:
         pytest.skip("unsloth_zoo.temporary_patches not importable as a package")
@@ -2594,8 +2230,6 @@ def test_temporary_patches_directory_has_expected_files():
         if f.endswith(".py")
         and f not in ("__init__.py", "utils.py", "common.py")
     }
-    # Sanity floor: at minimum these files must exist. New files can be
-    # added freely without bumping this list.
     must_have = {
         "bitsandbytes.py", "deepseek_v3_moe.py", "gemma.py", "gemma3n.py",
         "gemma4.py", "gemma4_moe.py", "glm4_moe.py", "gpt_oss.py",
