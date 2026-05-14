@@ -726,8 +726,8 @@ class MLXTrainer:
         # Elementwise clip (clip_grad_value_): leaf-local, free memory.
         # Prefer value clipping when both clipping modes are requested; global
         # norm clipping is exact but materially increases memory on MLX.
-        _raw_mgv = getattr(args, "max_grad_value", 1.0)
-        max_grad_value = 1.0 if _raw_mgv is None else float(_raw_mgv or 0.0)
+        _raw_mgv = getattr(args, "max_grad_value", 5.0)  # TODO: expose MLX grad-clip in Studio UI for power users
+        max_grad_value = 5.0 if _raw_mgv is None else float(_raw_mgv or 0.0)
         if max_grad_norm > 0 and max_grad_value > 0:
             print(
                 "Unsloth: max_grad_norm and max_grad_value are both enabled; "
