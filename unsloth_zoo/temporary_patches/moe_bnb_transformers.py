@@ -150,10 +150,13 @@ def patch_bnb4bit_quantize_convert():
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         """
-        input_dict:
-            - Dictionary containing raw tensors for the parameter to be quantized.
-            - For MoE module of nn.Parameter type, value is a tensor. TODO: Fix the comment
-        full_layer_name: Name of the module to be quantized.
+        Patched Bnb4bitQuantize.convert that quantizes MoE expert nn.Parameter weights.
+
+        input_dict: per-tensor mapping from transformers' WeightConverter.materialize_tensors.
+            For dense Linear weights this is dict[str, list[Tensor]] (matching upstream).
+            For MoE expert nn.Parameter weights some dispatch paths pass a bare Tensor
+            instead of a list, so the unwrap below tolerates both forms.
+        full_layer_name: state-dict-style dotted name of the parameter being converted.
         """
         value = list(input_dict.values())[0]
         # transformers v5 passes input_dict[key] as list[Tensor] for most weights
