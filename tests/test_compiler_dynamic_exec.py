@@ -14,36 +14,17 @@
 """End-to-end drift detectors for ``unsloth_zoo/compiler.py``'s DYNAMIC
 CODE CREATION pipeline.
 
-Companion to ``test_upstream_source_patterns.py`` -- that file pins the
-upstream patterns the rewriters search for BEFORE the rewrite runs. THIS
-file drives each rewriter end-to-end against real upstream transformers
-source and asserts that the rewritten output:
+Companion to ``test_upstream_source_patterns.py`` (which pins the
+upstream patterns BEFORE the rewrite). This file drives each rewriter
+end-to-end against real upstream transformers source and asserts the
+rewritten output ``ast.parse``s, ``compile`` + ``exec``s, and (for
+named-symbol rewrites) the symbol is gone after rewrite.
 
-  1. ``ast.parse`` succeeds (no syntax / indent / unbalanced-paren bugs
-     introduced by the rewrite),
-  2. ``compile`` + ``exec`` in a sandboxed namespace succeed (the
-     rewritten code is loadable; no NameError on a dangling identifier
-     left behind after upstream refactored it away),
-  3. for rewrites that target named symbols, the symbol is gone from
-     the rewritten output (the rewrite actually landed; a silent
-     ``str.replace`` no-op is the canonical zoo bug).
+Also drives ``unsloth_compile_transformers(model_type=X)`` end-to-end
+across every known model type and AST-parses the emitted cache file.
 
-Also drives the full ``unsloth_compile_transformers(model_type=X)``
-pipeline (which is itself the master entry point that exec()'s the
-combined rewritten module) over every model type the zoo knows about
-on the installed transformers and AST-parses the resulting compiled
-cache file.
-
-Test contract:
-
-  * CPU-only -- inherits ``tests/conftest.py`` GPU-free harness.
-  * Drift / invalid rewritten Python -> ``pytest.fail`` with a loud
-    DRIFT DETECTED message. Never ``pytest.skip`` to hide a real
-    rewriter bug.
-  * Model types not present on the installed transformers build are
-    skipped with reason "model_type X not present on installed
-    transformers, can't drive compiler" -- that's environment, not
-    drift.
+CPU-only; drift -> ``pytest.fail("DRIFT DETECTED: ...")``. Model types
+absent from the installed transformers are skipped (environment).
 """
 
 from __future__ import annotations
@@ -57,12 +38,8 @@ import textwrap
 import pytest
 
 
-# Disable torch.compile-driven side effects, so we exercise the SOURCE
-# rewrite + ast.parse pipeline (which is what the user cares about
-# here) without paying GPU/torch.compile cost. ``disable=True`` is
-# passed explicitly to ``unsloth_compile_transformers``; the env var
-# additionally short-circuits ``@torch.compile`` decoration inside the
-# emitted source so the compiled cache file imports cleanly under CPU.
+# Disable torch.compile side effects so we only exercise the SOURCE
+# rewrite + ast.parse pipeline (no GPU / no torch.compile cost).
 os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
 
 
@@ -70,17 +47,9 @@ transformers = pytest.importorskip("transformers")
 compiler = pytest.importorskip("unsloth_zoo.compiler")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-# Model types the zoo compiler is expected to drive end-to-end. The set
-# comes from grepping ``unsloth_compile_transformers(model_type=...)``
-# call sites in ``unsloth`` + ``unsloth_zoo`` and from the model
-# families enumerated by ``test_apply_fused_lm_head`` in
-# ``unsloth_zoo/compiler.py``. Models that aren't present on this
-# transformers build are SKIPPED (env, not drift) -- see
-# ``_load_modeling`` below.
+# Model types the zoo compiler drives end-to-end; sourced from
+# unsloth_compile_transformers(model_type=...) call sites in unsloth +
+# unsloth_zoo and from test_apply_fused_lm_head's enumerated families.
 KNOWN_MODEL_TYPES = [
     "llama",
     "llama4",
@@ -91,7 +60,7 @@ KNOWN_MODEL_TYPES = [
     "gemma2",
     "gemma3",
     "gemma3n",
-    "gemma4",          # not on tf 4.57 but on newer; skip if missing
+    "gemma4",          # newer tf only; skip if missing
     "qwen2",
     "qwen2_moe",
     "qwen2_vl",
@@ -100,7 +69,7 @@ KNOWN_MODEL_TYPES = [
     "qwen3_moe",
     "qwen3_next",
     "qwen3_vl",
-    "deepseek",        # legacy; replaced by deepseek_v2/v3
+    "deepseek",        # legacy
     "deepseek_v2",
     "deepseek_v3",
     "gpt_oss",
@@ -127,14 +96,8 @@ KNOWN_MODEL_TYPES = [
 
 
 def _load_modeling(model_type: str):
-    """Import ``transformers.models.<model_type>.modeling_<model_type>``.
-
-    Returns the module on success. Calls ``pytest.skip`` with a clear
-    environment-not-drift reason when the model isn't shipped by this
-    transformers build, so the suite stays green across the supported
-    transformers version matrix while still firing loudly on real
-    rewriter bugs.
-    """
+    """Import transformers.models.<model_type>.modeling_<model_type>.
+    Skip on ModuleNotFoundError (env, not drift)."""
     mod_path = f"transformers.models.{model_type}.modeling_{model_type}"
     try:
         return importlib.import_module(mod_path)
@@ -146,14 +109,7 @@ def _load_modeling(model_type: str):
 
 
 def _assert_parseable(rewritten: str, entry_point: str, *, dedent: bool = False):
-    """``ast.parse`` ``rewritten`` and ``pytest.fail`` with a loud DRIFT
-    DETECTED message on SyntaxError / IndentationError.
-
-    ``dedent=True`` for rewriters whose input is a method source
-    (already indented relative to its class) -- the rewriter is
-    allowed to preserve that indentation and the test just dedents
-    before parsing.
-    """
+    """ast.parse(rewritten) or pytest.fail with DRIFT message."""
     source = textwrap.dedent(rewritten) if dedent else rewritten
     try:
         ast.parse(source)
@@ -167,14 +123,9 @@ def _assert_parseable(rewritten: str, entry_point: str, *, dedent: bool = False)
 
 
 def _assert_execs(rewritten: str, entry_point: str, *, dedent: bool = False):
-    """``compile`` + ``exec`` ``rewritten`` in a sandboxed namespace
-    and ``pytest.fail`` with a DRIFT message on syntax / load errors.
-
-    Only top-level definitions are exercised -- exec()'ing a function
-    body in isolation isn't meaningful, so callers should ensure the
-    source represents a top-level Python program (e.g. a full module,
-    or a dedented top-level def).
-    """
+    """compile + exec rewritten in a sandbox; NameError -> DRIFT.
+    ImportError / other runtime errors at top-level are out of scope
+    (env, not drift); only NameError indicates a dangling identifier."""
     source = textwrap.dedent(rewritten) if dedent else rewritten
     sandbox = {"__name__": "test_compiler_dynamic_exec_sandbox"}
     try:
@@ -188,36 +139,20 @@ def _assert_execs(rewritten: str, entry_point: str, *, dedent: bool = False):
     try:
         exec(code, sandbox)
     except NameError as exc:
-        # A NameError at top-level exec means the rewrite left behind a
-        # dangling identifier whose source we never imported. That's
-        # the classic drift mode this file is hunting for.
         pytest.fail(
             f"DRIFT DETECTED: {entry_point} top-level exec raised "
             f"NameError on dangling identifier: {exc}"
         )
     except ImportError:
-        # ImportError on a transitive dep at top-level (e.g. an
-        # ``import causal_conv1d`` line in a Mamba-flavoured rewrite)
-        # is environment, not drift. The compile+ast checks above are
-        # what we're really asserting.
         pass
     except Exception:
-        # Any other runtime error during top-level eval (e.g. a
-        # decorator that requires CUDA) is out of scope here; the
-        # ast.parse + compile checks are the load-bearing assertions.
         pass
 
 
-# ---------------------------------------------------------------------------
-# Per-rewriter tests against a real transformers source (gemma3)
-# ---------------------------------------------------------------------------
-
-# We deliberately pick gemma3 as the canonical driver: it's a
-# moderately-sized model file that exercises almost every rewriter
-# path (RMSNorm, sliding-window attention, RoPE, MoE-shaped routing,
-# multi-modal projector, ForConditionalGeneration head). If a
-# rewriter is going to silently corrupt source, gemma3 is the most
-# likely place to surface it.
+# Per-rewriter tests against real transformers source. gemma3 is the
+# canonical driver: moderately-sized and exercises almost every
+# rewriter path (RMSNorm, sliding-window attn, RoPE, MoE-shaped
+# routing, multi-modal projector, ForConditionalGeneration head).
 
 
 @pytest.fixture(scope="module")
@@ -236,9 +171,8 @@ def test_higher_precision_softmax_full_module(gemma3_full_source):
 
 
 def test_higher_precision_softmax_idempotent(gemma3_full_source):
-    """The rewrite has an explicit idempotency lookahead (see
-    ``unsloth_zoo/compiler.py:398-404``). Drive it twice and assert no
-    double ``.to(x.dtype).to(x.dtype)`` chains appear."""
+    """Pins ``unsloth_zoo/compiler.py:398-404`` idempotency lookahead;
+    drive twice and assert no doubled ``.to(x.dtype).to(x.dtype)`` chains."""
     once = compiler.higher_precision_softmax(gemma3_full_source)
     twice = compiler.higher_precision_softmax(once)
     _assert_parseable(twice, "higher_precision_softmax(gemma3)x2")
@@ -255,8 +189,8 @@ def test_higher_precision_sqrt_mean_full_module(gemma3_full_source):
 
 
 def test_fix_rotary_embedding_dtype_passthrough(gemma3_full_source):
-    """Without ``UNSLOTH_FORCE_CUSTOM_DTYPE`` the rewriter is a no-op.
-    Validate the no-op path doesn't accidentally corrupt source."""
+    """Without UNSLOTH_FORCE_CUSTOM_DTYPE the rewriter is a no-op;
+    validate the no-op path doesn't corrupt source."""
     out = compiler.fix_rotary_embedding_dtype(gemma3_full_source)
     _assert_parseable(out, "fix_rotary_embedding_dtype(gemma3)")
     assert out == gemma3_full_source, (
@@ -266,13 +200,11 @@ def test_fix_rotary_embedding_dtype_passthrough(gemma3_full_source):
 
 
 def test_fix_attention_dtype_consistency_full_module(gemma3_full_source):
-    """The rewrite inserts a ``value_states = value_states.to(...)``
-    cast directly after every ``apply_rotary_pos_emb(...)`` call. Drive
-    it on the full module source and assert the result parses."""
+    """Pins ``unsloth_zoo/compiler.py`` fix_attention_dtype_consistency:
+    inserts V-dtype cast directly after each ``apply_rotary_pos_emb(...)``."""
     out = compiler.fix_attention_dtype_consistency(gemma3_full_source)
     _assert_parseable(out, "fix_attention_dtype_consistency(gemma3)")
     if "apply_rotary_pos_emb(" in gemma3_full_source:
-        # The rewrite SHOULD have landed.
         assert (
             "value_states = value_states.to(query_states.dtype)" in out
         ), (
@@ -282,13 +214,10 @@ def test_fix_attention_dtype_consistency_full_module(gemma3_full_source):
 
 
 def test_higher_precision_layernorms_full_module(gemma3_full_source, monkeypatch):
-    """The rewriter mutates ``os.environ`` (sets
-    ``UNSLOTH_HIGH_PRECISION_LAYERNORM``); use monkeypatch so the
-    setting doesn't leak."""
+    """Rewriter mutates os.environ (UNSLOTH_HIGH_PRECISION_LAYERNORM);
+    monkeypatch prevents leak."""
     monkeypatch.delenv("UNSLOTH_HIGH_PRECISION_LAYERNORM", raising=False)
     compiler.higher_precision_layernorms(gemma3_full_source)
-    # No source returned -- side-effect only. Just assert the env var
-    # is now set (any value).
     assert "UNSLOTH_HIGH_PRECISION_LAYERNORM" in os.environ, (
         "DRIFT DETECTED: higher_precision_layernorms did not set "
         "UNSLOTH_HIGH_PRECISION_LAYERNORM env var on gemma3"
@@ -301,12 +230,9 @@ def test_fixup_fused_lm_head_full_module(gemma3_full_source):
 
 
 def test_fixup_fused_lm_head_walrus_dropped():
-    """``fixup_fused_lm_head`` pins the gemma3n-style walrus assignment
-    ``(final_logit_softcapping := ...)`` and rewrites it to a plain
-    ``self.config.get_text_config().final_logit_softcapping is not
-    None`` check (see ``unsloth_zoo/compiler.py:2815-2818``). Drive the
-    rewrite with that exact input shape and assert the walrus name no
-    longer appears."""
+    """Pins ``unsloth_zoo/compiler.py:2815-2818`` gemma3n walrus rewrite:
+    ``(final_logit_softcapping := ...)`` -> plain
+    ``.final_logit_softcapping is not None`` check."""
     src = (
         "def forward(self):\n"
         "    if (final_logit_softcapping := self.config.get_text_config().final_logit_softcapping) is not None:\n"
@@ -315,14 +241,11 @@ def test_fixup_fused_lm_head_walrus_dropped():
     )
     out = compiler.fixup_fused_lm_head(src)
     _assert_parseable(out, "fixup_fused_lm_head(walrus)")
-    # The walrus binding name should be gone from the rewritten check.
     if ":= self.config" in out or "(final_logit_softcapping :=" in out:
         pytest.fail(
             "DRIFT DETECTED: fixup_fused_lm_head left the walrus "
             "binding in place; gemma3n rewrite did not land"
         )
-    # And the bare ``final_logit_softcapping`` operand should have
-    # been canonicalised to ``self.config.get_text_config().final_logit_softcapping``.
     assert "self.config.get_text_config().final_logit_softcapping" in out
 
 
@@ -332,9 +255,7 @@ def test_apply_mask_attention_mask_out_full_module(gemma3_full_source):
 
 
 def test_convert_attention_masks_to_bool_passthrough(gemma3_full_source):
-    """For a module-level source without a bare ``return`` line, the
-    rewriter MUST passthrough unmodified -- otherwise it produces
-    invalid code."""
+    """Module-level source without bare ``return`` -> passthrough."""
     out = compiler.convert_attention_masks_to_bool("gemma3", gemma3_full_source)
     _assert_parseable(out, "convert_attention_masks_to_bool(gemma3, full)")
 
@@ -345,13 +266,11 @@ def test_patch_residual_stream_full_module(gemma3_full_source):
 
 
 def test_replace_with_grouped_query_attention_attention_method(gemma3_mod):
-    """Drive the GQA rewriter on the actual ``Gemma3Attention.forward``
-    method body."""
+    """GQA rewriter on real Gemma3Attention.forward."""
     attn_src = inspect.getsource(gemma3_mod.Gemma3Attention.forward)
     out = compiler.replace_with_grouped_query_attention(
         "Gemma3Attention", attn_src,
     )
-    # Method source is indented; dedent before parsing.
     _assert_parseable(out, "replace_with_grouped_query_attention(Gemma3Attention)", dedent=True)
 
 
@@ -362,7 +281,6 @@ def test_apply_fused_lm_head_gemma3_causallm(gemma3_mod):
     )
     _assert_parseable(out, "apply_fused_lm_head(Gemma3ForCausalLM)", dedent=True)
     if applied:
-        # Sentinel that the rewrite landed.
         if "NOT_RETURN_LOGITS" not in out:
             pytest.fail(
                 "DRIFT DETECTED: apply_fused_lm_head reported applied=True "
@@ -388,7 +306,6 @@ def test_apply_fused_lm_head_gemma3_conditional(gemma3_mod):
 @pytest.mark.parametrize("model_type", ["llama", "mistral", "qwen2", "qwen3"])
 def test_apply_fused_lm_head_other_text_models(model_type):
     mod = _load_modeling(model_type)
-    # Find the ForCausalLM class
     causal_cls_name = None
     for n in dir(mod):
         if n.endswith("ForCausalLM"):
@@ -405,16 +322,12 @@ def test_apply_fused_lm_head_other_text_models(model_type):
 
 
 def test_patch_gradient_checkpointing_text_decoder(gemma3_mod):
-    """Drive the rewriter against a real decoder. It returns
-    ``None`` when the upstream module already uses
-    ``GradientCheckpointingLayer`` (the modern path) -- that's not
-    drift, it's normal upstream evolution. If it DOES return a
-    rewritten init+forward, both must parse."""
+    """Returns None when upstream uses GradientCheckpointingLayer (modern
+    path, not drift). Otherwise both init + forward must parse."""
     out = compiler.patch_gradient_checkpointing(
         "Gemma3TextModel", gemma3_mod.Gemma3TextModel,
     )
     if out is None:
-        # Modern upstream path -- expected on transformers 4.57+.
         return
     init, forward = out
     _assert_parseable(init, "patch_gradient_checkpointing.init", dedent=True)
@@ -422,8 +335,7 @@ def test_patch_gradient_checkpointing_text_decoder(gemma3_mod):
 
 
 def test_patch_gradient_checkpointing_layer_caller_text_decoder(gemma3_mod):
-    """Companion rewriter for the modern ``GradientCheckpointingLayer``
-    path; same parse contract."""
+    """Companion rewriter for the modern GradientCheckpointingLayer path."""
     out = compiler.patch_gradient_checkpointing_layer_caller(
         "Gemma3TextModel", gemma3_mod.Gemma3TextModel,
     )
@@ -441,19 +353,16 @@ def test_patch_gradient_checkpointing_layer_caller_text_decoder(gemma3_mod):
 
 
 def test_strip_kw_from_module_calls_text_decoder(gemma3_mod):
-    """``strip_kw_from_module_calls`` is called by the GC-layer rewriter
-    to drop ``kwarg=`` annotations from layer call sites. Drive it
-    standalone."""
+    """Standalone strip_kw_from_module_calls drive (called internally by
+    the GC-layer rewriter to drop kwarg= annotations)."""
     fwd_src = inspect.getsource(gemma3_mod.Gemma3TextModel.forward)
     out = compiler.strip_kw_from_module_calls(fwd_src, "self.layers")
     _assert_parseable(out, "strip_kw_from_module_calls(gemma3.layers)", dedent=True)
 
 
 def test_patch_finfo_attention_mask_dtype_mismatch_passthrough(gemma3_mod):
-    """The rewriter requires a very specific upstream block. When the
-    block isn't present (the modern transformers path) the rewriter
-    passes through unmodified -- still must produce parseable
-    output."""
+    """Passthrough on modern transformers source (block not present);
+    still must produce parseable output."""
     fwd_src = inspect.getsource(gemma3_mod.Gemma3TextModel.forward)
     out = compiler.patch_finfo_attention_mask_dtype_mismatch(
         "Gemma3TextModel", fwd_src,
@@ -466,8 +375,7 @@ def test_patch_finfo_attention_mask_dtype_mismatch_passthrough(gemma3_mod):
 
 
 def test_patch_moe_routing_weights_cast_qwen3_moe():
-    """Drive the MoE routing-weights cast rewriter against the real
-    Qwen3 MoE block (which is the canonical user of this codepath)."""
+    """Real Qwen3 MoE block (canonical user of this codepath)."""
     qmoe = _load_modeling("qwen3_moe")
     cls = qmoe.Qwen3MoeSparseMoeBlock
     src = inspect.getsource(cls.forward)
@@ -484,10 +392,8 @@ def test_patch_moe_routing_weights_cast_qwen3_moe():
 
 
 def test_patch_gradient_accumulation_for_conditional_gen(gemma3_mod):
-    """``patch_gradient_accumulation`` consumes a whole modeling module
-    and a class name. Returns ``None`` when the inner classes already
-    accept ``**kwargs``; otherwise returns a rewritten class source
-    that must parse."""
+    """Returns None when inner classes already accept **kwargs; otherwise
+    rewritten class source must parse."""
     out = compiler.patch_gradient_accumulation(
         gemma3_mod, "Gemma3ForConditionalGeneration",
     )
@@ -499,10 +405,8 @@ def test_patch_gradient_accumulation_for_conditional_gen(gemma3_mod):
     )
 
 
-# ---------------------------------------------------------------------------
-# Rewriter passthrough robustness on shapes the rewriter is NOT meant to
-# touch -- these guard against accidental corruption of unrelated source.
-# ---------------------------------------------------------------------------
+# Rewriter passthrough robustness on shapes the rewriter is NOT meant
+# to touch (guards against accidental corruption of unrelated source).
 
 
 PASSTHROUGH_SOURCE = (
@@ -531,9 +435,6 @@ def test_rewriter_passthrough_on_plain_python(name):
     fn = getattr(compiler, name)
     out = fn(PASSTHROUGH_SOURCE)
     _assert_parseable(out, f"{name}(plain-python)")
-    # Plain Python with no triggers should be left effectively untouched.
-    # The rewriters may normalise whitespace; the strict equality below
-    # is a meaningful invariant for this synthetic input.
     assert out == PASSTHROUGH_SOURCE, (
         f"DRIFT DETECTED: {name} mutated trigger-free source -- "
         f"diff in {abs(len(out) - len(PASSTHROUGH_SOURCE))} chars"
@@ -551,7 +452,6 @@ def test_two_arg_rewriter_passthrough_on_plain_python(name_args):
     name, extra = name_args
     fn = getattr(compiler, name)
     result = fn(PASSTHROUGH_SOURCE, *extra) if name == "convert_attention_masks_to_bool" else fn(PASSTHROUGH_SOURCE, *extra)
-    # apply_fused_lm_head returns (source, applied)
     if isinstance(result, tuple):
         out, _applied = result
     else:
@@ -559,17 +459,12 @@ def test_two_arg_rewriter_passthrough_on_plain_python(name_args):
     _assert_parseable(out, f"{name}(plain-python)")
 
 
-# ---------------------------------------------------------------------------
-# Targeted symbol-removal asserts (the rewrite must LAND, not silently
-# no-op).
-# ---------------------------------------------------------------------------
+# Targeted symbol-removal asserts (the rewrite must LAND, not silently no-op).
 
 
 def test_higher_precision_softmax_inserts_float32_cast():
-    """The rewrite is supposed to turn every plain
-    ``F.softmax(x, dim=-1)`` into
-    ``F.softmax(x, dim=-1, dtype=torch.float32).to(x.dtype)``. Drive a
-    triggering input and assert the float32 cast LANDED."""
+    """Pin: F.softmax(x, dim=-1) -> F.softmax(x, dim=-1,
+    dtype=torch.float32).to(x.dtype)."""
     src = (
         "def f(x):\n"
         "    return F.softmax(x, dim=-1)\n"
@@ -589,10 +484,8 @@ def test_higher_precision_softmax_inserts_float32_cast():
 
 
 def test_fixup_fused_lm_head_gemma4_flat_logits_dropped():
-    """``fixup_fused_lm_head`` is supposed to rename gemma4's
-    ``flat_logits``/``flat_labels`` to ``shift_logits``/``shift_labels``
-    (see ``unsloth_zoo/compiler.py:2829-2843``). The named symbols
-    should no longer be in the rewritten output."""
+    """Pins ``unsloth_zoo/compiler.py:2829-2843`` gemma4
+    flat_logits/flat_labels -> shift_logits/shift_labels rename."""
     src = (
         "    flat_logits = shift_logits.view(-1, vocab)\n"
         "    flat_labels = shift_labels.view(-1).to(device)\n"
@@ -612,12 +505,9 @@ def test_fixup_fused_lm_head_gemma4_flat_logits_dropped():
 
 
 def test_replace_with_grouped_query_attention_inserts_enable_gqa():
-    """When the rewriter's matcher fires, it inserts the
-    ``enable_gqa=...`` kwarg (see ``unsloth_zoo/compiler.py:304-311``).
-    Drive the rewriter and assert the kwarg landed or the source is
-    unchanged (matcher didn't fire) -- but in NO case should the
-    output be invalid Python."""
-    # Use real attention source from a model that uses GQA-shaped attn.
+    """Pins ``unsloth_zoo/compiler.py:304-311`` enable_gqa= insertion;
+    either the kwarg lands or source is unchanged (matcher didn't fire).
+    Output must always be valid Python."""
     llama = _load_modeling("llama")
     if not hasattr(llama, "LlamaAttention"):
         pytest.skip("LlamaAttention not exposed on installed transformers")
@@ -631,26 +521,19 @@ def test_replace_with_grouped_query_attention_inserts_enable_gqa():
     )
 
 
-# ---------------------------------------------------------------------------
-# End-to-end: ``unsloth_compile_transformers(model_type=X)``.
-# This is the MASTER entry point. It chains every rewriter above and
-# emits a combined module to ``unsloth_compiled_cache/``. We drive it
-# for every known model type, then AST-parse the cache file.
-# ---------------------------------------------------------------------------
+# End-to-end: unsloth_compile_transformers(model_type=X). Master entry
+# point chaining every rewriter; emits combined module to
+# unsloth_compiled_cache/. Drive for every known model type, AST-parse
+# the cache file. Cache name: unsloth_compiled_module_<type>.py (see
+# ``unsloth_zoo/compiler.py:66-67`` COMBINED_UNSLOTH_NAME).
 
 
 def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
-    """Run the full ``unsloth_compile_transformers`` pipeline for
-    ``model_type`` and return the path of the emitted combined cache
-    file. The cache filename is ``unsloth_compiled_module_<type>.py``
-    inside the ``unsloth_compiled_cache`` folder (see
-    ``unsloth_zoo/compiler.py:66-67`` for ``COMBINED_UNSLOTH_NAME``)."""
-    # Ensure we don't accidentally drag torch.compile / GPU kernels in.
+    """Run unsloth_compile_transformers for model_type, return cache path."""
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
     monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "1")
 
-    # Clear ``__UNSLOTH_PATCHED__`` so the pipeline rebuilds each time;
-    # otherwise the rewrite emits nothing on a re-run.
+    # Clear __UNSLOTH_PATCHED__ so the pipeline rebuilds each time.
     try:
         mod = importlib.import_module(
             f"transformers.models.{model_type}.modeling_{model_type}",
@@ -679,21 +562,13 @@ def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
 def test_unsloth_compile_transformers_emits_parseable_cache(
     model_type, monkeypatch,
 ):
-    """Drive ``unsloth_compile_transformers`` end-to-end for every
-    known model type and AST-parse the emitted combined cache.
-
-    This is the user's headline concern in one test: the master
-    pipeline exec()'s rewritten transformers source; if ANY rewriter
-    on the chain produces invalid Python, the cache file written here
-    won't ``ast.parse``."""
+    """End-to-end pipeline drive per model_type + AST-parse the emitted
+    combined cache. Master pipeline exec()'s rewritten transformers
+    source; any rewriter producing invalid Python surfaces here."""
     cache_path = _compile_and_get_cache(model_type, monkeypatch)
 
     if not os.path.isfile(cache_path):
-        # Pipeline emitted nothing (full_disable / combined_module is
-        # None). That's not drift per se, but it does mean the rewrite
-        # chain bailed out before emitting -- which on transformers
-        # builds where the model IS present is suspicious. Still, do
-        # not fail; the pipeline has many legitimate early-exits.
+        # Pipeline emitted nothing (full_disable / early-exit); not drift.
         pytest.skip(
             f"unsloth_compile_transformers({model_type!r}) emitted no "
             f"combined cache file (pipeline early-exit)"
@@ -718,26 +593,18 @@ def test_unsloth_compile_transformers_emits_parseable_cache(
         )
 
 
-# ---------------------------------------------------------------------------
-# Headline smoke test from the spec: gemma3 end-to-end on installed
-# transformers.
-# ---------------------------------------------------------------------------
+# Headline smoke test: gemma3 end-to-end on installed transformers.
 
 
 def test_smoke_unsloth_compile_transformers_gemma3(monkeypatch):
-    """Smoke test from the spec: ``unsloth_compile_transformers("gemma3",
-    trust_remote_code=False, fast_inference=False)`` returns valid
-    Python on the installed transformers."""
+    """Spec smoke: ``unsloth_compile_transformers("gemma3", ...)`` returns
+    valid Python on the installed transformers. Real zoo signature (see
+    ``unsloth_zoo/compiler.py:3116-3143``) doesn't accept
+    trust_remote_code/fast_inference; pass what it does accept."""
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
     monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "1")
-    _load_modeling("gemma3")  # ensures present-on-tf gating
+    _load_modeling("gemma3")
 
-    # The spec wording mentions ``trust_remote_code`` /
-    # ``fast_inference`` kwargs, but the actual ``unsloth_zoo``
-    # signature (see ``unsloth_zoo/compiler.py:3116-3143``) doesn't
-    # accept those. Pass through what the real signature accepts; the
-    # net effect (no-GPU, disabled torch.compile, end-to-end source
-    # rewrite + emit) is identical.
     try:
         mod = importlib.import_module(
             "transformers.models.gemma3.modeling_gemma3",
@@ -768,9 +635,7 @@ def test_smoke_unsloth_compile_transformers_gemma3(monkeypatch):
 
 
 def test_smoke_unsloth_compile_transformers_unknown_model_type(monkeypatch):
-    """The pipeline must handle an unknown model type gracefully (early
-    return on ``ModuleNotFoundError``) rather than emit a corrupt
-    cache."""
+    """Unknown model type must early-return None (no corrupt cache)."""
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
     result = compiler.unsloth_compile_transformers(
         "this_model_type_does_not_exist_xyz_123", disable=True,
@@ -781,12 +646,9 @@ def test_smoke_unsloth_compile_transformers_unknown_model_type(monkeypatch):
     )
 
 
-# ---------------------------------------------------------------------------
 # AST validity of CONSTANT source blocks pasted inside compiler.py.
 # These are exec()'d verbatim by ``create_new_function`` (see
-# ``unsloth_zoo/compiler.py:801-1126``) so any syntax bug in them
-# fires the same drift mode this whole file is hunting.
-# ---------------------------------------------------------------------------
+# ``unsloth_zoo/compiler.py:801-1126``).
 
 
 @pytest.mark.parametrize(
@@ -801,19 +663,15 @@ def test_smoke_unsloth_compile_transformers_unknown_model_type(monkeypatch):
     ],
 )
 def test_compiler_constant_source_blocks_parse(const_name):
-    """Each of these constants is a Python source block embedded in
-    ``unsloth_zoo/compiler.py`` and exec()'d as-is at compile time.
-    They must be valid Python (possibly with some placeholder tokens
-    that get .replace()'d before exec); test that AT LEAST those
-    without placeholders parse, and those with placeholders parse
-    after the documented substitution."""
+    """Each constant is a Python source block embedded in
+    ``unsloth_zoo/compiler.py`` and exec()'d as-is. Must be valid Python
+    (after documented placeholder substitution where applicable)."""
     block = getattr(compiler, const_name, None)
     if block is None:
         pytest.skip(f"{const_name} not present (renamed?)")
-    # The replace_gradient_checkpointing template uses LAYER / ARGS /
-    # MODULELIST_ITEM / $ placeholders that get substituted in the
-    # rewriter; substitute representative values here so the parser
-    # sees real source.
+    # replace_gradient_checkpointing template has LAYER / ARGS /
+    # MODULELIST_ITEM / $ placeholders substituted in the rewriter;
+    # substitute representative values here so the parser sees real source.
     if const_name == "replace_gradient_checkpointing":
         block = (
             block.replace("LAYER", "layer")
