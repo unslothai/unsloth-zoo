@@ -143,29 +143,12 @@ def _preload_real_device_type() -> bool:
 
 
 def _patch_torch_cuda_for_import() -> None:
-    """Guard concrete ``torch.cuda.*`` calls that ``unsloth_zoo.*``
-    modules make at IMPORT time on CPU-only CI runners.
+    """Stub torch.cuda.* calls made at IMPORT time on CPU-only CI runners.
 
-    Three crash classes covered:
-
-    1. ``torch.cuda.memory.mem_get_info`` -- some
-       ``unsloth_zoo.temporary_patches.*`` modules call this at
-       module init. Return a plausible (free, total) pair so the
-       memory-availability arithmetic succeeds.
-
-    2. ``torch.cuda.get_device_capability`` -- called at module top
-       level in ``unsloth_zoo/compiler.py:87`` and
-       ``unsloth_zoo/loss_utils.py:39`` to gate the cut_cross_entropy
-       import on Ampere+. CPU-only torch raises ``AssertionError:
-       Torch not compiled with CUDA enabled``, blocking every test
-       that does ``importlib.import_module("unsloth_zoo.compiler")``
-       or ``...loss_utils``. Patch to return ``(8, 0)`` so the
-       capability check passes (Ampere-equivalent); the actual
-       cut_cross_entropy import is try/except-wrapped anyway.
-
-    3. ``torch.cuda.get_device_properties`` -- similar shape, used
-       by other temporary_patches sites. Return a minimal namespace
-       with ``major`` / ``minor`` / ``total_memory`` attributes.
+    Covers mem_get_info (used by temporary_patches/*), get_device_capability
+    (compiler.py:87, loss_utils.py:39 -- gates cut_cross_entropy on Ampere+),
+    and get_device_properties. Return (8, 0) so Ampere-gated imports proceed;
+    the cut_cross_entropy import itself is try/except wrapped.
     """
     try:
         import torch  # type: ignore
@@ -217,29 +200,20 @@ if str(_TESTS_DIR) not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# 3. Apply upstream-drift fixes (triton CompiledKernel attrs, vLLM
-#    GuidedDecodingParams rename, peft transformers_weight_conversion shim,
-#    etc.) by triggering ``import unsloth``. The fixes are hosted on
-#    ``unsloth/import_fixes.py`` and applied at unsloth import time; zoo
-#    no longer carries a redundant copy of them. The production zoo
-#    import chain requires ``find_spec("unsloth")`` to succeed (see
-#    ``unsloth_zoo/__init__.py``), so unsloth has always already run by
-#    the time anything imports zoo at runtime; this conftest just forces
-#    the same ordering for the CPU-only test harness, which deliberately
-#    avoids triggering the full ``unsloth_zoo`` import chain itself (it
-#    requires CUDA / torch device init). Tests that don't have unsloth
-#    installed (e.g. security-only test runs in CI) keep passing because
-#    we swallow ImportError here.
+# 3. Apply upstream-drift fixes (triton CompiledKernel attrs, vLLM rename,
+#    peft transformers_weight_conversion shim, etc.) by triggering
+#    ``import unsloth``. Fixes live on ``unsloth/import_fixes.py`` and run
+#    at unsloth import time; zoo no longer carries a copy. Security-only
+#    test suites without unsloth installed keep passing -- ImportError is
+#    swallowed below.
 # ---------------------------------------------------------------------------
 
 def _apply_upstream_import_fixes_for_tests() -> None:
     try:
-        import unsloth  # noqa: F401  # side-effect: runs unsloth/import_fixes.py
+        import unsloth  # noqa: F401  # runs unsloth/import_fixes.py
     except Exception:
-        # unsloth not installed (security-only test suites), or it failed
-        # to import on this stack. Either way we don't want to take pytest
-        # collection down here -- individual drift-detector tests will
-        # surface any pathology that the missing patches would have hidden.
+        # unsloth missing (security-only suites) or import failed; drift
+        # detectors will surface any pathology the patches would mask.
         pass
 
 

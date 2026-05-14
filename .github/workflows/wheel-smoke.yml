@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-# Builds the PyPI wheel + sdist from the PR branch, then verifies the
-# built wheel contains what we expect to ship and is importable in a
-# clean venv. Adapted from unsloth's wheel-smoke.yml: zoo has no
-# frontend / Tauri / Studio tree, so the content checks pivot to
-# "unsloth_zoo package present, no tests/ shipped, no stray .pyc, real
-# version string from dynamic metadata, import smoke succeeds".
+# Build PyPI wheel + sdist, verify content sanity, import-smoke in a clean venv.
+# Adapted from unsloth's wheel-smoke.yml; zoo's content checks: package present,
+# no tests/ shipped, no stray .pyc, real version string, import smoke succeeds.
 
 name: Wheel CI
 
@@ -61,9 +58,7 @@ jobs:
               print("FAIL: no wheel produced"); sys.exit(2)
           w = wheels[0]
           print(f"wheel: {w}")
-          # Version sanity: dynamic metadata pulls from
-          # unsloth_zoo.__init__.__version__; assert the filename
-          # carries a non-zero SemVer-ish token, not "0.0.0".
+          # Version sanity: dynamic metadata pulls from unsloth_zoo.__init__.__version__.
           m = re.match(r"dist/unsloth_zoo-([^-]+)-py3-none-any\.whl", w)
           version = m.group(1) if m else None
           print(f"wheel version: {version}")
@@ -79,11 +74,8 @@ jobs:
                 "version is not 0.0.0":                 version is not None and version != "0.0.0",
                 "METADATA present":                     any(s.endswith(".dist-info/METADATA") for s in n),
               }
-              # Soft checks: warn only. Zoo's pyproject.toml currently
-              # doesn't exclude tests/ or scripts/ from setuptools'
-              # find_packages, so wheels DO ship them. Tightening
-              # the packaging config is a separate follow-up; failing
-              # the gate here would block this CI-bootstrap PR.
+              # Soft checks (warn only). Zoo's pyproject doesn't exclude tests/scripts;
+              # tightening the packaging config is a separate follow-up.
               soft_checks = {
                 "no tests/ shipped":                    not any(s.startswith("tests/") for s in n),
                 "no scripts/ shipped":                  not any(s.startswith("scripts/") for s in n),
@@ -101,15 +93,10 @@ jobs:
           PY
 
       - name: Import smoke (clean venv)
-        # unsloth_zoo/__init__.py:128 raises
-        # `ImportError("Please install Unsloth via 'pip install unsloth'!")`
-        # when the parent `unsloth` package is absent -- a deliberate
-        # guardrail that prevents standalone zoo use. So a bare
-        # `import unsloth_zoo` in a wheel-only venv WILL fail by
-        # design; the smoke check pivots to reading the version
-        # string from the installed dist-info METADATA instead. That
-        # confirms the wheel installed AND the version string is
-        # well-formed, without tripping the parent-import guard.
+        # unsloth_zoo/__init__.py:128 raises ImportError when parent `unsloth` is
+        # absent (deliberate guardrail). A bare `import unsloth_zoo` in a wheel-only
+        # venv will fail by design, so the smoke pivots to reading the version
+        # string from dist-info METADATA via importlib.metadata.
         run: |
           python -m venv /tmp/v
           /tmp/v/bin/pip install --upgrade pip
