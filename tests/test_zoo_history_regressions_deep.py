@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import ast
 import importlib
+import importlib.util
 import inspect
+import pathlib
 import re
 import textwrap
 
@@ -34,10 +36,35 @@ import pytest
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+def _module_source_path(module_name: str) -> pathlib.Path:
+    """Resolve a zoo module name to its source file path WITHOUT executing
+    its top-level code. importlib.import_module would import the module --
+    on CPU-only CI runners that crashes at unsloth_zoo/compiler.py:87
+    (`torch.cuda.get_device_capability()`). importlib.util.find_spec is
+    purely metadata and never executes module code, so this stays
+    CPU-safe across all Core matrix cells.
+    """
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or spec.origin in (None, "built-in"):
+        raise ImportError(f"could not locate source for {module_name!r}")
+    return pathlib.Path(spec.origin)
+
+
 def _get_source(module_name: str, attr: str | None = None) -> str:
-    mod = importlib.import_module(module_name)
+    """Return the source text for `module_name` (or `module_name.attr`).
+
+    For module-level source we read the file via importlib.util.find_spec
+    so we avoid running the module's top-level code (zoo's compiler.py
+    calls torch.cuda APIs at import time which fails on CPU-only CI).
+
+    For attribute-level source we still need to import the module to
+    resolve the attribute -- only callers that pass an `attr` need to
+    accept that risk; current call sites are all module-level so the
+    attribute branch is purely defensive.
+    """
     if attr is None:
-        return inspect.getsource(mod)
+        return _module_source_path(module_name).read_text(encoding="utf-8")
+    mod = importlib.import_module(module_name)
     obj = getattr(mod, attr)
     return inspect.getsource(obj)
 

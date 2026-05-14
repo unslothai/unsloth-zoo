@@ -37,6 +37,7 @@ the test docstring flags that case.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 from typing import Iterable
 
 import pytest
@@ -49,22 +50,50 @@ import pytest
 def _resolve(dotted: str) -> object:
     """``importlib.import_module`` + ``getattr`` chain. Raises an
     AssertionError naming the broken segment so the failure message
-    points at the actual zoo callsite the symbol unblocks."""
+    points at the actual zoo callsite the symbol unblocks.
+
+    Distinguishes:
+      * module-file-actually-missing (find_spec returns None) -> FAIL,
+        real upstream drift signal worth surfacing.
+      * module-file-present-but-transitively-broken (find_spec returns
+        a spec but import_module raises ImportError because of a
+        nested optional dep, e.g. transformers.utils.notebook needing
+        IPython) -> SKIP. Zoo's call sites for these paths are already
+        try/except-wrapped (see e.g. logging_utils.py:49-56), so the
+        zoo runtime tolerates the missing dep -- a test failure here
+        would be noise, not signal.
+      * attribute missing on a successfully-imported module -> FAIL.
+    """
     parts = dotted.split(".")
-    # Walk modules first, then attributes.
     obj: object = None
     consumed: list[str] = []
     for i in range(len(parts), 0, -1):
         mod_name = ".".join(parts[:i])
+        # Probe metadata first; this NEVER executes module code.
+        try:
+            spec = importlib.util.find_spec(mod_name)
+        except (ImportError, ValueError):
+            spec = None
+        if spec is None:
+            # find_spec returning None means the module path is
+            # genuinely absent at this depth -- try a shorter prefix.
+            continue
+        # Spec exists; importing should succeed unless the module
+        # itself has a transitively-broken optional dep.
         try:
             obj = importlib.import_module(mod_name)
             consumed = parts[:i]
             break
-        except ImportError:
-            continue
+        except ImportError as exc:
+            pytest.skip(
+                f"`{mod_name}` exists but its imports fail on this "
+                f"install ({type(exc).__name__}: {exc}); zoo wraps "
+                "this in try/except so absence is not a runtime bug. "
+                "Skipping to avoid false-positive in matrix CI."
+            )
     if obj is None:
         raise AssertionError(
-            f"Could not import any module prefix of `{dotted}`; "
+            f"Could not locate any module prefix of `{dotted}`; "
             "zoo references this dotted path -- regression at the "
             "import line (see source comment above the test)."
         )
