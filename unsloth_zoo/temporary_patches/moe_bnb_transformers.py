@@ -148,7 +148,12 @@ def patch_bnb4bit_quantize_convert():
         full_layer_name: Name of the module to be quantized.
         """
         value = list(input_dict.values())[0]
-        
+        # transformers v5 passes input_dict[key] as list[Tensor] for most weights
+        # (matches upstream Bnb4bitQuantize.convert which does `value = value[0]`).
+        # For some MoE expert dispatch paths it arrives as a bare Tensor; tolerate both.
+        if isinstance(value, (list, tuple)):
+            value = value[0]
+
         try:
             from transformers.quantizers.quantizers_utils import get_module_from_name
             module, _ = get_module_from_name(model, full_layer_name)
