@@ -68,7 +68,6 @@ def _get_source_of(dotted: str):
     import importlib
     obj = None
     mod_name = None
-    consumed = 0
     for i in range(len(parts), 0, -1):
         candidate = ".".join(parts[:i])
         try:
@@ -717,6 +716,10 @@ def test_misc_merge_quantization_configs_class_name_compare():
         pytest.skip(
             "AutoHfQuantizer.merge_quantization_configs source unavailable"
         )
+    needle = (
+        "if quantization_config.__class__.__name__ != "
+        "quantization_config_from_args.__class__.__name__:"
+    )
     class_name_check = "quantization_config.__class__.__name__"
     args_class_name_check = "quantization_config_from_args.__class__.__name__"
     if (class_name_check not in src) or (args_class_name_check not in src):

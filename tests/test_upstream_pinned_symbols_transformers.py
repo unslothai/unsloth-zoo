@@ -201,8 +201,9 @@ def test_gpt_oss_modeling_classes(tag: str):
     missing = [c for c in required if not _has_def(src, c, "class")]
     assert not missing, (
         f"{tag}: gpt_oss modeling missing classes {missing}; "
-        f"unsloth_zoo/temporary_patches/gpt_oss.py reassigns these by name, "
-        f"rename makes the MoE patches silently no-op"
+        f"unsloth_zoo/temporary_patches/gpt_oss.py reassigns these by name "
+        f"(.GptOssExperts = ..., .GptOssExperts.forward = ...) — rename "
+        f"makes the MoE patches silently no-op"
     )
 
 
@@ -299,7 +300,7 @@ def test_quantizers_should_convert_module_present_on_v5(tag: str):
     if src is None:
         pytest.skip(f"{tag}: quantizers_utils.py not present (legacy 4.x layout)")
     if tag.startswith("v4."):
-        pytest.skip(f"{tag}: 4.x line, function not expected here")
+        pytest.skip(f"{tag}: 4.x line — function not expected here")
     assert _has_def(src, "should_convert_module", "func"), (
         f"{tag}: function should_convert_module missing on transformers 5.x; "
         f"unsloth_zoo/patching_utils.py PR #491 substring-matching patch "

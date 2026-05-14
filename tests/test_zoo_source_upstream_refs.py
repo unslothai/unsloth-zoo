@@ -97,7 +97,7 @@ def _resolve_all(dotted_paths: Iterable[str]) -> None:
 
 
 def _skip_if_missing(module_name: str) -> None:
-    return pytest.importorskip(module_name)
+    pytest.importorskip(module_name)
 
 
 # ===========================================================================
