@@ -1218,14 +1218,29 @@ def patch_peft_param_wrapper_4bit_expert_shape():
         if get_bnb_param_type(param) == "4bit":
             shape = getattr(param, "_original_shape", None)
             if shape is not None and len(shape) == 3:
-                num_experts, in_features, out_features = shape
-                self.num_experts = num_experts
-                self.in_features = in_features
-                self.out_features = out_features
+                # Set num_experts only. Do NOT set in_features/out_features here:
+                # PEFT 0.19's ParamWrapper.update_layer swaps in_features<->out_features
+                # for 3D params (see peft 0.19 lora/layer.py update_layer), then calls
+                # _move_adapter_to_device_of_base_layer which calls get_param() again.
+                # If this patched get_param also resets in_features/out_features back
+                # to the unswapped order it UN-does PEFT's swap and breaks second-adapter
+                # add_adapter (gated by _did_swap_in_out_features). Let PEFT own those
+                # two attributes.
+                self.num_experts = shape[0]
                 return _ParamShapeProxy(param, shape)
             else:
-                # TODO: Can we raise an error here?
-                pass
+                # The MoE quantizer patch (moe_bnb_transformers.py) did not run, or
+                # this is a non-MoE 4-bit param being targeted via target_parameters
+                # (in which case its packed shape (K, 1) would be misinterpreted as
+                # (in=1, out=K) by PEFT's _get_in_out_features). Raise rather than
+                # silently corrupting LoRA dims.
+                raise ValueError(
+                    "unsloth: ParamWrapper.get_param() encountered a 4-bit Params4bit "
+                    f"without a 3D _original_shape attribute (param shape={tuple(param.shape)}). "
+                    "This usually means the MoE quantizer patch did not run during model load, "
+                    "or this parameter is not a stacked MoE expert and should not be in "
+                    "LoraConfig.target_parameters."
+                )
         return param
 
     _patched_get_param._unsloth_4bit_expert_patched = True
