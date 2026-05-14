@@ -187,7 +187,12 @@ def test_pretrained_model_enable_input_require_grads_uses_old_pattern():
     transformers PR #41993 rewrote ``enable_input_require_grads`` to
     iterate ``for module in self.modules()`` and call
     ``module.get_input_embeddings()``, which raises NotImplementedError
-    on vision sub-modules (GLM V4.6's ``self.visual``)."""
+    on vision sub-modules (GLM V4.6's ``self.visual``). Healthy state:
+    either the upstream rewrite isn't present (pre-HF#41993), OR the
+    patch installed a NotImplementedError-tolerant replacement. The
+    bare ``for module in self.modules()`` check alone cannot tell the
+    two apart because unsloth's replacement deliberately also uses
+    that loop, just wrapped in ``try / except NotImplementedError``."""
     pytest.importorskip("transformers")
     from transformers import PreTrainedModel
 
@@ -196,24 +201,34 @@ def test_pretrained_model_enable_input_require_grads_uses_old_pattern():
     except Exception as exc:
         pytest.skip(f"could not getsource(enable_input_require_grads): {exc!r}")
 
-    if "for module in self.modules()" in src:
-        pytest.fail(
-            "DRIFT DETECTED: PreTrainedModel.enable_input_require_grads now "
-            "iterates self.modules() (post HF#41993). "
-            "patch_enable_input_require_grads has to install a "
-            "NotImplementedError-tolerant replacement."
-        )
+    if "for module in self.modules()" not in src:
+        return  # healthy: pre-HF#41993 shape
+    if "NotImplementedError" in src:
+        return  # healthy: unsloth's tolerant replacement is installed
+
+    pytest.fail(
+        "DRIFT DETECTED: PreTrainedModel.enable_input_require_grads now "
+        "iterates self.modules() (post HF#41993) and has NOT been "
+        "wrapped by patch_enable_input_require_grads; vision submodules "
+        "(e.g. GLM V4.6's self.visual) will raise NotImplementedError "
+        "from get_input_embeddings and crash the whole call."
+    )
 
 
 def test_transformers_torchcodec_available_flag_is_present():
-    """``disable_torchcodec_if_broken`` (import_fixes.py 1291-1317).
-    Flips ``transformers.utils.import_utils._torchcodec_available`` to
-    False when torchcodec's native FFmpeg deps fail to load."""
+    """``disable_torchcodec_if_broken`` (import_fixes.py 1291-1317). Needs
+    either the pre-5.x module-level ``_torchcodec_available`` flag, or
+    the 5.x ``is_torchcodec_available`` public function; one of the two
+    is the patch site the fix monkey-patches when FFmpeg is missing."""
     tf_iu = pytest.importorskip("transformers.utils.import_utils")
-    assert hasattr(tf_iu, "_torchcodec_available"), (
-        "transformers.utils.import_utils._torchcodec_available was "
-        "removed/renamed upstream; disable_torchcodec_if_broken can no "
-        "longer disable a broken torchcodec install."
+    has_flag = hasattr(tf_iu, "_torchcodec_available")
+    has_func = callable(getattr(tf_iu, "is_torchcodec_available", None))
+    assert has_flag or has_func, (
+        "transformers.utils.import_utils dropped both "
+        "``_torchcodec_available`` (pre-5.x) AND "
+        "``is_torchcodec_available`` (>=5.x); "
+        "disable_torchcodec_if_broken can no longer disable a broken "
+        "torchcodec install."
     )
 
 
