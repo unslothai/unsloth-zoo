@@ -109,3 +109,12 @@ intelgpu = [
 homepage = "http://www.unsloth.ai"
 documentation = "https://github.com/unslothai/unsloth"
 repository = "https://github.com/unslothai/unsloth"
+
+[tool.pytest.ini_options]
+# Mirrors the same stanza added to unslothai/unsloth in PR #5397.
+# Scopes `pytest` discovery to ./tests so the GPU-heavy tests there
+# don't accidentally fire when a developer runs a bare `pytest` from
+# the repo root. CI jobs explicitly name the target subtree (e.g.
+# `pytest tests/security` for the hard-gate suite).
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -537,7 +537,13 @@ def patch_compiled_autograd():
     fx = torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture
     if fx.__name__ == "unsloth_end_capture": return
     source = inspect.getsource(fx)
-    if "with disable()" in source: return
+    # Recognise both the legacy `with disable()` and torch >= 2.7's
+    # underscore-prefixed `with _disable()` form. Either presence means
+    # upstream already wraps the compiled_fn call in a disable context,
+    # and zoo's patch is a no-op for this build. Forwards-compatible:
+    # any future `with foo_disable()` shape that contains `disable()`
+    # also short-circuits, which is the desired conservative behaviour.
+    if "with disable()" in source or "with _disable()" in source: return
     spaces = source.find("def")
     source = source.split("\n")
     source = "\n".join(x[spaces:] for x in source)
