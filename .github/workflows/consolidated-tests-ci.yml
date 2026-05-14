@@ -394,12 +394,48 @@ jobs:
         # drift before users do.
         #
         # HARD GATE: no continue-on-error. A red cell means real
-        # upstream drift -- transformers/trl/peft/vllm/datasets has
-        # renamed, moved, or removed a symbol zoo references, or one
-        # of the import_fixes pathologies is currently active without
-        # a corresponding zoo-side workaround. The drift signal is
-        # the entire point of the suite; making the cell green-by-
-        # default would defeat it.
+        # upstream drift -- transformers/trl/peft/vllm/datasets/etc
+        # has renamed, moved, or removed a symbol zoo references, or
+        # one of the import_fixes pathologies is currently active
+        # without a corresponding zoo-side workaround. The drift
+        # signal is the entire point of the suite; making the cell
+        # green-by-default would defeat it.
+        #
+        # 354 tests total per cell across 9 files:
+        #
+        #   Round 1 (211 tests):
+        #     test_upstream_pinned_symbols_{transformers,trl_vllm,accelerator}.py
+        #       -- 94 pinned-symbol probes parametrized across
+        #          (transformers, peft) / (TRL, vllm) version axes.
+        #     test_zoo_history_regressions_deep.py
+        #       -- 34 deep PR-history regressions (#4 through #635).
+        #     test_upstream_import_fixes_drift.py
+        #       -- 18 detectors mapped to fix_*/patch_* in unsloth's
+        #          import_fixes.py. Three known-active drifts get
+        #          zoo-side workarounds in unsloth_zoo/import_fixes.py
+        #          (apply_import_fixes runs at zoo __init__).
+        #     test_zoo_source_upstream_refs.py
+        #       -- 65 pins for every transformers.X.Y / trl.X / peft.X
+        #          / accelerate.X / datasets.X / vllm.X dotted reference
+        #          extracted from unsloth_zoo/*.py.
+        #
+        #   Round 2 (143 tests):
+        #     test_upstream_signatures.py
+        #       -- 65 signature pins for every upstream function zoo
+        #          monkey-patches / wraps / calls with positional-arity
+        #          assumptions (loss_utils, gradient_checkpointing,
+        #          training_utils, compiler, empty_model, saving_utils,
+        #          vllm_utils, every temporary_patches/* module).
+        #     test_extended_dep_api_pins.py
+        #       -- 44 API pins for accelerate / safetensors /
+        #          bitsandbytes / triton / datasets / tokenizers /
+        #          huggingface_hub / xformers.
+        #     test_upstream_source_patterns.py
+        #       -- 34 source-rewriter pattern pins. zoo's compiler.py
+        #          + temporary_patches/misc.py + temporary_patches/
+        #          gpt_oss.py do str.replace / re.sub against upstream
+        #          source; this file pins every targeted string so a
+        #          silent no-op surfaces.
         run: |
           python -m pytest -v --tb=short -rs \
             tests/test_upstream_pinned_symbols_transformers.py \
@@ -407,4 +443,7 @@ jobs:
             tests/test_upstream_pinned_symbols_accelerator.py \
             tests/test_zoo_history_regressions_deep.py \
             tests/test_upstream_import_fixes_drift.py \
-            tests/test_zoo_source_upstream_refs.py
+            tests/test_zoo_source_upstream_refs.py \
+            tests/test_upstream_signatures.py \
+            tests/test_extended_dep_api_pins.py \
+            tests/test_upstream_source_patterns.py
