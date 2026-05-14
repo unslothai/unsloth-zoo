@@ -122,7 +122,7 @@ class MLXTrainingConfig:
     # Elementwise clipping (PyTorch's torch.nn.utils.clip_grad_value_).
     # Clamps every grad value to [-max_grad_value, max_grad_value] leaf-by-leaf
     # with no cross-leaf reduction. Set 0.0 to disable.
-    max_grad_value: float | None = 1.0
+    max_grad_value: float | None = 5.0
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
     embedding_learning_rate: float = 0.0  # 0 = disabled, 5e-5 = recommended
