@@ -1,17 +1,9 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-# Whole-repo Python source-lint gate. Runs on every PR.
-#
-# Mirrors the shape of unslothai/unsloth's lint-ci.yml, scoped to
-# zoo's actual surface:
-#   - Python syntax (compileall) + ruff lint (narrow rule set, hard
-#     gate).
-#   - YAML + JSON round-trip for every committed config.
-# Skipped vs. unsloth:
-#   - shell lint (zoo has no committed *.sh)
-#   - TypeScript / Rust (Studio + Tauri are unsloth-side; zoo is
-#     pure Python).
+# Whole-repo Python source-lint gate. Adapted from unsloth's lint-ci.yml:
+# Python (compileall + narrow ruff) + YAML/JSON round-trip. Dropped vs unsloth:
+# shell lint (zoo has no committed *.sh), TypeScript/Rust (Studio/Tauri are unsloth-side).
 
 name: Lint CI
 
@@ -50,49 +42,25 @@ jobs:
       - run: pip install 'ruff==0.15.12' 'pyyaml>=6'
 
       - name: Python AST/syntax check (every committed .py must compile)
-        # python -m compileall uses the same parser the interpreter
-        # uses, so anything broken here would also crash at
-        # `import X` on a user's machine. Sub-second across the zoo
-        # source tree.
-        #
-        # continue-on-error during CI bootstrap: zoo's
-        # pyproject.toml declares `requires-python = ">=3.9,<3.15"`
-        # but unsloth_zoo/temporary_patches/gpt_oss.py uses a `match`
-        # statement (3.10+ syntax). Either bump the floor to 3.10 or
-        # rewrite the match. Tracking as a separate cleanup PR.
+        # continue-on-error during CI bootstrap: pyproject.toml declares
+        # `requires-python = ">=3.9,<3.15"` but temporary_patches/gpt_oss.py
+        # uses a 3.10+ `match` statement. Tracked as a separate cleanup PR.
         continue-on-error: true
         run: |
           python -m compileall -q -j 0 unsloth_zoo tests scripts
 
       - name: Python ruff check (narrow gate)
-        # Narrow rule set: E9 / F63 / F7 / F82 -- syntax errors,
-        # broken comparisons, undefined names. Anything stricter
-        # would surface latent style debt unrelated to this PR's
-        # CI-bootstrap goal; tighten later in a separate PR.
-        #
-        # continue-on-error during CI bootstrap: the first run on
-        # main surfaced 13 latent ruff findings (e.g. F821 undefined
-        # `old_hidden_states` in rl_replacements.py L1128, match
-        # statement on a file readable by Python 3.9 per
-        # pyproject.toml). Those are pre-existing zoo bugs unrelated
-        # to this PR; promote to fail-closed in a follow-up after
-        # the baseline is cleaned up.
+        # E9 / F63 / F7 / F82: syntax errors, broken comparisons, undefined names.
+        # continue-on-error during CI bootstrap: first run on main surfaced 13
+        # latent findings (rl_replacements.py L1128 F821, gpt_oss match-on-3.9).
         continue-on-error: true
         run: |
           ruff check --select E9,F63,F7,F82 unsloth_zoo tests scripts
 
       - name: No leftover debugger / pdb / breakpoint calls
-        # Matches the unsloth lint-ci pattern: catches `import pdb`,
-        # `pdb.set_trace()`, `breakpoint()`, `import ipdb` left in
-        # production code. Allowed in tests/ for debugger fixtures
-        # (none exist today; if any future test needs it, scope the
-        # exception explicitly).
-        #
-        # continue-on-error during CI bootstrap: rl_replacements.py
-        # has `#breakpoint()` (commented out) which the regex
-        # matches because `#` is `[^A-Za-z_]`. Fix in a follow-up by
-        # either removing the comment or tightening the regex to
-        # skip comment-prefixed lines.
+        # Catches `import pdb`, `pdb.set_trace()`, `breakpoint()`, `import ipdb`.
+        # continue-on-error during bootstrap: rl_replacements.py has a
+        # `#breakpoint()` comment the regex matches (# is [^A-Za-z_]).
         continue-on-error: true
         run: |
           set -e
@@ -148,9 +116,7 @@ jobs:
           PY
 
       - name: enforce kwargs spacing
-        # Mirrors the unsloth style rule -- function kwargs use
-        # `name = value` not `name=value`. Source-of-truth lives in
-        # scripts/enforce_kwargs_spacing.py.
+        # Style rule mirrored from unsloth: kwargs use `name = value` not `name=value`.
         continue-on-error: true
         run: |
           python3 scripts/enforce_kwargs_spacing.py unsloth_zoo

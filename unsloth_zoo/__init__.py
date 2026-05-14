@@ -92,17 +92,13 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 from importlib.util import find_spec
 import platform as _check_platform
 
-# Apply zoo-local import-time pathology workarounds (peft <-> transformers
-# v4 drift, triton CompiledKernel attrs, vLLM rename). These are strict
-# no-ops on healthy installs and MUST run before anything imports peft /
-# triton / vllm transitively. See unsloth_zoo/import_fixes.py for the
-# gating contract of each individual fix.
+# Apply zoo-local import-time fixes BEFORE anything imports peft / triton / vllm transitively.
+# No-op on healthy installs. See unsloth_zoo/import_fixes.py.
 try:
     from .import_fixes import apply_import_fixes as _apply_zoo_import_fixes
     _apply_zoo_import_fixes()
     del _apply_zoo_import_fixes
 except Exception:
-    # Never let an import-fix orchestrator crash kill zoo's own import.
     pass
 
 # Detect Apple Silicon MLX mode:
@@ -333,10 +329,6 @@ if not _SKIP_GPU_INIT:
 
     # Log Unsloth-Zoo Utilities
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
-
-    # (Zoo-local import-time fixes are applied earlier in this module --
-    # before platform / torch initialization -- so they patch peft / triton /
-    # vllm BEFORE any zoo submodule transitively imports them.)
 
     from .temporary_patches import (
         encode_conversations_with_harmony,

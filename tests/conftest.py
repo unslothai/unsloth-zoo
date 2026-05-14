@@ -143,29 +143,12 @@ def _preload_real_device_type() -> bool:
 
 
 def _patch_torch_cuda_for_import() -> None:
-    """Guard concrete ``torch.cuda.*`` calls that ``unsloth_zoo.*``
-    modules make at IMPORT time on CPU-only CI runners.
+    """Stub torch.cuda.* calls made at IMPORT time on CPU-only CI runners.
 
-    Three crash classes covered:
-
-    1. ``torch.cuda.memory.mem_get_info`` -- some
-       ``unsloth_zoo.temporary_patches.*`` modules call this at
-       module init. Return a plausible (free, total) pair so the
-       memory-availability arithmetic succeeds.
-
-    2. ``torch.cuda.get_device_capability`` -- called at module top
-       level in ``unsloth_zoo/compiler.py:87`` and
-       ``unsloth_zoo/loss_utils.py:39`` to gate the cut_cross_entropy
-       import on Ampere+. CPU-only torch raises ``AssertionError:
-       Torch not compiled with CUDA enabled``, blocking every test
-       that does ``importlib.import_module("unsloth_zoo.compiler")``
-       or ``...loss_utils``. Patch to return ``(8, 0)`` so the
-       capability check passes (Ampere-equivalent); the actual
-       cut_cross_entropy import is try/except-wrapped anyway.
-
-    3. ``torch.cuda.get_device_properties`` -- similar shape, used
-       by other temporary_patches sites. Return a minimal namespace
-       with ``major`` / ``minor`` / ``total_memory`` attributes.
+    Covers mem_get_info (used by temporary_patches/*), get_device_capability
+    (compiler.py:87, loss_utils.py:39 -- gates cut_cross_entropy on Ampere+),
+    and get_device_properties. Return (8, 0) so Ampere-gated imports proceed;
+    the cut_cross_entropy import itself is try/except wrapped.
     """
     try:
         import torch  # type: ignore
@@ -217,15 +200,10 @@ if str(_TESTS_DIR) not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# 3. Apply zoo-local upstream-drift fixes (triton CompiledKernel attrs,
-#    vLLM GuidedDecodingParams rename, peft transformers_weight_conversion
-#    shim, etc.). The production import path applies these via
-#    ``unsloth_zoo/__init__.py``, but the GPU-free test harness above
-#    deliberately avoids importing the full ``unsloth_zoo`` package
-#    (which requires CUDA / torch device initialization). Load just
-#    the standalone import-fixes module by file path so the drift
-#    detectors in ``test_upstream_import_fixes_drift.py`` see the
-#    same patched state a real zoo install would.
+# 3. Apply zoo-local import-fix drifts (triton CompiledKernel, vLLM rename,
+#    peft weight-conversion shim, etc.) directly via file path. The GPU-free
+#    harness above skips full unsloth_zoo/__init__.py; load just import_fixes
+#    so test_upstream_import_fixes_drift.py sees the same patched state.
 # ---------------------------------------------------------------------------
 
 def _apply_zoo_import_fixes_for_tests() -> None:
@@ -242,19 +220,14 @@ def _apply_zoo_import_fixes_for_tests() -> None:
     if not _os.path.exists(fix_path):
         return
     mod_name = "unsloth_zoo.import_fixes"
-    # Track whether WE installed the parent-package skeleton, so we can
-    # pop it after loading import_fixes.py. Leaving a half-initialised
-    # ``unsloth_zoo`` in sys.modules confuses other tests (e.g.
-    # test_zoo_history_regressions_deep.py imports submodules off the
-    # real package and relies on the full __init__.py having run).
+    # Track whether we installed the parent skeleton so we can pop it after.
+    # A half-initialised unsloth_zoo confuses other tests that import
+    # submodules expecting __init__.py to have run.
     _installed_skeleton = False
     if mod_name in sys.modules:
         mod = sys.modules[mod_name]
     else:
-        # Submodule import requires SOME parent ``unsloth_zoo`` entry in
-        # sys.modules. Reuse one if a sibling conftest step already
-        # installed it (and don't pop in that case); otherwise install a
-        # bare skeleton and pop on the way out.
+        # Submodule import needs SOME parent unsloth_zoo entry; reuse or skeleton.
         if "unsloth_zoo" not in sys.modules:
             zoo_pkg = types.ModuleType("unsloth_zoo")
             zoo_pkg.__path__ = list(pkg_spec.submodule_search_locations)
@@ -287,17 +260,11 @@ def _apply_zoo_import_fixes_for_tests() -> None:
     try:
         apply()
     except Exception:
-        # Individual fixes are already wrapped; if the entrypoint itself
-        # blows up, don't take pytest collection down.
+        # Individual fixes are wrapped; don't take pytest collection down.
         pass
     finally:
-        # Drop our scratch skeleton so subsequent ``import unsloth_zoo``
-        # / ``importlib.import_module("unsloth_zoo")`` calls hit the real
-        # package init (or whatever skeleton step 1 of this conftest
-        # installs lazily on demand) rather than our empty placeholder.
-        # The import-fixes module itself stays in sys.modules under
-        # ``unsloth_zoo.import_fixes`` -- python's import machinery is
-        # happy to find a submodule without an active parent entry.
+        # Drop scratch skeleton so later `import unsloth_zoo` hits real init.
+        # import_fixes itself stays cached as a submodule without active parent.
         if _installed_skeleton:
             sys.modules.pop("unsloth_zoo", None)
 
