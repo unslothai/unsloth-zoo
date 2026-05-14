@@ -90,7 +90,7 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 
 
 from importlib.util import find_spec
-import platform as _check_platform
+from .mlx.runtime import is_mlx_available
 
 # Import-time fixes live in ``unsloth/import_fixes.py`` and run at
 # ``import unsloth`` time. Zoo cannot be imported standalone (the GPU
@@ -99,23 +99,22 @@ import platform as _check_platform
 
 # Detect Apple Silicon MLX mode:
 # Either torch is absent (pure MLX), or unsloth already detected MLX
-_is_mlx_only = (
-    os.environ.get("UNSLOTH_FORCE_GPU_PATH", "0") != "1"
-    and _check_platform.system() == "Darwin"
-    and _check_platform.machine() == "arm64"
-    and find_spec("mlx") is not None
-)
+_is_mlx_only = is_mlx_available()
 
 if _is_mlx_only:
     # MLX mode: skip all CUDA/torch-specific initialization.
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
     UNSLOTH_ZOO_IS_PRESENT = True
-    del _is_mlx_only, _check_platform, find_spec
+    DEVICE_TYPE = "mlx"
+    DEVICE_TYPE_TORCH = "mps"
+    DEVICE_COUNT = 1
+    ALLOW_PREQUANTIZED_MODELS = True
+    del _is_mlx_only, is_mlx_available, find_spec
     # Everything below this point is GPU-only. Use a flag to gate it.
     _SKIP_GPU_INIT = True
 else:
     _SKIP_GPU_INIT = False
-    del _is_mlx_only, _check_platform
+    del _is_mlx_only, is_mlx_available
 
 # Inject triton & bitsandbytes stubs on Apple Silicon with MLX so unsloth's
 # CUDA-only imports don't error at startup. _SKIP_GPU_INIT=True is set only
@@ -127,6 +126,24 @@ if _SKIP_GPU_INIT:
     from .stubs.bitsandbytes_stub import inject_into_sys_modules as _inject_bnb
     _inject_bnb()
     del _inject_triton, _inject_bnb
+
+    # Temporary bridge for already-merged Unsloth code that imports the old
+    # flat MLX module names. Remove after the paired Unsloth PR lands and
+    # imports unsloth_zoo.mlx.* everywhere.
+    import importlib as _importlib
+    import sys as _sys
+
+    for _old_name, _new_name in (
+        ("unsloth_zoo.mlx_loader", "unsloth_zoo.mlx.loader"),
+        ("unsloth_zoo.mlx_trainer", "unsloth_zoo.mlx.trainer"),
+        ("unsloth_zoo.mlx_utils", "unsloth_zoo.mlx.utils"),
+        ("unsloth_zoo.mlx_compile", "unsloth_zoo.mlx.compile"),
+        ("unsloth_zoo.mlx_cce", "unsloth_zoo.mlx.cce"),
+        ("unsloth_zoo.mlx_cce.runtime_cce", "unsloth_zoo.mlx.cce.runtime_cce"),
+    ):
+        _sys.modules.setdefault(_old_name, _importlib.import_module(_new_name))
+
+    del _old_name, _new_name, _importlib, _sys
 
 if not _SKIP_GPU_INIT:
     if find_spec("unsloth") is None:

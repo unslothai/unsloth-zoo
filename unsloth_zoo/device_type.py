@@ -23,17 +23,23 @@ __all__ = [
     "device_synchronize",
     "device_empty_cache",
     "device_is_bf16_supported",
+    "is_mlx_available",
 ]
 
-import torch
 import functools
 from .utils import Version
+from .mlx.runtime import is_mlx_available
 import inspect
 import os
 import re
 import shutil
 import subprocess
 import urllib.request
+
+_IS_MLX = is_mlx_available()
+
+if not _IS_MLX:
+    import torch
 
 _PYTORCH_WHL_BASE_URL = "https://download.pytorch.org/whl"
 
@@ -120,6 +126,8 @@ pass
 
 @functools.cache
 def _detect_rocm_major_minor():
+    if _IS_MLX:
+        return None
     # Preferred sources ordered from most direct to fallback.
     sources = []
     hip_version = getattr(getattr(torch, "version", None), "hip", None)
@@ -200,11 +208,15 @@ pass
 
 @functools.cache
 def is_hip():
+    if _IS_MLX:
+        return False
     return bool(getattr(getattr(torch, "version", None), "hip", None))
 pass
 
 @functools.cache
 def get_device_type():
+    if _IS_MLX:
+        return "mlx"
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if is_hip():
             return "hip"
@@ -234,6 +246,7 @@ DEVICE_TYPE : str = get_device_type()
 # HIP fails for autocast and other torch functions. Use CUDA instead
 DEVICE_TYPE_TORCH = DEVICE_TYPE
 if DEVICE_TYPE_TORCH == "hip": DEVICE_TYPE_TORCH = "cuda"
+elif DEVICE_TYPE_TORCH == "mlx": DEVICE_TYPE_TORCH = "mps"
 
 @functools.cache
 def get_device_count():

@@ -38,12 +38,12 @@ def _install_shim():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("module_path", [
-    "unsloth_zoo.mlx_loader",
-    "unsloth_zoo.mlx_trainer",
-    "unsloth_zoo.mlx_utils",
-    "unsloth_zoo.mlx_compile",
-    "unsloth_zoo.mlx_cce",
-    "unsloth_zoo.mlx_cce.runtime_cce",
+    "unsloth_zoo.mlx.loader",
+    "unsloth_zoo.mlx.trainer",
+    "unsloth_zoo.mlx.utils",
+    "unsloth_zoo.mlx.compile",
+    "unsloth_zoo.mlx.cce",
+    "unsloth_zoo.mlx.cce.runtime_cce",
     "unsloth_zoo.gated_delta_vjp",
 ])
 def test_pr_a_module_imports(module_path):
@@ -58,48 +58,70 @@ def test_pr_a_module_imports(module_path):
 # ---------------------------------------------------------------------------
 
 def test_fast_mlx_model_class_exists():
-    from unsloth_zoo.mlx_loader import FastMLXModel
+    from unsloth_zoo.mlx.loader import FastMLXModel
     assert hasattr(FastMLXModel, "from_pretrained")
+
+
+def test_full_finetune_dtype_default_matches_torch_bf16():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.loader import _resolve_full_finetune_dtype
+
+    assert _resolve_full_finetune_dtype(mx.bfloat16, None, mx) == (
+        mx.bfloat16,
+        False,
+    )
+    assert _resolve_full_finetune_dtype(mx.bfloat16, False, mx) == (
+        mx.bfloat16,
+        False,
+    )
+    assert _resolve_full_finetune_dtype(mx.bfloat16, True, mx) == (
+        mx.float32,
+        True,
+    )
+    assert _resolve_full_finetune_dtype(mx.float16, None, mx) == (
+        mx.float32,
+        True,
+    )
 
 
 def test_fast_mlx_model_save_helpers_exist():
     """PR-B calls model.save_pretrained_merged / save_lora_adapters /
     push_to_hub_merged on the FastMLXModel INSTANCE returned by
     FastMLXModel.from_pretrained.  The helpers are module-level in
-    mlx_loader.py and attached via types.MethodType after load.
+    loader.py and attached via types.MethodType after load.
     """
-    import unsloth_zoo.mlx_loader as ml
+    import unsloth_zoo.mlx.loader as ml
     # The free functions must exist:
     assert hasattr(ml, "_mlx_save_pretrained_merged")
     assert hasattr(ml, "_mlx_save_lora_adapters")
     assert hasattr(ml, "_mlx_push_to_hub_merged")
-    # And the underlying mlx_utils targets:
-    import unsloth_zoo.mlx_utils as mu
+    # And the underlying utils targets:
+    import unsloth_zoo.mlx.utils as mu
     assert hasattr(mu, "save_pretrained_merged")
     assert hasattr(mu, "save_lora_adapters")
     assert hasattr(mu, "push_to_hub_merged")
 
 
-def test_mlx_trainer_classes():
-    from unsloth_zoo.mlx_trainer import (
+def test_trainer_classes():
+    from unsloth_zoo.mlx.trainer import (
         MLXTrainer,
         MLXTrainingConfig,
     )
     # train_on_responses_only is the third symbol PR-B imports
-    import unsloth_zoo.mlx_trainer as mt
+    import unsloth_zoo.mlx.trainer as mt
     assert hasattr(mt, "train_on_responses_only") or hasattr(mt, "MLXTrainer")
 
 
 # ---------------------------------------------------------------------------
-# 3. mlx_loader: dequantize-and-replace logic surface
+# 3. MLX loader: dequantize-and-replace logic surface
 # ---------------------------------------------------------------------------
 
 def test_mlx_loader_dequantize_replace_callable():
     """The dequantize-and-replace helper used by FastMLXModel.from_pretrained."""
-    import unsloth_zoo.mlx_loader as ml
+    import unsloth_zoo.mlx.loader as ml
     # PR-A names this `_dequantize_selected_mlx_modules`.
     assert hasattr(ml, "_dequantize_selected_mlx_modules"), (
-        "expected _dequantize_selected_mlx_modules in mlx_loader. "
+        "expected _dequantize_selected_mlx_modules in unsloth_zoo.mlx.loader. "
         f"Got dequant-related: {[a for a in dir(ml) if 'dequant' in a.lower()]}"
     )
 
@@ -112,7 +134,7 @@ def test_cce_fallback_path_runs():
     """Construct a tiny CCE loss and verify the no-kernel branch fires."""
     import torch
     import mlx.core as mx
-    from unsloth_zoo.mlx_cce.runtime_cce import _build_kernel_set
+    from unsloth_zoo.mlx.cce.runtime_cce import _build_kernel_set
 
     # With shim, is_available()=False -> kernel set returns (None, None, None)
     kernels = _build_kernel_set()
@@ -124,7 +146,7 @@ def test_cce_forward_chunked_pure_python():
     """Run the pure-Python CCE forward directly and verify a finite loss."""
     import torch
     import mlx.core as mx
-    from unsloth_zoo.mlx_cce.runtime_cce import _forward_chunked_fused_finalize
+    from unsloth_zoo.mlx.cce.runtime_cce import _forward_chunked_fused_finalize
 
     torch.manual_seed(0)
     n, hidden, vocab = 4, 8, 32
@@ -149,11 +171,11 @@ def test_cce_forward_chunked_pure_python():
 
 
 # ---------------------------------------------------------------------------
-# 5. mlx_compile: VLM dispatcher should at minimum import.
+# 5. compile: VLM dispatcher should at minimum import.
 # ---------------------------------------------------------------------------
 
-def test_mlx_compile_import_does_not_error():
-    import unsloth_zoo.mlx_compile  # full module-level execution
+def test_compile_import_does_not_error():
+    import unsloth_zoo.mlx.compile  # full module-level execution
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +193,9 @@ def test_gated_delta_vjp_imports():
 # 7. Optimizer construction: each MLXTrainingConfig optim string maps cleanly.
 # ---------------------------------------------------------------------------
 
-def test_mlx_trainer_config_smoke():
+def test_trainer_config_smoke():
     """MLXTrainingConfig should construct with sane defaults."""
-    from unsloth_zoo.mlx_trainer import MLXTrainingConfig
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
     # Try the default constructor — many MLX configs require keyword args.
     import dataclasses
     try:
@@ -184,3 +206,21 @@ def test_mlx_trainer_config_smoke():
         # We just want the class to be inspectable.
         ok = dataclasses.is_dataclass(MLXTrainingConfig) or True
     assert ok
+
+
+def test_adam_optimizers_enable_bias_correction():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class DummyModel:
+        def trainable_parameters(self):
+            return {}
+
+    for optim_name in ("adamw", "adam"):
+        trainer = MLXTrainer(
+            model=DummyModel(),
+            tokenizer=None,
+            train_dataset=[],
+            args=MLXTrainingConfig(optim=optim_name),
+        )
+        optimizer = trainer._build_optimizer(total_steps=10)
+        assert optimizer._kw["bias_correction"] is True

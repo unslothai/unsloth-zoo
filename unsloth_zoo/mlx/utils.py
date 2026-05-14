@@ -36,7 +36,7 @@ import tempfile
 from pathlib import Path
 
 
-from .mlx_cce import _get_runtime_cce
+from .cce import _get_runtime_cce
 
 
 def _safe_token_denominator(ntoks):
@@ -2116,7 +2116,7 @@ def _extract_vlm_images(item, messages, image_size):
 
     if not images and isinstance(messages, list):
         try:
-            from .vision_utils import process_vision_info
+            from ..vision_utils import process_vision_info
 
             extracted = process_vision_info(messages, return_video_kwargs=True)
             if isinstance(extracted, tuple) and extracted:
@@ -2980,7 +2980,7 @@ def save_pretrained_gguf(
             compresses it to ``quantization_method``. Pass ``"f32"`` /
             ``"f16"`` / ``"bf16"`` to force a specific intermediate
     """
-    from .llama_cpp import (
+    from ..llama_cpp import (
         convert_to_gguf,
         quantize_gguf,
         install_llama_cpp,

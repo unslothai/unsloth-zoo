@@ -27,13 +27,14 @@ import importlib
 import inspect
 import math
 import os
+import sys
 import types
 import warnings
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
 
-from .mlx_compile import (
+from .compile import (
     explain_compile_support,
     get_compile_qualification,
     get_compile_trait_report,
@@ -642,6 +643,17 @@ def _fp16_needs_bf16_modules(model):
             modules.append(language_backbone)
 
     return tuple(modules)
+
+
+def _resolve_full_finetune_dtype(target_dtype, float32_mixed_precision, mx):
+    if target_dtype == mx.bfloat16:
+        if type(float32_mixed_precision) is not bool:
+            # Match the Torch post-patch default: bf16 full finetuning stays
+            # bf16 unless float32_mixed_precision=True is explicitly requested.
+            float32_mixed_precision = False
+        if float32_mixed_precision is False:
+            return mx.bfloat16, False
+    return mx.float32, True
 
 
 def _patch_mixed_precision_set_dtype(model):
@@ -1826,21 +1838,21 @@ def _ensure_vlm_prompt_utils_patched():
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
-    from .mlx_utils import save_pretrained_merged
+    from .utils import save_pretrained_merged
     tokenizer = tokenizer or self._tokenizer
     save_pretrained_merged(self, tokenizer, save_directory, **kwargs)
 
 
 def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                                quantization_method="fast_quantized", **kwargs):
-    from .mlx_utils import save_pretrained_gguf
+    from .utils import save_pretrained_gguf
     tokenizer = tokenizer or self._tokenizer
     save_pretrained_gguf(self, tokenizer, save_directory,
                          quantization_method=quantization_method)
 
 
 def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, **kwargs):
-    from .mlx_utils import push_to_hub_merged
+    from .utils import push_to_hub_merged
     tokenizer = tokenizer or self._tokenizer
     # If save_directory wasn't given, fall back to repo_id (relative dir
     # named after the repo). Callers that already saved locally should
@@ -1851,14 +1863,14 @@ def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, 
 
 def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                             quantization_method="fast_quantized", **kwargs):
-    from .mlx_utils import push_to_hub_gguf
+    from .utils import push_to_hub_gguf
     tokenizer = tokenizer or self._tokenizer
     push_to_hub_gguf(self, tokenizer, repo_id, repo_id=repo_id,
                      quantization_method=quantization_method, **kwargs)
 
 
 def _mlx_save_lora_adapters(self, path, adapter_config=None):
-    from .mlx_utils import save_lora_adapters
+    from .utils import save_lora_adapters
     save_lora_adapters(self, path, adapter_config=adapter_config)
 
 
@@ -2066,6 +2078,7 @@ class FastMLXModel:
         patch_mode="patched",
         revision=None,
         random_state=3407,
+        float32_mixed_precision=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -2082,8 +2095,11 @@ class FastMLXModel:
             load_in_4bit: Accepted for API compat with CUDA unsloth.
             full_finetuning: When True, force-disable runtime quantization
                 (``load_in_4bit`` etc.) so the full-precision weights are
-                trainable. ``get_peft_model`` becomes a no-op for models
-                loaded this way.
+                trainable. By default MLX mirrors Unsloth Torch full
+                finetuning and upcasts trainable floating weights to float32;
+                pass ``float32_mixed_precision=False`` to keep native bf16
+                weights on bf16-capable Apple Silicon. ``get_peft_model``
+                becomes a no-op for models loaded this way.
             token: HuggingFace token for gated models.
             text_only: Loading mode:
                 None  — auto-detect from config (default)
@@ -2127,6 +2143,26 @@ class FastMLXModel:
                     f"Pass dtype='float16' on M1/M2.",
                     stacklevel=2,
                 )
+        if full_finetuning:
+            original_target_dtype = target_dtype
+            target_dtype, using_float32_full_ft = _resolve_full_finetune_dtype(
+                target_dtype,
+                float32_mixed_precision,
+                mx,
+            )
+            if not using_float32_full_ft:
+                print(
+                    "Unsloth: Using bfloat16 MLX full finetuning. "
+                    "This reduces memory but can differ from Unsloth Torch's "
+                    "float32_mixed_precision=True path."
+                )
+            else:
+                if original_target_dtype != mx.float32:
+                    print(
+                        "Unsloth: Using float32 MLX full finetuning to match "
+                        "Unsloth Torch's explicit float32_mixed_precision=True "
+                        "path."
+                    )
         try:
             from mlx_lm import load as mlx_load
             from mlx_lm.utils import _download
@@ -2338,6 +2374,7 @@ class FastMLXModel:
                         patch_mode=patch_mode,
                         revision=adapter_base_revision,
                         random_state=random_state,
+                        float32_mixed_precision=float32_mixed_precision,
                         **(
                             {"mlx_quantization_config": adapter_mlx_quant_config}
                             if adapter_mlx_quant_config is not None
@@ -2405,57 +2442,13 @@ class FastMLXModel:
                     raise
                 print(f"Unsloth: LoRA adapter detection failed ({e}), falling back to standard load.")
 
-        # Step 2: Check unsloth custom loader registry
         model_type = config_data.get("model_type", "")
-        try:
-            from unsloth.models.mlx import get_unsloth_loader
-            custom_loader = get_unsloth_loader(model_type)
-        except (ImportError, AttributeError, NotImplementedError):
-            custom_loader = None
 
-        if custom_loader is not None:
-            with _temporary_hf_token_env(token):
-                model, tokenizer_or_processor = custom_loader(
-                    model_name, config_data, max_seq_length=max_seq_length, token=token
-                )
-            if text_only is False or _is_vlm(config_data):
-                from .mlx_utils import normalize_vlm_processor_chat_template
-
-                tokenizer_or_processor = normalize_vlm_processor_chat_template(
-                    tokenizer_or_processor,
-                    chat_template=chat_template,
-                    model_name=model_name,
-                    model_type=model_type,
-                    strict=False,
-                )
-                model._is_vlm_model = True
-                model._processor = tokenizer_or_processor
-                _patch_mixed_precision_set_dtype(model)
-            elif chat_template is not None:
-                from .mlx_utils import normalize_mlx_chat_template
-
-                tokenizer_or_processor = normalize_mlx_chat_template(
-                    tokenizer_or_processor,
-                    chat_template=chat_template,
-                    model_name=model_name,
-                    model_type=model_type,
-                    is_vlm=False,
-                    strict=False,
-                )
-            model._config = config_data
-            model._hf_repo = model_name
-            model._src_path = local_path
-            model._unsloth_base_revision = revision
-            model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
-            model.max_seq_length = max_seq_length
-            model._unsloth_patch_mode = patch_mode
-            model._unsloth_full_finetuning = bool(full_finetuning)
-            _patch_mlx_saving(model, tokenizer_or_processor)
-            return model, tokenizer_or_processor
-
-        # Step 3: Route based on text_only
+        # Step 2: Route based on text_only
         is_vlm = False
-        force_vlm_text_path = bool(text_only is True and _prefer_vlm_loader_for_text(config_data, model_type))
+        force_vlm_text_path = bool(
+            text_only is True and _prefer_vlm_loader_for_text(config_data, model_type)
+        )
 
         if text_only is True and not force_vlm_text_path:
             is_vlm = False
@@ -2545,7 +2538,7 @@ class FastMLXModel:
                 import mlx.core as mx
                 mx.eval(model.parameters())
 
-            from .mlx_utils import (
+            from .utils import (
                 normalize_mlx_chat_template,
                 normalize_vlm_processor_chat_template,
             )
@@ -2655,7 +2648,7 @@ class FastMLXModel:
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
-            from .mlx_utils import normalize_mlx_chat_template
+            from .utils import normalize_mlx_chat_template
 
             tokenizer = normalize_mlx_chat_template(
                 tokenizer,
@@ -2929,7 +2922,7 @@ class FastMLXModel:
             _apply_gc = bool(use_gradient_checkpointing)
 
         if _apply_gc:
-            from .mlx_utils import apply_gradient_checkpointing
+            from .utils import apply_gradient_checkpointing
             apply_gradient_checkpointing(model)
 
         import mlx.utils

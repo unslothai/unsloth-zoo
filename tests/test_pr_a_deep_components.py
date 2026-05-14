@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-PR-A deeper component exercises: mlx_trainer, mlx_compile discovery,
+PR-A deeper component exercises: trainer, compile discovery,
 cce backward, and quantization helpers — beyond just imports.
 
 If a test fails, the failing component identifies the next gap.
@@ -40,7 +40,7 @@ def _install_shim():
 # ---------------------------------------------------------------------------
 
 def test_mlx_training_config_is_dataclass_with_all_fields():
-    from unsloth_zoo.mlx_trainer import MLXTrainingConfig
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
     assert dataclasses.is_dataclass(MLXTrainingConfig)
     fields = {f.name for f in dataclasses.fields(MLXTrainingConfig)}
     # Required SFT-compat fields
@@ -67,37 +67,102 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
 @pytest.mark.parametrize("optim_name", ["adamw", "adam", "sgd", "adafactor"])
 def test_mlx_training_config_each_optim(optim_name):
     """Every PR-A-supported optim string at least constructs cleanly in config."""
-    from unsloth_zoo.mlx_trainer import MLXTrainingConfig
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
     cfg = MLXTrainingConfig(optim=optim_name)
     assert cfg.optim == optim_name
 
 
+def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+    )
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type="linear",
+        warmup_steps=5,
+    )
+    schedule = trainer._build_schedule(total_steps=8)
+    def value_at(step):
+        value = schedule(step)
+        return value.item() if hasattr(value, "item") else float(value)
+
+    assert value_at(0) > 0.0
+    assert value_at(4) < trainer.args.learning_rate
+    assert value_at(5) == pytest.approx(trainer.args.learning_rate)
+
+    trainer.model = object()
+    optimizer = trainer._build_optimizer(total_steps=8)
+    assert not callable(optimizer.learning_rate)
+    first_lr = float(optimizer.learning_rate)
+    trainer._set_optimizer_lr_for_step(optimizer, 1)
+    second_lr = float(optimizer.learning_rate)
+    assert second_lr > first_lr
+
+
+@pytest.mark.parametrize(
+    ("scheduler", "warmup"),
+    [
+        ("linear", 0),
+        ("linear", 5),
+        ("cosine", 0),
+        ("cosine", 5),
+        ("constant", 0),
+        ("constant", 5),
+    ],
+)
+def test_scheduler_lr_is_nonzero_for_optimizer_update_steps(scheduler, warmup):
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    total_steps = 8
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type=scheduler,
+        warmup_steps=warmup,
+    )
+    schedule = trainer._build_schedule(total_steps=total_steps)
+
+    if callable(schedule):
+        raw_values = [schedule(step) for step in range(total_steps)]
+    else:
+        raw_values = [schedule] * total_steps
+    values = [
+        value.item() if hasattr(value, "item") else float(value)
+        for value in raw_values
+    ]
+
+    assert all(value > 0.0 for value in values)
+
+
 # ---------------------------------------------------------------------------
-# 2. mlx_compile module-level discovery functions return sensible defaults
+# 2. compile module-level discovery functions return sensible defaults
 #    on a host with no real MLX architectures.
 # ---------------------------------------------------------------------------
 
-def test_mlx_compile_discovers_no_archs_under_shim():
+def test_compile_discovers_no_archs_under_shim():
     """No real mlx_vlm.models.* installed -> empty discovery, not crash."""
-    import unsloth_zoo.mlx_compile as mc
+    import unsloth_zoo.mlx.compile as mc
     archs = mc.discover_architectures()
     assert isinstance(archs, tuple)
 
 
-def test_mlx_compile_patch_primitives_exist():
-    import unsloth_zoo.mlx_compile as mc
+def test_compile_patch_primitives_exist():
+    import unsloth_zoo.mlx.compile as mc
     primitives = mc.list_compile_patch_primitives()
     assert len(primitives) > 0
 
 
-def test_mlx_compile_protocol_requirements_exist():
-    import unsloth_zoo.mlx_compile as mc
+def test_compile_protocol_requirements_exist():
+    import unsloth_zoo.mlx.compile as mc
     reqs = mc.list_protocol_requirements()
     assert len(reqs) > 0
 
 
-def test_mlx_compile_summarize_qualifications_returns_dict():
-    import unsloth_zoo.mlx_compile as mc
+def test_compile_summarize_qualifications_returns_dict():
+    import unsloth_zoo.mlx.compile as mc
     s = mc.summarize_compile_qualifications()
     assert isinstance(s, dict)
     assert "architectures" in s
@@ -109,7 +174,7 @@ def test_mlx_compile_summarize_qualifications_returns_dict():
 
 def test_cce_backward_via_torch_autograd():
     """Build a tiny CCE forward and verify torch.autograd traverses it."""
-    from unsloth_zoo.mlx_cce.runtime_cce import _forward_chunked_fused_finalize
+    from unsloth_zoo.mlx.cce.runtime_cce import _forward_chunked_fused_finalize
 
     torch.manual_seed(0)
     n, hd, vocab = 4, 8, 32

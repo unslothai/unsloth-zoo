@@ -768,7 +768,13 @@ def make_runtime_cce_loss_fused_finalize(
             biases: mx.array,
             targets: mx.array,
         ) -> mx.array:
-            return runtime_cce_loss_full(hidden, weight, scales, biases, targets)[0]
+            losses, lse = runtime_cce_loss_full(
+                hidden, weight, scales, biases, targets
+            )
+            # Preserve the public return value/type as losses while keeping
+            # auxiliary log-sum-exp live for the custom VJP under mx.compile.
+            # The VJP reads lse from custom-function outputs during backward.
+            return losses + lse * mx.array(0.0, dtype=mx.float32)
 
         return runtime_cce_loss, use_metal_kernel
 
@@ -869,7 +875,11 @@ def make_runtime_cce_loss_fused_finalize(
         return grad_hidden.astype(hidden.dtype), grad_weight.astype(weight.dtype), mx.zeros_like(targets)
 
     def runtime_cce_loss(hidden: mx.array, weight: mx.array, targets: mx.array) -> mx.array:
-        return runtime_cce_loss_full(hidden, weight, targets)[0]
+        losses, lse = runtime_cce_loss_full(hidden, weight, targets)
+        # Preserve the public return value/type as losses while keeping
+        # auxiliary log-sum-exp live for the custom VJP under mx.compile.
+        # The VJP reads lse from custom-function outputs during backward.
+        return losses + lse * mx.array(0.0, dtype=mx.float32)
 
     return runtime_cce_loss, use_metal_kernel
 
