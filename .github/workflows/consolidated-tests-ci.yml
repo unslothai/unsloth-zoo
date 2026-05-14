@@ -334,23 +334,67 @@ jobs:
           pip show torch
           echo "::endgroup::"
 
-      - name: pytest upstream-pinned-symbol tests
-        # 94 parametrized tests probing `transformers.models.X.modeling_X.Y`,
-        # `trl.trainer.Z`, and accelerator dispatch symbols. The
-        # parametrize() decorators in each test file ALREADY span
-        # multiple (transformers, peft) / (TRL) version axes -- this
-        # matrix multiplies that by the cell-level (transformers, TRL,
-        # peft) install, so a drift in cell 2 (HF=latest + TRL=latest)
-        # surfaces as a red cell on the next PR.
+      - name: pytest upstream-regression suite (94 pinned + 117 expanded)
+        # SIX files run per matrix cell, 211 tests total:
+        #
+        #   tests/test_upstream_pinned_symbols_{transformers,trl_vllm,
+        #     accelerator}.py
+        #     -- 94 parametrized tests probing
+        #     `transformers.models.X.modeling_X.Y`, `trl.trainer.Z`,
+        #     and accelerator dispatch symbols. parametrize() decorators
+        #     ALREADY span multiple (transformers, peft)/(TRL) version
+        #     axes; this matrix multiplies that by the cell-level
+        #     (transformers, TRL, peft) install.
+        #
+        #   tests/test_zoo_history_regressions_deep.py
+        #     -- 34 regression tests mined from zoo PRs #4 through
+        #     #635 (Opus subagent ran the full merged-PR history).
+        #     Heuristic AST / regex / signature inspection; CPU-only;
+        #     ~8s total. Covers transformers API drift (PRs #322 / #91 /
+        #     #461 / #491 / #549 / #458), vLLM drift (#466 / #84 / #218),
+        #     compiler bug class (#533 / #552 / #564 / #482), GRPO/RL
+        #     math (#593 / #543 / #612), saving/dataset subtle bugs
+        #     (#4 / #477 / #595 / #615 / #559), cross-module sanity
+        #     (#422 / #374-425 / #580 / #617-generalisation / #432 /
+        #     #591 / #441).
+        #
+        #   tests/test_upstream_import_fixes_drift.py
+        #     -- 18 drift detectors mapped to fix functions in
+        #     unslothai/unsloth's unsloth/import_fixes.py (1932 LOC).
+        #     Each test fails or skip-with-marker when the upstream
+        #     pathology import_fixes guards against is currently
+        #     ACTIVE on the installed version: protobuf MessageFactory,
+        #     datasets 4.4.x recursion, trl tuple-vs-bool, transformers
+        #     PreTrainedModel.enable_input_require_grads source pattern,
+        #     torchcodec / causal_conv1d / wandb / peft weight-converter
+        #     / triton CompiledKernel attrs / torch-torchvision pairing /
+        #     vllm guided-decoding / huggingface_hub / xformers / etc.
+        #
+        #   tests/test_zoo_source_upstream_refs.py
+        #     -- 65 tests pinning every `transformers.X.Y.Z` /
+        #     `trl.X` / `peft.X` / `accelerate.X` / `datasets.X` /
+        #     `vllm.X` dotted reference Opus subagent C found in
+        #     unsloth_zoo/*.py. Each test resolves the dotted path
+        #     via importlib.import_module + getattr chain; failures
+        #     print the EXACT broken path. 24 zoo source files
+        #     covered; cross-version safe via candidate-list /
+        #     version-gate / importorskip patterns.
+        #
+        # The three matrix cells (HF=4.57.6, HF=default, HF=latest)
+        # multiplied by these 211 tests = the dominant zoo-side
+        # signal we have for catching transformers/trl/peft/vllm
+        # drift before users do.
         #
         # continue-on-error: true during CI bootstrap -- these tests
-        # are fresh; tighten to hard-gate once the first few runs
-        # settle. The test files themselves use pytest.importorskip()
-        # for optional deps (vllm, mlx) so missing-on-CPU is a clean
-        # skip, not a fail.
+        # are fresh and may surface latent zoo-source issues unrelated
+        # to upstream drift; tighten to hard-gate in a follow-up
+        # once the first 5-10 PRs cycle through cleanly.
         continue-on-error: true
         run: |
-          python -m pytest -v --tb=short \
+          python -m pytest -v --tb=short -rs \
             tests/test_upstream_pinned_symbols_transformers.py \
             tests/test_upstream_pinned_symbols_trl_vllm.py \
-            tests/test_upstream_pinned_symbols_accelerator.py
+            tests/test_upstream_pinned_symbols_accelerator.py \
+            tests/test_zoo_history_regressions_deep.py \
+            tests/test_upstream_import_fixes_drift.py \
+            tests/test_zoo_source_upstream_refs.py
