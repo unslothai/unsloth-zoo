@@ -320,6 +320,12 @@ jobs:
           pip install --no-deps unsloth || true
           # Override with matrix-resolved specs.
           pip install -U "$RESOLVED_TRANSFORMERS_SPEC" "$RESOLVED_TRL_SPEC" "$RESOLVED_PEFT_SPEC"
+          # bitsandbytes: unsloth_zoo/saving_utils.py imports it at
+          # module scope (the `_active_merge_device` path the
+          # accelerator pinned-symbol tests exercise). Recent versions
+          # ship a CPU build that imports cleanly on Linux without a
+          # CUDA toolchain. Same pin as unsloth's Core matrix.
+          pip install 'bitsandbytes>=0.45'
           pip install pytest==9.0.3 packaging
           echo "::group::Installed transformers + trl + peft + torch versions"
           pip show transformers
