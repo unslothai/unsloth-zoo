@@ -127,23 +127,48 @@ if _SKIP_GPU_INIT:
     _inject_bnb()
     del _inject_triton, _inject_bnb
 
-    # Temporary bridge for already-merged Unsloth code that imports the old
-    # flat MLX module names. Remove after the paired Unsloth PR lands and
-    # imports unsloth_zoo.mlx.* everywhere.
-    import importlib as _importlib
-    import sys as _sys
+# Lazy bridge for downstream code that still imports the old flat MLX module
+# names. Installed on every host so external scripts don't get a hard
+# ModuleNotFoundError at import time; the real import (which pulls in mlx)
+# is deferred to first attribute access. On non-MLX hosts that access
+# surfaces the same ModuleNotFoundError("mlx") users got pre-refactor.
+import importlib as _importlib
+import sys as _sys
+import types as _types
 
-    for _old_name, _new_name in (
-        ("unsloth_zoo.mlx_loader", "unsloth_zoo.mlx.loader"),
-        ("unsloth_zoo.mlx_trainer", "unsloth_zoo.mlx.trainer"),
-        ("unsloth_zoo.mlx_utils", "unsloth_zoo.mlx.utils"),
-        ("unsloth_zoo.mlx_compile", "unsloth_zoo.mlx.compile"),
-        ("unsloth_zoo.mlx_cce", "unsloth_zoo.mlx.cce"),
-        ("unsloth_zoo.mlx_cce.runtime_cce", "unsloth_zoo.mlx.cce.runtime_cce"),
-    ):
-        _sys.modules.setdefault(_old_name, _importlib.import_module(_new_name))
+class _LazyMLXAlias(_types.ModuleType):
+    __slots__ = ()
+    _LEGACY_TO_NEW = {
+        "unsloth_zoo.mlx_loader": "unsloth_zoo.mlx.loader",
+        "unsloth_zoo.mlx_trainer": "unsloth_zoo.mlx.trainer",
+        "unsloth_zoo.mlx_utils": "unsloth_zoo.mlx.utils",
+        "unsloth_zoo.mlx_compile": "unsloth_zoo.mlx.compile",
+        "unsloth_zoo.mlx_cce": "unsloth_zoo.mlx.cce",
+        "unsloth_zoo.mlx_cce.runtime_cce": "unsloth_zoo.mlx.cce.runtime_cce",
+    }
 
-    del _old_name, _new_name, _importlib, _sys
+    def _resolve(self):
+        import importlib, sys
+        target = self._LEGACY_TO_NEW[self.__name__]
+        real = importlib.import_module(target)
+        sys.modules[self.__name__] = real
+        return real
+
+    def __getattr__(self, name):
+        # Skip dunder probes (inspect.getmodule, hasattr(..., '__file__'),
+        # etc.) so we do not trigger an mlx import during torch's own
+        # init when it walks sys.modules. Real user attribute access
+        # (e.g. FastMLXModel) still resolves through to the new submodule.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return getattr(self._resolve(), name)
+
+for _old_name in _LazyMLXAlias._LEGACY_TO_NEW:
+    if _old_name in _sys.modules:
+        continue
+    _sys.modules[_old_name] = _LazyMLXAlias(_old_name)
+
+del _old_name, _importlib, _sys, _types
 
 if not _SKIP_GPU_INIT:
     if find_spec("unsloth") is None:
