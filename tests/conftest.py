@@ -143,12 +143,48 @@ def _preload_real_device_type() -> bool:
 
 
 def _patch_torch_cuda_for_import() -> None:
-    """Guard concrete ``torch.cuda.*`` calls that
-    ``unsloth_zoo.temporary_patches.*`` modules make at IMPORT time.
+    """Guard concrete ``torch.cuda.*`` calls that ``unsloth_zoo.*``
+    modules make at IMPORT time on CPU-only CI runners.
+
+    Three crash classes covered:
+
+    1. ``torch.cuda.memory.mem_get_info`` -- some
+       ``unsloth_zoo.temporary_patches.*`` modules call this at
+       module init. Return a plausible (free, total) pair so the
+       memory-availability arithmetic succeeds.
+
+    2. ``torch.cuda.get_device_capability`` -- called at module top
+       level in ``unsloth_zoo/compiler.py:87`` and
+       ``unsloth_zoo/loss_utils.py:39`` to gate the cut_cross_entropy
+       import on Ampere+. CPU-only torch raises ``AssertionError:
+       Torch not compiled with CUDA enabled``, blocking every test
+       that does ``importlib.import_module("unsloth_zoo.compiler")``
+       or ``...loss_utils``. Patch to return ``(8, 0)`` so the
+       capability check passes (Ampere-equivalent); the actual
+       cut_cross_entropy import is try/except-wrapped anyway.
+
+    3. ``torch.cuda.get_device_properties`` -- similar shape, used
+       by other temporary_patches sites. Return a minimal namespace
+       with ``major`` / ``minor`` / ``total_memory`` attributes.
     """
     try:
+        import torch  # type: ignore
         import torch.cuda.memory as _cuda_memory  # type: ignore
         _cuda_memory.mem_get_info = lambda *a, **k: (0, 80 * 1024 ** 3)
+    except Exception:
+        return
+    try:
+        torch.cuda.get_device_capability = lambda *a, **k: (8, 0)  # type: ignore[assignment]
+    except Exception:
+        pass
+    try:
+        class _StubDeviceProps:
+            major = 8
+            minor = 0
+            total_memory = 80 * 1024 ** 3
+            multi_processor_count = 108
+            name = "stub"
+        torch.cuda.get_device_properties = lambda *a, **k: _StubDeviceProps()  # type: ignore[assignment]
     except Exception:
         pass
 
