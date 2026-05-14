@@ -631,7 +631,16 @@ def test_datasets_torchcodec_audio_decoder_present_or_absent_cleanly():
     import AudioDecoder`. The whole block is wrapped in try/except so
     its absence is tolerated, but if the module IS importable, the
     AudioDecoder class MUST be on it (otherwise the patch silently
-    skips and audio dataset callers get a half-patched type)."""
+    skips and audio dataset callers get a half-patched type).
+
+    Note on `torchcodec` (separate package): datasets >=4.x's
+    `_torchcodec.py` does `from torchcodec.decoders import
+    AudioDecoder` at module top. That's a legitimate optional
+    transitive dep -- CI runners without audio support won't have
+    torchcodec, and zoo's call site survives via try/except. Treat
+    that environment as an importorskip, NOT a drift fail; a real
+    drift would be the symbol vanishing AFTER the module imports
+    cleanly."""
     _require_module("datasets")
     spec = importlib.util.find_spec("datasets.features._torchcodec")
     if spec is None:
@@ -640,6 +649,23 @@ def test_datasets_torchcodec_audio_decoder_present_or_absent_cleanly():
         return
     try:
         mod = importlib.import_module("datasets.features._torchcodec")
+    except ModuleNotFoundError as exc:
+        # Optional transitive dep (torchcodec itself, not zoo's call
+        # site) not installed on this CI box. zoo's `from
+        # datasets.features._torchcodec import AudioDecoder` is
+        # try/except wrapped at dataset_utils.py:873, so the absence
+        # is a tolerated runtime state, not drift.
+        if "torchcodec" in str(exc):
+            pytest.skip(
+                f"`datasets.features._torchcodec` requires the optional "
+                f"`torchcodec` package which isn't installed on this CI "
+                f"runner ({exc}); zoo's call site is try/except wrapped."
+            )
+        pytest.fail(
+            "DRIFT DETECTED: datasets.features._torchcodec exists but "
+            f"fails to import ({exc!r}); dataset_utils.py:873 "
+            "AudioDecoder patch silently no-ops on audio datasets."
+        )
     except Exception as exc:
         pytest.fail(
             "DRIFT DETECTED: datasets.features._torchcodec exists but "
