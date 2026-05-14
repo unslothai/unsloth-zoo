@@ -6,11 +6,9 @@
 #
 # Zoo's 13 existing test files all import torch and (mostly)
 # unsloth_zoo internals -- they are MoE / LoRA shape tests that
-# assume a torch install. We DO NOT spin up the full unsloth-style
-# `Core (HF=... + TRL=...)` matrix here; that's intrinsic to
-# unsloth's training surface, not zoo's library role.
+# assume a torch install.
 #
-# Two jobs:
+# Three jobs:
 #   - python-version-collect:  pytest --collect-only across the
 #     supported Python matrix (3.10-3.13). Catches import / syntax
 #     regressions WITHOUT requiring a GPU. Hard gate.
@@ -19,6 +17,16 @@
 #     in tests/conftest.py can run. Hard gate on tests/security;
 #     other CPU tests are continue-on-error during the CI-bootstrap
 #     phase and tighten later.
+#   - core-upstream-matrix:    `Core (HF=... + TRL=...)` matrix
+#     mirroring unslothai/unsloth's consolidated-tests-ci.yml shape.
+#     Three (transformers, TRL, peft) cells -- two pinned + one
+#     resolved from pyproject -- run the upstream-pinned-symbol
+#     tests (94 across 3 files) so transformers / TRL / peft drift
+#     surfaces as a red cell on the next PR, not silently in a
+#     downstream user's training run. This is THE high-value
+#     coverage for zoo specifically -- zoo IS the upstream-shim
+#     layer, so a matrix here catches more than the equivalent
+#     matrix on unsloth.
 #
 # Heavy GPU tests (test_active_merge_device_matrix.py,
 # test_forward_native_moe_loop_lora.py, etc.) are left as a
@@ -155,3 +163,188 @@ jobs:
             tests/test_zoo_history_regressions.py \
             tests/test_pypi_version_sync.py \
             -v
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Core (HF=... + TRL=...) upstream-version matrix. Mirrors the
+  # shape of unslothai/unsloth's consolidated-tests-ci.yml `Core`
+  # job, scoped to zoo's value: the upstream-pinned-symbol tests
+  # (test_upstream_pinned_symbols_transformers.py +
+  # test_upstream_pinned_symbols_trl_vllm.py +
+  # test_upstream_pinned_symbols_accelerator.py = 94 parametrized
+  # tests) are the dominant signal here -- they probe
+  # `transformers.models.X.modeling_X.Y`-style symbols that zoo's
+  # shim code references and that move around between transformers
+  # / TRL / peft releases.
+  #
+  # Three matrix cells (mirrors unsloth's exactly):
+  #   1. transformers==4.57.6 + TRL latest <1.0.0
+  #      (the just-before-5.x line; this is where most external
+  #      users sit today.)
+  #   2. transformers >=5,<6 + TRL >=1,<2
+  #      (absolute upstream tip. BEYOND zoo's pyproject caps
+  #      `transformers <=5.5.0` and `trl <=0.24.0`; explicitly
+  #      forces beyond-cap installs to surface drift signal early.)
+  #   3. transformers + TRL + peft resolved from pyproject.toml
+  #      (the "default" cell -- whatever a fresh `pip install
+  #      unsloth_zoo` lands on today.)
+  #
+  # fail-fast: false so a transformers / TRL drift in one cell does
+  # not cancel the others. continue-on-error: true on the test step
+  # during CI bootstrap -- the pinned-symbol tests are a fresh
+  # body of work and may surface latent zoo-source bugs unrelated
+  # to upstream drift; tighten to hard-gate in a follow-up after
+  # the first few real runs settle.
+  # ─────────────────────────────────────────────────────────────────────
+  core-upstream-matrix:
+    name: "Core (${{ matrix.combo.label }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        combo:
+          - id: t4576-trl0latest
+            label: "HF=4.57.6 + TRL<1"
+            transformers_spec: "transformers==4.57.6"
+            trl_spec: "trl>=0.18.2,<1.0.0"
+            peft_spec: "peft>=0.18,<0.20"
+          - id: tlatest5-trl1latest
+            label: "HF=latest + TRL=latest"
+            transformers_spec: "transformers>=5,<6"
+            trl_spec: "trl>=1,<2"
+            peft_spec: "peft"
+          - id: pyproject
+            label: "HF=default + TRL=default"
+            transformers_spec: "__from_pyproject__"
+            trl_spec: "__from_pyproject__"
+            peft_spec: "__from_pyproject__"
+    env:
+      MATRIX_TRANSFORMERS_SPEC: ${{ matrix.combo.transformers_spec }}
+      MATRIX_TRL_SPEC: ${{ matrix.combo.trl_spec }}
+      MATRIX_PEFT_SPEC: ${{ matrix.combo.peft_spec }}
+      MATRIX_COMBO_ID: ${{ matrix.combo.id }}
+      # transformers' bundled *_pb2.py was generated against an older
+      # protoc; the C++ protobuf 4+/5+ implementation rejects them
+      # with "Descriptors cannot be created directly". The pure-Python
+      # parser bypasses the check at negligible speed cost.
+      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+      UNSLOTH_COMPILE_DISABLE: '1'
+      # unsloth_zoo/__init__.py:128 raises ImportError unless
+      # `find_spec("unsloth") is None` returns a hit. We satisfy that
+      # with `pip install --no-deps unsloth` below; UNSLOTH_IS_PRESENT
+      # is the secondary handshake the bootstrap looks for after
+      # the find_spec gate passes.
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - name: Harden runner (audit)
+        # audit (not block) -- the matrix pulls arbitrary
+        # transformers / TRL / peft pins from PyPI; an allowlist
+        # would force us to enumerate every transitive dep PyPI
+        # mirror, which churns more than the matrix itself.
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Resolve matrix specs (handle __from_pyproject__ sentinel)
+        # The pyproject cell uses a sentinel; resolve the real
+        # `transformers`, `trl`, and `peft` constraints from zoo's
+        # pyproject.toml at job time. Walks top-level deps THEN every
+        # optional-dependencies extra, picking the first matching
+        # spec. Other cells pass their spec through unchanged.
+        run: |
+          set -euxo pipefail
+          python <<'PY' >> "$GITHUB_ENV"
+          import os, re, tomllib
+          spec_t = os.environ["MATRIX_TRANSFORMERS_SPEC"]
+          spec_r = os.environ["MATRIX_TRL_SPEC"]
+          spec_p = os.environ["MATRIX_PEFT_SPEC"]
+
+          def _pkg_name(spec: str) -> str:
+              m = re.match(r"\s*([A-Za-z0-9_.-]+)", spec)
+              return (m.group(1).lower() if m else "")
+
+          if "__from_pyproject__" in (spec_t, spec_r, spec_p):
+              with open("pyproject.toml", "rb") as f:
+                  doc = tomllib.load(f)
+              proj = doc.get("project", {})
+              all_deps: list[str] = list(proj.get("dependencies", []))
+              for _name, dep_list in proj.get("optional-dependencies", {}).items():
+                  all_deps.extend(dep_list)
+
+              # Strip environment markers (everything after the first ` ; `)
+              # so the resolved spec is a plain pip-installable string.
+              def _strip_marker(s: str) -> str:
+                  return s.split(";", 1)[0].strip()
+
+              if spec_t == "__from_pyproject__":
+                  spec_t = next((_strip_marker(x) for x in all_deps if _pkg_name(x) == "transformers"),
+                                "transformers")
+              if spec_r == "__from_pyproject__":
+                  spec_r = next((_strip_marker(x) for x in all_deps if _pkg_name(x) == "trl"),
+                                "trl")
+              if spec_p == "__from_pyproject__":
+                  spec_p = next((_strip_marker(x) for x in all_deps if _pkg_name(x) == "peft"),
+                                "peft")
+          print(f"RESOLVED_TRANSFORMERS_SPEC={spec_t}")
+          print(f"RESOLVED_TRL_SPEC={spec_r}")
+          print(f"RESOLVED_PEFT_SPEC={spec_p}")
+          PY
+          grep RESOLVED_ "$GITHUB_ENV" || true
+
+      - name: Install torch CPU + zoo + matrix-specified upstream libs
+        # Two-phase install:
+        #   1. `pip install -e .[core]` resolves zoo's pyproject defaults
+        #      for transformers / TRL / peft (cell 3 wants exactly this).
+        #   2. `pip install -U <RESOLVED_*>` overrides those defaults for
+        #      cells 1 / 2. The -U is critical -- without it pip will
+        #      not downgrade transformers from cell-3-default to cell-1
+        #      pin (4.57.6).
+        # --no-deps unsloth satisfies the find_spec("unsloth") guard in
+        # unsloth_zoo/__init__.py:128 without dragging unsloth's full
+        # CUDA-extension install chain onto a CPU runner.
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.4.0,<2.11.0"
+          pip install -e .[core]
+          pip install --no-deps unsloth || true
+          # Override with matrix-resolved specs.
+          pip install -U "$RESOLVED_TRANSFORMERS_SPEC" "$RESOLVED_TRL_SPEC" "$RESOLVED_PEFT_SPEC"
+          pip install pytest==9.0.3 packaging
+          echo "::group::Installed transformers + trl + peft + torch versions"
+          pip show transformers
+          pip show trl
+          pip show peft
+          pip show torch
+          echo "::endgroup::"
+
+      - name: pytest upstream-pinned-symbol tests
+        # 94 parametrized tests probing `transformers.models.X.modeling_X.Y`,
+        # `trl.trainer.Z`, and accelerator dispatch symbols. The
+        # parametrize() decorators in each test file ALREADY span
+        # multiple (transformers, peft) / (TRL) version axes -- this
+        # matrix multiplies that by the cell-level (transformers, TRL,
+        # peft) install, so a drift in cell 2 (HF=latest + TRL=latest)
+        # surfaces as a red cell on the next PR.
+        #
+        # continue-on-error: true during CI bootstrap -- these tests
+        # are fresh; tighten to hard-gate once the first few runs
+        # settle. The test files themselves use pytest.importorskip()
+        # for optional deps (vllm, mlx) so missing-on-CPU is a clean
+        # skip, not a fail.
+        continue-on-error: true
+        run: |
+          python -m pytest -v --tb=short \
+            tests/test_upstream_pinned_symbols_transformers.py \
+            tests/test_upstream_pinned_symbols_trl_vllm.py \
+            tests/test_upstream_pinned_symbols_accelerator.py
