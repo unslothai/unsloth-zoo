@@ -109,11 +109,17 @@ def replace_expert_params_with_bnb_params(
         module.down_proj = placeholder_down
         has_been_replaced = True
         
-        # TODO: Can remove this?
-        logger.info(f"Unsloth: Prepared {module_name}'s gate_up_proj & down_proj for BNB 4-bit quantization (shapes: {gate_up_proj.shape}, {down_proj.shape})")
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: Prepared {module_name}'s gate_up_proj & down_proj for BNB 4-bit quantization (shapes: {gate_up_proj.shape}, {down_proj.shape})")
     
-    if not has_been_replaced:
-        logger.warning(f"Unsloth: No expert parameters were found to be replaced for {model.name_or_path}")
+    if not has_been_replaced and UNSLOTH_ENABLE_LOGGING:
+        # Demoted from warning to info+gated: dense (non-MoE) 4-bit loads hit this
+        # path too (Phi3, GLM4 dense, Llama, Mistral, Gemma, Qwen2.5 dense, ...).
+        # Surface only when verbose to avoid spamming every bnb 4-bit user.
+        logger.info(
+            f"Unsloth: No MoE expert parameters were found to be replaced for "
+            f"{getattr(model, 'name_or_path', type(model).__name__)} (expected for non-MoE)"
+        )
     
     return model
 
@@ -181,8 +187,9 @@ def patch_bnb4bit_quantize_convert():
     
     patched_convert._unsloth_moe_patched = True
     patch_function(Bnb4bitQuantize, "convert", patched_convert, match_level = "relaxed")
-    
-    logger.info("Unsloth: Patched Bnb4bitQuantize.convert for MoE expert parameter support")
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: Patched Bnb4bitQuantize.convert for MoE expert parameter support")
 pass
 TEMPORARY_PATCHES.append(patch_bnb4bit_quantize_convert)
 
@@ -222,8 +229,9 @@ def patch_bnb4bit_quantizer_param_needs_quantization():
     
     patched_param_needs_quantization._unsloth_moe_patched = True
     patch_function(Bnb4BitHfQuantizer, "param_needs_quantization", patched_param_needs_quantization)
-    
-    logger.info("Unsloth: Patched Bnb4BitHfQuantizer.param_needs_quantization for MoE expert parameters")
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: Patched Bnb4BitHfQuantizer.param_needs_quantization for MoE expert parameters")
 pass
 TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_param_needs_quantization)
 
