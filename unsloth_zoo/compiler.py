@@ -313,13 +313,56 @@ def replace_with_grouped_query_attention(module, source):
         pass
     pass
 
-    source = re.sub(
+    # `output_attentions` super().forward chain rewriter.
+    #
+    # Old shape (transformers <= 4.49 on Llama / Mistral / Qwen2):
+    #
+    #     if output_attentions:
+    #         logger.warning_once(...)
+    #         return super().forward(
+    #             hidden_states=hidden_states,
+    #             ...
+    #         )
+    #
+    # We rewrite the whole `if output_attentions: ... return super().forward(...)`
+    # block to a hard `raise RuntimeError(...)` so the rest of zoo's
+    # compile pipeline can assume `output_attentions=False`.
+    #
+    # New shape on transformers 4.50+: the entire eager-attention chain
+    # was removed. Forward methods now take a `**kwargs` catch-all and
+    # `output_attentions` is silently ignored / never branches into a
+    # super().forward() return. The bug zoo was working around (eager
+    # attention silently re-entering and breaking the compile graph) is
+    # gone upstream.
+    #
+    # The regex below silently no-ops on 4.50+ because the pattern
+    # simply isn't there. That is the CORRECT behaviour: there's nothing
+    # to rewrite. We keep the rewrite for older transformers and add a
+    # secondary fallback so a partial-shape match (e.g. an upstream that
+    # kept the `if output_attentions:` guard but dropped the super()
+    # return) still hardens to the same RuntimeError.
+    rewritten, n_old = re.subn(
         r"if output_attentions\:.+?return super\(\)\.forward.+?\)",
         "if output_attentions: raise RuntimeError('Unsloth: Not supported')",
         source,
         flags=re.DOTALL | re.MULTILINE,
     )
-    return source
+    if n_old:
+        return rewritten
+    # Fallback: cover the bare `if output_attentions:` guard followed by
+    # a `return super().forward(...)` separated by an arbitrary body
+    # (logger warning, raise, etc.). Matches the legacy shape with a
+    # looser anchor; still no-ops on 4.50+ where the guard is gone.
+    rewritten, n_loose = re.subn(
+        r"if[ \t]+output_attentions[ \t]*:[^\n]*\n(?:[ \t]+[^\n]+\n)*?[ \t]+return[ \t]+super\(\)\.forward\([^)]*\)",
+        "if output_attentions: raise RuntimeError('Unsloth: Not supported')",
+        source,
+        flags=re.MULTILINE,
+    )
+    # If neither shape matched we silently return the source unchanged.
+    # On transformers 4.50+ that's the intended outcome: upstream removed
+    # the chain this rewriter was patching, so there's nothing to fix.
+    return rewritten if n_loose else source
 
 
 pass
@@ -375,6 +418,63 @@ def get_mask_functions():
         return [x for x in masking_utils if x.startswith("create")]
     except:
         return []
+
+
+pass
+
+
+def _all_attention_functions_has_sdpa():
+    """Return True if ``transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS``
+    (or its post-4.50 attention-interface equivalent) registers an "sdpa"
+    entry.
+
+    transformers 4.50+ moved per-attention-mechanism dispatch into a
+    registry-backed `ALL_ATTENTION_FUNCTIONS` mapping. Some models still
+    declare the legacy `_supports_sdpa` class attribute, but most modern
+    ones (Llama, Mistral, Qwen3, ...) rely entirely on the registry.
+    When zoo's source-string marker probe at compiler.py:3390-3392
+    misses, falling back to this check lets us still detect SDPA support
+    on those modern models.
+
+    Forwards-compat: probes a handful of plausible attribute names on
+    `transformers.modeling_utils` and `transformers.integrations.sdpa_attention`.
+    Returns False on any failure -- the caller treats False as "no
+    evidence of SDPA support" and leaves SDPA off, which is the safe
+    behaviour.
+    """
+    try:
+        import transformers.modeling_utils as _mu  # noqa: WPS433
+    except Exception:
+        return False
+    # The canonical post-4.50 name. We also probe a few historical /
+    # candidate names so the helper survives further upstream renames.
+    for attr in (
+        "ALL_ATTENTION_FUNCTIONS",
+        "ATTENTION_INTERFACES",
+        "AttentionInterface",
+        "_ALL_ATTENTION_FUNCTIONS",
+    ):
+        reg = getattr(_mu, attr, None)
+        if reg is None:
+            continue
+        try:
+            # Most candidates are mapping-like ({"sdpa": ..., "flash_attention_2": ...}).
+            if "sdpa" in reg:
+                return True
+        except Exception:
+            pass
+        # AttentionInterface in some 5.x previews is a class with a class-level
+        # registry. Probe the obvious attribute names.
+        for sub in ("_registry", "_global_mapping", "_mapping", "registry"):
+            inner = getattr(reg, sub, None)
+            if inner is None:
+                continue
+            try:
+                if "sdpa" in inner:
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 pass
@@ -2425,6 +2525,29 @@ MOE_ROUTING_WEIGHTS_CAST_PATTERN = (
 )
 MOE_ROUTING_WEIGHTS_CAST_REPLACE = r"\1router_logits\2"
 
+# Forwards-compat secondary regex for the MoE routing-weights dtype cast.
+#
+# The legacy pattern only catches the EXACT form
+# `routing_weights = routing_weights.to(hidden_states.dtype)` -- still
+# present on mixtral / qwen2_moe / qwen3_moe in transformers 4.57.x.
+#
+# Newer MoE rewrites (gpt_oss, deepseek_v3, prospective 5.x shapes) may
+# either drop the explicit cast entirely (no bug -> no fix needed, both
+# regexes silently no-op) or rewrite it as a self-assignment with
+# whitespace / line-break variation, or as `routing_weights = routing_weights.to(self.<something>.dtype)`.
+# This secondary pattern is strictly broader on whitespace and tolerates
+# an intermediate attribute chain on the .to() argument, so any future
+# variant of "cast routing_weights to a tensor's dtype before re-using
+# it" is still caught. The replacement preserves the original semantics:
+# route the cast through router_logits so the higher-precision router
+# graph dtype is preserved.
+MOE_ROUTING_WEIGHTS_CAST_PATTERN_NEW = (
+    r"(\brouting_weights\s*=\s*routing_weights\.to\(\s*)"
+    r"(?:hidden_states|self\.[A-Za-z_]\w*|inputs?_dtype)"
+    r"(\.dtype\s*\))"
+)
+MOE_ROUTING_WEIGHTS_CAST_REPLACE_NEW = r"\1router_logits\2"
+
 
 def patch_moe_routing_weights_cast(
     module_cls: Any, source: str
@@ -2439,17 +2562,42 @@ def patch_moe_routing_weights_cast(
             continue
 
         new_route_source = inspect.getsource(func)
+        # Try the legacy pattern first; if it didn't match, fall through
+        # to the broader forwards-compat pattern. Either pattern firing
+        # produces the same router_logits-routed replacement, so the two
+        # are equivalent on the source after one of them matches; we
+        # never apply both in sequence (the new pattern's match space is
+        # a strict superset of the legacy pattern's).
         new_route_source, replaced_count = re.subn(
             MOE_ROUTING_WEIGHTS_CAST_PATTERN,
             MOE_ROUTING_WEIGHTS_CAST_REPLACE,
             new_route_source,
         )
+        if replaced_count == 0:
+            new_route_source, replaced_count = re.subn(
+                MOE_ROUTING_WEIGHTS_CAST_PATTERN_NEW,
+                MOE_ROUTING_WEIGHTS_CAST_REPLACE_NEW,
+                new_route_source,
+            )
         if replaced_count > 0:
             new_route_sources[method_name] = new_route_source
 
-    return re.sub(
-        MOE_ROUTING_WEIGHTS_CAST_PATTERN, MOE_ROUTING_WEIGHTS_CAST_REPLACE, source
-    ), new_route_sources
+    # Same two-stage strategy for the bulk class source: legacy first,
+    # forwards-compat as fallback. If neither pattern matches (the cast
+    # was dropped upstream entirely), we return the source unchanged,
+    # which is the desired no-op behaviour.
+    new_source, n_legacy = re.subn(
+        MOE_ROUTING_WEIGHTS_CAST_PATTERN,
+        MOE_ROUTING_WEIGHTS_CAST_REPLACE,
+        source,
+    )
+    if n_legacy == 0:
+        new_source, _ = re.subn(
+            MOE_ROUTING_WEIGHTS_CAST_PATTERN_NEW,
+            MOE_ROUTING_WEIGHTS_CAST_REPLACE_NEW,
+            source,
+        )
+    return new_source, new_route_sources
 
 
 pass
@@ -3384,6 +3532,31 @@ def unsloth_compile_transformers(
     torch_modules = [x for x in torch_modules if x not in removal]
 
     # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
+    #
+    # Three upstream shapes to consider:
+    #   1. Pre-4.50 transformers declares `_supports_sdpa = True` (or False)
+    #      directly on the modeling class. This branch reads the marker
+    #      out of the source string.
+    #   2. transformers 4.50+ moved per-attention dispatch to
+    #      `transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS` (the
+    #      "attention interface" refactor). The `_supports_sdpa` class
+    #      attribute is gone from most models; SDPA is selected at runtime
+    #      based on `attn_implementation` and whether "sdpa" is registered
+    #      in ALL_ATTENTION_FUNCTIONS.
+    #   3. Hybrid models that mix old + new (e.g. an embedded vision
+    #      tower carrying the legacy marker while the LM head uses
+    #      ALL_ATTENTION_FUNCTIONS).
+    #
+    # Strategy:
+    #   * If the legacy marker is present, use it (preserves old
+    #     behaviour exactly).
+    #   * Otherwise, if zoo already detected scaled_dot_product_attention
+    #     modules in the source, assume SDPA is available (this was the
+    #     fallback even on the legacy branch).
+    #   * As a third fallback, probe ALL_ATTENTION_FUNCTIONS for a
+    #     registered "sdpa" entry. If it is registered, the model can
+    #     use SDPA via the dispatcher even without the class-level marker.
+    #   * Otherwise mark SDPA off.
     final_supports_sdpa = True
     if supports_sdpa is not None:
         assert type(supports_sdpa) is list and len(supports_sdpa) == 1
@@ -3393,6 +3566,12 @@ def unsloth_compile_transformers(
             if supports_sdpa[0] != False:
                 supports_sdpa[0] = True
         elif len(scaled_dot_product_attention_modules) != 0:
+            if supports_sdpa[0] != False:
+                supports_sdpa[0] = True
+        elif _all_attention_functions_has_sdpa():
+            # transformers 4.50+ ALL_ATTENTION_FUNCTIONS dispatch path.
+            # The class-level marker is gone but the runtime SDPA
+            # dispatch is still healthy; treat the model as SDPA-capable.
             if supports_sdpa[0] != False:
                 supports_sdpa[0] = True
         else:
@@ -3510,6 +3689,17 @@ def unsloth_compile_transformers(
     all_standalone_classes = {}
 
     # Fix modules with _update_causal_mask if SDPA can be used with causal masks
+    #
+    # Two upstream shapes to detect:
+    #   Old (transformers < 4.50 ish): the model class exposes a
+    #     `_update_causal_mask` method that we replace with the no-op.
+    #   New (modern Llama / Mistral / Qwen3 on transformers 4.50+):
+    #     `_update_causal_mask` is gone; the model now calls
+    #     `create_causal_mask` from `transformers.masking_utils` inside
+    #     `forward`. We can't bind a method, but we CAN still mark the
+    #     module as a causal-mask candidate so the downstream branch
+    #     (line ~3815) gets a chance to no-op when the method exists,
+    #     and otherwise the assignment-site `hasattr` guard short-circuits.
     remove_causal_masks = []
     if disable_causal_masks:
         for module in other_classes:
@@ -3521,7 +3711,24 @@ def unsloth_compile_transformers(
                 source = eval(f"{model_location}.{module}")
             except AttributeError:
                 continue
-            if not hasattr(source, "_update_causal_mask"):
+            has_legacy_hook = hasattr(source, "_update_causal_mask")
+            has_modern_create = False
+            if not has_legacy_hook:
+                # Modern shape probe: read forward source and look for the
+                # `create_causal_mask` call (or one of its sibling helpers
+                # from transformers.masking_utils that zoo already tracks
+                # in `MASKING_UTILS_CALLS`). We only do this when the
+                # legacy hook is absent so we don't pay the inspect.getsource
+                # cost on the common path.
+                try:
+                    forward_src = inspect.getsource(source.forward)
+                except Exception:
+                    forward_src = ""
+                has_modern_create = (
+                    "create_causal_mask" in forward_src
+                    or "transformers.masking_utils" in forward_src
+                )
+            if not (has_legacy_hook or has_modern_create):
                 continue
 
             try:
@@ -4034,6 +4241,15 @@ def unsloth_compile_transformers(
     )
     inner_training_loop = inner_training_loop.replace(
         "is_torch_tpu_available()",
+        "False",
+    )
+    # transformers 4.43+ renamed `is_torch_tpu_available` to
+    # `is_torch_xla_available`. Mirror the same hard-no-TPU stub so the
+    # rewriter handles both shapes; older transformers fall through the
+    # first replace, newer transformers fall through this one. Both are
+    # idempotent: a second replace on already-substituted source no-ops.
+    inner_training_loop = inner_training_loop.replace(
+        "is_torch_xla_available()",
         "False",
     )
     exec(inner_training_loop, globals())
