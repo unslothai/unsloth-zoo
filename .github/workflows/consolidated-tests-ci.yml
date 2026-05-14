@@ -93,7 +93,7 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
-          pip install --no-deps unsloth || true
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
           pip install pytest==9.0.3
 
       - name: pytest --collect-only
@@ -136,7 +136,7 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
-          pip install --no-deps unsloth || true
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
           pip install pytest==9.0.3 pyyaml==6.0.2
 
       - name: pytest tests/security (HARD GATE)
@@ -317,7 +317,7 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
-          pip install --no-deps unsloth || true
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
           # Override with matrix-resolved specs.
           pip install -U "$RESOLVED_TRANSFORMERS_SPEC" "$RESOLVED_TRL_SPEC" "$RESOLVED_PEFT_SPEC"
           # bitsandbytes: unsloth_zoo/saving_utils.py imports it at
