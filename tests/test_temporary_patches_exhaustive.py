@@ -121,6 +121,92 @@ def _param_names(func) -> list[str]:
     return [name for name in sig.parameters.keys()]
 
 
+def _original_attr_name(cls, attr: str) -> str:
+    """Reconstruct the storage key used by
+    ``unsloth_zoo.temporary_patches.utils.patch_function`` to stash the
+    original method body before it overwrites the class attribute.
+
+    Mirrors ``_get_unique_storage_name`` in that file:
+    ``_original_<last-component-of-module>_<class-name>_<attr>``. We
+    re-derive the name here rather than import it so this test stays
+    importable even on a zoo build where the temporary_patches sub-package
+    can't be imported (e.g. minimal CPU CI).
+    """
+    module_tail = getattr(cls, "__module__", "").rsplit(".", 1)[-1]
+    class_name = getattr(cls, "__name__", "") or cls.__class__.__name__
+    return f"_original_{module_tail}_{class_name}_{attr}"
+
+
+def _resolve_upstream_method(cls, method_name: str):
+    """Return the function object representing the UPSTREAM (unpatched)
+    method body for ``cls.method_name``.
+
+    ``apply_import_fixes()`` and the ``temporary_patches`` runner both
+    monkey-patch classes at import time, so a naive ``cls.method_name``
+    lookup later in the test session returns the zoo-patched function
+    instead of the upstream one. That makes signature drift tests false-
+    positive on the patched ``(self, *args, **kwargs)`` wrapper rather
+    than the real upstream API.
+
+    Resolution order:
+      1. If ``cls`` has ``_original_<module>_<class>_<method>`` set by
+         ``patch_function``, return that. This is the authoritative source.
+      2. If the live attribute's ``__qualname__`` indicates a zoo patch
+         wrapper (``patch_<X>.<locals>.<method>``) but no original is
+         stashed, fall through to (3) to load the source from the module
+         file directly.
+      3. Otherwise return the live attribute -- upstream isn't patched
+         on this stack.
+    """
+    if not hasattr(cls, method_name):
+        return None
+    live = getattr(cls, method_name)
+    # (1) explicit storage key from patch_function.
+    storage_key = _original_attr_name(cls, method_name)
+    original = getattr(cls, storage_key, None)
+    if original is not None:
+        return original
+    # (2) wrapper-by-qualname fallback.
+    qualname = getattr(live, "__qualname__", "") or ""
+    if ".<locals>." in qualname and qualname.split(".", 1)[0].startswith("patch_"):
+        # zoo patch wrapper, but no _original_ stash on the class. This
+        # is rare (force=True + store_original=False) but possible. Fall
+        # through; caller will skip cleanly via _maybe_skip_if_patched.
+        return live
+    return live
+
+
+def _maybe_skip_if_patched(cls, method_name: str, zoo_file: str) -> None:
+    """If the live ``cls.method_name`` is a zoo patch wrapper AND we
+    have no stored original to inspect, skip the test with a clear
+    "already-patched" reason rather than false-fail on the wrapper's
+    ``(self, *args, **kwargs)`` signature.
+
+    Used by signature-pin tests against classes that zoo replaces
+    wholesale via ``patch_function``. The skip is loud: the message
+    surfaces which zoo file did the patching so a future maintainer
+    can re-anchor the test if upstream's shape genuinely changes.
+    """
+    if not hasattr(cls, method_name):
+        return
+    live = getattr(cls, method_name)
+    storage_key = _original_attr_name(cls, method_name)
+    original = getattr(cls, storage_key, None)
+    if original is not None:
+        # We have the upstream original stashed; tests use it directly.
+        return
+    qualname = getattr(live, "__qualname__", "") or ""
+    if ".<locals>." in qualname and qualname.split(".", 1)[0].startswith("patch_"):
+        pytest.skip(
+            f"{zoo_file}: {cls.__module__}.{cls.__name__}.{method_name} "
+            f"is already overwritten by zoo's patch wrapper "
+            f"{qualname!r}; no upstream-original stash is available on "
+            f"this run, so the upstream signature pin can't be probed "
+            f"directly. The patch itself is exercised by the temporary_"
+            f"patches integration tests."
+        )
+
+
 def _assert_method_exists(cls, method_name: str, zoo_file: str):
     if not hasattr(cls, method_name):
         pytest.fail(
@@ -128,7 +214,8 @@ def _assert_method_exists(cls, method_name: str, zoo_file: str):
             f"{cls.__module__}.{cls.__name__}.{method_name} but installed "
             f"transformers {_TX_VERSION} has no such method on the class"
         )
-    return getattr(cls, method_name)
+    # Prefer the upstream-original stash if zoo has patched the method.
+    return _resolve_upstream_method(cls, method_name)
 
 
 def _assert_params_superset(
@@ -907,7 +994,12 @@ def test_csm_depth_decoder_for_causal_lm_forward_named_params():
     """misc.py:239 patches CsmDepthDecoderForCausalLM.forward with named
     params: input_ids, backbone_last_hidden_state, attention_mask,
     position_ids, past_key_values, inputs_embeds, labels, use_cache,
-    cache_position, logits_to_keep."""
+    cache_position, logits_to_keep.
+
+    Resolves through the ``_original_*`` stash so we inspect the genuine
+    upstream signature even after zoo's TEMPORARY_PATCHES have replaced
+    the live ``forward`` with a ``(self, *args, **kwargs)`` wrapper.
+    """
     cls = _try_get_class(
         "transformers.models.csm.modeling_csm",
         "CsmDepthDecoderForCausalLM",
@@ -916,6 +1008,7 @@ def test_csm_depth_decoder_for_causal_lm_forward_named_params():
         pytest.skip(
             f"CsmDepthDecoderForCausalLM absent on transformers {_TX_VERSION}"
         )
+    _maybe_skip_if_patched(cls, "forward", "misc.py")
     fwd = _assert_method_exists(cls, "forward", "misc.py")
     _assert_params_superset(
         fwd,
@@ -933,7 +1026,12 @@ def test_csm_for_conditional_generation_forward_named_params():
     """misc.py:373 patches CsmForConditionalGeneration.forward. The
     replacement forwards: input_ids, input_values, attention_mask,
     input_values_cutoffs, position_ids, past_key_values, inputs_embeds,
-    labels, use_cache, cache_position, logits_to_keep."""
+    labels, use_cache, cache_position, logits_to_keep.
+
+    Resolves through the ``_original_*`` stash so we inspect the genuine
+    upstream signature even after zoo's TEMPORARY_PATCHES have replaced
+    the live ``forward`` with a ``(self, *args, **kwargs)`` wrapper.
+    """
     cls = _try_get_class(
         "transformers.models.csm.modeling_csm",
         "CsmForConditionalGeneration",
@@ -942,6 +1040,7 @@ def test_csm_for_conditional_generation_forward_named_params():
         pytest.skip(
             f"CsmForConditionalGeneration absent on transformers {_TX_VERSION}"
         )
+    _maybe_skip_if_patched(cls, "forward", "misc.py")
     fwd = _assert_method_exists(cls, "forward", "misc.py")
     _assert_params_superset(
         fwd,
@@ -1271,14 +1370,25 @@ def test_pixtral_attention_init_signature():
 def test_pixtral_attention_forward_signature():
     """pixtral.py:97 patches PixtralAttention.forward with
     ``forward(self, hidden_states, attention_mask, position_embeddings,
-    output_attentions=False, **kwargs)``. Pin those names."""
+    output_attentions=False, **kwargs)``. Pin those names.
+
+    Once apply_import_fixes / TEMPORARY_PATCHES have run, the live
+    ``PixtralAttention.forward`` is zoo's patch wrapper with signature
+    ``(self, *args, **kwargs)``; reading that signature would false-fail
+    the upstream-shape pin. We instead resolve through
+    ``_original_<module>_<class>_<attr>`` (stashed by zoo's
+    ``patch_function``) to read the genuine upstream signature, or skip
+    loudly with the patch-wrapper detail if no stash is available.
+    """
     cls = _require_class(
         "transformers.models.pixtral.modeling_pixtral",
         "PixtralAttention",
         "pixtral.py",
     )
+    _maybe_skip_if_patched(cls, "forward", "pixtral.py")
+    upstream_fwd = _resolve_upstream_method(cls, "forward")
     _assert_params_superset(
-        cls.forward,
+        upstream_fwd,
         required=["hidden_states", "attention_mask", "position_embeddings"],
         zoo_file="pixtral.py",
         label="PixtralAttention.forward",

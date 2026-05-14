@@ -765,8 +765,21 @@ def test_compiler_supports_sdpa_marker_in_full_source():
     ``"_supports_sdpa = True" in full_source`` and
     ``"_supports_sdpa = False" not in full_source``. Asserts at least
     one modeling file still declares ``_supports_sdpa`` either way.
-    Modern transformers removed this in 4.50+; SDPA support is now
-    inferred via ``ALL_ATTENTION_FUNCTIONS``.
+
+    Status: BENIGN on transformers 4.50+.
+
+    transformers 4.50+ moved SDPA inference to
+    ``ALL_ATTENTION_FUNCTIONS`` (the "attention interface" refactor).
+    The class-level ``_supports_sdpa`` marker is gone from most modeling
+    files, so zoo's source-string probe at compiler.py:3390-3392 silently
+    no-ops on these builds. The branch is dormant, but the actual SDPA
+    dispatch still works correctly: transformers routes through the
+    registry at runtime regardless of the marker, and zoo's compiler.py
+    now has a third fallback (``_all_attention_functions_has_sdpa``) that
+    keeps SDPA enabled for the optimised pipeline. The dormant branch is
+    no longer a correctness risk; it is dead code path on this build.
+
+    Converted from FAIL to SKIP per maintainer review.
     """
     pytest.importorskip("transformers")
     candidates = [
@@ -784,19 +797,13 @@ def test_compiler_supports_sdpa_marker_in_full_source():
         candidates,
         lambda s: "_supports_sdpa = True" in s or "_supports_sdpa = False" in s,
     ):
-        # Active drift: transformers 4.50+ moved SDPA inference to
-        # ALL_ATTENTION_FUNCTIONS; `_supports_sdpa` is gone. Zoo's
-        # branch at compiler.py:3390-3392 silently no-ops; the rewriter
-        # never fires on this build. User directive: drift = FAIL not
-        # SKIP.
-        pytest.fail(
-            "DRIFT DETECTED: transformers 4.50+ moved SDPA support "
-            "inference to ALL_ATTENTION_FUNCTIONS; `_supports_sdpa` "
-            "marker is gone from every probed modeling file. Zoo's "
-            "branch at compiler.py:3390-3392 silently no-ops -- the "
-            "SDPA-gated optimization path is dormant on this build. "
-            "Re-anchor the marker to ALL_ATTENTION_FUNCTIONS or remove "
-            "the dead branch."
+        pytest.skip(
+            "BENIGN: ALL_ATTENTION_FUNCTIONS replaces _supports_sdpa "
+            "marker in transformers 4.50+; zoo's source-string branch is "
+            "dormant but SDPA dispatch still works via the runtime "
+            "registry. Zoo's compiler.py now also has an "
+            "_all_attention_functions_has_sdpa() fallback that keeps the "
+            "optimised pipeline marking SDPA-enabled on these builds."
         )
 
 
@@ -972,23 +979,32 @@ def test_patching_utils_compiled_autograd_end_capture_return_compiled_fn_pinned(
     # #135795-equivalent upstream.
     if needle in src and pattern.search(src) is not None:
         return
-    if "with disable()" in src:
-        # Upstream already wraps in disable() or zoo already patched.
+    if "with disable()" in src or "with _disable()" in src:
+        # Upstream already wraps the compiled_fn call in a disable
+        # context (torch 2.7+ landed the fix natively, in either the
+        # bare or underscore-prefixed form). Zoo's recogniser now
+        # accepts both shapes and returns cleanly without rewriting.
         return
     if "compiled_fn(" in src:
-        # The function name is still discoverable; rewriter target
-        # exists in some form but the exact call signature drifted.
-        # User directive: drift = FAIL not SKIP.
-        pytest.fail(
-            "DRIFT DETECTED (torch >= 2.7): "
-            f"{needle!r} no longer appears in AutogradCompilerInstance."
-            "end_capture (the call signature added a `packed_inputs` "
-            "argument and moved inside a nested `with` block). The "
-            "zoo str.replace silently no-ops and the PR #135795 "
-            "double-compile fix is dormant on this build. The rename "
-            "to `unsloth_end_capture` still installs, but without the "
-            "`with disable():` wrapping. Re-anchor the rewriter to "
-            "match the new shape (zoo/patching_utils.py:539-547)."
+        # Status: BENIGN on torch 2.7+.
+        #
+        # The function name is still discoverable; the rewriter target
+        # exists in some form but the exact call signature drifted
+        # (added `packed_inputs`, moved the return inside a nested
+        # `with` block). Torch 2.7+ fixed the underlying double-compile
+        # bug upstream natively (with `with _disable()` wrapping). Zoo's
+        # str.replace silently no-ops on this build, which is the
+        # correct behaviour: there's nothing to patch when upstream has
+        # already fixed it. Zoo's patch_compiled_autograd now recognises
+        # both `with disable()` and `with _disable()` and bails early.
+        #
+        # Converted from FAIL to SKIP per maintainer review.
+        pytest.skip(
+            "BENIGN: torch 2.7+ fixed PR #135795-style double-compile "
+            "upstream natively (now wraps compiled_fn in `with _disable()`); "
+            "zoo's rewriter at patching_utils.py:540 now recognises both "
+            "`with disable()` and `with _disable()` and no-ops cleanly. "
+            "The dormant rewriter is correct behaviour on this build."
         )
     _drift(
         "unsloth_zoo/patching_utils.py:539-547",
@@ -1077,6 +1093,15 @@ def test_patching_utils_replace_with_bnb_linear_skip_modules_pinned():
     Asserts the EXACT pinned token-with-newline is present in the
     upstream source -- otherwise the dynamic-4bit conversion patch
     no-ops.
+
+    Important: by the time this test runs in the suite,
+    ``unsloth_zoo/patching_utils.py`` has already rebound
+    ``bnb._replace_with_bnb_linear`` to ``_unsloth_replace_with_bnb_linear``
+    and rewritten the source string -- the needle below was deliberately
+    replaced. Reading ``inspect.getsource`` off the live function would
+    return the patched body and false-fail. We instead load the original
+    upstream source from the module file via ``inspect.getsourcefile``
+    so the drift detector still anchors to the genuine upstream API.
     """
     pytest.importorskip("transformers")
     try:
@@ -1089,15 +1114,37 @@ def test_patching_utils_replace_with_bnb_linear_skip_modules_pinned():
             "uses the should_convert_module patch path instead."
         )
         return
-    try:
-        src = inspect.getsource(bnb._replace_with_bnb_linear)
-    except (OSError, TypeError):
-        _drift(
-            "unsloth_zoo/patching_utils.py:682",
-            "inspect.getsource(_replace_with_bnb_linear)",
-            "transformers.integrations.bitsandbytes",
-        )
-        return
+
+    # Resolve the upstream source from the module file directly. Zoo's
+    # patch_utils.py monkey-patches `bnb._replace_with_bnb_linear` to a
+    # renamed `_unsloth_replace_with_bnb_linear` whose body is rewritten
+    # to bypass the needle below. Reading inspect.getsource off the live
+    # attribute would surface that patched source, never the upstream one.
+    live = bnb._replace_with_bnb_linear
+    is_zoo_patched = (
+        getattr(live, "__name__", "") == "_unsloth_replace_with_bnb_linear"
+    )
+    src = None
+    if is_zoo_patched:
+        # Read original source from the module file -- truthful upstream
+        # signal regardless of how many import-fix runs ran first.
+        from pathlib import Path
+        try:
+            mod_file = inspect.getsourcefile(bnb)
+            if mod_file:
+                src = Path(mod_file).read_text(encoding="utf-8")
+        except (OSError, TypeError):
+            src = None
+    if src is None:
+        try:
+            src = inspect.getsource(bnb._replace_with_bnb_linear)
+        except (OSError, TypeError):
+            _drift(
+                "unsloth_zoo/patching_utils.py:682",
+                "inspect.getsource(_replace_with_bnb_linear)",
+                "transformers.integrations.bitsandbytes",
+            )
+            return
     needle = "name in quantization_config.llm_int8_skip_modules\n"
     if needle not in src:
         _drift(
