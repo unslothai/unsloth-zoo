@@ -92,18 +92,13 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 from importlib.util import find_spec
 import platform as _check_platform
 
-# Apply zoo-local import-time pathology workarounds (peft <-> transformers
-# v4 drift, triton CompiledKernel attrs, vLLM rename). These are strict
-# no-ops on healthy installs and MUST run before anything imports peft /
-# triton / vllm transitively. See unsloth_zoo/import_fixes.py for the
-# gating contract of each individual fix.
-try:
-    from .import_fixes import apply_import_fixes as _apply_zoo_import_fixes
-    _apply_zoo_import_fixes()
-    del _apply_zoo_import_fixes
-except Exception:
-    # Never let an import-fix orchestrator crash kill zoo's own import.
-    pass
+# Import-time pathology workarounds (peft <-> transformers v4 drift, triton
+# CompiledKernel attrs, vLLM rename, etc.) live on the ``unsloth`` package
+# in ``unsloth/import_fixes.py`` and are applied at ``import unsloth`` time.
+# ``unsloth_zoo`` cannot be imported standalone -- the GPU init path below
+# requires ``find_spec("unsloth")`` to succeed -- so ``import unsloth`` has
+# always already run by the time we get here, and the patches are in
+# place. We therefore do NOT re-host or re-apply them at zoo import time.
 
 # Detect Apple Silicon MLX mode:
 # Either torch is absent (pure MLX), or unsloth already detected MLX
