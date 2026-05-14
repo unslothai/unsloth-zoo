@@ -401,7 +401,7 @@ jobs:
         # signal is the entire point of the suite; making the cell
         # green-by-default would defeat it.
         #
-        # 354 tests total per cell across 9 files:
+        # 626 tests total per cell across 12 files:
         #
         #   Round 1 (211 tests):
         #     test_upstream_pinned_symbols_{transformers,trl_vllm,accelerator}.py
@@ -436,6 +436,33 @@ jobs:
         #          gpt_oss.py do str.replace / re.sub against upstream
         #          source; this file pins every targeted string so a
         #          silent no-op surfaces.
+        #
+        #   Round 3 (272 tests):
+        #     test_compiler_rewriter_exhaustive.py
+        #       -- 79 tests pinning every str.replace / re.sub /
+        #          re.search site across zoo's compiler.py /
+        #          patching_utils.py / saving_utils.py /
+        #          temporary_patches/* and unsloth's compiler.py /
+        #          models/rl.py / trainer.py. Picks up the
+        #          REMAINING source-rewriter sites that round-2's
+        #          34-pattern sample missed.
+        #     test_compiler_dynamic_exec.py
+        #       -- 85 tests addressing the user's #1 concern:
+        #          UNSLOTH DOES DYNAMIC CODE CREATION. Drives every
+        #          rewrite entry point in zoo's compiler END-TO-END
+        #          on REAL transformers source, then ast.parse +
+        #          exec-in-sandbox the rewritten output to confirm
+        #          it's valid Python. Plus per-model-type smoke for
+        #          39 model_types (gemma3/3n/4, qwen2/3 family,
+        #          gpt_oss, mistral/ministral, deepseek/2/3, llama,
+        #          cohere, phi, starcoder, olmo, falcon, granite,
+        #          glm, pixtral, paligemma, idefics, mllama).
+        #     test_temporary_patches_exhaustive.py
+        #       -- 108 tests exhaustively pinning every
+        #          (model_class, method_name) pair zoo's
+        #          temporary_patches/*.py touches. Catches signature
+        #          drift on Csm / Pixtral / Mxfp4 / GraniteMoeHybrid
+        #          / Mllama / Lfm2VlMultiModalProjector / etc.
         run: |
           python -m pytest -v --tb=short -rs \
             tests/test_upstream_pinned_symbols_transformers.py \
@@ -446,4 +473,7 @@ jobs:
             tests/test_zoo_source_upstream_refs.py \
             tests/test_upstream_signatures.py \
             tests/test_extended_dep_api_pins.py \
-            tests/test_upstream_source_patterns.py
+            tests/test_upstream_source_patterns.py \
+            tests/test_compiler_rewriter_exhaustive.py \
+            tests/test_compiler_dynamic_exec.py \
+            tests/test_temporary_patches_exhaustive.py
