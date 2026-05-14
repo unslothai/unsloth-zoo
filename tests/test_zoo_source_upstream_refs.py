@@ -707,6 +707,7 @@ def test_qwen2_vl_image_processor_class():
     The patch site is wrapped in try/except, but the symbol IS reached on
     transformers >= 5.0; pin the path so a rename produces a clean
     failure instead of a silent no-op."""
+    pytest.importorskip("torchvision")  # transformers qwen2_vl imports it
     _resolve(
         "transformers.models.qwen2_vl.image_processing_qwen2_vl.Qwen2VLImageProcessor",
     )
@@ -724,6 +725,7 @@ def test_qwen2_5_vl_image_processor_class_gated_on_v5():
             f"transformers {transformers.__version__} (zoo patch is "
             "version-gated to >= 5.0.0)"
         )
+    pytest.importorskip("torchvision")  # transformers qwen2_5_vl imports it
     _resolve(
         "transformers.models.qwen2_5_vl.image_processing_qwen2_5_vl.Qwen2_5_VLImageProcessor",
     )

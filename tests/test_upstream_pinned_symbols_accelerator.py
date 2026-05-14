@@ -225,7 +225,7 @@ def test_mlx_trainer_uses_modern_memory_apis_only():
 
     mlx_trainer_path = pathlib.Path(
         importlib.util.find_spec("unsloth_zoo").submodule_search_locations[0]
-    ) / "mlx_trainer.py"
+    ) / "mlx" / "trainer.py"
     src = mlx_trainer_path.read_text()
 
     # The deprecated forms must NOT appear.
@@ -240,7 +240,7 @@ def test_mlx_trainer_uses_modern_memory_apis_only():
 
     # The modern forms must appear.
     for modern in ("mx.set_memory_limit", "mx.set_cache_limit", "mx.set_wired_limit"):
-        assert modern in src, f"Expected modern API {modern} missing from mlx_trainer.py"
+        assert modern in src, f"Expected modern API {modern} missing from mlx/trainer.py"
 
 
 # ---------------------------------------------------------------------------
@@ -325,12 +325,12 @@ def test_get_existing_mlx_quantization_detects_both_keys():
     only checks one silently re-enables the full_finetuning-on-quantized
     foot-gun that 7d2bb95 closed.
     """
-    # Import the helper without triggering the heavy mlx_loader import
+    # Import the helper without triggering the heavy mlx.loader import
     # chain on the GPU-free harness. We pull the function directly.
     import importlib.util
     import pathlib
     pkg_loc = importlib.util.find_spec("unsloth_zoo").submodule_search_locations[0]
-    src = (pathlib.Path(pkg_loc) / "mlx_loader.py").read_text()
+    src = (pathlib.Path(pkg_loc) / "mlx" / "loader.py").read_text()
 
     # The function must check BOTH key names; otherwise repos saved by
     # mlx-lm (key "quantization") OR by HF transformers ("quantization_config")
