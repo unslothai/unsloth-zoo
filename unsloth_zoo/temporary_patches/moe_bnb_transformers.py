@@ -37,10 +37,12 @@ except ImportError:
     Params4bit = None
 
 
-def _check_bnb_available():
-    if not HAS_BNB:
-        return False
-    return True
+__all__ = [
+    "patch_bnb4bit_quantize_convert",
+    "patch_bnb4bit_quantizer_param_needs_quantization",
+    "patch_bnb4bit_quantizer_process_model",
+    "replace_expert_params_with_bnb_params",
+]
 
 
 def _is_expert_module(module: nn.Module) -> bool:
@@ -216,14 +218,20 @@ def patch_bnb4bit_quantizer_param_needs_quantization():
             module, name = get_module_from_name(model, param_name)
             if name in ("gate_up_proj", "down_proj"):
                 param = getattr(module, name, None)
-                if isinstance(param, Params4bit):
+                # Only treat as MoE expert needing quantization if it's a
+                # Params4bit that has NOT already been quantized (bnb_quantized=False).
+                # This protects against a hypothetical re-invocation after first quantize.
+                if (
+                    isinstance(param, Params4bit)
+                    and not getattr(param, "bnb_quantized", False)
+                ):
                     return True
-        except Exception as e:
-            # TODO: Can we raise an error here?
-            logger.warning(
-                f"Unsloth: Error checking MoE expert param_needs_quantization for {param_name}: {e}"
-            )
-            pass
+        except (KeyError, AttributeError) as e:
+            # Expected when get_module_from_name can't resolve the name. Fall through.
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.info(
+                    f"Unsloth: param_needs_quantization fall-through for {param_name}: {e}"
+                )
         
         return False
     
