@@ -22,7 +22,7 @@ Patches transformers' bitsandbytes quantization to handle MoE expert parameters
 
 import torch
 import torch.nn as nn
-from typing import Optional, List, Tuple, Union
+from typing import Optional, List, Union
 import os
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
 from .utils import patch_function, raise_error
@@ -183,9 +183,18 @@ def patch_bnb4bit_quantize_convert():
                 module._is_hf_initialized = True
                 return {full_layer_name: new_value}
         
-        except Exception as e:
-            logger.warning(f"Unsloth: Error handling expert param quantization for {full_layer_name}: {e}")
-            pass
+        except (KeyError, AttributeError) as e:
+            # Expected non-fatal: get_module_from_name didn't resolve, or module
+            # didn't have the expected expert-shaped attributes. Fall through to
+            # original convert. Logged at info-level under UNSLOTH_ENABLE_LOGGING.
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.info(f"Unsloth: expert convert fall-through for {full_layer_name}: {e}")
+        except Exception:
+            # Unexpected: use logger.exception so the traceback is preserved for
+            # post-mortem. Still fall through to original_convert (don't break the
+            # whole load) but make sure the bug is visible — broad swallowing was
+            # what masked B1 (the list[Tensor] unwrap regression).
+            logger.exception(f"Unsloth: unexpected error in patched_convert for {full_layer_name}")
 
         # Fall back to original convert for non-expert params or in case of any failure
         return original_convert(self, input_dict, full_layer_name=full_layer_name, model=model, **kwargs)

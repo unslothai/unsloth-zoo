@@ -480,15 +480,21 @@ def _get_base_weight(param):
     while hasattr(param, "base_layer"):
         param = param.base_layer
     
-    if (
-        _check_bnb_available()
-        and isinstance(param, Params4bit)
-        and getattr(param, "quant_state", None) is not None
-    ):
+    if _check_bnb_available() and isinstance(param, Params4bit):
         # Guard against quant_state=None (e.g., meta-device placeholder before
         # patched_convert fired, or Params4bit constructed but not moved to cuda).
-        # Without this guard bnb.functional.dequantize_4bit dereferences None and
-        # raises a confusing C-side error far from the failing site.
+        # Raise an actionable error instead of dereferencing None inside
+        # bnb.functional.dequantize_4bit (which raises a confusing C-side error)
+        # OR silently returning packed uint8 data downstream (which mis-shapes the
+        # next operation).
+        if getattr(param, "quant_state", None) is None:
+            raise RuntimeError(
+                "unsloth: _get_base_weight saw a Params4bit with quant_state=None. "
+                "This usually means the model was used in forward before loading "
+                "completed quantization (meta placeholder still in place), or the "
+                "MoE quantizer patch did not fire for this expert. "
+                f"data.shape={tuple(param.data.shape)}, device={param.device}."
+            )
         return bnb.functional.dequantize_4bit(param.data, param.quant_state)
 
     if hasattr(param, "get_param"):
