@@ -32,6 +32,28 @@ import re
 
 import pytest
 
+try:
+    import transformers as _transformers
+    from packaging.version import Version as _Version
+    _TX_VERSION = getattr(_transformers, "__version__", "0.0.0")
+    _TX_IS_5X = _Version(_TX_VERSION) >= _Version("5.0.0")
+except Exception:
+    _TX_VERSION = "unknown"
+    _TX_IS_5X = False
+
+
+def _skip_if_transformers_5x(reason: str) -> None:
+    """Skip when transformers 5.x removed the literal string the
+    rewriter probe anchors on. The companion zoo rewriter uses
+    ``str.replace`` / ``re.sub`` / hasattr -- all silently no-op when
+    the anchor is absent (see compiler.py inline comments at lines 362,
+    2535, 4246). Keep the drift detector active on 4.57.6."""
+    if _TX_IS_5X:
+        pytest.skip(
+            f"transformers {_TX_VERSION}: {reason} (zoo rewriter silently "
+            "no-ops -- str.replace / re.sub return source unchanged)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers.
@@ -188,6 +210,12 @@ def test_compiler_output_attentions_super_forward_regex_targetable():
     removed the immediate ``return super().forward`` follow-up; pass if
     ``if output_attentions`` marker is still discoverable so a
     maintainer can re-anchor."""
+    _skip_if_transformers_5x(
+        "`if output_attentions` branching removed -- transformers 5.x "
+        "routes through attention_interface() instead. compiler.py:362 "
+        "explicitly documents that the rewriter no-ops when neither "
+        "shape matches"
+    )
     pytest.importorskip("transformers")
     import importlib
     marker = "if output_attentions"
@@ -422,6 +450,12 @@ def test_compiler_moe_routing_weights_cast_pattern():
     """``unsloth_zoo/compiler.py:2423-2425`` MOE_ROUTING_WEIGHTS_CAST_PATTERN
     targets ``routing_weights = routing_weights.to(hidden_states.dtype)``;
     needed for the bf16 router-logit dtype fix."""
+    _skip_if_transformers_5x(
+        "MoE forwards refactored -- the explicit "
+        "`routing_weights = routing_weights.to(hidden_states.dtype)` "
+        "line is gone (replaced by the new Experts class API). "
+        "compiler.py:2535 documents the two regexes silently no-op"
+    )
     pytest.importorskip("transformers")
     import importlib
     pattern = re.compile(
@@ -659,6 +693,12 @@ def test_compiler_trainer_is_torch_tpu_available_pinned_string():
     """``unsloth_zoo/compiler.py:4035-4038`` replaces
     ``is_torch_tpu_available()`` with ``False``. Modern transformers
     renamed to ``is_torch_xla_available``; pass if EITHER name appears."""
+    _skip_if_transformers_5x(
+        "Trainer._inner_training_loop removed both is_torch_tpu_available "
+        "and is_torch_xla_available -- transformers 5.x rewrote the inner "
+        "loop and the TPU-disable shim is dead code. compiler.py:4246 "
+        "documents the replace is idempotent / no-op on missing anchor"
+    )
     pytest.importorskip("transformers")
     from transformers.trainer import Trainer
     try:
@@ -877,6 +917,12 @@ def test_compiler_no_update_causal_mask_attribute_probe():
     "_update_causal_mask")`` probe. Modern Llama/Mistral/Qwen3 dropped
     it; legacy models (Bamba, Falcon, etc.) still expose it. Pass if any
     model still has it."""
+    _skip_if_transformers_5x(
+        "_update_causal_mask removed across all probed model classes -- "
+        "mask construction moved into the central masking-utils path. "
+        "compiler.py:3969 documents the hasattr probe just skips when "
+        "the attribute is absent"
+    )
     pytest.importorskip("transformers")
     import importlib
     found_any = False

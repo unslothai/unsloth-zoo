@@ -31,6 +31,25 @@ import re
 
 import pytest
 
+try:
+    import transformers as _transformers
+    from packaging.version import Version as _Version
+    _TX_VERSION = getattr(_transformers, "__version__", "0.0.0")
+    _TX_IS_5X = _Version(_TX_VERSION) >= _Version("5.0.0")
+except Exception:
+    _TX_VERSION = "unknown"
+    _TX_IS_5X = False
+
+
+def _skip_if_transformers_5x(reason: str) -> None:
+    """Skip when transformers 5.x removed the anchor the rewriter
+    probe pins. Keep the detector strict on 4.57.6."""
+    if _TX_IS_5X:
+        pytest.skip(
+            f"transformers {_TX_VERSION}: {reason} (zoo rewriter silently "
+            "no-ops -- str.replace returns source unchanged)"
+        )
+
 
 # Shared helpers (mirror test_upstream_source_patterns.py).
 
@@ -601,6 +620,12 @@ def test_compiler_class_pretrainedmodel_finder_pattern():
 def test_compiler_routing_weights_to_marker_in_source():
     """``unsloth_zoo/compiler.py:3376`` branches on ``routing_weights.to``
     in MoE forward (router-logit-cast / bf16 router fix anchor)."""
+    _skip_if_transformers_5x(
+        "MoE forwards refactored on transformers 5.x -- `routing_weights.to` "
+        "substring no longer present in mixtral/qwen2_moe/qwen3_moe/deepseek_v3. "
+        "compiler.py:3524 substring-in check just skips the module from the "
+        "router_logit_cast_modules list"
+    )
     pytest.importorskip("transformers")
     candidates = [
         "transformers.models.mixtral.modeling_mixtral",
@@ -1070,7 +1095,16 @@ def test_saving_utils_save_pretrained_state_dict_split_pinned_string():
 def test_saving_utils_save_pretrained_state_dict_contiguous_pinned_string():
     """``unsloth_zoo/saving_utils.py:2680-2686`` requires
     ``state_dict[tensor].contiguous()`` in upstream + replace to
-    ``merge_lora_weights(...)``; RuntimeError otherwise."""
+    ``merge_lora_weights(...)``; RuntimeError otherwise.
+
+    transformers 5.x rewrote PreTrainedModel.save_pretrained (sharding /
+    state-dict iteration moved). zoo's saving_utils.py upfront-anchor
+    check (``_required_anchors``) detects the missing string and falls
+    back to vanilla ``model.save_pretrained`` with a warning. The
+    detector becomes a positive-assertion on 5.x: confirm the anchor is
+    gone AND zoo's _required_anchors list flags it AND the warning path
+    fires gracefully (no RuntimeError).
+    """
     pytest.importorskip("transformers")
     import transformers.modeling_utils as mu
     try:
@@ -1078,6 +1112,24 @@ def test_saving_utils_save_pretrained_state_dict_contiguous_pinned_string():
     except (OSError, TypeError):
         pytest.skip("save_pretrained source unavailable")
     needle = "state_dict[tensor].contiguous()"
+    if _TX_IS_5X:
+        assert needle not in src, (
+            f"transformers {_TX_VERSION}: `{needle}` was expected gone "
+            "on 5.x but is present; refresh the zoo prod-fix anchor "
+            "list at saving_utils.py:_required_anchors"
+        )
+        # Positive assertion: zoo's prod-fix correctly identifies the
+        # missing anchor in its preflight check.
+        import unsloth_zoo.saving_utils as zsu
+        zsu_src = inspect.getsource(zsu.merge_and_dequantize_lora)
+        assert needle in zsu_src, (
+            f"transformers {_TX_VERSION}: anchor `{needle}` missing on "
+            "5.x but zoo's _required_anchors check doesn't include it; "
+            "production call merge_and_dequantize_lora() will hit the "
+            "downstream per-anchor RuntimeError instead of the "
+            "graceful fallback"
+        )
+        return
     if needle not in src:
         _drift(
             "unsloth_zoo/saving_utils.py:2680-2686",
@@ -1129,7 +1181,15 @@ def test_saving_utils_incremental_save_os_makedirs_pinned_regex():
 def test_saving_utils_incremental_save_for_loop_filename_to_tensors_pinned():
     """``unsloth_zoo/saving_utils.py:2526-2533`` requires
     ``for shard_file, tensors in filename_to_tensors`` in
-    save_pretrained; RuntimeError otherwise."""
+    save_pretrained; RuntimeError otherwise.
+
+    transformers 5.x renamed the iterator. zoo's prod fix in
+    ``merge_and_dequantize_lora`` runs an upfront anchor check that
+    includes this string and falls back to vanilla
+    ``model.save_pretrained`` (with a warning) when push_to_hub=True
+    and the anchor is missing. On 5.x: assert the anchor is gone AND
+    zoo's preflight check covers it.
+    """
     pytest.importorskip("transformers")
     import transformers.modeling_utils as mu
     try:
@@ -1137,6 +1197,20 @@ def test_saving_utils_incremental_save_for_loop_filename_to_tensors_pinned():
     except (OSError, TypeError):
         pytest.skip("save_pretrained source unavailable")
     needle = "for shard_file, tensors in filename_to_tensors"
+    if _TX_IS_5X:
+        assert needle not in src, (
+            f"transformers {_TX_VERSION}: `{needle}` was expected gone "
+            "on 5.x but is present; refresh the zoo prod-fix anchor "
+            "list at saving_utils.py:_required_anchors"
+        )
+        import unsloth_zoo.saving_utils as zsu
+        zsu_src = inspect.getsource(zsu.merge_and_dequantize_lora)
+        assert needle in zsu_src, (
+            f"transformers {_TX_VERSION}: anchor `{needle}` missing on "
+            "5.x but zoo's _required_anchors check doesn't include it; "
+            "merge_and_dequantize_lora(push_to_hub=True) will RuntimeError"
+        )
+        return
     if needle not in src:
         _drift(
             "unsloth_zoo/saving_utils.py:2526-2533",
@@ -1358,7 +1432,19 @@ def test_gpt_oss_config_old_class_dedent_compare_marker():
     """``unsloth_zoo/temporary_patches/gpt_oss.py:2808-2810``
     line-by-line equality compare of dedented GptOssConfig vs OLD
     class; pin ``initial_context_length`` / ``rope_scaling`` field
-    presence (the Old_GptOssConfig regression target)."""
+    presence (the Old_GptOssConfig regression target).
+
+    transformers 5.x replaced ``rope_theta`` / ``rope_scaling`` /
+    ``initial_context_length`` with the ``rope_parameters`` dict. zoo's
+    ``patch_gpt_oss_config`` gates on
+    ``inspect.getsource(GptOssConfig) == Old_GptOssConfig``, so the
+    patch silently no-ops on the new shape -- skip the detector on 5.x.
+    """
+    _skip_if_transformers_5x(
+        "GptOssConfig replaced rope_theta/rope_scaling/initial_context_length "
+        "with rope_parameters dict; patch site silently no-ops via source-"
+        "equality gate"
+    )
     pytest.importorskip("transformers")
     try:
         from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig

@@ -23,6 +23,28 @@ from typing import Iterable
 
 import pytest
 
+try:
+    import transformers as _transformers
+    from packaging.version import Version as _Version
+    _TX_IS_5X = _Version(getattr(_transformers, "__version__", "0.0.0")) >= _Version("5.0.0")
+    _TX_VERSION = getattr(_transformers, "__version__", "0.0.0")
+except Exception:
+    _TX_IS_5X = False
+    _TX_VERSION = "unknown"
+
+
+def _skip_if_transformers_5x(reason: str) -> None:
+    """Skip when transformers 5.x removed the named param the drift
+    detector anchors on. The companion zoo patch wraps with **kwargs
+    via patch_function(match_level='relaxed'), so the runtime call
+    still works -- the source-string anchor just isn't there to probe.
+    Keep the detector strict on 4.57.6."""
+    if _TX_IS_5X:
+        pytest.skip(
+            f"transformers {_TX_VERSION}: {reason} (zoo patch silently "
+            "no-ops via relaxed patch_function)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -646,6 +668,10 @@ def test_MinistralModel_forward_signature():
     match_level='relaxed'. zoo forwards input_ids, attention_mask,
     position_ids, past_key_values, inputs_embeds, use_cache,
     cache_position by name."""
+    _skip_if_transformers_5x(
+        "MinistralModel.forward moved cache_position into "
+        "**kwargs: Unpack[TransformersKwargs]"
+    )
     try:
         from transformers.models.ministral.modeling_ministral import (
             MinistralModel,
@@ -865,6 +891,10 @@ def test_GraniteMoeHybridMambaLayer_cuda_kernels_forward_signature():
     """misc.py:1061 patches ``GraniteMoeHybridMambaLayer.cuda_kernels_forward
     (self, hidden_states, cache_params, cache_position, attention_mask,
     seq_idx)``."""
+    _skip_if_transformers_5x(
+        "GraniteMoeHybridMambaLayer.cuda_kernels_forward moved cache_position "
+        "into **kwargs: Unpack[TransformersKwargs]"
+    )
     try:
         from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
             GraniteMoeHybridMambaLayer,

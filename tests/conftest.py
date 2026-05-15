@@ -235,6 +235,13 @@ if str(_TESTS_DIR) not in sys.path:
 # ---------------------------------------------------------------------------
 
 def _apply_upstream_import_fixes_for_tests() -> None:
+    # Let `import unsloth` succeed on a CPU-only CI runner. The flag is
+    # honoured by unsloth's get_device_type (returns "cuda" sentinel) and
+    # by PatchFastRL / _patch_trl_trainer (early-return so trl.SFTTrainer
+    # stays pristine for downstream inspect.getsource drift detectors).
+    # Production hosts with a real accelerator skip both branches.
+    import os
+    os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
     try:
         import unsloth  # noqa: F401  # runs unsloth/import_fixes.py
     except Exception:
