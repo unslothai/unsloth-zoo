@@ -125,7 +125,49 @@ def patch_glm4_moe():
     patch_function(Glm4MoeLiteMoE,      "forward", moe_block_forward)
 
     if UNSLOTH_ENABLE_LOGGING:
-        logger.info("Unsloth: Patched GLM4 MoE for Split LoRA support.")
+        logger.info("Unsloth: Patched GLM4 MoE Lite for Split LoRA support.")
 
-# Register the patch
+
+def patch_glm4_moe_standard():
+    """
+    Patches standard (non-lite) GLM4 MoE (Glm4MoeNaiveMoe + Glm4MoeMoE).
+    Uses the same _glm4_lora_extractor and grouped-MM forward as the lite variant.
+    """
+    patch_param_wrapper_for_moe()
+
+    try:
+        from transformers.models.glm4_moe.modeling_glm4_moe import (
+            Glm4MoeMoE,
+            Glm4MoeNaiveMoe,
+        )
+    except ImportError:
+        return
+
+    def _glm4_std_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+        total_rank = weight_A.shape[0]
+        rank_per_expert = total_rank // num_experts
+        dim1 = weight_A.shape[1]
+        dim2 = weight_B.shape[0]
+
+        if dim1 > dim2:
+            first_weight = weight_B.view(dim2, num_experts, rank_per_expert)
+            first_weight = first_weight.permute(1, 0, 2).contiguous()
+            second_weight = weight_A.view(num_experts, rank_per_expert, dim1).contiguous()
+        else:
+            first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
+            first_weight = first_weight.permute(0, 2, 1).contiguous()
+            second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
+            second_weight = second_weight.permute(1, 2, 0).contiguous()
+
+        return first_weight, second_weight, scaling, num_experts
+
+    Glm4MoeNaiveMoe._unsloth_lora_extractor_fn = staticmethod(_glm4_std_lora_extractor)
+
+    patch_function(Glm4MoeNaiveMoe, "forward", get_forward_moe_backend())
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: Patched GLM4 MoE (standard) for Split LoRA support.")
+
+# Register the patches
 TEMPORARY_PATCHES.append(patch_glm4_moe)
+TEMPORARY_PATCHES.append(patch_glm4_moe_standard)
