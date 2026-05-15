@@ -72,42 +72,51 @@ def _has_real_accelerator() -> bool:
     return False
 
 
-def _preload_real_device_type() -> bool:
-    """Pre-load the REAL ``unsloth_zoo.device_type`` module under a
+def _preload_real_device_type(
+    package: str = "unsloth_zoo",
+    prereqs: tuple = ("utils",),
+) -> bool:
+    """Pre-load the REAL ``<package>.device_type`` module under a
     temporarily-mocked ``torch.cuda.is_available()`` so its
     ``DEVICE_TYPE = get_device_type()`` initialization succeeds without
     a real accelerator. Returns True on success; returns False if
     torch is not importable at all (the security-audit CI job runs
     tests/security/ without installing torch, and those tests don't
-    need the preload).
+    need the preload), or if the target package isn't installed.
+
+    Parameterised so the same harness works for both ``unsloth_zoo``
+    (where ``utils.py`` defines ``Version`` before ``device_type``
+    consumes it) and ``unsloth`` (which has no such prereq).
     """
-    if "unsloth_zoo.device_type" in sys.modules:
+    target = f"{package}.device_type"
+    if target in sys.modules:
         return True
-    pkg_spec = importlib.util.find_spec("unsloth_zoo")
+    pkg_spec = importlib.util.find_spec(package)
     if pkg_spec is None or not pkg_spec.submodule_search_locations:
         return False
     pkg_path = pkg_spec.submodule_search_locations[0]
 
     import os
 
-    skeleton_already = "unsloth_zoo" in sys.modules
+    skeleton_already = package in sys.modules
     if not skeleton_already:
-        zoo_pkg = types.ModuleType("unsloth_zoo")
-        zoo_pkg.__path__ = [pkg_path]
-        zoo_pkg.__spec__ = pkg_spec
-        zoo_pkg.__package__ = "unsloth_zoo"
-        sys.modules["unsloth_zoo"] = zoo_pkg
+        pkg_mod = types.ModuleType(package)
+        pkg_mod.__path__ = [pkg_path]
+        pkg_mod.__spec__ = pkg_spec
+        pkg_mod.__package__ = package
+        sys.modules[package] = pkg_mod
 
     try:
-        if "unsloth_zoo.utils" not in sys.modules:
-            utils_path = os.path.join(pkg_path, "utils.py")
-            utils_spec = importlib.util.spec_from_file_location(
-                "unsloth_zoo.utils", utils_path,
-            )
-            utils_mod = importlib.util.module_from_spec(utils_spec)
-            sys.modules["unsloth_zoo.utils"] = utils_mod
+        for prereq in prereqs:
+            full = f"{package}.{prereq}"
+            if full in sys.modules:
+                continue
+            prereq_path = os.path.join(pkg_path, f"{prereq}.py")
+            prereq_spec = importlib.util.spec_from_file_location(full, prereq_path)
+            prereq_mod = importlib.util.module_from_spec(prereq_spec)
+            sys.modules[full] = prereq_mod
             try:
-                utils_spec.loader.exec_module(utils_mod)
+                prereq_spec.loader.exec_module(prereq_mod)
             except ModuleNotFoundError as exc:
                 # Tests that don't need torch (e.g. the tests/security
                 # subtree which only exercises scanner regex tables and
@@ -115,18 +124,16 @@ def _preload_real_device_type() -> bool:
                 # device-type preload when torch isn't installed. Pop
                 # the half-built modules and bail out gracefully.
                 if "torch" in str(exc):
-                    sys.modules.pop("unsloth_zoo.utils", None)
+                    sys.modules.pop(full, None)
                     if not skeleton_already:
-                        sys.modules.pop("unsloth_zoo", None)
+                        sys.modules.pop(package, None)
                     return False
                 raise
 
         device_type_path = os.path.join(pkg_path, "device_type.py")
-        dt_spec = importlib.util.spec_from_file_location(
-            "unsloth_zoo.device_type", device_type_path,
-        )
+        dt_spec = importlib.util.spec_from_file_location(target, device_type_path)
         dt_mod = importlib.util.module_from_spec(dt_spec)
-        sys.modules["unsloth_zoo.device_type"] = dt_mod
+        sys.modules[target] = dt_mod
 
         import torch
         _orig_is_avail = torch.cuda.is_available
@@ -137,9 +144,27 @@ def _preload_real_device_type() -> bool:
             torch.cuda.is_available = _orig_is_avail
     finally:
         if not skeleton_already:
-            sys.modules.pop("unsloth_zoo", None)
+            sys.modules.pop(package, None)
 
     return True
+
+
+def _install_device_type_stub(name: str) -> None:
+    """Last-resort stub when the real preload can't run (no torch / no
+    package installed). Matches the surface ``unsloth`` and ``unsloth_zoo``
+    consumers read at import time."""
+    stub = types.ModuleType(name)
+    stub.DEVICE_TYPE = "cuda"
+    stub.DEVICE_TYPE_TORCH = "cuda"
+    stub.DEVICE_COUNT = 1
+    stub.ALLOW_PREQUANTIZED_MODELS = False
+    stub.is_hip = lambda: False
+    stub.get_device_type = lambda: "cuda"
+    stub.get_device_count = lambda: 1
+    stub.device_synchronize = lambda *a, **k: None
+    stub.device_empty_cache = lambda *a, **k: None
+    stub.device_is_bf16_supported = lambda *a, **k: False
+    sys.modules[name] = stub
 
 
 def _patch_torch_cuda_for_import() -> None:
@@ -173,19 +198,15 @@ def _patch_torch_cuda_for_import() -> None:
 
 
 if not _has_real_accelerator():
-    if not _preload_real_device_type():
-        stub = types.ModuleType("unsloth_zoo.device_type")
-        stub.DEVICE_TYPE = "cuda"
-        stub.DEVICE_TYPE_TORCH = "cuda"
-        stub.DEVICE_COUNT = 1
-        stub.ALLOW_PREQUANTIZED_MODELS = False
-        stub.is_hip = lambda: False
-        stub.get_device_type = lambda: "cuda"
-        stub.get_device_count = lambda: 1
-        stub.device_synchronize = lambda *a, **k: None
-        stub.device_empty_cache = lambda *a, **k: None
-        stub.device_is_bf16_supported = lambda *a, **k: False
-        sys.modules["unsloth_zoo.device_type"] = stub
+    if not _preload_real_device_type("unsloth_zoo", prereqs=("utils",)):
+        _install_device_type_stub("unsloth_zoo.device_type")
+    # Also stub unsloth.device_type so tests that import unsloth (or any
+    # submodule like unsloth.trainer) on a CPU-only runner don't trip
+    # unsloth/device_type.py's own NotImplementedError. The real preload
+    # uses unsloth's own get_device_type(), which consults unsloth_zoo's
+    # Version helper, so no extra prereqs are needed here.
+    if not _preload_real_device_type("unsloth", prereqs=()):
+        _install_device_type_stub("unsloth.device_type")
     _patch_torch_cuda_for_import()
 
 
