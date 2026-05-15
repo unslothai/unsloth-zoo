@@ -41,6 +41,7 @@ __all__ = [
     "patch_bnb4bit_quantize_convert",
     "patch_bnb4bit_quantizer_param_needs_quantization",
     "patch_bnb4bit_quantizer_process_model",
+    "patch_transformers_grouped_linear_4bit",
     "replace_expert_params_with_bnb_params",
 ]
 
@@ -285,3 +286,114 @@ def patch_bnb4bit_quantizer_process_model():
     pass
 pass
 TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_process_model)
+
+
+def _maybe_dequant_params4bit_weight(weight, input_dtype):
+    """If `weight` is a packed Params4bit, dequantize to logical shape and cast
+    to `input_dtype`. Otherwise return `weight` unchanged.
+    """
+    if isinstance(weight, Params4bit) and getattr(weight, "quant_state", None) is not None:
+        original_shape = getattr(weight, "_original_shape", None)
+        dequant = bnb.functional.dequantize_4bit(weight.data, weight.quant_state)
+        if original_shape is not None and tuple(dequant.shape) != tuple(original_shape):
+            dequant = dequant.reshape(original_shape)
+        return dequant.to(input_dtype)
+    return weight
+
+
+def patch_transformers_grouped_linear_4bit():
+    """
+    transformers v5's `grouped_mm_experts_forward` and `batched_mm_experts_forward`
+    (in `transformers.integrations.moe`) read `self.gate_up_proj` /
+    `self.down_proj` raw and pass them through `_grouped_linear` /
+    `_batched_linear` -> `weight.transpose(-2, -1)` -> `torch._grouped_mm` /
+    `torch.bmm` -> `mat_a.to(weight.dtype)` ...
+
+    For MoE arches whose experts class is NOT replaced by an unsloth-zoo
+    per-arch patch (e.g. some Glm4Moe variants, Gemma4MoE), the experts forward
+    therefore sees the raw Params4bit (uint8 packed storage). The matmul ops raise:
+        - grouped_mm path:  `RuntimeError: Expected mat_a to be Float32, BFloat16 or
+                            Float16 matrix, got Byte` (during training)
+        - batched_mm path:  `RuntimeError: batch1 must be a 3D tensor` (during
+                            autoregressive decoding where the batched_mm dispatcher
+                            is used instead of grouped_mm)
+
+    Fix: wrap `_grouped_linear` and `_batched_linear` to detect Params4bit
+    weights, dequantize via `bnb.functional.dequantize_4bit` (using
+    `_original_shape` to recover the logical 3D `(E, in, out)` shape from
+    packed `(N, 1)` storage), cast to the input dtype, then delegate to the
+    original function which handles `is_transposed` orientation correctly.
+
+    Forward-only -- base weights are frozen; gradient flow stays on LoRA paths
+    that the per-arch wrappers (when they exist) inject separately. For arches
+    without a per-arch wrapper this gives base-only forward; PEFT's
+    `_activate_lora` parametrization adds the delta on top.
+    """
+    try:
+        from transformers.integrations import moe as tf_moe
+    except ImportError:
+        return
+    if not HAS_BNB:
+        return
+
+    if hasattr(tf_moe, "_grouped_linear") and not getattr(tf_moe._grouped_linear, "_unsloth_4bit_moe_patched", False):
+        _original_grouped_linear = tf_moe._grouped_linear
+
+        def _patched_grouped_linear(input, weight, offs, bias=None, is_transposed=False):
+            weight = _maybe_dequant_params4bit_weight(weight, input.dtype)
+            return _original_grouped_linear(input, weight, offs, bias=bias, is_transposed=is_transposed)
+
+        _patched_grouped_linear._unsloth_4bit_moe_patched = True
+        patch_function(tf_moe, "_grouped_linear", _patched_grouped_linear, match_level="relaxed")
+
+    if hasattr(tf_moe, "_batched_linear") and not getattr(tf_moe._batched_linear, "_unsloth_4bit_moe_patched", False):
+        _original_batched_linear = tf_moe._batched_linear
+
+        def _patched_batched_linear(input, weight, bias=None, is_transposed=False):
+            weight = _maybe_dequant_params4bit_weight(weight, input.dtype)
+            return _original_batched_linear(input, weight, bias=bias, is_transposed=is_transposed)
+
+        _patched_batched_linear._unsloth_4bit_moe_patched = True
+        patch_function(tf_moe, "_batched_linear", _patched_batched_linear, match_level="relaxed")
+
+    # batched_mm_experts_forward indexes `self.gate_up_proj[expert_ids]` BEFORE
+    # passing to `_batched_linear`. For a packed Params4bit (storage shape
+    # (N, 1) uint8), the indexing returns garbage (a (S, 1) uint8 slice) and
+    # the dtype information is lost — `_patched_batched_linear` no longer sees
+    # a Params4bit. Wrap the experts-forward dispatcher itself so the dequant
+    # happens BEFORE indexing.
+    if hasattr(tf_moe, "batched_mm_experts_forward") and not getattr(tf_moe.batched_mm_experts_forward, "_unsloth_4bit_moe_patched", False):
+        _original_batched_mm_experts_forward = tf_moe.batched_mm_experts_forward
+
+        def _patched_batched_mm_experts_forward(self, hidden_states, top_k_index, top_k_weights):
+            # Temporarily swap any packed Params4bit experts to dequantized 3D tensors
+            # for the duration of this forward call. setattr-restore pattern keeps the
+            # base layer Params4bit intact for subsequent calls / save / merge.
+            swapped = []
+            for attr in ("gate_up_proj", "down_proj", "up_proj"):
+                w = getattr(self, attr, None)
+                if isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None:
+                    dequant = _maybe_dequant_params4bit_weight(w, hidden_states.dtype)
+                    object.__setattr__(self, attr, dequant)
+                    swapped.append((attr, w))
+            try:
+                return _original_batched_mm_experts_forward(self, hidden_states, top_k_index, top_k_weights)
+            finally:
+                for attr, original in swapped:
+                    object.__setattr__(self, attr, original)
+
+        _patched_batched_mm_experts_forward._unsloth_4bit_moe_patched = True
+        patch_function(tf_moe, "batched_mm_experts_forward", _patched_batched_mm_experts_forward, match_level="relaxed")
+        # Also re-register in the dispatcher mapping so the forward decorator picks
+        # up the patched version (the decorator stores a reference at class-decoration
+        # time via ALL_EXPERTS_FUNCTIONS.get(...)).
+        try:
+            if hasattr(tf_moe, "ALL_EXPERTS_FUNCTIONS"):
+                tf_moe.ALL_EXPERTS_FUNCTIONS["batched_mm"] = _patched_batched_mm_experts_forward
+        except Exception:
+            pass
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: Patched transformers.integrations.moe._grouped_linear / _batched_linear / batched_mm_experts_forward for 4-bit MoE expert support")
+pass
+TEMPORARY_PATCHES.append(patch_transformers_grouped_linear_4bit)
