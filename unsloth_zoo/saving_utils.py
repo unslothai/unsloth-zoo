@@ -2635,6 +2635,47 @@ def merge_and_dequantize_lora(
     save_pretrained = save_pretrained.split("\n")
     save_pretrained = "\n".join(x[spaces:] for x in save_pretrained)
 
+    # transformers 5.x rewrote PreTrainedModel.save_pretrained -- the
+    # source-string anchors zoo's LoRA-merge optimization relies on are
+    # gone. Detect that upfront and fall back to vanilla save_pretrained
+    # so users on 5.x don't see a hard `Failed to find ...` RuntimeError
+    # from the per-anchor checks below. The LoRA merge won't run, so
+    # callers must `model.merge_and_unload()` (or equivalent) themselves
+    # before saving on 5.x.
+    _required_anchors = [
+        "state_dict_split = split_torch_state_dict_into_shards",
+        "state_dict[tensor].contiguous()",
+        "def save_pretrained",
+    ]
+    if push_to_hub:
+        _required_anchors.append("for shard_file, tensors in filename_to_tensors")
+    _missing_anchors = [a for a in _required_anchors if a not in save_pretrained]
+    if _missing_anchors:
+        import transformers as _tx
+        warnings.warn(
+            "Unsloth: transformers "
+            f"{getattr(_tx, '__version__', 'unknown')} rewrote "
+            f"PreTrainedModel.save_pretrained -- the source-string "
+            f"anchors {_missing_anchors!r} are missing, so the "
+            "LoRA-merge-on-save optimization is skipped. Calling "
+            "vanilla model.save_pretrained instead; merge LoRA "
+            "explicitly (e.g. model.merge_and_unload()) before "
+            "saving if you need the merged weights on disk.",
+            stacklevel = 2,
+        )
+        model.save_pretrained(
+            save_directory     = save_directory,
+            push_to_hub        = push_to_hub,
+            max_shard_size     = max_shard_size,
+            safe_serialization = safe_serialization,
+            token              = token,
+            private            = private,
+            revision           = revision,
+        )
+        if tokenizer is not None:
+            tokenizer.save_pretrained(save_directory = save_directory)
+        return
+
     # Now patch for incremental pushing to hub
     if push_to_hub:
         save_pretrained = incremental_save_pretrained(

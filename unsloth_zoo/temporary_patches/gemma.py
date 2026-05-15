@@ -30,6 +30,7 @@ from .utils import (
     Cache,
     StaticCache,
     HybridCache,
+    HAS_HYBRID_CACHE,
     Unpack,
     patch_function_past_key_values,
     dedent,
@@ -257,7 +258,10 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
         inputs_lead_dim, sequence_length = input_tensor.shape[:2]
         if using_static_cache:
             target_length = past_key_values.get_max_cache_shape()
-        elif isinstance(past_key_values, HybridCache):
+        elif HAS_HYBRID_CACHE and isinstance(past_key_values, HybridCache):
+            # HAS_HYBRID_CACHE gates the isinstance because transformers 5.x
+            # removed HybridCache; the fallback typing.Any from utils.py
+            # would otherwise raise TypeError here.
             target_length = past_key_values.get_max_cache_shape()
         else:
             target_length = (

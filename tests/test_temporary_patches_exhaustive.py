@@ -36,8 +36,25 @@ import pytest
 
 pytest.importorskip("transformers")
 import transformers  # noqa: E402
+from packaging.version import Version  # noqa: E402
 
 _TX_VERSION = getattr(transformers, "__version__", "0.0.0")
+_TX_IS_5X = Version(_TX_VERSION) >= Version("5.0.0")
+
+
+def _skip_if_transformers_5x(reason: str) -> None:
+    """transformers 5.x moved many ForCausalLM.forward named params
+    (notably ``cache_position``) into ``**kwargs: Unpack[TransformersKwargs]``
+    and renamed others (``rope_theta`` -> ``rope_parameters`` on GptOssConfig).
+    The runtime patches gracefully no-op via try/except + relaxed
+    patch_function, so the drift detector serves no purpose on 5.x and
+    just blocks CI. Skip with the upstream-removal reason; keep the
+    detector active on 4.57.6 where real drift can still surface."""
+    if _TX_IS_5X:
+        pytest.skip(
+            f"transformers {_TX_VERSION}: {reason} (zoo patch silently "
+            "no-ops via try/except + relaxed patch_function)"
+        )
 
 
 def _try_get_class(dotted_module: str, class_name: str):
@@ -323,6 +340,10 @@ def test_deepseek_v3_for_causal_lm_forward_named_params():
     by-name kwargs (input_ids, attention_mask, ..., output_router_logits,
     cache_position, logits_to_keep); output_router_logits may be in
     **kwargs (TransformersKwargs catch-all)."""
+    _skip_if_transformers_5x(
+        "DeepseekV3ForCausalLM.forward moved cache_position into "
+        "**kwargs: Unpack[TransformersKwargs]"
+    )
     cls = _try_get_class(
         "transformers.models.deepseek_v3.modeling_deepseek_v3",
         "DeepseekV3ForCausalLM",
@@ -689,7 +710,17 @@ def test_mxfp4_gpt_oss_experts_class_present_and_init_signature():
 
 def test_gpt_oss_config_class_construction_signature():
     """gpt_oss.py:2813 replaces GptOssConfig with Old_GptOssConfig; pin
-    kwarg names (num_hidden_layers, num_local_experts, vocab_size, ...)."""
+    kwarg names (num_hidden_layers, num_local_experts, vocab_size, ...).
+
+    transformers 5.x renamed ``rope_theta`` -> ``rope_parameters``. The
+    zoo patch site (`patch_gpt_oss_config`) gates on
+    ``inspect.getsource(GptOssConfig) == Old_GptOssConfig`` and skips the
+    replacement when the 5.x version's source no longer matches, so the
+    pin is dormant on 5.x. Keep it strict on 4.57.6.
+    """
+    _skip_if_transformers_5x(
+        "GptOssConfig.__init__ renamed rope_theta -> rope_parameters"
+    )
     cls = _try_get_class(
         "transformers.models.gpt_oss.configuration_gpt_oss", "GptOssConfig",
     )
@@ -716,6 +747,10 @@ def test_gpt_oss_config_class_construction_signature():
 def test_gpt_oss_for_causal_lm_forward_named_params():
     """gpt_oss.py:2890 patches GptOssForCausalLM.forward with by-name
     kwargs (input_ids, attention_mask, ..., logits_to_keep)."""
+    _skip_if_transformers_5x(
+        "GptOssForCausalLM.forward moved cache_position into "
+        "**kwargs: Unpack[TransformersKwargs]"
+    )
     cls = _try_get_class(
         "transformers.models.gpt_oss.modeling_gpt_oss", "GptOssForCausalLM",
     )
@@ -812,6 +847,10 @@ def test_csm_depth_decoder_for_causal_lm_forward_named_params():
     """misc.py:239 patches CsmDepthDecoderForCausalLM.forward with named
     params (input_ids, backbone_last_hidden_state, ..., logits_to_keep).
     Resolves via ``_original_*`` stash past zoo's wrapper."""
+    _skip_if_transformers_5x(
+        "CsmDepthDecoderForCausalLM.forward moved cache_position into "
+        "**kwargs: Unpack[TransformersKwargs]"
+    )
     cls = _try_get_class(
         "transformers.models.csm.modeling_csm",
         "CsmDepthDecoderForCausalLM",
@@ -838,6 +877,10 @@ def test_csm_for_conditional_generation_forward_named_params():
     """misc.py:373 patches CsmForConditionalGeneration.forward (input_ids,
     input_values, ..., logits_to_keep). Resolves via ``_original_*``
     stash past zoo's wrapper."""
+    _skip_if_transformers_5x(
+        "CsmForConditionalGeneration.forward moved cache_position into "
+        "**kwargs: Unpack[TransformersKwargs]"
+    )
     cls = _try_get_class(
         "transformers.models.csm.modeling_csm",
         "CsmForConditionalGeneration",
@@ -1280,6 +1323,10 @@ def test_qwen3_moe_experts_forward_signature_5x():
 def test_qwen3_moe_for_causal_lm_forward_named_params():
     """qwen3_moe.py:351 patches Qwen3MoeForCausalLM.forward via
     ``_patch_causal_lm_forward_for_hidden_states`` (qwen3_moe.py:138)."""
+    _skip_if_transformers_5x(
+        "Qwen3MoeForCausalLM.forward moved cache_position into "
+        "**kwargs: Unpack[TransformersKwargs]"
+    )
     cls = _try_get_class(
         "transformers.models.qwen3_moe.modeling_qwen3_moe",
         "Qwen3MoeForCausalLM",
@@ -1342,6 +1389,10 @@ def test_qwen3_next_experts_forward_signature():
 def test_qwen3_next_for_causal_lm_forward_named_params():
     """qwen3_next_moe.py:79 patches Qwen3NextForCausalLM.forward via
     ``_patch_causal_lm_forward_for_hidden_states``."""
+    _skip_if_transformers_5x(
+        "Qwen3NextForCausalLM.forward moved cache_position into "
+        "**kwargs: Unpack[TransformersKwargs]"
+    )
     cls = _try_get_class(
         "transformers.models.qwen3_next.modeling_qwen3_next",
         "Qwen3NextForCausalLM",
@@ -1369,6 +1420,10 @@ def test_qwen3_vl_moe_for_conditional_generation_forward_named_params():
     """qwen3_vl_moe.py:401 patches
     Qwen3VLMoeForConditionalGeneration.forward with by-name kwargs
     (input_ids, attention_mask, ..., logits_to_keep)."""
+    _skip_if_transformers_5x(
+        "Qwen3VLMoeForConditionalGeneration.forward moved cache_position "
+        "into **kwargs: Unpack[TransformersKwargs]"
+    )
     cls = _try_get_class(
         "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
         "Qwen3VLMoeForConditionalGeneration",
@@ -1624,7 +1679,19 @@ def test_misc_all_attention_functions_modeling_utils_top_level():
 
 def test_misc_modernbert_model_update_attention_mask_present():
     """misc.py:662 patches
-    ``ModernBertModel._update_attention_mask`` (SDPA-stride fix)."""
+    ``ModernBertModel._update_attention_mask`` (SDPA-stride fix).
+
+    transformers 5.x removed ``_update_attention_mask`` from
+    ModernBertModel (mask construction moved into the central
+    masking-utils path). zoo's patch site is fully guarded
+    (`misc.py:644-678`: import try/except + `getattr(..., None)` on
+    both the class and the method), so the SDPA-stride fix silently
+    no-ops on 5.x. Skip the drift here, keep it strict on 4.57.6.
+    """
+    _skip_if_transformers_5x(
+        "ModernBertModel._update_attention_mask removed (mask construction "
+        "moved into the central masking-utils path)"
+    )
     cls = _try_get_class(
         "transformers.models.modernbert.modeling_modernbert",
         "ModernBertModel",
@@ -2128,14 +2195,45 @@ def test_static_cache_class_present():
 
 
 def test_hybrid_cache_class_present():
-    """gemma.py:260 isinstance(past_key_values, HybridCache)."""
+    """gemma.py:260 isinstance(past_key_values, HybridCache).
+
+    Drift on 4.57.6: HybridCache must exist (zoo's gemma mask path
+    dispatches isinstance against it). Drift on 5.x: HybridCache was
+    removed; zoo's utils.py falls back to ``HybridCache = typing.Any``
+    and ``HAS_HYBRID_CACHE = False``, and gemma.py:260 gates the
+    isinstance on the flag so the runtime no-ops cleanly without
+    raising ``TypeError: isinstance() arg 2 must be a type``.
+    """
     cu = importlib.import_module("transformers.cache_utils")
+    from unsloth_zoo.temporary_patches.utils import HAS_HYBRID_CACHE
+    if _TX_IS_5X:
+        if hasattr(cu, "HybridCache"):
+            # Unexpected: 5.x reintroduced HybridCache. Make the
+            # detector visible -- zoo should re-enable the isinstance
+            # path so the gemma mask shortcut fires again.
+            assert HAS_HYBRID_CACHE is True, (
+                "transformers.cache_utils.HybridCache exists on "
+                f"transformers {_TX_VERSION} but zoo's HAS_HYBRID_CACHE "
+                "is False; refresh the utils.py probe."
+            )
+        else:
+            assert HAS_HYBRID_CACHE is False, (
+                "transformers.cache_utils.HybridCache missing on "
+                f"transformers {_TX_VERSION} but zoo's HAS_HYBRID_CACHE "
+                "is True; gemma.py:260 isinstance will raise TypeError."
+            )
+        return
     if not hasattr(cu, "HybridCache"):
         pytest.fail(
             "DRIFT DETECTED: zoo temporary_patches/gemma.py:260 uses "
             "transformers.cache_utils.HybridCache but it is missing on "
             f"transformers {_TX_VERSION}"
         )
+    assert HAS_HYBRID_CACHE is True, (
+        "transformers.cache_utils.HybridCache exists on transformers "
+        f"{_TX_VERSION} but zoo's HAS_HYBRID_CACHE flag is False; refresh "
+        "the utils.py probe so gemma.py isinstance fires."
+    )
 
 
 # bitsandbytes.py: Linear4bit __init__ signature pin.

@@ -65,15 +65,20 @@ from functools import lru_cache
 
 
 import requests
-import torchvision
 from packaging import version
 from typing import Union, Tuple, List, Dict, Sequence
 from itertools import takewhile
+# torchvision is an optional dependency: the video reader path uses it but
+# the rest of vision_utils (image preprocessing, HF picker integration)
+# works without it. Guard the top-level import so a CPU-only zoo install
+# without torchvision can still import this module.
 try:
+    import torchvision
     from torchvision import io, transforms
     from torchvision.transforms import InterpolationMode
     HAS_TORCHVISION = True
 except Exception:
+    torchvision = None
     HAS_TORCHVISION = False
 
 from .log import logger
