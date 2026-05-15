@@ -170,6 +170,18 @@ def _assert_params_superset(
 ):
     got = _param_names(func)
     missing = [name for name in required if name not in got]
+    if missing and _has_var_keyword(func):
+        # Newer transformers wrap many upstream forwards as
+        # ``(self, *args, **kwargs)`` (attention-impl dispatch, generic
+        # decorators, etc.). The zoo patch's call site stays valid because
+        # kwargs flow through verbatim; static param-name verification is
+        # not meaningful for a wrapped signature. Skip rather than emit
+        # spurious DRIFT.
+        pytest.skip(
+            f"{label} is wrapped as `(self, *args, **kwargs)` on "
+            f"transformers {_TX_VERSION}; static param-name verification "
+            "is not meaningful for this passthrough signature."
+        )
     if missing:
         try:
             sig = inspect.signature(func)
