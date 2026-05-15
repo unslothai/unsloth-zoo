@@ -74,16 +74,16 @@ def replace_expert_params_with_bnb_params(
         from transformers.quantizers.quantizers_utils import should_convert_module
     except Exception as e:
         return raise_error("transformers.quantizers.quantizers_utils.should_convert_module", e)
-    
+
     has_been_replaced = False
-    
+
     for module_name, module in model.named_modules():
         if not should_convert_module(module_name, modules_to_not_convert):
             continue
 
         if not _is_expert_module(module):
             continue
-        
+
         gate_up_proj = module.gate_up_proj
         down_proj = module.down_proj
 
@@ -97,7 +97,7 @@ def replace_expert_params_with_bnb_params(
                 quant_type=quantization_config.bnb_4bit_quant_type,
                 quant_storage=quantization_config.bnb_4bit_quant_storage,
             )
-            
+
             placeholder_down = Params4bit(
                 torch.zeros(down_proj.shape),
                 requires_grad=False,
@@ -105,26 +105,23 @@ def replace_expert_params_with_bnb_params(
                 quant_type=quantization_config.bnb_4bit_quant_type,
                 quant_storage=quantization_config.bnb_4bit_quant_storage,
             )
-        
+
         if pre_quantized:
             placeholder_gate_up.data = placeholder_gate_up.data.to(dtype=quantization_config.bnb_4bit_quant_storage)
             placeholder_down.data = placeholder_down.data.to(dtype=quantization_config.bnb_4bit_quant_storage)
         module.gate_up_proj = placeholder_gate_up
         module.down_proj = placeholder_down
         has_been_replaced = True
-        
+
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Prepared {module_name}'s gate_up_proj & down_proj for BNB 4-bit quantization (shapes: {gate_up_proj.shape}, {down_proj.shape})")
-    
+
     if not has_been_replaced and UNSLOTH_ENABLE_LOGGING:
-        # Demoted from warning to info+gated: dense (non-MoE) 4-bit loads hit this
-        # path too (Phi3, GLM4 dense, Llama, Mistral, Gemma, Qwen2.5 dense, ...).
-        # Surface only when verbose to avoid spamming every bnb 4-bit user.
         logger.info(
             f"Unsloth: No MoE expert parameters were found to be replaced for "
             f"{getattr(model, 'name_or_path', type(model).__name__)} (expected for non-MoE)"
         )
-    
+
     return model
 
 
@@ -133,7 +130,7 @@ def patch_bnb4bit_quantize_convert():
     Expert modules of nn.Parameter type are converted to Params4bit placeholders during weight loading.
     Also preserves the original shape of the expert parameters for PEFT LoRA compatibility.
     """
-    
+
     try:
         from transformers.integrations.bitsandbytes import Bnb4bitQuantize
     except Exception as e:
@@ -141,9 +138,9 @@ def patch_bnb4bit_quantize_convert():
 
     if hasattr(Bnb4bitQuantize.convert, "_unsloth_moe_patched"):
         return
-    
+
     original_convert = Bnb4bitQuantize.convert
-    
+
     def patched_convert(
         self,
         input_dict: dict[str, Union[list[torch.Tensor], torch.Tensor]],
@@ -151,19 +148,7 @@ def patch_bnb4bit_quantize_convert():
         model: torch.nn.Module | None = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
-        """
-        Patched Bnb4bitQuantize.convert that quantizes MoE expert nn.Parameter weights.
-
-        input_dict: per-tensor mapping from transformers' WeightConverter.materialize_tensors.
-            For dense Linear weights this is dict[str, list[Tensor]] (matching upstream).
-            For MoE expert nn.Parameter weights some dispatch paths pass a bare Tensor
-            instead of a list, so the unwrap below tolerates both forms.
-        full_layer_name: state-dict-style dotted name of the parameter being converted.
-        """
         value = list(input_dict.values())[0]
-        # transformers v5 passes input_dict[key] as list[Tensor] for most weights
-        # (matches upstream Bnb4bitQuantize.convert which does `value = value[0]`).
-        # For some MoE expert dispatch paths it arrives as a bare Tensor; tolerate both.
         if isinstance(value, (list, tuple)):
             value = value[0]
 
@@ -173,34 +158,19 @@ def patch_bnb4bit_quantize_convert():
 
             if _is_expert_module(module):
                 old_value = model.get_parameter_or_buffer(full_layer_name)
-                
                 old_dict = {k: v for k, v in old_value.__dict__.items()}
                 new_value = Params4bit(value, requires_grad=False, **old_dict).to(value.device)
-                
-                # Preserve _original_shape for expert params (critical for PEFT LoRA compatibility)
-                original_shape = value.shape
-                if original_shape is not None:
-                    setattr(new_value, "_original_shape", original_shape)
-                
+                # _original_shape is needed by PEFT LoRA to recover the logical 3D shape.
+                new_value._original_shape = value.shape
                 module._is_hf_initialized = True
                 return {full_layer_name: new_value}
-        
+
         except (KeyError, AttributeError) as e:
-            # Expected non-fatal: get_module_from_name didn't resolve, or module
-            # didn't have the expected expert-shaped attributes. Fall through to
-            # original convert. Logged at info-level under UNSLOTH_ENABLE_LOGGING.
             if UNSLOTH_ENABLE_LOGGING:
                 logger.info(f"Unsloth: expert convert fall-through for {full_layer_name}: {e}")
-        except Exception:
-            # Unexpected: use logger.exception so the traceback is preserved for
-            # post-mortem. Still fall through to original_convert (don't break the
-            # whole load) but make sure the bug is visible — broad swallowing was
-            # what masked B1 (the list[Tensor] unwrap regression).
-            logger.exception(f"Unsloth: unexpected error in patched_convert for {full_layer_name}")
 
-        # Fall back to original convert for non-expert params or in case of any failure
         return original_convert(self, input_dict, full_layer_name=full_layer_name, model=model, **kwargs)
-    
+
     patched_convert._unsloth_moe_patched = True
     patch_function(Bnb4bitQuantize, "convert", patched_convert, match_level = "relaxed")
 
@@ -212,43 +182,34 @@ TEMPORARY_PATCHES.append(patch_bnb4bit_quantize_convert)
 
 def patch_bnb4bit_quantizer_param_needs_quantization():
     """Recognize MoE expert modules of Params4bit type as needing quantization."""
-    
+
     try:
         from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
         from transformers.quantizers.quantizers_utils import get_module_from_name
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_bnb_4bit.Bnb4BitHfQuantizer", e)
-    
+
     if hasattr(Bnb4BitHfQuantizer.param_needs_quantization, "_unsloth_moe_patched"):
         return
-    
+
     original_param_needs_quantization = Bnb4BitHfQuantizer.param_needs_quantization
-    
+
     def patched_param_needs_quantization(self, model: "PreTrainedModel", param_name: str, **kwargs) -> bool:
         if original_param_needs_quantization(self, model, param_name, **kwargs):
             return True
-        
+
         try:
             module, name = get_module_from_name(model, param_name)
             if name in ("gate_up_proj", "down_proj"):
                 param = getattr(module, name, None)
-                # Only treat as MoE expert needing quantization if it's a
-                # Params4bit that has NOT already been quantized (bnb_quantized=False).
-                # This protects against a hypothetical re-invocation after first quantize.
-                if (
-                    isinstance(param, Params4bit)
-                    and not getattr(param, "bnb_quantized", False)
-                ):
+                if isinstance(param, Params4bit) and not getattr(param, "bnb_quantized", False):
                     return True
         except (KeyError, AttributeError) as e:
-            # Expected when get_module_from_name can't resolve the name. Fall through.
             if UNSLOTH_ENABLE_LOGGING:
-                logger.info(
-                    f"Unsloth: param_needs_quantization fall-through for {param_name}: {e}"
-                )
-        
+                logger.info(f"Unsloth: param_needs_quantization fall-through for {param_name}: {e}")
+
         return False
-    
+
     patched_param_needs_quantization._unsloth_moe_patched = True
     patch_function(Bnb4BitHfQuantizer, "param_needs_quantization", patched_param_needs_quantization)
 
@@ -263,16 +224,16 @@ def patch_bnb4bit_quantizer_process_model():
         from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_bnb_4bit.Bnb4BitHfQuantizer", e)
-    
+
     # Fast return if already patched
     if hasattr(Bnb4BitHfQuantizer._process_model_before_weight_loading, "_unsloth_moe_patched"):
         return
-    
+
     original_process_model_before_weight_loading = Bnb4BitHfQuantizer._process_model_before_weight_loading
-    
+
     def patched_process_model_before_weight_loading(self, model, device_map, **kwargs):
         original_process_model_before_weight_loading(self, model, device_map, **kwargs)
-        
+
         # Use the patched replace_expert_params_with_bnb_params function
         model = replace_expert_params_with_bnb_params(
             model,
@@ -281,7 +242,7 @@ def patch_bnb4bit_quantizer_process_model():
             pre_quantized=self.pre_quantized,
         )
         return model
-    
+
     patched_process_model_before_weight_loading._unsloth_moe_patched = True
     patch_function(Bnb4BitHfQuantizer, "_process_model_before_weight_loading", patched_process_model_before_weight_loading, match_level = "relaxed")
     pass
@@ -304,31 +265,12 @@ def _maybe_dequant_params4bit_weight(weight, input_dtype):
 
 def patch_transformers_grouped_linear_4bit():
     """
-    transformers v5's `grouped_mm_experts_forward` and `batched_mm_experts_forward`
-    (in `transformers.integrations.moe`) read `self.gate_up_proj` /
-    `self.down_proj` raw and pass them through `_grouped_linear` /
-    `_batched_linear` -> `weight.transpose(-2, -1)` -> `torch._grouped_mm` /
-    `torch.bmm` -> `mat_a.to(weight.dtype)` ...
-
-    For MoE arches whose experts class is NOT replaced by an unsloth-zoo
-    per-arch patch (e.g. some Glm4Moe variants, Gemma4MoE), the experts forward
-    therefore sees the raw Params4bit (uint8 packed storage). The matmul ops raise:
-        - grouped_mm path:  `RuntimeError: Expected mat_a to be Float32, BFloat16 or
-                            Float16 matrix, got Byte` (during training)
-        - batched_mm path:  `RuntimeError: batch1 must be a 3D tensor` (during
-                            autoregressive decoding where the batched_mm dispatcher
-                            is used instead of grouped_mm)
-
-    Fix: wrap `_grouped_linear` and `_batched_linear` to detect Params4bit
-    weights, dequantize via `bnb.functional.dequantize_4bit` (using
-    `_original_shape` to recover the logical 3D `(E, in, out)` shape from
-    packed `(N, 1)` storage), cast to the input dtype, then delegate to the
-    original function which handles `is_transposed` orientation correctly.
-
-    Forward-only -- base weights are frozen; gradient flow stays on LoRA paths
-    that the per-arch wrappers (when they exist) inject separately. For arches
-    without a per-arch wrapper this gives base-only forward; PEFT's
-    `_activate_lora` parametrization adds the delta on top.
+    Wrap transformers v5's `_grouped_linear`, `_batched_linear`, and
+    `batched_mm_experts_forward` so that packed Params4bit MoE experts are
+    dequantized to logical 3D bf16 before matmul. Without this the experts
+    forward feeds uint8 packed storage into torch._grouped_mm / torch.bmm and
+    raises a dtype/shape error for arches whose experts class is not replaced
+    by an unsloth-zoo per-arch patch.
     """
     try:
         from transformers.integrations import moe as tf_moe
@@ -357,19 +299,13 @@ def patch_transformers_grouped_linear_4bit():
         _patched_batched_linear._unsloth_4bit_moe_patched = True
         patch_function(tf_moe, "_batched_linear", _patched_batched_linear, match_level="relaxed")
 
-    # batched_mm_experts_forward indexes `self.gate_up_proj[expert_ids]` BEFORE
-    # passing to `_batched_linear`. For a packed Params4bit (storage shape
-    # (N, 1) uint8), the indexing returns garbage (a (S, 1) uint8 slice) and
-    # the dtype information is lost — `_patched_batched_linear` no longer sees
-    # a Params4bit. Wrap the experts-forward dispatcher itself so the dequant
-    # happens BEFORE indexing.
+    # batched_mm_experts_forward indexes self.gate_up_proj[expert_ids] BEFORE
+    # passing to _batched_linear, which loses dtype info for packed Params4bit;
+    # wrap the dispatcher itself so dequant happens before indexing.
     if hasattr(tf_moe, "batched_mm_experts_forward") and not getattr(tf_moe.batched_mm_experts_forward, "_unsloth_4bit_moe_patched", False):
         _original_batched_mm_experts_forward = tf_moe.batched_mm_experts_forward
 
         def _patched_batched_mm_experts_forward(self, hidden_states, top_k_index, top_k_weights):
-            # Temporarily swap any packed Params4bit experts to dequantized 3D tensors
-            # for the duration of this forward call. setattr-restore pattern keeps the
-            # base layer Params4bit intact for subsequent calls / save / merge.
             swapped = []
             for attr in ("gate_up_proj", "down_proj", "up_proj"):
                 w = getattr(self, attr, None)
@@ -385,14 +321,8 @@ def patch_transformers_grouped_linear_4bit():
 
         _patched_batched_mm_experts_forward._unsloth_4bit_moe_patched = True
         patch_function(tf_moe, "batched_mm_experts_forward", _patched_batched_mm_experts_forward, match_level="relaxed")
-        # Also re-register in the dispatcher mapping so the forward decorator picks
-        # up the patched version (the decorator stores a reference at class-decoration
-        # time via ALL_EXPERTS_FUNCTIONS.get(...)).
-        try:
-            if hasattr(tf_moe, "ALL_EXPERTS_FUNCTIONS"):
-                tf_moe.ALL_EXPERTS_FUNCTIONS["batched_mm"] = _patched_batched_mm_experts_forward
-        except Exception:
-            pass
+        if hasattr(tf_moe, "ALL_EXPERTS_FUNCTIONS"):
+            tf_moe.ALL_EXPERTS_FUNCTIONS["batched_mm"] = _patched_batched_mm_experts_forward
 
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: Patched transformers.integrations.moe._grouped_linear / _batched_linear / batched_mm_experts_forward for 4-bit MoE expert support")
@@ -402,29 +332,11 @@ TEMPORARY_PATCHES.append(patch_transformers_grouped_linear_4bit)
 
 def patch_transformers_weight_converter_kwargs():
     """
-    PEFT 0.19's `convert_peft_adapter_state_dict_for_transformers` (in
-    `peft/utils/transformers_weight_conversion.py:268`) constructs new
-    `WeightConverter` instances via:
-        new_conversion = orig_conversion.__class__(
-            source_patterns=...,
-            target_patterns=...,
-            distributed_operation=...,
-            quantization_operation=...,
-            operations=...,
-        )
-    This is forward-compatibility code for a later transformers release. With
-    transformers 5.6.2 the `WeightConverter.__init__` signature is
-    `(self, source_patterns, target_patterns, operations)` and the extra
-    kwargs raise `TypeError: WeightConverter.__init__() got an unexpected
-    keyword argument 'distributed_operation'`. This blocks every
-    `PeftModel.from_pretrained` for any MoE-fused 4-bit model on peft 0.19.
-
-    Fix: patch `WeightConverter.__init__` to accept and ignore unknown kwargs
-    (`distributed_operation`, `quantization_operation`, etc.). The original
-    init already stores everything it needs from `source_patterns`,
-    `target_patterns`, and `operations`. The ignored kwargs only affect
-    distributed / quantization codepaths that aren't exercised at adapter-load
-    time.
+    PEFT 0.19 constructs WeightConverter with kwargs (distributed_operation,
+    quantization_operation, ...) that transformers 5.6.2's __init__ does not
+    accept, raising TypeError during PeftModel.from_pretrained for any MoE
+    4-bit model. Drop unknown kwargs so the installed transformers signature
+    only sees what it knows.
     """
     try:
         from transformers.core_model_loading import WeightConverter
@@ -443,10 +355,6 @@ def patch_transformers_weight_converter_kwargs():
         original_params = {"self", "source_patterns", "target_patterns", "operations"}
 
     def _patched_init(self, *args, **kwargs):
-        # Drop kwargs that the installed transformers version does not accept.
-        # Forwarding only the kwargs the original signature recognises makes us
-        # forward-compatible with peft versions written against newer
-        # transformers releases.
         accepted = {k: v for k, v in kwargs.items() if k in original_params}
         return _original_init(self, *args, **accepted)
 

@@ -102,40 +102,27 @@ def patch_glm4_moe():
 
 
 def patch_glm4_moe_standard():
-    """
-    Patches standard (non-lite) GLM4 MoE (Glm4MoeNaiveMoe + Glm4MoeMoE).
-    Uses the same _glm4_lora_extractor and grouped-MM forward as the lite variant.
-    """
+    """Patches standard (non-lite) GLM4 MoE for Split LoRA using grouped GEMM."""
     patch_param_wrapper_for_moe()
 
     try:
-        from transformers.models.glm4_moe.modeling_glm4_moe import (
-            Glm4MoeMoE,
-            Glm4MoeNaiveMoe,
-        )
+        from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeNaiveMoe
     except ImportError:
         return
 
     def _glm4_std_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
-        total_rank = weight_A.shape[0]
-        rank_per_expert = total_rank // num_experts
-        dim1 = weight_A.shape[1]
-        dim2 = weight_B.shape[0]
-
-        if dim1 > dim2:
-            first_weight = weight_B.view(dim2, num_experts, rank_per_expert)
-            first_weight = first_weight.permute(1, 0, 2).contiguous()
-            second_weight = weight_A.view(num_experts, rank_per_expert, dim1).contiguous()
-        else:
-            first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
-            first_weight = first_weight.permute(0, 2, 1).contiguous()
-            second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
-            second_weight = second_weight.permute(1, 2, 0).contiguous()
-
-        return first_weight, second_weight, scaling, num_experts
+        return extract_moe_lora_weights_for_grouped_mm(
+            wrapper,
+            weight_A,
+            weight_B,
+            scaling,
+            num_experts,
+            model_name="GLM4 MoE",
+            enable_logging=UNSLOTH_ENABLE_LOGGING,
+            logger_obj=logger,
+        )
 
     Glm4MoeNaiveMoe._unsloth_lora_extractor_fn = staticmethod(_glm4_std_lora_extractor)
-
     patch_function(Glm4MoeNaiveMoe, "forward", get_forward_moe_backend())
 
     if UNSLOTH_ENABLE_LOGGING:

@@ -37,11 +37,6 @@ except ImportError:
     Params4bit = None
 
 
-def _check_bnb_available():
-    if not HAS_BNB:
-        return False
-    return True
-
 def _get_compile_location() -> str:
     return os.path.abspath(
         os.environ.get("UNSLOTH_COMPILE_LOCATION", UNSLOTH_COMPILE_LOCATION)
@@ -621,14 +616,8 @@ def _get_base_weight(param):
     # Recursively unwrap PEFT layers
     while hasattr(param, "base_layer"):
         param = param.base_layer
-    
-    if _check_bnb_available() and isinstance(param, Params4bit):
-        # Guard against quant_state=None (e.g., meta-device placeholder before
-        # patched_convert fired, or Params4bit constructed but not moved to cuda).
-        # Raise an actionable error instead of dereferencing None inside
-        # bnb.functional.dequantize_4bit (which raises a confusing C-side error)
-        # OR silently returning packed uint8 data downstream (which mis-shapes the
-        # next operation).
+
+    if HAS_BNB and isinstance(param, Params4bit):
         if getattr(param, "quant_state", None) is None:
             raise RuntimeError(
                 "unsloth: _get_base_weight saw a Params4bit with quant_state=None. "
@@ -807,17 +796,10 @@ def _is_moe_experts_module(module) -> bool:
     # returns torch.Tensor (not nn.Parameter), so we must accept both.
     if hasattr(module, "gate_up_proj"):
         param = module.gate_up_proj
-
         # 4-bit parameters are packed into 2D tensors (n_params, 1) or similar.
-        if _check_bnb_available() and isinstance(param, Params4bit) and param.ndim == 2:
+        if HAS_BNB and isinstance(param, Params4bit) and param.ndim == 2:
             return True
-
         # Standard MoE weights are 3D (num_experts, in, out).
-        # After PEFT's nn.utils.parametrize wrapping, accessing gate_up_proj
-        # returns a plain torch.Tensor (not nn.Parameter), so we must accept both
-        # (per the doc-string just above). This is restored from the pre-PR-527
-        # check; tightening to nn.Parameter-only silently breaks the parametrize
-        # forward path in PEFT.
         if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim in (2, 3):
             return True
 

@@ -1337,12 +1337,8 @@ class _ParamShapeProxy:
 
     @property
     def dtype(self):
-        # The underlying Params4bit storage dtype is uint8 (or quant_storage), which
-        # corrupts PEFT call sites that do `tensor.to(param.dtype)` — they end up
-        # truncating bf16 LoRA values to uint8 (delta values < 1.0 truncate to 0).
-        # Surface the pre-quantization compute dtype (typically bf16) from quant_state
-        # so PEFT's get_delta_weight / _move_adapter_to_device_of_base_layer cast
-        # the LoRA outputs into the same dtype the dequantized expert will be in.
+        # Surface the pre-quant compute dtype so PEFT's `tensor.to(param.dtype)`
+        # casts don't truncate bf16 LoRA deltas to the uint8 packed storage dtype.
         quant_state = getattr(self._param, "quant_state", None)
         qs_dtype = getattr(quant_state, "dtype", None) if quant_state is not None else None
         if qs_dtype is not None and (qs_dtype.is_floating_point or qs_dtype.is_complex):
@@ -1374,29 +1370,17 @@ def patch_peft_param_wrapper_4bit_expert_shape():
         if get_bnb_param_type(param) == "4bit":
             shape = getattr(param, "_original_shape", None)
             if shape is not None and len(shape) == 3:
-                # Set num_experts only. Do NOT set in_features/out_features here:
-                # PEFT 0.19's ParamWrapper.update_layer swaps in_features<->out_features
-                # for 3D params (see peft 0.19 lora/layer.py update_layer), then calls
-                # _move_adapter_to_device_of_base_layer which calls get_param() again.
-                # If this patched get_param also resets in_features/out_features back
-                # to the unswapped order it UN-does PEFT's swap and breaks second-adapter
-                # add_adapter (gated by _did_swap_in_out_features). Let PEFT own those
-                # two attributes.
+                # Don't touch in_features/out_features: PEFT 0.19's update_layer
+                # swaps them for 3D params and calls get_param() again afterwards.
                 self.num_experts = shape[0]
                 return _ParamShapeProxy(param, shape)
-            else:
-                # The MoE quantizer patch (moe_bnb_transformers.py) did not run, or
-                # this is a non-MoE 4-bit param being targeted via target_parameters
-                # (in which case its packed shape (K, 1) would be misinterpreted as
-                # (in=1, out=K) by PEFT's _get_in_out_features). Raise rather than
-                # silently corrupting LoRA dims.
-                raise ValueError(
-                    "unsloth: ParamWrapper.get_param() encountered a 4-bit Params4bit "
-                    f"without a 3D _original_shape attribute (param shape={tuple(param.shape)}). "
-                    "This usually means the MoE quantizer patch did not run during model load, "
-                    "or this parameter is not a stacked MoE expert and should not be in "
-                    "LoraConfig.target_parameters."
-                )
+            raise ValueError(
+                "unsloth: ParamWrapper.get_param() encountered a 4-bit Params4bit "
+                f"without a 3D _original_shape attribute (param shape={tuple(param.shape)}). "
+                "This usually means the MoE quantizer patch did not run during model load, "
+                "or this parameter is not a stacked MoE expert and should not be in "
+                "LoraConfig.target_parameters."
+            )
         return param
 
     _patched_get_param._unsloth_4bit_expert_patched = True
@@ -1407,19 +1391,11 @@ TEMPORARY_PATCHES.append(patch_peft_param_wrapper_4bit_expert_shape)
 
 def patch_peft_param_wrapper_merge_4bit():
     """
-    PEFT 0.18/0.19 ParamWrapper.merge does in-place `param.data += delta_weight`.
-    For a Params4bit MoE expert, `param.data` is the *packed* 4-bit storage of
-    shape (N_packed, 1) while `delta_weight` is in logical 3D (E, in, out). This
-    raises a RuntimeError shape mismatch (e.g. "size of tensor a (16777216)
-    must match the size of tensor b (1024) at non-singleton dimension 1") at
-    the `+=` line, breaking `merge_and_unload()` for every 4-bit MoE adapter.
-
-    Fix: when the wrapped param is a Params4bit with a 3D _original_shape, do a
-    dequantize -> add -> re-quantize cycle, mirroring lora.bnb.Linear4bit.merge.
-    Computes delta_weight directly from lora_A/lora_B to bypass the proxy.dtype
-    issue (proxy delegates .dtype to Params4bit which returns uint8 storage
-    dtype, corrupting the .to(param.dtype) cast inside the original
-    get_delta_weight).
+    PEFT's ParamWrapper.merge does in-place `param.data += delta_weight`, which
+    fails for a Params4bit MoE expert because `param.data` is the packed
+    (N_packed, 1) uint8 storage and `delta_weight` is the logical 3D tensor.
+    Override merge/unmerge with a dequantize -> add -> re-quantize cycle when
+    the wrapped param is a Params4bit with a 3D _original_shape.
     """
     try:
         from peft.tuners.lora.layer import ParamWrapper, check_adapters_to_merge
@@ -1441,8 +1417,6 @@ def patch_peft_param_wrapper_merge_4bit():
         return isinstance(param, Params4bit) and getattr(param, "_original_shape", None) is not None
 
     def _requantize_like(reference, new_data, original_shape):
-        # Build a fresh Params4bit using the same quant settings as the existing one,
-        # then move to the reference device which triggers _quantize.
         kwargs = dict(
             requires_grad=False,
             blocksize=getattr(reference, "blocksize", 64),
@@ -1454,9 +1428,7 @@ def patch_peft_param_wrapper_merge_4bit():
         if device.type == "meta":
             device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
         new_param = Params4bit(new_data.detach().to("cpu").contiguous(), **kwargs).to(device)
-        # Preserve the logical 3D shape attribute so subsequent _ParamShapeProxy
-        # lookups (and a second merge round) keep working.
-        setattr(new_param, "_original_shape", torch.Size(original_shape))
+        new_param._original_shape = torch.Size(original_shape)
         return new_param
 
     def _patched_merge(self, safe_merge=False, adapter_names=None):
@@ -1487,10 +1459,6 @@ def patch_peft_param_wrapper_merge_4bit():
             if tuple(dequant.shape) != tuple(original_shape):
                 dequant = dequant.reshape(original_shape)
             dequant = dequant.to(dtype=compute_dtype)
-            # Use PEFT's own get_delta_weight so the 0.18 vs 0.19 swap convention
-            # (and any future variants) are honoured. _ParamShapeProxy now exposes
-            # the pre-quant compute_dtype, so the .to(param.dtype) cast inside
-            # get_delta_weight no longer truncates LoRA values to uint8.
             delta_weight = self.get_delta_weight(active_adapter).to(
                 device=dequant.device, dtype=compute_dtype
             )
