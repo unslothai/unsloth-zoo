@@ -200,13 +200,18 @@ def _patch_torch_cuda_for_import() -> None:
 if not _has_real_accelerator():
     if not _preload_real_device_type("unsloth_zoo", prereqs=("utils",)):
         _install_device_type_stub("unsloth_zoo.device_type")
-    # Also stub unsloth.device_type so tests that import unsloth (or any
-    # submodule like unsloth.trainer) on a CPU-only runner don't trip
-    # unsloth/device_type.py's own NotImplementedError. The real preload
-    # uses unsloth's own get_device_type(), which consults unsloth_zoo's
-    # Version helper, so no extra prereqs are needed here.
-    if not _preload_real_device_type("unsloth", prereqs=()):
-        _install_device_type_stub("unsloth.device_type")
+    # NOTE: we deliberately do NOT stub ``unsloth.device_type`` here.
+    # Doing so makes ``import unsloth`` succeed on CPU-only CI, which
+    # then runs ``unsloth/_gpu_init.py:_patch_trl_trainer()`` and
+    # rebinds ``trl.trainer.sft_trainer.SFTTrainer`` /
+    # ``transformers.models.ministral.MinistralAttention`` to Unsloth's
+    # compiled wrappers. ``inspect.getsource(...)`` on those classes
+    # then returns the wrapper source, which masks upstream and causes
+    # zoo's drift detectors (test_MinistralAttention_forward_signature,
+    # test_unsloth_rl_trainer_*) to fail. The cost is that the
+    # ``test_unsloth_trainer_exec_marker`` smoke test fails on CPU-only
+    # runners; that failure exists on main too and tracks a separate
+    # ``unsloth.device_type`` consumer that needs its own CPU fallback.
     _patch_torch_cuda_for_import()
 
 
