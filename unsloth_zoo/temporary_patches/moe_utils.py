@@ -290,6 +290,15 @@ def forward_moe_backend(
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    try:
+        from .moe_utils_bnb4bit import _moe_uses_bnb4bit_expert_weights, forward_moe_backend_bnb4bit
+        if _moe_uses_bnb4bit_expert_weights(self):
+            result = forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
+            if result is not None:
+                return result
+    except ImportError:
+        pass
+
     backend = select_moe_backend()
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)

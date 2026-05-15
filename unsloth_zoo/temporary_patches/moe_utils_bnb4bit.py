@@ -14,20 +14,26 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
-MoE Expert Parameter 4-bit Quantization Patch for Transformers
+bitsandbytes 4-bit support for transformers v5 MoE expert parameters.
 
-Patches transformers' bitsandbytes quantization to handle MoE expert parameters
-(gate_up_proj, down_proj) that are nn.Parameter instead of nn.Linear.
+transformers' bitsandbytes integration only quantizes nn.Linear modules. MoE
+expert weights in transformers v5 are bare 3-D nn.Parameters
+(gate_up_proj / down_proj on the experts module), so the integration skips
+them. The patches here teach the integration to recognize and quantize those
+parameters, and route the experts forward through the standard backend after
+on-the-fly dequantization.
 """
+
+import os
+from typing import Optional, List, Union
 
 import torch
 import torch.nn as nn
-from typing import Optional, List, Union
-import os
+
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
 from .utils import patch_function, raise_error
 
-# Check bitsandbytes availability
+
 try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Params4bit
@@ -41,16 +47,38 @@ __all__ = [
     "patch_bnb4bit_quantize_convert",
     "patch_bnb4bit_quantizer_param_needs_quantization",
     "patch_bnb4bit_quantizer_process_model",
-    "patch_transformers_grouped_linear_4bit",
     "patch_transformers_weight_converter_kwargs",
     "replace_expert_params_with_bnb_params",
+    "forward_moe_backend_bnb4bit",
+    "_moe_uses_bnb4bit_expert_weights",
 ]
 
 
+# ============================================================================
+# Detection
+# ============================================================================
+
+def _is_bnb4bit_param(param) -> bool:
+    """True iff `param` is a Params4bit with a populated quant_state."""
+    return (
+        HAS_BNB
+        and isinstance(param, Params4bit)
+        and getattr(param, "quant_state", None) is not None
+    )
+
+
+def _moe_uses_bnb4bit_expert_weights(self) -> bool:
+    """True iff this experts module's gate_up_proj / down_proj are bnb 4-bit."""
+    if not HAS_BNB:
+        return False
+    return _is_bnb4bit_param(getattr(self, "gate_up_proj", None)) or _is_bnb4bit_param(
+        getattr(self, "down_proj", None)
+    )
+
+
 def _is_expert_module(module: nn.Module) -> bool:
-    """
-    Check if a module is an MoE experts module.
-    Specifically, check if the module has gate_up_proj & down_proj attributes that are nn.Parameter.
+    """A module is a transformers v5 MoE experts module iff gate_up_proj and
+    down_proj are both nn.Parameter (not nn.Linear).
     """
     return (
         hasattr(module, "gate_up_proj")
@@ -59,6 +87,109 @@ def _is_expert_module(module: nn.Module) -> bool:
         and isinstance(module.down_proj, nn.Parameter)
     )
 
+
+# ============================================================================
+# Dequantization
+# ============================================================================
+
+def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
+    """Dequantize a packed Params4bit MoE expert weight to logical 3D
+    `(E, in, out)` (or `(E, out, in)`, whichever the original storage was) at
+    `target_dtype`. Returns None if `weight` isn't a quantized Params4bit.
+    """
+    if not _is_bnb4bit_param(weight):
+        return None
+    dequant = bnb.functional.dequantize_4bit(weight.data, weight.quant_state)
+    original_shape = getattr(weight, "_original_shape", None)
+    if original_shape is not None and tuple(dequant.shape) != tuple(original_shape):
+        dequant = dequant.reshape(original_shape)
+    return dequant.to(target_dtype)
+
+
+def _call_with_temporary_moe_weights(experts_module, gate_up_proj, down_proj, forward_fn, *args):
+    """Temporarily swap dequantized weights onto the experts module for one
+    forward call, then restore the originals.
+
+    Mirrors moe_utils_fp8._call_with_temporary_moe_weights so the bnb4bit and
+    fp8 dispatchers stay structurally identical.
+    """
+    original_gate_up = experts_module.gate_up_proj
+    original_down = experts_module.down_proj
+    object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
+    object.__setattr__(experts_module, "down_proj", down_proj)
+    try:
+        return forward_fn(experts_module, *args)
+    finally:
+        object.__setattr__(experts_module, "gate_up_proj", original_gate_up)
+        object.__setattr__(experts_module, "down_proj", original_down)
+
+
+# ============================================================================
+# Forward dispatcher
+# ============================================================================
+
+_LOGGED_BACKENDS = set()
+
+
+def _log_moe_bnb4bit_backend_once(experts_module, message: str):
+    key = (id(type(experts_module)), message)
+    if key in _LOGGED_BACKENDS:
+        return
+    _LOGGED_BACKENDS.add(key)
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(message)
+
+
+def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights):
+    """
+    bnb 4-bit MoE forward: dequantize the expert weights to the input dtype,
+    then dispatch to the standard MoE backend (grouped_mm / triton / native).
+
+    Mirrors `forward_moe_backend_fp8` structure. Base weights stay in 4-bit
+    Params4bit storage; the dequantized copies are temporary.
+    """
+    from .moe_utils import (
+        select_moe_backend,
+        forward_native_grouped_mm,
+        forward_triton_grouped_gemm,
+        forward_native_moe_loop,
+    )
+
+    target_dtype = hidden_states.dtype
+    if not target_dtype.is_floating_point:
+        target_dtype = torch.bfloat16
+
+    gate_up_weight = _dequantize_bnb4bit_expert_weights(self.gate_up_proj, target_dtype)
+    down_weight = _dequantize_bnb4bit_expert_weights(self.down_proj, target_dtype)
+    if gate_up_weight is None or down_weight is None:
+        # Not bnb4bit after all (mixed state) — fall through to caller.
+        return None
+
+    backend = select_moe_backend()
+    if backend == "grouped_mm":
+        _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-grouped_mm.")
+        forward_fn = forward_native_grouped_mm
+    elif backend == "unsloth_triton":
+        _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-Triton grouped GEMM.")
+        forward_fn = forward_triton_grouped_gemm
+    else:
+        _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-native_torch loop.")
+        forward_fn = forward_native_moe_loop
+
+    return _call_with_temporary_moe_weights(
+        self,
+        gate_up_weight,
+        down_weight,
+        forward_fn,
+        hidden_states.to(target_dtype),
+        top_k_index,
+        top_k_weights,
+    )
+
+
+# ============================================================================
+# transformers integration patches
+# ============================================================================
 
 def replace_expert_params_with_bnb_params(
     model: nn.Module,
@@ -225,7 +356,6 @@ def patch_bnb4bit_quantizer_process_model():
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_bnb_4bit.Bnb4BitHfQuantizer", e)
 
-    # Fast return if already patched
     if hasattr(Bnb4BitHfQuantizer._process_model_before_weight_loading, "_unsloth_moe_patched"):
         return
 
@@ -234,7 +364,6 @@ def patch_bnb4bit_quantizer_process_model():
     def patched_process_model_before_weight_loading(self, model, device_map, **kwargs):
         original_process_model_before_weight_loading(self, model, device_map, **kwargs)
 
-        # Use the patched replace_expert_params_with_bnb_params function
         model = replace_expert_params_with_bnb_params(
             model,
             modules_to_not_convert=self.modules_to_not_convert,
@@ -245,89 +374,8 @@ def patch_bnb4bit_quantizer_process_model():
 
     patched_process_model_before_weight_loading._unsloth_moe_patched = True
     patch_function(Bnb4BitHfQuantizer, "_process_model_before_weight_loading", patched_process_model_before_weight_loading, match_level = "relaxed")
-    pass
 pass
 TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_process_model)
-
-
-def _maybe_dequant_params4bit_weight(weight, input_dtype):
-    """If `weight` is a packed Params4bit, dequantize to logical shape and cast
-    to `input_dtype`. Otherwise return `weight` unchanged.
-    """
-    if isinstance(weight, Params4bit) and getattr(weight, "quant_state", None) is not None:
-        original_shape = getattr(weight, "_original_shape", None)
-        dequant = bnb.functional.dequantize_4bit(weight.data, weight.quant_state)
-        if original_shape is not None and tuple(dequant.shape) != tuple(original_shape):
-            dequant = dequant.reshape(original_shape)
-        return dequant.to(input_dtype)
-    return weight
-
-
-def patch_transformers_grouped_linear_4bit():
-    """
-    Wrap transformers v5's `_grouped_linear`, `_batched_linear`, and
-    `batched_mm_experts_forward` so that packed Params4bit MoE experts are
-    dequantized to logical 3D bf16 before matmul. Without this the experts
-    forward feeds uint8 packed storage into torch._grouped_mm / torch.bmm and
-    raises a dtype/shape error for arches whose experts class is not replaced
-    by an unsloth-zoo per-arch patch.
-    """
-    try:
-        from transformers.integrations import moe as tf_moe
-    except ImportError:
-        return
-    if not HAS_BNB:
-        return
-
-    if hasattr(tf_moe, "_grouped_linear") and not getattr(tf_moe._grouped_linear, "_unsloth_4bit_moe_patched", False):
-        _original_grouped_linear = tf_moe._grouped_linear
-
-        def _patched_grouped_linear(input, weight, offs, bias=None, is_transposed=False):
-            weight = _maybe_dequant_params4bit_weight(weight, input.dtype)
-            return _original_grouped_linear(input, weight, offs, bias=bias, is_transposed=is_transposed)
-
-        _patched_grouped_linear._unsloth_4bit_moe_patched = True
-        patch_function(tf_moe, "_grouped_linear", _patched_grouped_linear, match_level="relaxed")
-
-    if hasattr(tf_moe, "_batched_linear") and not getattr(tf_moe._batched_linear, "_unsloth_4bit_moe_patched", False):
-        _original_batched_linear = tf_moe._batched_linear
-
-        def _patched_batched_linear(input, weight, bias=None, is_transposed=False):
-            weight = _maybe_dequant_params4bit_weight(weight, input.dtype)
-            return _original_batched_linear(input, weight, bias=bias, is_transposed=is_transposed)
-
-        _patched_batched_linear._unsloth_4bit_moe_patched = True
-        patch_function(tf_moe, "_batched_linear", _patched_batched_linear, match_level="relaxed")
-
-    # batched_mm_experts_forward indexes self.gate_up_proj[expert_ids] BEFORE
-    # passing to _batched_linear, which loses dtype info for packed Params4bit;
-    # wrap the dispatcher itself so dequant happens before indexing.
-    if hasattr(tf_moe, "batched_mm_experts_forward") and not getattr(tf_moe.batched_mm_experts_forward, "_unsloth_4bit_moe_patched", False):
-        _original_batched_mm_experts_forward = tf_moe.batched_mm_experts_forward
-
-        def _patched_batched_mm_experts_forward(self, hidden_states, top_k_index, top_k_weights):
-            swapped = []
-            for attr in ("gate_up_proj", "down_proj", "up_proj"):
-                w = getattr(self, attr, None)
-                if isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None:
-                    dequant = _maybe_dequant_params4bit_weight(w, hidden_states.dtype)
-                    object.__setattr__(self, attr, dequant)
-                    swapped.append((attr, w))
-            try:
-                return _original_batched_mm_experts_forward(self, hidden_states, top_k_index, top_k_weights)
-            finally:
-                for attr, original in swapped:
-                    object.__setattr__(self, attr, original)
-
-        _patched_batched_mm_experts_forward._unsloth_4bit_moe_patched = True
-        patch_function(tf_moe, "batched_mm_experts_forward", _patched_batched_mm_experts_forward, match_level="relaxed")
-        if hasattr(tf_moe, "ALL_EXPERTS_FUNCTIONS"):
-            tf_moe.ALL_EXPERTS_FUNCTIONS["batched_mm"] = _patched_batched_mm_experts_forward
-
-    if UNSLOTH_ENABLE_LOGGING:
-        logger.info("Unsloth: Patched transformers.integrations.moe._grouped_linear / _batched_linear / batched_mm_experts_forward for 4-bit MoE expert support")
-pass
-TEMPORARY_PATCHES.append(patch_transformers_grouped_linear_4bit)
 
 
 def patch_transformers_weight_converter_kwargs():
