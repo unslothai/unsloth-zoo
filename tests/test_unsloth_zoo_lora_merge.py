@@ -340,3 +340,134 @@ def test_merge_moe_fused_down_proj_expert(is_transposed):
         expected[ei] = expected[ei] + alpha * (delta.T if is_transposed else delta)
 
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
+
+
+# 8. PEFT 0.19+ standard layout (#5410).
+
+def test_merge_moe_gate_expert_standard_layout():
+    torch.manual_seed(SEED)
+    num_experts, rank_per, inter_dim, hidden_dim = 4, 4, 8, 12
+    total_rank = num_experts * rank_per
+    alpha = 8.0
+
+    gate_W = torch.randn(inter_dim, hidden_dim, dtype=torch.bfloat16)
+    lora_A = torch.randn(total_rank, hidden_dim,  dtype=torch.bfloat16) * 0.05
+    lora_B = torch.randn(2 * inter_dim, total_rank, dtype=torch.bfloat16) * 0.05
+    expert_idx = 1
+
+    out = _merge_moe_gate_expert(
+        gate_W.clone(), _ls(lora_A, lora_B, alpha),
+        expert_idx=expert_idx, num_experts=num_experts,
+        output_dtype=torch.bfloat16,
+    )
+    s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
+    a_slice = lora_A[s:e].to(torch.float32)
+    b_slice = lora_B[:, s:e].to(torch.float32)
+    delta = b_slice[:inter_dim, :] @ a_slice
+    expected = gate_W.to(torch.float32) + alpha * delta
+    torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
+
+
+def test_merge_moe_up_expert_standard_layout():
+    torch.manual_seed(SEED)
+    num_experts, rank_per, inter_dim, hidden_dim = 4, 4, 8, 12
+    total_rank = num_experts * rank_per
+    alpha = 8.0
+
+    up_W = torch.randn(inter_dim, hidden_dim, dtype=torch.bfloat16)
+    lora_A = torch.randn(total_rank, hidden_dim,  dtype=torch.bfloat16) * 0.05
+    lora_B = torch.randn(2 * inter_dim, total_rank, dtype=torch.bfloat16) * 0.05
+    expert_idx = 2
+
+    out = _merge_moe_up_expert(
+        up_W.clone(), _ls(lora_A, lora_B, alpha),
+        expert_idx=expert_idx, num_experts=num_experts,
+        output_dtype=torch.bfloat16,
+    )
+    s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
+    a_slice = lora_A[s:e].to(torch.float32)
+    b_slice = lora_B[:, s:e].to(torch.float32)
+    delta = b_slice[inter_dim:, :] @ a_slice
+    expected = up_W.to(torch.float32) + alpha * delta
+    torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
+
+
+def test_merge_moe_down_proj_expert_standard_layout():
+    torch.manual_seed(SEED)
+    num_experts, rank_per = 4, 4
+    total_rank = num_experts * rank_per
+    H, I = 12, 8
+    alpha = 8.0
+
+    down_W = torch.randn(H, I, dtype=torch.bfloat16)
+    lora_A = torch.randn(total_rank, I, dtype=torch.bfloat16) * 0.05
+    lora_B = torch.randn(H, total_rank, dtype=torch.bfloat16) * 0.05
+    expert_idx = 3
+
+    out = _merge_moe_down_proj_expert(
+        down_W.clone(), _ls(lora_A, lora_B, alpha),
+        expert_idx=expert_idx, num_experts=num_experts,
+        output_dtype=torch.bfloat16,
+    )
+    s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
+    a_slice = lora_A[s:e].to(torch.float32)
+    b_slice = lora_B[:, s:e].to(torch.float32)
+    delta = b_slice @ a_slice
+    expected = down_W.to(torch.float32) + alpha * delta
+    torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
+
+
+# 9. Layout detection + fallback (#5410).
+
+def test_detect_moe_lora_layout_classifies_both_conventions():
+    from unsloth_zoo.saving_utils import _detect_moe_lora_layout
+    num_experts, r, out_dim, in_dim = 4, 4, 16, 12
+    total_rank = num_experts * r
+    A_swap = torch.empty(total_rank, out_dim)
+    B_swap = torch.empty(in_dim,     total_rank)
+    assert _detect_moe_lora_layout(A_swap, B_swap, num_experts, out_dim, in_dim) == ("swapped", r)
+    A_std = torch.empty(total_rank, in_dim)
+    B_std = torch.empty(out_dim,    total_rank)
+    assert _detect_moe_lora_layout(A_std, B_std, num_experts, out_dim, in_dim) == ("standard", r)
+    A_bad = torch.empty(total_rank, out_dim + 1)
+    B_bad = torch.empty(in_dim,     total_rank)
+    assert _detect_moe_lora_layout(A_bad, B_bad, num_experts, out_dim, in_dim)[0] == "unknown"
+    assert _detect_moe_lora_layout(A_swap, B_swap, num_experts + 1, out_dim, in_dim)[0] == "unknown"
+
+
+def test_moe_merge_fallback_counter_records_bad_layout():
+    from unsloth_zoo.saving_utils import _MOE_MERGE_STATE, _reset_moe_merge_state
+    _reset_moe_merge_state()
+    num_experts, rank_per, inter_dim, hidden_dim = 4, 4, 8, 12
+    total_rank = num_experts * rank_per
+    gate_W = torch.randn(inter_dim, hidden_dim, dtype=torch.bfloat16)
+    lora_A = torch.randn(total_rank, hidden_dim + 7, dtype=torch.bfloat16)
+    lora_B = torch.randn(hidden_dim, total_rank,    dtype=torch.bfloat16)
+    out = _merge_moe_gate_expert(
+        gate_W.clone(), _ls(lora_A, lora_B, 1.0),
+        expert_idx=0, num_experts=num_experts, output_dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(out.cpu(), gate_W)
+    assert _MOE_MERGE_STATE["fallback"] >= 1
+    assert _MOE_MERGE_STATE["first_error"] is not None
+    assert _MOE_MERGE_STATE["first_error"]["role"] == "gate"
+    _reset_moe_merge_state()
+
+
+def test_resolve_num_experts_walks_base_layer_chain():
+    from unsloth_zoo.saving_utils import _resolve_num_experts_from_lora_stats
+
+    class Inner:
+        num_experts = 128
+
+    class Outer:
+        base_layer = Inner()
+
+    stats_inner_only = LoraStats(module=Inner(), lora_A=None, lora_B=None, alpha=1.0)
+    assert _resolve_num_experts_from_lora_stats(stats_inner_only, fallback=-1) == 128
+
+    stats_via_base_layer = LoraStats(module=Outer(), lora_A=None, lora_B=None, alpha=1.0)
+    assert _resolve_num_experts_from_lora_stats(stats_via_base_layer, fallback=-1) == 128
+
+    stats_none = LoraStats(module=None, lora_A=None, lora_B=None, alpha=1.0)
+    assert _resolve_num_experts_from_lora_stats(stats_none, fallback=17) == 17

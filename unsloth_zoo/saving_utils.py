@@ -609,6 +609,15 @@ def _merge_and_overwrite_lora(
                 safetensor_keys,
                 model_class_name = model_class_name,
             )
+            # #5410: use the wrapped module's num_experts, not the shard-local one.
+            for _lk, _ls in converted_lora_weights.items():
+                if not isinstance(_lk, str): continue
+                _pm = re.match(r"^(.*mlp\.experts)(?:\.base_layer)?$", _lk)
+                if not _pm: continue
+                _prefix = _pm.group(1)
+                _ne = _resolve_num_experts_from_lora_stats(_ls, fallback = None)
+                if _ne is not None and _ne > 1:
+                    moe_num_experts[_prefix] = _ne
             processed_mxfp4_keys = set()
             if UNSLOTH_ENABLE_LOGGING:
                 try:
@@ -918,128 +927,216 @@ def _merge_and_overwrite_lora(
     return count, safetensor_keys_seen
 pass
 
-def _merge_moe_gate_expert(gate_W, lora_stats, expert_idx, num_experts, output_dtype):
-    """
-    Merge LoRA for a single expert of gate_proj part of gate_up_proj.
-    """
+# Per-expert MoE LoRA merge helpers (#5410). PEFT 0.18 = "swapped", PEFT 0.19+
+# = "standard" (huggingface/peft#3165). Layout detected by shape vs the
+# per-expert disk weight; unrecognised shapes increment fallback and the
+# outer raises so partial merges cannot save.
+
+_MOE_MERGE_STATE = {
+    "attempted":   0,
+    "applied":     0,
+    "fallback":    0,
+    "first_error": None,
+}
+
+
+def _reset_moe_merge_state():
+    _MOE_MERGE_STATE["attempted"]   = 0
+    _MOE_MERGE_STATE["applied"]     = 0
+    _MOE_MERGE_STATE["fallback"]    = 0
+    _MOE_MERGE_STATE["first_error"] = None
+
+
+def _record_moe_merge_fallback(role, expert_idx, reason, lora_stats, W_shape):
+    _MOE_MERGE_STATE["fallback"] += 1
+    if _MOE_MERGE_STATE["first_error"] is None:
+        try:
+            a_shape = tuple(lora_stats.lora_A.shape) if lora_stats is not None and lora_stats.lora_A is not None else None
+            b_shape = tuple(lora_stats.lora_B.shape) if lora_stats is not None and lora_stats.lora_B is not None else None
+        except Exception:
+            a_shape, b_shape = None, None
+        _MOE_MERGE_STATE["first_error"] = {
+            "role":          role,
+            "expert_idx":    expert_idx,
+            "reason":        str(reason),
+            "lora_A_shape":  a_shape,
+            "lora_B_shape":  b_shape,
+            "per_expert_W":  W_shape,
+        }
+    logger.warning(
+        f"[Unsloth MoE merge fallback] role={role} expert={expert_idx} reason={reason}. "
+        f"per_expert_W={W_shape}. The base weight is being written through; "
+        "the merged checkpoint will be missing this delta."
+    )
+
+
+def _resolve_num_experts_from_lora_stats(lora_stats, fallback):
+    """Walk module.base_layer for num_experts; bounded so cycles cannot hang."""
     try:
-        if lora_stats.lora_A is None or lora_stats.lora_B is None:
-            return gate_W
-
-        total_rank, two_inter = lora_stats.lora_A.shape
-        in_dim, total_rank_B = lora_stats.lora_B.shape
-
-        # Validation checks
-        if total_rank_B != total_rank or two_inter % 2 != 0:
-            return gate_W
-
-        if num_experts is None or num_experts <= 0:
-            num_experts = total_rank // max(1, getattr(lora_stats, "rank", 0) or 1)
-        if num_experts <= 0 or total_rank % num_experts != 0:
-            return gate_W
-
-        rank = total_rank // num_experts
-        start, end = expert_idx * rank, (expert_idx + 1) * rank
-        if end > total_rank:
-            return gate_W
-
-        a_slice = lora_stats.lora_A[start:end, :]          # (r, 2I)
-        b_slice = lora_stats.lora_B[:, start:end]          # (H, r)
-        inter_dim = two_inter // 2
-
-        # gate_proj corresponds to first half of A
-        gate_a = a_slice[:, :inter_dim]                    # (r, I)
-
-        device = _active_merge_device()
-        gate_delta = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ gate_a.to(device, dtype = torch.float32, non_blocking = True)
-
-        gate_merged = gate_W.to(device, dtype = torch.float32, non_blocking = True)
-        gate_merged = gate_merged.add(gate_delta.transpose(0, 1), alpha = lora_stats.alpha)
-
-        return gate_merged.to(output_dtype)
+        module = getattr(lora_stats, "module", None)
     except Exception:
-        return gate_W
+        return fallback
+    seen = set()
+    for _ in range(16):
+        if module is None:
+            break
+        try:
+            mid = id(module)
+        except Exception:
+            break
+        if mid in seen:
+            break
+        seen.add(mid)
+        for attr in (
+            "num_experts",
+            "num_experts_per_group",
+            "num_routed_experts",
+            "num_local_experts",
+            "num_moe_experts",
+        ):
+            try:
+                value = getattr(module, attr, None)
+            except Exception:
+                value = None
+            if isinstance(value, int) and value > 1:
+                return value
+        try:
+            module = getattr(module, "base_layer", None)
+        except Exception:
+            break
+    return fallback
+
+
+def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim):
+    """Shape-classify as 'swapped' / 'standard' / 'unknown'; returns (layout, r)."""
+    total_rank_A, dim_A = lora_A.shape
+    dim_B, total_rank_B = lora_B.shape
+    if total_rank_A != total_rank_B or num_experts is None or num_experts <= 0:
+        return "unknown", 0
+    if total_rank_A % num_experts != 0:
+        return "unknown", 0
+    r = total_rank_A // num_experts
+    if dim_A == out_dim and dim_B == in_dim:
+        return "swapped", r
+    if dim_A == in_dim and dim_B == out_dim:
+        return "standard", r
+    return "unknown", r
+
+
+def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_dtype, *, role):
+    """Per-expert merge for gate_proj / up_proj. role='gate' -> first I, 'up' -> last I."""
+    if lora_stats is None or lora_stats.lora_A is None or lora_stats.lora_B is None:
+        return W
+    _MOE_MERGE_STATE["attempted"] += 1
+    try:
+        num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
+        if num_experts is None or num_experts <= 0:
+            num_experts = lora_stats.lora_A.shape[0] // max(1, getattr(lora_stats, "rank", 0) or 1)
+
+        I, H = W.shape
+        layout, r = _detect_moe_lora_layout(
+            lora_stats.lora_A, lora_stats.lora_B,
+            num_experts = num_experts, out_dim = 2 * I, in_dim = H,
+        )
+        if layout == "unknown" or r <= 0:
+            _record_moe_merge_fallback(
+                role, expert_idx,
+                f"layout not detected (A={tuple(lora_stats.lora_A.shape)}, B={tuple(lora_stats.lora_B.shape)})",
+                lora_stats, (I, H),
+            )
+            return W
+
+        start, end = expert_idx * r, (expert_idx + 1) * r
+        if end > num_experts * r:
+            _record_moe_merge_fallback(role, expert_idx, "expert_idx out of range", lora_stats, (I, H))
+            return W
+
+        a_slice = lora_stats.lora_A[start:end, :]
+        b_slice = lora_stats.lora_B[:, start:end]
+        device  = _active_merge_device()
+        a_f     = a_slice.to(device, dtype = torch.float32, non_blocking = True)
+        b_f     = b_slice.to(device, dtype = torch.float32, non_blocking = True)
+
+        if layout == "swapped":
+            half = a_f[:, :I] if role == "gate" else a_f[:, I:]
+            delta = b_f @ half
+            merged = W.to(device, dtype = torch.float32, non_blocking = True).add(
+                delta.transpose(0, 1), alpha = lora_stats.alpha,
+            )
+        else:
+            half = b_f[:I, :] if role == "gate" else b_f[I:, :]
+            delta = half @ a_f
+            merged = W.to(device, dtype = torch.float32, non_blocking = True).add(
+                delta, alpha = lora_stats.alpha,
+            )
+
+        _MOE_MERGE_STATE["applied"] += 1
+        return merged.to(output_dtype)
+    except Exception as exc:
+        _record_moe_merge_fallback(role, expert_idx, repr(exc), lora_stats, tuple(W.shape))
+        return W
+
+
+def _merge_moe_gate_expert(gate_W, lora_stats, expert_idx, num_experts, output_dtype):
+    return _merge_moe_gate_or_up_expert(
+        gate_W, lora_stats, expert_idx, num_experts, output_dtype, role = "gate",
+    )
 
 
 def _merge_moe_up_expert(up_W, lora_stats, expert_idx, num_experts, output_dtype):
-    """
-    Merge LoRA for a single expert of up_proj part of gate_up_proj.
-    """
-    try:
-        if lora_stats.lora_A is None or lora_stats.lora_B is None:
-            return up_W
-
-        total_rank, two_inter = lora_stats.lora_A.shape
-        in_dim, total_rank_B = lora_stats.lora_B.shape
-
-        # Validation checks
-        if total_rank_B != total_rank or two_inter % 2 != 0:
-            return up_W
-
-        if num_experts is None or num_experts <= 0:
-            num_experts = total_rank // max(1, getattr(lora_stats, "rank", 0) or 1)
-        if num_experts <= 0 or total_rank % num_experts != 0:
-            return up_W
-
-        rank = total_rank // num_experts
-        start, end = expert_idx * rank, (expert_idx + 1) * rank
-        if end > total_rank:
-            return up_W
-
-        a_slice = lora_stats.lora_A[start:end, :]          # (r, 2I)
-        b_slice = lora_stats.lora_B[:, start:end]          # (H, r)
-        inter_dim = two_inter // 2
-
-        # up_proj corresponds to second half of A
-        up_a   = a_slice[:, inter_dim:]                    # (r, I)
-
-        device = _active_merge_device()
-        up_delta   = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ up_a.to(device, dtype = torch.float32, non_blocking = True)
-
-        up_merged = up_W.to(device, dtype = torch.float32, non_blocking = True)
-        up_merged = up_merged.add(up_delta.transpose(0, 1), alpha = lora_stats.alpha)
-
-        return up_merged.to(output_dtype)
-    except Exception:
-        return up_W
+    return _merge_moe_gate_or_up_expert(
+        up_W, lora_stats, expert_idx, num_experts, output_dtype, role = "up",
+    )
 pass
 
+
 def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, output_dtype):
-    """
-    Merge LoRA for a single expert of down_proj.
-    LoRA weights are stacked per expert:
-      lora_A: (E*R, H)    (swapped)
-      lora_B: (I, E*R)    (swapped)
-    delta = (lora_B @ lora_A)^T
-    """
+    if lora_stats is None or lora_stats.lora_A is None or lora_stats.lora_B is None:
+        return down_W
+    _MOE_MERGE_STATE["attempted"] += 1
     try:
-        if lora_stats.lora_A is None or lora_stats.lora_B is None:
-            return down_W
-
-        total_rank, out_dim = lora_stats.lora_A.shape
-        in_dim, total_rank_B = lora_stats.lora_B.shape
-        if total_rank_B != total_rank:
-            return down_W
-
+        num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
         if num_experts is None or num_experts <= 0:
-            num_experts = total_rank // max(1, getattr(lora_stats, "rank", 0) or 1)
-        if num_experts <= 0 or total_rank % num_experts != 0:
+            num_experts = lora_stats.lora_A.shape[0] // max(1, getattr(lora_stats, "rank", 0) or 1)
+
+        H, I = down_W.shape
+        layout, r = _detect_moe_lora_layout(
+            lora_stats.lora_A, lora_stats.lora_B,
+            num_experts = num_experts, out_dim = H, in_dim = I,
+        )
+        if layout == "unknown" or r <= 0:
+            _record_moe_merge_fallback(
+                "down", expert_idx,
+                f"layout not detected (A={tuple(lora_stats.lora_A.shape)}, B={tuple(lora_stats.lora_B.shape)})",
+                lora_stats, (H, I),
+            )
             return down_W
 
-        rank = total_rank // num_experts
-        start, end = expert_idx * rank, (expert_idx + 1) * rank
-        if end > total_rank:
+        start, end = expert_idx * r, (expert_idx + 1) * r
+        if end > num_experts * r:
+            _record_moe_merge_fallback("down", expert_idx, "expert_idx out of range", lora_stats, (H, I))
             return down_W
 
-        a_slice = lora_stats.lora_A[start:end, :]     # (r, H_out)
-        b_slice = lora_stats.lora_B[:, start:end]     # (I_in, r)
+        a_slice = lora_stats.lora_A[start:end, :]
+        b_slice = lora_stats.lora_B[:, start:end]
+        device  = _active_merge_device()
+        a_f     = a_slice.to(device, dtype = torch.float32, non_blocking = True)
+        b_f     = b_slice.to(device, dtype = torch.float32, non_blocking = True)
 
-        device = _active_merge_device()
-        delta = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ a_slice.to(device, dtype = torch.float32, non_blocking = True)
-        merged = down_W.to(device, dtype = torch.float32, non_blocking = True)
-        merged = merged.add(delta.transpose(0, 1), alpha = lora_stats.alpha)
+        delta = b_f @ a_f
+        if layout == "swapped":
+            merged = down_W.to(device, dtype = torch.float32, non_blocking = True).add(
+                delta.transpose(0, 1), alpha = lora_stats.alpha,
+            )
+        else:
+            merged = down_W.to(device, dtype = torch.float32, non_blocking = True).add(
+                delta, alpha = lora_stats.alpha,
+            )
+
+        _MOE_MERGE_STATE["applied"] += 1
         return merged.to(output_dtype)
-    except Exception:
+    except Exception as exc:
+        _record_moe_merge_fallback("down", expert_idx, repr(exc), lora_stats, tuple(down_W.shape))
         return down_W
 pass
 
@@ -2097,6 +2194,15 @@ def merge_and_overwrite_lora(
         config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
+        # #5410: keep trained eos / sampling defaults on reload.
+        try:
+            gen_cfg = getattr(model, "generation_config", None)
+            if gen_cfg is None:
+                gen_cfg = getattr(getattr(model, "config", None), "generation_config", None)
+            if gen_cfg is not None:
+                gen_cfg.save_pretrained(save_directory)
+        except Exception as gen_cfg_err:
+            print(f"Unsloth: failed to save generation_config.json: {gen_cfg_err}")
     elif save_method == "mxfp4":
         from transformers import AutoConfig
         model_config = AutoConfig.from_pretrained(
@@ -2195,6 +2301,8 @@ def merge_and_overwrite_lora(
         )
 
     final_safetensors_list = []
+
+    _reset_moe_merge_state()  # #5410
 
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
     for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
@@ -2332,6 +2440,27 @@ def merge_and_overwrite_lora(
             f"does not match # of saved modules = {n_saved_modules}. Please file a bug report!"
         )
     pass
+
+    if _MOE_MERGE_STATE["fallback"] > 0:  # #5410: never claim success on a partial merge
+        err = _MOE_MERGE_STATE.get("first_error") or {}
+        raise RuntimeError(
+            "Unsloth: MoE LoRA merge fell back to the base weight on "
+            f"{_MOE_MERGE_STATE['fallback']} per-expert tensor(s) "
+            f"(of {_MOE_MERGE_STATE['attempted']} attempted, {_MOE_MERGE_STATE['applied']} applied). "
+            "The merged checkpoint would be missing the expert LoRA delta. "
+            f"First failure: role={err.get('role')} expert={err.get('expert_idx')} "
+            f"reason={err.get('reason')} lora_A={err.get('lora_A_shape')} "
+            f"lora_B={err.get('lora_B_shape')} per_expert_W={err.get('per_expert_W')}. "
+            "This usually means an unrecognised PEFT/Transformers MoE LoRA layout. "
+            "Please file a bug at https://github.com/unslothai/unsloth-zoo/issues "
+            "with these shapes."
+        )
+    if _MOE_MERGE_STATE["attempted"] > 0:
+        print(
+            f"Unsloth: MoE LoRA merge applied to "
+            f"{_MOE_MERGE_STATE['applied']}/{_MOE_MERGE_STATE['attempted']} "
+            "per-expert tensors."
+        )
 
     # --- Cleanup
     if temp_file is not None:
