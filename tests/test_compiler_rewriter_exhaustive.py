@@ -2038,14 +2038,18 @@ def test_unsloth_trainer_exec_marker():
     Skips on a host without a real accelerator: ``import unsloth`` raises
     ``NotImplementedError("Unsloth cannot find any torch accelerator")``
     at top-level on a CPU-only CI runner, which is neither an ImportError
-    nor a drift signal -- it's just the harness gate. Treat it as skip
-    so the no-GPU CI cell goes green; the GPU cell still exercises this
-    test for real.
+    nor a drift signal -- it's just the harness gate. ``importorskip``
+    only converts ``ImportError`` to ``skip``, so we have to wrap the
+    whole import path. Treat the no-accelerator case as skip so the
+    no-GPU CI cell goes green; the GPU cell still exercises the import
+    end-to-end.
     """
-    pytest.importorskip("unsloth")
     try:
+        import unsloth  # noqa: F401
         import unsloth.trainer as trainer_mod
     except ImportError as e:
+        if e.name == "unsloth":
+            pytest.skip(f"unsloth is not installed: {e}")
         _drift(
             "unsloth/trainer.py:614",
             "import unsloth.trainer",

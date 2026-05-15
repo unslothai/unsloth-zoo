@@ -207,7 +207,13 @@ jobs:
           set -euxo pipefail
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
-            "torch>=2.4.0,<2.11.0"
+            "torch>=2.4.0,<2.11.0" "torchvision<0.26"
+          # torchvision: transitive import of transformers.models.qwen2_vl
+          # / qwen2_5_vl image processors. The Qwen2_VL image-processor
+          # zoo references chains through `from torchvision...` at module
+          # top, so a missing torchvision turns the existence-probe drift
+          # tests RED on "ModuleNotFoundError: No module named 'torchvision'".
+          # CPU build is plenty; we don't need the CUDA variant.
           pip install -e .[core]
           pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
           # Override with matrix-resolved specs.
