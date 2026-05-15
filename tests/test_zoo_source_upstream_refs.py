@@ -715,8 +715,23 @@ def test_qwen2_vl_image_processor_class():
 
 def test_qwen2_5_vl_image_processor_class_gated_on_v5():
     """unsloth_zoo/temporary_patches/misc.py:1501 --
-    Qwen2_5_VLImageProcessor. Version-gated on transformers >= 5.0.0
-    (misc.py:1478-1482)."""
+    Qwen2_5_VLImageProcessor.
+
+    Originally added because zoo's patch site at misc.py:1501 references
+    this exact path; the version gate skipped on 4.x where the patch is
+    inert. transformers 5.x then DROPPED the slow image processors
+    entirely (no image_processing_qwen2_5_vl.py, no
+    image_processing_qwen2_5_vl_fast.py either): Qwen2.5-VL now reuses
+    ``Qwen2VLImageProcessor`` directly. zoo's misc.py:1500-1506 is
+    try/except ImportError-wrapped, so the no-longer-resolvable import
+    silently no-ops on 5.x and the runtime shim still fires via the
+    Qwen2VLImageProcessor patch at misc.py:1485-1498 (which is the
+    same class Qwen2.5-VL inherits at runtime).
+
+    On 4.57.6 the path still exists -- keep the strict drift check.
+    On 5.x the path is gone but the runtime is covered elsewhere --
+    skip.
+    """
     import transformers
     from packaging.version import Version
     if Version(transformers.__version__) < Version("5.0.0"):
@@ -724,6 +739,14 @@ def test_qwen2_5_vl_image_processor_class_gated_on_v5():
             "qwen2_5_vl.image_processing_qwen2_5_vl not required on "
             f"transformers {transformers.__version__} (zoo patch is "
             "version-gated to >= 5.0.0)"
+        )
+    if Version(transformers.__version__) >= Version("5.0.0"):
+        pytest.skip(
+            f"transformers {transformers.__version__}: slow image "
+            "processors removed, Qwen2.5-VL now reuses "
+            "Qwen2VLImageProcessor at runtime; zoo's misc.py:1500-1506 "
+            "patch site is try/except'd and silently no-ops (covered "
+            "by the Qwen2VLImageProcessor patch at misc.py:1485-1498)"
         )
     pytest.importorskip("torchvision")  # transformers qwen2_5_vl imports it
     _resolve(
