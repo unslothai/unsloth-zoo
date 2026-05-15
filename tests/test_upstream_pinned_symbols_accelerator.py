@@ -172,8 +172,15 @@ def test_moe_expert_merges_call_active_merge_device():
     through _active_merge_device(). A regression to a hardcoded "cuda" or
     DEVICE_TYPE_TORCH inside any one of them silently drops MPS/XPU
     placement and was the exact 2564f39 bug class.
+
+    After unsloth-zoo#647 the gate / up wrappers delegate to a unified
+    helper ``_merge_moe_gate_or_up_expert``; the check follows that
+    delegation by inspecting the union of each entry-point's source and
+    the source of any sibling ``_merge_moe_*`` helper it explicitly
+    forwards to.
     """
     import inspect
+    import re
     import unsloth_zoo.saving_utils as su
 
     targets = [
@@ -183,21 +190,42 @@ def test_moe_expert_merges_call_active_merge_device():
         "_merge_moe_fused_gate_up_expert",
         "_merge_moe_fused_down_proj_expert",
     ]
+    _helper_call_re = re.compile(r"\b(_merge_moe_[A-Za-z0-9_]+)\(")
+
+    def _effective_source(name: str, seen: set) -> str:
+        """Return the entry-point's source plus the source of any
+        sibling ``_merge_moe_*`` helper it explicitly forwards to.
+        One-level follow is enough: zoo never chains wrapper -> wrapper
+        -> helper, and the implementations all live in saving_utils."""
+        if name in seen:
+            return ""
+        seen.add(name)
+        fn = getattr(su, name, None)
+        if fn is None:
+            return ""
+        src = inspect.getsource(fn)
+        callees = set(_helper_call_re.findall(src)) - {name}
+        for callee in callees:
+            src += "\n" + _effective_source(callee, seen)
+        return src
+
     for name in targets:
         fn = getattr(su, name, None)
         assert fn is not None, (
             f"{name} missing; the MoE-expert merge dispatch surface "
             "shrank without notice — see commit 2564f39."
         )
-        src = inspect.getsource(fn)
+        src = _effective_source(name, set())
         assert "_active_merge_device(" in src, (
-            f"{name} no longer routes through _active_merge_device(). "
-            "That regresses 2564f39 + fd58aa1: hardcoded 'cuda' breaks "
-            "Intel XPU and Apple MPS LoRA merge."
+            f"{name} (and any sibling _merge_moe_* it delegates to) no "
+            "longer routes through _active_merge_device(). That regresses "
+            "2564f39 + fd58aa1: hardcoded 'cuda' breaks Intel XPU and "
+            "Apple MPS LoRA merge."
         )
         assert '.to("cuda"' not in src and ".to('cuda'" not in src, (
-            f"{name} hardcodes .to('cuda', ...) again — same regression "
-            "class as commit 2564f39."
+            f"{name} (or the helper it delegates to) hardcodes "
+            ".to('cuda', ...) again — same regression class as commit "
+            "2564f39."
         )
 
 
