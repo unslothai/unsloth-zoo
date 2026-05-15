@@ -2033,7 +2033,15 @@ def test_unsloth_rl_peft_pattern_27_marker():
 
 def test_unsloth_trainer_exec_marker():
     """``unsloth/trainer.py:614`` exec()'s synthesized trainer source;
-    pin that unsloth.trainer is importable."""
+    pin that unsloth.trainer is importable.
+
+    Skips on a host without a real accelerator: ``import unsloth`` raises
+    ``NotImplementedError("Unsloth cannot find any torch accelerator")``
+    at top-level on a CPU-only CI runner, which is neither an ImportError
+    nor a drift signal -- it's just the harness gate. Treat it as skip
+    so the no-GPU CI cell goes green; the GPU cell still exercises this
+    test for real.
+    """
     pytest.importorskip("unsloth")
     try:
         import unsloth.trainer as trainer_mod
@@ -2046,6 +2054,10 @@ def test_unsloth_trainer_exec_marker():
             "unreachable.",
         )
         return
+    except NotImplementedError as e:
+        if "accelerator" in str(e) or "GPU" in str(e):
+            pytest.skip(f"No accelerator visible to unsloth import: {e}")
+        raise
     # Module must expose some Trainer-family symbol downstream rewriter consumes.
     if not any(
         hasattr(trainer_mod, sym)
