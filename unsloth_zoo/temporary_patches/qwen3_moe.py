@@ -74,18 +74,36 @@ def _make_qwen_moe_lora_extractor():
 
         param_name = getattr(wrapper, "parameter_name", None)
 
-        if param_name == "down_proj" and intermediate_dim is not None and hidden_dim is not None:
-            first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-            first_weight = first_weight.permute(1, 0, 2).contiguous()
-            second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-            return first_weight, second_weight, scaling, num_experts
+        # Determine expected base in_dim per parameter to detect PEFT layout.
+        # PEFT 0.18 wraps 3-D params with a "swapped" layout where weight_A's
+        # second dim is the *output* of the base param; PEFT 0.19 uses the
+        # standard layout where weight_A's second dim is the *input*.
+        expected_in_dim = None
+        expected_out_dim = None
+        if hidden_dim is not None and intermediate_dim is not None:
+            if param_name == "down_proj":
+                expected_in_dim = intermediate_dim
+                expected_out_dim = hidden_dim
+            elif param_name == "gate_up_proj":
+                expected_in_dim = hidden_dim
+                expected_out_dim = 2 * intermediate_dim
 
-        elif param_name == "gate_up_proj" and hidden_dim is not None:
-            first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-            first_weight = first_weight.permute(1, 0, 2).contiguous()
-            second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-            return first_weight, second_weight, scaling, num_experts
+        if expected_in_dim is not None:
+            if dim_A == expected_in_dim:
+                # STANDARD (PEFT 0.19): weight_A is (E*R, in_dim), weight_B is (out_dim, E*R)
+                first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
+                first_weight = first_weight.permute(0, 2, 1).contiguous()  # (E, in_dim, R)
+                second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+                second_weight = second_weight.permute(1, 2, 0).contiguous()  # (E, R, out_dim)
+                return first_weight, second_weight, scaling, num_experts
+            elif dim_A == expected_out_dim:
+                # SWAPPED (PEFT 0.18): weight_A is (E*R, out_dim), weight_B is (in_dim, E*R)
+                first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+                first_weight = first_weight.permute(1, 0, 2).contiguous()  # (E, in_dim, R)
+                second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)  # (E, R, out_dim)
+                return first_weight, second_weight, scaling, num_experts
 
+        # Fallback: hidden_dim-based heuristic when param_name didn't match
         if hidden_dim is not None:
             if dim_B == hidden_dim:
                 first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
@@ -354,7 +372,7 @@ def patch_qwen3_moe():
 
         _qwen3_lora_extractor = _make_qwen_moe_lora_extractor()
 
-        transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts._unsloth_lora_extractor_fn = _qwen3_lora_extractor
+        transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts._unsloth_lora_extractor_fn = staticmethod(_qwen3_lora_extractor)
 
         forward = _make_qwen_moe_experts_forward()
         sparse_moe_block_forward = _make_qwen_moe_sparse_moe_block_forward(
