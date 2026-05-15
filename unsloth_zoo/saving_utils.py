@@ -870,10 +870,25 @@ def _record_moe_merge_fallback(role, expert_idx, reason, lora_stats, W_shape):
 def _resolve_num_experts_from_lora_stats(lora_stats, fallback):
     """Walk the wrapped module chain for the authoritative `num_experts`.
     The shard-local key scan can be a non-divisor of total_rank when experts
-    are split across multiple safetensor shards.
+    are split across multiple safetensor shards. The walk is bounded by a
+    max depth and a visited-id set so a cyclic or self-referential
+    `base_layer` cannot hang the merge.
     """
-    module = getattr(lora_stats, "module", None)
-    while module is not None:
+    try:
+        module = getattr(lora_stats, "module", None)
+    except Exception:
+        return fallback
+    seen = set()
+    for _ in range(16):
+        if module is None:
+            break
+        try:
+            mid = id(module)
+        except Exception:
+            break
+        if mid in seen:
+            break
+        seen.add(mid)
         for attr in (
             "num_experts",
             "num_experts_per_group",
@@ -881,11 +896,17 @@ def _resolve_num_experts_from_lora_stats(lora_stats, fallback):
             "num_local_experts",
             "num_moe_experts",
         ):
-            value = getattr(module, attr, None)
+            try:
+                value = getattr(module, attr, None)
+            except Exception:
+                value = None
             if isinstance(value, int) and value > 1:
                 return value
         # ParamWrapper.base_layer is the underlying MoE module
-        module = getattr(module, "base_layer", None)
+        try:
+            module = getattr(module, "base_layer", None)
+        except Exception:
+            break
     return fallback
 
 
