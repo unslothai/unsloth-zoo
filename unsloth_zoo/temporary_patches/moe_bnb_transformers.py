@@ -42,6 +42,7 @@ __all__ = [
     "patch_bnb4bit_quantizer_param_needs_quantization",
     "patch_bnb4bit_quantizer_process_model",
     "patch_transformers_grouped_linear_4bit",
+    "patch_transformers_modulelist_reverse",
     "replace_expert_params_with_bnb_params",
 ]
 
@@ -397,3 +398,85 @@ def patch_transformers_grouped_linear_4bit():
         logger.info("Unsloth: Patched transformers.integrations.moe._grouped_linear / _batched_linear / batched_mm_experts_forward for 4-bit MoE expert support")
 pass
 TEMPORARY_PATCHES.append(patch_transformers_grouped_linear_4bit)
+
+
+def patch_transformers_modulelist_reverse():
+    """
+    transformers v5's `SplitModulelist.get_target_patterns` and
+    `MergeModulelist.get_target_pattern` raise `ValueError("Undefined Operation
+    encountered!")` when invoked with `len(input_dict) == 1` and
+    `len(target_patterns) > 1`. This is the case `revert_weight_conversion`
+    hits for every fused-MoE save: the in-memory model has one fused
+    `experts.gate_up_proj` (3D), while `target_patterns` derived from the
+    forward-conversion mapping contains multiple star-templated entries (one
+    per parameter that was originally per-expert in the source checkpoint).
+
+    Symptom: `merged.save_pretrained(...)` on any model loaded with a fused-MoE
+    weight converter chain raises during `revert_weight_conversion` -> chunk
+    block. Affects ALL precisions including bf16, but only matters in practice
+    for users who want to serialize a merged-from-quantized MoE model.
+
+    Fix: when `len(target_patterns) > 1` and the source pattern matches one of
+    them (modulo `*` placeholders), pick the matching target. Otherwise use
+    the first target (heuristic that works for the common case where
+    target_patterns differ only in the suffix that happens to equal source's
+    suffix). For `SplitModulelist`, expand `*` -> `0..sizes-1` over the chosen
+    pattern.
+    """
+    try:
+        from transformers import core_model_loading as cml
+    except ImportError:
+        return
+    if not hasattr(cml, "SplitModulelist") or not hasattr(cml, "MergeModulelist"):
+        return
+
+    def _pick_matching_target(source_pattern, target_patterns):
+        """Pick the target pattern whose stem (split by '.') matches the source's."""
+        if len(target_patterns) == 1:
+            return target_patterns[0]
+        # Try to match by suffix component (e.g. "gate_up_proj" in
+        # "model.experts.*.gate_up_proj" should match the target_pattern that
+        # ends in "gate_up_proj").
+        src_tail = source_pattern.rstrip("*").rstrip(".").split(".")[-1]
+        for t in target_patterns:
+            t_tail = t.rstrip("*").rstrip(".").split(".")[-1]
+            if t_tail == src_tail:
+                return t
+        # Fallback: first target. Works for the simple len(target_patterns)>1
+        # case where the chain emits one target type per source.
+        return target_patterns[0]
+
+    SplitMod = cml.SplitModulelist
+    MergeMod = cml.MergeModulelist
+
+    if not getattr(SplitMod.get_target_patterns, "_unsloth_moe_patched", False):
+        _orig_split_get_targets = SplitMod.get_target_patterns
+
+        def _patched_split_get_target_patterns(self, input_dict, source_pattern, target_patterns, sizes):
+            if len(input_dict) == 1:
+                if len(target_patterns) >= 1:
+                    chosen = _pick_matching_target(source_pattern, target_patterns)
+                    return [chosen.replace("*", f"{i}") for i in range(sizes)]
+                raise ValueError("Undefined Operation encountered!")
+            return [source_pattern.replace("*", f"{i}") for i in range(sizes)]
+
+        _patched_split_get_target_patterns._unsloth_moe_patched = True
+        patch_function(SplitMod, "get_target_patterns", _patched_split_get_target_patterns, match_level="relaxed")
+
+    if not getattr(MergeMod.get_target_pattern, "_unsloth_moe_patched", False):
+        _orig_merge_get_target = MergeMod.get_target_pattern
+
+        def _patched_merge_get_target_pattern(self, input_dict, source_pattern, target_patterns):
+            if len(input_dict) == 1:
+                if len(target_patterns) >= 1:
+                    return _pick_matching_target(source_pattern, target_patterns)
+                raise ValueError("Undefined Operation encountered!")
+            return source_pattern
+
+        _patched_merge_get_target_pattern._unsloth_moe_patched = True
+        patch_function(MergeMod, "get_target_pattern", _patched_merge_get_target_pattern, match_level="relaxed")
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: Patched transformers core_model_loading SplitModulelist/MergeModulelist target-pattern resolution")
+pass
+TEMPORARY_PATCHES.append(patch_transformers_modulelist_reverse)
