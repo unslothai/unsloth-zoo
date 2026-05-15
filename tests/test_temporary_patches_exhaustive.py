@@ -1181,6 +1181,16 @@ def test_pixtral_attention_forward_signature():
     )
     _maybe_skip_if_patched(cls, "forward", "pixtral.py")
     upstream_fwd = _resolve_upstream_method(cls, "forward")
+    # Newer transformers (>=5.x) wrap forwards as ``(self, *args, **kwargs)``
+    # via attention-implementation dispatch. The zoo patch passes through
+    # kwargs so its call site stays valid; static param names are not
+    # introspectable, so skip rather than report spurious drift.
+    if _has_var_keyword(upstream_fwd):
+        pytest.skip(
+            "PixtralAttention.forward is now `(self, *args, **kwargs)` on "
+            f"transformers {_TX_VERSION}; static param-name verification "
+            "is not meaningful for this wrapped signature."
+        )
     _assert_params_superset(
         upstream_fwd,
         required=["hidden_states", "attention_mask", "position_embeddings"],
