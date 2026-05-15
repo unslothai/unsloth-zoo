@@ -119,10 +119,12 @@ class MLXTrainingConfig:
     optim: str = "adamw"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
     weight_decay: float = 0.001
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
-    # Elementwise clipping (PyTorch's torch.nn.utils.clip_grad_value_).
-    # Clamps every grad value to [-max_grad_value, max_grad_value] leaf-by-leaf
-    # with no cross-leaf reduction. Set 0.0 to disable.
-    max_grad_value: float | None = 5.0
+    # Elementwise clip ([-max_grad_value, max_grad_value], per-leaf, no
+    # cross-leaf reduction). Set 0.0 to disable. Default 1.0: |g_i| > 5
+    # rarely fires on real transformer grads, so the historical 5.0 was
+    # effectively a no-op; 1.0 matches the universal clip_grad_norm=1.0
+    # baseline while staying on MLX's fast tree_map(mx.clip) path.
+    max_grad_value: float | None = 1.0
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
     embedding_learning_rate: float = 0.0  # 0 = disabled, 5e-5 = recommended
@@ -726,8 +728,8 @@ class MLXTrainer:
         # Elementwise clip (clip_grad_value_): leaf-local, free memory.
         # Prefer value clipping when both clipping modes are requested; global
         # norm clipping is exact but materially increases memory on MLX.
-        _raw_mgv = getattr(args, "max_grad_value", 5.0)  # TODO: expose MLX grad-clip in Studio UI for power users
-        max_grad_value = 5.0 if _raw_mgv is None else float(_raw_mgv or 0.0)
+        _raw_mgv = getattr(args, "max_grad_value", 1.0)  # TODO: expose MLX grad-clip in Studio UI for power users
+        max_grad_value = 1.0 if _raw_mgv is None else float(_raw_mgv or 0.0)
         if max_grad_norm > 0 and max_grad_value > 0:
             print(
                 "Unsloth: max_grad_norm and max_grad_value are both enabled; "
