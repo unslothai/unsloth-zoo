@@ -42,6 +42,7 @@ __all__ = [
     "patch_bnb4bit_quantizer_param_needs_quantization",
     "patch_bnb4bit_quantizer_process_model",
     "patch_transformers_grouped_linear_4bit",
+    "patch_transformers_weight_converter_kwargs",
     "replace_expert_params_with_bnb_params",
 ]
 
@@ -397,3 +398,62 @@ def patch_transformers_grouped_linear_4bit():
         logger.info("Unsloth: Patched transformers.integrations.moe._grouped_linear / _batched_linear / batched_mm_experts_forward for 4-bit MoE expert support")
 pass
 TEMPORARY_PATCHES.append(patch_transformers_grouped_linear_4bit)
+
+
+def patch_transformers_weight_converter_kwargs():
+    """
+    PEFT 0.19's `convert_peft_adapter_state_dict_for_transformers` (in
+    `peft/utils/transformers_weight_conversion.py:268`) constructs new
+    `WeightConverter` instances via:
+        new_conversion = orig_conversion.__class__(
+            source_patterns=...,
+            target_patterns=...,
+            distributed_operation=...,
+            quantization_operation=...,
+            operations=...,
+        )
+    This is forward-compatibility code for a later transformers release. With
+    transformers 5.6.2 the `WeightConverter.__init__` signature is
+    `(self, source_patterns, target_patterns, operations)` and the extra
+    kwargs raise `TypeError: WeightConverter.__init__() got an unexpected
+    keyword argument 'distributed_operation'`. This blocks every
+    `PeftModel.from_pretrained` for any MoE-fused 4-bit model on peft 0.19.
+
+    Fix: patch `WeightConverter.__init__` to accept and ignore unknown kwargs
+    (`distributed_operation`, `quantization_operation`, etc.). The original
+    init already stores everything it needs from `source_patterns`,
+    `target_patterns`, and `operations`. The ignored kwargs only affect
+    distributed / quantization codepaths that aren't exercised at adapter-load
+    time.
+    """
+    try:
+        from transformers.core_model_loading import WeightConverter
+    except ImportError:
+        return
+
+    if getattr(WeightConverter.__init__, "_unsloth_kwargs_patched", False):
+        return
+
+    _original_init = WeightConverter.__init__
+
+    import inspect
+    try:
+        original_params = set(inspect.signature(_original_init).parameters)
+    except (TypeError, ValueError):
+        original_params = {"self", "source_patterns", "target_patterns", "operations"}
+
+    def _patched_init(self, *args, **kwargs):
+        # Drop kwargs that the installed transformers version does not accept.
+        # Forwarding only the kwargs the original signature recognises makes us
+        # forward-compatible with peft versions written against newer
+        # transformers releases.
+        accepted = {k: v for k, v in kwargs.items() if k in original_params}
+        return _original_init(self, *args, **accepted)
+
+    _patched_init._unsloth_kwargs_patched = True
+    WeightConverter.__init__ = _patched_init
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: Patched transformers WeightConverter.__init__ to ignore unknown kwargs (peft 0.19 forward-compat)")
+pass
+TEMPORARY_PATCHES.append(patch_transformers_weight_converter_kwargs)
