@@ -651,27 +651,37 @@ def test_MinistralAttention_forward_signature():
     match_level='relaxed'. Pin ``hidden_states``,
     ``position_embeddings``, ``attention_mask``.
 
-    On transformers 5.x ``MinistralAttention.forward`` was refactored
-    (cache_position moved into **kwargs, parameter order changed) so
-    zoo's ``patch_function(..., match_level='relaxed')`` falls back to
-    the generic ``(self, *args, **kwargs)`` wrapper. ``inspect.signature``
-    of the live attribute sees the wrapper, not the upstream named
-    params. The runtime call still works because the wrapper unpacks
-    via kwargs. Skip the named-param probe on 5.x; keep strict on 4.57.6.
+    Zoo's patch wraps the actual implementation with
+    ``def forward(self, *args, **kwargs): return _full_forward(...)``
+    so ``check_args_kwargs`` accepts removed params on 5.x. After the
+    wrap, ``inspect.signature(MinistralAttention.forward)`` is the
+    generic wrapper. The pre-wrap implementation (with the real named
+    params) is stashed under
+    ``_original_modeling_ministral_MinistralAttention_forward``; probe
+    that when it exists, else fall back to the live attr. If the live
+    attr is the relaxed wrapper, the named-param probe isn't applicable
+    -- the runtime call still works because the wrapper forwards via
+    kwargs.
     """
-    _skip_if_transformers_5x(
-        "MinistralAttention.forward reflowed (params moved into "
-        "**kwargs: Unpack[TransformersKwargs]); zoo's relaxed patch "
-        "wraps with (self, *args, **kwargs)"
-    )
     try:
         from transformers.models.ministral.modeling_ministral import (
             MinistralAttention,
         )
     except ImportError:
         pytest.skip("transformers.models.ministral not installed (added in 4.57)")
+    stash_attr = "_original_modeling_ministral_MinistralAttention_forward"
+    candidate = getattr(MinistralAttention, stash_attr, MinistralAttention.forward)
+    candidate_params = list(inspect.signature(candidate).parameters.keys())
+    if candidate_params == ["self", "args", "kwargs"]:
+        pytest.skip(
+            "MinistralAttention.forward is zoo's relaxed (self, *args, "
+            "**kwargs) wrapper and no _original_ stash is available on "
+            "this run; the wrapper forwards via kwargs so the named-"
+            "param contract is enforced at runtime, not via "
+            "inspect.signature"
+        )
     _assert_params_superset(
-        MinistralAttention.forward,
+        candidate,
         required=["hidden_states", "position_embeddings", "attention_mask"],
         zoo_callsite="ministral.py:99 MinistralAttention.forward patch",
     )
