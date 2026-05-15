@@ -161,7 +161,18 @@ class _LazyMLXAlias(_types.ModuleType):
         # (e.g. FastMLXModel) still resolves through to the new submodule.
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
-        return getattr(self._resolve(), name)
+        try:
+            real = self._resolve()
+        except ModuleNotFoundError:
+            # mlx is Apple-only. On non-mlx hosts the real submodule import
+            # fails. Surface as AttributeError so callers that walk sys.modules
+            # (notably pickle.whichmodule, used by torch._inductor's FX graph
+            # hash pickler) skip this stub cleanly instead of crashing the
+            # whole compile. Real user attribute access on a non-mlx host
+            # still surfaces a useful error -- they will see the AttributeError
+            # rather than a torch._dynamo.exc.BackendCompilerFailed wrapper.
+            raise AttributeError(name)
+        return getattr(real, name)
 
 for _old_name in _LazyMLXAlias._LEGACY_TO_NEW:
     if _old_name in _sys.modules:
