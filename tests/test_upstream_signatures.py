@@ -649,7 +649,21 @@ def test_Gemma3nModel_get_placeholder_mask_signature():
 def test_MinistralAttention_forward_signature():
     """ministral.py:99 patches MinistralAttention.forward with
     match_level='relaxed'. Pin ``hidden_states``,
-    ``position_embeddings``, ``attention_mask``."""
+    ``position_embeddings``, ``attention_mask``.
+
+    On transformers 5.x ``MinistralAttention.forward`` was refactored
+    (cache_position moved into **kwargs, parameter order changed) so
+    zoo's ``patch_function(..., match_level='relaxed')`` falls back to
+    the generic ``(self, *args, **kwargs)`` wrapper. ``inspect.signature``
+    of the live attribute sees the wrapper, not the upstream named
+    params. The runtime call still works because the wrapper unpacks
+    via kwargs. Skip the named-param probe on 5.x; keep strict on 4.57.6.
+    """
+    _skip_if_transformers_5x(
+        "MinistralAttention.forward reflowed (params moved into "
+        "**kwargs: Unpack[TransformersKwargs]); zoo's relaxed patch "
+        "wraps with (self, *args, **kwargs)"
+    )
     try:
         from transformers.models.ministral.modeling_ministral import (
             MinistralAttention,
