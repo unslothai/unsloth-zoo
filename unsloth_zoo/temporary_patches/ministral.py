@@ -90,6 +90,11 @@ def patch_MinistralAttention():
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
+    # Wrap so check_args_kwargs accepts removed params (e.g. cache_position in v5)
+    _full_forward = forward
+    def forward(self, *args, **kwargs):
+        return _full_forward(self, *args, **kwargs)
+
     patch_function(
         transformers.models.ministral.modeling_ministral.MinistralAttention,
         "forward",

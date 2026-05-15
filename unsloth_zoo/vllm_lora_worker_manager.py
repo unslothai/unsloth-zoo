@@ -222,6 +222,14 @@ class WorkerLoRAManager(AbstractWorkerManager):
             if mapping is not None:
                 self._adapter_manager.set_adapter_mapping(mapping)
 
+    def supports_tower_connector_lora(self) -> bool:
+        manager = getattr(self, '_adapter_manager', None)
+        if manager is None:
+            return False
+        return (
+            getattr(manager, 'supports_mm', False)
+            and getattr(manager, 'supports_tower_connector_lora', False)
+        )
 
     def _apply_adapters(self, adapter_requests: Set[Any]) -> None:
         if apply_adapters_worker:

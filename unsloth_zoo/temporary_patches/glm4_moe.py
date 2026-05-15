@@ -20,6 +20,7 @@ from .utils import patch_function, raise_error, logger
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
+    extract_moe_lora_weights_for_grouped_mm,
 )
 def patch_glm4_moe():
     """
@@ -42,44 +43,16 @@ def patch_glm4_moe():
     # Define LoRA extraction function for GLM4-MoE (Standard Format)
     # ====================================================================
     def _glm4_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
-        """
-        Custom LoRA extractor for GLM4.
-
-        Expectation for grouped_mm (Standard):
-        - first (Input):  (E, H, R)
-        - second (Output): (E, R, Out)
-
-        GLM4 Weights (Standard PEFT):
-        - gate_up is (E, Out, In) or (Out, In).
-        - lora_A (In->R) connects to H. Shape (E*R, H).
-          Needs: View(E, R, H) -> Permute(0, 2, 1) -> (E, H, R).
-        - lora_B (R->Out) connects to 2I. Shape (2I, E*R).
-          Needs: View(2I, E, R) -> Permute(1, 2, 0) -> (E, R, 2I).
-        """
-        total_rank = weight_A.shape[0]
-        rank_per_expert = total_rank // num_experts
-        dim1 = weight_A.shape[1]
-        dim2 = weight_B.shape[0]
-
-        # GLM4 MoE sometimes stores weights transposed (E, in_dim, out_dim),
-        # which flips LoRA A/B's input/output dimensions. Detect and handle both.
-        if dim1 > dim2:
-            # Transposed: weight_A is (E*R, out_dim), weight_B is (in_dim, E*R)
-            # first_weight from B: (E, in_dim, R)
-            first_weight = weight_B.view(dim2, num_experts, rank_per_expert)
-            first_weight = first_weight.permute(1, 0, 2).contiguous()
-
-            # second_weight from A: (E, R, out_dim)
-            second_weight = weight_A.view(num_experts, rank_per_expert, dim1).contiguous()
-        else:
-            # Standard: weight_A is (E*R, in_dim), weight_B is (out_dim, E*R)
-            first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
-            first_weight = first_weight.permute(0, 2, 1).contiguous()  # (E, in_dim, R)
-
-            second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
-            second_weight = second_weight.permute(1, 2, 0).contiguous()  # (E, R, out_dim)
-
-        return first_weight, second_weight, scaling, num_experts
+        return extract_moe_lora_weights_for_grouped_mm(
+            wrapper,
+            weight_A,
+            weight_B,
+            scaling,
+            num_experts,
+            model_name="GLM4 MoE",
+            enable_logging=UNSLOTH_ENABLE_LOGGING,
+            logger_obj=logger,
+        )
 
     Glm4MoeLiteNaiveMoe._unsloth_lora_extractor_fn = staticmethod(_glm4_lora_extractor)
 

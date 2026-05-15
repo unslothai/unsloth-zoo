@@ -83,6 +83,11 @@ def patch_PixtralAttention():
         attn_output = self.o_proj(attn_output)
         return attn_output, None
 
+    # Wrap so check_args_kwargs accepts removed params (e.g. output_attentions in v5)
+    _full_forward = forward
+    def forward(self, *args, **kwargs):
+        return _full_forward(self, *args, **kwargs)
+
     patch_function(
         transformers.models.pixtral.modeling_pixtral.PixtralAttention,
         "__init__",

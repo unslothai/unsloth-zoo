@@ -30,6 +30,7 @@ from .utils import (
     Cache,
     StaticCache,
     HybridCache,
+    HAS_HYBRID_CACHE,
     Unpack,
     patch_function_past_key_values,
     dedent,
@@ -37,6 +38,54 @@ from .utils import (
 import inspect
 
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
+
+
+def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states, sliding_window=None):
+    if attention_mask is None or attention_mask.dim() != 2:
+        return attention_mask
+
+    q_len = query_states.shape[2]
+    kv_len = key_states.shape[2]
+    mask_len = attention_mask.shape[-1]
+    if mask_len < kv_len:
+        pad = torch.ones(
+            (attention_mask.shape[0], kv_len - mask_len),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        attention_mask = torch.cat((attention_mask, pad), dim=-1)
+    elif mask_len > kv_len:
+        attention_mask = attention_mask[:, -kv_len:]
+
+    padding_mask = attention_mask[:, None, None, :].to(query_states.device) != 0
+    if q_len == 1:
+        return padding_mask
+
+    q_positions = torch.arange(q_len, device=query_states.device)[:, None]
+    k_positions = torch.arange(kv_len, device=query_states.device)[None, :]
+    cache_offset = kv_len - q_len
+    causal_mask = k_positions <= (q_positions + cache_offset)
+    if sliding_window is not None:
+        causal_mask = causal_mask & (k_positions > (q_positions + cache_offset - sliding_window))
+    return padding_mask & causal_mask[None, None, :, :]
+
+
+def _make_gemma3_attn_forwards(forward_function, has_cache_position):
+    """Build past_key_value / past_key_values forward variants for Gemma3Attention."""
+    functions = []
+    if has_cache_position:
+        def forward_past_key_value(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_value=None, cache_position=None, **kwargs):
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+        def forward_past_key_values(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_values=None, cache_position=None, **kwargs):
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
+    else:
+        def forward_past_key_value(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_value=None, **kwargs):
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, kwargs.pop("cache_position", None), **kwargs)
+        def forward_past_key_values(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_values=None, **kwargs):
+            return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs.pop("cache_position", None), **kwargs)
+    functions.append(forward_past_key_value)
+    functions.append(forward_past_key_values)
+    return functions
 
 
 def patch_Gemma3Processor():
@@ -209,7 +258,10 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
         inputs_lead_dim, sequence_length = input_tensor.shape[:2]
         if using_static_cache:
             target_length = past_key_values.get_max_cache_shape()
-        elif isinstance(past_key_values, HybridCache):
+        elif HAS_HYBRID_CACHE and isinstance(past_key_values, HybridCache):
+            # HAS_HYBRID_CACHE gates the isinstance because transformers 5.x
+            # removed HybridCache; the fallback typing.Any from utils.py
+            # would otherwise raise TypeError here.
             target_length = past_key_values.get_max_cache_shape()
         else:
             target_length = (
@@ -512,6 +564,12 @@ def patch_Gemma3Attention():
                 **kwargs,
             )
         else:
+            attn_mask_for_sdpa = _prepare_gemma3_sdpa_attention_mask(
+                attn_mask_for_sdpa,
+                query_states_fp32,
+                key_states_fp32,
+                getattr(self, "sliding_window", None),
+            )
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
             # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
             # We convert it to a bool for the SDPA kernel that only accepts bools.
@@ -546,29 +604,10 @@ def patch_Gemma3Attention():
         return attn_output_projected, attn_weights # 3-tuple return
     pass
 
-    functions = []
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
-    functions.append(forward)
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
-    functions.append(forward)
+    has_cache_position = "cache_position" in inspect.signature(
+        transformers.models.gemma3.modeling_gemma3.Gemma3Attention.forward
+    ).parameters
+    functions = _make_gemma3_attn_forwards(forward_function, has_cache_position)
     patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention)
@@ -767,6 +806,12 @@ def patch_Gemma3Attention_generic():
                 **kwargs,
             )
         else:
+            attn_mask_for_sdpa = _prepare_gemma3_sdpa_attention_mask(
+                attn_mask_for_sdpa,
+                query_states_fp32,
+                key_states_fp32,
+                getattr(self, "sliding_window", None),
+            )
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
             # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
             # We convert it to a bool for the SDPA kernel that only accepts bools.
@@ -801,29 +846,10 @@ def patch_Gemma3Attention_generic():
         return attn_output_projected, attn_weights # 3-tuple return
     pass
 
-    functions = []
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
-    functions.append(forward)
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
-    functions.append(forward)
+    has_cache_position = "cache_position" in inspect.signature(
+        transformers.models.gemma3.modeling_gemma3.Gemma3Attention.forward
+    ).parameters
+    functions = _make_gemma3_attn_forwards(forward_function, has_cache_position)
     patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention_generic)

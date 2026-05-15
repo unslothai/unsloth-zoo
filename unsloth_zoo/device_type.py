@@ -21,17 +21,25 @@ __all__ = [
     "ALLOW_PREQUANTIZED_MODELS",
     "ALLOW_BITSANDBYTES",
     "device_synchronize",
+    "device_empty_cache",
+    "device_is_bf16_supported",
+    "is_mlx_available",
 ]
 
-import torch
 import functools
 from .utils import Version
+from .mlx.runtime import is_mlx_available
 import inspect
 import os
 import re
 import shutil
 import subprocess
 import urllib.request
+
+_IS_MLX = is_mlx_available()
+
+if not _IS_MLX:
+    import torch
 
 _PYTORCH_WHL_BASE_URL = "https://download.pytorch.org/whl"
 
@@ -118,6 +126,8 @@ pass
 
 @functools.cache
 def _detect_rocm_major_minor():
+    if _IS_MLX:
+        return None
     # Preferred sources ordered from most direct to fallback.
     sources = []
     hip_version = getattr(getattr(torch, "version", None), "hip", None)
@@ -198,11 +208,15 @@ pass
 
 @functools.cache
 def is_hip():
+    if _IS_MLX:
+        return False
     return bool(getattr(getattr(torch, "version", None), "hip", None))
 pass
 
 @functools.cache
 def get_device_type():
+    if _IS_MLX:
+        return "mlx"
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if is_hip():
             return "hip"
@@ -212,6 +226,10 @@ def get_device_type():
     # Check torch.accelerator
     if hasattr(torch, "accelerator"):
         if not torch.accelerator.is_available():
+            # Test-only CPU fallback. The env var is read exactly once per
+            # process because get_device_type is @functools.cache'd.
+            if os.environ.get("UNSLOTH_ALLOW_CPU", "0") == "1":
+                return "cuda"
             amd_hint = _amd_installation_hint()
             if amd_hint is not None:
                 raise NotImplementedError(amd_hint)
@@ -223,6 +241,8 @@ def get_device_type():
                 f"But `torch.accelerator.current_accelerator()` works with it being = `{accelerator}`\n"\
                 f"Please reinstall torch - it's most likely broken :("
             )
+    if os.environ.get("UNSLOTH_ALLOW_CPU", "0") == "1":
+        return "cuda"
     amd_hint = _amd_installation_hint()
     if amd_hint is not None:
         raise NotImplementedError(amd_hint)
@@ -232,6 +252,7 @@ DEVICE_TYPE : str = get_device_type()
 # HIP fails for autocast and other torch functions. Use CUDA instead
 DEVICE_TYPE_TORCH = DEVICE_TYPE
 if DEVICE_TYPE_TORCH == "hip": DEVICE_TYPE_TORCH = "cuda"
+elif DEVICE_TYPE_TORCH == "mlx": DEVICE_TYPE_TORCH = "mps"
 
 @functools.cache
 def get_device_count():
@@ -271,5 +292,35 @@ def device_synchronize():
             torch.cuda.synchronize()
     elif DEVICE_TYPE == "xpu":
         if hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.synchronize()
+            if hasattr(torch.xpu, "synchronize"):
+                torch.xpu.synchronize()
+pass
+
+def device_empty_cache():
+    """
+    Empty the active device cache (CUDA, XPU, or HIP).
+    Cross-platform replacement for torch.cuda.empty_cache().
+    """
+    if DEVICE_TYPE in ("cuda", "hip"):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    elif DEVICE_TYPE == "xpu":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            if hasattr(torch.xpu, "empty_cache"):
+                torch.xpu.empty_cache()
+pass
+
+def device_is_bf16_supported():
+    """
+    Whether the active device (CUDA, XPU, or HIP) supports bfloat16.
+    Cross-platform replacement for torch.cuda.is_bf16_supported().
+    """
+    if DEVICE_TYPE in ("cuda", "hip"):
+        if torch.cuda.is_available():
+            return torch.cuda.is_bf16_supported()
+    elif DEVICE_TYPE == "xpu":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            if hasattr(torch.xpu, "is_bf16_supported"):
+                return torch.xpu.is_bf16_supported()
+    return False
 pass

@@ -29,6 +29,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
 from collections import OrderedDict
 import re
+from .log import logger
 
 # Skip some modules sensitive to quantization
 SKIP_QUANTIZATION_MODULES = [
@@ -42,6 +43,9 @@ SKIP_QUANTIZATION_MODULES = [
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
+    "score",                    # *ForSequenceClassification head
+    "classifier",               # *ForTokenClassification, *ForImageClassification, BERT-family head
+    "qa_outputs",               # *ForQuestionAnswering head
 ]
 
 def get_peft_regex(
@@ -74,6 +78,16 @@ def get_peft_regex(
     # Get only linear layers
     modules = model.named_modules()
     linear_modules = [name for name, module in modules if isinstance(module, torch.nn.Linear)]
+
+    # Gemma4 ClippableLinear wraps nn.Linear as .linear child -- detect and add those
+    try:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ClippableLinear
+        for name, module in model.named_modules():
+            if isinstance(module, Gemma4ClippableLinear):
+                linear_modules.append(name + ".linear")
+    except ImportError:
+        pass
+
     all_linear_modules = Counter(x.rsplit(".")[-1] for x in linear_modules)
 
     # Isolate lm_head / projection matrices if count == 1
@@ -242,103 +256,124 @@ def requires_grad_for_gradient_checkpointing(model):
         pass
     pass
 
-    # Find 1st ever item which requires grad
-    param = None
-    for name, param in model.named_parameters():
-        if param.requires_grad: break
-    if param is None: return
+    def collect_hook_targets():
+        hook_targets = OrderedDict()
+        fallback_targets = OrderedDict()
 
-    name = re.sub(r"\.([\d]{1,})\.", r"[\1].", name)
-    name_components = name.split(".")
+        for name, param in model.named_parameters():
+            if not param.requires_grad: continue
 
-    if len(name_components) == 0:
-        raise RuntimeError("Unsloth: Model has 0 layers?")
+            name = re.sub(r"\.([\d]{1,})\.", r"[\1].", name)
+            name_components = name.split(".")
 
-    final_where = None
-    # Try getting previous parent module
-    for j in range(len(name_components)-1, 0, -1):
-        name_curr = name_components[j]
-        name_pre  = "model." + ".".join(name_components[:j])
-        # Disable [\d] since it fails in gradient checkpointing
-        if re.search(r"\[[\d]{1,}\]", name_pre): continue
-        module = eval(name_pre)
-        if hasattr(module, "forward"):
-            try: forward = inspect.getsource(module.forward)
-            except: continue
+            if len(name_components) == 0:
+                raise RuntimeError("Unsloth: Model has 0 layers?")
 
-            # Normal self.language_model(...)
-            if f"self.{name_curr}(" in forward:
-                final_where = j + 1
-                break
+            final_where = None
+            fallback_name = None
+            fallback_module = None
 
-            # Fix self.blocks[0] like in Qwen
-            module_list = re.sub(r"\[[\d]{1,}\]", "", name_curr)
-            if f"in self.{module_list}:" in forward:
-                final_where = j
-                break
-            elif re.search(r"for [^\s]{3,} in self\." + module_list, forward) is not None:
-                # Might have failed finding self.layers: like self.layers[...]:
-                final_where = j
-                break
+            # Try getting previous parent module
+            for j in range(len(name_components)-1, 0, -1):
+                name_curr = name_components[j]
+                name_pre  = "model." + ".".join(name_components[:j])
+                # Disable [\d] since it fails in gradient checkpointing
+                if re.search(r"\[[\d]{1,}\]", name_pre): continue
+                module = eval(name_pre, globals(), {"model" : model})
+                fallback_name   = name_pre
+                fallback_module = module
+                if hasattr(module, "forward"):
+                    try: forward = inspect.getsource(module.forward)
+                    except: continue
+
+                    # Normal self.language_model(...)
+                    if f"self.{name_curr}(" in forward:
+                        final_where = j + 1
+                        break
+
+                    # Fix self.blocks[0] like in Qwen
+                    module_list = re.sub(r"\[[\d]{1,}\]", "", name_curr)
+                    if f"in self.{module_list}:" in forward:
+                        final_where = j
+                        break
+                    elif re.search(r"for [^\s]{3,} in self\." + module_list, forward) is not None:
+                        # Might have failed finding self.layers: like self.layers[...]:
+                        final_where = j
+                        break
+                    pass
+                pass
             pass
+
+            if final_where is None:
+                if fallback_module is not None:
+                    fallback_targets[fallback_name] = fallback_module
+                continue
+            pass
+
+            module_name = "model." + ".".join(name_components[:final_where])
+            module = eval(module_name, globals(), {"model" : model})
+            hook_targets[module_name] = module
         pass
+        return hook_targets, fallback_targets
     pass
 
-    if final_where is None:
-        # Find all input embeddings and just set them all as a fallback!
-        # Add other hooks first
+    hook_targets, fallback_targets = collect_hook_targets()
+    if len(hook_targets) == 0 and len(fallback_targets) == 0: return
+
+    hook_target_ids = {id(module) for module in hook_targets.values()}
+    for fallback_name, fallback_target in fallback_targets.items():
+        if id(fallback_target) in hook_target_ids: continue
+        logger.info(
+            f"Unsloth: Falling back to output gradient hook for `{fallback_name}` "
+            f"during gradient checkpointing."
+        )
         register_other_hooks(
             "requires_grad_post_hook",
             "requires_grad_post_hook",
-            module,
+            fallback_target,
             "_forward_hooks",
         )
-        module.register_forward_hook(requires_grad_post_hook)
-        return
+        fallback_target.register_forward_hook(requires_grad_post_hook)
     pass
+    if len(hook_targets) == 0: return
 
-    module_name = "model." + ".".join(name_components[:final_where])
-    module = eval(module_name)
+    for module_name, module in hook_targets.items():
+        logger.info(f"Unsloth: Making `{module_name}` require gradients")
 
-    if hasattr(module, "config") and (module.config.__class__.__name__ in ("CLIPVisionConfig", "SiglipVisionConfig",)):
-        # CLIP - backtrack to get_input_embeddings since requires_grad fails!
-        old_module = model
-        for module_name, module in model.named_modules():
-            if not hasattr(module, "get_input_embeddings"): break
-            old_module = module
-        module = old_module
-    pass
-    print(f"Unsloth: Making `{module_name}` require gradients")
+        still_need_patching = True
+        # Check if input_embeddings exists
+        if hasattr(module, "get_input_embeddings"):
+            # Use forward hook after Embedding() is called
+            try:
+                module = module.get_input_embeddings()
+                register_other_hooks(
+                    "requires_grad_post_hook",
+                    "requires_grad_post_hook",
+                    module,
+                    "_forward_hooks",
+                )
+                module.register_forward_hook(requires_grad_post_hook)
+                logger.info(f"Unsloth: Registered output gradient hook on `{module_name}` input embeddings.")
+                still_need_patching = False
+            except Exception as exception:
+                logger.warning(
+                    f"Unsloth: Failed to register input-embedding hook for `{module_name}`: {exception}. "
+                    "Falling back to pre-forward hook."
+                )
+                still_need_patching = True
+        pass
 
-    still_need_patching = True
-    # Check if input_embeddings exists
-    if hasattr(module, "get_input_embeddings"):
-        # Use forward hook after Embedding() is called
-        try:
-            module = module.get_input_embeddings()
-            # Add other hooks first
+        if still_need_patching:
+            # Use forward pre hook before module is called
             register_other_hooks(
-                "requires_grad_post_hook",
-                "requires_grad_post_hook",
+                "requires_grad_pre_hook",
+                "requires_grad_pre_hook",
                 module,
-                "_forward_hooks",
+                "_forward_pre_hooks",
             )
-            module.register_forward_hook(requires_grad_post_hook)
-            still_need_patching = False
-        except:
-            # Not Implemented probably?
-            still_need_patching = True
-    pass
-
-    if still_need_patching:
-        # Use forward pre hook before module is called
-        register_other_hooks(
-            "requires_grad_pre_hook",
-            "requires_grad_pre_hook",
-            module,
-            "_forward_pre_hooks",
-        )
-        module.register_forward_pre_hook(requires_grad_pre_hook, with_kwargs=True)
+            module.register_forward_pre_hook(requires_grad_pre_hook, with_kwargs=True)
+            logger.info(f"Unsloth: Registered pre-forward gradient hook on `{module_name}`.")
+        pass
     pass
 pass
 

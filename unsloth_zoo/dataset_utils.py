@@ -184,16 +184,22 @@ pass
 
 def train_on_responses_only(
     trainer,
-    instruction_part = None,
-    response_part    = None,
-    force_match      = True,  # Match newlines as well!
-    tokenizer        = None,  # Optional
-    return_function  = False, # Useful for iterating over lists
-    num_proc         = None,
+    instruction_part  = None,
+    response_part     = None,
+    force_match       = True,  # Match newlines as well!
+    tokenizer         = None,  # Optional
+    return_function   = False, # Useful for iterating over lists
+    num_proc          = None,
+    last_response_only = False, # Train only on the last assistant turn
 ):
     """
     Trains only on responses and not on the instruction by masking out
     the labels with -100 for the instruction part.
+
+    If last_response_only=True, only the final assistant turn has its
+    labels unmasked; all earlier assistant turns remain masked at -100
+    (they are never written, so they keep the initialized -100 values
+    and are not copied from old_labels either).
     """
     # All Unsloth Zoo code licensed under LGPLv3
     if tokenizer is None and trainer is not None:
@@ -249,13 +255,16 @@ def train_on_responses_only(
         for input_ids, old_labels in zip(input_ids_, labels_):
             n = len(input_ids)
             labels = [-100] * n
-            
+
             use_old_labels = False
             if old_labels is not None:
                 use_old_labels = True
                 assert(n == len(old_labels))
             n_minus_1 = n - 1
             j = 0
+
+            # Collect all (assistant_k, user_j) spans for this sample
+            spans = []
             while j < n:
                 # Find <assistant>
                 if (input_ids[j] == A_first) and \
@@ -308,13 +317,7 @@ def train_on_responses_only(
                                 k = n
                             pass
 
-                            if not use_old_labels:
-                                # Now copy input_ids to labels
-                                labels[assistant_k : user_j] = input_ids [assistant_k : user_j]
-                                # print(assistant_j, assistant_k, user_j, user_k)
-                            else:
-                                # Copy over from old labels!
-                                labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
+                            spans.append((assistant_k, user_j))
                             break
                         pass
                         j += 1
@@ -322,6 +325,19 @@ def train_on_responses_only(
                 pass
                 j += 1
             pass
+
+            # Apply labels: only the last assistant turn when last_response_only=True.
+            # Note: spans[-1:] safely returns [] when spans is empty (no assistant turn
+            # was found), so a sample with no assistant turn stays fully masked at -100.
+            apply_spans = spans[-1:] if last_response_only else spans
+            for assistant_k, user_j in apply_spans:
+                if not use_old_labels:
+                    # Now copy input_ids to labels
+                    labels[assistant_k : user_j] = input_ids [assistant_k : user_j]
+                else:
+                    # Copy over from old labels!
+                    labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
+
             all_labels.append(labels)
         pass
         return { "labels" : torch.tensor(all_labels, dtype = torch.int64) if use_tensors else all_labels }
@@ -330,18 +346,19 @@ def train_on_responses_only(
         return _train_on_responses_only
 
     import multiprocessing as _mp
-    if _mp.get_start_method() != 'fork':
-        num_proc = None
-    elif num_proc is None or type(num_proc) is not int:
-        import psutil
-        num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
-        # Check memory left so we can reduce multiprocessing to converse memory
-        memory_gb_left = psutil.virtual_memory().available / (1024**3)
-        if memory_gb_left <= 2:
-            num_proc = 1 # Too risky, so set to 1
+    if num_proc is None or type(num_proc) is not int:
+        if _mp.get_start_method() != 'fork':
+            num_proc = None
         else:
-            # Set it to int(memory_gb_left) so 16Gb = 16
-            num_proc = min(num_proc, int(memory_gb_left))
+            import psutil
+            num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
+            # Check memory left so we can reduce multiprocessing to converse memory
+            memory_gb_left = psutil.virtual_memory().available / (1024**3)
+            if memory_gb_left <= 2:
+                num_proc = 1 # Too risky, so set to 1
+            else:
+                # Set it to int(memory_gb_left) so 16Gb = 16
+                num_proc = min(num_proc, int(memory_gb_left))
 
     # In transformers 5.0+, VLM models skip dataset preparation in SFTTrainer.__init__
     # (skip_prepare_dataset=True when _is_vlm=True). This means the dataset may not be
@@ -553,16 +570,17 @@ def standardize_data_formats(
 
     if not isinstance(dataset, IterableDataset):
         import multiprocessing as _mp
-        if _mp.get_start_method() != 'fork':
-            num_proc = None
-        elif num_proc is None or type(num_proc) is not int:
-            import psutil
-            num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
-            memory_gb_left = psutil.virtual_memory().available / (1024**3)
-            if memory_gb_left <= 2:
-                num_proc = 1
+        if num_proc is None or type(num_proc) is not int:
+            if _mp.get_start_method() != 'fork':
+                num_proc = None
             else:
-                num_proc = min(num_proc, int(memory_gb_left))
+                import psutil
+                num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
+                memory_gb_left = psutil.virtual_memory().available / (1024**3)
+                if memory_gb_left <= 2:
+                    num_proc = 1
+                else:
+                    num_proc = min(num_proc, int(memory_gb_left))
         dataset_map_kwargs['num_proc'] = num_proc
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
@@ -640,6 +658,7 @@ def sft_prepare_dataset(
     do_truncation = max_seq_length != 0
     do_formatting_func = False
     do_tokenize = True
+    do_prompt_completion = False
 
     # Get correct column names
     column_names = set(next(iter(dataset)).keys())
@@ -666,6 +685,12 @@ def sft_prepare_dataset(
             raise RuntimeError(f"Unsloth: {processing_class.__class__} does not have .pad!")
         self.data_collator = DataCollatorForLanguageModeling(tokenizer, mlm = False)
         do_tokenize = False
+    elif "prompt" in column_names and "completion" in column_names:
+        # Prompt/completion dataset (used with completion_only_loss).
+        # TRL's __init__ already set self.data_collator for completion_only_loss
+        # before calling us -- we must NOT overwrite it here.
+        do_prompt_completion = True
+        used_column_names.append("completion_mask")
     elif dataset_text_field not in column_names:
         do_formatting_func = True
         if formatting_func is None:
@@ -681,6 +706,23 @@ def sft_prepare_dataset(
                     "Unsloth: The `formatting_func` should return a list of processed strings."
                 )
             test_text = test_text[0]
+        elif do_prompt_completion:
+            _first_ex = next(iter(dataset))
+            try:
+                from trl import is_conversational as _sft_is_conversational
+            except ImportError:
+                def _sft_is_conversational(example):
+                    for key in ("prompt", "completion", "messages"):
+                        val = example.get(key)
+                        if isinstance(val, list) and val and isinstance(val[0], dict):
+                            if "role" in val[0] and "content" in val[0]:
+                                return True
+                    return False
+            _is_conv = _sft_is_conversational(_first_ex)
+            if not _is_conv:
+                test_text = _first_ex["prompt"]
+            else:
+                test_text = None  # chat template handles BOS
         else:
             test_text = next(iter(dataset))[dataset_text_field][0]
 
@@ -698,7 +740,7 @@ def sft_prepare_dataset(
         bos_token = bos_token_1 or bos_token_2
 
         if bos_token is not None:
-            if test_text.startswith(bos_token) or bos_token in chat_template:
+            if (test_text is not None and test_text.startswith(bos_token)) or bos_token in chat_template:
                 add_special_tokens = False
                 print("Unsloth: We found double BOS tokens - we shall remove one automatically.")
         pass
@@ -716,11 +758,11 @@ def sft_prepare_dataset(
 
         if not isinstance(dataset, IterableDataset):
             import multiprocessing as _mp
-            if _mp.get_start_method() != 'fork':
-                dataset_num_proc = None
-            else:
-                dataset_num_proc = getattr(args, "dataset_num_proc", None)
-                if dataset_num_proc is None:
+            dataset_num_proc = getattr(args, "dataset_num_proc", None)
+            if dataset_num_proc is None:
+                if _mp.get_start_method() != 'fork':
+                    dataset_num_proc = None
+                else:
                     import psutil
                     dataset_num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
                     memory_gb_left = psutil.virtual_memory().available / (1024**3)
@@ -731,15 +773,68 @@ def sft_prepare_dataset(
             map_kwargs["num_proc"] = dataset_num_proc
         else:
             map_kwargs["batch_size"] = dataset._ex_iterable.batch_size
-            
-        if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
-        import warnings as _w
-        with _w.catch_warnings():
-            _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
-            dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
+
+        if do_prompt_completion:
+            # Tokenize prompt/completion datasets for completion_only_loss
+            _eos_token = getattr(tokenizer, 'eos_token', None)
+
+            def _tokenize_pc(example):
+                if _is_conv:
+                    prompt_ids = processing_class.apply_chat_template(
+                        example["prompt"], tokenize=True,
+                        add_generation_prompt=True, return_dict=False,
+                        tools=example.get("tools"),
+                        **(example.get("chat_template_kwargs") or {}),
+                    )
+                    if prompt_ids and isinstance(prompt_ids[0], list):
+                        prompt_ids = prompt_ids[0]
+                    pc_processed = processing_class.apply_chat_template(
+                        example["prompt"] + example["completion"],
+                        return_dict=True, tokenize=True,
+                        tools=example.get("tools"),
+                        **(example.get("chat_template_kwargs") or {}),
+                    )
+                    if isinstance(pc_processed.get("input_ids", [None])[0], list):
+                        pc_processed = {k: v[0] for k, v in pc_processed.items()}
+                    pc_ids = pc_processed["input_ids"]
+                else:
+                    _completion = example["completion"]
+                    if _eos_token and not _completion.endswith(_eos_token):
+                        _completion = _completion + _eos_token
+                    prompt_ids = tokenizer(
+                        example["prompt"], add_special_tokens=add_special_tokens,
+                    )["input_ids"]
+                    pc_ids = tokenizer(
+                        example["prompt"] + _completion,
+                        add_special_tokens=add_special_tokens,
+                    )["input_ids"]
+                if do_truncation and max_seq_length > 0:
+                    pc_ids = pc_ids[:max_seq_length]
+                n_prompt = min(len(prompt_ids), len(pc_ids))
+                completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
+                result = {"input_ids": pc_ids, "completion_mask": completion_mask}
+                if _needs_token_type_ids:
+                    result["token_type_ids"] = [0] * len(pc_ids)
+                return result
+
+            if use_desc:
+                map_kwargs["desc"] = 'Unsloth: Tokenizing ["prompt"+"completion"]'
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
+                dataset = dataset.map(
+                    _tokenize_pc, batched=False,
+                    remove_columns=list(column_names), **map_kwargs,
+                )
+        else:
+            if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
+                dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
 
         # If VLM, switch data collator since .pad is needed!
-        if is_vlm and not hasattr(processing_class, "pad"):
+        if is_vlm and not hasattr(processing_class, "pad") and not do_prompt_completion:
             data_collator = DataCollatorForLanguageModeling(tokenizer, mlm = False)
             self.data_collator = data_collator
         pass

@@ -42,9 +42,25 @@ import tempfile
 import logging
 import shlex
 import shutil
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 from pathlib import Path
 import psutil
+try:
+    from .device_type import device_is_bf16_supported
+except (ImportError, NotImplementedError):
+    # device_type can fail two ways: ImportError when torch is
+    # absent, NotImplementedError when get_device_type() runs at
+    # import on an unrecognised platform. Fall through to the
+    # platform probe in either case.
+    import platform as _platform
+    _IS_APPLE_SILICON = (
+        _platform.system() == "Darwin" and _platform.machine() == "arm64"
+    )
+    def device_is_bf16_supported():
+        return _IS_APPLE_SILICON
 
 # Get a logger instance
 logger = logging.getLogger(__name__)
@@ -54,6 +70,8 @@ if not logger.hasHandlers():
 
 LLAMA_CPP_CONVERT_FILE = \
     "https://github.com/ggerganov/llama.cpp/raw/refs/heads/master/convert_hf_to_gguf.py"
+
+LLAMA_CPP_CONVERTER_FILENAMES = ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py")
 
 COMMANDS_NOT_FOUND = (
     "command not found",
@@ -116,6 +134,41 @@ LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     "UNSLOTH_LLAMA_CPP_PATH",
     os.path.join(UNSLOTH_HOME, "llama.cpp"),
 )
+
+
+def _resolve_local_convert_script():
+    """Returns (abs_path, mtime_ns, size) for a local convert_hf_to_gguf.py if
+    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points at a directory containing one, else None.
+    The mtime_ns and size are part of the cache key on the cached implementation
+    so in-place updates to the same path are honored. When the env var is set
+    but invalid, this raises RuntimeError so an explicit pin fails closed
+    instead of silently falling back to the network."""
+    scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+    if not scripts_dir:
+        return None
+    scripts_dir = os.path.abspath(os.path.expanduser(scripts_dir))
+    if not os.path.isdir(scripts_dir):
+        raise RuntimeError(
+            f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' is not a directory. "
+            f"Unset UNSLOTH_LLAMA_CPP_SCRIPTS_DIR to use the network converter, "
+            f"or point it at a directory containing convert_hf_to_gguf.py."
+        )
+    for name in LLAMA_CPP_CONVERTER_FILENAMES:
+        candidate = os.path.join(scripts_dir, name)
+        try:
+            if not os.path.isfile(candidate):
+                continue
+            stat = os.stat(candidate)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Unsloth: Could not inspect local llama.cpp converter at '{candidate}': {exc}"
+            ) from exc
+        return (candidate, stat.st_mtime_ns, stat.st_size)
+    raise RuntimeError(
+        f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' has no "
+        f"convert_hf_to_gguf.py or convert-hf-to-gguf.py. Unset the env var "
+        f"to use the network converter."
+    )
 
 
 @contextlib.contextmanager
@@ -535,9 +588,9 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
     pass
 
     # Check for converter script
-    for converter in ["convert-hf-to-gguf.py", "convert_hf_to_gguf.py"]:
+    for converter in LLAMA_CPP_CONVERTER_FILENAMES:
         location = os.path.join(llama_cpp_folder, converter)
-        if os.path.exists(location):
+        if os.path.isfile(location):
             converter_location = location
             break
     pass
@@ -810,9 +863,11 @@ def install_llama_cpp(
                     cwd = llama_cpp_folder,
                     **kwargs
                 )
-                # Move compiled objects to main folder
+                # Move compiled objects to main folder.
+                # Remove only the target binaries first to avoid
+                # "same file" errors when symlinks point into build/bin/.
                 try_execute(
-                    f"cp build/bin/llama-* .",
+                    "rm -f " + " ".join(llama_cpp_targets) + " && cp build/bin/llama-* .",
                     cwd = llama_cpp_folder,
                     **kwargs
                 )
@@ -860,24 +915,60 @@ def _load_module_from_path(filepath, module_name):
 pass
 
 
+def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
+    # Resolve the env var on every call so changes between calls are honored;
+    # the resolved value is part of the cache key on the implementation below.
+    return _download_convert_hf_to_gguf_cached(name, _resolve_local_convert_script())
+
+
 @lru_cache(1)
-def _download_convert_hf_to_gguf(
-    name = "unsloth_convert_hf_to_gguf",
-):
+def _download_convert_hf_to_gguf_cached(name, _local_script_info):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Downloads from llama.cpp's Github report
+    # Downloads from llama.cpp's GitHub repository, or reads a local copy when
+    # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is set. _local_script_info is
+    # (path, mtime_ns, size); mtime/size in the cache key invalidate stale
+    # entries on in-place updates. Cache size is 1 because the patched script
+    # is written to a single shared on-disk path, so a second cache entry
+    # would always read stale bytes off disk.
 
     # Ensure llama.cpp directory exists
     os.makedirs(LLAMA_CPP_DEFAULT_DIR, exist_ok=True)
 
     supported_types = set() # Initialize outside try block
+    text_archs = set()
+    vision_archs = set()
     temp_original_file_path = None # Initialize for finally block
 
+    _local_script = _local_script_info[0] if _local_script_info is not None else None
+
     try:
-        # 1. Download the file
-        response = requests.get(LLAMA_CPP_CONVERT_FILE)
-        response.raise_for_status()
-        original_content = response.content
+        # 1. Obtain the file (local override takes precedence over network)
+        if _local_script is not None:
+            logger.info(f"Unsloth: Using local convert_hf_to_gguf.py from {_local_script}")
+            with open(_local_script, "rb") as f:
+                original_content = f.read()
+        else:
+            # Retry with exponential backoff: the upstream host can
+            # exceed the default read timeout on slower networks.
+            _last_err = None
+            original_content = None
+            for _attempt in range(3):
+                try:
+                    response = requests.get(
+                        LLAMA_CPP_CONVERT_FILE, timeout = (10, 120)
+                    )
+                    response.raise_for_status()
+                    original_content = response.content
+                    break
+                except requests.exceptions.RequestException as _err:
+                    _last_err = _err
+                    logger.warning(
+                        f"Unsloth: convert_hf_to_gguf.py download attempt "
+                        f"{_attempt + 1}/3 failed ({type(_err).__name__}: {_err}); retrying"
+                    )
+                    time.sleep(2 ** _attempt)
+            if original_content is None:
+                raise _last_err  # type: ignore[misc]
 
         # 2. Introspect Original Script for Supported Architectures
         logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
@@ -955,11 +1046,11 @@ def _download_convert_hf_to_gguf(
              del sys.modules[original_module_name]
 
     except Exception as e:
-         logger.error(f"Unsloth: Error during download or introspection of original script: {e}", exc_info=True)
+         logger.error(f"Unsloth: Error during loading or introspecting the original script: {e}", exc_info=True)
          if temp_original_file_path and os.path.exists(temp_original_file_path):
              try: os.remove(temp_original_file_path)
              except OSError as remove_error: logger.warning(f"Could not remove temp file {temp_original_file_path}: {remove_error}")
-         raise RuntimeError(f"Failed during download/introspection of original script: {e}") from e
+         raise RuntimeError(f"Failed during loading/introspection of original script: {e}") from e
     finally:
         if temp_original_file_path and os.path.exists(temp_original_file_path):
             try:
@@ -1069,6 +1160,15 @@ def _download_convert_hf_to_gguf(
         logger.error(f"Unsloth: Unexpected error after introspection: {e}", exc_info=True)
         raise RuntimeError(f"Unsloth: Failed during patching/parsing of script content: {e}") from e
 pass
+
+
+# Preserve the pre-split lru_cache surface (cache_clear, cache_info,
+# cache_parameters) so external callers keep working. __wrapped__ is not
+# forwarded because the inner function takes a private (name, _local_script_info)
+# pair while the public wrapper is a single-arg callable.
+_download_convert_hf_to_gguf.cache_clear = _download_convert_hf_to_gguf_cached.cache_clear
+_download_convert_hf_to_gguf.cache_info = _download_convert_hf_to_gguf_cached.cache_info
+_download_convert_hf_to_gguf.cache_parameters = _download_convert_hf_to_gguf_cached.cache_parameters
 
 
 def _split_str_to_n_bytes(split_str: str) -> int:
@@ -1306,11 +1406,11 @@ def convert_to_gguf(
                 base_name = model_name[:-5]
                 text_output = model_name
                 # Fix: mmproj should always include dtype since it's not quantized
-                mmproj_dtype = model_dtype if model_dtype else ("bf16" if torch.cuda.is_bf16_supported() else "f16")
+                mmproj_dtype = model_dtype if model_dtype else ("bf16" if device_is_bf16_supported() else "f16")
                 mmproj_output = f"{base_name}.{mmproj_dtype.upper()}-mmproj.gguf"
             else:
                 text_output = f"{model_name}.{quantization_type.upper()}.gguf"
-                mmproj_dtype = model_dtype if model_dtype else ("bf16" if torch.cuda.is_bf16_supported() else "f16")
+                mmproj_dtype = model_dtype if model_dtype else ("bf16" if device_is_bf16_supported() else "f16")
                 mmproj_output = f"{model_name}.{mmproj_dtype.upper()}-mmproj.gguf"
 
         # Text model conversion
@@ -1330,7 +1430,7 @@ def convert_to_gguf(
         # Vision projector conversion
         mmproj_args = {
             "--outfile"        : mmproj_output,
-            "--outtype"        : model_dtype if model_dtype else "bf16" if torch.cuda.is_bf16_supported() else "f16",
+            "--outtype"        : model_dtype if model_dtype else "bf16" if device_is_bf16_supported() else "f16",
             "--mmproj"         : "",
             "--split-max-size" : max_shard_size,
         }

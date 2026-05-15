@@ -44,7 +44,7 @@ pass
 # More memory efficient by chunking on (bsz+qlen) dimension
 # Exactly equivalent to the above
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
-def chunked_selective_log_softmax(logits, index):
+def chunked_selective_log_softmax(logits, index, temperature: float = 1.0):
     # Split into 4 chunks only
     chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = 4, dim = 0)
     chunked_index  = torch.chunk(index.reshape(-1), chunks = 4, dim = 0)
@@ -52,6 +52,8 @@ def chunked_selective_log_softmax(logits, index):
     # Below loop does the same as selective_log_softmax(chunk_logits, chunk_index)
     for chunk_logits, chunk_index in zip(chunked_logits, chunked_index):
         chunk_logits = chunk_logits.to(torch.float32)
+        if temperature != 1.0:
+            chunk_logits = chunk_logits / temperature
         selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
         logsumexp_values = torch.logsumexp(chunk_logits, dim = -1)
         per_token_logps = selected_logits - logsumexp_values
@@ -92,7 +94,7 @@ def chunked_hidden_states_selective_log_softmax(
         if logit_scale_divide != 0.0:
             chunk_logits = chunk_logits / logit_scale_divide
         if logit_softcapping != 0.0:
-            chunk_logits = chunk_logits * torch.tanh(chunk_logits / logit_softcapping)
+            chunk_logits = logit_softcapping * torch.tanh(chunk_logits / logit_softcapping)
 
         chunk_logits = chunk_logits.to(torch.float32)
 
@@ -162,6 +164,56 @@ def create_completion_attention_mask(
 pass
 RL_REPLACEMENTS["create_completion_attention_mask"] = create_completion_attention_mask
 
+
+# Rebuild Qwen-style mm_token_type_ids from full input_ids after GRPO generation changes sequence length.
+# This is primarily towards VLMs that use MRoPE
+def _unsloth_get_mm_token_id(processing_class, attr_name, token):
+    tokenizer = getattr(processing_class, "tokenizer", processing_class)
+    token_id = getattr(processing_class, attr_name, None)
+    if token_id is None:
+        token_id = getattr(tokenizer, attr_name, None)
+
+    convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if token_id is None and convert_tokens_to_ids is not None:
+        token_id = convert_tokens_to_ids(token)
+
+    if type(token_id) is int and token_id >= 0:
+        if token_id != getattr(tokenizer, "unk_token_id", None):
+            return token_id
+    return None
+pass
+
+
+def _unsloth_fix_mm_token_type_ids(
+    processing_class, input_ids, mm_token_type_ids = None, completion_ids = None
+):
+    image_token_id = _unsloth_get_mm_token_id(
+        processing_class, "image_token_id", "<|image_pad|>"
+    )
+    video_token_id = _unsloth_get_mm_token_id(
+        processing_class, "video_token_id", "<|video_pad|>"
+    )
+
+    if image_token_id is not None or video_token_id is not None:
+        rebuilt = input_ids.new_zeros(input_ids.shape)
+        if image_token_id is not None:
+            rebuilt = rebuilt.masked_fill(input_ids == image_token_id, 1)
+        if video_token_id is not None:
+            rebuilt = rebuilt.masked_fill(input_ids == video_token_id, 2)
+        return rebuilt
+
+    if (
+        mm_token_type_ids is not None
+        and completion_ids is not None
+        and mm_token_type_ids.shape[0] == input_ids.shape[0]
+        and mm_token_type_ids.shape[1] + completion_ids.shape[1] == input_ids.shape[1]
+    ):
+        return torch.cat(
+            [mm_token_type_ids, mm_token_type_ids.new_zeros(completion_ids.shape)],
+            dim = 1,
+        )
+    return mm_token_type_ids
+pass
 
 def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
     """
@@ -339,6 +391,11 @@ def grpo_compute_loss(
     get_sapo_token_loss = kwargs.get("get_sapo_token_loss", None)
     sapo_temperature_pos = kwargs.get("sapo_temperature_pos", 1.0)
     sapo_temperature_neg = kwargs.get("sapo_temperature_neg", 1.05)
+    get_gamma_weights = kwargs.get("get_gamma_weights", None)
+    vespo_k_pos = kwargs.get("vespo_k_pos", 2.0)
+    vespo_lambda_pos = kwargs.get("vespo_lambda_pos", 3.0)
+    vespo_k_neg = kwargs.get("vespo_k_neg", 3.0)
+    vespo_lambda_neg = kwargs.get("vespo_lambda_neg", 2.0)
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
     input_ids = input_ids.unsqueeze(-1)
@@ -430,6 +487,20 @@ def grpo_compute_loss(
                 coef_1[~positive_advantages_mask], sapo_temperature_neg
             )
         loss_i = -loss_i * advantages
+    elif loss_type == "vespo":
+        if get_gamma_weights is None:
+            raise Exception("vespo is only available in TRL 0.26.0+")
+        phi_seq = get_gamma_weights(
+            advantages=advantages,
+            log_ratio_per_token=log_ratio,
+            mask=mask,
+            importance_sampling_ratio=kwargs.get("importance_sampling_ratio"),
+            k_pos=vespo_k_pos,
+            lambda_pos=vespo_lambda_pos,
+            k_neg=vespo_k_neg,
+            lambda_neg=vespo_lambda_neg,
+        )
+        loss_i = -phi_seq * advantages * new
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -462,7 +533,7 @@ def grpo_compute_loss(
     elif loss_type == "dr_grpo":
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
-    elif loss_type in ["cispo", "dapo"]:
+    elif loss_type in ["cispo", "dapo", "vespo"]:
         normalizer = num_items_in_batch/ num_processes
         loss = (loss_i * mask).sum() / normalizer
     else:
@@ -521,9 +592,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
 
         device =_new_logps.device
         grad_inputs = torch.empty_like(_new_logps)
-        accumulated_loss              = torch.zeros(1, device = device)
-        accumulated_completion_length = torch.zeros(1, device = device)
-        accumulated_mean_kl           = torch.zeros(1, device = device)
+        accumulated_loss              = torch.zeros(1, device = device)[0]
+        accumulated_completion_length = torch.zeros(1, device = device)[0]
+        accumulated_mean_kl           = torch.zeros(1, device = device)[0]
         accumulated_delta             = []
         accumulated_flat_is_ratio     = []
         accumulated_coef_1            = []
@@ -660,6 +731,14 @@ def grpo_accumulated_loss(
     image_grid_thw = kwargs.get('image_grid_thw',None)
     pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
     image_sizes = kwargs.get('image_sizes',None)
+    num_images = kwargs.get('num_images',None)
+    # Transformers 5.x requires token_type_ids/mm_token_type_ids for some vision models
+    token_type_ids = kwargs.get('token_type_ids',None)
+    mm_token_type_ids = kwargs.get('mm_token_type_ids',None)
+    if mm_token_type_ids is not None or image_grid_thw is not None:
+        mm_token_type_ids = _unsloth_fix_mm_token_type_ids(
+            trainer.processing_class, input_ids, mm_token_type_ids
+        )
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if getattr(trainer, "vllm_importance_sampling_correction", False) else None
     temperature = kwargs.get("temperature", 1.0)
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
@@ -673,6 +752,11 @@ def grpo_accumulated_loss(
     kwargs["get_sapo_token_loss"] = trainer.get_sapo_token_loss if hasattr(trainer, "get_sapo_token_loss") else None
     kwargs["sapo_temperature_pos"] = trainer.args.sapo_temperature_pos if hasattr(trainer.args, "sapo_temperature_pos") else None
     kwargs["sapo_temperature_neg"] = trainer.args.sapo_temperature_neg if hasattr(trainer.args, "sapo_temperature_neg") else None
+    kwargs["get_gamma_weights"] = trainer.get_gamma_weights if hasattr(trainer, "get_gamma_weights") else None
+    kwargs["vespo_k_pos"] = trainer.args.vespo_k_pos if hasattr(trainer.args, "vespo_k_pos") else 2.0
+    kwargs["vespo_k_neg"] = trainer.args.vespo_k_neg if hasattr(trainer.args, "vespo_k_neg") else 3.0
+    kwargs["vespo_lambda_pos"] = trainer.args.vespo_lambda_pos if hasattr(trainer.args, "vespo_lambda_pos") else 3.0
+    kwargs["vespo_lambda_neg"] = trainer.args.vespo_lambda_neg if hasattr(trainer.args, "vespo_lambda_neg") else 2.0
     kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
     kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
     kwargs["use_vllm"] = trainer.use_vllm
@@ -760,63 +844,84 @@ def grpo_accumulated_loss(
 
     all_logprobs_list = []
 
-    attention_mask_chunks = torch.chunk(attention_mask, chunks=B, dim=0)
-    completion_ids_chunks = torch.chunk(completion_input_ids, chunks=B, dim=0)
-
-    def chunk_optional(tensor, chunks):
-        if tensor is None:
-            return [None] * chunks
-        return torch.chunk(tensor, chunks=chunks, dim=0)
+    def slice_sample_axis(value, start, end):
+        if value is None:
+            return None
+        return value[start:end]
 
     import math
     total_samples = input_ids.shape[0]
     batch_size = math.ceil(total_samples / B)
+    if isinstance(num_images, torch.Tensor):
+        num_images = num_images.detach().cpu().reshape(-1).tolist()
+    if image_grid_thw is not None and pixel_values is not None and num_images is not None:
+        rows_per_image = image_grid_thw.prod(dim=-1)
+        rows_per_sample = torch.split(rows_per_image, num_images)
+        rows_per_sample = torch.stack([s.sum() for s in rows_per_sample])
+        cum_rows = torch.cat(
+            [
+                torch.tensor([0], device=rows_per_sample.device),
+                rows_per_sample.cumsum(0),
+            ]
+        )
+        cum_imgs = torch.tensor([0] + num_images).cumsum(0)
+    else:
+        cum_rows = None
+        cum_imgs = None
 
     input_ids_chunks = []
     attention_mask_chunks = []
+    completion_ids_chunks = []
     pixel_values_chunks = []
     image_grid_thw_chunks = []
     pixel_attention_mask_chunks = []
+    image_sizes_chunks = []
+    token_type_ids_chunks = []
+    mm_token_type_ids_chunks = []
 
     current_pixel_idx = 0
     #TRL 0.23.0 batching logic
     for start in range(0, total_samples, batch_size):
-        end = start + batch_size
+        end = min(start + batch_size, total_samples)
 
         input_ids_chunks.append(input_ids[start:end])
         attention_mask_chunks.append(attention_mask[start:end])
+        completion_ids_chunks.append(completion_input_ids[start:end])
+        image_sizes_chunks.append(slice_sample_axis(image_sizes, start, end))
+        token_type_ids_chunks.append(slice_sample_axis(token_type_ids, start, end))
+        mm_token_type_ids_chunks.append(
+            slice_sample_axis(mm_token_type_ids, start, end)
+        )
 
         if image_grid_thw is not None and pixel_values is not None:
 
-            grid_slice = image_grid_thw[start:end]
+            if num_images is None:
+                grid_slice = image_grid_thw[start:end]
+                batch_pixel_count = grid_slice.prod(dim=-1).sum().item()
+                start_pixel_idx = current_pixel_idx
+                end_pixel_idx = current_pixel_idx + batch_pixel_count
+                current_pixel_idx = end_pixel_idx
+            else:
+                start_pixel_idx = cum_rows[start].item()
+                end_pixel_idx = cum_rows[end].item()
+                img_start, img_end = cum_imgs[start], cum_imgs[end]
+                grid_slice = image_grid_thw[img_start:img_end]
             image_grid_thw_chunks.append(grid_slice)
-
-
-            batch_pixel_count = grid_slice.prod(dim=-1).sum().item()
-
-            start_pixel_idx = current_pixel_idx
-            end_pixel_idx = current_pixel_idx + batch_pixel_count
 
             pixel_values_chunks.append(pixel_values[start_pixel_idx:end_pixel_idx])
 
             if pixel_attention_mask is not None:
-                pixel_attention_mask_chunks.append(
-                    pixel_attention_mask[start_pixel_idx:end_pixel_idx]
-                )
+                if pixel_attention_mask.shape[0] == pixel_values.shape[0]:
+                    pixel_attention_mask_chunks.append(pixel_attention_mask[start_pixel_idx:end_pixel_idx])
+                else:
+                    pixel_attention_mask_chunks.append(pixel_attention_mask[start:end])
             else:
                 pixel_attention_mask_chunks.append(None)
-
-            current_pixel_idx = end_pixel_idx
 
         else:
             pixel_values_chunks.append(None)
             image_grid_thw_chunks.append(None)
             pixel_attention_mask_chunks.append(None)
-
-    if image_sizes is not None and not isinstance(image_sizes, torch.Tensor):
-        image_sizes_chunks = [[size] for size in image_sizes]
-    else:
-        image_sizes_chunks = chunk_optional(image_sizes, B)
 
     zipped_inputs = zip(
         input_ids_chunks,
@@ -825,6 +930,8 @@ def grpo_accumulated_loss(
         image_grid_thw_chunks,
         pixel_attention_mask_chunks,
         image_sizes_chunks,
+        token_type_ids_chunks,
+        mm_token_type_ids_chunks,
         completion_ids_chunks
     )
 
@@ -846,7 +953,7 @@ def grpo_accumulated_loss(
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature):
             #Only the activations are needed so if we keep entire computational graph, keeps unnecessary memory on CPU so we detach it
-            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True) 
+            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True)
             ctx.device = hidden_states.device
             ctx.dtype = hidden_states.dtype
 
@@ -925,8 +1032,15 @@ def grpo_accumulated_loss(
         image_grid_thw_chunk,
         pixel_attention_mask_chunk,
         image_sizes_chunk,
+        token_type_ids_chunk,
+        mm_token_type_ids_chunk,
         completion_ids
     ) in zipped_inputs:
+            _extra_vision_kwargs = {}
+            if token_type_ids_chunk is not None:
+                _extra_vision_kwargs["token_type_ids"] = token_type_ids_chunk
+            if mm_token_type_ids_chunk is not None:
+                _extra_vision_kwargs["mm_token_type_ids"] = mm_token_type_ids_chunk
             with autocaster:
                 if pixel_values is None:
                     new_hidden_states_chunk = unwrapped_model(
@@ -936,10 +1050,22 @@ def grpo_accumulated_loss(
                         image_grid_thw = image_grid_thw_chunk,
                         pixel_attention_mask = pixel_attention_mask_chunk,
                         image_sizes = image_sizes_chunk,
+                        **_extra_vision_kwargs,
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
+                    logprobs_chunk = efficient_log_softmax(
+                        new_hidden_states_chunk,
+                        lm_head,
+                        completion_ids,
+                        chunks=input_ids_chunk.shape[0]*multiplier,
+                        logit_scale_multiply=logit_scale_multiply,
+                        logit_scale_divide=logit_scale_divide,
+                        logit_softcapping=logit_softcapping,
+                        temperature=temperature,
+                        batch_size = B
+                    )
                 else:
                     new_hidden_states_chunk = unwrapped_model(
                         input_ids = input_ids_chunk,
@@ -949,21 +1075,26 @@ def grpo_accumulated_loss(
                         pixel_attention_mask = pixel_attention_mask_chunk,
                         image_sizes = image_sizes_chunk,
                         logits_to_keep = logits_to_keep + 1,
+                        **_extra_vision_kwargs,
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
-
-                logprobs_chunk = efficient_log_softmax(
-                    new_hidden_states_chunk,
-                    lm_head,
-                    completion_ids,
-                    chunks=input_ids_chunk.shape[0]*multiplier,
-                    logit_scale_multiply=logit_scale_multiply,
-                    logit_scale_divide=logit_scale_divide,
-                    logit_softcapping=logit_softcapping,
-                    temperature=temperature,
-                    batch_size = B
-                )
+                    # Guard: check if model returned hidden states or logits
+                    if new_hidden_states_chunk.shape[-1] == lm_head.shape[1]:
+                        logprobs_chunk = efficient_log_softmax(
+                            new_hidden_states_chunk,
+                            lm_head,
+                            completion_ids,
+                            chunks=input_ids_chunk.shape[0]*multiplier,
+                            logit_scale_multiply=logit_scale_multiply,
+                            logit_scale_divide=logit_scale_divide,
+                            logit_softcapping=logit_softcapping,
+                            temperature=temperature,
+                            batch_size = B
+                        )
+                    else:
+                        # Model returned logits directly - scaling/softcapping already applied by model forward
+                        logprobs_chunk = chunked_selective_log_softmax(new_hidden_states_chunk, completion_ids, temperature)
                 #This is needed to avoid race conditions with GPT OSS offload_embbed=True
                 #However, it seems that this line does not slow down or disrupt models.
                 device_synchronize()

@@ -44,9 +44,28 @@ def patch_bitsandbytes_linear4bit_forward():
     try:
         import bitsandbytes
         bitsandbytes.nn.modules.Linear4bit
+        Params4bit = bitsandbytes.nn.modules.Params4bit
         fix_4bit_weight_quant_state_from_module = bitsandbytes.nn.modules.fix_4bit_weight_quant_state_from_module
     except Exception as e:
         return raise_error("bitsandbytes.Linear4bit", e)
+
+    # Fix Params4bit.__torch_function__ infinite recursion under torch.compile.
+    # bitsandbytes >= 0.46 added a __torch_function__ to Params4bit that calls
+    # super().__torch_function__() for all ops except chunk/split. The super()
+    # call goes to Parameter.__torch_function__ which re-dispatches back to
+    # Params4bit.__torch_function__ since Params4bit is still in the types tuple.
+    # In eager mode, torch's _disabled_torch_function_impl prevents this, but
+    # under torch.compile's AOT autograd runtime, the re-dispatch is not blocked,
+    # causing infinite recursion (observed on T4 with torch 2.8.0 + bnb 0.49.2).
+    #
+    # Fix: remove Params4bit's __torch_function__ entirely so it inherits from
+    # Parameter/Tensor which use C-level dispatch that cannot recurse. The bnb
+    # implementation only adds chunk/split handling (rarely used for 4-bit weights)
+    # and delegates everything else to super() anyway.
+    if hasattr(Params4bit, "__torch_function__") and \
+       "__torch_function__" in Params4bit.__dict__:
+        delattr(Params4bit, "__torch_function__")
+    pass
 
     def forward(self, x: torch.Tensor):
         # In transformers 5.0+, weights may not be in packed format yet during init
@@ -82,7 +101,6 @@ def patch_bitsandbytes_linear4bit_forward():
         # ** Errors out in torch.compile
         # weight = self.weight.t() if self.weight.dim() == 2 else self.weight
 
-        # Cannot do .t() on Params4bit, instead do it on torch.Tensor
         weight = self.weight.data.t()
 
         return bitsandbytes.matmul_4bit(x, weight, bias=bias, quant_state=quant_state).to(inp_dtype)

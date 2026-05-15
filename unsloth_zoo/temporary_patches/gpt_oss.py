@@ -27,6 +27,7 @@ from .common import (
     _torch_compile,
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
+    UNSLOTH_COMPILE_DISABLE,
 )
 from importlib.metadata import version as importlib_version
 from ..utils import Version
@@ -897,20 +898,31 @@ class GptOssExpertsBnb4bit(nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        num_tokens = hidden_states.shape[0]
         num_experts = routing_weights.shape[1]
-
+        top_k = router_indices.shape[1]
+        
         if self.training:
+            with torch.no_grad():
+                flat_experts = router_indices.flatten()  # [tokens * topk]
+                token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
+                
+                sorted_idx = flat_experts.argsort(stable=True)
+                sorted_tokens = token_ids[sorted_idx]
+                
+                counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
+            
             next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
-            # with torch.no_grad():
-                # expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                # expert_mask = expert_mask.permute(2, 1, 0)
-                # expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            # for expert_idx in expert_hitted[:]:
+            offset = 0
+            
             for expert_idx in range(num_experts):
-                with torch.no_grad():
-                    # _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                    token_idx, _ = torch.where(router_indices == expert_idx)
+                count = counts[expert_idx]
+                if count == 0:
+                    continue
+                # Use pre-computed indices (no torch.where needed)
+                token_idx = sorted_tokens[offset:offset + count]
                 current_state = hidden_states[token_idx]
+                
                 gate_up = self.gate_up_projs[expert_idx](current_state)
                 gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
                 # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
@@ -919,8 +931,12 @@ class GptOssExpertsBnb4bit(nn.Module):
                 # glu = gate * torch.sigmoid(gate * self.alpha)
                 # gated_output = (up + 1) * glu
                 out = self.down_projs[expert_idx](gated_output)
+                
                 weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                 next_states.index_add_(0, token_idx, weighted_output)
+                
+                offset += count
+            
             next_states = next_states.view(batch_size, -1, self.hidden_size)
             return next_states.to(hidden_states.dtype)
         else:
@@ -1095,6 +1111,31 @@ def restore_gpt_oss_original():
         pass
     return False
 
+def _normalized_unsloth_model_name() -> str:
+    return os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
+
+
+def _should_use_gpt_oss_bnb4bit() -> bool:
+    """
+    Decide if GPT-OSS should use BnB-compatible 4-bit experts.
+    Default: True when load_in_4bit is active.
+    Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to force BF16 path.
+    """
+    if "gpt_oss" not in _normalized_unsloth_model_name():
+        return False
+    if "_load_in_4bit_" not in _normalized_unsloth_model_name():
+        return False
+    return os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_DISABLE", "0") != "1"
+
+
+def _is_gpt_oss_4bit_load() -> bool:
+    return "_load_in_4bit_" in _normalized_unsloth_model_name()
+
+
+def _is_transformers_v5() -> bool:
+    return transformers_version >= Version("5.0.0.dev0")
+
+
 def patch_gpt_oss_bnb4bit_auto():
     """
     Auto-patch GPT-OSS for BnB 4-bit when load_in_4bit is active.
@@ -1121,8 +1162,10 @@ from ..device_type import DEVICE_TYPE
 
 if DEVICE_TYPE == "xpu":
     device_memory = torch.xpu.memory.mem_get_info(0)[-1]
-else:
+elif DEVICE_TYPE in ("cuda", "hip"):
     device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+else:
+    device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
@@ -1330,31 +1373,6 @@ from .moe_utils import (
     forward_native_grouped_mm,
     # torch_native_forward,
 )
-
-
-def _should_use_gpt_oss_bnb4bit() -> bool:
-    """
-    Decide if GPT-OSS should use BnB-compatible 4-bit experts.
-    Default: True when load_in_4bit is active.
-    Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to force BF16 path.
-    """
-    if "gpt_oss" not in _normalized_unsloth_model_name():
-        return False
-    if "_load_in_4bit_" not in _normalized_unsloth_model_name():
-        return False
-    return os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_DISABLE", "0") != "1"
-
-
-def _is_gpt_oss_4bit_load() -> bool:
-    return "_load_in_4bit_" in _normalized_unsloth_model_name()
-
-
-def _normalized_unsloth_model_name() -> str:
-    return os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
-
-
-def _is_transformers_v5() -> bool:
-    return transformers_version >= Version("5.0.0.dev0")
 
 
 def patch_gpt_oss_moe_for_lora():
@@ -1733,35 +1751,45 @@ def torch_native_forward(
 
     batch_size = hidden_states.shape[0]
     hidden_states = hidden_states.reshape(-1, self.hidden_size)
+    num_tokens = hidden_states.shape[0]
     num_experts = routing_weights.shape[1]
+    top_k = router_indices.shape[1]
+    
     if self.training:
+        with torch.no_grad():
+            flat_experts = router_indices.flatten()  # [tokens * topk]
+            token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
+            
+            sorted_idx = flat_experts.argsort(stable=True)
+            sorted_tokens = token_ids[sorted_idx]
+            
+            counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
+        
         next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
-        # with torch.no_grad():
-        #     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-        #     expert_mask = expert_mask.permute(2, 1, 0)
-        #     expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        # for expert_idx in expert_hitted[:]:
+        offset = 0
+        
         for expert_idx in range(num_experts):
-            with torch.no_grad():
-                # _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                token_idx, _ = torch.where(router_indices == expert_idx)
+            count = counts[expert_idx]
+            if count == 0:
+                continue
+            
+            # Use pre-computed indices (no torch.where needed)
+            token_idx = sorted_tokens[offset:offset + count]
             current_state = hidden_states[token_idx]
+            
             gate_up = self.gate_up_projs[expert_idx](current_state)
             down_proj = self.down_projs[expert_idx]
             gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
-            # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-            # gate = gate.clamp(min=None, max=self.limit)
-            # up = up.clamp(min=-self.limit, max=self.limit)
-            # glu = gate * torch.sigmoid(gate * self.alpha)
-            # gated_output = (up + 1) * glu
 
-            # Force float32 matrix multiply on some down projection modules
             gated_output = gated_output.to(torch.float32)
             device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
             with torch.autocast(device_type=device_type, enabled=False): # Force float32
                 out = down_proj(gated_output)
+            
             weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
             next_states.index_add_(0, token_idx, weighted_output)
+            
+            offset += count
         next_states = next_states.view(batch_size, -1, self.hidden_size)
         return next_states.to(torch.float32)
     else:
@@ -1839,6 +1867,11 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    # Uncompiled flex_attention backward has a dtype bug in PyTorch
+    # (sdpa_dense_backward: expected Float got BFloat16). The inplace eager
+    # fallback also uses out= matmul which is incompatible with autograd.
+    # Skip the patch and let stock transformers eager attention handle sinks.
+    if UNSLOTH_COMPILE_DISABLE: return
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         from ..flex_attention import (
@@ -2080,6 +2113,7 @@ TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 def patch_GptOssModel():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    if UNSLOTH_COMPILE_DISABLE: return
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
@@ -2311,7 +2345,6 @@ def patch_GptOssModel():
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -2327,6 +2360,7 @@ def patch_GptOssModel():
         if not self.training:
             inputs_embeds.requires_grad_(False)
 
+        cache_position = kwargs.pop("cache_position", None)
         if cache_position is None:
             past_seen_tokens = (past_key_values.get_seq_length() if past_key_values is not None else 0)
             cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
@@ -2365,10 +2399,15 @@ def patch_GptOssModel():
             # Initialize for common return path
             all_hidden_states = None
             for decoder_layer in self.layers:
+                _attn_type = getattr(decoder_layer, "attention_type", None)
+                if isinstance(attention_mask, dict):
+                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                else:
+                    mask = attention_mask
                 hidden_states, residual = inference_forward(
                     decoder_layer,
                     hidden_states,
-                    attention_mask[decoder_layer.attention_type],
+                    mask,
                     position_ids,
                     past_key_values,
                     use_cache,
@@ -2410,7 +2449,11 @@ def patch_GptOssModel():
                 if output_hidden_states:
                     all_hidden_states += (hidden_states,)
 
-                mask = (attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask)
+                _attn_type = getattr(decoder_layer, "attention_type", None)
+                if isinstance(attention_mask, dict):
+                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                else:
+                    mask = attention_mask
                 hidden_states = decoder_layer(
                     hidden_states,
                     attention_mask=mask,
