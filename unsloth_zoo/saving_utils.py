@@ -1007,8 +1007,15 @@ def _resolve_num_experts_from_lora_stats(lora_stats, fallback):
     return fallback
 
 
-def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim):
-    """Shape-classify as 'swapped' / 'standard' / 'unknown'; returns (layout, r)."""
+def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim, lora_module=None):
+    """Shape-classify as 'swapped' / 'standard' / 'unknown'; returns (layout, r).
+
+    When 2*I == H for the fused gate_up_proj (common when intermediate is
+    half the hidden dim), both 'standard' and 'swapped' shape checks pass.
+    Disambiguate using `_did_swap_in_out_features` set by unsloth on the
+    LoRA wrapper at training time, defaulting to 'standard' (PEFT layout)
+    when the flag is absent.
+    """
     total_rank_A, dim_A = lora_A.shape
     dim_B, total_rank_B = lora_B.shape
     if total_rank_A != total_rank_B or num_experts is None or num_experts <= 0:
@@ -1016,10 +1023,17 @@ def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim):
     if total_rank_A % num_experts != 0:
         return "unknown", 0
     r = total_rank_A // num_experts
-    if dim_A == out_dim and dim_B == in_dim:
-        return "swapped", r
-    if dim_A == in_dim and dim_B == out_dim:
+    standard_match = (dim_A == in_dim and dim_B == out_dim)
+    swapped_match  = (dim_A == out_dim and dim_B == in_dim)
+    if standard_match and swapped_match:
+        # Ambiguous shape — use the training-time signal.
+        if lora_module is not None and bool(getattr(lora_module, "_did_swap_in_out_features", False)):
+            return "swapped", r
         return "standard", r
+    if standard_match:
+        return "standard", r
+    if swapped_match:
+        return "swapped", r
     return "unknown", r
 
 
@@ -1037,6 +1051,7 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
         layout, r = _detect_moe_lora_layout(
             lora_stats.lora_A, lora_stats.lora_B,
             num_experts = num_experts, out_dim = 2 * I, in_dim = H,
+            lora_module = getattr(lora_stats, "module", None),
         )
         if layout == "unknown" or r <= 0:
             _record_moe_merge_fallback(
@@ -1103,6 +1118,7 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
         layout, r = _detect_moe_lora_layout(
             lora_stats.lora_A, lora_stats.lora_B,
             num_experts = num_experts, out_dim = H, in_dim = I,
+            lora_module = getattr(lora_stats, "module", None),
         )
         if layout == "unknown" or r <= 0:
             _record_moe_merge_fallback(
