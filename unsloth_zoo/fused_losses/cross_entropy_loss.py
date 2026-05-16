@@ -85,13 +85,17 @@ def compute_fused_ce_loss(
     1) logit_scale_multiply (X = X * logit_scale_multiply)
     2) logit_scale_divide   (X = X / logit_scale_divide)
     3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
+    4) ignore_index         (passed to F.cross_entropy; defaults to -100)
+    5) label_smoothing      (passed to F.cross_entropy; defaults to 0.0)
     """
+    ignore_index = int(kwargs.get("ignore_index", -100))
+    label_smoothing = float(kwargs.get("label_smoothing", 0.0))
     device = lm_head_weight.device
     if shift_labels:
         # Get shifted labels first
         _labels = torch.empty_like(labels, device = device)
         _labels[..., :-1] = labels[..., 1:]
-        _labels[..., -1] = -100
+        _labels[..., -1] = ignore_index
         labels = _labels
     pass
 
@@ -121,6 +125,8 @@ def compute_fused_ce_loss(
         input  = logits.view(-1, vocab_size).float().contiguous(),
         target = labels.view(-1).to(device).contiguous(),
         reduction = reduction,
+        ignore_index = ignore_index,
+        label_smoothing = label_smoothing,
     )
     loss = loss / n_items if n_items is not None else loss
     # Scale loss if needed for mixed precision training
@@ -192,6 +198,11 @@ class UnslothFusedLoss(torch.autograd.Function):
         """
         device = lm_head_weight.device
         if extra_kwargs is None: extra_kwargs = {}
+        # ignore_index defaults to -100 (HF convention); thread through both the
+        # label-shift step and the eventual F.cross_entropy call inside
+        # compute_fused_ce_loss so models that override ignore_index (rare but
+        # supported by HF ForCausalLMLoss) get correct masking.
+        ignore_index = int(extra_kwargs.get("ignore_index", -100))
 
         # Get shifted labels first
         if shift_labels:
@@ -200,15 +211,15 @@ class UnslothFusedLoss(torch.autograd.Function):
             # Also check mask
             if mask is not None:
                 mask = mask.to(device = device)
-                _labels[..., :-1][mask[..., 1:] == 0] = -100
+                _labels[..., :-1][mask[..., 1:] == 0] = ignore_index
             pass
-            _labels[..., -1] = -100
+            _labels[..., -1] = ignore_index
             _labels = _labels.view(-1)
             labels = _labels
         pass
 
         # N items divisor
-        divisor = n_items if n_items is not None else (labels != -100).sum()
+        divisor = n_items if n_items is not None else (labels != ignore_index).sum()
         # Counteract DataParallel having multiple items since it does scatter & gather
         if divisor.numel() != 1: divisor = divisor.ravel()[0]
         divisor = divisor.to(dtype = torch.float32, device = device)
