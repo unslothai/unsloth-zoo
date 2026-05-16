@@ -33,4 +33,5 @@ from .ministral import *
 from .mxfp4 import *
 from .bitsandbytes import *
 from .moe_utils_bnb4bit import *
+from .moe_utils_fp8 import *
 from .flex_attention_bwd import *
