@@ -299,6 +299,13 @@ def forward_moe_backend(
     except ImportError:
         pass
 
+    try:
+        from .moe_utils_fp8 import _moe_uses_fp8_expert_weights, forward_moe_backend_fp8
+        if _moe_uses_fp8_expert_weights(self):
+            return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
+    except ImportError:
+        pass
+
     backend = select_moe_backend()
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
