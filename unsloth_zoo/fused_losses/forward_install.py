@@ -13,9 +13,9 @@ Tier 1 swaps the forward via a hand-registered structural-hash allowlist
 to `ast_rewriter` which rewrites the canonical HF triplet in-place; misses
 go to `_UNMATCHED` and the LOSS_MAPPING sweep stays as the backstop.
 
-Opt-in via `UNSLOTH_FUSED_FORWARD=1`. Soft floor at transformers >= 4.56,
-the release where every `*ForCausalLM` settled on the
-`outputs.last_hidden_state` + `self.loss_function(logits, labels,
+On by default. Set `UNSLOTH_FUSED_FORWARD=0` to disable. Soft floor at
+transformers >= 4.56, the release where every `*ForCausalLM` settled on
+the `outputs.last_hidden_state` + `self.loss_function(logits, labels,
 vocab_size, **kwargs)` shape we match against.
 """
 
@@ -64,7 +64,8 @@ _INSTALL_DONE = False  # set once install_modeling_import_hook has run
 
 
 def is_enabled() -> bool:
-    return os.environ.get("UNSLOTH_FUSED_FORWARD", "0") == "1"
+    # On by default; opt out via UNSLOTH_FUSED_FORWARD=0.
+    return os.environ.get("UNSLOTH_FUSED_FORWARD", "1") != "0"
 
 
 def register_canonical(forward_hash: str, replacement_forward) -> None:
