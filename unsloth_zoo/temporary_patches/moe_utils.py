@@ -290,8 +290,15 @@ def forward_moe_backend(
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    # Use absolute imports — this function is also copied into
+    # `unsloth_compiled_cache/moe_utils.py` where relative imports of sibling
+    # helper modules don't resolve (only the dispatcher is copied, helpers stay
+    # in unsloth_zoo.temporary_patches).
     try:
-        from .moe_utils_bnb4bit import _moe_uses_bnb4bit_expert_weights, forward_moe_backend_bnb4bit
+        from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
+            _moe_uses_bnb4bit_expert_weights,
+            forward_moe_backend_bnb4bit,
+        )
         if _moe_uses_bnb4bit_expert_weights(self):
             result = forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
             if result is not None:
@@ -300,7 +307,10 @@ def forward_moe_backend(
         pass
 
     try:
-        from .moe_utils_fp8 import _moe_uses_fp8_expert_weights, forward_moe_backend_fp8
+        from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
+            _moe_uses_fp8_expert_weights,
+            forward_moe_backend_fp8,
+        )
         if _moe_uses_fp8_expert_weights(self):
             return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
     except ImportError:
