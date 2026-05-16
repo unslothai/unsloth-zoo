@@ -739,17 +739,23 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
 
 
 def _moe_uses_fp8_expert_weights(self) -> bool:
-    from .moe_utils import _get_moe_weight_and_quant_state
-
     if not hasattr(self, "gate_up_proj") or not hasattr(self, "down_proj"):
         return False
     gate_param = getattr(self, "gate_up_proj", None)
     down_param = getattr(self, "down_proj", None)
     if _is_float8_tensor(gate_param) or _is_float8_tensor(down_param):
         return True
-    gate_weight, _ = _get_moe_weight_and_quant_state(self, "gate_up_proj")
-    down_weight, _ = _get_moe_weight_and_quant_state(self, "down_proj")
-    return _is_float8_tensor(gate_weight) or _is_float8_tensor(down_weight)
+    # PEFT wraps the parameter in a ParamWrapper Module (or chains of them).
+    # Walk through base_layer / get_param to find the underlying tensor.
+    try:
+        from .moe_utils import _get_base_weight
+        if _is_float8_tensor(_get_base_weight(gate_param)):
+            return True
+        if _is_float8_tensor(_get_base_weight(down_param)):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _call_with_temporary_moe_weights(experts_module, gate_up_proj, down_proj, forward_fn, *args):
