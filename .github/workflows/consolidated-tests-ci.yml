@@ -248,4 +248,8 @@ jobs:
             tests/test_upstream_source_patterns.py \
             tests/test_compiler_rewriter_exhaustive.py \
             tests/test_compiler_dynamic_exec.py \
-            tests/test_temporary_patches_exhaustive.py
+            tests/test_temporary_patches_exhaustive.py \
+            tests/test_unsloth_zoo_lora_merge.py \
+            tests/test_peft_paramwrapper_layout_drift.py \
+            tests/test_transformers_moe_structure_drift.py \
+            tests/test_moe_merge_e2e_cpu.py
