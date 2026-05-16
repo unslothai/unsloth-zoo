@@ -209,6 +209,19 @@ def install_for_class(cls) -> bool:
     ns = dict(getattr(forward, "__globals__", {}))
     ns["unsloth_fused_lm_head_loss"] = unsloth_fused_lm_head_loss
     ns["EMPTY_LOGITS"] = EMPTY_LOGITS
+    # Some forwards we patch (especially those routed through unsloth's
+    # compiled-cache module) have __globals__ missing names that the
+    # rewritten return statement still references (CausalLMOutputWithPast
+    # and friends). Backfill from transformers.modeling_outputs so the
+    # exec succeeds without us having to enumerate every model's import.
+    try:
+        import transformers.modeling_outputs as _mo
+        for _name in dir(_mo):
+            if _name.startswith("_"):
+                continue
+            ns.setdefault(_name, getattr(_mo, _name))
+    except Exception:
+        pass
     synthetic_path = f"<unsloth-fused:{qn}>"
     # Register the rewritten source with linecache so `inspect.getsource`
     # and tracebacks see the actual body we installed.
