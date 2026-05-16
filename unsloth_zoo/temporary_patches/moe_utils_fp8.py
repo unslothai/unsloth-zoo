@@ -745,12 +745,26 @@ def _make_grouped_mm_rhs_column_major(weight: torch.Tensor) -> torch.Tensor:
     return weight.mT.contiguous()
 
 
-def _get_moe_weight_and_quant_info(experts_module, param_name: str):
-    from .moe_utils import _get_base_weight_and_quant_state, _try_attach_block_size
+def _try_attach_block_size(tensor, block_size):
+    """Defensively attach block_size as an attribute, ignoring failures
+    (e.g. read-only Tensor subclasses)."""
+    try:
+        setattr(tensor, "block_size", block_size)
+    except Exception:
+        pass
 
-    param = getattr(experts_module, param_name)
-    weight, quant_state = _get_base_weight_and_quant_state(param)
-    quant_kind = "quant_state" if getattr(weight, "quant_state", None) is not None else None
+
+def _get_moe_weight_and_quant_info(experts_module, param_name: str):
+    """Resolve the underlying expert weight tensor and (if present) its FP8
+    block-quant scale tensor, walking through PEFT ParamWrapper if needed."""
+    # Use the FP8-aware unwrap so we get the raw FP8 tensor, NOT a
+    # bf16-merged ParamWrapper.get_param() value.
+    weight = _unwrap_param_attr(experts_module, param_name)
+    if weight is None:
+        weight = getattr(experts_module, param_name, None)
+    param = getattr(experts_module, param_name, None)
+    quant_state = getattr(weight, "quant_state", None) if weight is not None else None
+    quant_kind = "quant_state" if quant_state is not None else None
 
     if quant_state is None:
         quant_state = getattr(experts_module, f"{param_name}_weight_scale_inv", None)

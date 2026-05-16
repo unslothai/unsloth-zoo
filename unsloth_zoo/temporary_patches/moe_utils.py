@@ -294,27 +294,32 @@ def forward_moe_backend(
     # `unsloth_compiled_cache/moe_utils.py` where relative imports of sibling
     # helper modules don't resolve (only the dispatcher is copied, helpers stay
     # in unsloth_zoo.temporary_patches).
+    # Narrow `except ImportError` to ONLY the import statement; runtime errors
+    # inside the bnb4bit/fp8 path must propagate so we don't silently fall
+    # through to a backend that will crash on unsupported dtypes.
+    _moe_uses_bnb4bit_expert_weights = forward_moe_backend_bnb4bit = None
     try:
         from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
             _moe_uses_bnb4bit_expert_weights,
             forward_moe_backend_bnb4bit,
         )
-        if _moe_uses_bnb4bit_expert_weights(self):
-            result = forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
-            if result is not None:
-                return result
     except ImportError:
         pass
+    if _moe_uses_bnb4bit_expert_weights is not None and _moe_uses_bnb4bit_expert_weights(self):
+        result = forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
+        if result is not None:
+            return result
 
+    _moe_uses_fp8_expert_weights = forward_moe_backend_fp8 = None
     try:
         from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
             _moe_uses_fp8_expert_weights,
             forward_moe_backend_fp8,
         )
-        if _moe_uses_fp8_expert_weights(self):
-            return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
     except ImportError:
         pass
+    if _moe_uses_fp8_expert_weights is not None and _moe_uses_fp8_expert_weights(self):
+        return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
 
     backend = select_moe_backend()
     if backend == "grouped_mm":
