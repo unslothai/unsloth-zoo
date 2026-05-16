@@ -855,9 +855,35 @@ def _manual_fp8_rowwise_quantize(inputs: torch.Tensor):
     return quantized.contiguous(), decode_scale.contiguous()
 
 
-def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weights):
-    from .moe_utils import _get_grouped_lora, _apply_grouped_lora, _expand_grouped_bias
+def _moe_separated_lora_delta(lora_data, permuted_input, offsets, out_dtype):
+    """Compute (X @ first) @ second * scaling for separated MoE LoRA — mirrors
+    the inline path in moe_utils.forward_native_grouped_mm. Returns the delta
+    to ADD to the base grouped-mm output, or None when no LoRA is active."""
+    if lora_data is None:
+        return None
+    first_weight, second_weight, scaling = lora_data[:3]
+    first_weight = first_weight.to(permuted_input.dtype).contiguous()
+    second_weight = second_weight.to(permuted_input.dtype).contiguous()
+    lora_out = torch._grouped_mm(permuted_input, first_weight, offs=offsets).contiguous()
+    # grouped_mm requires the trailing dim to be a multiple of 8.
+    if second_weight.shape[-1] % 8 != 0:
+        pad_size = 8 - (second_weight.shape[-1] % 8)
+        padded = F.pad(second_weight, (0, pad_size)).contiguous()
+        lora_delta = torch._grouped_mm(lora_out, padded, offs=offsets)[:, :-pad_size]
+    else:
+        lora_delta = torch._grouped_mm(lora_out, second_weight, offs=offsets)
+    return (lora_delta * scaling).to(out_dtype)
 
+
+def _expand_grouped_bias(bias, num_tokens_per_expert):
+    """Expand per-expert bias (E, out_dim) to (total_tokens, out_dim) by
+    repeating row i exactly num_tokens_per_expert[i] times — matches the
+    permuted-input layout used by grouped_mm."""
+    num_repeats = num_tokens_per_expert.to(bias.device)
+    return bias.repeat_interleave(num_repeats, dim=0)
+
+
+def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weights):
     if not _check_torch_scaled_grouped_mm_supported():
         return None
     if not hasattr(self, "gate_up_proj") or not hasattr(self, "down_proj"):
@@ -901,9 +927,10 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
         use_fast_accum=True,
     )
 
-    gate_up_lora = _get_grouped_lora(self, "gate_up_proj", "_unsloth_lora_gate_up_proj", use_separated_lora)
-    if gate_up_lora is not None:
-        mm1_out = mm1_out + _apply_grouped_lora(permuted_input, gate_up_lora, offsets, mm1_out.dtype)
+    gate_up_lora = getattr(self, "_unsloth_lora_gate_up_proj", None) if use_separated_lora else None
+    gate_up_delta = _moe_separated_lora_delta(gate_up_lora, permuted_input, offsets, mm1_out.dtype)
+    if gate_up_delta is not None:
+        mm1_out = mm1_out + gate_up_delta
     if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
         bias_expanded = _expand_grouped_bias(self.gate_up_proj_bias, num_tokens_per_expert)
         mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
@@ -931,9 +958,10 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
         use_fast_accum=True,
     )
 
-    down_lora = _get_grouped_lora(self, "down_proj", "_unsloth_lora_down_proj", use_separated_lora)
-    if down_lora is not None:
-        mm2_out = mm2_out + _apply_grouped_lora(inter, down_lora, offsets, inter.dtype)
+    down_lora = getattr(self, "_unsloth_lora_down_proj", None) if use_separated_lora else None
+    down_delta = _moe_separated_lora_delta(down_lora, inter, offsets, mm2_out.dtype)
+    if down_delta is not None:
+        mm2_out = mm2_out + down_delta
     if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
         bias_expanded = _expand_grouped_bias(self.down_proj_bias, num_tokens_per_expert).to(mm2_out.device)
         mm2_out = mm2_out + bias_expanded.to(mm2_out.dtype)
