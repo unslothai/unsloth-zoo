@@ -944,21 +944,43 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
 def _moe_uses_fp8_expert_weights(self) -> bool:
     if not hasattr(self, "gate_up_proj") or not hasattr(self, "down_proj"):
         return False
-    gate_param = getattr(self, "gate_up_proj", None)
-    down_param = getattr(self, "down_proj", None)
-    if _is_float8_tensor(gate_param) or _is_float8_tensor(down_param):
-        return True
-    # PEFT wraps the parameter in a ParamWrapper Module (or chains of them).
-    # Walk through base_layer / get_param to find the underlying tensor.
-    try:
-        from .moe_utils import _get_base_weight
-        if _is_float8_tensor(_get_base_weight(gate_param)):
+    for name in ("gate_up_proj", "down_proj"):
+        if _is_float8_tensor(_unwrap_param_attr(self, name)):
             return True
-        if _is_float8_tensor(_get_base_weight(down_param)):
-            return True
-    except Exception:
-        pass
     return False
+
+
+def _unwrap_param_attr(module, name):
+    """Resolve the underlying tensor for an experts-module attribute that
+    may have been wrapped by PEFT ParamWrapper (or a chain of them)."""
+    obj = getattr(module, name, None)
+    if obj is None:
+        return None
+    # Already a tensor / Parameter.
+    if isinstance(obj, torch.Tensor):
+        return obj
+    # PEFT ParamWrapper exposes get_param() — call it BEFORE walking base_layer
+    # because base_layer points back to the experts module, not the tensor.
+    while hasattr(obj, "get_param") and callable(obj.get_param):
+        try:
+            inner = obj.get_param()
+        except Exception:
+            break
+        if isinstance(inner, torch.Tensor):
+            return inner
+        if inner is obj:
+            break
+        obj = inner
+    # Last-ditch: if obj has a base_layer chain ending in something with the
+    # named attribute, recurse through it. (Handles nested ParamWrappers.)
+    seen = set()
+    while hasattr(obj, "base_layer") and id(obj) not in seen:
+        seen.add(id(obj))
+        base = obj.base_layer
+        if hasattr(base, name) and isinstance(getattr(base, name), torch.Tensor):
+            return getattr(base, name)
+        obj = base
+    return None
 
 
 def _call_with_temporary_moe_weights(experts_module, gate_up_proj, down_proj, forward_fn, *args):
