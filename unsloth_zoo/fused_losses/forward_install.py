@@ -150,9 +150,23 @@ def _structural_hash(fn) -> str | None:
     ).hexdigest()[:16]
 
 
+_LINEAR_HEAD_ATTRS = {
+    "lm_head",
+    "output_projection",
+    "embed_out",
+    "proj_out",
+    "generator_lm_head",
+    "head",
+    "logits_dense",
+    "codec_head",
+}
+
+
 def _is_eligible_class(cls) -> bool:
     name = getattr(cls, "__name__", "")
-    if not (name.endswith("ForCausalLM") or name.endswith("ForConditionalGeneration")):
+    # ForConditionalGeneration forwards (T5Gemma2 etc.) use aligned labels;
+    # the fused kernel hardcodes a causal shift so they'd off-by-one.
+    if not name.endswith("ForCausalLM"):
         return False
     if not hasattr(cls, "forward"):
         return False
@@ -162,6 +176,8 @@ def _is_eligible_class(cls) -> bool:
 def install_for_class(cls) -> bool:
     """Try to install the fused forward on `cls`. Returns True on success."""
     if not is_enabled():
+        return False
+    if not _transformers_version_ok():
         return False
     if not _is_eligible_class(cls):
         return False
@@ -205,10 +221,21 @@ def install_for_class(cls) -> bool:
         with _REGISTRY_LOCK:
             _UNMATCHED[qn] = "no-canonical-triplet"
         return False
+    # Composite / non-linear heads (e.g. BigBird's `self.cls = BigBirdOnlyMLMHead`)
+    # don't expose `.weight`/`.bias` and would crash inside the adapter.
+    if cap.head_attr not in _LINEAR_HEAD_ATTRS:
+        with _REGISTRY_LOCK:
+            _UNMATCHED[qn] = f"non-linear-head: {cap.head_attr}"
+        return False
 
     ns = dict(getattr(forward, "__globals__", {}))
     ns["unsloth_fused_lm_head_loss"] = unsloth_fused_lm_head_loss
     ns["EMPTY_LOGITS"] = EMPTY_LOGITS
+    try:
+        from transformers.utils.generic import can_return_tuple
+        ns.setdefault("can_return_tuple", can_return_tuple)
+    except Exception:
+        pass
     # Some forwards we patch (especially those routed through unsloth's
     # compiled-cache module) have __globals__ missing names that the
     # rewritten return statement still references (CausalLMOutputWithPast
@@ -266,6 +293,8 @@ def install_for_module(module) -> int:
     """Scan a transformers `modeling_*` module and install where eligible.
     Returns the number of classes newly patched."""
     if not is_enabled():
+        return 0
+    if not _transformers_version_ok():
         return 0
     name = getattr(module, "__name__", "")
     if not (name.startswith("transformers.models.") and ".modeling_" in name):

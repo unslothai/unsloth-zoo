@@ -76,11 +76,12 @@ def unsloth_fused_lm_head_loss(
     # through `unsloth_fused_ce_loss` (its API takes a bool flag), so the
     # safe path is to fall back to the un-fused loss for this caller.
     shift_labels_kw = kwargs.pop("shift_labels", None)
-    if shift_labels_kw is not None and not isinstance(shift_labels_kw, bool):
-        # Pre-shifted tensor path is not supported by the fused kernel today;
-        # this is a hint to the caller to disable UNSLOTH_FUSED_FORWARD if
-        # they rely on it. Falling back to a stock CE keeps correctness.
-        import torch
+    pre_shifted_tensor = (
+        shift_labels_kw is not None and not isinstance(shift_labels_kw, bool)
+    )
+    if pre_shifted_tensor or shift_labels_kw is False:
+        # Pre-shifted tensor or bool=False (caller already shifted): the fused
+        # kernel always re-shifts so fall back to stock CE to keep correctness.
         logits = torch.nn.functional.linear(
             hidden_states.to(dtype=lm_head.weight.dtype, device=lm_head.weight.device),
             lm_head.weight,
@@ -88,12 +89,20 @@ def unsloth_fused_lm_head_loss(
         )
         ignore_index = int(kwargs.get("ignore_index", -100))
         label_smoothing = float(kwargs.get("label_smoothing", 0.0))
-        return torch.nn.functional.cross_entropy(
+        target = shift_labels_kw if pre_shifted_tensor else labels
+        reduction = "sum" if n_items is not None else "mean"
+        loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.shape[-1]).float(),
-            shift_labels_kw.view(-1).to(logits.device),
+            target.view(-1).to(logits.device),
             ignore_index=ignore_index,
             label_smoothing=label_smoothing,
+            reduction=reduction,
         )
+        if n_items is not None:
+            if torch.is_tensor(n_items):
+                n_items = n_items.to(device=loss.device, dtype=loss.dtype)
+            loss = loss / n_items
+        return loss
 
     return unsloth_fused_ce_loss(
         trainer        = None,
