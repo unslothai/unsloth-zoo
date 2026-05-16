@@ -148,6 +148,104 @@ def test_ast_rewriter_declines_when_logits_rebound():
     assert cap is None
 
 
+GEMMA_SOFTCAP_SRC = """
+def forward(self, input_ids=None, labels=None, **kwargs):
+    outputs = self.model(input_ids=input_ids, **kwargs)
+    hidden_states = outputs.last_hidden_state
+    logits = self.lm_head(hidden_states)
+    if self.final_logit_softcapping is not None:
+        logits = logits / self.final_logit_softcapping
+        logits = torch.tanh(logits)
+        logits = logits * self.final_logit_softcapping
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+    return (loss, logits)
+"""
+
+
+def test_ast_rewriter_declines_when_intermediate_touches_logits():
+    # Gemma-style softcap mutates logits between lm_head and the labels-if.
+    # Wholesale rewriting would skip that step and feed un-softcapped logits
+    # to the fused loss; refuse and let the backstop handle it.
+    from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
+    new_src, cap = rewrite_forward_source(GEMMA_SOFTCAP_SRC)
+    assert new_src is None
+    assert cap is None
+
+
+CSM_ALIASED_LABELS_SRC = """
+def forward(self, input_ids=None, labels=None, backbone_labels=None, **kwargs):
+    outputs = self.model(input_ids=input_ids, **kwargs)
+    hidden_states = outputs.last_hidden_state
+    logits = self.lm_head(hidden_states)
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(logits=logits, labels=backbone_labels, vocab_size=self.config.vocab_size, **kwargs)
+    return (loss, logits)
+"""
+
+
+def test_ast_rewriter_declines_when_labels_aliased():
+    # CSM-style: gates on `labels is not None` but passes a different
+    # aliased name to loss_function. Wholesale rewrite would forward the
+    # wrong tensor; refuse.
+    from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
+    new_src, cap = rewrite_forward_source(CSM_ALIASED_LABELS_SRC)
+    assert new_src is None
+    assert cap is None
+
+
+MULTISTMT_LABEL_BRANCH_SRC = """
+def forward(self, input_ids=None, labels=None, **kwargs):
+    outputs = self.model(input_ids=input_ids, **kwargs)
+    hidden_states = outputs.last_hidden_state
+    logits = self.lm_head(hidden_states)
+    loss = None
+    if labels is not None:
+        aux_loss = self.aux_loss_coef * compute_aux(outputs)
+        loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+        loss = loss + aux_loss
+    return (loss, logits)
+"""
+
+
+def test_ast_rewriter_declines_non_trivial_labels_branch():
+    # MoE-style auxiliary loss inside the labels branch would be silently
+    # dropped by a wholesale rewrite. The rewriter must refuse.
+    from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
+    new_src, cap = rewrite_forward_source(MULTISTMT_LABEL_BRANCH_SRC)
+    assert new_src is None
+    assert cap is None
+
+
+EXTRA_LOSS_KW_SRC = """
+def forward(self, input_ids=None, labels=None, **kwargs):
+    outputs = self.model(input_ids=input_ids, **kwargs)
+    hidden_states = outputs.last_hidden_state
+    logits = self.lm_head(hidden_states)
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(
+            logits=logits, labels=labels, vocab_size=self.config.vocab_size,
+            num_items_in_batch=kwargs.get("num_items_in_batch"),
+        )
+    return (loss, logits)
+"""
+
+
+def test_ast_rewriter_forwards_explicit_extra_kwargs():
+    # Bloom-style: loss_function gets explicit `num_items_in_batch=...` even
+    # though there's no **kwargs unpack. The rewriter must preserve that
+    # kwarg in the call to unsloth_fused_lm_head_loss.
+    from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
+    new_src, cap = rewrite_forward_source(EXTRA_LOSS_KW_SRC)
+    assert new_src is not None
+    assert cap is not None
+    assert ("num_items_in_batch", ) == tuple(name for name, _ in cap.extra_loss_kws)
+    assert "num_items_in_batch=" in new_src
+
+
 # ---------------------------------------------------------------------------
 # install_for_class
 # ---------------------------------------------------------------------------
@@ -194,6 +292,41 @@ def test_install_skips_ineligible_name(fresh_install, enable_env):
     original = cls.forward
     assert fresh_install.install_for_class(cls) is False
     assert cls.forward is original
+
+
+def test_install_skips_for_conditional_generation(fresh_install, enable_env):
+    # *ForConditionalGeneration uses aligned labels (seq2seq); the fused
+    # kernel hardcodes a causal shift and would produce off-by-one losses.
+    # Such classes must be skipped.
+    cls = _make_synthetic_class(CANONICAL_KW_SRC, name="SyntheticForConditionalGeneration")
+    original = cls.forward
+    assert fresh_install.install_for_class(cls) is False
+    assert cls.forward is original
+
+
+COMPOSITE_HEAD_SRC = """
+def forward(self, input_ids=None, labels=None, **kwargs):
+    outputs = self.model(input_ids=input_ids, **kwargs)
+    hidden_states = outputs.last_hidden_state
+    logits = self.cls(hidden_states)
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+    return (loss, logits)
+"""
+
+
+def test_install_skips_composite_head(fresh_install, enable_env):
+    # BigBird-style `self.cls(...)` (BigBirdOnlyMLMHead) is a composite head,
+    # not a Linear; the adapter would crash on `lm_head.weight`. The
+    # installer must reject heads that aren't in the _LINEAR_HEAD_ATTRS
+    # allowlist.
+    cls = _make_synthetic_class(COMPOSITE_HEAD_SRC, name="SyntheticForCausalLM")
+    original = cls.forward
+    assert fresh_install.install_for_class(cls) is False
+    assert cls.forward is original
+    assert cls.__qualname__ in fresh_install._UNMATCHED
+    assert "non-linear-head" in fresh_install._UNMATCHED[cls.__qualname__]
 
 
 def test_install_patches_canonical_forward(fresh_install, enable_env):
@@ -344,6 +477,44 @@ def test_fused_kernel_respects_ignore_index():
         ignore_index=99,
     )
     assert torch.isfinite(loss), f"loss not finite with ignore_index=99: {loss}"
+
+
+def test_fused_kernel_accepts_int_n_items():
+    # HF Trainer / gradient accumulation passes a Python int for
+    # num_items_in_batch. The kernel must promote it to a tensor before
+    # the DataParallel .numel()/.ravel() guard.
+    torch = pytest.importorskip("torch")
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        pytest.skip("fused CE kernel requires a CUDA device")
+    from unsloth_zoo.fused_losses import unsloth_fused_ce_loss
+
+    B, T, H, V = 1, 8, 8, 16
+    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(V, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, V, (B, T), device="cuda")
+
+    loss = unsloth_fused_ce_loss(
+        trainer=None, hidden_states=hidden, lm_head_weight=weight, lm_head_bias=None,
+        labels=labels, torch_compile=False, n_items=3,  # int, not tensor
+    )
+    assert torch.isfinite(loss), f"loss not finite with int n_items: {loss}"
+
+
+def test_adapter_falls_back_when_shift_labels_false():
+    # When the caller passes shift_labels=False (bool) the fused kernel
+    # would still shift internally; route to the stock-CE fallback that
+    # honours the caller's intent.
+    torch = pytest.importorskip("torch")
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        pytest.skip("requires CUDA")
+    from unsloth_zoo.fused_losses import unsloth_fused_lm_head_loss
+
+    B, T, H, V = 1, 8, 8, 16
+    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(H, V, bias=False).cuda().float()
+    labels = torch.randint(0, V, (B, T), device="cuda")
+    loss = unsloth_fused_lm_head_loss(hidden, lm_head, labels, shift_labels=False)
+    assert torch.isfinite(loss), f"loss not finite: {loss}"
 
 
 def test_fused_kernel_label_smoothing_changes_loss():
