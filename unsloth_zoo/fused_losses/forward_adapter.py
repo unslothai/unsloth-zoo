@@ -16,15 +16,10 @@
 
 """HF-call-convention adapter for unsloth_fused_ce_loss.
 
-The HF forward template calls `self.loss_function(logits=..., labels=...,
-vocab_size=..., **kwargs)` AFTER `logits = self.lm_head(hidden_states[..])`.
-The fused kernel skips both the lm_head matmul and the fp32 cast by taking
-the un-projected hidden states plus the lm_head weight directly. Our
-rewriter replaces the call site; this adapter just maps the kwargs.
-
-`EMPTY_LOGITS` is the sentinel substituted into the `logits=` slot of the
-return value so downstream code that reads `outputs.logits` shape gets a
-0-element tensor rather than `None` (matches the compiler.py sentinel).
+The fused kernel takes hidden_states + lm_head.weight directly, skipping
+both the lm_head matmul and the fp32 logits materialisation that the HF
+template performs before `self.loss_function(...)`. `EMPTY_LOGITS` is the
+0-element sentinel slotted into the `logits=` return field.
 """
 
 from __future__ import annotations
@@ -70,18 +65,13 @@ def unsloth_fused_lm_head_loss(
         kwargs.pop("n_items", None)
     # vocab_size is read from lm_head_weight.shape[0]; drop the keyword.
     kwargs.pop("vocab_size", None)
-    # If TRL or a custom trainer passed already-shifted labels via the HF
-    # `shift_labels=<tensor>` convention, use them as-is and tell the kernel
-    # to skip its internal shift. We do not currently thread the tensor
-    # through `unsloth_fused_ce_loss` (its API takes a bool flag), so the
-    # safe path is to fall back to the un-fused loss for this caller.
+    # Caller already shifted (either `shift_labels=<tensor>` or `shift_labels=False`):
+    # the fused kernel always re-shifts, so route to stock CE for correctness.
     shift_labels_kw = kwargs.pop("shift_labels", None)
     pre_shifted_tensor = (
         shift_labels_kw is not None and not isinstance(shift_labels_kw, bool)
     )
     if pre_shifted_tensor or shift_labels_kw is False:
-        # Pre-shifted tensor or bool=False (caller already shifted): the fused
-        # kernel always re-shifts so fall back to stock CE to keep correctness.
         logits = torch.nn.functional.linear(
             hidden_states.to(dtype=lm_head.weight.dtype, device=lm_head.weight.device),
             lm_head.weight,
