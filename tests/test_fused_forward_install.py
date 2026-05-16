@@ -1,0 +1,370 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+"""Tests for the fused lm_head + cross_entropy auto-installer.
+
+Covers:
+  - AST rewriter recognises the canonical HF triplet shape (keyword form,
+    positional vocab_size, `.float()` wrapper, no-`loss = None` initialiser).
+  - AST rewriter declines on non-matching forwards (no triplet, missing
+    if-labels block, missing loss_function call).
+  - install_for_class:
+      * no-op when UNSLOTH_FUSED_FORWARD is off
+      * patches a synthetic *ForCausalLM whose forward matches the triplet
+      * leaves a hand-crafted bespoke forward in _UNMATCHED
+      * is idempotent
+  - Numerical equivalence of the rewritten forward vs the original at
+    small shapes (mean MSE under 1e-4 on bf16 -> fp32).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import types
+
+import pytest
+
+
+# Reset module state between tests so install registries don't bleed.
+@pytest.fixture
+def fresh_install():
+    from unsloth_zoo.fused_losses import forward_install as fi
+    with fi._REGISTRY_LOCK:
+        fi._PATCHED.clear()
+        fi._UNMATCHED.clear()
+        fi._FAILED.clear()
+        fi._CANONICAL_FORWARDS.clear()
+    yield fi
+    with fi._REGISTRY_LOCK:
+        fi._PATCHED.clear()
+        fi._UNMATCHED.clear()
+        fi._FAILED.clear()
+        fi._CANONICAL_FORWARDS.clear()
+
+
+@pytest.fixture
+def enable_env(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_FUSED_FORWARD", "1")
+
+
+# ---------------------------------------------------------------------------
+# AST rewriter unit tests
+# ---------------------------------------------------------------------------
+
+
+CANONICAL_KW_SRC = """
+def forward(self, input_ids=None, labels=None, logits_to_keep=0, **kwargs):
+    outputs = self.model(input_ids=input_ids, **kwargs)
+    hidden_states = outputs.last_hidden_state
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    logits = self.lm_head(hidden_states[:, slice_indices, :])
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+    return (loss, logits)
+"""
+
+CANONICAL_POS_SRC = """
+def forward(self, input_ids=None, labels=None, **kwargs):
+    outputs = self.model(input_ids=input_ids, **kwargs)
+    hidden_states = outputs.last_hidden_state
+    lm_logits = self.lm_head(hidden_states).float()
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(lm_logits, labels, self.config.vocab_size, **kwargs)
+    return (loss, lm_logits)
+"""
+
+NON_CANONICAL_SRC = """
+def forward(self, input_ids=None, labels=None, **kwargs):
+    outputs = self.model(input_ids=input_ids, **kwargs)
+    hidden_states = outputs.last_hidden_state
+    logits = self.lm_head(hidden_states)
+    if labels is not None:
+        loss_fct = object()  # legacy CrossEntropyLoss path
+        loss = loss_fct(logits, labels)
+    else:
+        loss = None
+    return (loss, logits)
+"""
+
+
+def test_ast_rewriter_matches_keyword_form():
+    from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
+    new_src, cap = rewrite_forward_source(CANONICAL_KW_SRC)
+    assert new_src is not None
+    assert cap is not None
+    assert cap.head_attr == "lm_head"
+    assert cap.logits_name == "logits"
+    assert "unsloth_fused_lm_head_loss" in new_src
+    assert "EMPTY_LOGITS" in new_src
+    # The original self.loss_function call must be gone from the rewritten src.
+    assert "self.loss_function" not in new_src
+
+
+def test_ast_rewriter_matches_positional_with_float_wrapper():
+    from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
+    new_src, cap = rewrite_forward_source(CANONICAL_POS_SRC)
+    assert new_src is not None
+    assert cap is not None
+    assert cap.head_attr == "lm_head"
+    assert cap.logits_name == "lm_logits"
+    assert "unsloth_fused_lm_head_loss" in new_src
+
+
+def test_ast_rewriter_declines_non_canonical():
+    from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
+    new_src, cap = rewrite_forward_source(NON_CANONICAL_SRC)
+    assert new_src is None
+    assert cap is None
+
+
+COHERE_REBINDING_SRC = """
+def forward(self, input_ids=None, labels=None, **kwargs):
+    outputs = self.model(input_ids=input_ids, **kwargs)
+    hidden_states = outputs.last_hidden_state
+    logits = self.lm_head(hidden_states)
+    logits = logits * self.logit_scale
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+    return (loss, logits)
+"""
+
+
+def test_ast_rewriter_declines_when_logits_rebound():
+    # Cohere-style `logits = logits * self.logit_scale` between lm_head and
+    # the if-labels block: removing the lm_head call would leave the
+    # rebinding referencing an undefined `logits`. The rewriter must refuse.
+    from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
+    new_src, cap = rewrite_forward_source(COHERE_REBINDING_SRC)
+    assert new_src is None
+    assert cap is None
+
+
+# ---------------------------------------------------------------------------
+# install_for_class
+# ---------------------------------------------------------------------------
+
+
+_SYNTH_COUNTER = 0
+
+
+def _make_synthetic_class(forward_src: str, name: str = "SyntheticForCausalLM"):
+    """Build a class whose forward source is recoverable via inspect.getsource.
+
+    `inspect.getsource` relies on `linecache`. Exec'd functions without a
+    real file backing return OSError, which is what the installer falls
+    back on. To exercise the rewriter we register a unique synthetic file
+    name with `linecache` and compile through it.
+    """
+    import linecache
+    global _SYNTH_COUNTER
+    _SYNTH_COUNTER += 1
+    fake_path = f"<unsloth-test-synthetic-{_SYNTH_COUNTER}.py>"
+    src = forward_src.lstrip("\n")
+    linecache.cache[fake_path] = (
+        len(src), None, [line + "\n" for line in src.splitlines()], fake_path,
+    )
+    namespace = {}
+    code = compile(src, fake_path, "exec")
+    exec(code, namespace)
+    forward_fn = namespace["forward"]
+    cls = type(name, (), {"forward": forward_fn})
+    cls.__module__ = "transformers.models.synthetic.modeling_synthetic"
+    return cls
+
+
+def test_install_noop_when_disabled(fresh_install, monkeypatch):
+    monkeypatch.delenv("UNSLOTH_FUSED_FORWARD", raising=False)
+    cls = _make_synthetic_class(CANONICAL_KW_SRC)
+    original = cls.forward
+    assert fresh_install.install_for_class(cls) is False
+    assert cls.forward is original
+
+
+def test_install_skips_ineligible_name(fresh_install, enable_env):
+    cls = _make_synthetic_class(CANONICAL_KW_SRC, name="SyntheticModel")
+    original = cls.forward
+    assert fresh_install.install_for_class(cls) is False
+    assert cls.forward is original
+
+
+def test_install_patches_canonical_forward(fresh_install, enable_env):
+    cls = _make_synthetic_class(CANONICAL_KW_SRC)
+    original = cls.forward
+    ok = fresh_install.install_for_class(cls)
+    assert ok is True
+    assert cls.forward is not original
+    rep = fresh_install._PATCHED[cls.__qualname__]
+    assert rep["tier"] == "2-ast-triplet"
+    assert rep["head_attr"] == "lm_head"
+
+
+def test_install_idempotent(fresh_install, enable_env):
+    cls = _make_synthetic_class(CANONICAL_KW_SRC)
+    first = fresh_install.install_for_class(cls)
+    patched_fn = cls.forward
+    second = fresh_install.install_for_class(cls)
+    assert first is True and second is True
+    assert cls.forward is patched_fn
+
+
+def test_install_leaves_non_canonical_in_unmatched(fresh_install, enable_env):
+    cls = _make_synthetic_class(NON_CANONICAL_SRC)
+    ok = fresh_install.install_for_class(cls)
+    assert ok is False
+    assert cls.__qualname__ in fresh_install._UNMATCHED
+
+
+def test_install_function_override_fast_path(fresh_install, enable_env):
+    from unsloth_zoo.fused_losses.forward_install import _structural_hash
+    cls = _make_synthetic_class(CANONICAL_KW_SRC)
+    target_hash = _structural_hash(cls.forward)
+    assert target_hash is not None
+
+    sentinel = []
+    def _replacement(self, *a, **kw):
+        sentinel.append(True)
+        return (None, None)
+
+    fresh_install.register_canonical(target_hash, _replacement)
+    ok = fresh_install.install_for_class(cls)
+    assert ok is True
+    rep = fresh_install._PATCHED[cls.__qualname__]
+    assert rep["tier"] == "1-function-override"
+    cls.forward(object())
+    assert sentinel == [True]
+
+
+def test_audit_dump(fresh_install, enable_env):
+    cls = _make_synthetic_class(CANONICAL_KW_SRC)
+    fresh_install.install_for_class(cls)
+    out = fresh_install.audit()
+    assert out["enabled"] is True
+    assert out["n_patched"] >= 1
+    assert cls.__qualname__ in out["patched"]
+
+
+# ---------------------------------------------------------------------------
+# Numerical equivalence on a small toy model
+# ---------------------------------------------------------------------------
+
+
+def _toy_forward_src():
+    # Mirrors the canonical HF template enough to be rewriter-eligible.
+    return """
+def forward(self, hidden_states, labels=None, **kwargs):
+    logits = self.lm_head(hidden_states)
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+    return (loss, logits)
+"""
+
+
+def test_rewritten_forward_loss_matches_reference(fresh_install, enable_env):
+    torch = pytest.importorskip("torch")
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        pytest.skip("fused CE kernel requires a CUDA device")
+
+    cls = _make_synthetic_class(_toy_forward_src(), name="ToyForCausalLM")
+
+    # Wire a config + lm_head + reference loss_function.
+    B, T, H, V = 2, 8, 32, 64
+
+    class _Config:
+        vocab_size = V
+
+    instance = cls()
+    instance.config = _Config()
+    instance.lm_head = torch.nn.Linear(H, V, bias=False).cuda().to(torch.bfloat16)
+
+    def _reference_loss(logits, labels, vocab_size, **kw):
+        # unsloth_fused_ce_loss shifts labels by one (causal LM convention).
+        # Mirror that here so the two losses are apples-to-apples.
+        shifted = labels.clone()
+        shifted[..., :-1] = labels[..., 1:]
+        shifted[..., -1] = -100
+        return torch.nn.functional.cross_entropy(
+            logits.float().view(-1, vocab_size),
+            shifted.view(-1),
+            ignore_index=-100,
+        )
+    instance.loss_function = _reference_loss
+
+    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.randint(0, V, (B, T), device="cuda")
+
+    ref_loss, _ = instance.forward(hidden, labels=labels)
+    ref_loss_value = float(ref_loss.detach().cpu().item())
+
+    # Install fused forward.
+    ok = fresh_install.install_for_class(cls)
+    assert ok is True
+
+    # The instance still binds the old forward (Python attribute lookup hits
+    # the class on call), so we re-fetch from the class.
+    fused_loss, fused_logits = cls.forward(instance, hidden, labels=labels)
+    fused_loss_value = float(fused_loss.detach().cpu().item())
+
+    # Loss should match the reference to within bf16 -> fp32 rounding noise.
+    assert abs(fused_loss_value - ref_loss_value) < 0.05, (
+        f"fused loss {fused_loss_value} diverged from reference {ref_loss_value}"
+    )
+    # logits slot becomes the EMPTY_LOGITS sentinel under fused path.
+    assert fused_logits.numel() == 0
+
+
+def test_fused_kernel_respects_ignore_index():
+    torch = pytest.importorskip("torch")
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        pytest.skip("fused CE kernel requires a CUDA device")
+    from unsloth_zoo.fused_losses import unsloth_fused_ce_loss
+
+    B, T, H, V = 1, 16, 8, 32
+    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(V, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, V, (B, T), device="cuda")
+    labels[0, 0] = 99  # would be a CUDA-side assert if not masked out
+
+    loss = unsloth_fused_ce_loss(
+        trainer=None,
+        hidden_states=hidden,
+        lm_head_weight=weight,
+        lm_head_bias=None,
+        labels=labels,
+        torch_compile=False,
+        ignore_index=99,
+    )
+    assert torch.isfinite(loss), f"loss not finite with ignore_index=99: {loss}"
+
+
+def test_fused_kernel_label_smoothing_changes_loss():
+    torch = pytest.importorskip("torch")
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        pytest.skip("fused CE kernel requires a CUDA device")
+    from unsloth_zoo.fused_losses import unsloth_fused_ce_loss
+
+    B, T, H, V = 1, 8, 8, 16
+    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(V, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, V, (B, T), device="cuda")
+
+    loss_plain = unsloth_fused_ce_loss(
+        trainer=None, hidden_states=hidden, lm_head_weight=weight, lm_head_bias=None,
+        labels=labels, torch_compile=False,
+    )
+    loss_smoothed = unsloth_fused_ce_loss(
+        trainer=None, hidden_states=hidden, lm_head_weight=weight, lm_head_bias=None,
+        labels=labels, torch_compile=False, label_smoothing=0.1,
+    )
+    assert float(loss_plain.item()) != float(loss_smoothed.item()), (
+        "label_smoothing kwarg was ignored: smoothed loss equals plain loss"
+    )

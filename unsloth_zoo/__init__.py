@@ -382,6 +382,18 @@ if not _SKIP_GPU_INIT:
     from .temporary_patches import (
         encode_conversations_with_harmony,
     )
+
+    # Opt-in fused lm_head + cross_entropy auto-installer. Off by default;
+    # set UNSLOTH_FUSED_FORWARD=1 to enable. When on, an AST-level rewriter
+    # plus an optional canonical-forward fast path is wired onto every
+    # transformers `*ForCausalLM` / `*ForConditionalGeneration` class as
+    # their modeling modules load.
+    try:
+        from .fused_losses.forward_install import install_modeling_import_hook as _install_fused_forward
+        _install_fused_forward()
+        del _install_fused_forward
+    except Exception:
+        pass
     from .rl_environments import (
         check_python_modules,
         create_locked_down_function,
