@@ -501,8 +501,7 @@ def _check_torch_scaled_grouped_mm_supported():
 
 
 def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
-    from .moe_utils import _try_attach_block_size
-
+    # _try_attach_block_size defined locally below; no import needed.
     if quant_state is None or not isinstance(quant_state, torch.Tensor):
         return quant_state
 
@@ -535,8 +534,7 @@ def _dequantize_expert_slice(
     quant_kind=None,
 ) -> Optional[torch.Tensor]:
     """Dequantize one expert's FP8 weight to target_dtype using pure PyTorch."""
-    from .moe_utils import _try_attach_block_size
-
+    # _try_attach_block_size defined locally below; no import needed.
     if expert_weight.dtype != torch.float8_e4m3fn:
         return expert_weight.to(target_dtype)
 
@@ -707,8 +705,7 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
 
 
 def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dtype: torch.dtype, quant_kind=None):
-    from .moe_utils import _try_attach_block_size
-
+    # _try_attach_block_size defined locally below; no import needed.
     if weight.ndim != 3:
         return None
 
