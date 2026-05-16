@@ -8,31 +8,15 @@
 
 """Auto-installer for the fused lm_head + cross_entropy forward.
 
-Two tiers:
+Tier 1 swaps the forward via a hand-registered structural-hash allowlist
+(empty by default; populate with `register_canonical`). Tier 2 falls back
+to `ast_rewriter` which rewrites the canonical HF triplet in-place; misses
+go to `_UNMATCHED` and the LOSS_MAPPING sweep stays as the backstop.
 
-  Tier 1 (function override, optional): if a class's forward AST hashes to
-    a known canonical-template hash, swap the entire forward for a
-    hand-written canonical version. Today the registry is empty by default;
-    callers can register hashes with `register_canonical(hash, forward_fn)`
-    as the canonical-forwards collection grows.
-
-  Tier 2 (AST triplet rewrite): otherwise, ask `ast_rewriter` to recognise
-    the canonical `logits = self.<HEAD>(...); if labels is not None:
-    loss = self.loss_function(...)` triplet and rewrite the call site to
-    `unsloth_fused_lm_head_loss`. Surrounding forward logic (VLM image
-    handling, MoE aux_loss, etc.) is preserved.
-
-Anything that matches neither tier is logged in `_UNMATCHED`. The
-LOSS_MAPPING sweep in `loss_utils.py:patch_loss_functions` remains the
-backstop for those.
-
-Activation:
-  - Opt-in via `UNSLOTH_FUSED_FORWARD=1` env var. Off by default until
-    enough versions have been exercised on real workloads.
-  - Soft version floor at transformers >= 4.56 (the release where every
-    canonical `*ForCausalLM` settled on the unified
-    `outputs.last_hidden_state` + `self.loss_function(logits=..., labels=...,
-    vocab_size=..., **kwargs)` shape we match against).
+Opt-in via `UNSLOTH_FUSED_FORWARD=1`. Soft floor at transformers >= 4.56,
+the release where every `*ForCausalLM` settled on the
+`outputs.last_hidden_state` + `self.loss_function(logits, labels,
+vocab_size, **kwargs)` shape we match against.
 """
 
 from __future__ import annotations
@@ -134,8 +118,7 @@ def _structural_hash(fn) -> str | None:
         tree = ast.parse(src)
     except SyntaxError:
         return None
-    # Strip docstrings so cosmetic changes do not bust the hash. Only
-    # nodes with a list-of-statements body have docstrings worth stripping.
+    # Strip docstrings so cosmetic changes do not bust the hash.
     _BODY_HOLDERS = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     for node in ast.walk(tree):
         if not isinstance(node, _BODY_HOLDERS):
@@ -163,9 +146,9 @@ _LINEAR_HEAD_ATTRS = {
 
 
 def _is_eligible_class(cls) -> bool:
+    # ForConditionalGeneration uses aligned labels; fused kernel hardcodes
+    # a causal shift, so accept only ForCausalLM.
     name = getattr(cls, "__name__", "")
-    # ForConditionalGeneration forwards (T5Gemma2 etc.) use aligned labels;
-    # the fused kernel hardcodes a causal shift so they'd off-by-one.
     if not name.endswith("ForCausalLM"):
         return False
     if not hasattr(cls, "forward"):
@@ -221,8 +204,8 @@ def install_for_class(cls) -> bool:
         with _REGISTRY_LOCK:
             _UNMATCHED[qn] = "no-canonical-triplet"
         return False
-    # Composite / non-linear heads (e.g. BigBird's `self.cls = BigBirdOnlyMLMHead`)
-    # don't expose `.weight`/`.bias` and would crash inside the adapter.
+    # Composite heads (e.g. BigBird's BigBirdOnlyMLMHead via self.cls) lack
+    # .weight/.bias and would crash inside the adapter.
     if cap.head_attr not in _LINEAR_HEAD_ATTRS:
         with _REGISTRY_LOCK:
             _UNMATCHED[qn] = f"non-linear-head: {cap.head_attr}"
@@ -236,11 +219,8 @@ def install_for_class(cls) -> bool:
         ns.setdefault("can_return_tuple", can_return_tuple)
     except Exception:
         pass
-    # Some forwards we patch (especially those routed through unsloth's
-    # compiled-cache module) have __globals__ missing names that the
-    # rewritten return statement still references (CausalLMOutputWithPast
-    # and friends). Backfill from transformers.modeling_outputs so the
-    # exec succeeds without us having to enumerate every model's import.
+    # Backfill transformers.modeling_outputs symbols; unsloth's compiled-cache
+    # forwards reference CausalLMOutputWithPast & friends in the return line.
     try:
         import transformers.modeling_outputs as _mo
         for _name in dir(_mo):
@@ -249,9 +229,9 @@ def install_for_class(cls) -> bool:
             ns.setdefault(_name, getattr(_mo, _name))
     except Exception:
         pass
+    # Register rewritten source with linecache so inspect.getsource and
+    # tracebacks see the installed body.
     synthetic_path = f"<unsloth-fused:{qn}>"
-    # Register the rewritten source with linecache so `inspect.getsource`
-    # and tracebacks see the actual body we installed.
     linecache.cache[synthetic_path] = (
         len(new_src), None,
         [line + "\n" for line in new_src.splitlines()],

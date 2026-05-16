@@ -198,10 +198,7 @@ class UnslothFusedLoss(torch.autograd.Function):
         """
         device = lm_head_weight.device
         if extra_kwargs is None: extra_kwargs = {}
-        # ignore_index defaults to -100 (HF convention); thread through both the
-        # label-shift step and the eventual F.cross_entropy call inside
-        # compute_fused_ce_loss so models that override ignore_index (rare but
-        # supported by HF ForCausalLMLoss) get correct masking.
+        # Thread ignore_index through label-shift and the inner CE call.
         ignore_index = int(extra_kwargs.get("ignore_index", -100))
 
         # Get shifted labels first

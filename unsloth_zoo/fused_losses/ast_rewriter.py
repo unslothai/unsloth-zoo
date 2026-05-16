@@ -8,43 +8,16 @@
 
 """AST-level rewriter for the canonical HF lm_head / loss_function triplet.
 
-What we match (structural, ignores whitespace, comments, docstrings):
-
-    <LOGITS_NAME> = self.<HEAD>(<HIDDEN_EXPR>)
-    ...
+Match:
+    <LOGITS> = self.<HEAD>(<HIDDEN>)              # optional .float()/[slice]/.contiguous() wrappers
     if labels is not None:
-        <LOGITS_NAME2> = self.loss_function(
-            <LOGITS_NAME>,                  # or logits=<LOGITS_NAME>
-            labels,                         # or labels=labels
-            vocab_size=<VOCAB_EXPR>,        # or 3rd positional
-            **<KWARGS_NAME>,
-        )
+        <LOSS> = self.loss_function(<LOGITS>, labels, vocab_size=..., **kwargs)
 
-What we rewrite to:
-
-    if labels is not None:
-        <LOSS_NAME> = unsloth_fused_lm_head_loss(
-            <HIDDEN_EXPR>, self.<HEAD>, labels,
-            vocab_size=<VOCAB_EXPR>, **<KWARGS_NAME>,
-        )
-        <LOGITS_NAME> = EMPTY_LOGITS
-    else:
-        <LOGITS_NAME> = self.<HEAD>(<HIDDEN_EXPR>)
-        <LOSS_NAME>   = None
-
-So the bf16 logits and the fp32 cast both disappear in the labels branch;
-generation (labels is None) is untouched.
-
-Robustness notes:
-
-- We tolerate `.float()` / `.contiguous()` / `[slice]` wrappers around
-  the `self.<HEAD>(...)` call by walking the RHS for any descendant Call
-  whose func is `self.<X>`.
-- We tolerate both keyword and positional `vocab_size` in the
-  `loss_function` call (some VLMs pass it positionally).
-- We do NOT rewrite forwards that lack the canonical triplet. Those
-  classes fall through to `_UNMATCHED` and the LOSS_MAPPING patch
-  remains the backstop.
+Rewrite the labels branch to call `unsloth_fused_lm_head_loss(<HIDDEN>,
+self.<HEAD>, labels, ...)` (skipping the bf16 logits + fp32 cast) and
+substitute EMPTY_LOGITS for the returned logits. The else (generation)
+branch keeps the original RHS verbatim. Forwards that miss the triplet
+fall through to `_UNMATCHED`; the LOSS_MAPPING sweep is the backstop.
 """
 
 from __future__ import annotations
@@ -254,12 +227,10 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
             loss_init_idx = j
             break
 
-    # Bail if any statement between the lm_head assign and the labels-if
-    # references logits_name (e.g. Gemma3 final_logit_softcapping mutates
-    # logits after lm_head). The rewrite would evaluate that block on
-    # EMPTY_LOGITS in the labels branch, so the fused loss would see
-    # un-softcapped logits and the post-rewrite block would silently corrupt
-    # the returned logits too.
+    # Bail if any statement between lm_head and the labels-if touches
+    # logits (e.g. Gemma3 final_logit_softcapping): it would run on
+    # EMPTY_LOGITS in the labels branch, so fused loss would see
+    # un-softcapped logits.
     for j in range(lm_head_assign_idx + 1, if_idx):
         if j == loss_init_idx:
             continue
@@ -328,8 +299,6 @@ def rewrite_forward_source(source: str) -> tuple[str | None, TripletCapture | No
 
     new_block = _build_replacement(cap)
     body = fn.body
-    # Replace `[lm_head_assign .. if_block]` (inclusive of both, plus an
-    # optional `loss = None` initialiser in between) with the new branch.
     delete_indices = {cap.lm_head_assign_idx, cap.if_block_idx}
     if cap.loss_init_idx is not None:
         delete_indices.add(cap.loss_init_idx)
@@ -343,9 +312,8 @@ def rewrite_forward_source(source: str) -> tuple[str | None, TripletCapture | No
             continue
         new_body.append(stmt)
     fn.body = new_body
-    # Strip only docstring-only decorators. `@can_return_tuple` carries
-    # real semantics (honours return_dict=False) and must be preserved; the
-    # installer injects it into the exec namespace.
+    # @can_return_tuple carries return_dict=False semantics and must
+    # survive; only strip the docstring-only decorators below.
     _DROP_DECORATORS = {
         "auto_docstring",
         "add_start_docstrings",
