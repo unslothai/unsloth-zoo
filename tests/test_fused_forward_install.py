@@ -280,11 +280,20 @@ def _make_synthetic_class(forward_src: str, name: str = "SyntheticForCausalLM"):
 
 
 def test_install_noop_when_disabled(fresh_install, monkeypatch):
-    monkeypatch.delenv("UNSLOTH_FUSED_FORWARD", raising=False)
+    # On by default; UNSLOTH_FUSED_FORWARD=0 is the explicit opt-out.
+    monkeypatch.setenv("UNSLOTH_FUSED_FORWARD", "0")
     cls = _make_synthetic_class(CANONICAL_KW_SRC)
     original = cls.forward
     assert fresh_install.install_for_class(cls) is False
     assert cls.forward is original
+
+
+def test_install_default_is_on(fresh_install, monkeypatch):
+    # With no env var set, the installer must be active.
+    monkeypatch.delenv("UNSLOTH_FUSED_FORWARD", raising=False)
+    cls = _make_synthetic_class(CANONICAL_KW_SRC)
+    assert fresh_install.is_enabled() is True
+    assert fresh_install.install_for_class(cls) is True
 
 
 def test_install_skips_ineligible_name(fresh_install, enable_env):
