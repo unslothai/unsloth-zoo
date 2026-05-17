@@ -35,6 +35,7 @@ def _tiny_config_kwargs():
         num_attention_heads=4,
         num_key_value_heads=2,
         num_experts=2,
+        num_local_experts=2,  # Mixtral reads num_local_experts (default 8)
         num_experts_per_tok=1,
         max_position_embeddings=64,
         vocab_size=128,
