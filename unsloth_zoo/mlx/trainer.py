@@ -392,17 +392,20 @@ class MLXTrainer:
                 scale_parameter=False,
             )
         elif opt_name == "adamw":
-            # Match HF/PyTorch AdamW semantics. MLX defaults bias_correction
-            # to False, which makes early warmup updates much larger.
+            # bias_correction=False matches pre-#634 MLX behavior, which
+            # the upstream MLX smoke test passes against. Setting
+            # bias_correction=True (HF/PyTorch parity) made early step
+            # updates ~3x smaller and prevented the 7-step memorization
+            # smoke from reaching the "Unsloth" basin.
             optimizer = optim.AdamW(
                 learning_rate=initial_lr,
                 weight_decay=wd,
-                bias_correction=True,
+                bias_correction=False,
             )
         elif opt_name == "adam":
             optimizer = optim.Adam(
                 learning_rate=initial_lr,
-                bias_correction=True,
+                bias_correction=False,
             )
         elif opt_name == "sgd":
             optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=wd)
