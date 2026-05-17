@@ -34,11 +34,16 @@ if os.environ.get("UNSLOTH_STABLE_DOWNLOADS", "0") == "1":
     os.environ["HF_HUB_DISABLE_XET"] = "1" # Disable XET
     os.environ["HF_XET_HIGH_PERFORMANCE"] = "0" # This causes "429 Too Many Requests"
 
-# Check offline mode as well
-if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-if os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1":
-    os.environ["HF_HUB_OFFLINE"] = "1"
+# Check offline mode as well. Cross-sync HF_HUB_OFFLINE,
+# TRANSFORMERS_OFFLINE, and HF_DATASETS_OFFLINE so setting any one of
+# the three implies all three. Without HF_DATASETS_OFFLINE here,
+# load_dataset() still issues a network call for dataset metadata even
+# when the rest of the HF stack is offline (and fails with
+# ConnectionError instead of resolving from cache).
+_OFFLINE_VARS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
+if any(os.environ.get(v, "0") == "1" for v in _OFFLINE_VARS):
+    for _v in _OFFLINE_VARS:
+        os.environ[_v] = "1"
 
 # Check "429 Too Many Requests" and set HF_XET_HIGH_PERFORMANCE
 from pathlib import Path
