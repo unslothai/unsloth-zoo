@@ -1084,14 +1084,38 @@ def _fp8_load_for_merge(file, header_metadata, weight_key):
     }
 
 
+def _peft_paramwrapper_swaps_in_out():
+    """True if installed PEFT version's ParamWrapper.update_layer performs the
+    `(experts, in, out) -> (experts, out, in)` swap for 3D non-transposed MoE
+    params. Introduced in PEFT 0.19; absent in 0.18 and earlier."""
+    try:
+        from peft.tuners.lora.layer import ParamWrapper
+        import inspect
+        return "_did_swap_in_out_features" in inspect.getsource(ParamWrapper.update_layer)
+    except Exception:
+        # If we can't inspect, assume modern PEFT.
+        return True
+
+
+_PEFT_AMBIGUOUS_LAYOUT_DEFAULT = "standard" if _peft_paramwrapper_swaps_in_out() else "swapped"
+
+
 def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim, lora_module=None):
     """Shape-classify as 'swapped' / 'standard' / 'unknown'; returns (layout, r).
 
     When 2*I == H for the fused gate_up_proj (common when intermediate is
     half the hidden dim), both 'standard' and 'swapped' shape checks pass.
-    Disambiguate using `_did_swap_in_out_features` set by unsloth on the
-    LoRA wrapper at training time, defaulting to 'standard' (PEFT layout)
-    when the flag is absent.
+    For that ambiguous case the right default depends on whether PEFT swapped
+    in/out features when creating the ParamWrapper:
+
+    - PEFT 0.19+ swaps for 3D non-transposed MoE → `lora_A.dim_A == in_dim`,
+      which corresponds to the "standard" branch of the merge math.
+    - PEFT 0.18 and earlier do NOT swap → `lora_A.dim_A == out_dim`, which
+      corresponds to the "swapped" branch.
+
+    `_PEFT_AMBIGUOUS_LAYOUT_DEFAULT` is computed once at import time from the
+    installed PEFT version. A caller can still override per-call by passing a
+    `lora_module` with `_did_swap_in_out_features` set explicitly.
     """
     total_rank_A, dim_A = lora_A.shape
     dim_B, total_rank_B = lora_B.shape
@@ -1103,10 +1127,14 @@ def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim, lora_m
     standard_match = (dim_A == in_dim and dim_B == out_dim)
     swapped_match  = (dim_A == out_dim and dim_B == in_dim)
     if standard_match and swapped_match:
-        # Ambiguous shape — use the training-time signal.
-        if lora_module is not None and bool(getattr(lora_module, "_did_swap_in_out_features", False)):
-            return "swapped", r
-        return "standard", r
+        # Ambiguous shape (typically 2*I == H). Prefer an explicit per-wrapper
+        # signal when available, otherwise fall back to the PEFT-version-aware
+        # default. `_did_swap_in_out_features = True` means PEFT swapped in/out
+        # at training time, which corresponds to "standard" storage from the
+        # merge code's perspective.
+        if lora_module is not None and hasattr(lora_module, "_did_swap_in_out_features"):
+            return ("standard" if lora_module._did_swap_in_out_features else "swapped"), r
+        return _PEFT_AMBIGUOUS_LAYOUT_DEFAULT, r
     if standard_match:
         return "standard", r
     if swapped_match:
