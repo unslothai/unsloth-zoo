@@ -124,13 +124,6 @@ class MLXTrainingConfig:
     # max_grad_norm is honored, matching HF/TRL semantics on CUDA. Pass
     # an explicit float > 0 to opt in to the MLX low-memory clip path.
     max_grad_value: float | None = None
-    # Adam bias correction. PyTorch's torch.optim.AdamW is always
-    # bias-corrected, but the original MLX MLXTrainer shipped with
-    # bias_correction=False, which gives ~3x larger early-step updates
-    # and is what existing MLX fine-tune scripts (including the smoke
-    # test in unslothai/unsloth) were tuned against. Default False to
-    # preserve that contract; pass True to opt in to HF/torch parity.
-    adam_bias_correction: bool = False
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
     embedding_learning_rate: float = 0.0  # 0 = disabled, 5e-5 = recommended
@@ -399,22 +392,17 @@ class MLXTrainer:
                 scale_parameter=False,
             )
         elif opt_name == "adamw":
-            # bias_correction is opt-in via self.args.adam_bias_correction.
-            # Default False matches the pre-#634 MLX default and the
-            # early-step behavior every existing MLX fine-tune script (incl.
-            # the upstream smoke test) was tuned against. See dataclass field
-            # for the full HF-parity tradeoff.
-            bc = bool(getattr(self.args, "adam_bias_correction", False))
+            # Match HF/PyTorch AdamW semantics. MLX defaults bias_correction
+            # to False, which makes early warmup updates much larger.
             optimizer = optim.AdamW(
                 learning_rate=initial_lr,
                 weight_decay=wd,
-                bias_correction=bc,
+                bias_correction=True,
             )
         elif opt_name == "adam":
-            bc = bool(getattr(self.args, "adam_bias_correction", False))
             optimizer = optim.Adam(
                 learning_rate=initial_lr,
-                bias_correction=bc,
+                bias_correction=True,
             )
         elif opt_name == "sgd":
             optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=wd)
