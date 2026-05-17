@@ -1007,6 +1007,83 @@ def _resolve_num_experts_from_lora_stats(lora_stats, fallback):
     return fallback
 
 
+# FP8 e4m3 max representable magnitude — matches transformers' Fp8Quantize.convert
+# (finegrained_fp8.py:838-859) and compressed-tensors' fp8 encode path.
+_FP8_E4M3_MAX = 448.0
+
+
+def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+    """Block-wise dequant of float8_e4m3fn weight via per-block weight_scale_inv.
+
+    Inverse of compressed-tensors / DeepSeek-style FP8 quantization:
+        W_real = decode_fp8(W) * scale_inv_broadcast(block_size)
+    where scale_inv has shape (rows/bm, cols/bn) and each scalar tiles its
+    bm x bn block of the dequantized weight.
+
+    Mirrors transformers.integrations.finegrained_fp8.Fp8Dequantize (lines
+    874-912) and unsloth_zoo.temporary_patches.moe_utils_fp8._dequantize_full_expert_weights_unsloth.
+    """
+    rows, cols = W_fp8.shape
+    srows, scols = scale_inv.shape
+    bm, bn = rows // srows, cols // scols
+    W_bf16 = W_fp8.to(scale_inv.dtype)
+    return (
+        W_bf16.reshape(srows, bm, scols, bn)
+        * scale_inv.unsqueeze(-1).unsqueeze(1)
+    ).reshape(rows, cols)
+
+
+def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: torch.dtype):
+    """Block-wise FP8 e4m3 re-quantization. Returns (W_fp8, new_scale_inv).
+
+    Per (bm, bn) block: scale_inv = max_abs / 448, W_fp8 = clamp(W / scale_inv, ±448).
+    Mirrors transformers Fp8Quantize.convert (finegrained_fp8.py:838-859).
+    Zero-blocks get scale_inv = 1.0 (avoids div-by-zero; the encoded fp8 is also 0).
+    """
+    rows, cols = W.shape
+    bm, bn = block_shape
+    srows, scols = rows // bm, cols // bn
+    # Compute in fp32 for numerical stability of the division
+    W_blocks = W.to(torch.float32).reshape(srows, bm, scols, bn)
+    block_max = W_blocks.abs().amax(dim=(1, 3))
+    scale_inv = (block_max / _FP8_E4M3_MAX).clamp_min(1e-12)
+    W_scaled = (
+        W_blocks / scale_inv.unsqueeze(-1).unsqueeze(1)
+    ).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+    W_fp8 = W_scaled.reshape(rows, cols).to(torch.float8_e4m3fn)
+    return W_fp8, scale_inv.to(scale_dtype)
+
+
+def _fp8_load_for_merge(file, header_metadata, weight_key):
+    """If `weight_key` points to an fp8 expert weight with a companion
+    `weight_scale_inv`, return (W_bf16, scale_meta) where scale_meta carries
+    the info needed to re-quantize on the way out. Otherwise return
+    (W_as_read, None) for the existing non-fp8 path.
+
+    scale_meta is a dict: {scale_key, scale_dtype, block_shape}
+    """
+    W = file.get_tensor(weight_key)
+    if W.dtype != torch.float8_e4m3fn:
+        return W, None
+    scale_key = weight_key[: -len(".weight")] + ".weight_scale_inv"
+    if scale_key not in header_metadata:
+        return W, None
+    scale_inv = file.get_tensor(scale_key)
+    if scale_inv.ndim != 2 or W.ndim != 2:
+        return W, None
+    rows, cols = W.shape
+    srows, scols = scale_inv.shape
+    if rows % srows != 0 or cols % scols != 0:
+        return W, None
+    bm, bn = rows // srows, cols // scols
+    W_bf16 = _fp8_dequant_blockwise(W, scale_inv)
+    return W_bf16, {
+        "scale_key":   scale_key,
+        "scale_dtype": scale_inv.dtype,
+        "block_shape": (bm, bn),
+    }
+
+
 def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim, lora_module=None):
     """Shape-classify as 'swapped' / 'standard' / 'unknown'; returns (layout, r).
 
@@ -1386,32 +1463,71 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
 
                 # Check for gate_proj
                 if gate_key in header_metadata:
-                    gate_W = file.get_tensor(gate_key)
+                    # For fp8 base, dequantize via weight_scale_inv before merge
+                    # so the LoRA delta is added in bf16-real-weight space, not
+                    # the raw fp8-decoded space (which is off by 1/scale_inv).
+                    gate_W, gate_fp8_meta = _fp8_load_for_merge(file, header_metadata, gate_key)
                     merged_gate = _merge_moe_gate_expert(
                         gate_W, lora_stats, expert_idx, num_experts, output_dtype or gate_W.dtype
                     )
-                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, gate_key, merged_gate, gate_W.dtype)
+                    if gate_fp8_meta is not None:
+                        merged_gate, new_scale = _fp8_requant_blockwise(
+                            merged_gate, gate_fp8_meta["block_shape"], gate_fp8_meta["scale_dtype"],
+                        )
+                        _write_tensor_direct_torch(
+                            mm, header_metadata, length_of_header,
+                            gate_fp8_meta["scale_key"], new_scale, gate_fp8_meta["scale_dtype"],
+                        )
+                        processed_mxfp4_keys.add(gate_fp8_meta["scale_key"])
+                        gate_write_dtype = torch.float8_e4m3fn
+                    else:
+                        gate_write_dtype = gate_W.dtype
+                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, gate_key, merged_gate, gate_write_dtype)
                     processed_mxfp4_keys.add(gate_key)
                     module_updated = True
 
                 # Check for up_proj
                 if up_key in header_metadata:
-                    up_W = file.get_tensor(up_key)
+                    up_W, up_fp8_meta = _fp8_load_for_merge(file, header_metadata, up_key)
                     merged_up = _merge_moe_up_expert(
                         up_W, lora_stats, expert_idx, num_experts, output_dtype or up_W.dtype
                     )
-                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, up_key, merged_up, up_W.dtype)
+                    if up_fp8_meta is not None:
+                        merged_up, new_scale = _fp8_requant_blockwise(
+                            merged_up, up_fp8_meta["block_shape"], up_fp8_meta["scale_dtype"],
+                        )
+                        _write_tensor_direct_torch(
+                            mm, header_metadata, length_of_header,
+                            up_fp8_meta["scale_key"], new_scale, up_fp8_meta["scale_dtype"],
+                        )
+                        processed_mxfp4_keys.add(up_fp8_meta["scale_key"])
+                        up_write_dtype = torch.float8_e4m3fn
+                    else:
+                        up_write_dtype = up_W.dtype
+                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, up_key, merged_up, up_write_dtype)
                     processed_mxfp4_keys.add(up_key)
                     module_updated = True
             else:
                 down_key = f"{prefix}.{expert_idx}.down_proj.weight"
                 if down_key not in header_metadata:
                     continue
-                down_W = file.get_tensor(down_key)
+                down_W, down_fp8_meta = _fp8_load_for_merge(file, header_metadata, down_key)
                 merged_down = _merge_moe_down_proj_expert(
                     down_W, lora_stats, expert_idx, num_experts, output_dtype or down_W.dtype
                 )
-                _write_tensor_direct_torch(mm, header_metadata, length_of_header, down_key, merged_down, down_W.dtype)
+                if down_fp8_meta is not None:
+                    merged_down, new_scale = _fp8_requant_blockwise(
+                        merged_down, down_fp8_meta["block_shape"], down_fp8_meta["scale_dtype"],
+                    )
+                    _write_tensor_direct_torch(
+                        mm, header_metadata, length_of_header,
+                        down_fp8_meta["scale_key"], new_scale, down_fp8_meta["scale_dtype"],
+                    )
+                    processed_mxfp4_keys.add(down_fp8_meta["scale_key"])
+                    down_write_dtype = torch.float8_e4m3fn
+                else:
+                    down_write_dtype = down_W.dtype
+                _write_tensor_direct_torch(mm, header_metadata, length_of_header, down_key, merged_down, down_write_dtype)
                 processed_mxfp4_keys.add(down_key)
                 module_updated = True
         if module_updated and not already_counted:
