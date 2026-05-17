@@ -125,12 +125,18 @@ class MLXTrainingConfig:
     # an explicit float > 0 to opt in to the MLX low-memory clip path.
     max_grad_value: float | None = None
     # Adam bias correction. PyTorch's torch.optim.AdamW is always
-    # bias-corrected, but the original MLX MLXTrainer shipped with
-    # bias_correction=False, which gives ~3x larger early-step updates
-    # and is what existing MLX fine-tune scripts (including the smoke
-    # test in unslothai/unsloth) were tuned against. Default False to
-    # preserve that contract; pass True to opt in to HF/torch parity.
-    adam_bias_correction: bool = False
+    # bias-corrected; mlx.optimizers.AdamW defaults to bias_correction=
+    # False (and so does mlx_lm.lora). PR #634 silently flipped this to
+    # True in MLXTrainer; subsequent end-to-end probing (rounds A-J of
+    # the mlx-parity-probes workflow) showed bc=True hits post_train_
+    # loss=0 on a single-row LoRA smoke fixture in ~10 steps while
+    # bc=False stays above loss 2 for 60+ steps and ~500 mlx-lm iters
+    # before getting close. So bc=True is the correct default for short
+    # memorization smokes AND for any user who expects HF/torch.AdamW
+    # math. Default True; users running long-horizon fine-tunes that
+    # depended on the pre-#634 MLX-ecosystem-default behavior can opt
+    # back to False explicitly.
+    adam_bias_correction: bool = True
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
     embedding_learning_rate: float = 0.0  # 0 = disabled, 5e-5 = recommended

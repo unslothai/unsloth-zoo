@@ -84,15 +84,17 @@ def test_mlx_training_config_max_grad_value_default_is_off():
     assert cfg.max_grad_norm == 1.0
 
 
-def test_mlx_training_config_adam_bias_correction_default_is_false():
-    """PR #634 silently flipped MLX AdamW bias_correction from False to True,
-    which shrinks early-step updates ~3x and broke the upstream MLX smoke
-    test (and every other 7-step-style memorization fine-tune). Default
-    must be False to preserve pre-#634 behavior; users wanting HF/torch
-    AdamW parity opt in by passing adam_bias_correction=True."""
+def test_mlx_training_config_adam_bias_correction_default_is_true():
+    """Round-J empirical: bc=False on the single-row LoRA smoke fixture
+    stays at post_train_loss > 2 for 60+ steps and cannot memorize within
+    a reasonable smoke horizon. bc=True hits loss=0 by step ~10 across all
+    seeds tested. Default True for HF/torch.AdamW parity AND for the short
+    memorization smoke to converge; users running long-horizon fine-tunes
+    that want the historical MLX-framework default can opt back to False
+    via adam_bias_correction=False."""
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
-    assert MLXTrainingConfig().adam_bias_correction is False
-    assert MLXTrainingConfig(adam_bias_correction=True).adam_bias_correction is True
+    assert MLXTrainingConfig().adam_bias_correction is True
+    assert MLXTrainingConfig(adam_bias_correction=False).adam_bias_correction is False
 
 
 def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
