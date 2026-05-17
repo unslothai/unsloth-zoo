@@ -509,21 +509,152 @@ def test_fused_kernel_accepts_int_n_items():
     assert torch.isfinite(loss), f"loss not finite with int n_items: {loss}"
 
 
-def test_adapter_falls_back_when_shift_labels_false():
-    # When the caller passes shift_labels=False (bool) the fused kernel
-    # would still shift internally; route to the stock-CE fallback that
-    # honours the caller's intent.
+def _ce_reference(hidden, lm_head, labels, shift_labels=None, n_items=None,
+                  ignore_index=-100, label_smoothing=0.0):
+    """Reference: F.cross_entropy on materialised logits. Mirrors HF
+    ForCausalLMLoss when shift_labels is supplied, otherwise does the
+    canonical causal shift itself."""
+    import torch
+    logits = torch.nn.functional.linear(hidden, lm_head.weight,
+                                        getattr(lm_head, "bias", None))
+    if shift_labels is None:
+        # Standard causal shift: predict token t+1 from position t.
+        target = torch.full_like(labels, ignore_index)
+        target[..., :-1] = labels[..., 1:]
+    else:
+        target = shift_labels
+    reduction = "sum" if n_items is not None else "mean"
+    loss = torch.nn.functional.cross_entropy(
+        logits.view(-1, logits.shape[-1]).float(),
+        target.reshape(-1).to(logits.device),
+        ignore_index=ignore_index,
+        label_smoothing=label_smoothing,
+        reduction=reduction,
+    )
+    if n_items is not None:
+        loss = loss / float(n_items)
+    return loss
+
+
+def test_adapter_auto_shift_matches_F_cross_entropy():
     torch = pytest.importorskip("torch")
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         pytest.skip("requires CUDA")
     from unsloth_zoo.fused_losses import unsloth_fused_lm_head_loss
 
-    B, T, H, V = 1, 8, 8, 16
+    torch.manual_seed(0)
+    B, T, H, V = 2, 32, 64, 128
     hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
     lm_head = torch.nn.Linear(H, V, bias=False).cuda().float()
     labels = torch.randint(0, V, (B, T), device="cuda")
-    loss = unsloth_fused_lm_head_loss(hidden, lm_head, labels, shift_labels=False)
-    assert torch.isfinite(loss), f"loss not finite: {loss}"
+    labels[0, 5:8] = -100  # sprinkle ignore_index
+
+    fused = unsloth_fused_lm_head_loss(hidden, lm_head, labels, vocab_size=V)
+    ref = _ce_reference(hidden, lm_head, labels)
+    assert torch.allclose(fused, ref, atol=1e-5, rtol=1e-5), (
+        f"fused auto-shift {fused.item()} != reference {ref.item()}"
+    )
+
+
+def test_adapter_pre_shifted_tensor_matches_F_cross_entropy():
+    torch = pytest.importorskip("torch")
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        pytest.skip("requires CUDA")
+    from unsloth_zoo.fused_losses import unsloth_fused_lm_head_loss
+
+    torch.manual_seed(1)
+    B, T, H, V = 2, 32, 64, 128
+    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(H, V, bias=False).cuda().float()
+    labels = torch.randint(0, V, (B, T), device="cuda")
+    # Simulate trl padding_free pre-shifted target: shift labels left by 1,
+    # last position becomes ignore_index. Same shape as logits.
+    shift = torch.full_like(labels, -100)
+    shift[..., :-1] = labels[..., 1:]
+
+    fused = unsloth_fused_lm_head_loss(
+        hidden, lm_head, labels=labels, vocab_size=V, shift_labels=shift,
+    )
+    ref = _ce_reference(hidden, lm_head, labels=None, shift_labels=shift)
+    assert torch.allclose(fused, ref, atol=1e-5, rtol=1e-5), (
+        f"fused pre-shifted {fused.item()} != reference {ref.item()}"
+    )
+
+
+def test_adapter_shift_labels_false_matches_F_cross_entropy():
+    torch = pytest.importorskip("torch")
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        pytest.skip("requires CUDA")
+    from unsloth_zoo.fused_losses import unsloth_fused_lm_head_loss
+
+    torch.manual_seed(2)
+    B, T, H, V = 2, 32, 64, 128
+    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(H, V, bias=False).cuda().float()
+    # Caller hands us labels that are already pre-shifted (the bool=False
+    # contract: do not shift again, treat labels as the target tensor).
+    target = torch.randint(0, V, (B, T), device="cuda")
+    target[..., -1] = -100  # canonical pre-shift fills last position
+    fused = unsloth_fused_lm_head_loss(
+        hidden, lm_head, labels=target, vocab_size=V, shift_labels=False,
+    )
+    ref = _ce_reference(hidden, lm_head, labels=None, shift_labels=target)
+    assert torch.allclose(fused, ref, atol=1e-5, rtol=1e-5), (
+        f"fused shift_labels=False {fused.item()} != reference {ref.item()}"
+    )
+
+
+def test_adapter_num_items_in_batch_divides_correctly():
+    torch = pytest.importorskip("torch")
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        pytest.skip("requires CUDA")
+    from unsloth_zoo.fused_losses import unsloth_fused_lm_head_loss
+
+    torch.manual_seed(3)
+    B, T, H, V = 2, 16, 32, 64
+    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(H, V, bias=False).cuda().float()
+    labels = torch.randint(0, V, (B, T), device="cuda")
+    labels[:, :2] = -100  # pad-like prefix
+
+    # Effective token count after causal shift: only positions where the
+    # shifted target is not ignore_index count.
+    target = torch.full_like(labels, -100)
+    target[..., :-1] = labels[..., 1:]
+    n_items = int((target != -100).sum().item())
+
+    fused = unsloth_fused_lm_head_loss(
+        hidden, lm_head, labels, vocab_size=V, num_items_in_batch=n_items,
+    )
+    ref = _ce_reference(hidden, lm_head, labels, n_items=n_items)
+    assert torch.allclose(fused, ref, atol=1e-5, rtol=1e-5), (
+        f"fused (num_items={n_items}) {fused.item()} != reference {ref.item()}"
+    )
+
+
+def test_adapter_num_items_in_batch_as_int_and_tensor_equal():
+    torch = pytest.importorskip("torch")
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        pytest.skip("requires CUDA")
+    from unsloth_zoo.fused_losses import unsloth_fused_lm_head_loss
+
+    torch.manual_seed(4)
+    B, T, H, V = 2, 16, 32, 64
+    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(H, V, bias=False).cuda().float()
+    labels = torch.randint(0, V, (B, T), device="cuda")
+    n_items_int = 17
+    n_items_tensor = torch.tensor(17, device="cuda")
+
+    fused_int = unsloth_fused_lm_head_loss(
+        hidden, lm_head, labels, vocab_size=V, num_items_in_batch=n_items_int,
+    )
+    fused_tensor = unsloth_fused_lm_head_loss(
+        hidden, lm_head, labels, vocab_size=V, num_items_in_batch=n_items_tensor,
+    )
+    assert torch.allclose(fused_int, fused_tensor, atol=1e-6), (
+        f"int vs tensor n_items disagree: {fused_int.item()} vs {fused_tensor.item()}"
+    )
 
 
 def test_fused_kernel_label_smoothing_changes_loss():
