@@ -1143,6 +1143,15 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
             _record_moe_merge_fallback(role, expert_idx, "expert_idx out of range", lora_stats, (I, H))
             return W
 
+        # unsloth's MoE forward (temporary_patches/moe_utils.py
+        # `_canonical_lora_weights_for_grouped_mm`) views lora_B as
+        # (out, num_experts, r) — contiguous-r columns per expert. This
+        # MUST match here so the merged checkpoint reproduces the unsloth
+        # training-time forward. (PEFT's own `get_delta_weight` uses
+        # stride-E reshape `(out, r, E)`, but unsloth bypasses PEFT's
+        # forward via `patch_param_wrapper_for_moe`, so the stored
+        # tensors only need to be interpreted with the same convention as
+        # unsloth's forward.)
         a_slice = lora_stats.lora_A[start:end, :]
         b_slice = lora_stats.lora_B[:, start:end]
         device  = _active_merge_device()
@@ -1210,6 +1219,7 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
             _record_moe_merge_fallback("down", expert_idx, "expert_idx out of range", lora_stats, (H, I))
             return down_W
 
+        # See _merge_moe_gate_or_up_expert for the slicing convention rationale.
         a_slice = lora_stats.lora_A[start:end, :]
         b_slice = lora_stats.lora_B[:, start:end]
         device  = _active_merge_device()
@@ -1573,6 +1583,10 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
 
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
+            # unsloth's MoE forward views lora_B contiguous-r per expert
+            # (see temporary_patches/moe_utils.py
+            # `_canonical_lora_weights_for_grouped_mm`); the merge must
+            # match so the saved checkpoint reproduces training-time forward.
             a_slice = lora_stats.lora_A[start:end, :]
             b_slice = lora_stats.lora_B[:, start:end]
             delta = b_slice.to(
@@ -1625,6 +1639,7 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
 
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
+            # See _merge_moe_fused_gate_up_expert for the slicing rationale.
             a_slice = lora_stats.lora_A[start:end, :]
             b_slice = lora_stats.lora_B[:, start:end]
             delta = b_slice.to(
