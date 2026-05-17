@@ -120,11 +120,10 @@ class MLXTrainingConfig:
     weight_decay: float = 0.001
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
     # Elementwise clip ([-max_grad_value, max_grad_value], per-leaf, no
-    # cross-leaf reduction). Set 0.0 to disable. Default 1.0: |g_i| > 5
-    # rarely fires on real transformer grads, so the historical 5.0 was
-    # effectively a no-op; 1.0 matches the universal clip_grad_norm=1.0
-    # baseline while staying on MLX's fast tree_map(mx.clip) path.
-    max_grad_value: float | None = 1.0
+    # cross-leaf reduction). Off by default (None) so a user-supplied
+    # max_grad_norm is honored, matching HF/TRL semantics on CUDA. Pass
+    # an explicit float > 0 to opt in to the MLX low-memory clip path.
+    max_grad_value: float | None = None
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
     embedding_learning_rate: float = 0.0  # 0 = disabled, 5e-5 = recommended
@@ -723,13 +722,14 @@ class MLXTrainer:
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
         _warned_skip_optimizer_state_grad_norm = False
 
-        # Build step functions following mlx-lm's pattern
+        # Build step functions following mlx-lm's pattern.
+        # max_grad_value is opt-in: None/0 => disabled, honor max_grad_norm.
+        # Explicit float > 0 enables the elementwise low-memory clip path
+        # and overrides max_grad_norm (with a notice) since the two cannot
+        # combine meaningfully on MLX's compiled update.
         max_grad_norm = float(args.max_grad_norm or 0.0)
-        # Elementwise clip (clip_grad_value_): leaf-local, free memory.
-        # Prefer value clipping when both clipping modes are requested; global
-        # norm clipping is exact but materially increases memory on MLX.
-        _raw_mgv = getattr(args, "max_grad_value", 1.0)  # TODO: expose MLX grad-clip in Studio UI for power users
-        max_grad_value = 1.0 if _raw_mgv is None else float(_raw_mgv or 0.0)
+        _raw_mgv = getattr(args, "max_grad_value", None)
+        max_grad_value = 0.0 if _raw_mgv is None else float(_raw_mgv or 0.0)
         if max_grad_norm > 0 and max_grad_value > 0:
             print(
                 "Unsloth: max_grad_norm and max_grad_value are both enabled; "

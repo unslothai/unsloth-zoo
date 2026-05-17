@@ -72,6 +72,18 @@ def test_mlx_training_config_each_optim(optim_name):
     assert cfg.optim == optim_name
 
 
+def test_mlx_training_config_max_grad_value_default_is_off():
+    """HF/TRL parity: a default MLXTrainingConfig must NOT silently override a
+    user-supplied max_grad_norm. See unsloth-zoo issue #662 / PR #634 regression.
+    The elementwise clip path is opt-in only."""
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
+    assert MLXTrainingConfig().max_grad_value is None
+    # User passing only max_grad_norm (HF default style) keeps value clip off.
+    cfg = MLXTrainingConfig(max_grad_norm=1.0)
+    assert cfg.max_grad_value is None
+    assert cfg.max_grad_norm == 1.0
+
+
 def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     from unsloth_zoo.mlx.trainer import (
         MLXTrainer,
