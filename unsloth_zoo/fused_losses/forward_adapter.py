@@ -65,41 +65,30 @@ def unsloth_fused_lm_head_loss(
         kwargs.pop("n_items", None)
     # vocab_size is read from lm_head_weight.shape[0]; drop the keyword.
     kwargs.pop("vocab_size", None)
-    # Caller already shifted (either `shift_labels=<tensor>` or `shift_labels=False`):
-    # the fused kernel always re-shifts, so route to stock CE for correctness.
+    # If caller already shifted (e.g. trl padding_free with packing passes
+    # shift_labels=<tensor>), route the pre-shifted target into the fused
+    # kernel with shift_labels=False so we still get chunked logits.
     shift_labels_kw = kwargs.pop("shift_labels", None)
     pre_shifted_tensor = (
         shift_labels_kw is not None and not isinstance(shift_labels_kw, bool)
     )
-    if pre_shifted_tensor or shift_labels_kw is False:
-        logits = torch.nn.functional.linear(
-            hidden_states.to(dtype=lm_head.weight.dtype, device=lm_head.weight.device),
-            lm_head.weight,
-            getattr(lm_head, "bias", None),
-        )
-        ignore_index = int(kwargs.get("ignore_index", -100))
-        label_smoothing = float(kwargs.get("label_smoothing", 0.0))
-        target = shift_labels_kw if pre_shifted_tensor else labels
-        reduction = "sum" if n_items is not None else "mean"
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.shape[-1]).float(),
-            target.view(-1).to(logits.device),
-            ignore_index=ignore_index,
-            label_smoothing=label_smoothing,
-            reduction=reduction,
-        )
-        if n_items is not None:
-            if torch.is_tensor(n_items):
-                n_items = n_items.to(device=loss.device, dtype=loss.dtype)
-            loss = loss / n_items
-        return loss
+    if pre_shifted_tensor:
+        target = shift_labels_kw
+        do_shift = False
+    elif shift_labels_kw is False:
+        target = labels
+        do_shift = False
+    else:
+        target = labels
+        do_shift = True
 
     return unsloth_fused_ce_loss(
         trainer        = None,
         hidden_states  = hidden_states,
         lm_head_weight = lm_head.weight,
         lm_head_bias   = getattr(lm_head, "bias", None),
-        labels         = labels,
+        labels         = target,
         n_items        = n_items,
+        shift_labels   = do_shift,
         **kwargs,
     )

@@ -213,6 +213,11 @@ class UnslothFusedLoss(torch.autograd.Function):
             _labels[..., -1] = ignore_index
             _labels = _labels.view(-1)
             labels = _labels
+        else:
+            # Caller already shifted (e.g. trl padding_free passes
+            # shift_labels=<tensor>). Flatten so chunking aligns with
+            # hidden_states.reshape(-1, hd).
+            labels = labels.contiguous().view(-1).to(device = device)
         pass
 
         # N items divisor
@@ -273,7 +278,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    False, # Outer pre-shifted (or caller did); inner skips
                     **kwargs,
                 )
                 grad_lm_head.add_(chunk_grad_lm_head)
@@ -291,7 +296,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    False, # Outer pre-shifted (or caller did); inner skips
                     **kwargs,
                 )
                 grad_lm_head.add_(chunk_grad_lm_head)
@@ -308,7 +313,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    False, # Outer pre-shifted (or caller did); inner skips
                     **kwargs,
                 )
                 grad_lm_head_bias.add_(chunk_grad_lm_head_bias)
@@ -325,7 +330,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    False, # Outer pre-shifted (or caller did); inner skips
                     **kwargs,
                 )
             pass
@@ -534,12 +539,14 @@ def unsloth_fused_ce_loss(
     target_gb      : Optional[int] = None,
     torch_compile  : Optional[bool] = True,
     overwrite      : Optional[bool] = False,
+    shift_labels   : bool = True,
     **kwargs,
 ):
     """
     Computes chunked fused cross_entropy_loss(chunk(X) @ W + b, chunk(labels))
     * If n_items is not given, does mean(ce_loss), otherwise sum(ce_loss)/n_items
-    * Auto does shift of labels ie hidden_states[..., :-1] and labels[..., 1:]
+    * shift_labels=True (default) shifts internally: hidden_states[..., :-1] and labels[..., 1:].
+      Set False when caller already pre-shifted (e.g. trl padding_free).
     * Allows scaling factor from mixed precision fp16, fp8
     * target_gb specifies the max GB memory the fused loss can use - default detects VRAM left
     * Upcasts to float32 and allows kwargs to have:
@@ -571,7 +578,7 @@ def unsloth_fused_ce_loss(
         mask = mask,
         n_items = n_items,
         scaling = scaling,
-        shift_labels = True,
+        shift_labels = shift_labels,
         target_gb = target_gb,
         torch_compile = torch_compile,
         overwrite = overwrite,
