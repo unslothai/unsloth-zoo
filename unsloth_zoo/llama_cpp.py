@@ -903,6 +903,9 @@ def _load_module_from_path(filepath, module_name):
     if spec is None or spec.loader is None:
             raise ImportError(f"Could not load spec for module {module_name} at {filepath}")
     module = importlib.util.module_from_spec(spec)
+    script_dir = os.path.dirname(os.path.abspath(filepath))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
     # Register module before execution to handle circular imports within the script if any
     sys.modules[module_name] = module
     try:
