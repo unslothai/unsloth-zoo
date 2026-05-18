@@ -1,14 +1,14 @@
 # Unsloth Zoo - Utilities for Unsloth
-# Verify that `MLXTrainingConfig(max_grad_value=None)` disables
-# elementwise grad clipping rather than silently rebinding to the
-# default 1.0.
+# Verify MLX grad-clip semantics match issue #662's HF-parity proposal:
 #
-# Background: the field is typed `float | None = 1.0`, and the field
-# docstring documents `None` as a disable signal. Probe authors comparing
-# `unsloth_zoo.MLXTrainer` against `mlx-lm`'s native loop (which does
-# no elementwise clipping) set `max_grad_value=None` and were surprised
-# that clipping was still applied. This test pins the fixed behavior so
-# the disable-None semantics stays stable.
+#   1. MLXTrainingConfig.max_grad_value defaults to None (no elementwise
+#      clip), so a user-passed max_grad_norm is honored as in HF/TRL.
+#   2. None and 0.0 both disable elementwise clipping. Explicit None
+#      previously rebound silently to 1.0.
+#   3. A positive value opts in to elementwise clipping; the existing
+#      mutual-exclusion rule (elementwise wins, max_grad_norm zeroed)
+#      then applies and prints a notice.
+#   4. The dataclass round-trips None through the field.
 
 from __future__ import annotations
 
@@ -29,15 +29,16 @@ def _disable_clip_decision(raw_mgv):
     return max_grad_value > 0
 
 
-def test_field_default_is_clip_on():
+def test_field_default_is_clip_off():
+    """Default = None (no elementwise clip). HF/TRL parity."""
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
 
     cfg = MLXTrainingConfig(output_dir="/tmp/x")
-    assert cfg.max_grad_value == 1.0
+    assert cfg.max_grad_value is None
 
 
 def test_none_disables_clip():
-    """The motivating change: passing None disables clipping."""
+    """Explicit None disables clipping (not silently rebound to 1.0)."""
     assert _disable_clip_decision(None) is False
 
 
@@ -48,7 +49,7 @@ def test_zero_disables_clip():
 
 
 def test_positive_enables_clip():
-    """A positive value keeps clipping on."""
+    """A positive value opts in to elementwise clipping."""
     assert _disable_clip_decision(1.0) is True
     assert _disable_clip_decision(2.5) is True
 
@@ -59,3 +60,11 @@ def test_field_accepts_none():
 
     cfg = MLXTrainingConfig(max_grad_value=None, output_dir="/tmp/x")
     assert cfg.max_grad_value is None
+
+
+def test_field_accepts_explicit_positive():
+    """Field accepts positive floats for power users opting into clip."""
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
+
+    cfg = MLXTrainingConfig(max_grad_value=2.5, output_dir="/tmp/x")
+    assert cfg.max_grad_value == 2.5
