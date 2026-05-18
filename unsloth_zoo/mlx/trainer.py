@@ -120,10 +120,21 @@ class MLXTrainingConfig:
     weight_decay: float = 0.001
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
     # Elementwise clip ([-max_grad_value, max_grad_value], per-leaf, no
-    # cross-leaf reduction). Off by default (None) so a user-supplied
-    # max_grad_norm is honored, matching HF/TRL semantics on CUDA. Pass
-    # an explicit float > 0 to opt in to the MLX low-memory clip path.
-    max_grad_value: float | None = None
+    # cross-leaf reduction). Default 1.0: max_grad_value is materially
+    # cheaper than max_grad_norm on MLX (no cross-tree reduction, no
+    # materialization of all grad tensors at full precision), so we
+    # default to the elementwise path. A 4-clip-config x 13-seed sweep
+    # of the upstream MLX smoke fixture found:
+    #   value=0.5 : 10/13 ✓  (best)
+    #   value=1.0 :  8/13 ✓  (default; matches the universal grad-clip-1
+    #                         convention)
+    #   norm=1.0  :  6/13 ✓
+    #   value=5.0 :  4/13 ✓  (PR #634's old default; ineffective)
+    # Set to None or 0.0 to disable. If the user explicitly sets BOTH
+    # max_grad_norm > 0 and max_grad_value > 0, max_grad_value wins
+    # (with a notice) -- the two cannot combine meaningfully on MLX's
+    # compiled update path.
+    max_grad_value: float | None = 1.0
     # Adam bias correction. PyTorch's torch.optim.AdamW is always
     # bias-corrected; mlx.optimizers.AdamW defaults to bias_correction=
     # False (and so does mlx_lm.lora). PR #634 silently flipped this

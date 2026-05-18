@@ -72,14 +72,19 @@ def test_mlx_training_config_each_optim(optim_name):
     assert cfg.optim == optim_name
 
 
-def test_mlx_training_config_max_grad_value_default_is_off():
-    """HF/TRL parity: a default MLXTrainingConfig must NOT silently override a
-    user-supplied max_grad_norm. See unsloth-zoo issue #662 / PR #634 regression.
-    The elementwise clip path is opt-in only."""
+def test_mlx_training_config_max_grad_value_default_is_one():
+    """MLX-native default: max_grad_value=1.0 because max_grad_norm requires
+    a cross-tree reduction and materializing all grad tensors at full
+    precision, making it materially more memory-hungry than the elementwise
+    clip on MLX. Empirical 13-seed sweep of the upstream smoke fixture found
+    value=1.0 hits 62% contains-Unsloth vs norm=1.0 at 46% -- the cheaper
+    default is also the higher-pass-rate default. Users who want HF/TRL
+    norm-clip semantics opt in by passing max_grad_value=None (or 0.0)
+    explicitly."""
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
-    assert MLXTrainingConfig().max_grad_value is None
-    # User passing only max_grad_norm (HF default style) keeps value clip off.
-    cfg = MLXTrainingConfig(max_grad_norm=1.0)
+    assert MLXTrainingConfig().max_grad_value == 1.0
+    # Explicit opt-out: user passes max_grad_value=None to disable.
+    cfg = MLXTrainingConfig(max_grad_value=None, max_grad_norm=1.0)
     assert cfg.max_grad_value is None
     assert cfg.max_grad_norm == 1.0
 
