@@ -1744,7 +1744,7 @@ elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGIT
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
-elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and NOT_RETURN_LOGITS:
     lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
@@ -1767,6 +1767,12 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
+elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+    # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
+    # has already materialised the full lm_head matmul; route the loss
+    # through self.loss_function on those same logits instead of letting
+    # unsloth_fused_ce_loss redo the chunked matmul.
+    loss = self.loss_function(logits, labels.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
 else:
     logits = self.lm_head(hidden_states\\1)
     if (\\2) != ():
