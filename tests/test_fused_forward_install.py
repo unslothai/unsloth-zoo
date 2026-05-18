@@ -104,8 +104,15 @@ def test_ast_rewriter_matches_keyword_form():
     assert cap.logits_name == "logits"
     assert "unsloth_fused_lm_head_loss" in new_src
     assert "EMPTY_LOGITS" in new_src
-    # The original self.loss_function call must be gone from the rewritten src.
-    assert "self.loss_function" not in new_src
+    # self.loss_function appears exactly once: on the UNSLOTH_RETURN_LOGITS
+    # opt-in path, where we materialise logits via the original RHS and
+    # route the loss through it to avoid a second lm_head matmul.
+    assert new_src.count("self.loss_function") == 1
+    # Labels branch carries the UNSLOTH_RETURN_LOGITS opt-in; the hidden-
+    # states branch is intentionally absent (handled by the compiled
+    # forward in unsloth_zoo/compiler.py).
+    assert "UNSLOTH_RETURN_LOGITS" in new_src
+    assert "UNSLOTH_RETURN_HIDDEN_STATES" not in new_src
 
 
 def test_ast_rewriter_matches_positional_with_float_wrapper():
@@ -655,6 +662,109 @@ def test_adapter_num_items_in_batch_as_int_and_tensor_equal():
     assert torch.allclose(fused_int, fused_tensor, atol=1e-6), (
         f"int vs tensor n_items disagree: {fused_int.item()} vs {fused_tensor.item()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Env-var branch: UNSLOTH_RETURN_LOGITS
+# ---------------------------------------------------------------------------
+
+
+def _install_toy_cls(fresh_install):
+    cls = _make_synthetic_class(_toy_forward_src(), name="EnvVarToyForCausalLM")
+    assert fresh_install.install_for_class(cls) is True
+    return cls
+
+
+def _toy_instance(cls, dtype, V=64, H=32):
+    import torch
+    class _Config:
+        vocab_size = V
+    inst = cls()
+    inst.config = _Config()
+    inst.lm_head = torch.nn.Linear(H, V, bias=False).cuda().to(dtype)
+    def _reference_loss(logits, labels, vocab_size, **kw):
+        shifted = labels.clone()
+        shifted[..., :-1] = labels[..., 1:]
+        shifted[..., -1] = -100
+        return torch.nn.functional.cross_entropy(
+            logits.float().view(-1, vocab_size),
+            shifted.view(-1),
+            ignore_index=-100,
+        )
+    inst.loss_function = _reference_loss
+    return inst
+
+
+def test_rewritten_forward_returns_real_logits_when_env_set(
+    fresh_install, enable_env, monkeypatch,
+):
+    # UNSLOTH_RETURN_LOGITS=1 with labels present: logits slot carries
+    # real lm_head output and loss is computed via self.loss_function on
+    # those materialised logits. Critically, only ONE lm_head matmul
+    # happens (no fused-kernel re-matmul).
+    torch = pytest.importorskip("torch")
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        pytest.skip("requires CUDA")
+
+    cls = _install_toy_cls(fresh_install)
+    B, T, H, V = 2, 8, 32, 64
+    inst = _toy_instance(cls, dtype=torch.bfloat16, V=V, H=H)
+    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
+    labels = torch.randint(0, V, (B, T), device="cuda")
+
+    # Count lm_head invocations to prove single-matmul on the opt-in path.
+    lm_head_calls = {"n": 0}
+    orig_call = inst.lm_head.__class__.__call__
+    def _counting_call(self, *a, **kw):
+        lm_head_calls["n"] += 1
+        return orig_call(self, *a, **kw)
+    monkeypatch.setattr(inst.lm_head.__class__, "__call__", _counting_call)
+
+    # Also count self.loss_function invocations to confirm the opt-in path
+    # routes through the model's own loss function.
+    loss_fn_calls = {"n": 0}
+    real_loss_fn = inst.loss_function
+    def _counting_loss_fn(*a, **kw):
+        loss_fn_calls["n"] += 1
+        return real_loss_fn(*a, **kw)
+    inst.loss_function = _counting_loss_fn
+
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "1")
+    loss, logits = cls.forward(inst, hidden, labels=labels)
+    assert loss is not None
+    assert torch.isfinite(loss)
+    assert logits.shape == (B, T, V), (
+        f"expected real logits {(B, T, V)}, got {tuple(logits.shape)}"
+    )
+    assert lm_head_calls["n"] == 1, (
+        f"opt-in path must do exactly one lm_head matmul, observed {lm_head_calls['n']}"
+    )
+    assert loss_fn_calls["n"] == 1, (
+        f"opt-in path must call self.loss_function once, observed {loss_fn_calls['n']}"
+    )
+
+
+def test_rewritten_forward_default_labels_branch_yields_empty_logits(
+    fresh_install, enable_env, monkeypatch,
+):
+    # Defaults (env var unset): labels branch returns EMPTY_LOGITS so we
+    # don't pay the lm_head matmul on the hot path. Byte-identical to
+    # the pre-PR behaviour.
+    torch = pytest.importorskip("torch")
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        pytest.skip("requires CUDA")
+
+    cls = _install_toy_cls(fresh_install)
+    B, T, H, V = 2, 8, 32, 64
+    inst = _toy_instance(cls, dtype=torch.bfloat16, V=V, H=H)
+    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
+    labels = torch.randint(0, V, (B, T), device="cuda")
+
+    monkeypatch.delenv("UNSLOTH_RETURN_LOGITS", raising=False)
+    loss, logits = cls.forward(inst, hidden, labels=labels)
+    assert loss is not None
+    assert torch.isfinite(loss)
+    assert logits.numel() == 0
 
 
 def test_fused_kernel_label_smoothing_changes_loss():
