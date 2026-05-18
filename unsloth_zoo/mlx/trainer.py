@@ -126,20 +126,21 @@ class MLXTrainingConfig:
     max_grad_value: float | None = None
     # Adam bias correction. PyTorch's torch.optim.AdamW is always
     # bias-corrected; mlx.optimizers.AdamW defaults to bias_correction=
-    # False (and so does mlx_lm.lora). PR #634 silently flipped this to
-    # True in MLXTrainer; subsequent end-to-end probing (rounds A-L of
-    # the mlx-parity-probes workflow) showed:
-    #   * bc=True hits post_train_loss=0 on a single-row LoRA smoke
-    #     fixture in ~10 steps for every seed tested;
-    #   * bc=False on the SAME fixture stays at loss > 2 for 50 steps
-    #     and DIVERGES to NaN by step ~100, so it is unsafe at long
-    #     horizons on small / fast-overfitting fixtures.
-    # So bc=True is the correct default for short memorization smokes,
-    # the upstream studio MLX smoke test, AND for any user who expects
-    # HF/torch.AdamW math. Default True; pass adam_bias_correction=
-    # False ONLY if you know your fixture is large enough that the
-    # early-step difference matters and your LR is small enough to
-    # avoid the NaN-divergence regime.
+    # False (and so does mlx_lm.lora). PR #634 silently flipped this
+    # to True in MLXTrainer; subsequent end-to-end probing (rounds A-Q
+    # of the mlx-parity-probes workflow) showed the safety envelope is
+    # an lr x bc interaction, not bc alone:
+    #
+    #   lr=1e-3, bc=True  -> stable 30..1000 steps (smoke + long runs)
+    #   lr=1e-3, bc=False -> NaN past ~88 steps on small fixtures
+    #   lr=1e-4, bc=False -> stable through 200 steps (memorizes)
+    #   lr=5e-3, bc=True  -> NaN by ~100 steps (too aggressive)
+    #
+    # bc=True is the correct default for the typical LoRA LR band
+    # (1e-3 - 5e-4) AND for any user who expects HF/torch.AdamW
+    # math. Default True; pass adam_bias_correction=False ONLY at
+    # smaller LRs (<= 1e-4) where you've verified the loss stays
+    # finite.
     adam_bias_correction: bool = True
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
