@@ -13,11 +13,22 @@ Match:
     if labels is not None:
         <LOSS> = self.loss_function(<LOGITS>, labels, vocab_size=..., **kwargs)
 
-Rewrite the labels branch to call `unsloth_fused_lm_head_loss(<HIDDEN>,
-self.<HEAD>, labels, ...)` (skipping the bf16 logits + fp32 cast) and
-substitute EMPTY_LOGITS for the returned logits. The else (generation)
-branch keeps the original RHS verbatim. Forwards that miss the triplet
-fall through to `_UNMATCHED`; the LOSS_MAPPING sweep is the backstop.
+Rewrite expands the original two-branch block into three branches that
+mirror the compiler-rewritten forward in ``unsloth_zoo/compiler.py``:
+
+  1. ``UNSLOTH_RETURN_HIDDEN_STATES=1`` -> return hidden_states in the
+     logits slot, no lm_head matmul, no loss. GRPO and other callers
+     that compute their own logprobs from hidden_states + lm_head rely
+     on this early return.
+  2. ``labels is not None`` -> call ``unsloth_fused_lm_head_loss`` for
+     the loss. The logits slot becomes ``EMPTY_LOGITS`` unless
+     ``UNSLOTH_RETURN_LOGITS=1`` is set, in which case the original
+     ``self.<HEAD>(<HIDDEN>)`` expression runs so the caller still
+     gets real logits (eval / custom metrics).
+  3. otherwise (generation) -> original RHS verbatim, ``loss = None``.
+
+Forwards that miss the triplet fall through to ``_UNMATCHED``; the
+LOSS_MAPPING sweep is the backstop.
 """
 
 from __future__ import annotations
@@ -254,7 +265,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
 
 
 def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
-    """Build the AST nodes for the rewritten labels-branch / else-branch."""
+    """Build the AST nodes for the rewritten three-branch block."""
     head_attr = cap.head_attr
     logits = cap.logits_name
     loss = cap.loss_name
@@ -266,13 +277,21 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
+    # Priority matches unsloth_zoo/compiler.py: return-hidden first, then
+    # the labels (fused-loss) branch, then plain generation.
     template = textwrap.dedent(f"""
-        if labels is not None:
+        if os.environ.get('UNSLOTH_RETURN_HIDDEN_STATES', '0') == '1':
+            {logits} = {hidden_src}
+            {loss} = None
+        elif labels is not None:
             {loss} = unsloth_fused_lm_head_loss(
                 {hidden_src}, self.{head_attr}, labels,
                 vocab_size={vocab}{extra}{kwargs_unpack},
             )
-            {logits} = EMPTY_LOGITS
+            if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':
+                {logits} = {logits_rhs}
+            else:
+                {logits} = EMPTY_LOGITS
         else:
             {logits} = {logits_rhs}
             {loss} = None
