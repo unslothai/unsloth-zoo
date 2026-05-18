@@ -106,15 +106,11 @@ def test_ast_rewriter_matches_keyword_form():
     assert "EMPTY_LOGITS" in new_src
     # The original self.loss_function call must be gone from the rewritten src.
     assert "self.loss_function" not in new_src
-    # Three branches mirror unsloth_zoo/compiler.py: return-hidden first,
-    # then the labels branch with the UNSLOTH_RETURN_LOGITS opt-in, then
-    # plain generation.
-    assert "UNSLOTH_RETURN_HIDDEN_STATES" in new_src
+    # Labels branch carries the UNSLOTH_RETURN_LOGITS opt-in; the hidden-
+    # states branch is intentionally absent (handled by the compiled
+    # forward in unsloth_zoo/compiler.py).
     assert "UNSLOTH_RETURN_LOGITS" in new_src
-    idx_hidden = new_src.index("UNSLOTH_RETURN_HIDDEN_STATES")
-    idx_labels = new_src.index("labels is not None")
-    idx_logits = new_src.index("UNSLOTH_RETURN_LOGITS")
-    assert idx_hidden < idx_labels < idx_logits, new_src
+    assert "UNSLOTH_RETURN_HIDDEN_STATES" not in new_src
 
 
 def test_ast_rewriter_matches_positional_with_float_wrapper():
@@ -667,7 +663,7 @@ def test_adapter_num_items_in_batch_as_int_and_tensor_equal():
 
 
 # ---------------------------------------------------------------------------
-# Env-var branches: UNSLOTH_RETURN_HIDDEN_STATES / UNSLOTH_RETURN_LOGITS
+# Env-var branch: UNSLOTH_RETURN_LOGITS
 # ---------------------------------------------------------------------------
 
 
@@ -695,32 +691,6 @@ def _toy_instance(cls, dtype, V=64, H=32):
         )
     inst.loss_function = _reference_loss
     return inst
-
-
-def test_rewritten_forward_returns_hidden_states_when_env_set(
-    fresh_install, enable_env, monkeypatch,
-):
-    # UNSLOTH_RETURN_HIDDEN_STATES=1 must take priority over the labels
-    # branch: returned logits slot carries hidden_states (hidden_dim),
-    # not vocab-dim, and loss is None. GRPO's _get_per_token_logps_and_
-    # entropies relies on this early return.
-    torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("requires CUDA")
-
-    cls = _install_toy_cls(fresh_install)
-    B, T, H, V = 2, 8, 32, 64
-    inst = _toy_instance(cls, dtype=torch.bfloat16, V=V, H=H)
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
-    labels = torch.randint(0, V, (B, T), device="cuda")
-
-    monkeypatch.setenv("UNSLOTH_RETURN_HIDDEN_STATES", "1")
-    loss, logits = cls.forward(inst, hidden, labels=labels)
-    assert loss is None
-    assert logits.shape[-1] == H, (
-        f"expected hidden_dim={H}, got last dim {logits.shape[-1]}"
-    )
-    assert torch.equal(logits, hidden)
 
 
 def test_rewritten_forward_returns_real_logits_when_env_set(
@@ -752,8 +722,9 @@ def test_rewritten_forward_returns_real_logits_when_env_set(
 def test_rewritten_forward_default_labels_branch_yields_empty_logits(
     fresh_install, enable_env, monkeypatch,
 ):
-    # Defaults (neither env var set): labels branch still returns
-    # EMPTY_LOGITS so we don't pay the lm_head matmul on the hot path.
+    # Defaults (env var unset): labels branch returns EMPTY_LOGITS so we
+    # don't pay the lm_head matmul on the hot path. Byte-identical to
+    # the pre-PR behaviour.
     torch = pytest.importorskip("torch")
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         pytest.skip("requires CUDA")
@@ -764,33 +735,11 @@ def test_rewritten_forward_default_labels_branch_yields_empty_logits(
     hidden = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
     labels = torch.randint(0, V, (B, T), device="cuda")
 
-    monkeypatch.delenv("UNSLOTH_RETURN_HIDDEN_STATES", raising=False)
     monkeypatch.delenv("UNSLOTH_RETURN_LOGITS", raising=False)
     loss, logits = cls.forward(inst, hidden, labels=labels)
     assert loss is not None
     assert torch.isfinite(loss)
     assert logits.numel() == 0
-
-
-def test_rewritten_forward_hidden_states_takes_priority_over_logits(
-    fresh_install, enable_env, monkeypatch,
-):
-    # Both env vars set: return-hidden wins (matches compiler.py ordering).
-    torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("requires CUDA")
-
-    cls = _install_toy_cls(fresh_install)
-    B, T, H, V = 2, 8, 32, 64
-    inst = _toy_instance(cls, dtype=torch.bfloat16, V=V, H=H)
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
-    labels = torch.randint(0, V, (B, T), device="cuda")
-
-    monkeypatch.setenv("UNSLOTH_RETURN_HIDDEN_STATES", "1")
-    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "1")
-    loss, logits = cls.forward(inst, hidden, labels=labels)
-    assert loss is None
-    assert logits.shape[-1] == H
 
 
 def test_fused_kernel_label_smoothing_changes_loss():

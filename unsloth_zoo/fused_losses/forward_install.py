@@ -215,7 +215,7 @@ def install_for_class(cls) -> bool:
     ns = dict(getattr(forward, "__globals__", {}))
     ns["unsloth_fused_lm_head_loss"] = unsloth_fused_lm_head_loss
     ns["EMPTY_LOGITS"] = EMPTY_LOGITS
-    # The rewritten body reads UNSLOTH_RETURN_HIDDEN_STATES / UNSLOTH_RETURN_LOGITS.
+    # The rewritten body reads UNSLOTH_RETURN_LOGITS via os.environ.get.
     ns.setdefault("os", os)
     try:
         from transformers.utils.generic import can_return_tuple

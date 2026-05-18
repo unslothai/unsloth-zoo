@@ -13,22 +13,20 @@ Match:
     if labels is not None:
         <LOSS> = self.loss_function(<LOGITS>, labels, vocab_size=..., **kwargs)
 
-Rewrite expands the original two-branch block into three branches that
-mirror the compiler-rewritten forward in ``unsloth_zoo/compiler.py``:
+Rewrite the labels branch to call ``unsloth_fused_lm_head_loss(<HIDDEN>,
+self.<HEAD>, labels, ...)`` (skipping the bf16 logits + fp32 cast). The
+logits slot becomes ``EMPTY_LOGITS`` unless ``UNSLOTH_RETURN_LOGITS=1``
+is set, in which case the original ``self.<HEAD>(<HIDDEN>)`` expression
+runs so the caller still gets real logits (eval / custom metrics). The
+else (generation) branch keeps the original RHS verbatim. Forwards that
+miss the triplet fall through to ``_UNMATCHED``; the LOSS_MAPPING sweep
+is the backstop.
 
-  1. ``UNSLOTH_RETURN_HIDDEN_STATES=1`` -> return hidden_states in the
-     logits slot, no lm_head matmul, no loss. GRPO and other callers
-     that compute their own logprobs from hidden_states + lm_head rely
-     on this early return.
-  2. ``labels is not None`` -> call ``unsloth_fused_lm_head_loss`` for
-     the loss. The logits slot becomes ``EMPTY_LOGITS`` unless
-     ``UNSLOTH_RETURN_LOGITS=1`` is set, in which case the original
-     ``self.<HEAD>(<HIDDEN>)`` expression runs so the caller still
-     gets real logits (eval / custom metrics).
-  3. otherwise (generation) -> original RHS verbatim, ``loss = None``.
-
-Forwards that miss the triplet fall through to ``_UNMATCHED``; the
-LOSS_MAPPING sweep is the backstop.
+``UNSLOTH_RETURN_HIDDEN_STATES`` is intentionally not handled here:
+GRPO's hidden-states fast path lives in the compiler-rewritten forward
+(``unsloth_zoo/compiler.py``), which always overrides the AST forward
+for the unsloth-supported ``*ForCausalLM`` classes that callers actually
+use with that env var.
 """
 
 from __future__ import annotations
@@ -265,7 +263,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
 
 
 def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
-    """Build the AST nodes for the rewritten three-branch block."""
+    """Build the AST nodes for the rewritten labels-branch / else-branch."""
     head_attr = cap.head_attr
     logits = cap.logits_name
     loss = cap.loss_name
@@ -277,13 +275,10 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
-    # Priority matches unsloth_zoo/compiler.py: return-hidden first, then
-    # the labels (fused-loss) branch, then plain generation.
+    # Labels branch goes through the fused kernel. The logits slot is
+    # EMPTY_LOGITS by default, or real logits when UNSLOTH_RETURN_LOGITS=1.
     template = textwrap.dedent(f"""
-        if os.environ.get('UNSLOTH_RETURN_HIDDEN_STATES', '0') == '1':
-            {logits} = {hidden_src}
-            {loss} = None
-        elif labels is not None:
+        if labels is not None:
             {loss} = unsloth_fused_lm_head_loss(
                 {hidden_src}, self.{head_attr}, labels,
                 vocab_size={vocab}{extra}{kwargs_unpack},
