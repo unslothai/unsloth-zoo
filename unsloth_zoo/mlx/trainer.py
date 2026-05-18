@@ -1532,8 +1532,21 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         if not batch_items:
             continue
         max_len = max(len(ids) for ids, _ in batch_items)
-        # Round up to nearest multiple of _PAD_MULTIPLE (matching mlx-lm)
-        padded_len = ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
+        # Match mlx-lm's `iterate_batches` padding exactly: pad to
+        # `1 + _PAD_MULTIPLE * ceil(max_len / _PAD_MULTIPLE)`. The
+        # extra +1 token gives the autoregressive shift one slot of
+        # headroom, so after `inputs = batch[:, :-1]` / `targets =
+        # batch[:, 1:]` the effective sequence length is a clean
+        # multiple of _PAD_MULTIPLE -- matching what `default_loss`
+        # in mlx_lm.tuner.trainer sees. Previously this rounded to
+        # `_PAD_MULTIPLE * ceil(max_len / _PAD_MULTIPLE)`, dropping
+        # the +1 and producing inputs that were one token shorter
+        # than mlx-lm's. On small-model fixtures (gemma-3-270m-it)
+        # that one-token shift moved the run into a different basin
+        # of attraction (paired-seed comparison: probe 31 manual
+        # loop hit 10/15 = 67% vs probe 33-37 MLXTrainer hit 40-53%
+        # on the same seeds in danielhanchen/unsloth-staging-2).
+        padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
         padded_len = min(padded_len, max_seq_length)
 
         batch_ids = []
