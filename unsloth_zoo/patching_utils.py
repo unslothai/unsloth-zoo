@@ -537,7 +537,8 @@ def patch_compiled_autograd():
     fx = torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture
     if fx.__name__ == "unsloth_end_capture": return
     source = inspect.getsource(fx)
-    if "with disable()" in source: return
+    # torch >= 2.7 renamed `with disable()` to `with _disable()`. Either means upstream already wraps compiled_fn; no-op.
+    if "with disable()" in source or "with _disable()" in source: return
     spaces = source.find("def")
     source = source.split("\n")
     source = "\n".join(x[spaces:] for x in source)

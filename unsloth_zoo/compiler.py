@@ -313,13 +313,56 @@ def replace_with_grouped_query_attention(module, source):
         pass
     pass
 
-    source = re.sub(
+    # `output_attentions` super().forward chain rewriter.
+    #
+    # Old shape (transformers <= 4.49 on Llama / Mistral / Qwen2):
+    #
+    #     if output_attentions:
+    #         logger.warning_once(...)
+    #         return super().forward(
+    #             hidden_states=hidden_states,
+    #             ...
+    #         )
+    #
+    # We rewrite the whole `if output_attentions: ... return super().forward(...)`
+    # block to a hard `raise RuntimeError(...)` so the rest of zoo's
+    # compile pipeline can assume `output_attentions=False`.
+    #
+    # New shape on transformers 4.50+: the entire eager-attention chain
+    # was removed. Forward methods now take a `**kwargs` catch-all and
+    # `output_attentions` is silently ignored / never branches into a
+    # super().forward() return. The bug zoo was working around (eager
+    # attention silently re-entering and breaking the compile graph) is
+    # gone upstream.
+    #
+    # The regex below silently no-ops on 4.50+ because the pattern
+    # simply isn't there. That is the CORRECT behaviour: there's nothing
+    # to rewrite. We keep the rewrite for older transformers and add a
+    # secondary fallback so a partial-shape match (e.g. an upstream that
+    # kept the `if output_attentions:` guard but dropped the super()
+    # return) still hardens to the same RuntimeError.
+    rewritten, n_old = re.subn(
         r"if output_attentions\:.+?return super\(\)\.forward.+?\)",
         "if output_attentions: raise RuntimeError('Unsloth: Not supported')",
         source,
         flags=re.DOTALL | re.MULTILINE,
     )
-    return source
+    if n_old:
+        return rewritten
+    # Fallback: cover the bare `if output_attentions:` guard followed by
+    # a `return super().forward(...)` separated by an arbitrary body
+    # (logger warning, raise, etc.). Matches the legacy shape with a
+    # looser anchor; still no-ops on 4.50+ where the guard is gone.
+    rewritten, n_loose = re.subn(
+        r"if[ \t]+output_attentions[ \t]*:[^\n]*\n(?:[ \t]+[^\n]+\n)*?[ \t]+return[ \t]+super\(\)\.forward\([^)]*\)",
+        "if output_attentions: raise RuntimeError('Unsloth: Not supported')",
+        source,
+        flags=re.MULTILINE,
+    )
+    # If neither shape matched we silently return the source unchanged.
+    # On transformers 4.50+ that's the intended outcome: upstream removed
+    # the chain this rewriter was patching, so there's nothing to fix.
+    return rewritten if n_loose else source
 
 
 pass
@@ -380,6 +423,63 @@ def get_mask_functions():
 pass
 
 
+def _all_attention_functions_has_sdpa():
+    """Return True if ``transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS``
+    (or its post-4.50 attention-interface equivalent) registers an "sdpa"
+    entry.
+
+    transformers 4.50+ moved per-attention-mechanism dispatch into a
+    registry-backed `ALL_ATTENTION_FUNCTIONS` mapping. Some models still
+    declare the legacy `_supports_sdpa` class attribute, but most modern
+    ones (Llama, Mistral, Qwen3, ...) rely entirely on the registry.
+    When zoo's source-string marker probe at compiler.py:3390-3392
+    misses, falling back to this check lets us still detect SDPA support
+    on those modern models.
+
+    Forwards-compat: probes a handful of plausible attribute names on
+    `transformers.modeling_utils` and `transformers.integrations.sdpa_attention`.
+    Returns False on any failure -- the caller treats False as "no
+    evidence of SDPA support" and leaves SDPA off, which is the safe
+    behaviour.
+    """
+    try:
+        import transformers.modeling_utils as _mu  # noqa: WPS433
+    except Exception:
+        return False
+    # The canonical post-4.50 name. We also probe a few historical /
+    # candidate names so the helper survives further upstream renames.
+    for attr in (
+        "ALL_ATTENTION_FUNCTIONS",
+        "ATTENTION_INTERFACES",
+        "AttentionInterface",
+        "_ALL_ATTENTION_FUNCTIONS",
+    ):
+        reg = getattr(_mu, attr, None)
+        if reg is None:
+            continue
+        try:
+            # Most candidates are mapping-like ({"sdpa": ..., "flash_attention_2": ...}).
+            if "sdpa" in reg:
+                return True
+        except Exception:
+            pass
+        # AttentionInterface in some 5.x previews is a class with a class-level
+        # registry. Probe the obvious attribute names.
+        for sub in ("_registry", "_global_mapping", "_mapping", "registry"):
+            inner = getattr(reg, sub, None)
+            if inner is None:
+                continue
+            try:
+                if "sdpa" in inner:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+pass
+
+
 # Convert F.softmax(x, ...) to F.softmax(x, ..., dtype = torch.float32).to(x.dtype)
 def higher_precision_softmax(source):
     """
@@ -394,7 +494,14 @@ def higher_precision_softmax(source):
         r"([^,]{1,}), "
         r"(dim[ ]?\=[ ]?[\-0-9]{1,2})"
         r"(\,[ ]?dtype[^\)]{1,})?"
-        r"\)",
+        r"\)"
+        # Idempotency: skip the rewrite when the softmax(...) is already
+        # followed by `.to(<variable>.dtype)`. Without this lookahead,
+        # re-running higher_precision_softmax on already-rewritten source
+        # appends another `.to(<variable>.dtype)` per pass (the existing
+        # cast is outside the matched span and `source.replace(...)`
+        # leaves it in place, producing `softmax(...).to(x.dtype).to(x.dtype)`).
+        r"(?!\s*\.to\(\s*\2\s*\.dtype\s*\))",
         source,
     )
     for item in softmax_objects:
@@ -808,7 +915,8 @@ def create_new_function(
     # Fix all softmax low precisions to float32
     new_source = higher_precision_softmax(new_source)
 
-    if new_source[0] == " ":
+    # Skip dedent on empty source to avoid IndexError.
+    if new_source and new_source[0] == " ":
         spaces = new_source.find("def")
         new_source = new_source.split("\n")
         new_source = "\n".join(x[spaces:] for x in new_source)
@@ -837,6 +945,28 @@ def create_new_function(
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
         items += ["SiglipEncoder"]
+    # Pull back base classes referenced in the emitted source whose
+    # name was filtered out of `items`. Without this the cache imports
+    # a class whose base is undefined.
+    try:
+        _modeling_file = eval(model_location)
+        _modeling_dir = set(dir(_modeling_file))
+    except Exception:
+        _modeling_dir = set()
+    if _modeling_dir:
+        for base in re.findall(r"^class\s+\w+\(([^)]*)\)\s*:", new_source, flags=re.MULTILINE):
+            for b in base.split(","):
+                b = b.strip().split(".")[0]
+                if (
+                    b
+                    and b in _modeling_dir
+                    and b not in items
+                    and b != name
+                    and f"class {b}(" not in new_source
+                    and f"class {b}:" not in new_source
+                    and f"def {b}(" not in new_source
+                ):
+                    items.append(b)
     # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
@@ -1109,6 +1239,7 @@ def create_standalone_class(
     add_loss_kwargs=False,
     new_init=None,
     new_methods=None,
+    supports_return_hidden_states=False,
 ) -> str:
     """
     new_methods: dict[str, str] = {
@@ -1331,15 +1462,18 @@ def create_standalone_class(
 
     # Combine all into file
     source = source + full_class
+    if supports_return_hidden_states:
+        source += f"\n{module}.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True\n"
 
-    # Remove @auto_docstring
-    source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    # Transformers 5.x decorators on forward methods
-    source = re.sub(r"@merge_with_config_defaults[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    source = re.sub(r"@capture_outputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    # source = source.replace("@auto_docstring", "")
+    # Strip decorators with a paren-balanced match. A `[^\)]*` group
+    # stops at the first `)` inside a string argument and leaves an
+    # unterminated literal in the emitted source.
+    _PAREN_GROUP = r"(?P<grp>\((?:[^()'\"]|'[^'\\]*(?:\\.[^'\\]*)*'|\"[^\"\\]*(?:\\.[^\"\\]*)*\"|(?P>grp))*\))"
+    for _dec in (
+        "auto_docstring", "use_kernelized_func", "check_model_inputs",
+        "merge_with_config_defaults", "capture_outputs",
+    ):
+        source = regex.sub(rf"@{_dec}\s*(?:{_PAREN_GROUP})?", "", source)
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
@@ -1610,7 +1744,7 @@ elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGIT
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
-elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and NOT_RETURN_LOGITS:
     lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
@@ -1633,6 +1767,20 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
+elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+    # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
+    # already materialised the full lm_head matmul; apply the captured logit
+    # scale/softcap transforms and route loss through self.loss_function on
+    # those logits instead of letting unsloth_fused_ce_loss redo the matmul.
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) not in (None, (),):
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
+    loss = self.loss_function(logits, labels.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
 else:
     logits = self.lm_head(hidden_states\\1)
     if (\\2) != ():
@@ -1859,13 +2007,22 @@ def apply_fused_lm_head(forward, module=None):
             "$KWARGS$", "locals().get('loss_kwargs', {}) or locals().get('kwargs', {})"
         )
 
-        # Fix Idefics and Idefics3
-        forward = forward.replace(
-            "loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))",
-            "shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)\n"
-            "shift_labels = shift_labels.view(-1)\n"
-            "shift_labels = shift_labels.to(shift_logits.device)\n"
-            "loss = loss_fct(shift_logits, shift_labels)",
+        # Idefics-style loss rewrite. Anchor to start-of-line and capture
+        # leading whitespace so the match doesn't fire inside e.g.
+        # `lm_loss = loss_fct(...)` and so emitted lines inherit the
+        # surrounding indent.
+        forward = re.sub(
+            r"^([ \t]+)loss = loss_fct\("
+            r"shift_logits\.view\(-1, shift_logits\.size\(-1\)\), "
+            r"shift_labels\.view\(-1\)\)$",
+            lambda m: (
+                f"{m.group(1)}shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)\n"
+                f"{m.group(1)}shift_labels = shift_labels.view(-1)\n"
+                f"{m.group(1)}shift_labels = shift_labels.to(shift_logits.device)\n"
+                f"{m.group(1)}loss = loss_fct(shift_logits, shift_labels)"
+            ),
+            forward,
+            flags=re.MULTILINE,
         )
 
         # Find matches
@@ -1972,9 +2129,9 @@ def apply_fused_lm_head(forward, module=None):
         forward = forward.replace(",**)", ")")
         forward = forward.replace(",** )", ")")
         # print(forward)
-        return forward
+        return forward, True
     pass
-    return forward
+    return forward, False
 
 
 pass
@@ -2064,7 +2221,7 @@ def test_apply_fused_lm_head():
     for name, forward in forwards:
         # print("=" * 30)
         # print(name)
-        forward = apply_fused_lm_head(forward, name)
+        forward, _ = apply_fused_lm_head(forward, name)
         if "NOT_RETURN_LOGITS" not in forward:
             print(f"Failed patching fast CE forward for {name}")
         if "loss = outputs.loss" in forward:
@@ -2109,6 +2266,11 @@ def convert_attention_masks_to_bool(module, old_source):
     all_splits = source.strip().split("\n")
     splits = all_splits[-1].strip()
     if "return" not in splits:
+        return old_source
+    # Skip returns whose body contains parens. The findall regex below
+    # cannot parse nested parens and would produce an unbalanced rewrite.
+    return_body = splits[len("return"):].strip()
+    if "(" in return_body:
         return old_source
     vars = re.findall(r"return[\s]{1,}(?:([^\,]{1,})\,[\s]{0,}){0,}([^\s]{1,})", splits)
     if len(vars) != 1:
@@ -2377,6 +2539,29 @@ MOE_ROUTING_WEIGHTS_CAST_PATTERN = (
 )
 MOE_ROUTING_WEIGHTS_CAST_REPLACE = r"\1router_logits\2"
 
+# Forwards-compat secondary regex for the MoE routing-weights dtype cast.
+#
+# The legacy pattern only catches the EXACT form
+# `routing_weights = routing_weights.to(hidden_states.dtype)` -- still
+# present on mixtral / qwen2_moe / qwen3_moe in transformers 4.57.x.
+#
+# Newer MoE rewrites (gpt_oss, deepseek_v3, prospective 5.x shapes) may
+# either drop the explicit cast entirely (no bug -> no fix needed, both
+# regexes silently no-op) or rewrite it as a self-assignment with
+# whitespace / line-break variation, or as `routing_weights = routing_weights.to(self.<something>.dtype)`.
+# This secondary pattern is strictly broader on whitespace and tolerates
+# an intermediate attribute chain on the .to() argument, so any future
+# variant of "cast routing_weights to a tensor's dtype before re-using
+# it" is still caught. The replacement preserves the original semantics:
+# route the cast through router_logits so the higher-precision router
+# graph dtype is preserved.
+MOE_ROUTING_WEIGHTS_CAST_PATTERN_NEW = (
+    r"(\brouting_weights\s*=\s*routing_weights\.to\(\s*)"
+    r"(?:hidden_states|self\.[A-Za-z_]\w*|inputs?_dtype)"
+    r"(\.dtype\s*\))"
+)
+MOE_ROUTING_WEIGHTS_CAST_REPLACE_NEW = r"\1router_logits\2"
+
 
 def patch_moe_routing_weights_cast(
     module_cls: Any, source: str
@@ -2391,17 +2576,42 @@ def patch_moe_routing_weights_cast(
             continue
 
         new_route_source = inspect.getsource(func)
+        # Try the legacy pattern first; if it didn't match, fall through
+        # to the broader forwards-compat pattern. Either pattern firing
+        # produces the same router_logits-routed replacement, so the two
+        # are equivalent on the source after one of them matches; we
+        # never apply both in sequence (the new pattern's match space is
+        # a strict superset of the legacy pattern's).
         new_route_source, replaced_count = re.subn(
             MOE_ROUTING_WEIGHTS_CAST_PATTERN,
             MOE_ROUTING_WEIGHTS_CAST_REPLACE,
             new_route_source,
         )
+        if replaced_count == 0:
+            new_route_source, replaced_count = re.subn(
+                MOE_ROUTING_WEIGHTS_CAST_PATTERN_NEW,
+                MOE_ROUTING_WEIGHTS_CAST_REPLACE_NEW,
+                new_route_source,
+            )
         if replaced_count > 0:
             new_route_sources[method_name] = new_route_source
 
-    return re.sub(
-        MOE_ROUTING_WEIGHTS_CAST_PATTERN, MOE_ROUTING_WEIGHTS_CAST_REPLACE, source
-    ), new_route_sources
+    # Same two-stage strategy for the bulk class source: legacy first,
+    # forwards-compat as fallback. If neither pattern matches (the cast
+    # was dropped upstream entirely), we return the source unchanged,
+    # which is the desired no-op behaviour.
+    new_source, n_legacy = re.subn(
+        MOE_ROUTING_WEIGHTS_CAST_PATTERN,
+        MOE_ROUTING_WEIGHTS_CAST_REPLACE,
+        source,
+    )
+    if n_legacy == 0:
+        new_source, _ = re.subn(
+            MOE_ROUTING_WEIGHTS_CAST_PATTERN_NEW,
+            MOE_ROUTING_WEIGHTS_CAST_REPLACE_NEW,
+            source,
+        )
+    return new_source, new_route_sources
 
 
 pass
@@ -2685,7 +2895,12 @@ def patch_gradient_accumulation(modeling_file, module):
     # All Unsloth Zoo code licensed under LGPLv3
 
     functions = dir(modeling_file)
-    module = eval(f"modeling_file.{module}")
+    # `module` may be a name from dir() that isn't runtime-accessible
+    # (unbound aliases in __all__). Skip rather than abort.
+    try:
+        module = eval(f"modeling_file.{module}")
+    except AttributeError:
+        return None
     try:
         forward = module.forward
         source = inspect.getsource(forward)
@@ -2709,7 +2924,10 @@ def patch_gradient_accumulation(modeling_file, module):
 
     total_has_kwargs = False
     for call_class, inner_class in inner_classes:
-        inner_class = eval(f"modeling_file.{inner_class}")
+        try:
+            inner_class = eval(f"modeling_file.{inner_class}")
+        except AttributeError:
+            continue
         has_kwargs = (
             tuple(inspect.signature(inner_class.forward).parameters.values())[-1].kind
             == inspect._VAR_KEYWORD
@@ -3201,9 +3419,22 @@ def unsloth_compile_transformers(
     modeling_file.__UNSLOTH_PATCHED__ = True
     functions = dir(modeling_file)
     full_source = inspect.getsource(modeling_file)
-    # Order functions by ascending order
+
+    # Order by definition position. A bare-name find() also matches
+    # forward references in annotations, docstrings and type unions,
+    # which can land subclasses before their base class and raise
+    # NameError at cache import. Match the definition forms first.
+    def _def_pos(name):
+        for prefix in (f"class {name}(", f"class {name}:", f"def {name}("):
+            i = full_source.find(prefix)
+            if i != -1:
+                return i
+        # Module-level aliases without a def/class fall back to bare name.
+        i = full_source.find(name)
+        return i if i != -1 else len(full_source)
+
     functions = list(
-        np.array(functions)[np.argsort([full_source.find(x) for x in functions])]
+        np.array(functions)[np.argsort([_def_pos(x) for x in functions])]
     )
     ordered_functions = functions.copy()
 
@@ -3315,6 +3546,31 @@ def unsloth_compile_transformers(
     torch_modules = [x for x in torch_modules if x not in removal]
 
     # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
+    #
+    # Three upstream shapes to consider:
+    #   1. Pre-4.50 transformers declares `_supports_sdpa = True` (or False)
+    #      directly on the modeling class. This branch reads the marker
+    #      out of the source string.
+    #   2. transformers 4.50+ moved per-attention dispatch to
+    #      `transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS` (the
+    #      "attention interface" refactor). The `_supports_sdpa` class
+    #      attribute is gone from most models; SDPA is selected at runtime
+    #      based on `attn_implementation` and whether "sdpa" is registered
+    #      in ALL_ATTENTION_FUNCTIONS.
+    #   3. Hybrid models that mix old + new (e.g. an embedded vision
+    #      tower carrying the legacy marker while the LM head uses
+    #      ALL_ATTENTION_FUNCTIONS).
+    #
+    # Strategy:
+    #   * If the legacy marker is present, use it (preserves old
+    #     behaviour exactly).
+    #   * Otherwise, if zoo already detected scaled_dot_product_attention
+    #     modules in the source, assume SDPA is available (this was the
+    #     fallback even on the legacy branch).
+    #   * As a third fallback, probe ALL_ATTENTION_FUNCTIONS for a
+    #     registered "sdpa" entry. If it is registered, the model can
+    #     use SDPA via the dispatcher even without the class-level marker.
+    #   * Otherwise mark SDPA off.
     final_supports_sdpa = True
     if supports_sdpa is not None:
         assert type(supports_sdpa) is list and len(supports_sdpa) == 1
@@ -3324,6 +3580,12 @@ def unsloth_compile_transformers(
             if supports_sdpa[0] != False:
                 supports_sdpa[0] = True
         elif len(scaled_dot_product_attention_modules) != 0:
+            if supports_sdpa[0] != False:
+                supports_sdpa[0] = True
+        elif _all_attention_functions_has_sdpa():
+            # transformers 4.50+ ALL_ATTENTION_FUNCTIONS dispatch path.
+            # The class-level marker is gone but the runtime SDPA
+            # dispatch is still healthy; treat the model as SDPA-capable.
             if supports_sdpa[0] != False:
                 supports_sdpa[0] = True
         else:
@@ -3387,7 +3649,11 @@ def unsloth_compile_transformers(
     disabled_scaled_dot_product_attention_modules = []
 
     for module in scaled_dot_product_attention_modules.keys():
-        source = eval(f"{model_location}.{module}")
+        # Skip names that aren't runtime-accessible.
+        try:
+            source = eval(f"{model_location}.{module}")
+        except AttributeError:
+            continue
         try:
             source = inspect.getsource(source.forward)
         except:
@@ -3437,11 +3703,46 @@ def unsloth_compile_transformers(
     all_standalone_classes = {}
 
     # Fix modules with _update_causal_mask if SDPA can be used with causal masks
+    #
+    # Two upstream shapes to detect:
+    #   Old (transformers < 4.50 ish): the model class exposes a
+    #     `_update_causal_mask` method that we replace with the no-op.
+    #   New (modern Llama / Mistral / Qwen3 on transformers 4.50+):
+    #     `_update_causal_mask` is gone; the model now calls
+    #     `create_causal_mask` from `transformers.masking_utils` inside
+    #     `forward`. We can't bind a method, but we CAN still mark the
+    #     module as a causal-mask candidate so the downstream branch
+    #     (line ~3815) gets a chance to no-op when the method exists,
+    #     and otherwise the assignment-site `hasattr` guard short-circuits.
     remove_causal_masks = []
     if disable_causal_masks:
         for module in other_classes:
-            source = eval(f"{model_location}.{module}")
-            if not hasattr(source, "_update_causal_mask"):
+            # `other_classes` (from dir() / class regex) can include
+            # names that aren't runtime-accessible: unbound entries in
+            # __all__, or aliases that are missing on some transformers
+            # versions.
+            try:
+                source = eval(f"{model_location}.{module}")
+            except AttributeError:
+                continue
+            has_legacy_hook = hasattr(source, "_update_causal_mask")
+            has_modern_create = False
+            if not has_legacy_hook:
+                # Modern shape probe: read forward source and look for the
+                # `create_causal_mask` call (or one of its sibling helpers
+                # from transformers.masking_utils that zoo already tracks
+                # in `MASKING_UTILS_CALLS`). We only do this when the
+                # legacy hook is absent so we don't pay the inspect.getsource
+                # cost on the common path.
+                try:
+                    forward_src = inspect.getsource(source.forward)
+                except Exception:
+                    forward_src = ""
+                has_modern_create = (
+                    "create_causal_mask" in forward_src
+                    or "transformers.masking_utils" in forward_src
+                )
+            if not (has_legacy_hook or has_modern_create):
                 continue
 
             try:
@@ -3466,7 +3767,10 @@ def unsloth_compile_transformers(
     # actively disable certain modules
     disable_modules = set()
     for module, fullgraph in torch_modules.items():
-        source = eval(f"{model_location}.{module}")
+        try:
+            source = eval(f"{model_location}.{module}")
+        except AttributeError:
+            continue
         if not hasattr(source, "forward"):
             continue
         try:
@@ -3717,7 +4021,9 @@ def unsloth_compile_transformers(
                 # Fix some arguments up like for Gemma 3N
                 new_source = fixup_fused_lm_head(source)
                 # Apply fused LM transforms
-                new_source = apply_fused_lm_head(new_source, module)
+                new_source, supports_return_hidden_states = apply_fused_lm_head(
+                    new_source, module
+                )
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:
@@ -3730,6 +4036,7 @@ def unsloth_compile_transformers(
                             disable=True,
                             forward_source=new_source,
                             add_loss_kwargs=True,
+                            supports_return_hidden_states=supports_return_hidden_states,
                         )
                         print(
                             f"Unsloth: Fast fused linear cross entropy patch for {module}."
@@ -3747,7 +4054,11 @@ def unsloth_compile_transformers(
     # Allow gradient checkpointing if not enabled
     if gradient_checkpointing:
         for module in other_classes:
-            source = eval(f"{model_location}.{module}")
+            # Skip names that aren't runtime-accessible.
+            try:
+                source = eval(f"{model_location}.{module}")
+            except AttributeError:
+                continue
             if "(GradientCheckpointingLayer)" in full_source:
                 if module in FIX_GC_LAYER_CALLER_MODULES:
                     output = patch_gradient_checkpointing_layer_caller(module, source)
@@ -3784,7 +4095,11 @@ def unsloth_compile_transformers(
         if module in all_standalone_classes:
             source = all_standalone_classes[module]
         else:
-            module_cls = eval(f"{model_location}.{module}")
+            # Skip names that aren't runtime-accessible.
+            try:
+                module_cls = eval(f"{model_location}.{module}")
+            except AttributeError:
+                continue
             if hasattr(module_cls, "forward"):
                 source = inspect.getsource(module_cls.forward)
             else:
@@ -3817,7 +4132,11 @@ def unsloth_compile_transformers(
 
     if len(router_logit_cast_modules) > 0:
         for module in router_logit_cast_modules:
-            module_cls = eval(f"{model_location}.{module}")
+            # Skip names that aren't runtime-accessible.
+            try:
+                module_cls = eval(f"{model_location}.{module}")
+            except AttributeError:
+                continue
             if hasattr(module_cls, "forward"):
                 source = inspect.getsource(module_cls.forward)
             else:
@@ -3938,6 +4257,15 @@ def unsloth_compile_transformers(
         "is_torch_tpu_available()",
         "False",
     )
+    # transformers 4.43+ renamed `is_torch_tpu_available` to
+    # `is_torch_xla_available`. Mirror the same hard-no-TPU stub so the
+    # rewriter handles both shapes; older transformers fall through the
+    # first replace, newer transformers fall through this one. Both are
+    # idempotent: a second replace on already-substituted source no-ops.
+    inner_training_loop = inner_training_loop.replace(
+        "is_torch_xla_available()",
+        "False",
+    )
     exec(inner_training_loop, globals())
     Trainer._inner_training_loop = _fast_inner_training_loop
 
@@ -3970,6 +4298,10 @@ def unsloth_compile_transformers(
                 print(f"Unsloth: Cannot run inspect.getsource on {module} with error = {e}")
                 continue
 
+            # str(inspect.signature) can disagree with source on quote
+            # style or fully-qualified annotations, so find() may return
+            # -1. Fall back to the first newline so multi-line signatures
+            # still split correctly; the trailing `:` is restored below.
             where = source.find(str(parameters))
             if where == -1:
                 where = source.find("\n") + 1
@@ -3996,7 +4328,15 @@ def unsloth_compile_transformers(
                     flags=re.DOTALL,
                 )
             pass
-            parameters = f"def {module}" + parameters + code_section
+            sig = f"def {module}{parameters}"
+            # Restore the trailing `:` (and a newline when the find()
+            # fallback consumed it) so the body lands as an indented suite.
+            if code_section.lstrip(" \t").startswith(":"):
+                parameters = sig + code_section
+            elif code_section.startswith("\n"):
+                parameters = sig + ":" + code_section
+            else:
+                parameters = sig + ":\n" + code_section
             print(f"Unsloth: Fixed up function {module}.")
 
             if module in disable_compile_functions:
@@ -4055,6 +4395,11 @@ def unsloth_compile_transformers(
                     break
             pass
             if not bad:
+                # Functions defined inside an if/else come back indented
+                # from inspect.getsource; dedent before prepending the
+                # decorator so the result parses.
+                if source and source[0] in (" ", "\t"):
+                    source = textwrap.dedent(source)
                 if module in disable_compile_functions:
                     source = re.sub(
                         r"@torch.compile\([^\n]*\)\n",

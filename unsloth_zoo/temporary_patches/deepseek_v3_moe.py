@@ -42,6 +42,7 @@ from ..hf_utils import dtype_from_config
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
+    extract_moe_lora_weights_for_grouped_mm,
 )
 
 def patch_deepseek_v3():
@@ -73,52 +74,16 @@ def patch_deepseek_v3():
     # Define LoRA extraction function for DeepSeekV3 (Standard Format)
     # ====================================================================
     def _deepseek_v3_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
-        """
-        Custom LoRA extractor for DeepSeekV3.
-
-        DeepSeekV3 expert weights are stored as (E, out_dim, in_dim) and PEFT's ParamWrapper
-        treats dim1 as in_features and dim2 as out_features. For correct separated LoRA
-        (X @ first @ second), we need to pick the weight that connects to the actual input dim.
-        """
-        total_rank = weight_A.shape[0]
-        rank_per_expert = total_rank // num_experts
-        dim_A = weight_A.shape[1]
-        dim_B = weight_B.shape[0]
-
-        input_dim = None
-        if hasattr(wrapper, "parameter_name"):
-            if wrapper.parameter_name == "gate_up_proj":
-                base = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
-                input_dim = getattr(base, "hidden_dim", None)
-            elif wrapper.parameter_name == "down_proj":
-                base = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
-                input_dim = getattr(base, "intermediate_dim", None)
-
-        if input_dim is None:
-            base = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
-            input_dim = getattr(base, "hidden_dim", None)
-
-        # If lora_A connects to input_dim: standard (A then B)
-        if input_dim is not None and dim_A == input_dim:
-            first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-            first_weight = first_weight.permute(0, 2, 1).contiguous()  # (E, input_dim, R)
-            second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-            second_weight = second_weight.permute(1, 2, 0).contiguous()  # (E, R, out_dim)
-            return first_weight, second_weight, scaling, num_experts
-
-        # If lora_B connects to input_dim: swapped (B then A)
-        if input_dim is not None and dim_B == input_dim:
-            first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-            first_weight = first_weight.permute(1, 0, 2).contiguous()  # (E, input_dim, R)
-            second_weight = weight_A.view(num_experts, rank_per_expert, dim_A).contiguous()  # (E, R, out_dim)
-            return first_weight, second_weight, scaling, num_experts
-
-        # Fallback: standard (A then B)
-        first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-        first_weight = first_weight.permute(0, 2, 1).contiguous()
-        second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-        second_weight = second_weight.permute(1, 2, 0).contiguous()
-        return first_weight, second_weight, scaling, num_experts
+        return extract_moe_lora_weights_for_grouped_mm(
+            wrapper,
+            weight_A,
+            weight_B,
+            scaling,
+            num_experts,
+            model_name="DeepSeekV3 MoE",
+            enable_logging=UNSLOTH_ENABLE_LOGGING,
+            logger_obj=logger,
+        )
 
     # Register the extractor on the NaiveMoe class (avoid binding as instance method)
     DeepseekV3NaiveMoe._unsloth_lora_extractor_fn = staticmethod(_deepseek_v3_lora_extractor)

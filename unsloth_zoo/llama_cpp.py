@@ -42,10 +42,25 @@ import tempfile
 import logging
 import shlex
 import shutil
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 from pathlib import Path
 import psutil
-from .device_type import device_is_bf16_supported
+try:
+    from .device_type import device_is_bf16_supported
+except (ImportError, NotImplementedError):
+    # device_type can fail two ways: ImportError when torch is
+    # absent, NotImplementedError when get_device_type() runs at
+    # import on an unrecognised platform. Fall through to the
+    # platform probe in either case.
+    import platform as _platform
+    _IS_APPLE_SILICON = (
+        _platform.system() == "Darwin" and _platform.machine() == "arm64"
+    )
+    def device_is_bf16_supported():
+        return _IS_APPLE_SILICON
 
 # Get a logger instance
 logger = logging.getLogger(__name__)
@@ -888,6 +903,10 @@ def _load_module_from_path(filepath, module_name):
     if spec is None or spec.loader is None:
             raise ImportError(f"Could not load spec for module {module_name} at {filepath}")
     module = importlib.util.module_from_spec(spec)
+    script_dir = os.path.dirname(os.path.abspath(filepath))
+    original_path = sys.path[:]
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
     # Register module before execution to handle circular imports within the script if any
     sys.modules[module_name] = module
     try:
@@ -896,6 +915,8 @@ def _load_module_from_path(filepath, module_name):
         # Clean up registry if exec fails
         del sys.modules[module_name]
         raise ImportError(f"Failed to execute module {module_name} from {filepath}") from e
+    finally:
+        sys.path[:] = original_path
     return module
 pass
 
@@ -933,9 +954,27 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
             with open(_local_script, "rb") as f:
                 original_content = f.read()
         else:
-            response = requests.get(LLAMA_CPP_CONVERT_FILE, timeout = (5, 30))
-            response.raise_for_status()
-            original_content = response.content
+            # Retry with exponential backoff: the upstream host can
+            # exceed the default read timeout on slower networks.
+            _last_err = None
+            original_content = None
+            for _attempt in range(3):
+                try:
+                    response = requests.get(
+                        LLAMA_CPP_CONVERT_FILE, timeout = (10, 120)
+                    )
+                    response.raise_for_status()
+                    original_content = response.content
+                    break
+                except requests.exceptions.RequestException as _err:
+                    _last_err = _err
+                    logger.warning(
+                        f"Unsloth: convert_hf_to_gguf.py download attempt "
+                        f"{_attempt + 1}/3 failed ({type(_err).__name__}: {_err}); retrying"
+                    )
+                    time.sleep(2 ** _attempt)
+            if original_content is None:
+                raise _last_err  # type: ignore[misc]
 
         # 2. Introspect Original Script for Supported Architectures
         logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
