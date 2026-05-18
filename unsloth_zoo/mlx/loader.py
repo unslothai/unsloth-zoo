@@ -91,18 +91,40 @@ def _temporary_hf_token_env(token):
 def _convert_mlx_dtype(model, target_dtype) -> None:
     """Cast floating-point params to target_dtype (preserves quantized ints)
     while honoring the model's optional path-based ``cast_predicate``.
+
+    Emits a single warning when casting bfloat16 -> float16: fp16's finite
+    range (~6.5e4) is much narrower than bf16's (~3.4e38), so models whose
+    native storage is bf16 can lose precision or overflow silently. This
+    has been observed on Gemma3-270m: a stochastic LoRA memorization
+    fixture shows ~28pp lower greedy-decode pass rate under dtype="float16"
+    vs dtype=None against the same checkpoint. Cast still happens (users
+    asking for fp16 on M1/M2 need it); the warning just makes the
+    trade-off visible.
     """
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
     cast_pred = getattr(model, "cast_predicate", lambda _: True)
 
     needs_cast = False
+    has_bf16 = False
     for k, v in tree_flatten(model.parameters()):
         if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) and v.dtype != target_dtype:
             needs_cast = True
-            break
+            if v.dtype == mx.bfloat16:
+                has_bf16 = True
     if not needs_cast:
         return
+
+    if has_bf16 and target_dtype == mx.float16:
+        warnings.warn(
+            "Unsloth: downcasting bfloat16 weights to float16. fp16's "
+            "range (~6.5e4) is narrower than bf16's (~3.4e38); models "
+            "with large activations (e.g. Gemma3) can lose precision or "
+            "overflow silently. Pass dtype=None to keep native bf16, or "
+            "dtype='bfloat16' to be explicit, on bf16-capable Apple "
+            "Silicon (M3+). Pass dtype='float32' for full precision.",
+            stacklevel=2,
+        )
 
     model.update(tree_map_with_path(
         lambda k, v: v.astype(target_dtype)
