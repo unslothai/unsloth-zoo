@@ -127,15 +127,19 @@ class MLXTrainingConfig:
     # Adam bias correction. PyTorch's torch.optim.AdamW is always
     # bias-corrected; mlx.optimizers.AdamW defaults to bias_correction=
     # False (and so does mlx_lm.lora). PR #634 silently flipped this to
-    # True in MLXTrainer; subsequent end-to-end probing (rounds A-J of
-    # the mlx-parity-probes workflow) showed bc=True hits post_train_
-    # loss=0 on a single-row LoRA smoke fixture in ~10 steps while
-    # bc=False stays above loss 2 for 60+ steps and ~500 mlx-lm iters
-    # before getting close. So bc=True is the correct default for short
-    # memorization smokes AND for any user who expects HF/torch.AdamW
-    # math. Default True; users running long-horizon fine-tunes that
-    # depended on the pre-#634 MLX-ecosystem-default behavior can opt
-    # back to False explicitly.
+    # True in MLXTrainer; subsequent end-to-end probing (rounds A-L of
+    # the mlx-parity-probes workflow) showed:
+    #   * bc=True hits post_train_loss=0 on a single-row LoRA smoke
+    #     fixture in ~10 steps for every seed tested;
+    #   * bc=False on the SAME fixture stays at loss > 2 for 50 steps
+    #     and DIVERGES to NaN by step ~100, so it is unsafe at long
+    #     horizons on small / fast-overfitting fixtures.
+    # So bc=True is the correct default for short memorization smokes,
+    # the upstream studio MLX smoke test, AND for any user who expects
+    # HF/torch.AdamW math. Default True; pass adam_bias_correction=
+    # False ONLY if you know your fixture is large enough that the
+    # early-step difference matters and your LR is small enough to
+    # avoid the NaN-divergence regime.
     adam_bias_correction: bool = True
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
