@@ -13,14 +13,19 @@ Match:
     if labels is not None:
         <LOSS> = self.loss_function(<LOGITS>, labels, vocab_size=..., **kwargs)
 
-Rewrite the labels branch to call ``unsloth_fused_lm_head_loss(<HIDDEN>,
-self.<HEAD>, labels, ...)`` (skipping the bf16 logits + fp32 cast). The
-logits slot becomes ``EMPTY_LOGITS`` unless ``UNSLOTH_RETURN_LOGITS=1``
-is set, in which case the original ``self.<HEAD>(<HIDDEN>)`` expression
-runs so the caller still gets real logits (eval / custom metrics). The
-else (generation) branch keeps the original RHS verbatim. Forwards that
-miss the triplet fall through to ``_UNMATCHED``; the LOSS_MAPPING sweep
-is the backstop.
+Rewrite the labels branch to two paths:
+  - default (``UNSLOTH_RETURN_LOGITS`` unset): ``unsloth_fused_lm_head_loss(
+    <HIDDEN>, self.<HEAD>, labels, ...)`` (skipping the bf16 logits + fp32
+    cast); ``logits = EMPTY_LOGITS``. No lm_head matmul on the hot path.
+  - opt-in (``UNSLOTH_RETURN_LOGITS=1``): materialise logits once via the
+    original ``self.<HEAD>(<HIDDEN>)`` expression, then route the loss
+    through the model's own ``self.loss_function`` on those logits. One
+    lm_head matmul total (vs two if we kept the fused kernel and computed
+    logits separately for the return slot).
+
+The else (generation) branch keeps the original RHS verbatim. Forwards
+that miss the triplet fall through to ``_UNMATCHED``; the LOSS_MAPPING
+sweep is the backstop.
 
 ``UNSLOTH_RETURN_HIDDEN_STATES`` is intentionally not handled here:
 GRPO's hidden-states fast path lives in the compiler-rewritten forward
@@ -275,17 +280,21 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
-    # Labels branch goes through the fused kernel. The logits slot is
-    # EMPTY_LOGITS by default, or real logits when UNSLOTH_RETURN_LOGITS=1.
+    # Labels branch. Default path: fused kernel, logits = EMPTY_LOGITS
+    # (no lm_head matmul at all). UNSLOTH_RETURN_LOGITS=1 path: materialise
+    # the full lm_head matmul once and route loss through the model's own
+    # self.loss_function on those logits. Avoids double matmul (fused
+    # kernel chunks lm_head internally; logits_rhs runs the full matmul).
     template = textwrap.dedent(f"""
         if labels is not None:
-            {loss} = unsloth_fused_lm_head_loss(
-                {hidden_src}, self.{head_attr}, labels,
-                vocab_size={vocab}{extra}{kwargs_unpack},
-            )
             if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':
                 {logits} = {logits_rhs}
+                {loss} = self.loss_function({logits}, labels, vocab_size={vocab}{extra}{kwargs_unpack})
             else:
+                {loss} = unsloth_fused_lm_head_loss(
+                    {hidden_src}, self.{head_attr}, labels,
+                    vocab_size={vocab}{extra}{kwargs_unpack},
+                )
                 {logits} = EMPTY_LOGITS
         else:
             {logits} = {logits_rhs}
