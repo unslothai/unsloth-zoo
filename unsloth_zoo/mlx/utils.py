@@ -2664,6 +2664,31 @@ def _get_mlx_config_quantization(model):
     return config.get("quantization") or config.get("quantization_config")
 
 
+def _get_mlx_dropout_probability(drop):
+    if drop is None:
+        return 0.0
+    if hasattr(drop, "p"):
+        return float(drop.p)
+    keep_probability = getattr(drop, "_p_1", 1.0)
+    return float(1.0 - keep_probability)
+
+
+def _infer_mlx_lora_rank(module):
+    lora_a = getattr(module, "lora_a", None)
+    lora_b = getattr(module, "lora_b", None)
+    lora_a_shape = tuple(getattr(lora_a, "shape", ()) or ())
+    lora_b_shape = tuple(getattr(lora_b, "shape", ()) or ())
+    if len(lora_a_shape) >= 3:
+        rank = lora_a_shape[-2]
+        if not lora_b_shape or lora_b_shape[-1] == rank:
+            return int(rank)
+    if lora_a_shape and lora_b_shape and lora_a_shape[-1] == lora_b_shape[0]:
+        return int(lora_a_shape[-1])
+    if lora_a_shape:
+        return int(lora_a_shape[-1])
+    return None
+
+
 def _enrich_mlx_adapter_config(model, adapter_config):
     adapter_config = dict(adapter_config or {})
     hf_repo = getattr(model, "_hf_repo", None) or adapter_config.get("base_model_name_or_path")
@@ -2735,16 +2760,11 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
                 lora_paths.append(name)
                 if lora_rank is None:
-                    lora_rank = int(module.lora_a.shape[-1])
+                    lora_rank = _infer_mlx_lora_rank(module)
                     lora_scale = float(getattr(module, "scale", 1.0))
-                    drop = getattr(module, "dropout", None)
-                    if drop is None:
-                        lora_dropout = 0.0
-                    elif hasattr(drop, "p"):
-                        lora_dropout = float(drop.p)
-                    else:
-                        keep_probability = getattr(drop, "_p_1", 1.0)
-                        lora_dropout = float(1.0 - keep_probability)
+                    lora_dropout = _get_mlx_dropout_probability(
+                        getattr(module, "dropout", None)
+                    )
         if lora_paths and "unsloth_mlx_lora_module_paths" not in adapter_config:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
         if lora_rank is not None:

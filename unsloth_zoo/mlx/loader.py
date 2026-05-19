@@ -1103,6 +1103,14 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
             setattr(parent, leaf, wrapped)
 
 
+def _eval_mlx_model_after_adapter_reload(model):
+    try:
+        model.eval()
+    except Exception:
+        pass
+    return model
+
+
 def _adapter_actual_quant_config(adapter_cfg, resolved_map):
     expected = _global_quant_params(adapter_cfg.get("base_quantization_config"))
     if expected is not None:
@@ -2435,6 +2443,7 @@ class FastMLXModel:
                     else:
                         from mlx_lm.tuner.utils import load_adapters
                         model = load_adapters(model, local_path)
+                    model = _eval_mlx_model_after_adapter_reload(model)
                     loaded_model_config = getattr(model, "_config", None)
                     is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
                     processor = getattr(model, "_processor", None)
