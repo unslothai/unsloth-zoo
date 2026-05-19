@@ -2738,7 +2738,13 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     lora_rank = int(module.lora_a.shape[-1])
                     lora_scale = float(getattr(module, "scale", 1.0))
                     drop = getattr(module, "dropout", None)
-                    lora_dropout = float(getattr(drop, "p", 0.0) if drop else 0.0)
+                    if drop is None:
+                        lora_dropout = 0.0
+                    elif hasattr(drop, "p"):
+                        lora_dropout = float(drop.p)
+                    else:
+                        keep_probability = getattr(drop, "_p_1", 1.0)
+                        lora_dropout = float(1.0 - keep_probability)
         if lora_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
         if lora_rank is not None:
