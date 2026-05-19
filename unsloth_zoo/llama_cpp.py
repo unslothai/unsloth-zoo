@@ -1798,12 +1798,23 @@ def quantize_gguf(
         import shlex
         return shlex.quote(s)
 
-    # Q2_K_L is an Unsloth preset (q2_k + q8_0 output / embedding tensors),
-    # not a native llama.cpp ftype. Expand here so every caller shares one path.
+    # Q2_K_L is an Unsloth preset (q2_k base with selective upcasts), not a
+    # native llama.cpp ftype. Recipe: token_embd -> Q4_K, output -> Q6_K, and
+    # every ffn_down / ffn_down_exps tensor (all layer ids, dense + MoE) ->
+    # Q3_K. llama-quantize matches --tensor-type with std::regex_search and
+    # iterates with first-match-wins, so we chain the more-specific MoE
+    # pattern first; the leading `\.` anchors on the GGUF path separator so
+    # the override does not slip into unrelated tensor names that happen to
+    # contain the substring "ffn_down".
     _display_quant_type = quant_type
     _extra_flags = ""
     if str(quant_type).strip().lower() == "q2_k_l":
-        _extra_flags = "--output-tensor-type q8_0 --token-embedding-type q8_0 "
+        _extra_flags = (
+            '--tensor-type "\\.ffn_down_exps=Q3_K" '
+            '--tensor-type "\\.ffn_down=Q3_K" '
+            '--output-tensor-type Q6_K '
+            '--token-embedding-type Q4_K '
+        )
         quant_type = "q2_k"
 
     command = (
@@ -1816,7 +1827,8 @@ def quantize_gguf(
         if _extra_flags:
             print(
                 "Unsloth: Expanding Q2_K_L preset "
-                "(q2_k + --output-tensor-type q8_0 --token-embedding-type q8_0)."
+                "(q2_k base, .ffn_down_exps=Q3_K + .ffn_down=Q3_K, "
+                "output=Q6_K, token_embd=Q4_K)."
             )
 
     try:
