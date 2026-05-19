@@ -2743,14 +2743,17 @@ def _install_qwen3_family_compile_patches():
         return y.astype(source_dtype)
 
     def patched_qwen3_vision_block_call(self, hidden_states, cu_seqlens, rotary_pos_emb):
-        hidden_states = hidden_states + self.attn(
+        residual_dtype = hidden_states.dtype
+        attn_output = self.attn(
             _qwen3_torch_like_layer_norm(self.norm1, hidden_states),
             cu_seqlens=cu_seqlens,
             rotary_pos_emb=rotary_pos_emb,
         )
-        hidden_states = hidden_states + self.mlp(
+        hidden_states = (hidden_states + attn_output.astype(residual_dtype)).astype(residual_dtype)
+        mlp_output = self.mlp(
             _qwen3_torch_like_layer_norm(self.norm2, hidden_states)
         )
+        hidden_states = (hidden_states + mlp_output.astype(residual_dtype)).astype(residual_dtype)
         return hidden_states
 
     def patched_qwen3_rot_pos_emb(self, grid_thw):
