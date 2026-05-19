@@ -2745,17 +2745,23 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     else:
                         keep_probability = getattr(drop, "_p_1", 1.0)
                         lora_dropout = float(1.0 - keep_probability)
-        if lora_paths:
+        if lora_paths and "unsloth_mlx_lora_module_paths" not in adapter_config:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
         if lora_rank is not None:
             lora_parameters = dict(adapter_config.get("lora_parameters") or {})
-            lora_parameters.setdefault("rank", lora_rank)
-            lora_parameters.setdefault("scale", lora_scale)
-            lora_parameters.setdefault("dropout", lora_dropout)
+            inferred_lora_parameters = {
+                "rank": lora_rank,
+                "scale": lora_scale,
+                "dropout": lora_dropout,
+            }
+            for key, value in inferred_lora_parameters.items():
+                if key not in lora_parameters:
+                    explicit_value = adapter_config.get(key)
+                    lora_parameters[key] = value if explicit_value is None else explicit_value
             adapter_config["lora_parameters"] = lora_parameters
-            adapter_config.setdefault("rank", lora_parameters["rank"])
-            adapter_config.setdefault("scale", lora_parameters["scale"])
-            adapter_config.setdefault("dropout", lora_parameters["dropout"])
+            adapter_config["rank"] = lora_parameters["rank"]
+            adapter_config["scale"] = lora_parameters["scale"]
+            adapter_config["dropout"] = lora_parameters["dropout"]
             adapter_config.setdefault("peft_type", "LORA")
     except Exception:
         pass
