@@ -1092,6 +1092,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
     text_archs = set()
     vision_archs = set()
     temp_original_file_path = None # Initialize for finally block
+    original_module_name = None    # Only set on the monolith branch
     # Set by introspection; read by Patch 2 + Patch 3 below. Default to
     # 'monolith' so a failed introspection still drives the legacy patches.
     _layout = "monolith"
@@ -1130,40 +1131,20 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
             if original_content is None:
                 raise _last_err  # type: ignore[misc]
 
-        # 2. Introspect Original Script for Supported Architectures
-        logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
-        with tempfile.NamedTemporaryFile(
-            mode='wb', suffix=".py", prefix="original_gguf_", dir=LLAMA_CPP_DEFAULT_DIR, delete=False
-        ) as temp_file:
-            temp_original_file_path = temp_file.name
-            temp_file.write(original_content)
-            temp_file.flush()
-
-        logger.debug(f"Loading module from temporary file: {temp_original_file_path}")
-        original_module_name = f"convert_hf_to_gguf_{os.path.basename(temp_original_file_path).split('.')[0]}"
-
-        # Set NO_LOCAL_GGUF to prevent the script from adding path again
-        old_env = os.environ.get('NO_LOCAL_GGUF')
-        os.environ['NO_LOCAL_GGUF'] = '1'
-
-        try:
-            module = _load_module_from_path(temp_original_file_path, original_module_name)
-        finally:
-            # Restore environment
-            if old_env is None:
-                os.environ.pop('NO_LOCAL_GGUF', None)
-            else:
-                os.environ['NO_LOCAL_GGUF'] = old_env
-
-        # Extract supported TEXT + MMPROJ architectures.
-        # Package layout: ModelBase._model_classes is empty until
-        # load_all_models() runs, so AST-parse the static TEXT_MODEL_MAP /
-        # MMPROJ_MODEL_MAP in conversion/__init__.py instead. Monolith
-        # layout keeps the original _model_classes introspection.
+        # 2. Detect layout BEFORE attempting to import. The package-layout
+        # entrypoint does `from conversion import ...`, which a temp-file
+        # import resolves against LLAMA_CPP_DEFAULT_DIR -- so when the user
+        # set UNSLOTH_LLAMA_CPP_SCRIPTS_DIR to a different checkout, the
+        # import would ModuleNotFoundError and abort the patcher before we
+        # could reach the AST-based arch extraction path.
         _layout = _detect_converter_layout(original_content, _llama_cpp_dir)
         logger.info(f"Unsloth: convert_hf_to_gguf layout detected: {_layout}")
+        logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
 
         if _layout == "package":
+            # Package layout: archs come from AST-parsing the static
+            # TEXT_MODEL_MAP / MMPROJ_MODEL_MAP in conversion/__init__.py.
+            # No module import required, so we skip the temp-write entirely.
             conv_init_py = os.path.join(_llama_cpp_dir, "conversion", "__init__.py")
             text_archs   = _extract_dict_keys_from_conversion_init(conv_init_py, "TEXT_MODEL_MAP")
             vision_archs = _extract_dict_keys_from_conversion_init(conv_init_py, "MMPROJ_MODEL_MAP")
@@ -1176,6 +1157,30 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                     "allowlist will be empty; conversion will still attempt to run."
                 )
         else:
+            # Monolith layout: original behaviour. Write the entrypoint to a
+            # temp file under LLAMA_CPP_DEFAULT_DIR and import it to read
+            # ModelBase._model_classes.
+            with tempfile.NamedTemporaryFile(
+                mode='wb', suffix=".py", prefix="original_gguf_", dir=LLAMA_CPP_DEFAULT_DIR, delete=False
+            ) as temp_file:
+                temp_original_file_path = temp_file.name
+                temp_file.write(original_content)
+                temp_file.flush()
+
+            logger.debug(f"Loading module from temporary file: {temp_original_file_path}")
+            original_module_name = f"convert_hf_to_gguf_{os.path.basename(temp_original_file_path).split('.')[0]}"
+
+            # Set NO_LOCAL_GGUF to prevent the script from adding path again
+            old_env = os.environ.get('NO_LOCAL_GGUF')
+            os.environ['NO_LOCAL_GGUF'] = '1'
+
+            try:
+                module = _load_module_from_path(temp_original_file_path, original_module_name)
+            finally:
+                if old_env is None:
+                    os.environ.pop('NO_LOCAL_GGUF', None)
+                else:
+                    os.environ['NO_LOCAL_GGUF'] = old_env
             ModelBase = getattr(module, 'ModelBase', None)
             ModelType = getattr(module, 'ModelType', None)
 
@@ -1221,8 +1226,8 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                 f"Unsloth: No supported architectures (TEXT or VISION) could be determined from the original script."
             )
 
-        # Cleanup module reference
-        if original_module_name in sys.modules:
+        # Cleanup module reference (only set on the monolith branch)
+        if original_module_name is not None and original_module_name in sys.modules:
              del sys.modules[original_module_name]
 
     except Exception as e:

@@ -340,6 +340,70 @@ def test_llama_cpp_dir_resolves_to_source_dir_when_local_script_set(tmp_path):
     assert llama_cpp._get_llama_cpp_dir(local_info) == str(custom)
 
 
+def test_package_layout_does_not_require_module_import(tmp_path, monkeypatch):
+    """Regression for Codex P1 on 3a9a23c: when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
+    points at a package-layout checkout, the patcher must NOT call
+    `_load_module_from_path` on the entrypoint. Importing it would resolve
+    `from conversion import ...` against LLAMA_CPP_DEFAULT_DIR (a different
+    dir than the override) and raise ModuleNotFoundError, aborting the
+    patcher before AST arch extraction + branding could run.
+
+    We assert the contract by replacing `_load_module_from_path` with a
+    sentinel that fails the test if called, then driving the patcher end-
+    to-end with `UNSLOTH_LLAMA_CPP_SCRIPTS_DIR` set."""
+    llama_cpp = _load_llama_cpp_module()
+
+    # Build a custom package-layout checkout in tmp_path. We extend the
+    # shared fixture with a parse_args() stub so the end-to-end pipeline can
+    # finish its flag-parsing step on the patched file (the real upstream
+    # entrypoint has these calls; the shared fixture omits them because no
+    # other test exercises the full pipeline).
+    entry_with_args = _PACKAGE_ENTRYPOINT + (
+        b"\n"
+        b"def parse_args():\n"
+        b"    parser = argparse.ArgumentParser()\n"
+        b"    parser.add_argument(\"model\")\n"
+        b"    parser.add_argument(\"--outfile\", default=None)\n"
+        b"    parser.add_argument(\"--outtype\", default=\"f16\")\n"
+        b"    parser.add_argument(\"--vocab-only\", action=\"store_true\")\n"
+        b"    return parser.parse_args()\n"
+    )
+    root = tmp_path / "custom_llama_cpp"
+    root.mkdir()
+    (root / "convert_hf_to_gguf.py").write_bytes(entry_with_args)
+    conv = root / "conversion"
+    conv.mkdir()
+    (conv / "__init__.py").write_bytes(_PACKAGE_INIT_PY)
+    (conv / "base.py").write_bytes(_PACKAGE_BASE_PY)
+    (conv / "qwen.py").write_bytes(_PACKAGE_QWEN_PY)
+
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(root))
+
+    # Sentinel: any call here means the patcher fell through to the
+    # module-load path on package layout, which is the bug we're guarding.
+    called = {"hit": False}
+    def _trap(*a, **kw):
+        called["hit"] = True
+        raise AssertionError("monolith-only _load_module_from_path called on package layout")
+    monkeypatch.setattr(llama_cpp, "_load_module_from_path", _trap)
+
+    # Cache must be cleared between runs because @lru_cache(1) keys include
+    # the resolved local_script_info -- but a stale entry from a previous
+    # test would short-circuit the new call.
+    llama_cpp._download_convert_hf_to_gguf_cached.cache_clear()
+
+    patched_path, text_archs, vision_archs = llama_cpp._download_convert_hf_to_gguf("regression_no_module_import")
+
+    assert called["hit"] is False
+    assert patched_path.endswith(".py")
+    assert "LlamaForCausalLM" in text_archs
+    assert text_archs == frozenset(text_archs)
+    # base.py was patched in place under the override dir.
+    assert b"# UNSLOTH_BRANDING_APPLIED" in (conv / "base.py").read_bytes()
+    # Cleanup for follow-on tests.
+    llama_cpp._download_convert_hf_to_gguf_cached.cache_clear()
+
+
 def test_patcher_anchors_on_custom_dir_when_override_set(tmp_path):
     """Build a custom llama.cpp tree with the new package layout in a temp
     dir, point a synthetic local_script_info at it, and confirm sibling
