@@ -3,14 +3,17 @@
 Q2_K_L is an Unsloth-side preset, not a native llama.cpp ftype. Recipe:
 
   llama-quantize \\
-      --tensor-type ffn_down=Q3_K \\
+      --tensor-type "\\.ffn_down_exps=Q3_K" \\
+      --tensor-type "\\.ffn_down=Q3_K" \\
       --output-tensor-type Q6_K \\
       --token-embedding-type Q4_K \\
       IN OUT q2_k NTHREADS
 
-``--tensor-type ffn_down=Q3_K`` uses llama-quantize substring matching to
-cover both ``ffn_down.weight`` (dense FFN) and ``ffn_down_exps.weight``
-(MoE experts) across every block id without needing per-layer regex.
+``--tensor-type`` is matched with ``std::regex_search`` (NOT substring) and
+iterates first-match-wins inside llama-quantize, so we chain the more-
+specific MoE pattern first. The leading ``\\.`` anchors the override on the
+GGUF path-separator dot so it cannot leak into hypothetical tensor names
+that merely contain the substring "ffn_down".
 """
 
 from __future__ import annotations
@@ -55,7 +58,7 @@ def _stub_output_exists(monkeypatch):
     monkeypatch.setattr(Path, "stat", lambda self: SimpleNamespace(st_size=4096))
 
 
-def test_q2_k_l_expands_to_q2_k_with_dynamic_recipe(monkeypatch):
+def test_q2_k_l_expands_to_q2_k_with_dynamic_recipe(monkeypatch):  # noqa: D401
     llama_cpp = _load_llama_cpp_module()
     captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
     _stub_output_exists(monkeypatch)
@@ -75,13 +78,19 @@ def test_q2_k_l_expands_to_q2_k_with_dynamic_recipe(monkeypatch):
     assert "q2_k_l" not in cmd, f"q2_k_l leaked into llama-quantize command: {cmd!r}"
     # The expanded ftype must appear, as a standalone token.
     assert " q2_k " in cmd, f"q2_k token missing: {cmd!r}"
-    # All three preset flags must appear, in any order.
+    # All four preset flags must appear.
     assert "--output-tensor-type Q6_K" in cmd, f"--output-tensor-type Q6_K missing: {cmd!r}"
     assert "--token-embedding-type Q4_K" in cmd, f"--token-embedding-type Q4_K missing: {cmd!r}"
-    assert "--tensor-type ffn_down=Q3_K" in cmd, f"--tensor-type ffn_down=Q3_K missing: {cmd!r}"
-    # llama-quantize parses option flags before the positional model paths --
-    # the new --tensor-type flag must land in the option region.
-    assert cmd.index("--tensor-type ffn_down=Q3_K") < cmd.index("/tmp/in.gguf"), (
+    assert '--tensor-type "\\.ffn_down_exps=Q3_K"' in cmd, (
+        f'--tensor-type "\\.ffn_down_exps=Q3_K" missing: {cmd!r}'
+    )
+    assert '--tensor-type "\\.ffn_down=Q3_K"' in cmd, (
+        f'--tensor-type "\\.ffn_down=Q3_K" missing: {cmd!r}'
+    )
+    # llama-quantize parses option flags before the positional model paths;
+    # the --tensor-type flags must land in the option region.
+    first_tt = cmd.index('--tensor-type "\\.ffn_down_exps=Q3_K"')
+    assert first_tt < cmd.index("/tmp/in.gguf"), (
         f"--tensor-type must precede positional args: {cmd!r}"
     )
     # Sanity: input/output paths and thread count are still present.
@@ -90,12 +99,14 @@ def test_q2_k_l_expands_to_q2_k_with_dynamic_recipe(monkeypatch):
     assert " 4" in cmd, f"n_threads missing: {cmd!r}"
 
 
-def test_q2_k_l_ffn_down_pattern_covers_dense_and_moe(monkeypatch):
-    """`--tensor-type ffn_down=Q3_K` uses llama-quantize substring matching, so a
-    single pattern hits both `blk.N.ffn_down.weight` (dense) and
-    `blk.N.ffn_down_exps.weight` (MoE experts) for every layer id without
-    needing per-layer or per-architecture regex. Document that here so future
-    refactors do not split the pattern back into per-layer overrides."""
+def test_q2_k_l_ffn_down_pattern_order_is_specific_first(monkeypatch):
+    """llama-quantize iterates --tensor-type with first-match-wins
+    (`if (std::regex_search(...)) { ...; break; }` in src/llama-quant.cpp).
+    The more-specific MoE pattern `\\.ffn_down_exps` must therefore appear
+    BEFORE the dense pattern `\\.ffn_down` -- otherwise the dense regex
+    would absorb every MoE expert via its prefix match and the explicit
+    MoE override would be dead code. Asserting the order keeps this
+    invariant from sliding under a future cleanup pass."""
 
     llama_cpp = _load_llama_cpp_module()
     captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
@@ -111,12 +122,13 @@ def test_q2_k_l_ffn_down_pattern_covers_dense_and_moe(monkeypatch):
     )
 
     cmd = captured["cmd"]
-    # One pattern, no per-layer enumeration. The bare substring "ffn_down"
-    # matches both "ffn_down.weight" and "ffn_down_exps.weight" because
-    # llama-quantize uses std::string::find on the pattern.
-    assert cmd.count("--tensor-type ffn_down=Q3_K") == 1, (
-        f"expected exactly one ffn_down override; got: {cmd!r}"
+    moe_idx = cmd.index('--tensor-type "\\.ffn_down_exps=Q3_K"')
+    dense_idx = cmd.index('--tensor-type "\\.ffn_down=Q3_K"')
+    assert moe_idx < dense_idx, (
+        f"MoE pattern must come first (first-match-wins): {cmd!r}"
     )
+    # Document the invariant that we do NOT enumerate per layer id -- both
+    # patterns are layer-agnostic regexes covering every block.
     assert "blk." not in cmd, f"per-layer enumeration leaked into command: {cmd!r}"
 
 
@@ -141,7 +153,8 @@ def test_q2_k_l_is_case_insensitive(monkeypatch):
         assert " q2_k " in cmd, f"variant {variant!r}: expansion missing: {cmd!r}"
         assert "--output-tensor-type Q6_K" in cmd
         assert "--token-embedding-type Q4_K" in cmd
-        assert "--tensor-type ffn_down=Q3_K" in cmd
+        assert '--tensor-type "\\.ffn_down_exps=Q3_K"' in cmd
+        assert '--tensor-type "\\.ffn_down=Q3_K"' in cmd
 
 
 def test_other_quant_types_are_untouched(monkeypatch):
