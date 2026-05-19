@@ -120,7 +120,10 @@ class MLXTrainingConfig:
     weight_decay: float = 0.001
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
     # Elementwise clip ([-max_grad_value, max_grad_value], per-leaf).
-    # None or 0.0 disables; positive opts in and overrides max_grad_norm.
+    # None (default) keeps the cheap MLX default of 1.0 unless the user
+    # passes max_grad_norm > 0, in which case global-norm clipping wins.
+    # 0.0 disables. A positive float opts in explicitly and overrides
+    # max_grad_norm with a warning.
     max_grad_value: float | None = None
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
@@ -720,18 +723,34 @@ class MLXTrainer:
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
         _warned_skip_optimizer_state_grad_norm = False
 
-        # Build step functions following mlx-lm's pattern
+        # Build step functions following mlx-lm's pattern.
+        # Resolution rule:
+        #   * max_grad_value=None (default) -> cheap MLX elementwise clip
+        #     at 1.0, unless the user also passed max_grad_norm > 0 -- in
+        #     that case the user opted into global-norm clipping (HF/TRL
+        #     parity) and elementwise is disabled to avoid double-clip.
+        #   * max_grad_value explicit (float or 0.0) -> honor exactly;
+        #     if both modes are positive, elementwise wins (warn).
+        # max_grad_norm uses MLX's clip_grad_norm helper which materially
+        # increases peak memory on bf16 VLM runs, hence the elementwise
+        # default.
         max_grad_norm = float(args.max_grad_norm or 0.0)
-        # Elementwise clip (clip_grad_value_): leaf-local, free memory.
-        # None or 0.0 disables; positive opts in and overrides max_grad_norm.
         _raw_mgv = getattr(args, "max_grad_value", None)  # TODO: expose MLX grad-clip in Studio UI for power users
-        max_grad_value = 0.0 if _raw_mgv is None else float(_raw_mgv or 0.0)
-        if max_grad_norm > 0 and max_grad_value > 0:
-            print(
-                "Unsloth: max_grad_norm and max_grad_value are both enabled; "
-                "ignoring max_grad_norm in favor of max_grad_value."
-            )
-            max_grad_norm = 0.0
+        _user_set_mgv = _raw_mgv is not None
+        if _user_set_mgv:
+            max_grad_value = float(_raw_mgv or 0.0)
+            if max_grad_norm > 0 and max_grad_value > 0:
+                print(
+                    "Unsloth: max_grad_norm and max_grad_value are both enabled; "
+                    "ignoring max_grad_norm in favor of max_grad_value."
+                )
+                max_grad_norm = 0.0
+        elif max_grad_norm > 0:
+            # User opted into global-norm clipping; suppress the default elementwise.
+            max_grad_value = 0.0
+        else:
+            # Neither requested -> cheap MLX default.
+            max_grad_value = 1.0
         _clip_grad_value = max_grad_value > 0
         state = [model.state, optimizer.state, mx.random.state]
         # The direct grad_accum==1 fast path delegates clipping to
