@@ -31,6 +31,7 @@ import sys
 import os
 import time
 import re
+import ast
 import requests
 import json
 from tqdm.auto import tqdm as ProgressBar
@@ -921,14 +922,161 @@ def _load_module_from_path(filepath, module_name):
 pass
 
 
+_UNSLOTH_BRANDING_MARKER = b"# UNSLOTH_BRANDING_APPLIED"
+_BRANDING_PATTERN = re.compile(
+    rb"(self\.metadata \= gguf\.Metadata\.load\(.+?\))([\n\r]+([\s\t]{4,}))",
+    flags = re.MULTILINE,
+)
+
+
+def _get_llama_cpp_dir(local_script_info):
+    """Resolve the directory holding the converter being patched.
+    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR wins when set; otherwise the default
+    ~/.unsloth/llama.cpp. Single anchor for layout detection, branding patch,
+    Qwen check, and sibling-info cache key."""
+    if local_script_info is not None:
+        return os.path.dirname(local_script_info[0])
+    return LLAMA_CPP_DEFAULT_DIR
+pass
+
+
+def _conversion_sibling_info(llama_cpp_dir):
+    """Hashable (path, mtime, size) tuples for conversion/{__init__,base,qwen}.py.
+    Folded into the patcher cache key so re-pulled llama.cpp checkouts re-patch.
+    Returns None on monolithic layout."""
+    conv_dir = os.path.join(llama_cpp_dir, "conversion")
+    init_py  = os.path.join(conv_dir, "__init__.py")
+    base_py  = os.path.join(conv_dir, "base.py")
+    qwen_py  = os.path.join(conv_dir, "qwen.py")
+    if not (os.path.isfile(init_py) and os.path.isfile(base_py)):
+        return None
+    def _stat(p):
+        try:
+            s = os.stat(p)
+            return (p, s.st_mtime_ns, s.st_size)
+        except OSError:
+            return (p, 0, 0)
+    return (
+        _stat(init_py),
+        _stat(base_py),
+        _stat(qwen_py) if os.path.isfile(qwen_py) else None,
+    )
+pass
+
+
+def _detect_converter_layout(entry_content_bytes, llama_cpp_dir):
+    """Return 'package' for the new conversion/ package layout, else 'monolith'.
+    Detection is structural: entrypoint must contain `from conversion import`
+    AND conversion/__init__.py + conversion/base.py must exist on disk."""
+    try:
+        if b"from conversion import" not in entry_content_bytes:
+            return "monolith"
+        init_py = os.path.join(llama_cpp_dir, "conversion", "__init__.py")
+        base_py = os.path.join(llama_cpp_dir, "conversion", "base.py")
+        if os.path.isfile(init_py) and os.path.isfile(base_py):
+            return "package"
+    except Exception:
+        # Detection is best-effort; on any I/O or attribute error fall back
+        # to monolith so the legacy regex patches still run.
+        pass
+    return "monolith"
+pass
+
+
+def _extract_dict_keys_from_conversion_init(conv_init_path, dict_name):
+    """AST-parse conversion/__init__.py for TEXT_MODEL_MAP / MMPROJ_MODEL_MAP
+    string-literal keys. Used as the arch allowlist on the new layout because
+    ModelBase._model_classes is empty until load_all_models() runs."""
+    try:
+        with open(conv_init_path, "rb") as f:
+            tree = ast.parse(f.read())
+    except Exception:
+        return set()
+    keys = set()
+    def _harvest(value):
+        if isinstance(value, ast.Dict):
+            for k in value.keys:
+                if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                    keys.add(k.value)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == dict_name:
+                    _harvest(node.value)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == dict_name:
+                _harvest(node.value)
+    return keys
+pass
+
+
+def _apply_branding_patch_to_base(conv_base_path):
+    """Insert Unsloth metadata branding after `self.metadata = gguf.Metadata.load(...)`
+    in conversion/base.py. Idempotent via a one-line marker.
+    Returns 'applied' / 'already-applied' / 'pattern-missing'."""
+    try:
+        with open(conv_base_path, "rb") as f:
+            content = f.read()
+    except OSError:
+        return "pattern-missing"
+    if _UNSLOTH_BRANDING_MARKER in content:
+        return "already-applied"
+
+    def _replace(match):
+        load_call = match.group(1)
+        suffix    = match.group(2)   # already starts with newline + indent
+        indent    = match.group(3)
+        return (
+            load_call + b"\n"
+            + indent + _UNSLOTH_BRANDING_MARKER + b"\n"
+            + indent + b"if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'\n"
+            + indent + b"if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'\n"
+            + indent + b"if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']"
+            + suffix
+        )
+
+    new_content, n = _BRANDING_PATTERN.subn(_replace, content, count = 1)
+    if n == 0:
+        return "pattern-missing"
+    try:
+        with open(conv_base_path, "wb") as f:
+            f.write(new_content)
+    except OSError:
+        return "pattern-missing"
+    return "applied"
+pass
+
+
+def _qwen_already_handles_expert_aliases(conv_qwen_path):
+    """True iff conversion/qwen.py already searches both num_local_experts AND
+    num_experts. Upstream master uses
+        self.find_hparam(["num_local_experts", "num_experts"])
+    so the legacy patch is a no-op and the warning is misleading."""
+    try:
+        with open(conv_qwen_path, "rb") as f:
+            content = f.read()
+    except OSError:
+        return False
+    return (b"num_local_experts" in content) and (b"num_experts" in content)
+pass
+
+
 def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
-    # Resolve the env var on every call so changes between calls are honored;
-    # the resolved value is part of the cache key on the implementation below.
-    return _download_convert_hf_to_gguf_cached(name, _resolve_local_convert_script())
+    # Resolve env vars + sibling mtimes on every call; both are folded into
+    # the @lru_cache key so re-pulled llama.cpp checkouts re-run the patcher.
+    # Anchor the conversion/ lookup to the converter being patched, not
+    # always LLAMA_CPP_DEFAULT_DIR -- matters when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
+    # points at a different checkout.
+    local_script_info = _resolve_local_convert_script()
+    return _download_convert_hf_to_gguf_cached(
+        name,
+        local_script_info,
+        _conversion_sibling_info(_get_llama_cpp_dir(local_script_info)),
+    )
 
 
 @lru_cache(1)
-def _download_convert_hf_to_gguf_cached(name, _local_script_info):
+def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_info):
     # All Unsloth Zoo code licensed under LGPLv3
     # Downloads from llama.cpp's GitHub repository, or reads a local copy when
     # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is set. _local_script_info is
@@ -944,6 +1092,13 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
     text_archs = set()
     vision_archs = set()
     temp_original_file_path = None # Initialize for finally block
+    original_module_name = None    # Only set on the monolith branch
+    # Set by introspection; read by Patch 2 + Patch 3 below. Default to
+    # 'monolith' so a failed introspection still drives the legacy patches.
+    _layout = "monolith"
+    # Resolve once: same dir feeds layout detection, branding patch, Qwen
+    # check, sibling cache key. UNSLOTH_LLAMA_CPP_SCRIPTS_DIR overrides default.
+    _llama_cpp_dir = _get_llama_cpp_dir(_local_script_info)
 
     _local_script = _local_script_info[0] if _local_script_info is not None else None
 
@@ -976,65 +1131,89 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
             if original_content is None:
                 raise _last_err  # type: ignore[misc]
 
-        # 2. Introspect Original Script for Supported Architectures
+        # 2. Detect layout BEFORE attempting to import. The package-layout
+        # entrypoint does `from conversion import ...`, which a temp-file
+        # import resolves against LLAMA_CPP_DEFAULT_DIR -- so when the user
+        # set UNSLOTH_LLAMA_CPP_SCRIPTS_DIR to a different checkout, the
+        # import would ModuleNotFoundError and abort the patcher before we
+        # could reach the AST-based arch extraction path.
+        _layout = _detect_converter_layout(original_content, _llama_cpp_dir)
+        logger.info(f"Unsloth: convert_hf_to_gguf layout detected: {_layout}")
         logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
-        with tempfile.NamedTemporaryFile(
-            mode='wb', suffix=".py", prefix="original_gguf_", dir=LLAMA_CPP_DEFAULT_DIR, delete=False
-        ) as temp_file:
-            temp_original_file_path = temp_file.name
-            temp_file.write(original_content)
-            temp_file.flush()
 
-        logger.debug(f"Loading module from temporary file: {temp_original_file_path}")
-        original_module_name = f"convert_hf_to_gguf_{os.path.basename(temp_original_file_path).split('.')[0]}"
-
-        # Set NO_LOCAL_GGUF to prevent the script from adding path again
-        old_env = os.environ.get('NO_LOCAL_GGUF')
-        os.environ['NO_LOCAL_GGUF'] = '1'
-
-        try:
-            module = _load_module_from_path(temp_original_file_path, original_module_name)
-        finally:
-            # Restore environment
-            if old_env is None:
-                os.environ.pop('NO_LOCAL_GGUF', None)
-            else:
-                os.environ['NO_LOCAL_GGUF'] = old_env
-
-        # --- Extract Supported Architectures (TEXT and VISION) ---
-        ModelBase = getattr(module, 'ModelBase', None)
-        ModelType = getattr(module, 'ModelType', None)
-
-        if ModelBase is None or ModelType is None:
-            logger.warning(
-                f"Unsloth: Failed to find 'ModelBase' or 'ModelType' in the original downloaded script. "
-                f"Structure might have changed. Cannot determine supported architectures."
-            )
-        elif not hasattr(ModelBase, '_model_classes') or not isinstance(ModelBase._model_classes, dict):
-             logger.warning(
-                f"Unsloth: 'ModelBase._model_classes' not found or not a dictionary in original script."
-                 " Cannot determine supported architectures."
-            )
+        if _layout == "package":
+            # Package layout: archs come from AST-parsing the static
+            # TEXT_MODEL_MAP / MMPROJ_MODEL_MAP in conversion/__init__.py.
+            # No module import required, so we skip the temp-write entirely.
+            conv_init_py = os.path.join(_llama_cpp_dir, "conversion", "__init__.py")
+            text_archs   = _extract_dict_keys_from_conversion_init(conv_init_py, "TEXT_MODEL_MAP")
+            vision_archs = _extract_dict_keys_from_conversion_init(conv_init_py, "MMPROJ_MODEL_MAP")
+            supported_types.update(text_archs)
+            supported_types.update(vision_archs)
+            if not supported_types:
+                logger.warning(
+                    "Unsloth: conversion/__init__.py parsed but TEXT_MODEL_MAP / "
+                    "MMPROJ_MODEL_MAP yielded no architecture keys. The arch "
+                    "allowlist will be empty; conversion will still attempt to run."
+                )
         else:
-            # Check for TEXT models
-            if hasattr(ModelType, 'TEXT') and ModelType.TEXT in ModelBase._model_classes:
-                if isinstance(ModelBase._model_classes[ModelType.TEXT], dict):
-                    text_archs = set(ModelBase._model_classes[ModelType.TEXT].keys())
-                    supported_types.update(text_archs)
-                else:
-                    logger.warning("Unsloth: ModelBase._model_classes[ModelType.TEXT] is not a dictionary.")
-            else:
-                logger.info("Unsloth: No TEXT model architectures found registered in the original script.")
+            # Monolith layout: original behaviour. Write the entrypoint to a
+            # temp file under LLAMA_CPP_DEFAULT_DIR and import it to read
+            # ModelBase._model_classes.
+            with tempfile.NamedTemporaryFile(
+                mode='wb', suffix=".py", prefix="original_gguf_", dir=LLAMA_CPP_DEFAULT_DIR, delete=False
+            ) as temp_file:
+                temp_original_file_path = temp_file.name
+                temp_file.write(original_content)
+                temp_file.flush()
 
-            # Check for VISION models
-            if hasattr(ModelType, 'MMPROJ') and ModelType.MMPROJ in ModelBase._model_classes:
-                if isinstance(ModelBase._model_classes[ModelType.MMPROJ], dict):
-                    vision_archs = set(ModelBase._model_classes[ModelType.MMPROJ].keys())
-                    supported_types.update(vision_archs)
+            logger.debug(f"Loading module from temporary file: {temp_original_file_path}")
+            original_module_name = f"convert_hf_to_gguf_{os.path.basename(temp_original_file_path).split('.')[0]}"
+
+            # Set NO_LOCAL_GGUF to prevent the script from adding path again
+            old_env = os.environ.get('NO_LOCAL_GGUF')
+            os.environ['NO_LOCAL_GGUF'] = '1'
+
+            try:
+                module = _load_module_from_path(temp_original_file_path, original_module_name)
+            finally:
+                if old_env is None:
+                    os.environ.pop('NO_LOCAL_GGUF', None)
                 else:
-                    logger.warning("Unsloth: ModelBase._model_classes[ModelType.MMPROJ] is not a dictionary.")
+                    os.environ['NO_LOCAL_GGUF'] = old_env
+            ModelBase = getattr(module, 'ModelBase', None)
+            ModelType = getattr(module, 'ModelType', None)
+
+            if ModelBase is None or ModelType is None:
+                logger.warning(
+                    f"Unsloth: Failed to find 'ModelBase' or 'ModelType' in the original downloaded script. "
+                    f"Structure might have changed. Cannot determine supported architectures."
+                )
+            elif not hasattr(ModelBase, '_model_classes') or not isinstance(ModelBase._model_classes, dict):
+                 logger.warning(
+                    f"Unsloth: 'ModelBase._model_classes' not found or not a dictionary in original script."
+                     " Cannot determine supported architectures."
+                )
             else:
-                 logger.info("Unsloth: No VISION model architectures found registered in the original script.")
+                # Check for TEXT models
+                if hasattr(ModelType, 'TEXT') and ModelType.TEXT in ModelBase._model_classes:
+                    if isinstance(ModelBase._model_classes[ModelType.TEXT], dict):
+                        text_archs = set(ModelBase._model_classes[ModelType.TEXT].keys())
+                        supported_types.update(text_archs)
+                    else:
+                        logger.warning("Unsloth: ModelBase._model_classes[ModelType.TEXT] is not a dictionary.")
+                else:
+                    logger.info("Unsloth: No TEXT model architectures found registered in the original script.")
+
+                # Check for VISION models
+                if hasattr(ModelType, 'MMPROJ') and ModelType.MMPROJ in ModelBase._model_classes:
+                    if isinstance(ModelBase._model_classes[ModelType.MMPROJ], dict):
+                        vision_archs = set(ModelBase._model_classes[ModelType.MMPROJ].keys())
+                        supported_types.update(vision_archs)
+                    else:
+                        logger.warning("Unsloth: ModelBase._model_classes[ModelType.MMPROJ] is not a dictionary.")
+                else:
+                     logger.info("Unsloth: No VISION model architectures found registered in the original script.")
         # --- End Architecture Extraction ---
 
         # Convert final set to frozenset for immutability (good practice for cache keys/return values)
@@ -1047,8 +1226,8 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
                 f"Unsloth: No supported architectures (TEXT or VISION) could be determined from the original script."
             )
 
-        # Cleanup module reference
-        if original_module_name in sys.modules:
+        # Cleanup module reference (only set on the monolith branch)
+        if original_module_name is not None and original_module_name in sys.modules:
              del sys.modules[original_module_name]
 
     except Exception as e:
@@ -1085,41 +1264,73 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info):
 
 
 
-        # Patch 2: Metadata Branding
+        # Patch 2: Metadata Branding.
+        # Monolith: target lives in the entrypoint; patch the in-memory bytes.
+        # Package: target moved to conversion/base.py; patch that file in place
+        # (idempotent via _UNSLOTH_BRANDING_MARKER) since the entrypoint just
+        # imports ModelBase from it at runtime.
         try:
-            metadata_patch_applied = False
-            new_patched_content = re.sub(
-                rb"(self\.metadata \= gguf\.Metadata\.load\(.+?\))([\n\r]+([\s\t]{4,}))",
-                rb"\1\n"
-                rb"\3if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'\n"
-                rb"\3if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'\n"
-                rb"\3if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']\n"
-                rb"\2",
-                patched_content, count=1, flags=re.MULTILINE
-            )
-            if new_patched_content != patched_content: patched_content = new_patched_content; metadata_patch_applied = True
-            if not metadata_patch_applied:
-                 if re.search(rb"self\.metadata \= gguf\.Metadata\.load\(", patched_content): logger.warning("Unsloth: Metadata branding patch target found, but regex failed to apply.")
-                 else: logger.warning("Unsloth: Metadata branding patch target 'self.metadata = gguf.Metadata.load(...)' not found.")
+            if _layout == "package":
+                conv_base_py = os.path.join(_llama_cpp_dir, "conversion", "base.py")
+                _branding_status = _apply_branding_patch_to_base(conv_base_py)
+                if _branding_status == "applied":
+                    logger.info(f"Unsloth: Metadata branding patch applied to {conv_base_py}.")
+                elif _branding_status == "already-applied":
+                    logger.info(f"Unsloth: Metadata branding patch already present in {conv_base_py} (idempotent skip).")
+                else:
+                    logger.warning(
+                        f"Unsloth: Metadata branding patch target not found in {conv_base_py}. "
+                        f"Upstream may have refactored Metadata.load again."
+                    )
+            else:
+                metadata_patch_applied = False
+                new_patched_content = re.sub(
+                    rb"(self\.metadata \= gguf\.Metadata\.load\(.+?\))([\n\r]+([\s\t]{4,}))",
+                    rb"\1\n"
+                    rb"\3if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'\n"
+                    rb"\3if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'\n"
+                    rb"\3if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']\n"
+                    rb"\2",
+                    patched_content, count=1, flags=re.MULTILINE
+                )
+                if new_patched_content != patched_content: patched_content = new_patched_content; metadata_patch_applied = True
+                if not metadata_patch_applied:
+                     if re.search(rb"self\.metadata \= gguf\.Metadata\.load\(", patched_content): logger.warning("Unsloth: Metadata branding patch target found, but regex failed to apply.")
+                     else: logger.warning("Unsloth: Metadata branding patch target 'self.metadata = gguf.Metadata.load(...)' not found.")
         except Exception as e: logger.error(f"Unsloth: Error applying metadata branding patch: {e}", exc_info=True); raise
 
 
-        # Patch 3: Qwen2MoE/Qwen3MoE num_experts fix
+        # Patch 3: Qwen2MoE / Qwen3MoE num_experts fix.
+        # Package layout uses find_hparam(["num_local_experts", "num_experts"])
+        # already, so the legacy patch is obsolete and its warning misleading.
+        # Skip it (info-log) on new layout; run unchanged on monolith.
         try:
-            # Use a single regex to handle both quote styles
-            num_experts_pattern = rb'n_experts = self\.hparams\[(["\'])num_experts\1\]'
-            replacement = (
-                b"# Qwen3MoE seems to use num_local_experts instead of num_experts\n"
-                b"            n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')"
-            )
+            _qwen_handled = False
+            if _layout == "package":
+                conv_qwen_py = os.path.join(_llama_cpp_dir, "conversion", "qwen.py")
+                if os.path.isfile(conv_qwen_py) and _qwen_already_handles_expert_aliases(conv_qwen_py):
+                    logger.info(
+                        "Unsloth: Qwen2MoE expert-key alias already handled upstream "
+                        "(conversion/qwen.py uses find_hparam([num_local_experts, num_experts])) "
+                        "-- legacy patch skipped."
+                    )
+                    _qwen_handled = True
 
-            new_patched_content = re.sub(num_experts_pattern, replacement, patched_content)
-            num_experts_patch_applied = (new_patched_content != patched_content)
+            if not _qwen_handled:
+                # Use a single regex to handle both quote styles
+                num_experts_pattern = rb'n_experts = self\.hparams\[(["\'])num_experts\1\]'
+                replacement = (
+                    b"# Qwen3MoE seems to use num_local_experts instead of num_experts\n"
+                    b"            n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')"
+                )
 
-            if num_experts_patch_applied:
-                patched_content = new_patched_content
-            else:
-                logger.warning("Unsloth: Qwen2MoE num_experts patch target not found.")
+                new_patched_content = re.sub(num_experts_pattern, replacement, patched_content)
+                num_experts_patch_applied = (new_patched_content != patched_content)
+
+                if num_experts_patch_applied:
+                    patched_content = new_patched_content
+                else:
+                    logger.warning("Unsloth: Qwen2MoE num_experts patch target not found.")
 
         except Exception as e:
             logger.error(f"Unsloth: Error applying Qwen2MoE num_experts patch: {e}", exc_info=True)
@@ -1587,10 +1798,38 @@ def quantize_gguf(
         import shlex
         return shlex.quote(s)
 
-    command = f"{_quote(quantizer_location)} {_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
+    # Q2_K_L is an Unsloth preset (q2_k base with selective upcasts), not a
+    # native llama.cpp ftype. Recipe: token_embd -> Q4_K, output -> Q6_K, and
+    # every ffn_down / ffn_down_exps tensor (all layer ids, dense + MoE) ->
+    # Q3_K. llama-quantize matches --tensor-type with std::regex_search and
+    # iterates with first-match-wins, so we chain the more-specific MoE
+    # pattern first; the leading `\.` anchors on the GGUF path separator so
+    # the override does not slip into unrelated tensor names that happen to
+    # contain the substring "ffn_down".
+    _display_quant_type = quant_type
+    _extra_flags = ""
+    if str(quant_type).strip().lower() == "q2_k_l":
+        _extra_flags = (
+            '--tensor-type "\\.ffn_down_exps=Q3_K" '
+            '--tensor-type "\\.ffn_down=Q3_K" '
+            '--output-tensor-type Q6_K '
+            '--token-embedding-type Q4_K '
+        )
+        quant_type = "q2_k"
+
+    command = (
+        f"{_quote(quantizer_location)} {_extra_flags}"
+        f"{_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
+    )
 
     if print_output:
-        print(f"Unsloth: Quantizing to {quant_type}...")
+        print(f"Unsloth: Quantizing to {_display_quant_type}...")
+        if _extra_flags:
+            print(
+                "Unsloth: Expanding Q2_K_L preset "
+                "(q2_k base, .ffn_down_exps=Q3_K + .ffn_down=Q3_K, "
+                "output=Q6_K, token_embd=Q4_K)."
+            )
 
     try:
         if print_output:
@@ -1603,7 +1842,7 @@ def quantize_gguf(
     except subprocess.CalledProcessError as e:
         if print_output and hasattr(e, 'stdout') and e.stdout:
             print(e.stdout)
-        raise RuntimeError(f"Failed to quantize {input_gguf} to {quant_type}: {e}")
+        raise RuntimeError(f"Failed to quantize {input_gguf} to {_display_quant_type}: {e}")
 
     # Verify output exists and get size using pathlib
     output_path = Path(output_gguf)
