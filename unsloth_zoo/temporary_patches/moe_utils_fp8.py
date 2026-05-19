@@ -1246,11 +1246,13 @@ def patch_fp8_validate_quantization_for_training():
     except ImportError:
         return
 
-    sentinel = "_unsloth_fp8_guard_patched"
-    if getattr(_trainer_utils_mod.validate_quantization_for_training, sentinel, False):
+    _original = getattr(_trainer_utils_mod, "validate_quantization_for_training", None)
+    if _original is None:
         return
 
-    _original = _trainer_utils_mod.validate_quantization_for_training
+    sentinel = "_unsloth_fp8_guard_patched"
+    if getattr(_original, sentinel, False):
+        return
 
     def _is_fp8_quantized(model):
         hq = getattr(model, "hf_quantizer", None)
