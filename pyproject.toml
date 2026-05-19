@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     # --- GPU-only deps (skipped on macOS arm64) ---
-    "torch>=2.4.0,<2.11.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "torch>=2.4.0,<2.13.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "torchao>=0.13.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "triton>=3.0.0 ; ('linux' in sys_platform)",
     "tyro ; (sys_platform != 'darwin' or platform_machine != 'arm64')",

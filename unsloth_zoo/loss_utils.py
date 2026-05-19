@@ -137,7 +137,15 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # Now patch the losses!
     import transformers.modeling_utils
     LOSS_MAPPING = transformers.loss.loss_utils.LOSS_MAPPING
-    LOSS_MAPPING["ForCausalLM"] = UnslothForCausalLMLoss
+    # Patch every key still aliased to the stock ForCausalLMLoss. PreTrainedModel
+    # resolves loss_type via regex on the class name, so classes like
+    # Qwen3_5ForConditionalGeneration land on LOSS_MAPPING["ForConditionalGeneration"]
+    # (and CsmForConditionalGeneration on its own key), both of which point at the
+    # stock ForCausalLMLoss. Without this sweep those models keep the un-patched
+    # loss and OOM via logits.float() at large vocab sizes.
+    for _key, _fn in list(LOSS_MAPPING.items()):
+        if getattr(_fn, "__name__", "") == "ForCausalLMLoss":
+            LOSS_MAPPING[_key] = UnslothForCausalLMLoss
 
     # Remove @property and @lru_cache
     if hasattr(transformers.modeling_utils.PreTrainedModel.loss_function, "fget") and \

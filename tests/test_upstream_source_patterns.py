@@ -316,9 +316,14 @@ def test_compiler_per_layer_projection_inplace_regex():
 def test_compiler_cross_entropy_lm_head_pattern_present():
     """``unsloth_zoo/compiler.py:1508-1525`` (cross_entropy_find_1)
     expects ``logits = self.lm_head(hidden_states`` at the head of the
-    loss block in every ForCausalLM forward."""
+    loss block in every ForCausalLM forward.
+
+    Read on-disk modeling source: the fused-forward installer rewrites
+    ``cls.forward`` at import time, but the upstream pattern compiler.py
+    pins still lives in the source file."""
     pytest.importorskip("transformers")
     import importlib
+    import pathlib
     candidate_classes = [
         "transformers.models.llama.modeling_llama.LlamaForCausalLM",
         "transformers.models.llama4.modeling_llama4.Llama4ForCausalLM",
@@ -334,12 +339,12 @@ def test_compiler_cross_entropy_lm_head_pattern_present():
             mod = importlib.import_module(mod_path)
         except ImportError:
             continue
-        cls = getattr(mod, cls_name, None)
-        if cls is None:
+        src_file = getattr(mod, "__file__", None)
+        if not src_file:
             continue
         try:
-            src = inspect.getsource(cls.forward)
-        except (OSError, TypeError):
+            src = pathlib.Path(src_file).read_text(encoding="utf-8")
+        except OSError:
             continue
         if needle in src:
             found = True
@@ -357,9 +362,16 @@ def test_compiler_cross_entropy_lm_head_pattern_present():
 
 def test_compiler_cross_entropy_find_2_loss_function_signature():
     """``unsloth_zoo/compiler.py:1593-1600`` (cross_entropy_find_2) pins
-    ``loss = self.loss_function(...$LOGITS$, $LABELS$, $VOCABSIZE$...)``."""
+    ``loss = self.loss_function(...$LOGITS$, $LABELS$, $VOCABSIZE$...)``.
+
+    Read the modeling module's on-disk source directly. The fused-forward
+    installer (forward_install.py) replaces ``*ForCausalLM.forward`` at
+    import time, so ``inspect.getsource(cls.forward)`` would return the
+    rewritten body; the upstream pattern this test pins still lives on
+    disk untouched."""
     pytest.importorskip("transformers")
     import importlib
+    import pathlib
     candidate_classes = [
         "transformers.models.llama.modeling_llama.LlamaForCausalLM",
         "transformers.models.mistral.modeling_mistral.MistralForCausalLM",
@@ -374,12 +386,12 @@ def test_compiler_cross_entropy_find_2_loss_function_signature():
             mod = importlib.import_module(mod_path)
         except ImportError:
             continue
-        cls = getattr(mod, cls_name, None)
-        if cls is None:
+        src_file = getattr(mod, "__file__", None)
+        if not src_file:
             continue
         try:
-            src = inspect.getsource(cls.forward)
-        except (OSError, TypeError):
+            src = pathlib.Path(src_file).read_text(encoding="utf-8")
+        except OSError:
             continue
         if needle in src:
             return
