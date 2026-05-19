@@ -59,8 +59,12 @@ _PATCH_BINDINGS: set[tuple[str, str, str, str]] = set()
 # Architectures explicitly verified for mlx compile support.
 # Training verification currently covers:
 # - qwen2_5_vl: real end-to-end compiled training via train.py
-# - qwen3_vl / qwen3_5 / qwen3_5_moe / gemma4 / paligemma / moondream3:
+# - qwen3_5 / qwen3_5_moe / gemma4 / paligemma / moondream3:
 #   compiled synthetic forward+backward
+# Qwen3-VL/Qwen3-VL-MoE stay patched but unqualified for real training compile:
+# a fixed-fixture Qwen3-VL full-FT probe showed compiled vision backward/update
+# drift relative to patched eager while sampled language gradients stayed
+# aligned. Re-promote only after real 10-step training parity is verified.
 # SmolVLM has processor/template support, but real mlx-vlm training still hits
 # MLX primitive-less-array failures after a compiled call. Keep it patched but
 # unqualified until a real dataset compile run passes.
@@ -93,8 +97,6 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "qwen2_5_vl",
     "qwen3_5",
     "qwen3_5_moe",
-    "qwen3_vl_moe",
-    "qwen3_vl",
 }
 _VERIFIED_GENERATION_ARCHES: set[str] = set()
 
@@ -104,6 +106,19 @@ _MODEL_REPO_TRAINING_COMPILE_BLOCKLIST: tuple[tuple[str, str], ...] = (
         "SmolVLM/Idefics3 real training currently leaves MLX primitive-less arrays after compiled execution",
     ),
 )
+
+_ARCH_TRAINING_COMPILE_BLOCK_REASONS: dict[str, str] = {
+    "qwen3_vl": (
+        "Qwen3-VL real 10-step training parity is not verified: compiled "
+        "vision backward/update drifts relative to patched eager"
+    ),
+    "qwen3_vl_moe": (
+        "Qwen3-VL-MoE shares the Qwen3-VL vision/deepstack training path; "
+        "keep compile disabled until Qwen3-VL real 10-step training parity "
+        "is verified"
+    ),
+}
+
 
 _BACKEND_CONFIG_KEYS = (
     "text_config",
@@ -1335,7 +1350,10 @@ def _build_compile_qualification(
         name for name in matched_patterns if name in _PATCHED_PATTERN_BUNDLES
     )
 
-    if training_ok or generation_ok:
+    arch_block_reason = _ARCH_TRAINING_COMPILE_BLOCK_REASONS.get(arch)
+    if arch_block_reason is not None and not generation_ok:
+        reason = arch_block_reason
+    elif training_ok or generation_ok:
         ready = []
         if training_ok:
             ready.append("training")
