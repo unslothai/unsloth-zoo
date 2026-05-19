@@ -976,6 +976,8 @@ def _detect_converter_layout(entry_content_bytes, llama_cpp_dir):
         if os.path.isfile(init_py) and os.path.isfile(base_py):
             return "package"
     except Exception:
+        # Detection is best-effort; on any I/O or attribute error fall back
+        # to monolith so the legacy regex patches still run.
         pass
     return "monolith"
 pass
@@ -1022,14 +1024,14 @@ def _apply_branding_patch_to_base(conv_base_path):
 
     def _replace(match):
         load_call = match.group(1)
-        suffix    = match.group(2)
+        suffix    = match.group(2)   # already starts with newline + indent
         indent    = match.group(3)
         return (
             load_call + b"\n"
             + indent + _UNSLOTH_BRANDING_MARKER + b"\n"
             + indent + b"if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'\n"
             + indent + b"if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'\n"
-            + indent + b"if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']\n"
+            + indent + b"if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']"
             + suffix
         )
 

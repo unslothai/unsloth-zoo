@@ -15,10 +15,8 @@ Two flavours:
 from __future__ import annotations
 
 import importlib.util
-import logging
 import os
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
