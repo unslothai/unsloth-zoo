@@ -929,6 +929,17 @@ _BRANDING_PATTERN = re.compile(
 )
 
 
+def _get_llama_cpp_dir(local_script_info):
+    """Resolve the directory holding the converter being patched.
+    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR wins when set; otherwise the default
+    ~/.unsloth/llama.cpp. Single anchor for layout detection, branding patch,
+    Qwen check, and sibling-info cache key."""
+    if local_script_info is not None:
+        return os.path.dirname(local_script_info[0])
+    return LLAMA_CPP_DEFAULT_DIR
+pass
+
+
 def _conversion_sibling_info(llama_cpp_dir):
     """Hashable (path, mtime, size) tuples for conversion/{__init__,base,qwen}.py.
     Folded into the patcher cache key so re-pulled llama.cpp checkouts re-patch.
@@ -1051,10 +1062,14 @@ pass
 def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     # Resolve env vars + sibling mtimes on every call; both are folded into
     # the @lru_cache key so re-pulled llama.cpp checkouts re-run the patcher.
+    # Anchor the conversion/ lookup to the converter being patched, not
+    # always LLAMA_CPP_DEFAULT_DIR -- matters when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
+    # points at a different checkout.
+    local_script_info = _resolve_local_convert_script()
     return _download_convert_hf_to_gguf_cached(
         name,
-        _resolve_local_convert_script(),
-        _conversion_sibling_info(LLAMA_CPP_DEFAULT_DIR),
+        local_script_info,
+        _conversion_sibling_info(_get_llama_cpp_dir(local_script_info)),
     )
 
 
@@ -1078,6 +1093,9 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
     # Set by introspection; read by Patch 2 + Patch 3 below. Default to
     # 'monolith' so a failed introspection still drives the legacy patches.
     _layout = "monolith"
+    # Resolve once: same dir feeds layout detection, branding patch, Qwen
+    # check, sibling cache key. UNSLOTH_LLAMA_CPP_SCRIPTS_DIR overrides default.
+    _llama_cpp_dir = _get_llama_cpp_dir(_local_script_info)
 
     _local_script = _local_script_info[0] if _local_script_info is not None else None
 
@@ -1140,11 +1158,11 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         # load_all_models() runs, so AST-parse the static TEXT_MODEL_MAP /
         # MMPROJ_MODEL_MAP in conversion/__init__.py instead. Monolith
         # layout keeps the original _model_classes introspection.
-        _layout = _detect_converter_layout(original_content, LLAMA_CPP_DEFAULT_DIR)
+        _layout = _detect_converter_layout(original_content, _llama_cpp_dir)
         logger.info(f"Unsloth: convert_hf_to_gguf layout detected: {_layout}")
 
         if _layout == "package":
-            conv_init_py = os.path.join(LLAMA_CPP_DEFAULT_DIR, "conversion", "__init__.py")
+            conv_init_py = os.path.join(_llama_cpp_dir, "conversion", "__init__.py")
             text_archs   = _extract_dict_keys_from_conversion_init(conv_init_py, "TEXT_MODEL_MAP")
             vision_archs = _extract_dict_keys_from_conversion_init(conv_init_py, "MMPROJ_MODEL_MAP")
             supported_types.update(text_archs)
@@ -1246,7 +1264,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         # imports ModelBase from it at runtime.
         try:
             if _layout == "package":
-                conv_base_py = os.path.join(LLAMA_CPP_DEFAULT_DIR, "conversion", "base.py")
+                conv_base_py = os.path.join(_llama_cpp_dir, "conversion", "base.py")
                 _branding_status = _apply_branding_patch_to_base(conv_base_py)
                 if _branding_status == "applied":
                     logger.info(f"Unsloth: Metadata branding patch applied to {conv_base_py}.")
@@ -1282,7 +1300,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         try:
             _qwen_handled = False
             if _layout == "package":
-                conv_qwen_py = os.path.join(LLAMA_CPP_DEFAULT_DIR, "conversion", "qwen.py")
+                conv_qwen_py = os.path.join(_llama_cpp_dir, "conversion", "qwen.py")
                 if os.path.isfile(conv_qwen_py) and _qwen_already_handles_expert_aliases(conv_qwen_py):
                     logger.info(
                         "Unsloth: Qwen2MoE expert-key alias already handled upstream "

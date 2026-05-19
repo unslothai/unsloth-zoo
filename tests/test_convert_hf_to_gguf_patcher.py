@@ -320,6 +320,56 @@ def test_conversion_sibling_info_none_for_monolith(monolith_layout):
     assert llama_cpp._conversion_sibling_info(str(monolith_layout)) is None
 
 
+# --- _get_llama_cpp_dir resolution (addresses PR #667 review) ---------------
+
+
+def test_llama_cpp_dir_defaults_when_no_local_script():
+    llama_cpp = _load_llama_cpp_module()
+    assert llama_cpp._get_llama_cpp_dir(None) == llama_cpp.LLAMA_CPP_DEFAULT_DIR
+
+
+def test_llama_cpp_dir_resolves_to_source_dir_when_local_script_set(tmp_path):
+    """UNSLOTH_LLAMA_CPP_SCRIPTS_DIR override: the patcher must operate
+    against the directory containing the selected converter, not the
+    hard-coded default. Mirrors `_resolve_local_convert_script`'s 3-tuple
+    return shape `(abs_path, mtime_ns, size)`."""
+    llama_cpp = _load_llama_cpp_module()
+    custom = tmp_path / "custom_llama_cpp"
+    custom.mkdir()
+    src = custom / "convert_hf_to_gguf.py"
+    src.write_bytes(b"# placeholder\n")
+    local_info = (str(src), src.stat().st_mtime_ns, src.stat().st_size)
+    assert llama_cpp._get_llama_cpp_dir(local_info) == str(custom)
+
+
+def test_patcher_anchors_on_custom_dir_when_override_set(tmp_path):
+    """Build a custom llama.cpp tree with the new package layout in a temp
+    dir, point a synthetic local_script_info at it, and confirm sibling
+    info + layout detection target THAT dir, not the hardcoded default."""
+    llama_cpp = _load_llama_cpp_module()
+    root = tmp_path / "custom_llama_cpp"
+    root.mkdir()
+    (root / "convert_hf_to_gguf.py").write_bytes(_PACKAGE_ENTRYPOINT)
+    conv = root / "conversion"
+    conv.mkdir()
+    (conv / "__init__.py").write_bytes(_PACKAGE_INIT_PY)
+    (conv / "base.py").write_bytes(_PACKAGE_BASE_PY)
+    (conv / "qwen.py").write_bytes(_PACKAGE_QWEN_PY)
+
+    local_info = (
+        str(root / "convert_hf_to_gguf.py"),
+        (root / "convert_hf_to_gguf.py").stat().st_mtime_ns,
+        (root / "convert_hf_to_gguf.py").stat().st_size,
+    )
+    resolved = llama_cpp._get_llama_cpp_dir(local_info)
+    assert resolved == str(root)
+    sib = llama_cpp._conversion_sibling_info(resolved)
+    assert sib is not None
+    assert sib[1][0] == str(conv / "base.py")  # base.py path in sibling tuple
+    layout = llama_cpp._detect_converter_layout(_PACKAGE_ENTRYPOINT, resolved)
+    assert layout == "package"
+
+
 # --- Network smoke against current upstream llama.cpp ----------------------
 
 
