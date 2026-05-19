@@ -92,14 +92,8 @@ def _convert_mlx_dtype(model, target_dtype) -> None:
     """Cast floating-point params to target_dtype (preserves quantized ints)
     while honoring the model's optional path-based ``cast_predicate``.
 
-    Emits a single warning when casting bfloat16 -> float16: fp16's finite
-    range (~6.5e4) is much narrower than bf16's (~3.4e38), so models whose
-    native storage is bf16 can lose precision or overflow silently. This
-    has been observed on Gemma3-270m: a stochastic LoRA memorization
-    fixture shows ~28pp lower greedy-decode pass rate under dtype="float16"
-    vs dtype=None against the same checkpoint. Cast still happens (users
-    asking for fp16 on M1/M2 need it); the warning just makes the
-    trade-off visible.
+    Warns once on bfloat16 -> float16 since fp16's narrower range can
+    silently lose precision on bf16-native models.
     """
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
