@@ -2662,8 +2662,8 @@ def _install_qwen3_family_compile_patches():
         )
         q, k, v = mx.split(qkv, 3)
 
-        q = vision_module.apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
-        k = vision_module.apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
+        q = _qwen3_vision_rotary_fp32(q, rotary_pos_emb)
+        k = _qwen3_vision_rotary_fp32(k, rotary_pos_emb)
 
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
@@ -2689,6 +2689,24 @@ def _install_qwen3_family_compile_patches():
         output = mx.concatenate(attn_outputs, axis=2)
         output = output.transpose(0, 2, 1, 3).reshape(seq_length, -1)
         return self.proj(output)
+
+    def _qwen3_vision_rotary_fp32(tensor, freqs):
+        """Match Transformers Qwen3-VL rotary: fp32 math, cast back."""
+        import mlx.core as mx
+
+        orig_dtype = tensor.dtype
+        tensor_f = tensor.astype(mx.float32)
+        freqs_f = freqs.astype(mx.float32)
+        cos = mx.cos(freqs_f)
+        sin = mx.sin(freqs_f)
+
+        cos = mx.expand_dims(cos, axis=1)
+        cos = mx.tile(cos, (1, 1, 2))
+        sin = mx.expand_dims(sin, axis=1)
+        sin = mx.tile(sin, (1, 1, 2))
+
+        rotated = (tensor_f * cos) + (vision_module.rotate_half(tensor_f) * sin)
+        return rotated.astype(orig_dtype)
 
     def _qwen3_torch_like_layer_norm(norm, x):
         """Match PyTorch bf16 LayerNorm: fp32 stats/affine, cast result back."""

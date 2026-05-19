@@ -279,6 +279,20 @@ def test_mlx_loader_keeps_norm_parameters_float32():
     )
 
 
+def test_qwen3_vl_vision_rotary_uses_transformers_fp32_math():
+    import inspect
+    import unsloth_zoo.mlx.compile as mc
+
+    source = inspect.getsource(mc._install_qwen3_family_compile_patches)
+
+    assert "def _qwen3_vision_rotary_fp32" in source
+    assert "tensor_f = tensor.astype(mx.float32)" in source
+    assert "freqs_f = freqs.astype(mx.float32)" in source
+    assert "return rotated.astype(orig_dtype)" in source
+    assert "q = _qwen3_vision_rotary_fp32(q, rotary_pos_emb)" in source
+    assert "k = _qwen3_vision_rotary_fp32(k, rotary_pos_emb)" in source
+
+
 # ---------------------------------------------------------------------------
 # 2. compile module-level discovery functions return sensible defaults
 #    on a host with no real MLX architectures.
