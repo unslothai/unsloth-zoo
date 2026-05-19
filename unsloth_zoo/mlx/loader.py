@@ -2741,10 +2741,6 @@ class FastMLXModel:
                 "Install via: pip install unsloth-zoo[mlx]"
             )
 
-        # Seed mlx random state so LoRA matrix init (lora_b is zero, lora_a
-        # is random Gaussian) is reproducible across runs.
-        _seed_mlx_random_state(random_state)
-
         # finetune_vision_layers (None = use train_vision arg; bool overrides it)
         if finetune_vision_layers is not None:
             train_vision = bool(finetune_vision_layers)
@@ -2824,6 +2820,10 @@ class FastMLXModel:
                     num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = _resolve_lora_keys(lm, target_modules)
                 if language_lora_keys is None or len(language_lora_keys) > 0:
+                    # Match mlx_lm/tuner/lora.py (def train) -- seed
+                    # mx.random immediately before LoRA init; lazy MLX
+                    # state advances otherwise leak into lora_a sampling.
+                    _seed_mlx_random_state(random_state)
                     linear_to_lora_layers(
                         lm,
                         num_layers=num_layers,
@@ -2907,6 +2907,10 @@ class FastMLXModel:
                 language_lora_keys = _resolve_lora_keys(model, target_modules)
                 if language_lora_keys is not None and len(language_lora_keys) == 0:
                     _raise_no_lora_targets(target_modules)
+                # Match mlx_lm/tuner/lora.py (def train) -- seed
+                # mx.random immediately before LoRA init; lazy MLX
+                # state advances otherwise leak into lora_a sampling.
+                _seed_mlx_random_state(random_state)
                 linear_to_lora_layers(
                     model,
                     num_layers=num_layers,
