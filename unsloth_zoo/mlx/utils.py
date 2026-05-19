@@ -2723,15 +2723,34 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
-    # why: record LoRA module paths so reload recreates vision/projector LoRA
-    # layers (mlx-lm.load_adapters only knows the language tower).
+    # why: record LoRA module paths and parameters so reload recreates the same
+    # adapter topology. Without scale metadata, reload falls back to scale=1.0
+    # even when training used alpha/r > 1, changing post-reload logits.
     try:
         lora_paths = []
+        lora_rank = None
+        lora_scale = None
+        lora_dropout = None
         for name, module in model.named_modules():
             if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
                 lora_paths.append(name)
+                if lora_rank is None:
+                    lora_rank = int(module.lora_a.shape[-1])
+                    lora_scale = float(getattr(module, "scale", 1.0))
+                    drop = getattr(module, "dropout", None)
+                    lora_dropout = float(getattr(drop, "p", 0.0) if drop else 0.0)
         if lora_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
+        if lora_rank is not None:
+            lora_parameters = dict(adapter_config.get("lora_parameters") or {})
+            lora_parameters.setdefault("rank", lora_rank)
+            lora_parameters.setdefault("scale", lora_scale)
+            lora_parameters.setdefault("dropout", lora_dropout)
+            adapter_config["lora_parameters"] = lora_parameters
+            adapter_config.setdefault("rank", lora_parameters["rank"])
+            adapter_config.setdefault("scale", lora_parameters["scale"])
+            adapter_config.setdefault("dropout", lora_parameters["dropout"])
+            adapter_config.setdefault("peft_type", "LORA")
     except Exception:
         pass
     return adapter_config
