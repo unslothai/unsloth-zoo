@@ -353,7 +353,7 @@ def make_cce_loss_fn(model):
             sc = layer.scales
             bi = layer.biases if _has_biases else mx.zeros_like(layer.scales)
             steps = mx.arange(1, targets.shape[1] + 1)
-            length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             if labels is None:
                 mask = length_mask
             else:
@@ -386,7 +386,7 @@ def make_cce_loss_fn(model):
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             steps = mx.arange(1, targets.shape[1] + 1)
-            length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             if labels is None:
                 mask = length_mask
             else:
@@ -422,7 +422,7 @@ def make_baseline_loss_fn():
             targets = labels[:, 1:]
         logits = model(inputs)
         steps = mx.arange(1, targets.shape[1] + 1)
-        length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+        length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
         if labels is None:
             mask = length_mask.astype(mx.float32)
         else:
@@ -744,13 +744,13 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     attention_mask = batch_dict.get("attention_mask")
     labels = batch_dict.get("labels")
 
-    inputs = input_ids[:, :-1]
-    # Shift attention_mask so any 4D causal/image mask the embedder builds
-    # has q/kv dims matching the (shifted) inputs. Otherwise models like
-    # Gemma3 see (B,1,S,S-1) vs (B,H,S-1,S-1) at SDPA and crash.
+    # Match the standard VLM forward semantics: run the full multimodal
+    # sequence, then use hidden[:, :-1] to predict labels[:, 1:].  Qwen3-VL
+    # image/mRoPE/deepstack state depends on the complete sequence; trimming
+    # input_ids before the multimodal forward produces a different loss from
+    # the full-logits path and from CUDA.
+    inputs = input_ids
     fwd_attn_mask = attention_mask
-    if attention_mask is not None and attention_mask.shape[-1] == input_ids.shape[-1]:
-        fwd_attn_mask = attention_mask[:, :-1]
 
     # Collect extra keys (e.g. image_grid_thw for Qwen) that some models need.
     extra_kwargs = {
@@ -767,7 +767,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         **extra_kwargs,
     )
     merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
-    if "position_ids" in extra_kwargs and "position_ids" not in backbone_kwargs:
+    if "position_ids" in extra_kwargs:
         backbone_kwargs["position_ids"] = extra_kwargs["position_ids"]
 
     hidden = _forward_text_hidden_states(
@@ -776,6 +776,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         inputs_embeds=merged_embeds,
         **backbone_kwargs,
     )
+    hidden = hidden[:, :-1, :]
 
     if labels is not None:
         # train_on_responses_only: labels already encode instruction and
@@ -2423,7 +2424,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
     Returns:
         A CacheDataset ready for ``iterate_batches``.
     """
-    from mlx_lm.tuner.datasets import TextDataset, CacheDataset
+    from mlx_lm.tuner.datasets import CacheDataset
 
     normalize_mlx_chat_template(
         tokenizer,
@@ -2460,7 +2461,24 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
             "a formatting_func that returns text."
         )
 
-    return CacheDataset(TextDataset(formatted, tokenizer, text_key="text"))
+    class _StudioTextDataset:
+        """TextDataset variant that does not append EOS behind Studio's back."""
+
+        def __init__(self, data, tokenizer, text_key="text"):
+            self._data = data
+            self.tokenizer = tokenizer
+            self.text_key = text_key
+
+        def process(self, item):
+            return (self.tokenizer.encode(item[self.text_key]), 0)
+
+        def __getitem__(self, idx):
+            return self._data[idx]
+
+        def __len__(self):
+            return len(self._data)
+
+    return CacheDataset(_StudioTextDataset(formatted, tokenizer, text_key="text"))
 
 
 def create_batches(dataset, tokenizer, batch_size, max_seq_length,
@@ -2497,6 +2515,8 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         loop=(num_batches is not None),
         seed=seed,
     ):
+        max_length = int(mx.max(lengths_info[:, 1]).item())
+        batch = batch[:, :max_length]
         batch_pairs.append((batch, lengths_info, None))
         if num_batches is not None and len(batch_pairs) >= num_batches:
             break
@@ -2531,6 +2551,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
         loop=True,
         seed=seed,
     ):
+        max_length = int(mx.max(lengths_info[:, 1]).item())
+        batch = batch[:, :max_length]
         yield batch, lengths_info, None
 
 

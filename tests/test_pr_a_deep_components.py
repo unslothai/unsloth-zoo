@@ -113,7 +113,7 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
         ("constant", 5),
     ],
 )
-def test_scheduler_lr_is_nonzero_for_optimizer_update_steps(scheduler, warmup):
+def test_scheduler_lr_matches_expected_optimizer_update_steps(scheduler, warmup):
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     total_steps = 8
@@ -134,7 +134,149 @@ def test_scheduler_lr_is_nonzero_for_optimizer_update_steps(scheduler, warmup):
         for value in raw_values
     ]
 
-    assert all(value > 0.0 for value in values)
+    if scheduler == "linear" and warmup == 0:
+        expected = [
+            0.0,
+            trainer.args.learning_rate,
+            trainer.args.learning_rate * 6 / 7,
+            trainer.args.learning_rate * 5 / 7,
+            trainer.args.learning_rate * 4 / 7,
+            trainer.args.learning_rate * 3 / 7,
+            trainer.args.learning_rate * 2 / 7,
+            trainer.args.learning_rate * 1 / 7,
+        ]
+        assert values == pytest.approx(expected)
+    else:
+        assert all(value > 0.0 for value in values)
+
+
+def test_mlx_text_dataset_does_not_append_eos(monkeypatch):
+    """Studio formatting owns EOS decisions; MLX batching must not add one."""
+    import sys
+
+    class CacheDataset:
+        def __init__(self, data):
+            self._data = data
+            self._cache = {}
+
+        def __len__(self):
+            return len(self._data)
+
+        def __getitem__(self, idx):
+            if idx not in self._cache:
+                self._cache[idx] = self._data.process(self._data[idx])
+            return self._cache[idx]
+
+        def itemlen(self, idx):
+            return len(self[idx][0])
+
+    monkeypatch.setattr(sys.modules["mlx_lm.tuner.datasets"], "CacheDataset", CacheDataset)
+
+    from unsloth_zoo.mlx.utils import _prepare_dataset
+
+    class Tokenizer:
+        eos_token_id = 99
+        chat_template = None
+
+        def encode(self, text):
+            assert text == "hello"
+            return [1, 2, 3]
+
+    dataset = _prepare_dataset([{"text": "hello"}], Tokenizer())
+
+    assert dataset[0] == ([1, 2, 3], 0)
+
+
+def test_mlx_text_loss_masks_exclude_position_at_sequence_length():
+    import inspect
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    source = inspect.getsource(mlx_utils.make_baseline_loss_fn)
+    assert "steps < lengths[:, 1:]" in source
+
+
+def test_mlx_train_result_reports_base_quantization():
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    source = inspect.getsource(MLXTrainer._train_inner)
+    assert '"base_quantization_config"' in source
+    assert '"base_quantization_policy"' in source
+    assert '"base_quantized_source"' in source
+
+
+def test_mlx_loader_exposes_dense_nf4_diagnostic_mode():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.loader import (
+        _MLX_QUANT_MODE_DEFAULTS,
+        _nf4_dense_dequantize_weight,
+    )
+
+    assert _MLX_QUANT_MODE_DEFAULTS["nf4_dense"] == (64, 4)
+
+    weight = mx.array([[-1.0, -0.6961928, 0.0, 0.72295684]], dtype=mx.float32)
+    dequantized = _nf4_dense_dequantize_weight(weight, group_size=4)
+    assert dequantized.shape == weight.shape
+    assert dequantized.reshape((-1,)).tolist() == pytest.approx(
+        weight.reshape((-1,)).tolist()
+    )
+
+
+def test_mlx_loader_keeps_norm_parameters_float32():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.loader import _keep_norm_parameters_float32
+
+    class TinyModel:
+        def __init__(self):
+            self._parameters = {
+                "vision_tower": {
+                    "blocks": {
+                        "0": {
+                            "norm1": {
+                                "weight": mx.array([1.0], dtype=mx.bfloat16),
+                                "bias": mx.array([0.0], dtype=mx.bfloat16),
+                            },
+                            "attn": {
+                                "qkv": {
+                                    "weight": mx.array([[1.0]], dtype=mx.bfloat16),
+                                },
+                            },
+                        },
+                    },
+                },
+                "language_model": {
+                    "model": {
+                        "layers": {
+                            "0": {
+                                "input_layernorm": {
+                                    "weight": mx.array([1.0], dtype=mx.bfloat16),
+                                },
+                            },
+                        },
+                    },
+                },
+            }
+
+        def parameters(self):
+            return self._parameters
+
+        def update(self, parameters):
+            self._parameters = parameters
+
+    model = TinyModel()
+    _keep_norm_parameters_float32(model)
+    params = model.parameters()
+
+    assert params["vision_tower"]["blocks"]["0"]["norm1"]["weight"].dtype == mx.float32
+    assert params["vision_tower"]["blocks"]["0"]["norm1"]["bias"].dtype == mx.float32
+    assert (
+        params["language_model"]["model"]["layers"]["0"]["input_layernorm"]["weight"].dtype
+        == mx.float32
+    )
+    assert (
+        params["vision_tower"]["blocks"]["0"]["attn"]["qkv"]["weight"].dtype
+        == mx.bfloat16
+    )
 
 
 # ---------------------------------------------------------------------------

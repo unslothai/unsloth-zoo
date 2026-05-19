@@ -112,6 +112,38 @@ def _convert_mlx_dtype(model, target_dtype) -> None:
     mx.eval(model.parameters())
 
 
+def _is_norm_parameter_path(path) -> bool:
+    """Return whether a parameter path belongs to a normalization module."""
+    parts = str(path).lower().split(".")
+    return any("norm" in part for part in parts[:-1])
+
+
+def _keep_norm_parameters_float32(model) -> None:
+    """Keep LM/VLM normalization parameters in fp32 across FT/LoRA/QLoRA."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten, tree_map_with_path
+
+    needs_cast = False
+    for k, v in tree_flatten(model.parameters()):
+        if (
+            _is_norm_parameter_path(k)
+            and mx.issubdtype(v.dtype, mx.floating)
+            and v.dtype != mx.float32
+        ):
+            needs_cast = True
+            break
+    if not needs_cast:
+        return
+
+    model.update(tree_map_with_path(
+        lambda k, v: v.astype(mx.float32)
+        if _is_norm_parameter_path(k) and mx.issubdtype(v.dtype, mx.floating)
+        else v,
+        model.parameters(),
+    ))
+    mx.eval(model.parameters())
+
+
 def _seed_mlx_random_state(random_state):
     try:
         seed = int(random_state)
@@ -725,6 +757,9 @@ _MULTIMODAL_SKIP_FRAGMENTS = (
 
 _MLX_QUANT_MODE_DEFAULTS = {
     "affine": (64, 4),
+    # Diagnostic CUDA bitsandbytes NF4 parity mode. This quantizes and then
+    # immediately dequantizes into dense Linear weights; it is not memory-saving.
+    "nf4_dense": (64, 4),
     "mxfp4": (32, 4),
     "nvfp4": (16, 4),
     "mxfp8": (32, 8),
@@ -1412,6 +1447,87 @@ def _dequantize_selected_mlx_modules(model, predicate):
     return len(replacements)
 
 
+def _nf4_dense_dequantize_weight(weight, group_size=64):
+    import mlx.core as mx
+
+    codebook = mx.array(
+        [
+            -1.0,
+            -0.6961928009986877,
+            -0.5250730514526367,
+            -0.39491748809814453,
+            -0.28444138169288635,
+            -0.18477343022823334,
+            -0.09105003625154495,
+            0.0,
+            0.07958029955625534,
+            0.16093020141124725,
+            0.24611230194568634,
+            0.33791524171829224,
+            0.44070982933044434,
+            0.5626170039176941,
+            0.7229568362236023,
+            1.0,
+        ],
+        dtype=mx.float32,
+    )
+    original_shape = weight.shape
+    original_dtype = weight.dtype
+    flat = weight.astype(mx.float32).reshape((-1,))
+    original_size = (
+        flat.numel()
+        if callable(getattr(flat, "numel", None))
+        else (flat.size() if callable(getattr(flat, "size", None)) else flat.size)
+    )
+    pad = (-original_size) % group_size
+    if pad:
+        flat = mx.concatenate([flat, mx.zeros((pad,), dtype=mx.float32)])
+    groups = flat.reshape((-1, group_size))
+    absmax = mx.max(mx.abs(groups), axis=1, keepdims=True)
+    denom = mx.maximum(absmax, mx.array(1e-12, dtype=mx.float32))
+    scaled = groups / denom
+    indices = mx.argmin(mx.abs(scaled[..., None] - codebook), axis=-1)
+    dequantized = (codebook[indices] * absmax).reshape((-1,))[:original_size]
+    return dequantized.reshape(original_shape).astype(original_dtype)
+
+
+def _apply_dense_nf4_quantization(model, config, spec: _MLXQuantizationSpec, predicate):
+    import mlx.core as mx
+
+    quantized = {}
+    for path, module in model.named_modules():
+        if not predicate(path, module):
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None or len(getattr(weight, "shape", ())) != 2:
+            continue
+        module.weight = _nf4_dense_dequantize_weight(weight, spec.group_size or 64)
+        quantized[path] = {
+            "bits": 4,
+            "group_size": spec.group_size or 64,
+            "mode": "nf4_dense",
+            "storage": "dense_dequantized",
+        }
+        mx.eval(module.weight)
+
+    updated_config = dict(config or {}) if isinstance(config, dict) else {}
+    updated_config["quantization"] = quantized
+    updated_config["quantization_config"] = quantized
+    model._config = updated_config
+    model._unsloth_quantization_config = quantized
+    model._unsloth_quantization_policy = {
+        **spec.to_metadata(),
+        "storage": "dense_dequantized",
+        "warning": (
+            "nf4_dense is a diagnostic CUDA bitsandbytes NF4 parity mode. "
+            "Weights are stored densely after quantize/dequantize and this "
+            "does not reduce memory like QLoRA."
+        ),
+    }
+    model._unsloth_quantized_source = "runtime_dense_nf4"
+    return model, updated_config
+
+
 def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
     if not spec.enabled:
         model._unsloth_quantization_config = None
@@ -1448,6 +1564,8 @@ def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm
     if is_vlm or spec.quantize_modules is not None or user_predicate is not None:
         config = dict(config or {})
         config.setdefault("quantization", {})
+    if spec.mode == "nf4_dense":
+        return _apply_dense_nf4_quantization(model, config, spec, predicate)
     model, updated_config = quantize_model(
         model,
         config,
@@ -2435,6 +2553,7 @@ class FastMLXModel:
                         model._unsloth_quantized_source = adapter_cfg.get(
                             "base_quantized_source"
                         )
+                    _keep_norm_parameters_float32(model)
                     _patch_mlx_saving(model, tokenizer)
                     return model, tokenizer
             except Exception as e:
@@ -2537,6 +2656,7 @@ class FastMLXModel:
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
+            _keep_norm_parameters_float32(model)
 
             from .utils import (
                 normalize_mlx_chat_template,
@@ -2648,6 +2768,7 @@ class FastMLXModel:
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
+            _keep_norm_parameters_float32(model)
             from .utils import normalize_mlx_chat_template
 
             tokenizer = normalize_mlx_chat_template(

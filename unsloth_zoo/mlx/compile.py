@@ -2674,13 +2674,48 @@ def _install_qwen3_family_compile_patches():
 
         attn_outputs = []
         for q_chunk, k_chunk, v_chunk in zip(*splits):
+            # MLX fused SDPA currently has a forward/value mismatch under
+            # value_and_grad for Qwen3-VL vision chunks. Use explicit attention
+            # here so training loss and plain forward loss agree.
+            scores = (
+                q_chunk.astype(mx.float32)
+                @ mx.swapaxes(k_chunk.astype(mx.float32), -1, -2)
+            ) * self.scale
+            probs = mx.softmax(scores, axis=-1).astype(q_chunk.dtype)
             attn_outputs.append(
-                vision_module.ensure_fused_sdpa(q_chunk, k_chunk, v_chunk, self.scale)
+                probs @ v_chunk
             )
 
         output = mx.concatenate(attn_outputs, axis=2)
         output = output.transpose(0, 2, 1, 3).reshape(seq_length, -1)
         return self.proj(output)
+
+    def _qwen3_torch_like_layer_norm(norm, x):
+        """Match PyTorch bf16 LayerNorm: fp32 stats/affine, cast result back."""
+        import mlx.core as mx
+
+        source_dtype = x.dtype
+        x_f = x.astype(mx.float32)
+        mean = mx.mean(x_f, axis=-1, keepdims=True)
+        centered = x_f - mean
+        var = mx.mean(centered * centered, axis=-1, keepdims=True)
+        y = centered * mx.rsqrt(var + norm.eps)
+        if "weight" in norm:
+            y = y * norm.weight.astype(mx.float32)
+        if "bias" in norm:
+            y = y + norm.bias.astype(mx.float32)
+        return y.astype(source_dtype)
+
+    def patched_qwen3_vision_block_call(self, hidden_states, cu_seqlens, rotary_pos_emb):
+        hidden_states = hidden_states + self.attn(
+            _qwen3_torch_like_layer_norm(self.norm1, hidden_states),
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=rotary_pos_emb,
+        )
+        hidden_states = hidden_states + self.mlp(
+            _qwen3_torch_like_layer_norm(self.norm2, hidden_states)
+        )
+        return hidden_states
 
     def patched_qwen3_rot_pos_emb(self, grid_thw):
         import mlx.core as mx
@@ -2918,6 +2953,7 @@ def _install_qwen3_family_compile_patches():
     _patch_staticmethod(module.Model, "merge_input_ids_with_image_features", merge_qwen3)
     _patch_staticmethod(qwen35_module.Model, "merge_input_ids_with_image_features", merge_qwen3)
     _patch_method(vision_module.Attention, "__call__", patched_qwen3_attention)
+    _patch_method(vision_module.Qwen3VLMoEVisionBlock, "__call__", patched_qwen3_vision_block_call)
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_qwen3_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
     _patch_method(vision_module.VisionModel, "__call__", patched_qwen3_vision_call)
@@ -2928,6 +2964,7 @@ def _install_qwen3_family_compile_patches():
         qwen3moe_module.masked_scatter = _masked_scatter_no_numpy
         _patch_staticmethod(qwen3moe_module.Model, "merge_input_ids_with_image_features", merge_qwen3)
         _patch_method(qwen3moe_vision_module.Attention, "__call__", patched_qwen3_attention)
+        _patch_method(qwen3moe_vision_module.Qwen3VLMoEVisionBlock, "__call__", patched_qwen3_vision_block_call)
         _patch_method(qwen3moe_vision_module.VisionModel, "rot_pos_emb", patched_qwen3_rot_pos_emb)
         _patch_method(qwen3moe_vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
         _patch_method(qwen3moe_vision_module.VisionModel, "__call__", patched_qwen3_vision_call)

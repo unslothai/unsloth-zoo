@@ -322,6 +322,22 @@ class MLXTrainer:
 
         decay_steps = max(total_steps - warmup, 1)
 
+        if sched_type == "linear" and warmup == 0:
+            # Match the Studio CUDA/Trainer path observed in fixed-fixture
+            # probes: linear/no-warmup starts with a zero-LR optimizer step,
+            # then decays from the requested LR over the remaining steps.
+            decay_after_zero = max(total_steps - 1, 1)
+
+            def main_schedule(step):
+                step = mx.array(step)
+                decay = mx.maximum(
+                    mx.array(total_steps, dtype=mx.float32) - step,
+                    mx.array(0.0, dtype=mx.float32),
+                ) / mx.array(decay_after_zero, dtype=mx.float32)
+                return mx.where(step <= 0, mx.array(0.0, dtype=mx.float32), lr * decay)
+
+            return main_schedule
+
         if sched_type == "cosine":
             main_schedule = optim.cosine_decay(lr, decay_steps, end=0.0)
         elif sched_type == "linear":
@@ -745,7 +761,8 @@ class MLXTrainer:
         _direct_single_step_update = (
             grad_accum == 1 and
             not _needs_grad_scaling and
-            max_grad_norm <= 0
+            max_grad_norm <= 0 and
+            not _clip_grad_value
         )
 
         def _grad_leaf_scale(name, safe_toks_f, clip_scale=None, dtype=None):
@@ -1261,6 +1278,15 @@ class MLXTrainer:
             ),
             "compile_auto_tune_applied": list(getattr(self, "_compile_auto_tune_applied", [])),
             "memory_limits_applied": dict(getattr(self, "_memory_limits_applied", {})),
+            "base_quantization_config": getattr(
+                self.model, "_unsloth_quantization_config", None,
+            ),
+            "base_quantization_policy": getattr(
+                self.model, "_unsloth_quantization_policy", None,
+            ),
+            "base_quantized_source": getattr(
+                self.model, "_unsloth_quantized_source", None,
+            ),
         }
 
     def _prepare_data(self, is_vlm):
