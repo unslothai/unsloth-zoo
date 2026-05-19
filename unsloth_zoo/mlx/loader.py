@@ -2820,11 +2820,6 @@ class FastMLXModel:
                 num_layers = 0
                 if hasattr(lm, "model") and hasattr(lm.model, "layers"):
                     num_layers = len(lm.model.layers)
-                # finetune_last_n_layers: opt-in to mlx-lm CLI semantics where
-                # only the last N transformer blocks get LoRA. mlx-lm/lora.py
-                # CONFIG_DEFAULTS sets num_layers=16. Defaults to None here
-                # (= all layers, matching PEFT/CUDA semantics); pass an int
-                # to mirror mlx-lm CLI behavior.
                 if finetune_last_n_layers is not None and num_layers > 0:
                     num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = _resolve_lora_keys(lm, target_modules)
@@ -2907,11 +2902,6 @@ class FastMLXModel:
                 num_layers = 0
                 if hasattr(model, "model") and hasattr(model.model, "layers"):
                     num_layers = len(model.model.layers)
-                # finetune_last_n_layers: opt-in to mlx-lm CLI semantics where
-                # only the last N transformer blocks get LoRA. mlx-lm/lora.py
-                # CONFIG_DEFAULTS sets num_layers=16. Defaults to None here
-                # (= all layers, matching PEFT/CUDA semantics); pass an int
-                # to mirror mlx-lm CLI behavior.
                 if finetune_last_n_layers is not None and num_layers > 0:
                     num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = _resolve_lora_keys(model, target_modules)
