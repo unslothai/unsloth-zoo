@@ -2741,9 +2741,19 @@ class FastMLXModel:
                 "Install via: pip install unsloth-zoo[mlx]"
             )
 
-        # Seed mlx random state so LoRA matrix init (lora_b is zero, lora_a
-        # is random Gaussian) is reproducible across runs.
-        _seed_mlx_random_state(random_state)
+        # Note: the actual `mx.random.seed(random_state)` is moved closer to
+        # each `linear_to_lora_layers` call below. Calling it here -- and then
+        # running >100 lines of target-module normalization, `_fix_missing_no_grad`,
+        # `_resolve_lora_keys`, and (on VLM) `_fix_gemma4_kv_sharing` before the
+        # actual LoRA construction -- leaves a window in which lazy MLX
+        # evaluations can advance `mx.random.state` so that lora_a values end up
+        # different from what `mlx-lm`'s CLI gets after `mx.random.seed(seed)` at
+        # `mlx_lm/lora.py:223` (the seed is the last thing CLI does before
+        # `linear_to_lora_layers`). Empirically (probe 39 on
+        # danielhanchen/unsloth-staging-2) step-1 grad_norm diverged by 2-3 units
+        # vs the mlx-lm-direct path on the same seed even though the model
+        # weights loaded identically; seeding immediately before
+        # `linear_to_lora_layers` closes that window.
 
         # finetune_vision_layers (None = use train_vision arg; bool overrides it)
         if finetune_vision_layers is not None:
@@ -2829,6 +2839,10 @@ class FastMLXModel:
                     num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = _resolve_lora_keys(lm, target_modules)
                 if language_lora_keys is None or len(language_lora_keys) > 0:
+                    # Reseed mx.random immediately before LoRA construction to
+                    # match mlx-lm CLI's lora.py:223 ordering exactly. See
+                    # rationale on the comment block at the top of this method.
+                    _seed_mlx_random_state(random_state)
                     linear_to_lora_layers(
                         lm,
                         num_layers=num_layers,
@@ -2917,6 +2931,14 @@ class FastMLXModel:
                 language_lora_keys = _resolve_lora_keys(model, target_modules)
                 if language_lora_keys is not None and len(language_lora_keys) == 0:
                     _raise_no_lora_targets(target_modules)
+                # Reseed mx.random immediately before LoRA construction so
+                # `linear_to_lora_layers`'s `mx.random.uniform` calls for lora_a
+                # init see a fresh state. Matches mlx-lm CLI's lora.py:223
+                # ordering (seed is the last thing it does before
+                # linear_to_lora_layers). Without this, ~160 lines of
+                # target-module normalization and module-tree walks between an
+                # earlier seed and this call can advance mx.random.state.
+                _seed_mlx_random_state(random_state)
                 linear_to_lora_layers(
                     model,
                     num_layers=num_layers,

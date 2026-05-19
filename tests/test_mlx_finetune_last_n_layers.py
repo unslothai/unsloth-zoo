@@ -72,6 +72,11 @@ def test_get_peft_model_passes_finetune_last_n_layers_through():
         _is_vlm_model = False
         def freeze(self): pass
         def unfreeze(self, **kwargs): pass
+        # get_peft_model's tail counts trainable/total params for a log line;
+        # return empty dicts so the count is 0/0 (the log handles the
+        # divide-by-zero case via `pct = 0 if total == 0`).
+        def trainable_parameters(self): return {}
+        def parameters(self): return {}
 
     # Capture num_layers values seen by linear_to_lora_layers.
     captured = {"calls": []}
