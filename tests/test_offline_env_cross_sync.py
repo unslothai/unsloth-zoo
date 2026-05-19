@@ -71,11 +71,20 @@ class TestOfflineCrossSync:
         assert os.environ.get("TRANSFORMERS_OFFLINE") == "1"
         assert os.environ.get("HF_DATASETS_OFFLINE") == "1"
 
-    def test_only_value_1_triggers(self, monkeypatch, reload_zoo):
-        # The cross-sync only matches the literal "1" (existing convention).
-        # Other truthy spellings are left as-is; documented behaviour.
-        monkeypatch.setenv("HF_HUB_OFFLINE", "true")
+    @pytest.mark.parametrize("value", ["true", "True", "TRUE", "yes", "on"])
+    def test_truthy_spellings_trigger_and_normalize(self, monkeypatch, reload_zoo, value):
+        # Since #675, any value in {"1","true","yes","on"} (case-insensitive)
+        # triggers cross-sync and normalizes all three to "1".
+        monkeypatch.setenv("HF_HUB_OFFLINE", value)
         reload_zoo()
-        assert os.environ.get("HF_HUB_OFFLINE") == "true"
+        assert os.environ.get("HF_HUB_OFFLINE") == "1"
+        assert os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+        assert os.environ.get("HF_DATASETS_OFFLINE") == "1"
+
+    def test_falsy_value_does_not_trigger(self, monkeypatch, reload_zoo):
+        # Falsy values leave the other two vars unset.
+        monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+        reload_zoo()
+        assert os.environ.get("HF_HUB_OFFLINE") == "0"
         assert os.environ.get("TRANSFORMERS_OFFLINE", "0") != "1"
         assert os.environ.get("HF_DATASETS_OFFLINE", "0") != "1"
