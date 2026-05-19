@@ -1532,8 +1532,9 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         if not batch_items:
             continue
         max_len = max(len(ids) for ids, _ in batch_items)
-        # Round up to nearest multiple of _PAD_MULTIPLE (matching mlx-lm)
-        padded_len = ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
+        # Match mlx-lm iterate_batches: +1 gives the autoregressive
+        # shift headroom so post-shift length is a clean _PAD_MULTIPLE.
+        padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
         padded_len = min(padded_len, max_seq_length)
 
         batch_ids = []
