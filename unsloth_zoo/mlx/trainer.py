@@ -119,14 +119,8 @@ class MLXTrainingConfig:
     optim: str = "adamw"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
     weight_decay: float = 0.001
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
-    # Elementwise clip ([-max_grad_value, max_grad_value], per-leaf, no
-    # cross-leaf reduction). None or 0.0 disables. Default None matches
-    # HF/TRL semantics (no elementwise clip) so a user passing
-    # max_grad_norm=1.0 — the HF/TRL standard — gets global-norm
-    # clipping as they intended instead of having it silently dropped in
-    # favor of elementwise. Power users can still opt into elementwise
-    # clipping by passing a positive value; in that case the existing
-    # mutual-exclusion rule (elementwise wins over global) applies.
+    # Elementwise clip ([-max_grad_value, max_grad_value], per-leaf).
+    # None or 0.0 disables; positive opts in and overrides max_grad_norm.
     max_grad_value: float | None = None
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
@@ -729,11 +723,7 @@ class MLXTrainer:
         # Build step functions following mlx-lm's pattern
         max_grad_norm = float(args.max_grad_norm or 0.0)
         # Elementwise clip (clip_grad_value_): leaf-local, free memory.
-        # Default None disables elementwise so a user-supplied max_grad_norm
-        # is honored as the HF/TRL parity setting. Power users opt in by
-        # passing a positive value, in which case the existing mutual-
-        # exclusion rule (elementwise wins over global) applies and we
-        # warn so the override is visible.
+        # None or 0.0 disables; positive opts in and overrides max_grad_norm.
         _raw_mgv = getattr(args, "max_grad_value", None)  # TODO: expose MLX grad-clip in Studio UI for power users
         max_grad_value = 0.0 if _raw_mgv is None else float(_raw_mgv or 0.0)
         if max_grad_norm > 0 and max_grad_value > 0:
