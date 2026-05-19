@@ -1038,7 +1038,9 @@ def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: tor
 
     Per (bm, bn) block: scale_inv = max_abs / 448, W_fp8 = clamp(W / scale_inv, ±448).
     Mirrors transformers Fp8Quantize.convert (finegrained_fp8.py:838-859).
-    Zero-blocks get scale_inv = 1.0 (avoids div-by-zero; the encoded fp8 is also 0).
+    Zero-blocks get clamped to scale_inv = 1e-12 (avoids div-by-zero; the
+    encoded fp8 is 0 either way, so on reload `0 * 1e-12 == 0` round-trips
+    cleanly).
     """
     rows, cols = W.shape
     bm, bn = block_shape
@@ -1054,27 +1056,41 @@ def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: tor
     return W_fp8, scale_inv.to(scale_dtype)
 
 
+_FP8_MERGE_UNSAFE = object()  # sentinel: FP8 base detected but cannot safely apply LoRA delta
+
+
 def _fp8_load_for_merge(file, header_metadata, weight_key):
     """If `weight_key` points to an fp8 expert weight with a companion
-    `weight_scale_inv`, return (W_bf16, scale_meta) where scale_meta carries
-    the info needed to re-quantize on the way out. Otherwise return
-    (W_as_read, None) for the existing non-fp8 path.
+    `weight_scale_inv` (DeepSeek-style) or `weight_scale` (compressed-tensors
+    style), return (W_bf16, scale_meta) where scale_meta carries the info
+    needed to re-quantize on the way out. For non-fp8 weights return
+    (W_as_read, None). For fp8 weights where the companion scale cannot be
+    located or matched, return (_FP8_MERGE_UNSAFE, None) — the caller MUST
+    skip the LoRA merge for this key rather than cast fp8 → fp32 directly
+    (that drops the per-block scale and the merged checkpoint is corrupt).
 
     scale_meta is a dict: {scale_key, scale_dtype, block_shape}
     """
     W = file.get_tensor(weight_key)
     if W.dtype != torch.float8_e4m3fn:
         return W, None
-    scale_key = weight_key[: -len(".weight")] + ".weight_scale_inv"
-    if scale_key not in header_metadata:
-        return W, None
+    # DeepSeek-style scale_inv is preferred; compressed-tensors' weight_scale
+    # carries the same per-block magnitude.
+    base = weight_key[: -len(".weight")] if weight_key.endswith(".weight") else weight_key
+    candidate_keys = (
+        base + ".weight_scale_inv",
+        base + ".weight_scale",
+    )
+    scale_key = next((k for k in candidate_keys if k in header_metadata), None)
+    if scale_key is None:
+        return _FP8_MERGE_UNSAFE, None
     scale_inv = file.get_tensor(scale_key)
     if scale_inv.ndim != 2 or W.ndim != 2:
-        return W, None
+        return _FP8_MERGE_UNSAFE, None
     rows, cols = W.shape
     srows, scols = scale_inv.shape
     if rows % srows != 0 or cols % scols != 0:
-        return W, None
+        return _FP8_MERGE_UNSAFE, None
     bm, bn = rows // srows, cols // scols
     W_bf16 = _fp8_dequant_blockwise(W, scale_inv)
     return W_bf16, {
@@ -1087,14 +1103,29 @@ def _fp8_load_for_merge(file, header_metadata, weight_key):
 def _peft_paramwrapper_swaps_in_out():
     """True if installed PEFT version's ParamWrapper.update_layer performs the
     `(experts, in, out) -> (experts, out, in)` swap for 3D non-transposed MoE
-    params. Introduced in PEFT 0.19; absent in 0.18 and earlier."""
+    params. Introduced in PEFT 0.19; absent in 0.18 and earlier.
+
+    Prefers `peft.__version__` (cheap, stable) and falls back to checking
+    whether `ParamWrapper` exposes `_did_swap_in_out_features` as a class
+    attribute (defined at __init__ time in 0.19, absent in 0.18). Last-resort
+    fallback to inspect.getsource if neither is available (e.g. a packaged
+    PEFT without a version string).
+    """
+    try:
+        from peft import __version__ as _peft_version
+        major, minor = _peft_version.split(".")[:2]
+        return (int(major), int(minor)) >= (0, 19)
+    except Exception:
+        pass
     try:
         from peft.tuners.lora.layer import ParamWrapper
+        # PEFT 0.19's update_layer references `_did_swap_in_out_features`; the
+        # attribute is set on instances, not the class, so a hasattr check on
+        # the class doesn't suffice — fall back to source inspection.
         import inspect
         return "_did_swap_in_out_features" in inspect.getsource(ParamWrapper.update_layer)
     except Exception:
-        # If we can't inspect, assume modern PEFT.
-        return True
+        return True  # assume modern PEFT
 
 
 _PEFT_AMBIGUOUS_LAYOUT_DEFAULT = "standard" if _peft_paramwrapper_swaps_in_out() else "swapped"
@@ -1150,7 +1181,19 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
     try:
         num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
         if num_experts is None or num_experts <= 0:
-            num_experts = lora_stats.lora_A.shape[0] // max(1, getattr(lora_stats, "rank", 0) or 1)
+            rank = getattr(lora_stats, "rank", 0) or 0
+            if rank <= 0:
+                # No usable num_experts AND no rank metadata. Falling back to
+                # `total_rank // 1` would produce a degenerate r=1 slicing
+                # whose shape check happens to pass but emits a wrong delta —
+                # silently. Refuse to merge.
+                _record_moe_merge_fallback(
+                    role, expert_idx,
+                    "num_experts and lora_stats.rank both missing — cannot derive per-expert slicing",
+                    lora_stats, tuple(W.shape),
+                )
+                return W
+            num_experts = lora_stats.lora_A.shape[0] // rank
 
         I, H = W.shape
         layout, r = _detect_moe_lora_layout(
@@ -1226,7 +1269,15 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
     try:
         num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
         if num_experts is None or num_experts <= 0:
-            num_experts = lora_stats.lora_A.shape[0] // max(1, getattr(lora_stats, "rank", 0) or 1)
+            rank = getattr(lora_stats, "rank", 0) or 0
+            if rank <= 0:
+                _record_moe_merge_fallback(
+                    "down", expert_idx,
+                    "num_experts and lora_stats.rank both missing — cannot derive per-expert slicing",
+                    lora_stats, tuple(down_W.shape),
+                )
+                return down_W
+            num_experts = lora_stats.lora_A.shape[0] // rank
 
         H, I = down_W.shape
         layout, r = _detect_moe_lora_layout(
@@ -1505,6 +1556,13 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                     # so the LoRA delta is added in bf16-real-weight space, not
                     # the raw fp8-decoded space (which is off by 1/scale_inv).
                     gate_W, gate_fp8_meta = _fp8_load_for_merge(file, header_metadata, gate_key)
+                    if gate_W is _FP8_MERGE_UNSAFE:
+                        _record_moe_merge_fallback(
+                            "gate", expert_idx,
+                            f"fp8 base at {gate_key} has no usable weight_scale_inv/weight_scale companion; skipping LoRA merge to avoid scale-loss corruption",
+                            lora_stats, None,
+                        )
+                        continue
                     merged_gate = _merge_moe_gate_expert(
                         gate_W, lora_stats, expert_idx, num_experts, output_dtype or gate_W.dtype
                     )
@@ -1527,6 +1585,13 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 # Check for up_proj
                 if up_key in header_metadata:
                     up_W, up_fp8_meta = _fp8_load_for_merge(file, header_metadata, up_key)
+                    if up_W is _FP8_MERGE_UNSAFE:
+                        _record_moe_merge_fallback(
+                            "up", expert_idx,
+                            f"fp8 base at {up_key} has no usable weight_scale_inv/weight_scale companion; skipping LoRA merge to avoid scale-loss corruption",
+                            lora_stats, None,
+                        )
+                        continue
                     merged_up = _merge_moe_up_expert(
                         up_W, lora_stats, expert_idx, num_experts, output_dtype or up_W.dtype
                     )
@@ -1550,6 +1615,13 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 if down_key not in header_metadata:
                     continue
                 down_W, down_fp8_meta = _fp8_load_for_merge(file, header_metadata, down_key)
+                if down_W is _FP8_MERGE_UNSAFE:
+                    _record_moe_merge_fallback(
+                        "down", expert_idx,
+                        f"fp8 base at {down_key} has no usable weight_scale_inv/weight_scale companion; skipping LoRA merge to avoid scale-loss corruption",
+                        lora_stats, None,
+                    )
+                    continue
                 merged_down = _merge_moe_down_proj_expert(
                     down_W, lora_stats, expert_idx, num_experts, output_dtype or down_W.dtype
                 )
@@ -1582,8 +1654,13 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
       - Standard (Gemma4):    (E, 2*I, H) with lora_A (E*R, H), lora_B (2*I, E*R)
     is_transposed: if provided, overrides dimension-based heuristic (needed when dims are equal).
     """
+    _MOE_MERGE_STATE["attempted"] += 1
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
+            _record_moe_merge_fallback(
+                "fused_gate_up", -1, "lora_A or lora_B is None",
+                lora_stats, tuple(gate_up_W.shape),
+            )
             return gate_up_W
 
         num_experts, dim1, dim2 = gate_up_W.shape
@@ -1591,10 +1668,20 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
         dim_B, total_rank_B = lora_stats.lora_B.shape
 
         if total_rank_B != total_rank:
+            _record_moe_merge_fallback(
+                "fused_gate_up", -1,
+                f"total_rank mismatch (A.shape[0]={total_rank}, B.shape[1]={total_rank_B})",
+                lora_stats, tuple(gate_up_W.shape),
+            )
             return gate_up_W
 
         rank = total_rank // num_experts
         if total_rank % num_experts != 0:
+            _record_moe_merge_fallback(
+                "fused_gate_up", -1,
+                f"total_rank {total_rank} not divisible by num_experts {num_experts}",
+                lora_stats, tuple(gate_up_W.shape),
+            )
             return gate_up_W
 
         if is_transposed is not None:
@@ -1604,6 +1691,11 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
         elif dim_A == dim2 and dim_B == dim1:
             use_transpose = False
         else:
+            _record_moe_merge_fallback(
+                "fused_gate_up", -1,
+                f"layout ambiguous (W.shape={tuple(gate_up_W.shape)}, A.shape={tuple(lora_stats.lora_A.shape)}, B.shape={tuple(lora_stats.lora_B.shape)})",
+                lora_stats, tuple(gate_up_W.shape),
+            )
             return gate_up_W
 
         device = _active_merge_device()
@@ -1625,8 +1717,13 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
                 delta.T if use_transpose else delta, alpha=lora_stats.alpha
             )
 
+        _MOE_MERGE_STATE["applied"] += 1
         return gate_up_merged.to(output_dtype)
-    except Exception:
+    except Exception as exc:
+        _record_moe_merge_fallback(
+            "fused_gate_up", -1, repr(exc),
+            lora_stats, tuple(gate_up_W.shape),
+        )
         return gate_up_W
 
 
@@ -1638,8 +1735,13 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
       - Standard (Gemma4):    (E, H, I) with lora_A (E*R, H), lora_B (I, E*R)
     is_transposed: if provided, overrides dimension-based heuristic (needed when H==I).
     """
+    _MOE_MERGE_STATE["attempted"] += 1
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
+            _record_moe_merge_fallback(
+                "fused_down", -1, "lora_A or lora_B is None",
+                lora_stats, tuple(down_W.shape),
+            )
             return down_W
 
         num_experts, dim1, dim2 = down_W.shape
@@ -1647,10 +1749,20 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
         dim_B, total_rank_B = lora_stats.lora_B.shape
 
         if total_rank_B != total_rank:
+            _record_moe_merge_fallback(
+                "fused_down", -1,
+                f"total_rank mismatch (A.shape[0]={total_rank}, B.shape[1]={total_rank_B})",
+                lora_stats, tuple(down_W.shape),
+            )
             return down_W
 
         rank = total_rank // num_experts
         if total_rank % num_experts != 0:
+            _record_moe_merge_fallback(
+                "fused_down", -1,
+                f"total_rank {total_rank} not divisible by num_experts {num_experts}",
+                lora_stats, tuple(down_W.shape),
+            )
             return down_W
 
         if is_transposed is not None:
@@ -1660,6 +1772,11 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
         elif dim_A == dim2 and dim_B == dim1:
             use_transpose = False
         else:
+            _record_moe_merge_fallback(
+                "fused_down", -1,
+                f"layout ambiguous (W.shape={tuple(down_W.shape)}, A.shape={tuple(lora_stats.lora_A.shape)}, B.shape={tuple(lora_stats.lora_B.shape)})",
+                lora_stats, tuple(down_W.shape),
+            )
             return down_W
 
         device = _active_merge_device()
@@ -1678,8 +1795,13 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
                 delta.T if use_transpose else delta, alpha=lora_stats.alpha
             )
 
+        _MOE_MERGE_STATE["applied"] += 1
         return down_merged.to(output_dtype)
-    except Exception:
+    except Exception as exc:
+        _record_moe_merge_fallback(
+            "fused_down", -1, repr(exc),
+            lora_stats, tuple(down_W.shape),
+        )
         return down_W
 
 

@@ -1049,6 +1049,25 @@ def _slice_fp8_linear_quant_state(experts_module, param_name: str, expert_idx: i
 
 
 def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weights):
+    # This is the last-resort FP8 path (no scaled_grouped_mm support AND
+    # _dequantize_full_expert_weights returned None for either projection).
+    # It computes the FP8 forward but does NOT consume the separated LoRA
+    # attributes that `patch_param_wrapper_for_moe` injects, so reaching this
+    # path while LoRA is active would silently train without the adapter.
+    # Refuse rather than corrupt: the user can disable LoRA or fix the
+    # missing kernel before retrying.
+    if (
+        getattr(self, "_unsloth_lora_gate_up_proj", None) is not None
+        or getattr(self, "_unsloth_lora_down_proj", None) is not None
+    ):
+        raise RuntimeError(
+            "Unsloth: MoE FP8 fell through to the per-expert fp8_linear "
+            "fallback while LoRA adapters are attached. This path does not "
+            "apply the separated LoRA delta and would silently train without "
+            "it. Install unsloth.kernels.fp8 (or a torch with "
+            "_scaled_grouped_mm support, or a working FP8 dequant) so a "
+            "LoRA-aware backend can be selected."
+        )
     try:
         from unsloth.kernels.fp8 import fp8_linear
     except ImportError:
