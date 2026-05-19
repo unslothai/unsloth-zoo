@@ -412,25 +412,12 @@ def make_baseline_loss_fn():
     Returns:
         A function (model, batch, lengths, labels=None) -> (loss, ntoks).
         When labels is provided, uses labels[:,1:] for targets with
-        (targets != -100) as the loss mask.
-
-    Numerical parity with mlx-lm:
-        The labels=None path is intentionally byte-identical to
-        ``mlx_lm.tuner.trainer.default_loss``. The labels-aware path
-        adds the -100 / safe_targets / fp32-mask machinery needed for
-        train_on_responses_only. Keeping the two paths separated means
-        that running zoo's MLXTrainer with no per-token label mask
-        produces value-for-value identical loss AND gradient sequences
-        to mlx-lm CLI on the same data + seed.
+        (targets != -100) as the loss mask. The labels=None branch is
+        byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
     """
     def loss_fn(model, batch, lengths, labels=None):
         if labels is None:
-            # mlx-lm parity fast path. Matches mlx_lm.tuner.trainer.default_loss
-            # byte-for-byte: bool mask (not fp32 cast), raw ntoks division (not
-            # _safe_token_denominator), no `safe_targets` mx.where. Differences
-            # of that kind altered the autodiff graph and produced ~0.01-0.06
-            # step-2 loss divergence vs mlx-lm CLI on identical configs
-            # (gemma-3-270m-it, see Round BO probe_31/probe_37 paired-seed data).
+            # byte-identical to mlx_lm.tuner.trainer.default_loss
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
             logits = model(inputs)
