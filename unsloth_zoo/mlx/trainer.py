@@ -1397,7 +1397,14 @@ class MLXTrainer:
                     _lora_scale = getattr(m, "scale", 1.0)
 
                     _drop = getattr(m, "dropout", None)
-                    _lora_dropout = getattr(_drop, "p", 0.0) if _drop else 0.0
+                    if _drop is None:
+                        _lora_dropout = 0.0
+                    elif hasattr(_drop, "p"):
+                        _lora_dropout = float(_drop.p)
+                    else:
+                        _lora_dropout = float(
+                            1.0 - getattr(_drop, "_p_1", 1.0)
+                        )
                     break
 
 

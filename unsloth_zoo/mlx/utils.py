@@ -2755,9 +2755,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 "dropout": lora_dropout,
             }
             for key, value in inferred_lora_parameters.items():
-                if key not in lora_parameters:
-                    explicit_value = adapter_config.get(key)
-                    lora_parameters[key] = value if explicit_value is None else explicit_value
+                lora_parameters[key] = value
             adapter_config["lora_parameters"] = lora_parameters
             adapter_config["rank"] = lora_parameters["rank"]
             adapter_config["scale"] = lora_parameters["scale"]
