@@ -58,6 +58,25 @@ def test_force_float32_list_exported():
     assert "qwen3_5" in unsloth_zoo.FORCE_FLOAT32
 
 
+def test_force_float32_matches_config_json_model_types():
+    """Entries are HuggingFace `config.json` `model_type` values (the same
+    strings returned by `get_transformers_model_type`). The MLX matcher
+    must accept the real on-disk variants verbatim."""
+    from unsloth_zoo.mlx.loader import _is_force_float32_arch
+    # Real config.json model_type strings as they appear on the Hub.
+    real_world = [
+        "gemma3",       # google/gemma-3-*
+        "gemma3_text",  # google/embeddinggemma-*
+        "gemma3n",      # google/gemma-3n-*
+        "gpt_oss",      # openai/gpt-oss-*
+        "qwen3_5",      # Qwen/Qwen3.5-*
+    ]
+    for model_type in real_world:
+        assert _is_force_float32_arch(model_type) is True, (
+            f"FORCE_FLOAT32 must match real config.json model_type {model_type!r}"
+        )
+
+
 def test_warns_on_bf16_to_fp16_for_gemma3():
     """The production scenario: gemma3 bf16 weights downcast to fp16."""
     import torch
