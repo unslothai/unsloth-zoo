@@ -223,4 +223,7 @@ def test_adam_optimizers_enable_bias_correction():
             args=MLXTrainingConfig(optim=optim_name),
         )
         optimizer = trainer._build_optimizer(total_steps=10)
-        assert optimizer._kw["bias_correction"] is True
+        if hasattr(optimizer, "_kw"):
+            assert optimizer._kw["bias_correction"] is True
+        else:
+            assert optimizer.bias_correction is True

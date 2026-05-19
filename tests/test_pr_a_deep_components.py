@@ -102,6 +102,31 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     assert second_lr > first_lr
 
 
+def test_adamw_weight_decay_uses_hf_bias_norm_filter():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class DummyModel:
+        def trainable_parameters(self):
+            return {}
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = DummyModel()
+    trainer.args = MLXTrainingConfig(
+        optim="adamw",
+        weight_decay=0.1,
+    )
+
+    optimizer = trainer._build_optimizer(total_steps=8)
+
+    assert trainer._manual_adamw_weight_decay == pytest.approx(0.1)
+    if hasattr(optimizer, "_kw"):
+        assert optimizer._kw["weight_decay"] == 0.0
+    assert MLXTrainer._should_apply_weight_decay("layers.0.mlp.down_proj.weight")
+    assert not MLXTrainer._should_apply_weight_decay("layers.0.mlp.down_proj.bias")
+    assert not MLXTrainer._should_apply_weight_decay("layers.0.input_layernorm.weight")
+    assert not MLXTrainer._should_apply_weight_decay("vision.blocks.0.norm1.weight")
+
+
 @pytest.mark.parametrize(
     ("scheduler", "warmup"),
     [

@@ -377,14 +377,16 @@ class MLXTrainer:
     def _build_optimizer(self, total_steps):
         """Create MLX optimizer with LR schedule from config.
 
-        For optimizers that support weight_decay, wraps with
-        optim.decay_weight to exclude bias and norm parameters
-        (matching HuggingFace Trainer behavior).
+        For AdamW, MLX applies weight decay inside the leaf update without a
+        parameter-group filter. Keep MLX AdamW's built-in decay disabled and
+        apply decoupled decay ourselves so bias and norm parameters match
+        HuggingFace Trainer behavior.
         """
         schedule = self._build_schedule(total_steps)
         initial_lr = self._schedule_value(schedule, 0)
         self._lr_schedule = schedule if callable(schedule) else None
         wd = self.args.weight_decay
+        self._manual_adamw_weight_decay = 0.0
 
         opt_name = _normalize_mlx_optimizer_name(self.args.optim)
         if opt_name == "adafactor":
@@ -411,9 +413,10 @@ class MLXTrainer:
         elif opt_name == "adamw":
             # Match HF/PyTorch AdamW semantics. MLX defaults bias_correction
             # to False, which makes early warmup updates much larger.
+            self._manual_adamw_weight_decay = float(wd or 0.0)
             optimizer = optim.AdamW(
                 learning_rate=initial_lr,
-                weight_decay=wd,
+                weight_decay=0.0,
                 bias_correction=True,
             )
         elif opt_name == "adam":
@@ -429,6 +432,36 @@ class MLXTrainer:
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=wd)
         self._resolved_optimizer_name = opt_name
         return optimizer
+
+    @staticmethod
+    def _should_apply_weight_decay(name, parameter=None):
+        """HF-style AdamW decay filter: decay weights, skip bias and norms."""
+        parts = [part.lower() for part in str(name).split(".") if part]
+        leaf = parts[-1] if parts else str(name).lower()
+        if leaf == "bias":
+            return False
+        if any("norm" in part for part in parts):
+            return False
+        return True
+
+    def _apply_manual_adamw_weight_decay(self, model, optimizer, grad):
+        """Apply decoupled AdamW decay to trainable non-bias/non-norm leaves."""
+        wd = float(getattr(self, "_manual_adamw_weight_decay", 0.0) or 0.0)
+        if wd <= 0:
+            return
+
+        flat_grad = dict(tree_flatten(grad))
+        decayed = []
+        for name, parameter in tree_flatten(model.trainable_parameters()):
+            if name not in flat_grad:
+                continue
+            if not self._should_apply_weight_decay(name, parameter):
+                continue
+            lr = optimizer.learning_rate.astype(flat_grad[name].dtype)
+            scale = mx.array(1.0, dtype=lr.dtype) - lr * mx.array(wd, dtype=lr.dtype)
+            decayed.append((name, parameter * scale))
+        if decayed:
+            model.update(tree_unflatten(decayed))
 
     @staticmethod
     def _adafactor_unsupported_parameters(model):
@@ -860,6 +893,7 @@ class MLXTrainer:
                     lambda g: mx.clip(g, -max_grad_value, max_grad_value),
                     final_grad,
                 )
+            self._apply_manual_adamw_weight_decay(model, optimizer, final_grad)
             optimizer.update(model, final_grad)
             return grad_norm
 
@@ -885,6 +919,7 @@ class MLXTrainer:
                     lambda g: mx.clip(g, -max_grad_value, max_grad_value),
                     grad,
                 )
+            self._apply_manual_adamw_weight_decay(model, optimizer, grad)
             optimizer.update(model, grad)
             return grad_norm
 
