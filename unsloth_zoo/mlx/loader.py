@@ -2696,6 +2696,7 @@ class FastMLXModel:
         finetune_language_layers=True,
         finetune_attention_modules=True,
         finetune_mlp_modules=True,
+        finetune_last_n_layers=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Apply LoRA via mlx-lm on Apple Silicon.
@@ -2819,6 +2820,8 @@ class FastMLXModel:
                 num_layers = 0
                 if hasattr(lm, "model") and hasattr(lm.model, "layers"):
                     num_layers = len(lm.model.layers)
+                if finetune_last_n_layers is not None and num_layers > 0:
+                    num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = _resolve_lora_keys(lm, target_modules)
                 if language_lora_keys is None or len(language_lora_keys) > 0:
                     linear_to_lora_layers(
@@ -2899,6 +2902,8 @@ class FastMLXModel:
                 num_layers = 0
                 if hasattr(model, "model") and hasattr(model.model, "layers"):
                     num_layers = len(model.model.layers)
+                if finetune_last_n_layers is not None and num_layers > 0:
+                    num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = _resolve_lora_keys(model, target_modules)
                 if language_lora_keys is not None and len(language_lora_keys) == 0:
                     _raise_no_lora_targets(target_modules)
