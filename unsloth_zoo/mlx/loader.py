@@ -88,15 +88,36 @@ def _temporary_hf_token_env(token):
                     os.environ[name] = value
 
 
-def _convert_mlx_dtype(model, target_dtype) -> None:
+def _is_force_float32_arch(model_type: str) -> bool:
+    """Case-insensitive lookup of ``model_type`` in
+    ``unsloth_zoo.FORCE_FLOAT32``. Strips ``-``/``_`` and treats a
+    trailing comma on a list entry as an exact-match marker."""
+    if not model_type:
+        return False
+    from ..model_lists import FORCE_FLOAT32
+    def _norm(s: str) -> str:
+        return s.lower().replace("-", "").replace("_", "")
+    norm_input = _norm(model_type)
+    for entry in FORCE_FLOAT32:
+        e = entry.lower()
+        if e.endswith(","):
+            e = e[:-1]
+        if _norm(e) == norm_input:
+            return True
+    return False
+
+
+def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     """Cast floating-point params to target_dtype (preserves quantized ints)
     while honoring the model's optional path-based ``cast_predicate``.
 
-    Warns once on bfloat16 -> float16 since fp16's narrower range can
-    silently lose precision on bf16-native models.
+    Warns on bfloat16 -> float16 for architectures in
+    ``unsloth_zoo.FORCE_FLOAT32`` (Gemma3 family, gpt_oss, Qwen3.5) where
+    fp16's narrower range silently NaN/Infs at training time.
     """
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
+    from ..model_lists import FORCE_FLOAT32
     cast_pred = getattr(model, "cast_predicate", lambda _: True)
 
     needs_cast = False
@@ -109,14 +130,11 @@ def _convert_mlx_dtype(model, target_dtype) -> None:
     if not needs_cast:
         return
 
-    if has_bf16 and target_dtype == mx.float16:
+    if has_bf16 and target_dtype == mx.float16 and _is_force_float32_arch(model_type):
         warnings.warn(
-            "Unsloth: downcasting bfloat16 weights to float16. fp16's "
-            "range (~6.5e4) is narrower than bf16's (~3.4e38); models "
-            "with large activations (e.g. Gemma3) can lose precision or "
-            "overflow silently. Pass dtype=None to keep native bf16, or "
-            "dtype='bfloat16' to be explicit, on bf16-capable Apple "
-            "Silicon (M3+). Pass dtype='float32' for full precision.",
+            f"Unsloth: downcasting bfloat16 -> float16 on {model_type!r}, "
+            "which is known to NaN/Inf in fp16. Pass dtype=None to keep "
+            "native bf16, or dtype='float32' for full precision.",
             stacklevel=2,
         )
 
@@ -2549,7 +2567,7 @@ class FastMLXModel:
                 )
 
             if target_dtype is not None:
-                _convert_mlx_dtype(model, target_dtype)
+                _convert_mlx_dtype(model, target_dtype, model_type=model_type)
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
@@ -2660,7 +2678,7 @@ class FastMLXModel:
                 )
 
             if target_dtype is not None:
-                _convert_mlx_dtype(model, target_dtype)
+                _convert_mlx_dtype(model, target_dtype, model_type=model_type)
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
