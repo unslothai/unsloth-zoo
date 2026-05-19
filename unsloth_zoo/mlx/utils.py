@@ -413,20 +413,40 @@ def make_baseline_loss_fn():
         A function (model, batch, lengths, labels=None) -> (loss, ntoks).
         When labels is provided, uses labels[:,1:] for targets with
         (targets != -100) as the loss mask.
+
+    Numerical parity with mlx-lm:
+        The labels=None path is intentionally byte-identical to
+        ``mlx_lm.tuner.trainer.default_loss``. The labels-aware path
+        adds the -100 / safe_targets / fp32-mask machinery needed for
+        train_on_responses_only. Keeping the two paths separated means
+        that running zoo's MLXTrainer with no per-token label mask
+        produces value-for-value identical loss AND gradient sequences
+        to mlx-lm CLI on the same data + seed.
     """
     def loss_fn(model, batch, lengths, labels=None):
         if labels is None:
-            inputs, targets = batch[:, :-1], batch[:, 1:]
-        else:
+            # mlx-lm parity fast path. Matches mlx_lm.tuner.trainer.default_loss
+            # byte-for-byte: bool mask (not fp32 cast), raw ntoks division (not
+            # _safe_token_denominator), no `safe_targets` mx.where. Differences
+            # of that kind altered the autodiff graph and produced ~0.01-0.06
+            # step-2 loss divergence vs mlx-lm CLI on identical configs
+            # (gemma-3-270m-it, see Round BO probe_31/probe_37 paired-seed data).
             inputs = batch[:, :-1]
-            targets = labels[:, 1:]
+            targets = batch[:, 1:]
+            logits = model(inputs)
+            steps = mx.arange(1, targets.shape[1] + 1)
+            mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            ce = nn.losses.cross_entropy(logits, targets) * mask
+            ntoks = mask.sum()
+            ce = ce.astype(mx.float32).sum() / ntoks
+            return ce, ntoks
+        # labels-aware path: train_on_responses_only style masking.
+        inputs = batch[:, :-1]
+        targets = labels[:, 1:]
         logits = model(inputs)
         steps = mx.arange(1, targets.shape[1] + 1)
         length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
-        if labels is None:
-            mask = length_mask.astype(mx.float32)
-        else:
-            mask = mx.logical_and(targets != -100, length_mask).astype(mx.float32)
+        mask = mx.logical_and(targets != -100, length_mask).astype(mx.float32)
         # Replace -100 with 0 before CE — MLX has no ignore_index;
         # the mask already zeros out these positions in the loss.
         safe_targets = mx.where(targets == -100, 0, targets)
