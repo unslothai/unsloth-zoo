@@ -88,21 +88,55 @@ def _temporary_hf_token_env(token):
                     os.environ[name] = value
 
 
-def _convert_mlx_dtype(model, target_dtype) -> None:
+def _is_force_float32_arch(model_type: str) -> bool:
+    """Case-insensitive lookup of ``model_type`` in
+    ``unsloth_zoo.FORCE_FLOAT32``. Strips ``-``/``_`` and treats a
+    trailing comma on a list entry as an exact-match marker."""
+    if not model_type:
+        return False
+    from ..model_lists import FORCE_FLOAT32
+    def _norm(s: str) -> str:
+        return s.lower().replace("-", "").replace("_", "")
+    norm_input = _norm(model_type)
+    for entry in FORCE_FLOAT32:
+        e = entry.lower()
+        if e.endswith(","):
+            e = e[:-1]
+        if _norm(e) == norm_input:
+            return True
+    return False
+
+
+def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     """Cast floating-point params to target_dtype (preserves quantized ints)
     while honoring the model's optional path-based ``cast_predicate``.
+
+    Warns on bfloat16 -> float16 for architectures in
+    ``unsloth_zoo.FORCE_FLOAT32`` (Gemma3 family, gpt_oss, Qwen3.5) where
+    fp16's narrower range silently NaN/Infs at training time.
     """
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
+    from ..model_lists import FORCE_FLOAT32
     cast_pred = getattr(model, "cast_predicate", lambda _: True)
 
     needs_cast = False
+    has_bf16 = False
     for k, v in tree_flatten(model.parameters()):
         if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) and v.dtype != target_dtype:
             needs_cast = True
-            break
+            if v.dtype == mx.bfloat16:
+                has_bf16 = True
     if not needs_cast:
         return
+
+    if has_bf16 and target_dtype == mx.float16 and _is_force_float32_arch(model_type):
+        warnings.warn(
+            f"Unsloth: downcasting bfloat16 -> float16 on {model_type!r}, "
+            "which is known to NaN/Inf in fp16. Pass dtype=None to keep "
+            "native bf16, or dtype='float32' for full precision.",
+            stacklevel=2,
+        )
 
     model.update(tree_map_with_path(
         lambda k, v: v.astype(target_dtype)
@@ -2533,7 +2567,7 @@ class FastMLXModel:
                 )
 
             if target_dtype is not None:
-                _convert_mlx_dtype(model, target_dtype)
+                _convert_mlx_dtype(model, target_dtype, model_type=model_type)
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
@@ -2644,7 +2678,7 @@ class FastMLXModel:
                 )
 
             if target_dtype is not None:
-                _convert_mlx_dtype(model, target_dtype)
+                _convert_mlx_dtype(model, target_dtype, model_type=model_type)
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())

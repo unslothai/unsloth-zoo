@@ -104,6 +104,7 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 
 from importlib.util import find_spec
 from .mlx.runtime import is_mlx_available
+from .model_lists import FORCE_FLOAT32
 
 # Import-time fixes live in ``unsloth/import_fixes.py`` and run at
 # ``import unsloth`` time. Zoo cannot be imported standalone (the GPU
