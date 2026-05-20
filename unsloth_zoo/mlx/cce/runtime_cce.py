@@ -464,6 +464,9 @@ def _forward_chunked_fused_finalize(
 
     n, _ = hidden_compute.shape
     vocab_size = weight_compute.shape[0]
+    if n == 0:
+        empty = mx.zeros((0,), dtype=mx.float32)
+        return empty, empty
     compute_bytes = 2 if hidden_compute.dtype in (mx.float16, mx.bfloat16) else 4
     chunk_size = _resolve_chunk_size(
         chunk_size,
@@ -680,6 +683,14 @@ def make_runtime_cce_loss_fused_finalize(
             hidden_compute = hidden
             weight_compute = weight
             targets32 = targets.astype(mx.int32)
+            if hidden_compute.shape[0] == 0:
+                return (
+                    mx.zeros_like(hidden),
+                    mx.zeros_like(weight),
+                    mx.zeros_like(scales),
+                    mx.zeros_like(biases),
+                    mx.zeros_like(targets),
+                )
             if grad_output is None:
                 grad_output = mx.zeros_like(outputs[0])
             grad_output32 = grad_output.astype(mx.float32)
@@ -805,6 +816,8 @@ def make_runtime_cce_loss_fused_finalize(
         hidden_compute = hidden
         weight_compute = weight
         targets32 = targets.astype(mx.int32)
+        if hidden_compute.shape[0] == 0:
+            return mx.zeros_like(hidden), mx.zeros_like(weight), mx.zeros_like(targets)
         if grad_output is None:
             grad_output = mx.zeros_like(outputs[0])
         grad_output32 = grad_output.astype(mx.float32)
