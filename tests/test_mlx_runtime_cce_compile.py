@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 
 import pytest
@@ -110,6 +111,90 @@ def test_quantized_runtime_cce_zero_tokens_returns_empty_losses_and_zero_gradien
     assert loss.item() == pytest.approx(0.0)
     assert grad.shape == hidden.shape
     assert mx.sum(mx.abs(grad).astype(mx.float32)).item() == pytest.approx(0.0)
+
+@pytest.mark.parametrize("bad_target", [-1, 32])
+def test_runtime_cce_invalid_labels_poison_loss_and_gradients(bad_target):
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    runtime_cce, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100,
+        chunk_size=16,
+    )
+    hidden = mx.ones((3, 16), dtype=mx.float32)
+    weight = mx.ones((32, 16), dtype=mx.float32)
+    targets = mx.array([0, bad_target, -100], dtype=mx.int32)
+
+    losses = runtime_cce(hidden, weight, targets)
+    mx.eval(losses)
+
+    assert losses[0].item() == pytest.approx(math.log(32.0), rel=1e-5)
+    assert math.isnan(losses[1].item())
+    assert losses[2].item() == pytest.approx(0.0)
+
+    def loss_fn(h, w):
+        return runtime_cce(h, w, targets).astype(mx.float32).sum()
+
+    loss, grads = mx.value_and_grad(loss_fn, argnums=(0, 1))(hidden, weight)
+    grad_norm = _stable_norm(grads)
+    mx.eval(loss, grad_norm)
+
+    assert math.isnan(loss.item())
+    assert math.isnan(grad_norm.item())
+
+
+def test_compiled_runtime_cce_invalid_labels_poison_loss():
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    runtime_cce, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100,
+        chunk_size=16,
+    )
+    hidden = mx.ones((2, 16), dtype=mx.float32)
+    weight = mx.ones((32, 16), dtype=mx.float32)
+    targets = mx.array([0, 32], dtype=mx.int32)
+
+    def losses_fn(h, w, t):
+        return runtime_cce(h, w, t)
+
+    losses = mx.compile(losses_fn)(hidden, weight, targets)
+    mx.eval(losses)
+
+    assert losses[0].item() == pytest.approx(math.log(32.0), rel=1e-5)
+    assert math.isnan(losses[1].item())
+
+
+def test_quantized_runtime_cce_invalid_labels_poison_loss():
+    _skip_torch_shim()
+    import mlx.nn as nn
+
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    linear = nn.Linear(32, 32, bias=False)
+    linear.weight = mx.ones((32, 32), dtype=mx.float32)
+    qlinear = nn.QuantizedLinear.from_linear(linear, group_size=32, bits=4)
+    runtime_cce, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100,
+        chunk_size=16,
+        quantized=True,
+        group_size=qlinear.group_size,
+        bits=qlinear.bits,
+    )
+    hidden = mx.ones((2, 32), dtype=mx.float32)
+    targets = mx.array([0, 32], dtype=mx.int32)
+
+    losses = runtime_cce(
+        hidden,
+        qlinear.weight,
+        qlinear.scales,
+        qlinear.biases,
+        targets,
+    )
+    mx.eval(losses)
+
+    assert losses[0].item() == pytest.approx(math.log(32.0), rel=1e-5)
+    assert math.isnan(losses[1].item())
 
 def test_compiled_runtime_cce_preserves_aux_lse_for_gradients():
     _skip_torch_shim()

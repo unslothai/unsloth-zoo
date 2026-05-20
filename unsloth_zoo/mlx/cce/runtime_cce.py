@@ -115,6 +115,24 @@ def _apply_softcap(logits: mx.array, logit_softcap: float) -> mx.array:
     return softcap * mx.tanh(logits / softcap)
 
 
+def _target_validity_masks(
+    targets: mx.array,
+    vocab_size: int,
+    ignore_index: int,
+) -> tuple[mx.array, mx.array]:
+    in_vocab = (targets >= 0) & (targets < vocab_size)
+    not_ignored = targets != ignore_index
+    return not_ignored & in_vocab, not_ignored & ~in_vocab
+
+
+def _poison_invalid_targets(values: mx.array, invalid: mx.array) -> mx.array:
+    return mx.where(
+        invalid,
+        mx.full(values.shape, float("nan"), dtype=values.dtype),
+        values,
+    )
+
+
 def _chunk_matmul(
     x: mx.array,
     weight: mx.array,
@@ -509,8 +527,10 @@ def _forward_chunked_fused_finalize(
             target_logit = mx.where(in_chunk, chunk_target, target_logit)
 
         lse = running_max + mx.log(running_sum_exp + 1e-9)
-        valid = targets != ignore_index
+        valid, invalid = _target_validity_masks(targets, vocab_size, ignore_index)
         loss = mx.where(valid, lse - target_logit, mx.zeros_like(lse))
+        loss = _poison_invalid_targets(loss, invalid)
+        lse = _poison_invalid_targets(lse, invalid)
         return loss, lse
 
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
@@ -551,6 +571,9 @@ def _forward_chunked_fused_finalize(
                 grid=(n * 256, 1, 1),
                 threadgroup=(256, 1, 1),
             )
+            _, invalid = _target_validity_masks(targets, vocab_size, ignore_index)
+            loss = _poison_invalid_targets(loss, invalid)
+            lse = _poison_invalid_targets(lse, invalid)
             return loss, lse
 
         running_max, running_sum_exp, target_logit = forward_update_kernel(
