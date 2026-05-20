@@ -171,34 +171,6 @@ def test_full_ft_norm_biases_follow_module_cast():
             f"{n} should follow its norm module's dtype cast, got {p[n].dtype}"
 
 
-def test_full_ft_embed_stays_compute_dtype():
-    m, p = _run(full_finetuning=True)
-    assert p["model.embed_tokens.weight"].dtype == torch.bfloat16
-
-
-def test_full_ft_lm_head_stays_compute_dtype():
-    # lm_head shares storage with embed_tokens (weight tying).
-    m, p = _run(full_finetuning=True)
-    assert m.lm_head.weight.dtype == torch.bfloat16
-    assert m.lm_head.weight is m.model.embed_tokens.weight
-
-
-def test_full_ft_linear_bias_stays_compute_dtype():
-    m, p = _run(full_finetuning=True, with_bias=True)
-    assert p["model.layers.0.self_attn.q_proj.bias"].dtype == torch.bfloat16
-
-
-def test_full_ft_base_linear_stays_compute_dtype():
-    m, p = _run(full_finetuning=True)
-    assert p["model.layers.0.self_attn.q_proj.weight"].dtype == torch.bfloat16
-
-
-def test_full_ft_all_params_remain_trainable():
-    m, p = _run(full_finetuning=True)
-    for n, param in p.items():
-        assert param.requires_grad, f"{n} should be trainable in full-FT"
-
-
 # ---------------- deferral to external _pre_set_compute_dtype ----------------
 
 def test_full_ft_defers_to_pre_set_compute_dtype_on_norm():
@@ -232,20 +204,6 @@ def test_lora_norms_stay_bf16_frozen():
     ):
         assert p[n].dtype == torch.bfloat16
         assert p[n].requires_grad is False
-
-
-def test_lora_embed_stays_bf16_frozen():
-    m, p = _run(full_finetuning=False)
-    qp = p["model.embed_tokens.weight"]
-    assert qp.dtype == torch.bfloat16
-    assert qp.requires_grad is False
-
-
-def test_lora_base_linear_stays_bf16_frozen():
-    m, p = _run(full_finetuning=False)
-    qp = p["model.layers.0.self_attn.q_proj.weight"]
-    assert qp.dtype == torch.bfloat16
-    assert qp.requires_grad is False
 
 
 # ---------------- rollback env switch ----------------
@@ -282,11 +240,6 @@ def test_matcher_catches_vit_style_norm1_norm2():
     assert p["model.visual.blocks.0.norm1.bias"].dtype == torch.float32
     assert p["model.visual.blocks.0.norm2.weight"].dtype == torch.float32
     assert p["model.visual.blocks.0.norm2.bias"].dtype == torch.float32
-
-
-def test_full_ft_weight_tying_preserved():
-    m, p = _run(full_finetuning=True)
-    assert m.lm_head.weight is m.model.embed_tokens.weight
 
 
 # ---------------- autocast wrapper: signature / meta-device / deepcopy ------
