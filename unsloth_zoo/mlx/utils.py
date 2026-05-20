@@ -697,7 +697,11 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             targets = labels[:, 1:]
             targets = _mask_image_tokens(targets, _image_token_ids)
             logits, targets = _align_logits_with_labels(logits, targets)
-            mask = (targets != -100).astype(mx.float32)
+            if attention_mask is not None:
+                length_mask = attention_mask[:, 1:][:, :targets.shape[1]]
+            else:
+                length_mask = mx.ones_like(targets, dtype=mx.float32)
+            mask = mx.logical_and(targets != -100, length_mask).astype(mx.float32)
         else:
             targets = input_ids[:, 1:]
 
@@ -867,6 +871,15 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         # compatibility for externally supplied labels.
         targets = labels[:, 1:]
         masked_targets = _mask_image_tokens(targets, image_token_ids)
+        if attention_mask is not None:
+            length_mask = attention_mask[:, 1:][:, :masked_targets.shape[1]]
+        else:
+            length_mask = mx.ones_like(masked_targets, dtype=mx.bool_)
+        masked_targets = mx.where(
+            mx.logical_and(masked_targets != -100, length_mask),
+            masked_targets,
+            -100,
+        )
         ntoks = (masked_targets != -100).sum()
     else:
         targets = input_ids[:, 1:]
@@ -2511,8 +2524,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
                      model_name=None, model_type=None):
     """Wrap a HuggingFace dataset into mlx-lm's dataset classes.
 
-    Uses TextDataset + CacheDataset from mlx_lm so that tokenization
-    (including EOS appending) matches mlx-lm's own training pipeline exactly.
+    Uses CacheDataset from mlx_lm while leaving rendered text token-exact.
 
     If a formatting_func is provided, each item is pre-formatted into a
     ``{"text": ...}`` dict before wrapping.
@@ -2566,6 +2578,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
             self.text_key = text_key
 
         def process(self, item):
+            # Studio/chat templates own EOS; adding one here changes labels.
             return (self.tokenizer.encode(item[self.text_key]), 0)
 
         def __getitem__(self, idx):
