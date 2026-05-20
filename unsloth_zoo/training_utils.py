@@ -92,6 +92,40 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
 pass
 
 
+def _wrap_forward_in_bf16_autocast(model, compute_dtype):
+    """For bf16 full-FT with fp32 norm weights, the norm forward returns an
+    fp32 tensor which then meets the next bf16 linear and trips
+    `F.linear`'s dtype-equality check. Wrap `model.forward` in
+    `torch.amp.autocast(compute_dtype)` so linear/matmul inputs are
+    downcast at the op boundary -- the standard PyTorch mixed-precision
+    pattern PEFT and Accelerate already rely on. Idempotent; defers to an
+    outer autocast context if one is already active.
+    """
+    if compute_dtype in (None, torch.float32):
+        return model
+    if getattr(model, "_unsloth_bf16_autocast_wrapped", False):
+        return model
+    _orig_forward = model.forward
+
+    def _wrapped(*args, **kwargs):
+        # Try to pick the right device_type from the first tensor we see.
+        device_type = "cuda"
+        for t in list(args) + list(kwargs.values()):
+            if torch.is_tensor(t):
+                device_type = t.device.type
+                break
+        if torch.is_autocast_enabled(device_type):
+            return _orig_forward(*args, **kwargs)
+        if not torch.amp.is_autocast_available(device_type):
+            return _orig_forward(*args, **kwargs)
+        with torch.amp.autocast(device_type=device_type, dtype=compute_dtype):
+            return _orig_forward(*args, **kwargs)
+
+    model.forward = _wrapped
+    model._unsloth_bf16_autocast_wrapped = True
+    return model
+
+
 @torch.no_grad
 def prepare_model_for_training(
     model                      : Any,
@@ -138,6 +172,20 @@ def prepare_model_for_training(
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
     pass
+    # Defer to any external compute-dtype policy already in effect on norm
+    # modules (e.g. UNSLOTH_HIGH_PRECISION_LAYERNORM which tags norm modules
+    # with `_pre_set_compute_dtype`). Record those parameter ids so we leave
+    # them alone instead of overwriting that policy.
+    _externally_managed_param_ids = set()
+    for _, _module in model.named_modules():
+        if hasattr(_module, "_pre_set_compute_dtype"):
+            for _, _p in _module.named_parameters(recurse=False):
+                _externally_managed_param_ids.add(id(_p))
+    # Rollback switch (defaults off = corrected behaviour). Set to 1 to keep
+    # norm weights at their loaded dtype like the pre-fix code path.
+    _disable_float32_norm_upcast = (
+        os.environ.get("UNSLOTH_DISABLE_FLOAT32_UPCAST", "0") == "1")
+
     for name, param in model.named_parameters():
         upcast = False
         requires_grad = False
@@ -148,18 +196,31 @@ def prepare_model_for_training(
             else:
                 requires_grad = False
         else:
-            if train_layernorms and ("norm." in name or "_layernorm" in name):
-                requires_grad = True
-                upcast = True # Must upcast layernorms to float32
-            if train_embedding and ("embed_tokens" in name or "embedding" in name):
-                requires_grad = True
-                upcast = False # Can leave in bfloat16
-            if train_lm_head and ("lm_head" in name):
-                requires_grad = True
-                upcast = False # Can leave in bfloat16
-            else:
-                requires_grad = True
-                upcast = False # Can leave in bfloat16
+            # Full finetuning: train everything by default at compute dtype.
+            # Norm weights must be upcast to float32 for adam writeback
+            # precision -- without this ~60% of bf16 adam updates round to
+            # zero on writeback (measured on Qwen3-0.6B input_layernorm).
+            # Previously a dangling `else:` attached to `if train_lm_head:`
+            # silently clobbered the `upcast = True` set for norms above it.
+            requires_grad = True
+            upcast = False
+            # Norm-name matcher catches the patterns we've seen in the wild:
+            #   Llama/Qwen3:        "input_layernorm", "model.norm",
+            #                       "self_attn.q_norm", "self_attn.k_norm"
+            #   SigLIP/CLIP vision: "encoder.layers.0.layer_norm1/2"
+            #   ViT/DINO/Qwen3-VL:  "visual.blocks.0.norm1/2"
+            _is_norm_name = (
+                "norm." in name
+                or "_layernorm" in name
+                or "layer_norm" in name
+                or ".norm1." in name
+                or ".norm2." in name
+            )
+            if (train_layernorms
+                    and _is_norm_name
+                    and id(param) not in _externally_managed_param_ids
+                    and not _disable_float32_norm_upcast):
+                upcast = True
         pass
         # Set training or not
         if requires_grad:
@@ -167,8 +228,11 @@ def prepare_model_for_training(
         else:
             param.requires_grad_(False)
 
-        # Upcast to float32 if needed
-        if requires_grad:
+        # Upcast to float32 if needed. Skip params owned by a module that
+        # already has `_pre_set_compute_dtype` set (the external compute-dtype
+        # policy will have already cast them) so we don't silently downcast
+        # their fp32 storage back to the compute dtype here.
+        if requires_grad and id(param) not in _externally_managed_param_ids:
             name = name.replace("base_model", "model", 1)
             while re.search(r'\.(\d+)\.', name) is not None:
                 name = re.sub(r'\.(\d+)\.', r'[\1].', name)
@@ -194,6 +258,17 @@ def prepare_model_for_training(
                 # Maybe model.model
                 exec(f"model.{name}.to({str(torch.float32)})")
     pass
+
+    # When the bf16 full-FT path now has fp32 norm weights, those norms'
+    # forward returns fp32 tensors (e.g. `weight * downcast_hidden` in
+    # transformers' Llama/Qwen3 RMSNorm). Without an autocast context, that
+    # fp32 then enters the next bf16 linear and trips F.linear's dtype check.
+    # Wrap forward in torch.amp.autocast(bf16) so linear/matmul inputs get
+    # downcast at the op boundary -- the canonical PyTorch mixed-precision
+    # pattern HF / PEFT / Accelerate all use. Cheap no-op when not needed.
+    if (full_finetuning and not _disable_float32_norm_upcast
+            and mixed_precision_dtype == torch.bfloat16):
+        _wrap_forward_in_bf16_autocast(model, torch.bfloat16)
 
     # Gradient checkpointing
     # If the user requested vanilla GC (True/False), ensure any prior Unsloth patch is undone.
