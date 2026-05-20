@@ -318,12 +318,11 @@ def test_qwen3_vl_vision_rotary_uses_transformers_fp32_math():
     assert "k = _qwen3_vision_rotary_fp32(k, rotary_pos_emb)" in source
 
 
-def test_qwen3_vl_training_compile_not_verified_until_real_parity():
+def test_qwen3_vl_training_compile_verified():
     import unsloth_zoo.mlx.compile as mc
 
-    assert "qwen3_vl" not in mc._VERIFIED_TRAINING_ARCHES
-    assert "qwen3_vl_moe" not in mc._VERIFIED_TRAINING_ARCHES
-    assert "real 10-step training parity" in mc._ARCH_TRAINING_COMPILE_BLOCK_REASONS["qwen3_vl"]
+    assert "qwen3_vl" in mc._VERIFIED_TRAINING_ARCHES
+    assert "qwen3_vl_moe" in mc._VERIFIED_TRAINING_ARCHES
 
 
 # ---------------------------------------------------------------------------

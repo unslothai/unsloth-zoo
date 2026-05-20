@@ -63,6 +63,7 @@ from .utils import (
     iterate_vlm_training_batches,
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
+    _get_vlm_ignore_token_ids,
     collect_mlx_texts,
     save_lora_adapters,
     apply_gradient_checkpointing,
@@ -198,14 +199,6 @@ class MLXTrainer:
 
         # Auto-detect VLM
         self._is_vlm = _is_vlm_model(model)
-        if self._is_vlm:
-            # VLM callers pass the processor through the tokenizer slot to
-            # mirror HF Trainer APIs. The loss is constructed before data
-            # preparation, so attach it now for image-token masking.
-            if self.processor is None:
-                self.processor = tokenizer
-            if self.processor is not None:
-                self.model._processor = self.processor
 
         # Constructor params override args if provided
         if dataset_text_field is not None:
@@ -358,8 +351,8 @@ class MLXTrainer:
         if warmup > 0:
             def warmup_fn(step):
                 step = mx.array(step)
-                step = mx.minimum(step + 1, mx.array(warmup))
-                return step * (lr / (warmup + 1))
+                step = mx.minimum(step, mx.array(warmup))
+                return step * (lr / warmup)
             if callable(main_schedule):
                 return optim.join_schedules(
                     [warmup_fn, main_schedule], [warmup]
@@ -445,10 +438,16 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name == "sgd":
+            # TODO: For HF Trainer parity, consider applying the same
+            # bias/norm weight-decay exclusion used by AdamW to SGD.
             optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=wd)
         elif opt_name == "muon":
+            # TODO: For HF Trainer parity, consider applying the same
+            # bias/norm weight-decay exclusion used by AdamW to Muon.
             optimizer = optim.Muon(learning_rate=initial_lr, weight_decay=wd)
         elif opt_name == "lion":
+            # TODO: For HF Trainer parity, consider applying the same
+            # bias/norm weight-decay exclusion used by AdamW to Lion.
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=wd)
         self._resolved_optimizer_name = opt_name
         return optimizer
@@ -719,15 +718,32 @@ class MLXTrainer:
 
         # Pick loss function — returns (loss, ntoks) tuples
         use_cce = args.use_cce
+        _vlm_ignore_token_ids = None
 
         if is_vlm:
+            processor = self._resolve_vlm_processor()
+            # VLM collation owns label creation/masking. These IDs should be
+            # redundant for normal SFT batches and are only a loss-side
+            # compatibility backstop for missing or externally supplied labels.
+            _vlm_ignore_token_ids = _get_vlm_ignore_token_ids(
+                processor=processor,
+                config=getattr(model, "_config", {}),
+            )
             _atid = args.assistant_token_id if args.train_on_completions else 0
             if use_cce:
-                loss_fn = make_vlm_cce_loss_fn(model, assistant_token_id=_atid)
+                loss_fn = make_vlm_cce_loss_fn(
+                    model,
+                    assistant_token_id=_atid,
+                    ignore_token_ids=_vlm_ignore_token_ids,
+                )
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
                 print(f"Unsloth: Using VLM CCE loss ({cce_backend}) for memory-efficient training.")
             else:
-                loss_fn = make_vlm_baseline_loss_fn(model, assistant_token_id=_atid)
+                loss_fn = make_vlm_baseline_loss_fn(
+                    model,
+                    assistant_token_id=_atid,
+                    ignore_token_ids=_vlm_ignore_token_ids,
+                )
                 print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
             if use_cce:
@@ -1082,7 +1098,7 @@ class MLXTrainer:
             if _labeled_eval is not None:
                 eval_batches = _labeled_eval
             elif is_vlm:
-                processor = self.processor or getattr(self.model, "_processor", None)
+                processor = self._resolve_vlm_processor()
                 config = getattr(self.model, "_config", {})
                 _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
                 eval_batches = create_vlm_batches(
@@ -1379,6 +1395,40 @@ class MLXTrainer:
             ),
         }
 
+    def _resolve_vlm_processor(self):
+        """Resolve the processor used for VLM collation without mutating model."""
+        args = self.args
+        config = getattr(self.model, "_config", {})
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        model_name = getattr(self.model, "_hf_repo", None)
+
+        processor = self.processor
+        if processor is None and (
+            hasattr(self.tokenizer, "image_processor")
+            or (
+                hasattr(self.tokenizer, "tokenizer")
+                and hasattr(self.tokenizer, "apply_chat_template")
+            )
+        ):
+            processor = self.tokenizer
+        if processor is None:
+            processor = getattr(self.model, "_processor", None)
+        if processor is None:
+            raise ValueError(
+                "VLM training requires a processor. Pass processor= to MLXTrainer "
+                "or load the model with FastLanguageModel.from_pretrained()."
+            )
+
+        processor = normalize_vlm_processor_chat_template(
+            processor,
+            chat_template=getattr(args, "vlm_chat_template", None),
+            model_name=model_name,
+            model_type=model_type,
+            strict=False,
+        )
+        self.processor = processor
+        return processor
+
     def _prepare_data(self, is_vlm):
         """Prepare training data. Returns (batches, batch_iter)."""
         args = self.args
@@ -1387,21 +1437,7 @@ class MLXTrainer:
         model_name = getattr(self.model, "_hf_repo", None)
 
         if is_vlm:
-            processor = self.processor or getattr(self.model, "_processor", None)
-            if processor is None:
-                raise ValueError(
-                    "VLM training requires a processor. Pass processor= to MLXTrainer "
-                    "or load the model with FastLanguageModel.from_pretrained()."
-                )
-            processor = normalize_vlm_processor_chat_template(
-                processor,
-                chat_template=getattr(args, "vlm_chat_template", None),
-                model_name=model_name,
-                model_type=model_type,
-                strict=False,
-            )
-            self.processor = processor
-            self.model._processor = processor
+            processor = self._resolve_vlm_processor()
         else:
             self.tokenizer = normalize_mlx_chat_template(
                 self.tokenizer,

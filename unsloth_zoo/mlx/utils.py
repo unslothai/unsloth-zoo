@@ -450,66 +450,143 @@ _IMAGE_TOKEN_STRINGS = (
     "<|vision_end|>",      # Qwen
     "<|vision_pad|>",      # Qwen
     "<|image_pad|>",       # Qwen
+    "<|video_pad|>",       # Qwen
     "<image>",             # PaliGemma, Llava, InternVL
     "</image>",            # InternVL
+    "[IMG]",               # Mistral
+    "[IMG_BREAK]",         # Mistral
+    "[IMG_END]",           # Mistral
     "<image_soft_token>",  # Gemma 3
     "<start_of_image>",    # Gemma 3
     "<end_of_image>",      # Gemma 3
+    "<|START_OF_IMG|>",    # Cohere
+    "<|END_OF_IMG|>",      # Cohere
+    "<|IMG_LINE_BREAK|>",  # Cohere
+    "<|IMG_PATCH|>",       # Cohere
 )
 
 
-def _get_image_token_ids(model):
-    """Resolve image token IDs from model's processor/tokenizer.
+def _append_unique_int(ids, value):
+    if value is None:
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _append_unique_int(ids, item)
+        return
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return
+    if value not in ids:
+        ids.append(value)
 
-    Returns an mx.array of token IDs to mask from loss, or None if
-    no image tokens are found (non-VLM or tokenizer doesn't have them).
-    """
-    processor = getattr(model, "_processor", None)
-    tokenizer = getattr(processor, "tokenizer", processor) if processor else None
-    if tokenizer is None:
+
+def _convert_token_to_id(tokenizer, token):
+    try:
+        token_ids = tokenizer.convert_tokens_to_ids([token])
+    except Exception:
+        try:
+            token_ids = tokenizer.convert_tokens_to_ids(token)
+        except Exception:
+            return None
+    if isinstance(token_ids, (list, tuple)):
+        token_id = token_ids[0] if token_ids else None
+    else:
+        token_id = token_ids
+    if token_id is None:
         return None
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None and token_id == unk_id:
+        return None
+    return token_id
+
+
+def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
+    """Resolve VLM token IDs that should be ignored by SFT loss labels.
+
+    Mirrors the CUDA vision collator's best-effort token masking without making
+    the loss depend on processor state attached to the model.
+    """
+    if processor is None and model is not None:
+        processor = getattr(model, "_processor", None)
+    if config is None and model is not None:
+        config = getattr(model, "_config", None)
 
     ids = []
-    for tok_str in _IMAGE_TOKEN_STRINGS:
-        try:
-            tok_ids = tokenizer.convert_tokens_to_ids([tok_str])
-            if tok_ids and tok_ids[0] is not None:
-                # Some tokenizers return the unk_token_id for unknown tokens
-                unk_id = getattr(tokenizer, "unk_token_id", None)
-                if tok_ids[0] != unk_id:
-                    ids.append(tok_ids[0])
-        except Exception:
-            continue
+    tokenizer = _get_processor_tokenizer(processor)
+    if tokenizer is not None:
+        for tok_str in _IMAGE_TOKEN_STRINGS:
+            _append_unique_int(ids, _convert_token_to_id(tokenizer, tok_str))
 
-    # Also check config for image_token_index / image_token_id
-    config = getattr(model, "_config", {})
-    for key in ("image_token_index", "image_token_id"):
-        val = config.get(key)
-        if val is not None and val not in ids:
-            ids.append(val)
+        for attr in (
+            "image_token",
+            "video_token",
+            "audio_token",
+            "boi_token",
+            "eoi_token",
+        ):
+            token = getattr(tokenizer, attr, None)
+            if token is not None:
+                _append_unique_int(ids, _convert_token_to_id(tokenizer, token))
+
+        for attr in (
+            "pad_token_id",
+            "image_token_id",
+            "video_token_id",
+            "audio_token_id",
+        ):
+            _append_unique_int(ids, getattr(tokenizer, attr, None))
+
+    for key in (
+        "image_token_index",
+        "image_token_id",
+        "video_token_index",
+        "video_token_id",
+        "audio_token_index",
+        "audio_token_id",
+        "boi_token_index",
+        "boi_token_id",
+        "eoi_token_index",
+        "eoi_token_id",
+        "pad_token_id",
+    ):
+        _append_unique_int(ids, _config_get(config, key, None))
 
     if not ids:
         return None
     return ids  # plain Python list; avoids mx.eval in the hot path
 
 
-def _mask_image_tokens(targets, image_token_ids):
-    """Set image token positions in targets to -100 (ignore_index).
+def _get_image_token_ids(model):
+    """Backward-compatible wrapper for legacy callers."""
+    return _get_vlm_ignore_token_ids(model=model)
 
-    Prevents the model from training to predict image placeholder tokens,
-    which are fixed special tokens that provide no useful gradient signal.
 
-    Args:
-        targets: mx.array of token IDs.
-        image_token_ids: plain Python list of int token IDs, or None.
-    """
-    if not image_token_ids:
+def _mask_label_token_ids(targets, ignore_token_ids, ignore_index=-100):
+    if not ignore_token_ids:
         return targets
-    # Build a mask: True where target is any image token
-    is_image = targets == image_token_ids[0]
-    for tok_id in image_token_ids[1:]:
-        is_image = is_image | (targets == tok_id)
-    return mx.where(is_image, -100, targets)
+    should_ignore = targets == ignore_token_ids[0]
+    for tok_id in ignore_token_ids[1:]:
+        should_ignore = should_ignore | (targets == tok_id)
+    return mx.where(should_ignore, ignore_index, targets)
+
+
+def _mask_image_tokens(targets, image_token_ids):
+    """Set image/vision token positions in targets to -100."""
+    return _mask_label_token_ids(targets, image_token_ids)
+
+
+def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
+                           ignore_index=-100):
+    if labels is None:
+        labels = batch_dict["input_ids"].astype(mx.int32)
+    else:
+        labels = labels.astype(mx.int32)
+    labels = _mask_label_token_ids(labels, ignore_token_ids, ignore_index)
+    attention_mask = batch_dict.get("attention_mask")
+    if attention_mask is not None:
+        labels = mx.where(attention_mask == 0, mx.array(ignore_index), labels)
+    return labels.astype(mx.int32)
 
 
 def _mask_prompt_tokens(targets, assistant_token_id):
@@ -572,7 +649,8 @@ def _trim_sequence_aligned_vlm_kwargs(extra_kwargs, seq_len):
     return extra_kwargs
 
 
-def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
+def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
+                              ignore_token_ids=None):
     """Create a standard cross-entropy loss function for VLMs.
 
     Takes a batch dict with input_ids, pixel_values, attention_mask.
@@ -580,7 +658,11 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
     Returns:
         A function (model, batch_dict) -> (loss, ntoks).
     """
-    _image_token_ids = _get_image_token_ids(model) if model is not None else None
+    _image_token_ids = (
+        ignore_token_ids
+        if ignore_token_ids is not None
+        else (_get_image_token_ids(model) if model is not None else None)
+    )
     _assistant_token_id = assistant_token_id
 
     def loss_fn(model, batch_dict):
@@ -609,8 +691,9 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
         logits = logits.astype(mx.float32)
 
         if labels is not None:
-            # train_on_responses_only: labels encode instruction/padding masking.
-            # Still mask image placeholder tokens.
+            # Labels encode instruction/padding/special-token masking when
+            # produced by MLX VLM collation. The extra mask keeps legacy
+            # externally supplied labels compatible.
             targets = labels[:, 1:]
             targets = _mask_image_tokens(targets, _image_token_ids)
             logits, targets = _align_logits_with_labels(logits, targets)
@@ -779,9 +862,9 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     hidden = hidden[:, :-1, :]
 
     if labels is not None:
-        # train_on_responses_only: labels already encode instruction and
-        # padding masking. Still need to mask image placeholder tokens
-        # since they provide no useful gradient signal.
+        # Labels are the source of truth. Collation should already encode
+        # instruction/padding/special-token masking; the extra mask preserves
+        # compatibility for externally supplied labels.
         targets = labels[:, 1:]
         masked_targets = _mask_image_tokens(targets, image_token_ids)
         ntoks = (masked_targets != -100).sum()
@@ -875,71 +958,8 @@ def _normalize_int_tuple(values):
     return tuple(int(x) for x in values)
 
 
-def _expand_image_token_sequences(
-    input_ids,
-    attention_mask,
-    image_token_id,
-    repeat_count,
-    labels=None,
-):
-    input_ids_np = np.asarray(input_ids)
-    attention_mask_np = (
-        np.asarray(attention_mask)
-        if attention_mask is not None
-        else np.ones_like(input_ids_np, dtype=np.int32)
-    )
-    labels_np = np.asarray(labels) if labels is not None else None
-
-    expanded_ids = []
-    expanded_masks = []
-    expanded_labels = [] if labels_np is not None else None
-    max_len = 0
-    for row_idx, (row_ids, row_mask) in enumerate(zip(input_ids_np, attention_mask_np)):
-        new_ids = []
-        new_mask = []
-        new_labels = [] if labels_np is not None else None
-        row_labels_list = labels_np[row_idx].tolist() if labels_np is not None else None
-        for pos, (token_id, mask_value) in enumerate(zip(row_ids.tolist(), row_mask.tolist())):
-            if int(token_id) == int(image_token_id):
-                new_ids.extend([int(image_token_id)] * int(repeat_count))
-                new_mask.extend([int(mask_value)] * int(repeat_count))
-                if new_labels is not None:
-                    new_labels.extend([-100] * int(repeat_count))
-            else:
-                new_ids.append(int(token_id))
-                new_mask.append(int(mask_value))
-                if new_labels is not None:
-                    new_labels.append(int(row_labels_list[pos]))
-        expanded_ids.append(new_ids)
-        expanded_masks.append(new_mask)
-        if expanded_labels is not None:
-            expanded_labels.append(new_labels)
-        max_len = max(max_len, len(new_ids))
-
-    padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
-    padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
-    padded_labels = (
-        np.full((len(expanded_labels), max_len), -100, dtype=np.int32)
-        if expanded_labels is not None else None
-    )
-    for row_idx, (row_ids, row_mask) in enumerate(zip(expanded_ids, expanded_masks)):
-        row_len = len(row_ids)
-        padded_ids[row_idx, :row_len] = row_ids
-        padded_masks[row_idx, :row_len] = row_mask
-        if padded_labels is not None:
-            padded_labels[row_idx, :row_len] = expanded_labels[row_idx]
-
-    if padded_labels is not None:
-        return mx.array(padded_ids), mx.array(padded_masks), mx.array(padded_labels)
-    return mx.array(padded_ids), mx.array(padded_masks)
-
-
-def _expand_token_runs(
-    input_ids,
-    attention_mask,
-    replacements_by_batch,
-    labels=None,
-):
+def _expand_token_replacements(input_ids, attention_mask, replacements_by_batch,
+                               labels=None):
     input_ids_np = np.asarray(input_ids)
     attention_mask_np = (
         np.asarray(attention_mask)
@@ -966,17 +986,20 @@ def _expand_token_runs(
         row_ids_list = row_ids.tolist()
         row_mask_list = row_mask.tolist()
         for start, end, token_id, repeat in replacements:
+            start = int(start)
+            end = int(end)
+            repeat = int(repeat)
             if start > prev:
                 new_ids.extend(row_ids_list[prev:start])
                 new_mask.extend(row_mask_list[prev:start])
                 if new_labels is not None:
                     new_labels.extend(row_labels_list[prev:start])
-            new_ids.extend([int(token_id)] * int(repeat))
+            new_ids.extend([int(token_id)] * repeat)
             fill_mask = int(row_mask_list[start]) if start < len(row_mask_list) else 1
-            new_mask.extend([fill_mask] * int(repeat))
+            new_mask.extend([fill_mask] * repeat)
             if new_labels is not None:
-                new_labels.extend([-100] * int(repeat))
-            prev = int(end)
+                new_labels.extend([-100] * repeat)
+            prev = end
         if prev < len(row_ids_list):
             new_ids.extend(row_ids_list[prev:])
             new_mask.extend(row_mask_list[prev:])
@@ -1004,6 +1027,43 @@ def _expand_token_runs(
     if padded_labels is not None:
         return mx.array(padded_ids), mx.array(padded_masks), mx.array(padded_labels)
     return mx.array(padded_ids), mx.array(padded_masks)
+
+
+def _expand_image_token_sequences(
+    input_ids,
+    attention_mask,
+    image_token_id,
+    repeat_count,
+    labels=None,
+):
+    input_ids_np = np.asarray(input_ids)
+    replacements_by_batch = []
+    for row in input_ids_np:
+        replacements = []
+        for pos, token_id in enumerate(row.tolist()):
+            if int(token_id) == int(image_token_id):
+                replacements.append((pos, pos + 1, image_token_id, repeat_count))
+        replacements_by_batch.append(tuple(replacements))
+    return _expand_token_replacements(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        replacements_by_batch=tuple(replacements_by_batch),
+        labels=labels,
+    )
+
+
+def _expand_token_runs(
+    input_ids,
+    attention_mask,
+    replacements_by_batch,
+    labels=None,
+):
+    return _expand_token_replacements(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        replacements_by_batch=replacements_by_batch,
+        labels=labels,
+    )
 
 
 def _build_qwen_position_ids(
@@ -1447,7 +1507,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
     return batch_dict
 
 
-def make_vlm_cce_loss_fn(model, assistant_token_id=0):
+def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     """Create a CCE loss function for VLMs.
 
     Uses model.get_input_embeddings() to get merged vision+text embeddings,
@@ -1473,7 +1533,11 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
             "falling back to baseline CE loss.",
             stacklevel=2,
         )
-        return make_vlm_baseline_loss_fn(model, assistant_token_id=assistant_token_id)
+        return make_vlm_baseline_loss_fn(
+            model,
+            assistant_token_id=assistant_token_id,
+            ignore_token_ids=ignore_token_ids,
+        )
 
     tm = _get_text_model(model)
     if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
@@ -1483,7 +1547,11 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
             "falling back to baseline CE loss.",
             stacklevel=2,
         )
-        return make_vlm_baseline_loss_fn(model, assistant_token_id=assistant_token_id)
+        return make_vlm_baseline_loss_fn(
+            model,
+            assistant_token_id=assistant_token_id,
+            ignore_token_ids=ignore_token_ids,
+        )
 
     softcap = _get_logit_softcap(model)
     lm_layer = _get_lm_head_layer(model)
@@ -1492,7 +1560,11 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
     # Must be called after LoRA setup.
     _skip_weight_grad = not _is_lm_head_trainable(model)
 
-    _image_token_ids = _get_image_token_ids(model)
+    _image_token_ids = (
+        ignore_token_ids
+        if ignore_token_ids is not None
+        else _get_image_token_ids(model)
+    )
     if _image_token_ids is not None:
         print(f"Unsloth: Masking {len(_image_token_ids)} image token IDs from VLM loss.")
     _assistant_token_id = assistant_token_id
@@ -1606,6 +1678,10 @@ def _has_chat_template(obj):
 
 
 def _get_processor_tokenizer(processor):
+    if processor is None:
+        return None
+    if hasattr(processor, "_tokenizer"):
+        return processor._tokenizer
     return getattr(processor, "tokenizer", processor)
 
 
@@ -2181,7 +2257,8 @@ def _processor_vlm_inputs(processor, texts, all_images, max_seq_length, suffixes
     return processor(**proc_kwargs)
 
 
-def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image_size):
+def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image_size,
+                                         ignore_token_ids=None):
     prompt_texts = []
     combined_texts = []
     all_images = []
@@ -2214,8 +2291,12 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
         processor, prompt_texts, all_images, max_seq_length
     )
     batch = _to_mx_vlm_batch(combined_inputs)
+    batch["labels"] = _apply_vlm_label_masks(
+        batch,
+        ignore_token_ids=ignore_token_ids,
+    )
 
-    labels_np = np.array(batch["input_ids"].tolist(), dtype=np.int32)
+    labels_np = np.array(batch["labels"].tolist(), dtype=np.int32)
     prompt_batch = _to_mx_vlm_batch(prompt_inputs)
     prompt_mask = prompt_batch.get("attention_mask")
     prompt_ids = prompt_batch["input_ids"]
@@ -2225,14 +2306,12 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
         else:
             prompt_len = int(mx.sum(prompt_ids[row] != 0).item())
         labels_np[row, :prompt_len] = -100
-    labels = mx.array(labels_np)
-    if "attention_mask" in batch:
-        labels = mx.where(batch["attention_mask"] == 0, mx.array(-100), labels)
-    batch["labels"] = labels.astype(mx.int32)
+    batch["labels"] = mx.array(labels_np).astype(mx.int32)
     return batch
 
 
-def _collate_vlm_batch(items, processor, max_seq_length, image_size, formatting_func=None):
+def _collate_vlm_batch(items, processor, max_seq_length, image_size,
+                       formatting_func=None, ignore_token_ids=None):
     """Collate a batch of VLM samples using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator:
@@ -2255,7 +2334,8 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size, formatting_
         and "completion" in formatted_items[0]
     ):
         return _collate_vlm_prompt_completion_batch(
-            formatted_items, processor, max_seq_length, image_size
+            formatted_items, processor, max_seq_length, image_size,
+            ignore_token_ids=ignore_token_ids,
         )
 
     all_texts = []
@@ -2284,10 +2364,15 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size, formatting_
         processor, all_texts, all_images, max_seq_length,
         suffixes=all_suffixes,
     )
-    return _to_mx_vlm_batch(inputs)
+    batch = _to_mx_vlm_batch(inputs)
+    batch["labels"] = _apply_vlm_label_masks(
+        batch,
+        ignore_token_ids=ignore_token_ids,
+    )
+    return batch
 
 
-def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn):
+def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None):
     """Apply response masking to a VLM batch dict, adding 'labels' key.
 
     Converts input_ids to plain lists, runs the masking closure from
@@ -2300,12 +2385,11 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn):
     labels_list = result["labels"]
     if hasattr(labels_list, "tolist"):
         labels_list = labels_list.tolist()
-    attention_mask = batch_dict.get("attention_mask")
-    if attention_mask is not None:
-        labels_array = mx.where(attention_mask == 0, mx.array(-100), mx.array(labels_list))
-    else:
-        labels_array = mx.array(labels_list)
-    batch_dict["labels"] = labels_array
+    batch_dict["labels"] = _apply_vlm_label_masks(
+        batch_dict,
+        labels=mx.array(labels_list),
+        ignore_token_ids=ignore_token_ids,
+    )
     return batch_dict
 
 
@@ -2320,6 +2404,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     import numpy as np
 
     image_size = _get_vlm_image_size(config, processor)
+    ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
 
     indices = list(range(len(dataset)))
     np.random.seed(seed)
@@ -2337,10 +2422,15 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
         batch_dict = _collate_vlm_batch(
             items, processor, max_seq_length, image_size,
             formatting_func=formatting_func,
+            ignore_token_ids=ignore_token_ids,
         )
         batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
         if response_mask_fn is not None:
-            batch_dict = _apply_response_mask_to_vlm_batch(batch_dict, response_mask_fn)
+            batch_dict = _apply_response_mask_to_vlm_batch(
+                batch_dict,
+                response_mask_fn,
+                ignore_token_ids=ignore_token_ids,
+            )
         batch_list.append(batch_dict)
         if num_batches is not None and len(batch_list) >= num_batches:
             break
@@ -2369,15 +2459,21 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
     import numpy as np
 
     image_size = _get_vlm_image_size(config, processor)
+    ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
 
     def _emit(items):
         batch_dict = _collate_vlm_batch(
             items, processor, max_seq_length, image_size,
             formatting_func=formatting_func,
+            ignore_token_ids=ignore_token_ids,
         )
         batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
         if response_mask_fn is not None:
-            batch_dict = _apply_response_mask_to_vlm_batch(batch_dict, response_mask_fn)
+            batch_dict = _apply_response_mask_to_vlm_batch(
+                batch_dict,
+                response_mask_fn,
+                ignore_token_ids=ignore_token_ids,
+            )
         return batch_dict
 
     if hasattr(dataset, "__len__"):
