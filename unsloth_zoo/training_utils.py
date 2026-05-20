@@ -32,6 +32,7 @@ from .gradient_checkpointing import (
 )
 import os
 import re
+import functools
 
 __all__ = [
     "fix_zero_training_loss",
@@ -100,28 +101,54 @@ def _wrap_forward_in_bf16_autocast(model, compute_dtype):
     downcast at the op boundary -- the standard PyTorch mixed-precision
     pattern PEFT and Accelerate already rely on. Idempotent; defers to an
     outer autocast context if one is already active.
+
+    Implementation notes:
+      - `functools.wraps(_orig_forward)` preserves the model's forward
+        signature so `inspect.signature(model.forward)` still reports
+        the real parameter names. HF `Trainer._set_signature_columns_if_needed`
+        reads that signature to decide which dataset columns to keep under
+        `remove_unused_columns=True`.
+      - The wrap is installed by subclassing `type(model)` and overriding
+        `forward` on the new class, rather than reassigning `model.forward`
+        to a closure. `copy.deepcopy(model)` (used by EMA / model averaging
+        / `Trainer._save_optimizer_and_scheduler` checkpoint paths) uses
+        `obj.__class__` to reconstruct the copy, so the subclass survives
+        and the copy's `forward` correctly binds to the copy's `self`.
+      - `is_autocast_available(device_type)` is probed BEFORE
+        `is_autocast_enabled(device_type)` because the latter raises on
+        unsupported device types (e.g. "meta" tensors during materialise),
+        whereas `is_autocast_available` returns False cleanly.
     """
     if compute_dtype in (None, torch.float32):
         return model
     if getattr(model, "_unsloth_bf16_autocast_wrapped", False):
         return model
-    _orig_forward = model.forward
 
-    def _wrapped(*args, **kwargs):
-        # Try to pick the right device_type from the first tensor we see.
+    _orig_forward = type(model).forward
+
+    @functools.wraps(_orig_forward)
+    def _wrapped(self, *args, **kwargs):
         device_type = "cuda"
         for t in list(args) + list(kwargs.values()):
             if torch.is_tensor(t):
                 device_type = t.device.type
                 break
-        if torch.is_autocast_enabled(device_type):
-            return _orig_forward(*args, **kwargs)
+        # Order matters: is_autocast_enabled raises on unsupported device
+        # types (e.g. "meta"); is_autocast_available returns False cleanly.
         if not torch.amp.is_autocast_available(device_type):
-            return _orig_forward(*args, **kwargs)
+            return _orig_forward(self, *args, **kwargs)
+        if torch.is_autocast_enabled(device_type):
+            return _orig_forward(self, *args, **kwargs)
         with torch.amp.autocast(device_type=device_type, dtype=compute_dtype):
-            return _orig_forward(*args, **kwargs)
+            return _orig_forward(self, *args, **kwargs)
 
-    model.forward = _wrapped
+    cls = type(model)
+    new_cls = type(
+        cls.__name__ + "WithUnslothBf16Autocast",
+        (cls,),
+        {"forward": _wrapped},
+    )
+    model.__class__ = new_cls
     model._unsloth_bf16_autocast_wrapped = True
     return model
 

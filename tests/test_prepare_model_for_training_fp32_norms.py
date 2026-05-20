@@ -287,3 +287,112 @@ def test_matcher_catches_vit_style_norm1_norm2():
 def test_full_ft_weight_tying_preserved():
     m, p = _run(full_finetuning=True)
     assert m.lm_head.weight is m.model.embed_tokens.weight
+
+
+# ---------------- autocast wrapper: signature / meta-device / deepcopy ------
+
+
+class _TinyForSig(nn.Module):
+    """Model with an `input_ids`/`labels` style forward so we can inspect
+    the signature `Trainer._set_signature_columns_if_needed` would see."""
+
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.LayerNorm(8)
+        self.proj = nn.Linear(8, 8)
+        self.to(torch.bfloat16)
+        self.config = _Cfg(dtype=torch.bfloat16)
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        x = self.norm(input_ids.to(self.norm.weight.dtype))
+        return self.proj(x)
+
+
+def test_wrapper_preserves_forward_signature():
+    """Regression: HF Trainer reads `inspect.signature(model.forward)` to
+    decide which dataset columns to keep under `remove_unused_columns=True`.
+    A bare `(*args, **kwargs)` wrapper would drop every named column."""
+    import inspect
+    from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+
+    m = _TinyForSig()
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+    sig = inspect.signature(m.forward)
+    names = list(sig.parameters.keys())
+    assert "input_ids" in names, names
+    assert "attention_mask" in names, names
+    assert "labels" in names, names
+
+
+def test_wrapper_meta_device_does_not_crash():
+    """Regression: torch.is_autocast_enabled('meta') raises on
+    unsupported device types. We must probe is_autocast_available first."""
+    from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+
+    class _MetaModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = _Cfg(dtype=torch.bfloat16)
+
+        def forward(self, x):
+            return x
+
+    m = _MetaModel()
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+    # Passing a meta tensor would previously crash inside the wrapper
+    # at torch.is_autocast_enabled('meta'); the reordered guards must
+    # treat 'meta' as "autocast unavailable, fall through".
+    out = m(torch.zeros(2, device="meta"))
+    assert out.device.type == "meta"
+
+
+def test_wrapper_survives_deepcopy_and_uses_copy_weights():
+    """Regression: EMA / model averaging deepcopies the model. The closure-
+    based capture pinned `_orig_forward` to the original instance, so the
+    copy ran forward against the ORIGINAL weights. Subclass+self-bind via
+    types.MethodType-equivalent (class override) must rebind cleanly."""
+    import copy
+    from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+
+    class _Owner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(4, 4, bias=False)
+            self.config = _Cfg(dtype=torch.bfloat16)
+
+        def forward(self, x):
+            return self.lin(x)
+
+    m = _Owner()
+    with torch.no_grad():
+        m.lin.weight.fill_(1.0)
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+
+    m2 = copy.deepcopy(m)
+    with torch.no_grad():
+        m2.lin.weight.fill_(2.0)
+
+    # Distinct parameter storage after deepcopy.
+    assert m.lin.weight.data_ptr() != m2.lin.weight.data_ptr()
+
+    x = torch.zeros(1, 4, dtype=torch.bfloat16)
+    x[0, 0] = 1.0
+    # Original sees fills of 1.0 (row sum = 1).
+    y1 = m(x)
+    # Copy with weights overwritten to 2.0 must see 2.0 (row sum = 2),
+    # NOT the original's 1.0. The pre-fix closure leaked to original.
+    y2 = m2(x)
+    assert torch.allclose(y1.float(), torch.full_like(y1, 1.0, dtype=torch.float32))
+    assert torch.allclose(y2.float(), torch.full_like(y2, 2.0, dtype=torch.float32))
+
+
+def test_wrapper_idempotent():
+    """Calling _wrap twice does NOT double-wrap (and the second call is a
+    no-op, returning the same model object with the same class)."""
+    from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+
+    m = _TinyForSig()
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+    cls_after_first = type(m)
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+    assert type(m) is cls_after_first
