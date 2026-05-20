@@ -89,7 +89,8 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
         value = schedule(step)
         return value.item() if hasattr(value, "item") else float(value)
 
-    assert value_at(0) > 0.0
+    assert value_at(0) == pytest.approx(0.0)
+    assert value_at(1) > value_at(0)
     assert value_at(4) < trainer.args.learning_rate
     assert value_at(5) == pytest.approx(trainer.args.learning_rate)
 
@@ -125,6 +126,22 @@ def test_adamw_weight_decay_uses_hf_bias_norm_filter():
     assert not MLXTrainer._should_apply_weight_decay("layers.0.mlp.down_proj.bias")
     assert not MLXTrainer._should_apply_weight_decay("layers.0.input_layernorm.weight")
     assert not MLXTrainer._should_apply_weight_decay("vision.blocks.0.norm1.weight")
+
+
+def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    def should_restore_original_dtype(name):
+        return (
+            not MLXTrainer._is_norm_parameter_name(name)
+            and not MLXTrainer._is_lora_parameter_name(name)
+        )
+
+    assert should_restore_original_dtype("model.layers.0.mlp.down_proj.weight")
+    assert not should_restore_original_dtype("model.layers.0.self_attn.q_proj.lora_a")
+    assert not should_restore_original_dtype("model.layers.0.self_attn.q_proj.lora_b")
+    assert not should_restore_original_dtype("model.layers.0.input_layernorm.weight")
+    assert not should_restore_original_dtype("vision.blocks.0.norm1.weight")
 
 
 @pytest.mark.parametrize(
@@ -171,6 +188,9 @@ def test_scheduler_lr_matches_expected_optimizer_update_steps(scheduler, warmup)
             trainer.args.learning_rate * 1 / 7,
         ]
         assert values == pytest.approx(expected)
+    elif warmup > 0:
+        assert values[0] == pytest.approx(0.0)
+        assert all(value > 0.0 for value in values[1:])
     else:
         assert all(value > 0.0 for value in values)
 

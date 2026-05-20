@@ -463,6 +463,22 @@ class MLXTrainer:
             return False
         return True
 
+    @staticmethod
+    def _is_norm_parameter_name(name):
+        return any(
+            "norm" in part.lower()
+            for part in str(name).split(".")
+            if part
+        )
+
+    @staticmethod
+    def _is_lora_parameter_name(name):
+        return any(
+            "lora" in part.lower()
+            for part in str(name).split(".")
+            if part
+        )
+
     def _apply_manual_adamw_weight_decay(self, model, optimizer, grad):
         """Apply decoupled AdamW decay to trainable non-bias/non-norm leaves."""
         wd = float(getattr(self, "_manual_adamw_weight_decay", 0.0) or 0.0)
@@ -834,26 +850,20 @@ class MLXTrainer:
             not _clip_grad_value
         )
 
-        def _is_norm_parameter_name(name):
-            return any(
-                "norm" in part.lower()
-                for part in str(name).split(".")
-                if part
-            )
-
         _restore_storage_after_norm_clip = max_grad_norm > 0
         _trainable_storage_dtypes = (
             {
                 name: value.dtype
                 for name, value in tree_flatten(model.trainable_parameters())
-                if not _is_norm_parameter_name(name)
+                if not self._is_norm_parameter_name(name)
+                and not self._is_lora_parameter_name(name)
             }
             if _restore_storage_after_norm_clip
             else {}
         )
 
         def _restore_trainable_storage_dtypes():
-            """Keep norm-clipped MLX updates from promoting non-norm params."""
+            """Keep norm-clipped MLX updates from promoting base params."""
             if not _restore_storage_after_norm_clip:
                 return
             recast = []
