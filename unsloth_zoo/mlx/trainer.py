@@ -118,6 +118,8 @@ class MLXTrainingConfig:
     # Optimization
     optim: str = "adamw"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
     weight_decay: float = 0.001
+    adam_beta1: float | None = None
+    adam_beta2: float | None = None
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
     # Elementwise clip ([-max_grad_value, max_grad_value], per-leaf, no
     # cross-leaf reduction). Set 0.0 to disable. Default 1.0: |g_i| > 5
@@ -196,6 +198,14 @@ class MLXTrainer:
 
         # Auto-detect VLM
         self._is_vlm = _is_vlm_model(model)
+        if self._is_vlm:
+            # VLM callers pass the processor through the tokenizer slot to
+            # mirror HF Trainer APIs. The loss is constructed before data
+            # preparation, so attach it now for image-token masking.
+            if self.processor is None:
+                self.processor = tokenizer
+            if self.processor is not None:
+                self.model._processor = self.processor
 
         # Constructor params override args if provided
         if dataset_text_field is not None:
@@ -387,6 +397,14 @@ class MLXTrainer:
         self._lr_schedule = schedule if callable(schedule) else None
         wd = self.args.weight_decay
         self._manual_adamw_weight_decay = 0.0
+        adam_beta1 = getattr(self.args, "adam_beta1", None)
+        adam_beta2 = getattr(self.args, "adam_beta2", None)
+        adam_kwargs = {}
+        if adam_beta1 is not None or adam_beta2 is not None:
+            adam_kwargs["betas"] = (
+                float(0.9 if adam_beta1 is None else adam_beta1),
+                float(0.999 if adam_beta2 is None else adam_beta2),
+            )
 
         opt_name = _normalize_mlx_optimizer_name(self.args.optim)
         if opt_name == "adafactor":
@@ -418,11 +436,13 @@ class MLXTrainer:
                 learning_rate=initial_lr,
                 weight_decay=0.0,
                 bias_correction=True,
+                **adam_kwargs,
             )
         elif opt_name == "adam":
             optimizer = optim.Adam(
                 learning_rate=initial_lr,
                 bias_correction=True,
+                **adam_kwargs,
             )
         elif opt_name == "sgd":
             optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=wd)
@@ -798,6 +818,39 @@ class MLXTrainer:
             not _clip_grad_value
         )
 
+        def _is_norm_parameter_name(name):
+            return any(
+                "norm" in part.lower()
+                for part in str(name).split(".")
+                if part
+            )
+
+        _restore_storage_after_norm_clip = max_grad_norm > 0
+        _trainable_storage_dtypes = (
+            {
+                name: value.dtype
+                for name, value in tree_flatten(model.trainable_parameters())
+                if not _is_norm_parameter_name(name)
+            }
+            if _restore_storage_after_norm_clip
+            else {}
+        )
+
+        def _restore_trainable_storage_dtypes():
+            """Keep norm-clipped MLX updates from promoting non-norm params."""
+            if not _restore_storage_after_norm_clip:
+                return
+            recast = []
+            needs_update = False
+            for name, value in tree_flatten(model.trainable_parameters()):
+                dtype = _trainable_storage_dtypes.get(name)
+                if dtype is not None and value.dtype != dtype:
+                    value = value.astype(dtype)
+                    needs_update = True
+                recast.append((name, value))
+            if needs_update:
+                model.update(tree_unflatten(recast))
+
         def _grad_leaf_scale(name, safe_toks_f, clip_scale=None, dtype=None):
             """Return the exact scalar applied to one grad leaf before update.
 
@@ -895,6 +948,7 @@ class MLXTrainer:
                 )
             self._apply_manual_adamw_weight_decay(model, optimizer, final_grad)
             optimizer.update(model, final_grad)
+            _restore_trainable_storage_dtypes()
             return grad_norm
 
         def _apply_update_direct(grad):
@@ -921,6 +975,7 @@ class MLXTrainer:
                 )
             self._apply_manual_adamw_weight_decay(model, optimizer, grad)
             optimizer.update(model, grad)
+            _restore_trainable_storage_dtypes()
             return grad_norm
 
         # Unified step function for both VLM and text training.
