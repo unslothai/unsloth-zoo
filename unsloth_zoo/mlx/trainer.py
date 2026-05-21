@@ -38,7 +38,6 @@ Usage mirrors TRL notebooks:
 
 from dataclasses import asdict, dataclass, is_dataclass
 import concurrent.futures
-import importlib
 import math
 import os
 import random
@@ -94,66 +93,111 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
-_NORM_OUTPUT_CAST_EXTRA_CLASS_PATHS = (
-    ("mlx_lm.models.bailing_moe_linear", "GroupRMSNorm"),
-    ("mlx_lm.models.cohere", "LayerNorm2D"),
-    ("mlx_lm.models.falcon_h1", "FalconH1RMSNormGated"),
-    ("mlx_lm.models.gemma", "RMSNorm"),
-    ("mlx_lm.models.gemma2", "RMSNorm"),
-    ("mlx_lm.models.gemma3_text", "RMSNorm"),
-    ("mlx_lm.models.granitemoehybrid", "GraniteMoeHybridRMSNormGated"),
-    ("mlx_lm.models.mamba2", "MambaRMSNormGated"),
-    ("mlx_lm.models.nemotron", "NemotronLayerNorm1P"),
-    ("mlx_lm.models.nemotron_h", "MambaRMSNormGated"),
-    ("mlx_lm.models.plamo2", "RMSNorm"),
-    ("mlx_lm.models.qwen3_next", "Qwen3NextRMSNormGated"),
-    ("mlx_lm.models.recurrent_gemma", "RMSNorm"),
-    ("mlx_lm.models.rwkv7", "LayerNormPerHead"),
-    ("mlx_lm.models.stablelm", "LayerNormPerHead"),
-    ("mlx_lm.models.step3p5", "ZeroCenteredRMSNorm"),
-    ("mlx_vlm.models.deepseekocr_2.vision", "Qwen2RMSNorm"),
-    ("mlx_vlm.models.dots_ocr.vision", "RMSNorm"),
-    ("mlx_vlm.models.fastvlm.vision", "LayerNormChannel"),
-    ("mlx_vlm.models.gemma3.language", "RMSNorm"),
-    ("mlx_vlm.models.gemma3n.audio", "Gemma3nCumulativeGroupNorm"),
-    ("mlx_vlm.models.gemma3n.language", "Gemma3nRMSNorm"),
-    ("mlx_vlm.models.gemma3n.vision", "RMSNormAct2d"),
-    ("mlx_vlm.models.gemma4.audio", "AudioRMSNorm"),
-    ("mlx_vlm.models.gemma4.language", "RMSNormZeroShift"),
-    ("mlx_vlm.models.gemma4.vision", "RMSNorm"),
-    ("mlx_vlm.models.gemma4.vision", "VisionRMSNorm"),
-    ("mlx_vlm.models.jina_vlm.language", "RMSNorm"),
-    ("mlx_vlm.models.paligemma.language", "RMSNorm"),
-    ("mlx_vlm.models.qwen3_5.language", "Qwen3_5RMSNormGated"),
-    ("mlx_vlm.models.sam3.sam_components", "LayerNorm2d"),
-    ("mlx_vlm.models.sam3d_body.layers", "LayerNorm32"),
-)
+_NORM_OUTPUT_CAST_BASE_CLASSES = (nn.RMSNorm, nn.LayerNorm)
 _NORM_OUTPUT_CAST_PATCHED_CLASSES = set()
 
 
-def _iter_norm_output_cast_classes():
+def _is_norm_parameter_path(path) -> bool:
+    parts = str(path).lower().split(".")
+    return any("norm" in part for part in parts[:-1])
+
+
+def _join_parameter_path(module_path, parameter_path):
+    if module_path and parameter_path:
+        return f"{module_path}.{parameter_path}"
+    return module_path or parameter_path
+
+
+def _has_norm_selected_floating_parameter(module_path, module) -> bool:
+    try:
+        parameters = module.parameters()
+    except Exception:
+        return False
+
+    try:
+        for parameter_path, value in tree_flatten(parameters):
+            full_path = _join_parameter_path(module_path, parameter_path)
+            if (
+                _is_norm_parameter_path(full_path)
+                and hasattr(value, "dtype")
+                and mx.issubdtype(value.dtype, mx.floating)
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_floating_parameter(module) -> bool:
+    try:
+        parameters = module.parameters()
+    except Exception:
+        return False
+
+    try:
+        for _, value in tree_flatten(parameters):
+            if hasattr(value, "dtype") and mx.issubdtype(value.dtype, mx.floating):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_no_parameterized_non_norm_children(module) -> bool:
+    try:
+        children = module.children()
+    except Exception:
+        return False
+
+    try:
+        for _, child in tree_flatten(children, is_leaf=nn.Module.is_module):
+            if (
+                isinstance(child, nn.Module)
+                and "norm" not in type(child).__name__.lower()
+                and _has_floating_parameter(child)
+            ):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _is_norm_output_cast_candidate(module_path, module) -> bool:
+    """Return whether a custom module itself produces norm-like output."""
+    norm_cls = type(module)
+    if norm_cls in _NORM_OUTPUT_CAST_BASE_CLASSES:
+        return True
+    if "norm" not in norm_cls.__name__.lower():
+        return False
+    if not _has_norm_selected_floating_parameter(module_path, module):
+        return False
+    return _has_no_parameterized_non_norm_children(module)
+
+
+def _iter_norm_output_cast_classes(model=None):
     norm_classes = []
     seen = set()
 
-    for module_name, class_name in _NORM_OUTPUT_CAST_EXTRA_CLASS_PATHS:
-        try:
-            module = importlib.import_module(module_name)
-            norm_cls = getattr(module, class_name)
-        except Exception:
-            continue
-        if norm_cls not in seen:
-            norm_classes.append(norm_cls)
-            seen.add(norm_cls)
+    for norm_cls in _NORM_OUTPUT_CAST_BASE_CLASSES:
+        norm_classes.append(norm_cls)
+        seen.add(norm_cls)
 
-    for norm_cls in (nn.RMSNorm, nn.LayerNorm):
-        if norm_cls not in seen:
-            norm_classes.append(norm_cls)
-            seen.add(norm_cls)
+    if model is not None:
+        try:
+            named_modules = model.named_modules()
+        except Exception:
+            named_modules = ()
+        for module_path, module in named_modules:
+            if _is_norm_output_cast_candidate(module_path, module):
+                norm_cls = type(module)
+                if norm_cls not in seen:
+                    norm_classes.append(norm_cls)
+                    seen.add(norm_cls)
 
     return tuple(norm_classes)
 
 
-def _set_norm_output_cast_to_input_dtype(enabled: bool) -> None:
+def _set_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
     """Control whether norm outputs are cast back to activation dtype.
 
     Norm parameters can stay in fp32 for stability, but letting fp32 norm
@@ -162,7 +206,7 @@ def _set_norm_output_cast_to_input_dtype(enabled: bool) -> None:
     result back matches PyTorch autocast behavior more closely: fp32 norm math,
     bf16/fp16 downstream activations.
     """
-    norm_classes = list(_iter_norm_output_cast_classes())
+    norm_classes = list(_iter_norm_output_cast_classes(model))
     if not enabled:
         norm_classes.extend(
             norm_cls for norm_cls in _NORM_OUTPUT_CAST_PATCHED_CLASSES
@@ -762,7 +806,7 @@ class MLXTrainer:
         args = self.args
         model = self.model
         cast_norm_output = bool(getattr(args, "cast_norm_output_to_input_dtype", True))
-        _set_norm_output_cast_to_input_dtype(cast_norm_output)
+        _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
         if cast_norm_output:
             print("Unsloth: Casting MLX norm outputs back to activation dtype.")
         args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))

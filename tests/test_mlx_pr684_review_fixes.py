@@ -206,34 +206,46 @@ def test_pr684_compiler_review_guards_are_present():
     assert 'getattr(norm, "weight", None)' in mlx_compile_source
 
 
-def test_norm_output_cast_includes_custom_norms():
+def test_norm_output_cast_discovers_custom_norms_from_loaded_model():
     _skip_if_mlx_core_was_replaced()
+    import mlx.nn as nn
+
     gemma3_text = pytest.importorskip("mlx_lm.models.gemma3_text")
     stablelm = pytest.importorskip("mlx_lm.models.stablelm")
     fastvlm_vision = pytest.importorskip("mlx_vlm.models.fastvlm.vision")
     import unsloth_zoo.mlx.trainer as trainer_mod
 
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = gemma3_text.RMSNorm(4)
+            self.q_layernorm = stablelm.LayerNormPerHead(
+                head_dim=4, num_heads=2, eps=1e-5
+            )
+            self.norm = fastvlm_vision.LayerNormChannel(num_features=4)
+
     trainer_mod._set_norm_output_cast_to_input_dtype(False)
+    model = TinyModel()
     cases = [
-        (gemma3_text.RMSNorm(4), mx.ones((2, 4), dtype=mx.bfloat16)),
+        (model.input_layernorm, mx.ones((2, 4), dtype=mx.bfloat16)),
         (
-            stablelm.LayerNormPerHead(head_dim=4, num_heads=2, eps=1e-5),
+            model.q_layernorm,
             mx.ones((1, 3, 2, 4), dtype=mx.bfloat16),
         ),
         (
-            fastvlm_vision.LayerNormChannel(num_features=4),
+            model.norm,
             mx.ones((1, 2, 2, 4), dtype=mx.bfloat16),
         ),
     ]
 
-    norm_classes = trainer_mod._iter_norm_output_cast_classes()
+    norm_classes = trainer_mod._iter_norm_output_cast_classes(model)
     for norm, x in cases:
         assert type(norm) in norm_classes
         raw = norm(x)
         assert raw.dtype == mx.float32
 
     try:
-        trainer_mod._set_norm_output_cast_to_input_dtype(True)
+        trainer_mod._set_norm_output_cast_to_input_dtype(True, model)
         for norm, x in cases:
             out = norm(x)
             assert out.dtype == x.dtype
