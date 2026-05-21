@@ -167,6 +167,16 @@ def _has_no_parameterized_non_norm_children(module) -> bool:
     return True
 
 
+def _norm_output_cast_input_dtype(args, kwargs):
+    for value in args:
+        if hasattr(value, "dtype"):
+            return value.dtype
+    for value in kwargs.values():
+        if hasattr(value, "dtype"):
+            return value.dtype
+    return None
+
+
 def _is_norm_output_cast_candidate(module_path, module) -> bool:
     """Return whether a custom module itself produces norm-like output."""
     norm_cls = type(module)
@@ -227,10 +237,15 @@ def _set_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
             if getattr(original_call, "_unsloth_norm_output_cast_wrapper", False):
                 continue
 
-            def norm_call_cast_output(self, x, *args, _original_call=original_call, **kwargs):
-                out = _original_call(self, x, *args, **kwargs)
-                if hasattr(x, "dtype") and hasattr(out, "dtype") and out.dtype != x.dtype:
-                    return out.astype(x.dtype)
+            def norm_call_cast_output(self, *args, _original_call=original_call, **kwargs):
+                input_dtype = _norm_output_cast_input_dtype(args, kwargs)
+                out = _original_call(self, *args, **kwargs)
+                if (
+                    input_dtype is not None
+                    and hasattr(out, "dtype")
+                    and out.dtype != input_dtype
+                ):
+                    return out.astype(input_dtype)
                 return out
 
             norm_call_cast_output._unsloth_norm_output_cast_wrapper = True
