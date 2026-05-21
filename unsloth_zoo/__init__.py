@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2026.5.2"
+__version__ = "2026.5.3"
 
 import os
 import warnings
@@ -23,8 +23,18 @@ import re
 if "TOKENIZERS_PARALLELISM" not in os.environ:
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Hugging Face Hub faster downloads
-if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
+# Detect offline mode first. hf_transfer is a Rust downloader that bypasses
+# huggingface_hub's offline guard, so leaving it on defeats HF_HUB_OFFLINE
+# and TRANSFORMERS_OFFLINE entirely.
+_OFFLINE_TRUE = {"1", "true", "yes", "on"}
+_offline_env = (
+    os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in _OFFLINE_TRUE
+    or os.environ.get("TRANSFORMERS_OFFLINE", "").strip().lower() in _OFFLINE_TRUE
+    or os.environ.get("HF_DATASETS_OFFLINE", "").strip().lower() in _OFFLINE_TRUE
+)
+
+# Hugging Face Hub faster downloads (skipped when offline mode is requested).
+if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ and not _offline_env:
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 # More stable downloads
@@ -34,16 +44,14 @@ if os.environ.get("UNSLOTH_STABLE_DOWNLOADS", "0") == "1":
     os.environ["HF_HUB_DISABLE_XET"] = "1" # Disable XET
     os.environ["HF_XET_HIGH_PERFORMANCE"] = "0" # This causes "429 Too Many Requests"
 
-# Check offline mode as well. Cross-sync HF_HUB_OFFLINE,
-# TRANSFORMERS_OFFLINE, and HF_DATASETS_OFFLINE so setting any one of
-# the three implies all three. Without HF_DATASETS_OFFLINE here,
-# load_dataset() still issues a network call for dataset metadata even
-# when the rest of the HF stack is offline (and fails with
-# ConnectionError instead of resolving from cache).
-_OFFLINE_VARS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
-if any(os.environ.get(v, "0") == "1" for v in _OFFLINE_VARS):
-    for _v in _OFFLINE_VARS:
+# Cross-sync HF_HUB_OFFLINE, TRANSFORMERS_OFFLINE, HF_DATASETS_OFFLINE so
+# setting any one of the three implies all three. Without HF_DATASETS_OFFLINE
+# here, load_dataset() still issues a network call for dataset metadata even
+# when the rest of the HF stack is offline.
+if _offline_env:
+    for _v in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         os.environ[_v] = "1"
+del _OFFLINE_TRUE, _offline_env
 
 # Check "429 Too Many Requests" and set HF_XET_HIGH_PERFORMANCE
 from pathlib import Path
@@ -96,6 +104,7 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 
 from importlib.util import find_spec
 from .mlx.runtime import is_mlx_available
+from .model_lists import FORCE_FLOAT32
 
 # Import-time fixes live in ``unsloth/import_fixes.py`` and run at
 # ``import unsloth`` time. Zoo cannot be imported standalone (the GPU

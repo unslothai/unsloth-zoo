@@ -19,6 +19,7 @@ __all__ = [
     "get_transformers_model_type",
     "unsloth_compile_transformers",
     "create_new_function",
+    "FORCE_FLOAT32",
 ]
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
@@ -136,6 +137,10 @@ DISABLE_COMPILE_FUNCTIONS = [
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
 ]
+
+# Re-exported from .model_lists so callers can keep using
+# `from unsloth_zoo.compiler import FORCE_FLOAT32`.
+from .model_lists import FORCE_FLOAT32  # noqa: E402,F401
 
 
 _full_license_header = """

@@ -412,14 +412,24 @@ def make_baseline_loss_fn():
     Returns:
         A function (model, batch, lengths, labels=None) -> (loss, ntoks).
         When labels is provided, uses labels[:,1:] for targets with
-        (targets != -100) as the loss mask.
+        (targets != -100) as the loss mask. The labels=None branch is
+        byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
     """
     def loss_fn(model, batch, lengths, labels=None):
         if labels is None:
-            inputs, targets = batch[:, :-1], batch[:, 1:]
-        else:
+            # byte-identical to mlx_lm.tuner.trainer.default_loss
             inputs = batch[:, :-1]
-            targets = labels[:, 1:]
+            targets = batch[:, 1:]
+            logits = model(inputs)
+            steps = mx.arange(1, targets.shape[1] + 1)
+            mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            ce = nn.losses.cross_entropy(logits, targets) * mask
+            ntoks = mask.sum()
+            ce = ce.astype(mx.float32).sum() / ntoks
+            return ce, ntoks
+        # labels-aware path: train_on_responses_only style masking.
+        inputs = batch[:, :-1]
+        targets = labels[:, 1:]
         logits = model(inputs)
         steps = mx.arange(1, targets.shape[1] + 1)
         length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
