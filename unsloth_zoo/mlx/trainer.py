@@ -123,7 +123,8 @@ class MLXTrainingConfig:
     adam_beta1: float | None = None
     adam_beta2: float | None = None
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
-    # Elementwise clip ([-max_grad_value, max_grad_value], per-leaf).
+    # Proportional per-tensor clipping. This is cheaper than global norm, but
+    # preserves each tensor's gradient direction unlike elementwise value clip.
     # None (default) keeps the cheap MLX default of 1.0 unless the user
     # passes max_grad_norm > 0, in which case global-norm clipping wins.
     # 0.0 disables. A positive float opts in explicitly and overrides
@@ -952,6 +953,17 @@ class MLXTrainer:
             # This avoids adding a second consumer to the lazy backward graph.
             return getattr(optimizer, "betas", None)
 
+        def _clip_grad_by_leaf_norm(grad):
+            if not _clip_grad_value:
+                return grad
+            def _clip_leaf_norm(g):
+                g_f = g.astype(mx.float32)
+                norm = mx.sqrt(mx.sum(g_f * g_f))
+                scale = mx.minimum(max_grad_value / (norm + 1e-6), 1.0)
+                return g * scale.astype(g.dtype)
+
+            return tree_map(_clip_leaf_norm, grad)
+
         def _apply_update(grad, toks_f):
             """Common gradient post-processing and optimizer update.
 
@@ -977,11 +989,7 @@ class MLXTrainer:
                     final_grad, max_norm=max_grad_norm
                 )
             if _clip_grad_value:
-                # Elementwise clip after norm-scaling, before optimizer step.
-                final_grad = tree_map(
-                    lambda g: mx.clip(g, -max_grad_value, max_grad_value),
-                    final_grad,
-                )
+                final_grad = _clip_grad_by_leaf_norm(final_grad)
             self._apply_manual_adamw_weight_decay(model, optimizer, final_grad)
             optimizer.update(model, final_grad)
             _restore_trainable_storage_dtypes()
@@ -1004,11 +1012,7 @@ class MLXTrainer:
             if max_grad_norm > 0:
                 grad, grad_norm = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
             if _clip_grad_value:
-                # Elementwise clip per leaf — free memory (no cross-leaf reduction).
-                grad = tree_map(
-                    lambda g: mx.clip(g, -max_grad_value, max_grad_value),
-                    grad,
-                )
+                grad = _clip_grad_by_leaf_norm(grad)
             self._apply_manual_adamw_weight_decay(model, optimizer, grad)
             optimizer.update(model, grad)
             _restore_trainable_storage_dtypes()
