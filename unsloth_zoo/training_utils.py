@@ -32,6 +32,7 @@ from .gradient_checkpointing import (
 )
 import os
 import re
+import sys
 import functools
 
 __all__ = [
@@ -93,6 +94,64 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
 pass
 
 
+# Cache of generated autocast subclasses, keyed by (base_class, compute_dtype).
+# Caching keeps the subclass identity stable across instances of the same base
+# class and lets us register each subclass exactly once as a module-level
+# symbol so pickle / torch.save(model) can resolve it by module + qualname.
+_BF16_AUTOCAST_SUBCLASSES = {}
+
+
+def _make_bf16_autocast_subclass(cls, compute_dtype):
+    """Build (or fetch from cache) a subclass of `cls` whose `forward` is
+    wrapped in `torch.amp.autocast(compute_dtype)`.
+
+    The subclass is registered as a module-level attribute of this module so
+    that `pickle` (and therefore `torch.save(model, ...)`) can resolve it by
+    `module + qualname`. Without that registration, assigning a runtime
+    `type(...)` class to `model.__class__` makes the model unpicklable
+    (`PicklingError: attribute lookup ... failed`).
+    """
+    cached = _BF16_AUTOCAST_SUBCLASSES.get((cls, compute_dtype))
+    if cached is not None:
+        return cached
+
+    _orig_forward = cls.forward
+
+    @functools.wraps(_orig_forward)
+    def _wrapped(self, *args, **kwargs):
+        device_type = "cuda"
+        for t in args:
+            if torch.is_tensor(t):
+                device_type = t.device.type
+                break
+        else:
+            for t in kwargs.values():
+                if torch.is_tensor(t):
+                    device_type = t.device.type
+                    break
+        # Order matters: is_autocast_enabled raises on unsupported device
+        # types (e.g. "meta"); is_autocast_available returns False cleanly.
+        if not torch.amp.is_autocast_available(device_type):
+            return _orig_forward(self, *args, **kwargs)
+        if torch.is_autocast_enabled(device_type):
+            return _orig_forward(self, *args, **kwargs)
+        with torch.amp.autocast(device_type=device_type, dtype=compute_dtype):
+            return _orig_forward(self, *args, **kwargs)
+
+    name = cls.__name__ + "WithUnslothBf16Autocast"
+    module = sys.modules[__name__]
+    # Disambiguate if two different base classes share the same __name__ so
+    # each registered symbol resolves back to exactly one subclass.
+    if hasattr(module, name) and getattr(module, name) is not None:
+        name = f"{name}_{len(_BF16_AUTOCAST_SUBCLASSES)}"
+
+    new_cls = type(name, (cls,), {"forward": _wrapped, "__module__": __name__})
+    new_cls.__qualname__ = name
+    setattr(module, name, new_cls)
+    _BF16_AUTOCAST_SUBCLASSES[(cls, compute_dtype)] = new_cls
+    return new_cls
+
+
 def _wrap_forward_in_bf16_autocast(model, compute_dtype):
     """For bf16 full-FT with fp32 norm weights, the norm forward returns an
     fp32 tensor which then meets the next bf16 linear and trips
@@ -114,6 +173,9 @@ def _wrap_forward_in_bf16_autocast(model, compute_dtype):
         / `Trainer._save_optimizer_and_scheduler` checkpoint paths) uses
         `obj.__class__` to reconstruct the copy, so the subclass survives
         and the copy's `forward` correctly binds to the copy's `self`.
+      - The subclass is cached and registered as a module-level symbol (see
+        `_make_bf16_autocast_subclass`) so `pickle` / `torch.save(model)` can
+        resolve it by `module + qualname` instead of raising `PicklingError`.
       - `is_autocast_available(device_type)` is probed BEFORE
         `is_autocast_enabled(device_type)` because the latter raises on
         unsupported device types (e.g. "meta" tensors during materialise),
@@ -124,31 +186,7 @@ def _wrap_forward_in_bf16_autocast(model, compute_dtype):
     if getattr(model, "_unsloth_bf16_autocast_wrapped", False):
         return model
 
-    _orig_forward = type(model).forward
-
-    @functools.wraps(_orig_forward)
-    def _wrapped(self, *args, **kwargs):
-        device_type = "cuda"
-        for t in list(args) + list(kwargs.values()):
-            if torch.is_tensor(t):
-                device_type = t.device.type
-                break
-        # Order matters: is_autocast_enabled raises on unsupported device
-        # types (e.g. "meta"); is_autocast_available returns False cleanly.
-        if not torch.amp.is_autocast_available(device_type):
-            return _orig_forward(self, *args, **kwargs)
-        if torch.is_autocast_enabled(device_type):
-            return _orig_forward(self, *args, **kwargs)
-        with torch.amp.autocast(device_type=device_type, dtype=compute_dtype):
-            return _orig_forward(self, *args, **kwargs)
-
-    cls = type(model)
-    new_cls = type(
-        cls.__name__ + "WithUnslothBf16Autocast",
-        (cls,),
-        {"forward": _wrapped},
-    )
-    model.__class__ = new_cls
+    model.__class__ = _make_bf16_autocast_subclass(type(model), compute_dtype)
     model._unsloth_bf16_autocast_wrapped = True
     return model
 
@@ -240,8 +278,8 @@ def prepare_model_for_training(
                 "norm." in name
                 or "_layernorm" in name
                 or "layer_norm" in name
-                or ".norm1." in name
-                or ".norm2." in name
+                or "norm1." in name
+                or "norm2." in name
             )
             if (train_layernorms
                     and _is_norm_name

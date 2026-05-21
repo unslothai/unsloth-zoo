@@ -349,3 +349,66 @@ def test_wrapper_idempotent():
     cls_after_first = type(m)
     _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
     assert type(m) is cls_after_first
+
+
+def test_wrapper_is_picklable():
+    """Regression: the generated subclass must be registered as a module-level
+    symbol so pickle / torch.save(model) can resolve it by module + qualname.
+    Otherwise the bf16 full-FT path makes the whole model unpicklable
+    (PicklingError)."""
+    import io
+    from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+
+    m = _TinyForSig()
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+
+    buf = io.BytesIO()
+    torch.save(m, buf)  # would raise PicklingError pre-fix
+    buf.seek(0)
+    m2 = torch.load(buf, weights_only=False)
+    assert type(m2).__name__ == type(m).__name__
+    out = m2(torch.zeros(2, 8, dtype=torch.bfloat16))
+    assert out.shape == (2, 8)
+
+
+def test_wrapper_subclass_is_cached_across_instances():
+    """Two instances of the same base class must share one generated subclass
+    so we register a single module-level symbol (stable pickle identity)."""
+    from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+
+    a = _TinyForSig()
+    b = _TinyForSig()
+    _wrap_forward_in_bf16_autocast(a, torch.bfloat16)
+    _wrap_forward_in_bf16_autocast(b, torch.bfloat16)
+    assert type(a) is type(b)
+
+
+def test_matcher_catches_top_level_norm1_norm2():
+    """norm1/norm2 params at the top level (no leading dot) must still be
+    matched -- the pattern uses a trailing dot only, like `norm.`."""
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    class _TopLevelNorm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm1 = nn.LayerNorm(8)
+            self.norm2 = nn.LayerNorm(8)
+            self.embed_tokens = nn.Embedding(16, 8)
+            self.proj = nn.Linear(8, 8)
+            self.to(torch.bfloat16)
+            self.config = _Cfg(dtype=torch.bfloat16)
+
+        def get_input_embeddings(self):
+            return self.embed_tokens
+
+        def forward(self, x):
+            return self.proj(x)
+
+    m = _TopLevelNorm()
+    prepare_model_for_training(
+        m, use_gradient_checkpointing=False,
+        full_finetuning=True, train_layernorms=True,
+        float32_mixed_precision=False,
+    )
+    assert m.norm1.weight.dtype == torch.float32
+    assert m.norm2.weight.dtype == torch.float32
