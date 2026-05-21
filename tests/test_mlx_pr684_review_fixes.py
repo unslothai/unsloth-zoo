@@ -204,3 +204,38 @@ def test_pr684_compiler_review_guards_are_present():
     assert '"weight" in norm' not in mlx_compile_source
     assert '"bias" in norm' not in mlx_compile_source
     assert 'getattr(norm, "weight", None)' in mlx_compile_source
+
+
+def test_norm_output_cast_includes_custom_norms():
+    _skip_if_mlx_core_was_replaced()
+    gemma3_text = pytest.importorskip("mlx_lm.models.gemma3_text")
+    stablelm = pytest.importorskip("mlx_lm.models.stablelm")
+    fastvlm_vision = pytest.importorskip("mlx_vlm.models.fastvlm.vision")
+    import unsloth_zoo.mlx.trainer as trainer_mod
+
+    trainer_mod._set_norm_output_cast_to_input_dtype(False)
+    cases = [
+        (gemma3_text.RMSNorm(4), mx.ones((2, 4), dtype=mx.bfloat16)),
+        (
+            stablelm.LayerNormPerHead(head_dim=4, num_heads=2, eps=1e-5),
+            mx.ones((1, 3, 2, 4), dtype=mx.bfloat16),
+        ),
+        (
+            fastvlm_vision.LayerNormChannel(num_features=4),
+            mx.ones((1, 2, 2, 4), dtype=mx.bfloat16),
+        ),
+    ]
+
+    norm_classes = trainer_mod._iter_norm_output_cast_classes()
+    for norm, x in cases:
+        assert type(norm) in norm_classes
+        raw = norm(x)
+        assert raw.dtype == mx.float32
+
+    try:
+        trainer_mod._set_norm_output_cast_to_input_dtype(True)
+        for norm, x in cases:
+            out = norm(x)
+            assert out.dtype == x.dtype
+    finally:
+        trainer_mod._set_norm_output_cast_to_input_dtype(False)

@@ -38,6 +38,7 @@ Usage mirrors TRL notebooks:
 
 from dataclasses import asdict, dataclass, is_dataclass
 import concurrent.futures
+import importlib
 import math
 import os
 import random
@@ -93,6 +94,65 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
+_NORM_OUTPUT_CAST_EXTRA_CLASS_PATHS = (
+    ("mlx_lm.models.bailing_moe_linear", "GroupRMSNorm"),
+    ("mlx_lm.models.cohere", "LayerNorm2D"),
+    ("mlx_lm.models.falcon_h1", "FalconH1RMSNormGated"),
+    ("mlx_lm.models.gemma", "RMSNorm"),
+    ("mlx_lm.models.gemma2", "RMSNorm"),
+    ("mlx_lm.models.gemma3_text", "RMSNorm"),
+    ("mlx_lm.models.granitemoehybrid", "GraniteMoeHybridRMSNormGated"),
+    ("mlx_lm.models.mamba2", "MambaRMSNormGated"),
+    ("mlx_lm.models.nemotron", "NemotronLayerNorm1P"),
+    ("mlx_lm.models.nemotron_h", "MambaRMSNormGated"),
+    ("mlx_lm.models.plamo2", "RMSNorm"),
+    ("mlx_lm.models.qwen3_next", "Qwen3NextRMSNormGated"),
+    ("mlx_lm.models.recurrent_gemma", "RMSNorm"),
+    ("mlx_lm.models.rwkv7", "LayerNormPerHead"),
+    ("mlx_lm.models.stablelm", "LayerNormPerHead"),
+    ("mlx_lm.models.step3p5", "ZeroCenteredRMSNorm"),
+    ("mlx_vlm.models.deepseekocr_2.vision", "Qwen2RMSNorm"),
+    ("mlx_vlm.models.dots_ocr.vision", "RMSNorm"),
+    ("mlx_vlm.models.fastvlm.vision", "LayerNormChannel"),
+    ("mlx_vlm.models.gemma3.language", "RMSNorm"),
+    ("mlx_vlm.models.gemma3n.audio", "Gemma3nCumulativeGroupNorm"),
+    ("mlx_vlm.models.gemma3n.language", "Gemma3nRMSNorm"),
+    ("mlx_vlm.models.gemma3n.vision", "RMSNormAct2d"),
+    ("mlx_vlm.models.gemma4.audio", "AudioRMSNorm"),
+    ("mlx_vlm.models.gemma4.language", "RMSNormZeroShift"),
+    ("mlx_vlm.models.gemma4.vision", "RMSNorm"),
+    ("mlx_vlm.models.gemma4.vision", "VisionRMSNorm"),
+    ("mlx_vlm.models.jina_vlm.language", "RMSNorm"),
+    ("mlx_vlm.models.paligemma.language", "RMSNorm"),
+    ("mlx_vlm.models.qwen3_5.language", "Qwen3_5RMSNormGated"),
+    ("mlx_vlm.models.sam3.sam_components", "LayerNorm2d"),
+    ("mlx_vlm.models.sam3d_body.layers", "LayerNorm32"),
+)
+_NORM_OUTPUT_CAST_PATCHED_CLASSES = set()
+
+
+def _iter_norm_output_cast_classes():
+    norm_classes = []
+    seen = set()
+
+    for module_name, class_name in _NORM_OUTPUT_CAST_EXTRA_CLASS_PATHS:
+        try:
+            module = importlib.import_module(module_name)
+            norm_cls = getattr(module, class_name)
+        except Exception:
+            continue
+        if norm_cls not in seen:
+            norm_classes.append(norm_cls)
+            seen.add(norm_cls)
+
+    for norm_cls in (nn.RMSNorm, nn.LayerNorm):
+        if norm_cls not in seen:
+            norm_classes.append(norm_cls)
+            seen.add(norm_cls)
+
+    return tuple(norm_classes)
+
+
 def _set_norm_output_cast_to_input_dtype(enabled: bool) -> None:
     """Control whether norm outputs are cast back to activation dtype.
 
@@ -102,8 +162,15 @@ def _set_norm_output_cast_to_input_dtype(enabled: bool) -> None:
     result back matches PyTorch autocast behavior more closely: fp32 norm math,
     bf16/fp16 downstream activations.
     """
-    for norm_cls in (nn.RMSNorm, nn.LayerNorm):
-        patched = getattr(norm_cls, "_unsloth_cast_output_to_input_dtype", False)
+    norm_classes = list(_iter_norm_output_cast_classes())
+    if not enabled:
+        norm_classes.extend(
+            norm_cls for norm_cls in _NORM_OUTPUT_CAST_PATCHED_CLASSES
+            if norm_cls not in norm_classes
+        )
+
+    for norm_cls in norm_classes:
+        patched = norm_cls.__dict__.get("_unsloth_cast_output_to_input_dtype", False)
         if enabled:
             if patched:
                 continue
@@ -118,12 +185,14 @@ def _set_norm_output_cast_to_input_dtype(enabled: bool) -> None:
             norm_cls._unsloth_original_call = original_call
             norm_cls.__call__ = norm_call_cast_output
             norm_cls._unsloth_cast_output_to_input_dtype = True
+            _NORM_OUTPUT_CAST_PATCHED_CLASSES.add(norm_cls)
         elif patched:
             original_call = getattr(norm_cls, "_unsloth_original_call", None)
             if original_call is not None:
                 norm_cls.__call__ = original_call
             norm_cls._unsloth_original_call = None
             norm_cls._unsloth_cast_output_to_input_dtype = False
+            _NORM_OUTPUT_CAST_PATCHED_CLASSES.discard(norm_cls)
 
 
 def _normalize_mlx_scheduler_type(name):
