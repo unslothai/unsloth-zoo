@@ -825,6 +825,8 @@ def vllm_dynamic_quant_supported(
     if "quantization_config" not in config: return True
 
     llm_int8_skip_modules = config.quantization_config.get("llm_int8_skip_modules", {})
+    if _is_gemma4_config(config) and _get_gemma4_bnb_skip_module_aliases(config.quantization_config) is not None:
+        return True
 
     # Only allow layer modules ie model.layers.1.mlp or model.layers.1.self_attn
 
@@ -2940,6 +2942,38 @@ def _test_same_model(model, new_model, input_ids):
     return
 pass
 
+def _get_dense_causal_lm_state_dict(model):
+    state_dict = model.state_dict()
+    if not any(key.startswith("model.language_model.") for key in state_dict):
+        return state_dict, False
+
+    normalized = {}
+    prefix = "model.language_model."
+    for key, value in state_dict.items():
+        if key.startswith(prefix):
+            normalized["model." + key[len(prefix):]] = value
+        elif key.startswith("lm_head."):
+            normalized[key] = value
+    return normalized, True
+pass
+
+def _test_whole_model_forward(model, new_model, input_ids):
+    kwargs = dict(
+        input_ids = input_ids,
+        labels = input_ids,
+        output_hidden_states = True,
+        use_cache = False,
+    )
+    old_outputs = model(**kwargs)
+    new_outputs = new_model(**kwargs)
+    torch.testing.assert_close(old_outputs.logits, new_outputs.logits)
+    if getattr(old_outputs, "loss", None) is not None and getattr(new_outputs, "loss", None) is not None:
+        torch.testing.assert_close(old_outputs.loss, new_outputs.loss)
+    if getattr(old_outputs, "hidden_states", None) is not None and getattr(new_outputs, "hidden_states", None) is not None:
+        for old_hidden, new_hidden in zip(old_outputs.hidden_states, new_outputs.hidden_states):
+            torch.testing.assert_close(old_hidden, new_hidden, rtol = 1e-3, atol = 1e-4)
+pass
+
 @torch.inference_mode()
 def test_model_conversion(original_model, new_model):
     """
@@ -3187,8 +3221,12 @@ def _test_get_vllm_state_dict(
         param.requires_grad_(False)
     model, _ = patch_model_and_tokenizer(model, None)
     model.eval()
-    extraction_config = model.config if not is_vision_model else config
+    if not is_vision_model and _is_gemma4_config(model.config):
+        extraction_config = getattr(model.config, "text_config", model.config)
+    else:
+        extraction_config = model.config if not is_vision_model else config
     extraction_config.model_name = model_name
+    dense_state_dict, text_normalized_state_dict = _get_dense_causal_lm_state_dict(model)
 
     # Patch vLLM to disable multiprocessing for state dict extraction
     patch_vllm()
@@ -3214,10 +3252,13 @@ def _test_get_vllm_state_dict(
         is_vision_model = is_vision_model,
     )
 
-    assert_same_state_dict(model.state_dict(), state_dict)
+    assert_same_state_dict(dense_state_dict, state_dict)
 
     new_model = convert_vllm_to_huggingface(quant_state_dict, extraction_config, dtype, is_vision_model = is_vision_model)
-    test_model_conversion(model, new_model)
+    if text_normalized_state_dict:
+        assert_same_state_dict(dense_state_dict, new_model.state_dict())
+    else:
+        test_model_conversion(model, new_model)
     new_model, _ = patch_model_and_tokenizer(new_model, None)
     new_model.eval()
 
@@ -3266,7 +3307,17 @@ def _test_get_vllm_state_dict(
         # Check all hidden states manually
         input_ids = tokenizer(inputs[0], add_special_tokens = False, return_tensors = "pt")
         input_ids = input_ids["input_ids"].to("cuda", non_blocking = True)
-        _test_same_model(model, new_model, input_ids)
+        model_layers = getattr(getattr(model, "model", None), "layers", ())
+        supports_layerwise_test = (
+            not text_normalized_state_dict
+            and len(model_layers) != 0
+            and all(hasattr(layer, "self_attn") for layer in model_layers)
+            and hasattr(getattr(model, "model", None), "rotary_emb")
+        )
+        if supports_layerwise_test:
+            _test_same_model(model, new_model, input_ids)
+        else:
+            _test_whole_model_forward(model, new_model, input_ids)
     else:
         # VLMs dont have a standardised forward pass mechanism. So we just test whole model forward pass and not layer wise
         # TODO: Maybe add layer wise checks
