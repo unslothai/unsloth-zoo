@@ -204,7 +204,7 @@ def copy_attributes(original_model, new_model):
             try:
                 original_val = getattr(original_module, attr)
 
-                if attr in buffer_names:
+                if attr in buffer_names and attr != "layer_scalar":
                     # Some models like gemma3 have embed_scale and position_ids as buffers
                     # Lets copy them over to avoid inconsistencies
                     setattr(module, attr, original_val.to(new_model.device))
@@ -249,11 +249,27 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     from transformers import AutoModelForCausalLM
     from accelerate import init_empty_weights
+    def _set_runtime_dtype(config_obj):
+        for dtype_attr in ("dtype", "torch_dtype"):
+            if hasattr(config_obj, dtype_attr):
+                setattr(config_obj, dtype_attr, dtype)
+
+    causal_config = config
+    using_text_subconfig = getattr(causal_config, "model_type", "").endswith("_text")
+    if (
+        not hasattr(causal_config, "vocab_size")
+        and hasattr(causal_config, "text_config")
+    ):
+        causal_config = deepcopy(causal_config.text_config)
+        using_text_subconfig = True
+        if hasattr(config, "model_name"):
+            causal_config.model_name = config.model_name
+    _set_runtime_dtype(causal_config)
     # Suppress warning on uninited weights
     old_warn = os.environ.get("UNSLOTH_WARN_UNINITIALIZED", "1")
     os.environ["UNSLOTH_WARN_UNINITIALIZED"] = "0"
-    model_name = getattr(config, 'model_name', None)
-    kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype_from_config(config)}
+    model_name = getattr(causal_config, 'model_name', getattr(config, 'model_name', None))
+    kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype}
     original_meta_model = None
     error = None
     # [NOTE] init_empty_weights(include_buffers = True) is wrong
@@ -263,7 +279,7 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     # With include_buffers=True, buffers become empty meta tensors with no data,
     # causing attribute access failures during inference.
     with init_empty_weights(include_buffers = False):
-        if model_name is not None:
+        if model_name is not None and not using_text_subconfig:
             try:
                 # This would persist quantization information for FP8 weights
                 original_meta_model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
@@ -273,7 +289,7 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         if original_meta_model is None:
             try:
                 # We must do this for 4.57.0 and above
-                original_meta_model = AutoModelForCausalLM.from_config(config)
+                original_meta_model = AutoModelForCausalLM.from_config(causal_config)
             except Exception as e:
                 error = str(e)
                 original_meta_model = None
@@ -284,7 +300,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         print(f"Failed to create original_meta_model for AutoModelForCausalLM. Error {error}")
         original_meta_model = None
 
-    new_config = deepcopy(config)
+    new_config = deepcopy(causal_config)
+    _set_runtime_dtype(new_config)
     new_config.intermediate_size = 1
     new_config.hidden_size = 1
     new_config.num_attention_heads = 1
@@ -302,7 +319,7 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     })
 
     # Set attention module head_dim
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    head_dim = getattr(causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})
 
     new_model = AutoModelForCausalLM.from_config(
@@ -310,7 +327,7 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         attn_implementation = "eager",
     )
 
-    return new_model, original_meta_model, config.num_hidden_layers
+    return new_model, original_meta_model, causal_config.num_hidden_layers
 
 def _set_config_attrs(config_obj, attrs_to_set):
     """Helper to set multiple attributes on a config object if they exist."""
@@ -685,6 +702,74 @@ def finalize_huggingface_model(
     quantization_config = None,
     bnb_config = None,
 ):
+    def _copy_rotary_buffers(source_model, target_model):
+        if source_model is None:
+            return
+        source_modules = dict(source_model.named_modules())
+        for module_name, target_module in target_model.named_modules():
+            source_module = source_modules.get(module_name, None)
+            if source_module is None:
+                continue
+            for attr_name in ("rotary_emb", "rotary_emb_local", "rotary_pos_emb"):
+                source_rotary = getattr(source_module, attr_name, None)
+                target_rotary = getattr(target_module, attr_name, None)
+                if (
+                    source_rotary is None
+                    or target_rotary is None
+                    or not hasattr(source_rotary, "_buffers")
+                    or not hasattr(target_rotary, "_buffers")
+                ):
+                    continue
+                for buffer_name, source_buffer in source_rotary._buffers.items():
+                    if (
+                        not torch.is_tensor(source_buffer)
+                        or source_buffer.device.type == "meta"
+                        or buffer_name not in target_rotary._buffers
+                    ):
+                        continue
+                    target_buffer = target_rotary._buffers[buffer_name]
+                    if (
+                        torch.is_tensor(target_buffer)
+                        and target_buffer.shape == source_buffer.shape
+                    ):
+                        target_rotary._buffers[buffer_name] = source_buffer.to(
+                            device = target_buffer.device,
+                            dtype = target_buffer.dtype,
+                        )
+
+    def _reinit_rotary_embeddings(target_model):
+        local_rope_config = None
+        for module_name, module in target_model.named_modules():
+            if hasattr(module, "rotary_emb"):
+                current_rotary_config = getattr(module.rotary_emb, "config", None)
+                is_vision_rotary = vision_config is not None and (
+                    "vision_tower" in module_name
+                    or "vision_model" in module_name
+                    or (current_rotary_config is not None and id(current_rotary_config) in vision_config_ids)
+                )
+                rotary_config = vision_config if is_vision_rotary else text_config
+                try:
+                    module.rotary_emb = module.rotary_emb.__class__(
+                        config = rotary_config,
+                        device = target_device,
+                    )
+                except Exception as rotary_reinit_error:
+                    logger.warning(
+                        f"Unsloth: skipped rotary_emb reinit for {module_name}: {rotary_reinit_error}"
+                    )
+            if hasattr(module, "rotary_pos_emb") and vision_config is not None:
+                head_dim = vision_config.hidden_size // vision_config.num_heads
+                module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)
+            if hasattr(module, "rotary_emb_local"):
+                if local_rope_config is None:
+                    local_rope_config = deepcopy(text_config)
+                    local_rope_config.rope_theta = text_config.rope_local_base_freq
+                    local_rope_config.rope_scaling = {"rope_type": "default"}
+                module.rotary_emb_local = module.rotary_emb_local.__class__(
+                    config = local_rope_config,
+                    device = target_device,
+                )
+
     if original_meta_model is not None:
         copy_attributes(original_meta_model, new_model)
 
@@ -736,59 +821,24 @@ def finalize_huggingface_model(
     if live_vision_config is not None:
         vision_config_ids.add(id(live_vision_config))
 
-    local_rope_config = None
-    for module_name, module in new_model.named_modules():
-        if hasattr(module, "rotary_emb"):
-            current_rotary_config = getattr(module.rotary_emb, "config", None)
-            is_vision_rotary = vision_config is not None and (
-                "vision_tower" in module_name
-                or "vision_model" in module_name
-                or (current_rotary_config is not None and id(current_rotary_config) in vision_config_ids)
-            )
-            rotary_config = vision_config if is_vision_rotary else text_config
-            reinit_ok = True
-            try:
-                module.rotary_emb = module.rotary_emb.__class__(
-                    config = rotary_config,
-                    device = target_device,
-                )
-            except Exception as rotary_reinit_error:
-                reinit_ok = False
-                logger.warning(
-                    f"Unsloth: skipped rotary_emb reinit for {module_name}: {rotary_reinit_error}"
-                )
-            if reinit_ok:
-                for buffer_name, buffer in list(module.rotary_emb._buffers.items()):
-                    if torch.is_tensor(buffer) and buffer.is_floating_point():
-                        module.rotary_emb._buffers[buffer_name] = buffer.to(
-                            device = target_device,
-                            dtype = torch.float32,
-                        )
-        if hasattr(module, "rotary_pos_emb") and vision_config is not None:
-            head_dim = vision_config.hidden_size // vision_config.num_heads
-            module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)
-        if hasattr(module, "rotary_emb_local"):
-            if local_rope_config is None:
-                local_rope_config = deepcopy(text_config)
-                local_rope_config.rope_theta = text_config.rope_local_base_freq
-                local_rope_config.rope_scaling = {"rope_type": "default"}
-            module.rotary_emb_local = module.rotary_emb_local.__class__(
-                config = local_rope_config,
-                device = target_device,
-            )
+    _reinit_rotary_embeddings(new_model)
+    _copy_rotary_buffers(original_meta_model, new_model)
 
     if (quantization_config or {}) == {} and bnb_config is None:
         new_model = new_model.to(device = target_device, dtype = dtype)
+        _reinit_rotary_embeddings(new_model)
+        _copy_rotary_buffers(original_meta_model, new_model)
         for module in new_model.modules():
-            rotary_emb = getattr(module, "rotary_emb", None)
-            if rotary_emb is None:
-                continue
-            for buffer_name, buffer in list(rotary_emb._buffers.items()):
-                if torch.is_tensor(buffer) and buffer.is_floating_point():
-                    rotary_emb._buffers[buffer_name] = buffer.to(
-                        device = target_device,
-                        dtype = torch.float32,
-                    )
+            for attr_name in ("rotary_emb", "rotary_emb_local", "rotary_pos_emb"):
+                rotary = getattr(module, attr_name, None)
+                if rotary is None or not hasattr(rotary, "_buffers"):
+                    continue
+                for buffer_name, buffer in list(rotary._buffers.items()):
+                    if torch.is_tensor(buffer) and buffer.is_floating_point():
+                        rotary._buffers[buffer_name] = buffer.to(
+                            device = target_device,
+                            dtype = torch.float32,
+                        )
     return new_model
 pass
 
@@ -1118,8 +1168,8 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
         try:
             for k, v in quant_state.as_dict(packed=True).items():
                 state_dict[f"{name}.weight.{k}"] = v
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Unsloth: could not expand quant_state for {name}: {e}")
 
     if hasattr(gdn, "in_proj_qkvz"):
         proj = getattr(gdn.in_proj_qkvz, "base_layer", gdn.in_proj_qkvz)
@@ -1150,7 +1200,28 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
 
         qs_attr = getattr(raw_weight, "bnb_quant_state", getattr(weight, "bnb_quant_state", None))
         qkv_states = [qs_attr.get(i) for i in (0, 1, 2)] if isinstance(qs_attr, dict) else [None, None, None]
-        if sum(qs is not None for qs in qkv_states) > 1:
+
+        fused_full_qs = None
+        if isinstance(qs_attr, dict) and sum(qs is not None for qs in qkv_states) == 1:
+            for qs in qkv_states:
+                if qs is None:
+                    continue
+                qs_shape = getattr(qs, "shape", None)
+                if qs_shape is not None and qs_shape[0] == offsets[4]:
+                    fused_full_qs = qs
+                break
+
+        if fused_full_qs is not None:
+            try:
+                from bitsandbytes.functional import dequantize_4bit
+            except Exception:
+                raise RuntimeError(
+                    "Unsloth: prequantized BnB Qwen3.5 GDN requires bitsandbytes for fused in_proj_qkvz reconstruction."
+                )
+            full = dequantize_4bit(weight, quant_state=fused_full_qs)
+            store(f"{prefix}.in_proj_qkv.weight", full[offsets[0]:offsets[3]])
+            store(f"{prefix}.in_proj_z.weight", full[offsets[3]:offsets[4]])
+        elif sum(qs is not None for qs in qkv_states) > 1:
             try:
                 from bitsandbytes.functional import dequantize_4bit
             except Exception:
@@ -1162,13 +1233,17 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
                 shard = weight[offsets[i]:offsets[i + 1]]
                 parts.append(dequantize_4bit(shard, quant_state=qs) if qs is not None else shard)
             store(f"{prefix}.in_proj_qkv.weight", torch.cat(parts, dim=0))
+            z_qs = qs_attr.get(3) if isinstance(qs_attr, dict) else None
+            if z_qs is not None:
+                store(f"{prefix}.in_proj_z.weight", dequantize_4bit(z_weight, quant_state=z_qs))
+            else:
+                store(f"{prefix}.in_proj_z.weight", z_weight)
         else:
             store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
+            store(f"{prefix}.in_proj_z.weight", z_weight)
             if isinstance(qs_attr, dict):
                 _store_quant_state(f"{prefix}.in_proj_qkv", qkv_states[0])
-        store(f"{prefix}.in_proj_z.weight", z_weight)
-        if isinstance(qs_attr, dict):
-            _store_quant_state(f"{prefix}.in_proj_z", qs_attr.get(3))
+                _store_quant_state(f"{prefix}.in_proj_z", qs_attr.get(3))
 
         if weight.dtype == torch.float8_e4m3fn:
             scale_attr = None

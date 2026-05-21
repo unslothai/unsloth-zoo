@@ -1227,6 +1227,29 @@ def test_load_vllm_gemma4_patch_runs_after_bnb_autodetect():
     assert src.index(autodetect_anchor) < src.index(gate_anchor)
 
 
+def test_gemma4_bnb_skip_module_aliases_cover_vllm_text_prefixes():
+    from unsloth_zoo import vllm_utils
+
+    quantization_config = {
+        "load_in_4bit": True,
+        "llm_int8_skip_modules": [
+            "model.language_model.layers.0.mlp",
+            "model.language_model.layers.1.self_attn",
+            "visual",
+        ],
+    }
+    aliased = vllm_utils._get_gemma4_bnb_skip_module_aliases(quantization_config)
+
+    assert aliased is not None
+    skip_modules = set(aliased["llm_int8_skip_modules"])
+    assert "model.language_model.layers.0.mlp" in skip_modules
+    assert "model.layers.0.mlp" in skip_modules
+    assert "language_model.model.layers.0.mlp" in skip_modules
+    assert "model.layers.1.self_attn" in skip_modules
+    assert "language_model.model.layers.1.self_attn" in skip_modules
+    assert "visual" in skip_modules
+
+
 def test_patch_gemma4_vllm_lora_support_preserves_embedding_modules():
     # Regression: `cls.embedding_modules = {}` clobbered a pre-existing
     # embedding registry on the vLLM class, which vLLM's LoRA manager uses

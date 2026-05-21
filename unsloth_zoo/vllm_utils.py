@@ -846,6 +846,29 @@ def vllm_dynamic_quant_supported(
     return True
 pass
 
+def _get_gemma4_bnb_skip_module_aliases(quantization_config):
+    if not isinstance(quantization_config, dict):
+        return None
+    skip_modules = quantization_config.get("llm_int8_skip_modules", None)
+    if skip_modules is None:
+        return None
+
+    aliases = set(skip_modules)
+    for module in skip_modules:
+        if module.startswith("model.language_model."):
+            text_module = module[len("model.language_model."):]
+            aliases.add("model." + text_module)
+            aliases.add("language_model.model." + text_module)
+        elif module.startswith("language_model.model."):
+            aliases.add("model." + module[len("language_model.model."):])
+    if len(aliases) == len(skip_modules):
+        return None
+
+    quantization_config = quantization_config.copy()
+    quantization_config["llm_int8_skip_modules"] = sorted(aliases)
+    return quantization_config
+pass
+
 
 def get_vllm_state_dict(
     llm,
@@ -1072,6 +1095,15 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         }
     else:
         gemma4_k_eq_v_layers = set()
+    if _is_gemma4_config(config):
+        num_kv_shared_layers = getattr(text_config, "num_kv_shared_layers", 0) or 0
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", 0) or 0
+        gemma4_kv_shared_layers = set(range(
+            max(num_hidden_layers - num_kv_shared_layers, 0),
+            num_hidden_layers,
+        ))
+    else:
+        gemma4_kv_shared_layers = set()
 
     # Embedding
     if hasattr(vllm_internals, "model"): # Standard Language models
@@ -1079,7 +1111,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         vllm_text_model_prefix = "model"
     elif hasattr(vllm_internals, "language_model"):
         # For Llama 3.2, Gemma 3 and Qwen 2.5 VL, they have text model in model.language_model.model
-        vllm_text_model_prefix = "model.language_model"
+        if not is_vision_model and not hasattr(config, "text_config"):
+            vllm_text_model_prefix = "model"
+        else:
+            vllm_text_model_prefix = "model.language_model"
         vllm_text_model = vllm_internals.language_model.model
     else:
         raise RuntimeError(f'Unsloth: Cannot find vllm_internal_model!')
@@ -1116,8 +1151,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 get_state_dict(f"{prefix}.qkv_proj", 0, state_dict, qkv_proj, slice_weights=False)
             else:
                 get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
-                get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
-                if kk not in gemma4_k_eq_v_layers:
+                if kk not in gemma4_kv_shared_layers:
+                    get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
+                if kk not in gemma4_k_eq_v_layers and kk not in gemma4_kv_shared_layers:
                     get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
             get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
         elif hasattr(layer, "cross_attn"):
@@ -1156,6 +1192,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
 
         for layernorm_name in layernorm_names:
+            if kk in gemma4_kv_shared_layers and ".self_attn.k_norm" in layernorm_name:
+                continue
             vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
             try:
                 layernorm = eval(vllm_name).state_dict()["weight"]
@@ -2297,6 +2335,14 @@ def load_vllm(
         # To reduce memory usage, we limit the number of images/videos per prompt
         # TODO: Make it configurable by user
         engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
+    if _is_gemma4_config(config) and use_bitsandbytes:
+        gemma4_bnb_quantization_config = _get_gemma4_bnb_skip_module_aliases(
+            getattr(config, "quantization_config", None)
+        )
+        if gemma4_bnb_quantization_config is not None:
+            engine_args["hf_overrides"] = {
+                "quantization_config": gemma4_bnb_quantization_config,
+            }
 
     # [[CRITICAL for RL on policy]]
     # Check for Cascade Attention which fails on A100 / L40 for vLLM < 0.11.0 versions
@@ -3112,7 +3158,7 @@ def _test_get_vllm_state_dict(
     # patch_bitsandbytes_compute_dtype(dtype)
     model_type = getattr(config, "model_type", "causal_lm")
 
-    enable_lora = model_type != "mllama"
+    enable_lora = model_type not in ("mllama", "gemma4")
     if compilation_config is None and model_type == "gemma4":
         compilation_config = 0
 
@@ -3141,6 +3187,8 @@ def _test_get_vllm_state_dict(
         param.requires_grad_(False)
     model, _ = patch_model_and_tokenizer(model, None)
     model.eval()
+    extraction_config = model.config if not is_vision_model else config
+    extraction_config.model_name = model_name
 
     # Patch vLLM to disable multiprocessing for state dict extraction
     patch_vllm()
@@ -3162,13 +3210,13 @@ def _test_get_vllm_state_dict(
     state_dict, quant_state_dict = get_vllm_state_dict(
         llm,
         return_state_dict = True,
-        config = config,
+        config = extraction_config,
         is_vision_model = is_vision_model,
     )
 
     assert_same_state_dict(model.state_dict(), state_dict)
 
-    new_model = convert_vllm_to_huggingface(quant_state_dict, config, dtype, is_vision_model = is_vision_model)
+    new_model = convert_vllm_to_huggingface(quant_state_dict, extraction_config, dtype, is_vision_model = is_vision_model)
     test_model_conversion(model, new_model)
     new_model, _ = patch_model_and_tokenizer(new_model, None)
     new_model.eval()
