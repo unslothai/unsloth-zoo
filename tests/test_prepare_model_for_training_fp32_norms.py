@@ -412,3 +412,56 @@ def test_matcher_catches_top_level_norm1_norm2():
     )
     assert m.norm1.weight.dtype == torch.float32
     assert m.norm2.weight.dtype == torch.float32
+
+
+class _AudioRMSNorm(nn.Module):
+    """Custom RMSNorm whose param names (`norm_out`, `norm_pre_attn`) do NOT
+    match any name substring pattern -- mirrors Gemma-4/3n audio tower."""
+
+    def __init__(self, dim=8):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return x * self.weight
+
+
+def test_matcher_catches_norm_by_module_class_when_name_unmatched():
+    """Gemma audio tower uses RMSNorm modules named `norm_out` / `norm_pre_attn`
+    / `norm_post_attn`. The param names match none of the substring patterns,
+    so detection must fall back to the owning module's class name."""
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    class _AudioBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm_pre_attn = _AudioRMSNorm(8)
+            self.norm_post_attn = _AudioRMSNorm(8)
+            self.norm_out = _AudioRMSNorm(8)
+            self.proj = nn.Linear(8, 8)
+
+    class _AudioModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.audio_tower = _AudioBlock()
+            self.embed_tokens = nn.Embedding(16, 8)
+            self.to(torch.bfloat16)
+            self.config = _Cfg(dtype=torch.bfloat16)
+
+        def get_input_embeddings(self):
+            return self.embed_tokens
+
+        def forward(self, x):
+            return self.audio_tower.proj(x)
+
+    m = _AudioModel()
+    prepare_model_for_training(
+        m, use_gradient_checkpointing=False,
+        full_finetuning=True, train_layernorms=True,
+        float32_mixed_precision=False,
+    )
+    assert m.audio_tower.norm_pre_attn.weight.dtype == torch.float32
+    assert m.audio_tower.norm_post_attn.weight.dtype == torch.float32
+    assert m.audio_tower.norm_out.weight.dtype == torch.float32
+    # non-norm linear stays bf16
+    assert m.audio_tower.proj.weight.dtype == torch.bfloat16

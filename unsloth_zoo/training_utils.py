@@ -242,10 +242,20 @@ def prepare_model_for_training(
     # with `_pre_set_compute_dtype`). Record those parameter ids so we leave
     # them alone instead of overwriting that policy.
     _externally_managed_param_ids = set()
+    # Also identify norm parameters by the OWNING MODULE's class name, not just
+    # by parameter-name substrings. Custom norm classes whose params don't carry
+    # a recognisable name token (e.g. Gemma audio tower's `norm_out`,
+    # `norm_pre_attn`, `norm_post_attn`) are missed by name matching alone but
+    # are still RMSNorm/LayerNorm modules that must be upcast for bf16 full-FT.
+    _norm_class_re = re.compile(r"(?i)(rms_?norm|layer_?norm)")
+    _norm_param_ids = set()
     for _, _module in model.named_modules():
         if hasattr(_module, "_pre_set_compute_dtype"):
             for _, _p in _module.named_parameters(recurse=False):
                 _externally_managed_param_ids.add(id(_p))
+        if _norm_class_re.search(type(_module).__name__):
+            for _, _p in _module.named_parameters(recurse=False):
+                _norm_param_ids.add(id(_p))
     # Rollback switch (defaults off = corrected behaviour). Set to 1 to keep
     # norm weights at their loaded dtype like the pre-fix code path.
     _disable_float32_norm_upcast = (
@@ -269,13 +279,17 @@ def prepare_model_for_training(
             # silently clobbered the `upcast = True` set for norms above it.
             requires_grad = True
             upcast = False
-            # Norm-name matcher catches the patterns we've seen in the wild:
+            # Norm matcher: union of (a) owning-module class name being a
+            # RMSNorm/LayerNorm (robust, catches any naming), and (b) the
+            # parameter-name patterns we've seen in the wild:
             #   Llama/Qwen3:        "input_layernorm", "model.norm",
             #                       "self_attn.q_norm", "self_attn.k_norm"
             #   SigLIP/CLIP vision: "encoder.layers.0.layer_norm1/2"
             #   ViT/DINO/Qwen3-VL:  "visual.blocks.0.norm1/2"
+            #   Gemma audio tower:  "norm_out", "norm_pre_attn", "norm_post_attn"
             _is_norm_name = (
-                "norm." in name
+                id(param) in _norm_param_ids
+                or "norm." in name
                 or "_layernorm" in name
                 or "layer_norm" in name
                 or "norm1." in name
