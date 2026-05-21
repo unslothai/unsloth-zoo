@@ -1518,7 +1518,7 @@ def _nf4_dense_dequantize_weight(weight, group_size=64):
         flat = mx.concatenate([flat, mx.zeros((pad,), dtype=mx.float32)])
     groups = flat.reshape((-1, group_size))
     absmax = mx.max(mx.abs(groups), axis=1, keepdims=True)
-    denom = mx.maximum(absmax, mx.array(1e-12, dtype=mx.float32))
+    denom = mx.where(absmax > 0, absmax, mx.ones_like(absmax))
     scaled = groups / denom
     indices = mx.argmin(mx.abs(scaled[..., None] - codebook), axis=-1)
     dequantized = (codebook[indices] * absmax).reshape((-1,))[:original_size]
@@ -3089,14 +3089,15 @@ class FastMLXModel:
             from .utils import apply_gradient_checkpointing
             apply_gradient_checkpointing(model)
 
-        import mlx.utils
-        trainable = sum(v.size for _, v in mlx.utils.tree_flatten(model.trainable_parameters()))
-        total = sum(v.size for _, v in mlx.utils.tree_flatten(model.parameters()))
-        pct = 100.0 * trainable / total if total > 0 else 0
-        print(
-            f"Unsloth: LoRA applied — {trainable:,} trainable params "
-            f"({pct:.2f}% of {total:,} total)"
-        )
+        if hasattr(model, "trainable_parameters") and hasattr(model, "parameters"):
+            import mlx.utils
+            trainable = sum(v.size for _, v in mlx.utils.tree_flatten(model.trainable_parameters()))
+            total = sum(v.size for _, v in mlx.utils.tree_flatten(model.parameters()))
+            pct = 100.0 * trainable / total if total > 0 else 0
+            print(
+                f"Unsloth: LoRA applied — {trainable:,} trainable params "
+                f"({pct:.2f}% of {total:,} total)"
+            )
         return model
 
 

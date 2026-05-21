@@ -522,9 +522,15 @@ class MLXTrainer:
                 continue
             if not self._should_apply_weight_decay(name, parameter):
                 continue
-            lr = optimizer.learning_rate.astype(flat_grad[name].dtype)
-            scale = mx.array(1.0, dtype=lr.dtype) - lr * mx.array(wd, dtype=lr.dtype)
-            decayed.append((name, parameter * scale))
+            if not mx.issubdtype(parameter.dtype, mx.floating):
+                continue
+            lr_value = optimizer.learning_rate
+            if hasattr(lr_value, "astype"):
+                lr = lr_value.astype(mx.float32)
+            else:
+                lr = mx.array(lr_value, dtype=mx.float32)
+            scale = mx.array(1.0, dtype=mx.float32) - lr * mx.array(wd, dtype=mx.float32)
+            decayed.append((name, (parameter.astype(mx.float32) * scale).astype(parameter.dtype)))
         if decayed:
             model.update(tree_unflatten(decayed))
 
@@ -805,6 +811,7 @@ class MLXTrainer:
                 print("Unsloth: Using standard cross-entropy loss.")
 
         # Prepare data — determine total_steps first
+        self._prepared_batches_include_epochs = False
         batches, batch_iter = self._prepare_data(is_vlm)
 
         if batches is not None and not batches:
@@ -817,7 +824,9 @@ class MLXTrainer:
             total_steps = args.max_steps
         elif batches is not None:
             n_batches = len(batches)
-            if args.num_train_epochs > 0:
+            if getattr(self, "_prepared_batches_include_epochs", False):
+                total_steps = n_batches // grad_accum
+            elif args.num_train_epochs > 0:
                 # Epoch-based: total micro-batches = epochs * batches_per_epoch
                 total_steps = (n_batches * args.num_train_epochs) // grad_accum
             else:
@@ -1525,6 +1534,15 @@ class MLXTrainer:
                 if getattr(args, "preserve_dataset_order", False)
                 else getattr(args, "dataset_order", "default")
             )
+            vlm_num_epochs = (
+                args.num_train_epochs
+                if (
+                    args.max_steps <= 0
+                    and args.num_train_epochs > 0
+                    and vlm_dataset_order == "torch_randperm"
+                )
+                else None
+            )
             if args.streaming:
                 return None, iterate_vlm_training_batches(
                     dataset=self.train_dataset,
@@ -1538,6 +1556,7 @@ class MLXTrainer:
                     dataset_order=vlm_dataset_order,
                 )
             else:
+                self._prepared_batches_include_epochs = vlm_num_epochs is not None
                 batches = create_vlm_batches(
                     dataset=self.train_dataset,
                     processor=processor,
@@ -1549,6 +1568,7 @@ class MLXTrainer:
                     response_mask_fn=_vlm_mask_fn,
                     formatting_func=self.formatting_func,
                     dataset_order=vlm_dataset_order,
+                    num_epochs=vlm_num_epochs,
                 )
                 if _vlm_mask_fn is not None and batches:
                     _check_vlm_all_masked(batches)
@@ -1586,11 +1606,19 @@ class MLXTrainer:
                     getattr(args, "preserve_dataset_order", False)
                     or getattr(args, "dataset_order", "default") != "default"
                 ):
-                    batch_kwargs["dataset_order"] = (
+                    text_dataset_order = (
                         "sequential"
                         if getattr(args, "preserve_dataset_order", False)
                         else getattr(args, "dataset_order", "default")
                     )
+                    batch_kwargs["dataset_order"] = text_dataset_order
+                    if (
+                        args.max_steps <= 0
+                        and args.num_train_epochs > 0
+                        and text_dataset_order == "torch_randperm"
+                    ):
+                        batch_kwargs["num_epochs"] = args.num_train_epochs
+                        self._prepared_batches_include_epochs = True
                     batches = create_ordered_batches(**batch_kwargs)
                 else:
                     batches = create_batches(**batch_kwargs)

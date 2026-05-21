@@ -2719,10 +2719,12 @@ def _install_qwen3_family_compile_patches():
         centered = x_f - mean
         var = mx.mean(centered * centered, axis=-1, keepdims=True)
         y = centered * mx.rsqrt(var + norm.eps)
-        if "weight" in norm:
-            y = y * norm.weight.astype(mx.float32)
-        if "bias" in norm:
-            y = y + norm.bias.astype(mx.float32)
+        weight = getattr(norm, "weight", None)
+        if weight is not None:
+            y = y * weight.astype(mx.float32)
+        bias = getattr(norm, "bias", None)
+        if bias is not None:
+            y = y + bias.astype(mx.float32)
         return y.astype(source_dtype)
 
     def patched_qwen3_vision_block_call(self, hidden_states, cu_seqlens, rotary_pos_emb):

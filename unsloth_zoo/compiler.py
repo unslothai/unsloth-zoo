@@ -1749,7 +1749,7 @@ elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGIT
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
-elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and NOT_RETURN_LOGITS:
     lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 

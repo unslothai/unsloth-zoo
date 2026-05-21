@@ -43,6 +43,10 @@ def _safe_token_denominator(ntoks):
     return mx.maximum(ntoks.astype(mx.float32), mx.array(1.0, dtype=mx.float32))
 
 
+def _normalize_seed(seed, default=3407):
+    return default if seed is None else int(seed)
+
+
 def _get_transformer_layers(model):
     """Find transformer layers, unwrapping VLM wrappers if needed.
 
@@ -540,7 +544,6 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
                 _append_unique_int(ids, _convert_token_to_id(tokenizer, token))
 
         for attr in (
-            "pad_token_id",
             "image_token_id",
             "video_token_id",
             "audio_token_id",
@@ -558,7 +561,6 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
         "boi_token_id",
         "eoi_token_index",
         "eoi_token_id",
-        "pad_token_id",
     ):
         _append_unique_int(ids, _config_get(config, key, None))
 
@@ -2494,7 +2496,8 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None
 
 def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                        num_batches=None, seed=42, response_mask_fn=None,
-                       formatting_func=None, dataset_order="default"):
+                       formatting_func=None, dataset_order="default",
+                       num_epochs=None):
     """Pre-materialize VLM training batches using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator:
@@ -2508,27 +2511,29 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     batch_list = []
     seen = 0
     epoch = 0
+    base_seed = _normalize_seed(seed)
+    target_epochs = 1 if num_batches is None and num_epochs is None else num_epochs
     indices = list(range(len(dataset)))
     if dataset_order == "torch_randperm":
-        indices = _torch_randperm_order(len(dataset), seed)
+        indices = _torch_randperm_order(len(dataset), base_seed)
     elif dataset_order in (None, "default"):
         if num_batches is not None:
-            np.random.seed(seed)
+            np.random.seed(base_seed)
             np.random.shuffle(indices)
     elif dataset_order != "sequential":
         raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
 
     while num_batches is None or len(batch_list) < num_batches:
         if seen >= len(indices):
-            if num_batches is None:
+            if num_batches is None and target_epochs is not None and epoch + 1 >= target_epochs:
                 break
             epoch += 1
             seen = 0
             indices = list(range(len(dataset)))
             if dataset_order == "torch_randperm":
-                indices = _torch_randperm_order(len(dataset), int(seed) + epoch)
+                indices = _torch_randperm_order(len(dataset), base_seed + epoch)
             elif dataset_order in (None, "default"):
-                np.random.seed(int(seed) + epoch)
+                np.random.seed(base_seed + epoch)
                 np.random.shuffle(indices)
 
         bi = indices[seen : seen + batch_size]
@@ -2576,6 +2581,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
 
     image_size = _get_vlm_image_size(config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
+    base_seed = _normalize_seed(seed)
 
     def _emit(items):
         batch_dict = _collate_vlm_batch(
@@ -2598,7 +2604,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
         epoch = 0
         while True:
             if dataset_order == "torch_randperm":
-                indices = _torch_randperm_order(len(dataset), int(seed) + epoch)
+                indices = _torch_randperm_order(len(dataset), base_seed + epoch)
             elif dataset_order == "sequential":
                 indices = list(range(len(dataset)))
             elif dataset_order in (None, "default"):
@@ -2768,7 +2774,8 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
                            num_batches=None, seed=None, dataset_order="sequential",
                            dataset_text_field="text",
                            formatting_func=None, chat_template=None,
-                           model_name=None, model_type=None):
+                           model_name=None, model_type=None,
+                           num_epochs=None):
     """Create text batches with an explicit dataset order.
 
     Studio uses this to mirror CUDA's effective sampler stream without
@@ -2790,10 +2797,13 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             tokenized.append(ids)
 
     if not tokenized:
-        return []
+        raise ValueError(
+            "Unsloth MLX: ordered dataset produced no trainable token sequences "
+            "(need at least two tokens after formatting/truncation)."
+        )
 
     def make_order(epoch):
-        base_seed = 3407 if seed is None else int(seed)
+        base_seed = _normalize_seed(seed)
         if dataset_order == "torch_randperm":
             return _torch_randperm_order(len(tokenized), base_seed + epoch)
         if dataset_order not in (None, "sequential"):
@@ -2805,6 +2815,10 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     order = make_order(epoch)
     order_pos = 0
     seen = 0
+    target_items = (
+        len(tokenized) * (1 if num_epochs is None else int(num_epochs))
+        if num_batches is None else None
+    )
     while num_batches is None or len(batch_pairs) < num_batches:
         batch_items = []
         for _ in range(batch_size):
@@ -2815,7 +2829,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             batch_items.append(tokenized[order[order_pos]])
             order_pos += 1
             seen += 1
-            if num_batches is None and seen >= len(tokenized):
+            if num_batches is None and target_items is not None and seen >= target_items:
                 break
 
         max_length = max(len(ids) for ids in batch_items)
@@ -2827,7 +2841,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             lengths.append([0, length])
         batch_pairs.append((mx.array(batch_ids), mx.array(lengths), None))
 
-        if num_batches is None and seen >= len(tokenized):
+        if num_batches is None and target_items is not None and seen >= target_items:
             break
 
     mx.eval([b for b, l, _ in batch_pairs] + [l for _, l, _ in batch_pairs])
