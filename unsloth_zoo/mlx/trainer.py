@@ -93,6 +93,39 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
+def _set_norm_output_cast_to_input_dtype(enabled: bool) -> None:
+    """Control whether norm outputs are cast back to activation dtype.
+
+    Norm parameters can stay in fp32 for stability, but letting fp32 norm
+    outputs flow through the rest of the graph promotes downstream
+    intermediates and materially increases LoRA/QLoRA memory. Casting the
+    result back matches PyTorch autocast behavior more closely: fp32 norm math,
+    bf16/fp16 downstream activations.
+    """
+    for norm_cls in (nn.RMSNorm, nn.LayerNorm):
+        patched = getattr(norm_cls, "_unsloth_cast_output_to_input_dtype", False)
+        if enabled:
+            if patched:
+                continue
+            original_call = norm_cls.__call__
+
+            def norm_call_cast_output(self, x, *args, _original_call=original_call, **kwargs):
+                out = _original_call(self, x, *args, **kwargs)
+                if hasattr(x, "dtype") and hasattr(out, "dtype") and out.dtype != x.dtype:
+                    return out.astype(x.dtype)
+                return out
+
+            norm_cls._unsloth_original_call = original_call
+            norm_cls.__call__ = norm_call_cast_output
+            norm_cls._unsloth_cast_output_to_input_dtype = True
+        elif patched:
+            original_call = getattr(norm_cls, "_unsloth_original_call", None)
+            if original_call is not None:
+                norm_cls.__call__ = original_call
+            norm_cls._unsloth_original_call = None
+            norm_cls._unsloth_cast_output_to_input_dtype = False
+
+
 def _normalize_mlx_scheduler_type(name):
     sched_type = str(name or "linear").strip().lower()
     if sched_type not in SUPPORTED_MLX_LR_SCHEDULERS:
@@ -168,6 +201,7 @@ class MLXTrainingConfig:
     cache_limit_gb: float | None = None  # Optional MLX Metal cache cap in GB; <= 0 disables override
     wired_limit_gb: float | None = None  # None = min(recommended working set, memory limit); <= 0 disables
     disable_memory_limits: bool = False
+    cast_norm_output_to_input_dtype: bool = True  # fp32 norm storage/math, bf16/fp16 downstream activations
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
@@ -652,6 +686,10 @@ class MLXTrainer:
         """
         args = self.args
         model = self.model
+        cast_norm_output = bool(getattr(args, "cast_norm_output_to_input_dtype", True))
+        _set_norm_output_cast_to_input_dtype(cast_norm_output)
+        if cast_norm_output:
+            print("Unsloth: Casting MLX norm outputs back to activation dtype.")
         args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
         model._unsloth_patch_mode = args.patch_mode
 
