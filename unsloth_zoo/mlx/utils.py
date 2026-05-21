@@ -2219,10 +2219,63 @@ def _extract_vlm_images(item, messages, image_size):
     return _resize_vlm_images(images, image_size)
 
 
-def _format_vlm_images_for_processor(all_images):
+def _flatten_vlm_images(all_images):
+    flattened = []
+    for images in all_images:
+        if isinstance(images, (list, tuple)):
+            flattened.extend(images)
+        else:
+            flattened.append(images)
+    return flattened
+
+
+def _nest_vlm_images_by_sample(all_images):
+    nested = []
+    for images in all_images:
+        if images is None:
+            nested.append([])
+        elif isinstance(images, (list, tuple)):
+            nested.append(list(images))
+        else:
+            nested.append([images])
+    return nested
+
+
+def _vlm_processor_prefers_nested_images(processor):
+    cls = processor.__class__
+    marker = f"{getattr(cls, '__module__', '')}.{getattr(cls, '__name__', '')}".lower()
+    # Some mlx-vlm processors count images per prompt and require
+    # images=[[sample0_img0, ...], [sample1_img0, ...]]. Qwen/LLaVA/Gemma4-style
+    # processors consume a flat image stream and are handled by the default path.
+    return any(
+        name in marker
+        for name in (
+            "deepseek_vl",
+            "falcon",
+            "gemma3",
+            "gemma3n",
+            "idefics",
+            "lfm2_vl",
+            "minicpmo",
+            "mistral",
+            "mllama",
+            "paligemma",
+            "pixtral",
+            "smolvlm",
+        )
+    )
+
+
+def _format_vlm_images_for_processor(all_images, processor=None, image_layout=None):
     if not any(all_images):
         return None
-    return all_images
+    if image_layout == "nested":
+        return _nest_vlm_images_by_sample(all_images)
+    if image_layout == "flat":
+        return _flatten_vlm_images(all_images)
+    if processor is not None and _vlm_processor_prefers_nested_images(processor):
+        return _nest_vlm_images_by_sample(all_images)
+    return _flatten_vlm_images(all_images)
 
 
 def _to_mx_vlm_batch(inputs):
@@ -2254,7 +2307,7 @@ def _to_mx_vlm_batch(inputs):
 
 
 def _processor_vlm_inputs(processor, texts, all_images, max_seq_length, suffixes=None):
-    proc_kwargs = dict(
+    base_kwargs = dict(
         text=texts,
         padding=True,
         truncation=True,
@@ -2262,12 +2315,35 @@ def _processor_vlm_inputs(processor, texts, all_images, max_seq_length, suffixes
         return_tensors="np",
         add_special_tokens=False,
     )
-    images = _format_vlm_images_for_processor(all_images)
+    images = _format_vlm_images_for_processor(all_images, processor=processor)
     if images is not None:
-        proc_kwargs["images"] = images
+        image_layouts = (
+            ("nested", "flat")
+            if _vlm_processor_prefers_nested_images(processor)
+            else ("flat", "nested")
+        )
+    else:
+        image_layouts = (None,)
     if suffixes is not None and any(suffix is not None for suffix in suffixes):
-        proc_kwargs["suffix"] = [suffix or "" for suffix in suffixes]
-    return processor(**proc_kwargs)
+        base_kwargs["suffix"] = [suffix or "" for suffix in suffixes]
+
+    first_error = None
+    for image_layout in image_layouts:
+        proc_kwargs = dict(base_kwargs)
+        if image_layout is not None:
+            proc_kwargs["images"] = _format_vlm_images_for_processor(
+                all_images,
+                processor=processor,
+                image_layout=image_layout,
+            )
+        try:
+            return processor(**proc_kwargs)
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            if len(image_layouts) == 1:
+                raise
+    raise first_error
 
 
 def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image_size,
@@ -2408,7 +2484,7 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None
 
 def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                        num_batches=None, seed=42, response_mask_fn=None,
-                       formatting_func=None):
+                       formatting_func=None, dataset_order="default"):
     """Pre-materialize VLM training batches using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator:
@@ -2419,18 +2495,36 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     image_size = _get_vlm_image_size(config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
 
-    indices = list(range(len(dataset)))
-    np.random.seed(seed)
-    if num_batches is not None:
-        np.random.shuffle(indices)
-
-    batch_indices = [
-        indices[i : i + batch_size]
-        for i in range(0, len(indices), batch_size)
-    ]
-
     batch_list = []
-    for bi in batch_indices:
+    seen = 0
+    epoch = 0
+    indices = list(range(len(dataset)))
+    if dataset_order == "torch_randperm":
+        indices = _torch_randperm_order(len(dataset), seed)
+    elif dataset_order in (None, "default"):
+        if num_batches is not None:
+            np.random.seed(seed)
+            np.random.shuffle(indices)
+    elif dataset_order != "sequential":
+        raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
+
+    while num_batches is None or len(batch_list) < num_batches:
+        if seen >= len(indices):
+            if num_batches is None:
+                break
+            epoch += 1
+            seen = 0
+            indices = list(range(len(dataset)))
+            if dataset_order == "torch_randperm":
+                indices = _torch_randperm_order(len(dataset), int(seed) + epoch)
+            elif dataset_order in (None, "default"):
+                np.random.seed(int(seed) + epoch)
+                np.random.shuffle(indices)
+
+        bi = indices[seen : seen + batch_size]
+        seen += len(bi)
+        if not bi:
+            break
         items = [dataset[idx] for idx in bi]
         batch_dict = _collate_vlm_batch(
             items, processor, max_seq_length, image_size,
@@ -2445,8 +2539,6 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                 ignore_token_ids=ignore_token_ids,
             )
         batch_list.append(batch_dict)
-        if num_batches is not None and len(batch_list) >= num_batches:
-            break
 
     # Evaluate all tensors
     all_tensors = []
@@ -2463,7 +2555,8 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
 def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   max_seq_length, seed=42,
                                   response_mask_fn=None,
-                                  formatting_func=None):
+                                  formatting_func=None,
+                                  dataset_order="default"):
     """Streaming VLM batch generator using processor directly.
 
     Yields batch dicts with input_ids, pixel_values, attention_mask,
@@ -2490,18 +2583,32 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
         return batch_dict
 
     if hasattr(dataset, "__len__"):
-        indices = list(range(len(dataset)))
-        batch_indices = [
-            indices[i : i + batch_size]
-            for i in range(0, len(indices), batch_size)
-        ]
-        if not batch_indices:
+        if len(dataset) <= 0:
             raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
+        epoch = 0
         while True:
-            order = np.random.permutation(len(batch_indices))
-            for b in order:
-                items = [dataset[idx] for idx in batch_indices[b]]
+            if dataset_order == "torch_randperm":
+                indices = _torch_randperm_order(len(dataset), int(seed) + epoch)
+            elif dataset_order == "sequential":
+                indices = list(range(len(dataset)))
+            elif dataset_order in (None, "default"):
+                indices = list(range(len(dataset)))
+                batch_indices = [
+                    indices[i : i + batch_size]
+                    for i in range(0, len(indices), batch_size)
+                ]
+                order = np.random.permutation(len(batch_indices))
+                for b in order:
+                    items = [dataset[idx] for idx in batch_indices[b]]
+                    yield _emit(items)
+                epoch += 1
+                continue
+            else:
+                raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
+            for start in range(0, len(indices), batch_size):
+                items = [dataset[idx] for idx in indices[start : start + batch_size]]
                 yield _emit(items)
+            epoch += 1
     else:
         while True:
             pending = []
@@ -2628,6 +2735,89 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         batch = batch[:, :max_length]
         batch_pairs.append((batch, lengths_info, None))
         if num_batches is not None and len(batch_pairs) >= num_batches:
+            break
+
+    mx.eval([b for b, l, _ in batch_pairs] + [l for _, l, _ in batch_pairs])
+    return batch_pairs
+
+
+def _torch_randperm_order(length, seed):
+    try:
+        import torch
+    except Exception as exc:
+        raise ImportError(
+            "Unsloth MLX: dataset_order='torch_randperm' requires torch so MLX "
+            "Studio can mirror CUDA Studio batch order."
+        ) from exc
+    generator = torch.Generator()
+    generator.manual_seed(3407 if seed is None else int(seed))
+    return torch.randperm(length, generator=generator).tolist()
+
+
+def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
+                           num_batches=None, seed=None, dataset_order="sequential",
+                           dataset_text_field="text",
+                           formatting_func=None, chat_template=None,
+                           model_name=None, model_type=None):
+    """Create text batches with an explicit dataset order.
+
+    Studio uses this to mirror CUDA's effective sampler stream without
+    changing generic mlx-lm batching behavior.
+    """
+
+    ds = _prepare_dataset(
+        dataset, tokenizer, dataset_text_field, formatting_func,
+        chat_template=chat_template,
+        model_name=model_name,
+        model_type=model_type,
+    )
+
+    tokenized = []
+    for row in ds:
+        ids = row[0] if isinstance(row, (tuple, list)) else row
+        ids = list(ids)[:max_seq_length]
+        if len(ids) >= 2:
+            tokenized.append(ids)
+
+    if not tokenized:
+        return []
+
+    def make_order(epoch):
+        base_seed = 3407 if seed is None else int(seed)
+        if dataset_order == "torch_randperm":
+            return _torch_randperm_order(len(tokenized), base_seed + epoch)
+        if dataset_order not in (None, "sequential"):
+            raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
+        return list(range(len(tokenized)))
+
+    batch_pairs = []
+    epoch = 0
+    order = make_order(epoch)
+    order_pos = 0
+    seen = 0
+    while num_batches is None or len(batch_pairs) < num_batches:
+        batch_items = []
+        for _ in range(batch_size):
+            if order_pos >= len(order):
+                epoch += 1
+                order = make_order(epoch)
+                order_pos = 0
+            batch_items.append(tokenized[order[order_pos]])
+            order_pos += 1
+            seen += 1
+            if num_batches is None and seen >= len(tokenized):
+                break
+
+        max_length = max(len(ids) for ids in batch_items)
+        batch_ids = []
+        lengths = []
+        for ids in batch_items:
+            length = len(ids)
+            batch_ids.append(ids + [0] * (max_length - length))
+            lengths.append([0, length])
+        batch_pairs.append((mx.array(batch_ids), mx.array(lengths), None))
+
+        if num_batches is None and seen >= len(tokenized):
             break
 
     mx.eval([b for b, l, _ in batch_pairs] + [l for _, l, _ in batch_pairs])

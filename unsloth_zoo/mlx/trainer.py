@@ -58,6 +58,7 @@ from .utils import (
     make_vlm_cce_loss_fn,
     make_vlm_baseline_loss_fn,
     create_batches,
+    create_ordered_batches,
     iterate_training_batches,
     create_vlm_batches,
     iterate_vlm_training_batches,
@@ -160,6 +161,8 @@ class MLXTrainingConfig:
     compile_trace: bool = True
     gradient_checkpointing: bool = True
     streaming: bool = False  # Use streaming iterator instead of materializing batches
+    dataset_order: str = "default"  # "default", "sequential", or "torch_randperm"
+    preserve_dataset_order: bool = False  # Match Studio CUDA SequentialSampler order
     memory_limit_gb: float | None = None  # None = auto Metal guard (~85% of recommended working set); <= 0 disables
     cache_limit_gb: float | None = None  # Optional MLX Metal cache cap in GB; <= 0 disables override
     wired_limit_gb: float | None = None  # None = min(recommended working set, memory limit); <= 0 disables
@@ -323,47 +326,39 @@ class MLXTrainer:
         if sched_type == "constant" and warmup == 0:
             return lr
 
-        decay_steps = max(total_steps - warmup, 1)
+        def warmup_multiplier(step):
+            if warmup <= 0:
+                return mx.array(1.0, dtype=mx.float32)
+            return step / mx.array(max(warmup, 1), dtype=mx.float32)
 
-        if sched_type == "linear" and warmup == 0:
-            # Match the Studio CUDA/Trainer path observed in fixed-fixture
-            # probes: linear/no-warmup starts with a zero-LR optimizer step,
-            # then decays from the requested LR over the remaining steps.
-            decay_after_zero = max(total_steps - 1, 1)
+        def decay_progress(step):
+            return (
+                step - mx.array(warmup, dtype=mx.float32)
+            ) / mx.array(max(total_steps - warmup, 1), dtype=mx.float32)
 
-            def main_schedule(step):
-                step = mx.array(step)
-                decay = mx.maximum(
-                    mx.array(total_steps, dtype=mx.float32) - step,
-                    mx.array(0.0, dtype=mx.float32),
-                ) / mx.array(decay_after_zero, dtype=mx.float32)
-                return mx.where(step <= 0, mx.array(0.0, dtype=mx.float32), lr * decay)
-
-            return main_schedule
-
-        if sched_type == "cosine":
-            main_schedule = optim.cosine_decay(lr, decay_steps, end=0.0)
-        elif sched_type == "linear":
-            main_schedule = optim.linear_schedule(lr, 0.0, decay_steps)
-        else:  # constant
-            main_schedule = lr
-
-        if warmup > 0:
-            def warmup_fn(step):
-                step = mx.array(step)
-                step = mx.minimum(step, mx.array(warmup))
-                return step * (lr / warmup)
-            if callable(main_schedule):
-                return optim.join_schedules(
-                    [warmup_fn, main_schedule], [warmup]
-                )
+        def schedule(step):
+            # Match HuggingFace/Trainer LR as seen by the optimizer before
+            # each update. ``step`` is zero-based optimizer-step index.
+            step = mx.array(step).astype(mx.float32)
+            if warmup > 0:
+                warm = lr * warmup_multiplier(step)
             else:
-                const_fn = optim.linear_schedule(lr, lr, decay_steps)
-                return optim.join_schedules(
-                    [warmup_fn, const_fn], [warmup]
-                )
+                warm = mx.array(lr, dtype=mx.float32)
 
-        return main_schedule
+            progress = decay_progress(step)
+            if sched_type == "cosine":
+                decay = mx.array(0.5, dtype=mx.float32) * (
+                    mx.array(1.0, dtype=mx.float32) + mx.cos(mx.array(math.pi) * progress)
+                )
+            elif sched_type == "linear":
+                decay = mx.array(1.0, dtype=mx.float32) - progress
+            else:  # constant with warmup
+                decay = mx.array(1.0, dtype=mx.float32)
+            decay = mx.maximum(decay, mx.array(0.0, dtype=mx.float32))
+            main = mx.array(lr, dtype=mx.float32) * decay
+            return mx.where(step < warmup, warm, main)
+
+        return schedule
 
     @staticmethod
     def _schedule_value(schedule, step):
@@ -1468,6 +1463,11 @@ class MLXTrainer:
 
         if is_vlm:
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
+            vlm_dataset_order = (
+                "sequential"
+                if getattr(args, "preserve_dataset_order", False)
+                else getattr(args, "dataset_order", "default")
+            )
             if args.streaming:
                 return None, iterate_vlm_training_batches(
                     dataset=self.train_dataset,
@@ -1478,6 +1478,7 @@ class MLXTrainer:
                     seed=args.seed,
                     response_mask_fn=_vlm_mask_fn,
                     formatting_func=self.formatting_func,
+                    dataset_order=vlm_dataset_order,
                 )
             else:
                 batches = create_vlm_batches(
@@ -1490,6 +1491,7 @@ class MLXTrainer:
                     seed=args.seed,
                     response_mask_fn=_vlm_mask_fn,
                     formatting_func=self.formatting_func,
+                    dataset_order=vlm_dataset_order,
                 )
                 if _vlm_mask_fn is not None and batches:
                     _check_vlm_all_masked(batches)
@@ -1510,7 +1512,7 @@ class MLXTrainer:
                     model_type=model_type,
                 )
             else:
-                batches = create_batches(
+                batch_kwargs = dict(
                     dataset=self.train_dataset,
                     tokenizer=self.tokenizer,
                     batch_size=args.per_device_train_batch_size,
@@ -1523,6 +1525,18 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                 )
+                if (
+                    getattr(args, "preserve_dataset_order", False)
+                    or getattr(args, "dataset_order", "default") != "default"
+                ):
+                    batch_kwargs["dataset_order"] = (
+                        "sequential"
+                        if getattr(args, "preserve_dataset_order", False)
+                        else getattr(args, "dataset_order", "default")
+                    )
+                    batches = create_ordered_batches(**batch_kwargs)
+                else:
+                    batches = create_batches(**batch_kwargs)
                 return batches, None
 
     def save_model(self, output_dir=None):

@@ -60,6 +60,8 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "use_cce",
         "compile",
         "gradient_checkpointing",
+        "dataset_order",
+        "preserve_dataset_order",
     ):
         assert must_have in fields, f"missing field: {must_have}"
 
