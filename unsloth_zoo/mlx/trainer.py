@@ -114,13 +114,18 @@ def _has_norm_selected_floating_parameter(module_path, module) -> bool:
     except Exception:
         return False
 
+    module_path_selected = _is_norm_parameter_path(_join_parameter_path(module_path, "_"))
     try:
         for parameter_path, value in tree_flatten(parameters):
-            full_path = _join_parameter_path(module_path, parameter_path)
             if (
-                _is_norm_parameter_path(full_path)
-                and hasattr(value, "dtype")
+                hasattr(value, "dtype")
                 and mx.issubdtype(value.dtype, mx.floating)
+                and (
+                    module_path_selected
+                    or _is_norm_parameter_path(
+                        _join_parameter_path(module_path, parameter_path)
+                    )
+                )
             ):
                 return True
     except Exception:
@@ -219,6 +224,8 @@ def _set_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
             if patched:
                 continue
             original_call = norm_cls.__call__
+            if getattr(original_call, "_unsloth_norm_output_cast_wrapper", False):
+                continue
 
             def norm_call_cast_output(self, x, *args, _original_call=original_call, **kwargs):
                 out = _original_call(self, x, *args, **kwargs)
@@ -226,6 +233,7 @@ def _set_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
                     return out.astype(x.dtype)
                 return out
 
+            norm_call_cast_output._unsloth_norm_output_cast_wrapper = True
             norm_cls._unsloth_original_call = original_call
             norm_cls.__call__ = norm_call_cast_output
             norm_cls._unsloth_cast_output_to_input_dtype = True
