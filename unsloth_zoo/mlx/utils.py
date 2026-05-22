@@ -2541,6 +2541,25 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
         yield batch, lengths_info, None
 
 
+def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+    if tensors:
+        mx.save_safetensors(str(path / "adapters.safetensors"), tensors)
+
+    adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
+    if adapter_config:
+        with open(path / "adapter_config.json", "w") as f:
+            json.dump(adapter_config, f, indent=2)
+
+
+def save_trainable_adapters(model, path, adapter_config=None):
+    """Save the current trainable parameter tree for training checkpoints."""
+    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    _save_adapter_artifacts(model, path, trainable, adapter_config=adapter_config)
+
+
 def save_lora_adapters(model, path, adapter_config=None):
     """Save LoRA adapter weights to disk.
 
@@ -2549,19 +2568,21 @@ def save_lora_adapters(model, path, adapter_config=None):
         path: Directory to save adapters.
         adapter_config: Optional dict with LoRA config metadata.
     """
-    path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
+    parameters = dict(mlx.utils.tree_flatten(model.parameters()))
+    adapter_tensors = {
+        name: value
+        for name, value in parameters.items()
+        if "lora_" in name.lower()
+    }
 
-    # Collect only trainable (LoRA) parameters — flatten nested dict for safetensors
-    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    if not adapter_tensors:
+        raise ValueError(
+            "Unsloth: no MLX LoRA adapter tensors were found to save."
+        )
 
-    if trainable:
-        mx.save_safetensors(str(path / "adapters.safetensors"), trainable)
-
-    adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
-    if adapter_config:
-        with open(path / "adapter_config.json", "w") as f:
-            json.dump(adapter_config, f, indent=2)
+    _save_adapter_artifacts(
+        model, path, adapter_tensors, adapter_config=adapter_config
+    )
 
 
 def _infer_snapshot_commit(path):

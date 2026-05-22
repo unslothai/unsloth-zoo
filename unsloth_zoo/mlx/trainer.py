@@ -64,7 +64,7 @@ from .utils import (
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
     collect_mlx_texts,
-    save_lora_adapters,
+    save_trainable_adapters,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -1235,7 +1235,7 @@ class MLXTrainer:
             # Checkpointing
             if args.save_steps > 0 and current_step % args.save_steps == 0:
                 ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
-                save_lora_adapters(model, ckpt_dir)
+                save_trainable_adapters(model, ckpt_dir)
                 print(f"  Saved checkpoint to {ckpt_dir}")
 
         total_time = time.perf_counter() - start_time
