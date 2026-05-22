@@ -102,10 +102,8 @@ def _is_norm_parameter_path(path) -> bool:
     return any("norm" in part for part in parts[:-1])
 
 
-def _join_parameter_path(module_path, parameter_path):
-    if module_path and parameter_path:
-        return f"{module_path}.{parameter_path}"
-    return module_path or parameter_path
+def _is_norm_module_path(path) -> bool:
+    return any("norm" in part for part in str(path).lower().split("."))
 
 
 def _has_norm_selected_floating_parameter(module_path, module) -> bool:
@@ -114,7 +112,7 @@ def _has_norm_selected_floating_parameter(module_path, module) -> bool:
     except Exception:
         return False
 
-    module_path_selected = _is_norm_parameter_path(_join_parameter_path(module_path, "_"))
+    module_path_selected = _is_norm_module_path(module_path)
     try:
         for parameter_path, value in tree_flatten(parameters):
             if (
@@ -122,9 +120,7 @@ def _has_norm_selected_floating_parameter(module_path, module) -> bool:
                 and mx.issubdtype(value.dtype, mx.floating)
                 and (
                     module_path_selected
-                    or _is_norm_parameter_path(
-                        _join_parameter_path(module_path, parameter_path)
-                    )
+                    or _is_norm_parameter_path(parameter_path)
                 )
             ):
                 return True
@@ -148,7 +144,7 @@ def _has_floating_parameter(module) -> bool:
     return False
 
 
-def _has_no_parameterized_non_norm_children(module) -> bool:
+def _has_parameterized_non_norm_children(module) -> bool:
     try:
         children = module.children()
     except Exception:
@@ -161,10 +157,10 @@ def _has_no_parameterized_non_norm_children(module) -> bool:
                 and "norm" not in type(child).__name__.lower()
                 and _has_floating_parameter(child)
             ):
-                return False
+                return True
     except Exception:
         return False
-    return True
+    return False
 
 
 def _norm_output_cast_input_dtype(args, kwargs):
@@ -184,9 +180,11 @@ def _is_norm_output_cast_candidate(module_path, module) -> bool:
         return True
     if "norm" not in norm_cls.__name__.lower():
         return False
+    if _has_parameterized_non_norm_children(module):
+        return False
     if not _has_norm_selected_floating_parameter(module_path, module):
         return False
-    return _has_no_parameterized_non_norm_children(module)
+    return True
 
 
 def _iter_norm_output_cast_classes(model=None):
@@ -229,12 +227,13 @@ def _set_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
         )
 
     for norm_cls in norm_classes:
-        patched = norm_cls.__dict__.get("_unsloth_cast_output_to_input_dtype", False)
+        patched = norm_cls in _NORM_OUTPUT_CAST_PATCHED_CLASSES
         if enabled:
-            if patched:
-                continue
             original_call = norm_cls.__call__
-            if getattr(original_call, "_unsloth_norm_output_cast_wrapper", False):
+            if (
+                patched
+                or getattr(original_call, "_unsloth_norm_output_cast_wrapper", False)
+            ):
                 continue
 
             def norm_call_cast_output(self, *args, _original_call=original_call, **kwargs):

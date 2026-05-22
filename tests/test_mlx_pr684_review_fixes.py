@@ -251,3 +251,37 @@ def test_norm_output_cast_discovers_custom_norms_from_loaded_model():
             assert out.dtype == x.dtype
     finally:
         trainer_mod._set_norm_output_cast_to_input_dtype(False)
+
+
+def test_norm_output_cast_does_not_double_patch_inherited_norm_call():
+    _skip_if_mlx_core_was_replaced()
+    import mlx.nn as nn
+    import unsloth_zoo.mlx.trainer as trainer_mod
+
+    class CustomRMSNorm(nn.RMSNorm):
+        pass
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = CustomRMSNorm(4)
+
+    trainer_mod._set_norm_output_cast_to_input_dtype(False)
+    model = TinyModel()
+    x = mx.ones((2, 4), dtype=mx.bfloat16)
+
+    try:
+        trainer_mod._set_norm_output_cast_to_input_dtype(True, model)
+        assert nn.RMSNorm in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
+        assert CustomRMSNorm not in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
+        assert model.input_layernorm(x).dtype == x.dtype
+    finally:
+        trainer_mod._set_norm_output_cast_to_input_dtype(False)
+
+    assert nn.RMSNorm not in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
+    assert CustomRMSNorm not in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
+    assert not getattr(
+        CustomRMSNorm.__call__,
+        "_unsloth_norm_output_cast_wrapper",
+        False,
+    )
