@@ -371,6 +371,35 @@ def test_wrapper_is_picklable():
     assert out.shape == (2, 8)
 
 
+def test_wrapper_unpickles_in_fresh_interpreter():
+    """Regression for the cross-process checkpoint handoff: a torch.save(model)
+    pickle must be loadable in a FRESH interpreter that never called
+    `_wrap_forward_in_bf16_autocast` (so the runtime-registered subclass symbol
+    does not exist there). We simulate that by pickling, then deleting the
+    registered symbol AND clearing the subclass cache before unpickling --
+    `__reduce__` must reconstruct the subclass from the importable base class."""
+    import pickle
+    import unsloth_zoo.training_utils as tu
+    from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+
+    m = _TinyForSig()
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+    gen_name = type(m).__name__
+    blob = pickle.dumps(m)
+
+    # Simulate a fresh process: drop the runtime registration + cache so the
+    # generated symbol is NOT resolvable by name.
+    if hasattr(tu, gen_name):
+        delattr(tu, gen_name)
+    tu._BF16_AUTOCAST_SUBCLASSES.clear()
+
+    m2 = pickle.loads(blob)
+    assert type(m2).__name__ == gen_name
+    assert type(m2).__name__.endswith("WithUnslothBf16Autocast")
+    out = m2(torch.zeros(2, 8, dtype=torch.bfloat16))
+    assert out.shape == (2, 8)
+
+
 def test_wrapper_subclass_is_cached_across_instances():
     """Two instances of the same base class must share one generated subclass
     so we register a single module-level symbol (stable pickle identity)."""

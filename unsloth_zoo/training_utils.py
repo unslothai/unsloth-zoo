@@ -101,15 +101,40 @@ pass
 _BF16_AUTOCAST_SUBCLASSES = {}
 
 
+def _reconstruct_bf16_autocast_model(base_cls, compute_dtype):
+    """Pickle / deepcopy reconstructor. Rebuilds (or fetches) the autocast
+    subclass from the IMPORTABLE base class, then returns a blank instance for
+    `__setstate__` to populate. Because reconstruction is driven by the base
+    class (which IS importable by module + qualname) rather than by the
+    runtime-generated subclass symbol, unpickling works in a FRESH interpreter
+    where `_make_bf16_autocast_subclass` has not been called yet (e.g. loading
+    a `torch.save(model)` checkpoint in another process / session)."""
+    cls = _make_bf16_autocast_subclass(base_cls, compute_dtype)
+    return cls.__new__(cls)
+
+
+def _bf16_autocast_reduce(self):
+    """`__reduce__` for generated autocast subclasses. Serialize via the base
+    class + the standard nn.Module state so no dynamically-generated class
+    symbol needs to be resolvable at unpickle time."""
+    cls = type(self)
+    base_cls = cls.__dict__.get("_unsloth_autocast_base", cls.__mro__[1])
+    compute_dtype = cls.__dict__.get("_unsloth_autocast_dtype", torch.bfloat16)
+    getstate = getattr(self, "__getstate__", None)
+    state = getstate() if getstate is not None else self.__dict__
+    return (_reconstruct_bf16_autocast_model, (base_cls, compute_dtype), state)
+
+
 def _make_bf16_autocast_subclass(cls, compute_dtype):
     """Build (or fetch from cache) a subclass of `cls` whose `forward` is
     wrapped in `torch.amp.autocast(compute_dtype)`.
 
-    The subclass is registered as a module-level attribute of this module so
-    that `pickle` (and therefore `torch.save(model, ...)`) can resolve it by
-    `module + qualname`. Without that registration, assigning a runtime
-    `type(...)` class to `model.__class__` makes the model unpicklable
-    (`PicklingError: attribute lookup ... failed`).
+    Picklability: the subclass defines `__reduce__` (`_bf16_autocast_reduce`)
+    so model instances serialize via their importable BASE class and are
+    reconstructed by `_reconstruct_bf16_autocast_model` -- this is what makes
+    `torch.save(model)` checkpoints loadable in a fresh process. The subclass
+    is also registered as a module-level symbol so that pickling the class
+    object itself (and same-process `copy`/pickle) resolves by name.
     """
     cached = _BF16_AUTOCAST_SUBCLASSES.get((cls, compute_dtype))
     if cached is not None:
@@ -145,7 +170,13 @@ def _make_bf16_autocast_subclass(cls, compute_dtype):
     if hasattr(module, name) and getattr(module, name) is not None:
         name = f"{name}_{len(_BF16_AUTOCAST_SUBCLASSES)}"
 
-    new_cls = type(name, (cls,), {"forward": _wrapped, "__module__": __name__})
+    new_cls = type(name, (cls,), {
+        "forward": _wrapped,
+        "__module__": __name__,
+        "__reduce__": _bf16_autocast_reduce,
+        "_unsloth_autocast_base": cls,
+        "_unsloth_autocast_dtype": compute_dtype,
+    })
     new_cls.__qualname__ = name
     setattr(module, name, new_cls)
     _BF16_AUTOCAST_SUBCLASSES[(cls, compute_dtype)] = new_cls
