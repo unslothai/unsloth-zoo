@@ -33,6 +33,7 @@ from .gradient_checkpointing import (
 import os
 import re
 import sys
+import types
 import functools
 
 __all__ = [
@@ -250,14 +251,21 @@ def _wrap_forward_in_bf16_autocast(model, compute_dtype):
         # An instance-level `forward` (e.g. Unsloth runtime forward patching)
         # shadows any class-method override -- `self.forward` resolves the
         # instance attribute first -- so mutating `__class__` would NOT
-        # intercept it. Wrap the instance attribute directly instead.
+        # intercept it. Wrap the instance attribute directly.
+        #
+        # Bind as a `types.MethodType` so the wrapper receives `self` and reads
+        # the original forward from `self.__dict__` instead of closing over the
+        # original `model`. `copy.deepcopy` rebinds a bound method's `__self__`
+        # to the copy, so the copy's wrapped forward executes against the copy's
+        # parameters (EMA / model averaging / checkpoint paths).
         @functools.wraps(instance_forward)
-        def _wrapped_instance_forward(*args, **kwargs):
+        def _wrapped_instance_forward(self, *args, **kwargs):
+            orig = self.__dict__["_unsloth_autocast_orig_forward"]
             return _call_forward_with_bf16_autocast(
-                instance_forward, model, args, kwargs, compute_dtype,
+                orig, self, args, kwargs, compute_dtype,
             )
         model._unsloth_autocast_orig_forward = instance_forward
-        model.forward = _wrapped_instance_forward
+        model.forward = types.MethodType(_wrapped_instance_forward, model)
     else:
         model.__class__ = _make_bf16_autocast_subclass(type(model), compute_dtype)
     model._unsloth_bf16_autocast_wrapped = True
@@ -284,11 +292,17 @@ def _unwrap_forward_in_bf16_autocast(model):
 def _canonical_module_name(name):
     """Convert a `named_parameters` key into an attribute path to the owning
     module (e.g. `model.layers.0.input_layernorm.weight` ->
-    `model.layers[0].input_layernorm`)."""
+    `model.layers[0].input_layernorm`). Only a TRAILING `.weight` / `.bias`
+    parameter suffix is stripped (end-anchored) -- a plain `.replace(...)` would
+    corrupt module names that merely contain `.weight`/`.bias` as a substring
+    (e.g. `...self_attn.bias_proj.weight` or `...weight_scale.weight`)."""
     module_name = name.replace("base_model", "model", 1)
     while re.search(r"\.(\d+)\.", module_name) is not None:
         module_name = re.sub(r"\.(\d+)\.", r"[\1].", module_name)
-    return module_name.replace(".weight", "", 1).replace(".bias", "", 1)
+    for suffix in (".weight", ".bias"):
+        if module_name.endswith(suffix):
+            return module_name[: -len(suffix)]
+    return module_name
 
 
 def _cast_named_module(model, name, dtype):

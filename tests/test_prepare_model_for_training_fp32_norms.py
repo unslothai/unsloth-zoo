@@ -687,3 +687,89 @@ def test_legacy_upcast_layernorm_defers_to_external_policy():
     assert m.norm1.weight.dtype == torch.float32
     # externally managed norm preserved (fp32, untouched)
     assert m.managed_norm.weight.dtype == torch.float32
+
+
+def test_canonical_module_name_strips_only_trailing_suffix():
+    """#A: only a TRAILING .weight/.bias must be stripped; names that merely
+    contain those as substrings (bias_proj, weight_scale, bias_layernorm) must
+    keep their module path intact."""
+    from unsloth_zoo.training_utils import _canonical_module_name
+    assert _canonical_module_name("model.layers.0.input_layernorm.weight") == \
+        "model.layers[0].input_layernorm"
+    assert _canonical_module_name("model.layers.0.self_attn.bias_proj.weight") == \
+        "model.layers[0].self_attn.bias_proj"
+    assert _canonical_module_name("model.decoder.bias_layernorm.weight") == \
+        "model.decoder.bias_layernorm"
+    assert _canonical_module_name("model.x.weight_scale.weight") == \
+        "model.x.weight_scale"
+    assert _canonical_module_name("model.norm.bias") == "model.norm"
+
+
+def test_full_ft_handles_bias_substring_module_names():
+    """#A: a module named with a `.bias`/`.weight` substring must not crash
+    prepare_model_for_training (the canonicalizer used to resolve a bogus
+    attribute path)."""
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = nn.LayerNorm(8)
+            self.bias_proj = nn.Linear(8, 8)      # name contains ".bias"
+            self.weight_scale = nn.Linear(8, 8)   # name contains ".weight"
+            self.embed_tokens = nn.Embedding(16, 8)
+            self.to(torch.bfloat16)
+            self.config = _Cfg(dtype=torch.bfloat16)
+
+        def get_input_embeddings(self):
+            return self.embed_tokens
+
+        def forward(self, x):
+            return self.weight_scale(self.bias_proj(self.input_layernorm(x)))
+
+    m = _M()
+    prepare_model_for_training(  # must not raise
+        m, use_gradient_checkpointing=False, use_reentrant=False,
+        full_finetuning=True, train_layernorms=True,
+        float32_mixed_precision=False,
+    )
+    assert m.input_layernorm.weight.dtype == torch.float32
+    assert m.bias_proj.weight.dtype == torch.bfloat16
+    assert m.weight_scale.weight.dtype == torch.bfloat16
+
+
+def test_instance_forward_wrapper_rebinds_on_deepcopy():
+    """#B: when wrapping an instance-level forward, deepcopy must rebind the
+    wrapper to the COPY's parameters, not leak back to the original."""
+    import copy
+    from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(4, 4, bias=False)
+            self.config = _Cfg(dtype=torch.bfloat16)
+
+        def _impl(self, x):
+            return self.lin(x)
+
+        def forward(self, x):
+            return self._impl(x)
+
+    m = _M()
+    with torch.no_grad():
+        m.lin.weight.fill_(1.0)
+    m.forward = m._impl  # instance-level forward
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+
+    m2 = copy.deepcopy(m)
+    with torch.no_grad():
+        m2.lin.weight.fill_(2.0)
+    assert m.lin.weight.data_ptr() != m2.lin.weight.data_ptr()
+
+    x = torch.zeros(1, 4, dtype=torch.bfloat16)
+    x[0, 0] = 1.0
+    y1 = m(x)   # original weights = 1.0
+    y2 = m2(x)  # copy weights = 2.0 -- must NOT see the original's 1.0
+    assert torch.allclose(y1.float(), torch.full_like(y1, 1.0, dtype=torch.float32))
+    assert torch.allclose(y2.float(), torch.full_like(y2, 2.0, dtype=torch.float32))
