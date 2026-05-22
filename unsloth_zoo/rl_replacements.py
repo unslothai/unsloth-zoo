@@ -215,6 +215,24 @@ def _unsloth_fix_mm_token_type_ids(
     return mm_token_type_ids
 pass
 
+
+def _unsloth_clear_stateful_mrope(model):
+    modules = getattr(model, "modules", None)
+    if modules is None:
+        return False
+
+    cleared = False
+    for module in modules():
+        if (
+            hasattr(module, "compute_3d_position_ids")
+            and hasattr(module, "rope_deltas")
+        ):
+            module.rope_deltas = None
+            cleared = True
+    return cleared
+pass
+
+
 def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
     """
     Moves all padding tokens in each sequence of a batch to the right.
@@ -841,7 +859,6 @@ def grpo_accumulated_loss(
         if hasattr(module, "_hf_hook") and hasattr(module._hf_hook, "io_same_decice"):
             module._hf_hook.io_same_decice = False
     pass
-
     all_logprobs_list = []
 
     def slice_sample_axis(value, start, end):

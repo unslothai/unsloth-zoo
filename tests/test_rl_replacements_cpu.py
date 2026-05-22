@@ -159,6 +159,157 @@ def test_align_logprobs_with_mask_inserts_per_row_left_padding():
 
 
 # ---------------------------------------------------------------------------
+# Stateful MRoPE text-only GRPO helpers
+# ---------------------------------------------------------------------------
+
+
+class _FakeAccelerator:
+    scaler = None
+
+    def unwrap_model(self, model, keep_fp32_wrapper = False):
+        return model
+
+
+class _FakeQwen35MRoPE(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rope_deltas = torch.ones((2, 1), dtype = torch.long)
+
+    def compute_3d_position_ids(self):
+        raise AssertionError("test helper should only be detected")
+
+
+class _FakeGRPOModel(torch.nn.Module):
+    def __init__(self, *, has_mrope = False, hidden_size = 3, vocab_size = 11):
+        super().__init__()
+        self.device = torch.device("cpu")
+        self.embed = torch.nn.Embedding(vocab_size, hidden_size)
+        self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias = False)
+        self.calls = []
+        if has_mrope:
+            self.mrope = _FakeQwen35MRoPE()
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def forward(self, **kwargs):
+        self.calls.append(kwargs)
+        input_ids = kwargs["input_ids"]
+        logits = torch.zeros(
+            input_ids.shape[0],
+            input_ids.shape[1],
+            self.lm_head.in_features,
+            dtype = torch.float32,
+        )
+        return SimpleNamespace(logits = logits)
+
+
+def _fake_trainer(model):
+    return SimpleNamespace(
+        accelerator = _FakeAccelerator(),
+        args = SimpleNamespace(
+            unsloth_grpo_mini_batch = 1,
+            unsloth_logit_chunk_multiplier = 1,
+        ),
+        beta = 0.0,
+        current_gradient_accumulation_steps = 1,
+        model = model,
+        processing_class = SimpleNamespace(pad_token_id = 0),
+        use_vllm = False,
+        _autocast_dtype = torch.bfloat16,
+    )
+
+
+def _run_fake_grpo(monkeypatch, model, *, pixel_values = None, image_grid_thw = None):
+    monkeypatch.setattr(rr, "device_synchronize", lambda: None)
+    monkeypatch.setattr(
+        rr,
+        "chunked_hidden_states_selective_log_softmax",
+        lambda hidden_states, lm_head, index, *args, **kwargs: hidden_states.new_zeros(index.shape),
+    )
+    monkeypatch.setattr(
+        rr,
+        "UnslothEfficientGRPO",
+        SimpleNamespace(
+            apply = lambda *args: (
+                torch.tensor(0.0),
+                torch.tensor(0.0),
+                torch.tensor(0.0),
+                torch.tensor(0.0),
+                torch.tensor(0.0),
+                torch.tensor(0.0),
+            )
+        ),
+    )
+
+    input_ids = torch.tensor(
+        [
+            [0, 0, 1, 2, 3],
+            [0, 4, 5, 6, 7],
+        ]
+    )
+    attention_mask = (input_ids != 0).long()
+    kwargs = {}
+    if pixel_values is not None:
+        kwargs["pixel_values"] = pixel_values
+    if image_grid_thw is not None:
+        kwargs["image_grid_thw"] = image_grid_thw
+
+    return rr.grpo_accumulated_loss(
+        trainer = _fake_trainer(model),
+        input_ids = input_ids,
+        attention_mask = attention_mask,
+        logits_to_keep = 2,
+        completion_mask = torch.ones((2, 2)),
+        advantages = torch.ones(2),
+        old_logps = None,
+        ref_logps = None,
+        **kwargs,
+    )
+
+
+def test_clear_stateful_mrope_detects_required_interface_and_clears_state():
+    model = _FakeGRPOModel(has_mrope = True)
+    assert rr._unsloth_clear_stateful_mrope(model) is True
+    assert model.mrope.rope_deltas is None
+    assert rr._unsloth_clear_stateful_mrope(_FakeGRPOModel(has_mrope = False)) is False
+
+
+def test_grpo_text_only_stateful_mrope_does_not_mutate_rope_deltas_or_pass_position_ids(monkeypatch):
+    model = _FakeGRPOModel(has_mrope = True)
+    assert model.mrope.rope_deltas is not None
+
+    _run_fake_grpo(monkeypatch, model)
+
+    assert model.mrope.rope_deltas is not None
+    assert "position_ids" not in model.calls[0]
+
+
+def test_grpo_text_only_non_mrope_model_does_not_receive_position_ids(monkeypatch):
+    model = _FakeGRPOModel(has_mrope = False)
+
+    _run_fake_grpo(monkeypatch, model)
+
+    assert "position_ids" not in model.calls[0]
+
+
+def test_grpo_multimodal_stateful_mrope_keeps_existing_forward_contract(monkeypatch):
+    model = _FakeGRPOModel(has_mrope = True)
+
+    _run_fake_grpo(
+        monkeypatch,
+        model,
+        pixel_values = torch.zeros((2, 3)),
+        image_grid_thw = torch.ones((2, 3), dtype = torch.long),
+    )
+
+    assert model.mrope.rope_deltas is not None
+    assert "position_ids" not in model.calls[0]
+    assert model.calls[0]["pixel_values"].shape == (2, 3)
+    assert model.calls[0]["image_grid_thw"].shape == (2, 3)
+
+
+# ---------------------------------------------------------------------------
 # sanitize_logprob
 # ---------------------------------------------------------------------------
 
