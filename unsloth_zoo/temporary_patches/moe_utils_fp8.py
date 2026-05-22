@@ -14,7 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import os
 from typing import Optional
 
 import torch
@@ -24,410 +23,6 @@ import torch.nn.functional as F
 
 _TORCH_SCALED_GROUPED_MM_AVAILABLE = hasattr(torch, "_scaled_grouped_mm")
 _TORCH_SCALED_GROUPED_MM_SUPPORTED = None
-
-
-def _maybe_patch_glm4_stacked_moe_fp8_scales(
-    model,
-    model_name: str,
-    token = None,
-    revision = None,
-):
-    config = getattr(model, "config", None)
-    if config is None or getattr(config, "model_type", None) != "glm4_moe_lite":
-        return False
-
-    quantization_config = getattr(config, "quantization_config", None)
-    if isinstance(quantization_config, dict):
-        quant_method = quantization_config.get("quant_method", None)
-    else:
-        quant_method = getattr(quantization_config, "quant_method", None)
-    if quant_method != "compressed-tensors":
-        return False
-
-    inner_model = getattr(model, "model", None)
-    if inner_model is None or not hasattr(inner_model, "layers"):
-        return False
-
-    routed_layers = []
-    for layer_idx, layer in enumerate(inner_model.layers):
-        experts = getattr(getattr(layer, "mlp", None), "experts", None)
-        if experts is None or not hasattr(experts, "gate_up_proj"):
-            continue
-        if getattr(experts.gate_up_proj, "dtype", None) == torch.float8_e4m3fn:
-            routed_layers.append((layer_idx, experts))
-    if len(routed_layers) == 0:
-        return False
-
-    import safetensors.torch
-    import json as _json
-
-    # Collect all tensor keys we'll need so we can find the right shards
-    needed_keys = set()
-    for layer_idx, experts in routed_layers:
-        num_experts = experts.gate_up_proj.shape[0]
-        for expert_idx in range(num_experts):
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                needed_keys.add(f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{proj}.weight")
-                needed_keys.add(f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{proj}.weight_scale")
-
-    # Resolve file path(s) -- single file or sharded
-    shard_paths = {}  # tensor_key -> local file path
-    if os.path.isdir(model_name):
-        single_path = os.path.join(model_name, "model.safetensors")
-        if os.path.exists(single_path):
-            shard_paths = {k: single_path for k in needed_keys}
-        else:
-            index_path = os.path.join(model_name, "model.safetensors.index.json")
-            if not os.path.exists(index_path):
-                return False
-            with open(index_path) as f:
-                weight_map = _json.load(f).get("weight_map", {})
-            for k in needed_keys:
-                shard_file = weight_map.get(k)
-                if shard_file is None:
-                    return False
-                shard_paths[k] = os.path.join(model_name, shard_file)
-    else:
-        from huggingface_hub import hf_hub_download
-
-        try:
-            single_path = hf_hub_download(
-                repo_id = model_name,
-                filename = "model.safetensors",
-                token = token,
-                revision = revision,
-            )
-            shard_paths = {k: single_path for k in needed_keys}
-        except Exception:
-            try:
-                index_path = hf_hub_download(
-                    repo_id = model_name,
-                    filename = "model.safetensors.index.json",
-                    token = token,
-                    revision = revision,
-                )
-                with open(index_path) as f:
-                    weight_map = _json.load(f).get("weight_map", {})
-                # Download only the unique shards we need
-                needed_shards = set()
-                for k in needed_keys:
-                    shard_file = weight_map.get(k)
-                    if shard_file is None:
-                        return False
-                    needed_shards.add(shard_file)
-                downloaded = {}
-                for shard_file in needed_shards:
-                    downloaded[shard_file] = hf_hub_download(
-                        repo_id = model_name,
-                        filename = shard_file,
-                        token = token,
-                        revision = revision,
-                    )
-                for k in needed_keys:
-                    shard_paths[k] = downloaded[weight_map[k]]
-            except Exception:
-                return False
-
-    if not shard_paths:
-        return False
-
-    # Open all unique shard files and build a multi-shard reader
-    unique_paths = set(shard_paths.values())
-    open_handles = {}
-    try:
-        for p in unique_paths:
-            open_handles[p] = safetensors.torch.safe_open(p, framework = "pt")
-
-        class _MultiShardFile:
-            def get_tensor(self, key):
-                return open_handles[shard_paths[key]].get_tensor(key)
-
-        file = _MultiShardFile()
-        _patch_result = _do_glm4_scale_patching(file, routed_layers)
-    finally:
-        open_handles.clear()
-
-    return _patch_result
-
-
-def _do_glm4_scale_patching(file, routed_layers):
-    """Inner helper that reads tensors from file and patches routed_layers."""
-    for layer_idx, experts in routed_layers:
-        device = experts.gate_up_proj.device
-        num_experts = experts.gate_up_proj.shape[0]
-        gate_up_rows = []
-        down_rows = []
-        gate_up_scales = []
-        down_scales = []
-
-        for expert_idx in range(num_experts):
-            gate = file.get_tensor(
-                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight"
-            )
-            gate_scale = file.get_tensor(
-                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight_scale"
-            )
-            up = file.get_tensor(
-                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight"
-            )
-            up_scale = file.get_tensor(
-                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight_scale"
-            )
-            down = file.get_tensor(
-                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight"
-            )
-            down_scale = file.get_tensor(
-                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight_scale"
-            )
-
-            gate_up_rows.append(torch.cat([gate, up], dim = 0))
-            down_rows.append(down)
-            gate_up_scales.append(torch.cat([gate_scale, up_scale], dim = 0))
-            down_scales.append(down_scale)
-
-        experts.gate_up_proj = nn.Parameter(
-            torch.stack(gate_up_rows, dim = 0).to(device = device),
-            requires_grad = experts.gate_up_proj.requires_grad,
-        )
-        experts.down_proj = nn.Parameter(
-            torch.stack(down_rows, dim = 0).to(device = device),
-            requires_grad = experts.down_proj.requires_grad,
-        )
-        experts.gate_up_proj_weight_scale = nn.Parameter(
-            torch.stack(gate_up_scales, dim = 0).to(device = device),
-            requires_grad = False,
-        )
-        experts.down_proj_weight_scale = nn.Parameter(
-            torch.stack(down_scales, dim = 0).to(device = device),
-            requires_grad = False,
-        )
-        experts.gate_up_proj_scale = experts.gate_up_proj_weight_scale
-        experts.down_proj_scale = experts.down_proj_weight_scale
-
-    return True
-
-
-def maybe_patch_stacked_moe_expert_fp8_scales(
-    model,
-    model_name: Optional[str] = None,
-    token = None,
-    revision = None,
-):
-    if model_name is None:
-        config = getattr(model, "config", None)
-        model_name = getattr(config, "_name_or_path", None)
-    if not model_name:
-        return False
-
-    if _maybe_patch_glm4_stacked_moe_fp8_scales(
-        model,
-        model_name,
-        token = token,
-        revision = revision,
-    ):
-        return True
-
-    # Generic path: when the checkpoint has FP8 weights already stacked
-    # (shape (E, M, N)) plus stacked scales (e.g. gate_up_proj_scale_inv),
-    # but the loaded experts class doesn't declare those scale attributes,
-    # transformers silently drops them. This happens for Qwen3-Coder-FP8
-    # loaded into the bf16 Qwen3MoeExperts class via unsloth FastLanguageModel.
-    # Re-load the scale tensors directly from the checkpoint and attach them.
-    return _maybe_attach_dropped_moe_fp8_scales(
-        model,
-        model_name,
-        token = token,
-        revision = revision,
-    )
-
-
-def _maybe_attach_dropped_moe_fp8_scales(
-    model,
-    model_name: str,
-    token = None,
-    revision = None,
-) -> bool:
-    """Attach FP8 weight_scale_inv tensors that were dropped during load
-    because the (bf16) experts class didn't declare them. Supports two
-    checkpoint layouts:
-
-      1. Stacked: `model.layers.<i>.mlp.experts.<proj>_proj_scale_inv`
-         (per-layer, already 3-D shape (E, p, q)).
-      2. Per-expert (Qwen3-Coder layout):
-         `model.layers.<i>.mlp.experts.<e>.<proj>_proj.weight_scale_inv`
-         (per-expert 2-D, must be stacked into (E, p, q) here).
-
-    The corresponding fused gate_up_proj scale is built by concatenating
-    gate + up scales along the row axis (matching how the weights are
-    fused at load time)."""
-
-    inner_model = getattr(model, "model", None)
-    if inner_model is None or not hasattr(inner_model, "layers"):
-        return False
-
-    routed_layers = []
-    for layer_idx, layer in enumerate(inner_model.layers):
-        experts = getattr(getattr(layer, "mlp", None), "experts", None)
-        if experts is None or not hasattr(experts, "gate_up_proj"):
-            continue
-        if getattr(experts.gate_up_proj, "dtype", None) != torch.float8_e4m3fn:
-            continue
-        has_gu_scale = any(
-            hasattr(experts, attr)
-            for attr in (
-                "gate_up_proj_scale_inv", "gate_up_proj_weight_scale_inv",
-                "gate_up_proj_scale", "gate_up_proj_weight_scale",
-            )
-        )
-        has_dn_scale = any(
-            hasattr(experts, attr)
-            for attr in (
-                "down_proj_scale_inv", "down_proj_weight_scale_inv",
-                "down_proj_scale", "down_proj_weight_scale",
-            )
-        )
-        if not has_gu_scale or not has_dn_scale:
-            routed_layers.append((layer_idx, experts))
-    if not routed_layers:
-        return False
-
-    # Try layout 1 first: per-layer stacked scale tensors.
-    stacked_keys = set()
-    for layer_idx, _ in routed_layers:
-        stacked_keys.add(f"model.layers.{layer_idx}.mlp.experts.gate_up_proj_scale_inv")
-        stacked_keys.add(f"model.layers.{layer_idx}.mlp.experts.down_proj_scale_inv")
-    shard_paths = _resolve_safetensors_shards(model_name, stacked_keys, token, revision)
-    if shard_paths and len(shard_paths) == len(stacked_keys):
-        return _attach_stacked_scales(routed_layers, shard_paths)
-
-    # Layout 2: per-expert scales (Qwen3-Coder). Stack into (E, p, q).
-    num_experts = routed_layers[0][1].gate_up_proj.shape[0]
-    per_expert_keys = set()
-    for layer_idx, _ in routed_layers:
-        for e in range(num_experts):
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                per_expert_keys.add(
-                    f"model.layers.{layer_idx}.mlp.experts.{e}.{proj}.weight_scale_inv"
-                )
-    shard_paths = _resolve_safetensors_shards(model_name, per_expert_keys, token, revision)
-    if not shard_paths or len(shard_paths) != len(per_expert_keys):
-        return False
-    return _attach_per_expert_scales(routed_layers, shard_paths, num_experts)
-
-
-def _attach_stacked_scales(routed_layers, shard_paths) -> bool:
-    import safetensors.torch
-    open_handles = {p: safetensors.torch.safe_open(p, framework="pt")
-                    for p in set(shard_paths.values())}
-    attached = 0
-    try:
-        for layer_idx, experts in routed_layers:
-            for proj in ("gate_up_proj", "down_proj"):
-                key = f"model.layers.{layer_idx}.mlp.experts.{proj}_scale_inv"
-                if key not in shard_paths:
-                    continue
-                scale = open_handles[shard_paths[key]].get_tensor(key)
-                scale = scale.to(device=experts.gate_up_proj.device)
-                setattr(experts, f"{proj}_scale_inv",
-                        nn.Parameter(scale, requires_grad=False))
-                attached += 1
-    finally:
-        open_handles.clear()
-    _annotate_block_size(routed_layers)
-    return attached > 0
-
-
-def _attach_per_expert_scales(routed_layers, shard_paths, num_experts) -> bool:
-    """Stack per-expert weight_scale_inv tensors into (E, p, q) and attach."""
-    import safetensors.torch
-    open_handles = {p: safetensors.torch.safe_open(p, framework="pt")
-                    for p in set(shard_paths.values())}
-    attached = 0
-    try:
-        for layer_idx, experts in routed_layers:
-            device = experts.gate_up_proj.device
-            gate_up_scales = []
-            down_scales = []
-            for e in range(num_experts):
-                key_g = f"model.layers.{layer_idx}.mlp.experts.{e}.gate_proj.weight_scale_inv"
-                key_u = f"model.layers.{layer_idx}.mlp.experts.{e}.up_proj.weight_scale_inv"
-                key_d = f"model.layers.{layer_idx}.mlp.experts.{e}.down_proj.weight_scale_inv"
-                gs = open_handles[shard_paths[key_g]].get_tensor(key_g)
-                us = open_handles[shard_paths[key_u]].get_tensor(key_u)
-                ds = open_handles[shard_paths[key_d]].get_tensor(key_d)
-                # gate_up is fused by stacking gate above up along the out (row) axis.
-                gate_up_scales.append(torch.cat([gs, us], dim=0))
-                down_scales.append(ds)
-            gu = torch.stack(gate_up_scales, dim=0).to(device=device).float().contiguous()
-            dn = torch.stack(down_scales, dim=0).to(device=device).float().contiguous()
-            experts.gate_up_proj_scale_inv = nn.Parameter(gu, requires_grad=False)
-            experts.down_proj_scale_inv = nn.Parameter(dn, requires_grad=False)
-            attached += 2
-    finally:
-        open_handles.clear()
-    _annotate_block_size(routed_layers)
-    return attached > 0
-
-
-def _annotate_block_size(routed_layers):
-    for _, experts in routed_layers:
-        w = experts.gate_up_proj
-        s = getattr(experts, "gate_up_proj_scale_inv", None)
-        if isinstance(s, torch.Tensor) and s.ndim == 3 and w.ndim == 3 and s.shape[1] > 0 and s.shape[2] > 0:
-            bm = (w.shape[1] + s.shape[1] - 1) // s.shape[1]
-            bn = (w.shape[2] + s.shape[2] - 1) // s.shape[2]
-            setattr(experts, "block_size", [bm, bn])
-
-
-def _resolve_safetensors_shards(model_name, needed_keys, token=None, revision=None):
-    """Return {tensor_key: local_path} for needed_keys, downloading shards
-    from HF hub if model_name is a repo id, or reading the local index if
-    model_name is a directory. Returns {} on failure."""
-    import json as _json
-    shard_paths = {}
-    if os.path.isdir(model_name):
-        single_path = os.path.join(model_name, "model.safetensors")
-        if os.path.exists(single_path):
-            return {k: single_path for k in needed_keys}
-        index_path = os.path.join(model_name, "model.safetensors.index.json")
-        if not os.path.exists(index_path):
-            return {}
-        with open(index_path) as f:
-            weight_map = _json.load(f).get("weight_map", {})
-        for k in needed_keys:
-            shard_file = weight_map.get(k)
-            if shard_file is None:
-                return {}
-            shard_paths[k] = os.path.join(model_name, shard_file)
-        return shard_paths
-
-    from huggingface_hub import hf_hub_download
-    try:
-        single_path = hf_hub_download(repo_id=model_name, filename="model.safetensors",
-                                       token=token, revision=revision)
-        return {k: single_path for k in needed_keys}
-    except Exception:
-        pass
-    try:
-        index_path = hf_hub_download(repo_id=model_name, filename="model.safetensors.index.json",
-                                      token=token, revision=revision)
-        with open(index_path) as f:
-            weight_map = _json.load(f).get("weight_map", {})
-        needed_shards = {weight_map[k] for k in needed_keys if k in weight_map}
-        if not needed_shards or len(needed_shards) != len({s for s in (weight_map.get(k) for k in needed_keys) if s}):
-            # not all keys present in index
-            for k in needed_keys:
-                if k not in weight_map:
-                    return {}
-        downloaded = {}
-        for shard_file in needed_shards:
-            downloaded[shard_file] = hf_hub_download(repo_id=model_name, filename=shard_file,
-                                                     token=token, revision=revision)
-        for k in needed_keys:
-            shard_paths[k] = downloaded[weight_map[k]]
-        return shard_paths
-    except Exception:
-        return {}
 
 
 def _is_float8_tensor(tensor: Optional[torch.Tensor]) -> bool:
@@ -501,7 +96,6 @@ def _check_torch_scaled_grouped_mm_supported():
 
 
 def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
-    # _try_attach_block_size defined locally below; no import needed.
     if quant_state is None or not isinstance(quant_state, torch.Tensor):
         return quant_state
 
@@ -534,7 +128,6 @@ def _dequantize_expert_slice(
     quant_kind=None,
 ) -> Optional[torch.Tensor]:
     """Dequantize one expert's FP8 weight to target_dtype using pure PyTorch."""
-    # _try_attach_block_size defined locally below; no import needed.
     if expert_weight.dtype != torch.float8_e4m3fn:
         return expert_weight.to(target_dtype)
 
@@ -705,7 +298,6 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
 
 
 def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dtype: torch.dtype, quant_kind=None):
-    # _try_attach_block_size defined locally below; no import needed.
     if weight.ndim != 3:
         return None
 
@@ -724,12 +316,19 @@ def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dt
     if result is not None:
         return result
 
-    # Fallback 2: per-expert loop.
+    # Fallback 2: per-expert loop. Only reachable when scale is 2-D with an
+    # explicit transposed block_size annotation; vectorized + unsloth Triton
+    # paths above cover every standard 3-D scale layout.
+    if (
+        not isinstance(quant_state, torch.Tensor)
+        or quant_state.ndim != 2
+        or block_size is None
+    ):
+        return None
     dequantized = []
     for expert_idx in range(weight.shape[0]):
         expert_weight = weight[expert_idx].contiguous()
-        if block_size is not None:
-            _try_attach_block_size(expert_weight, block_size)
+        _try_attach_block_size(expert_weight, block_size)
         expert_quant_state = _slice_fp8_quant_state(weight, quant_state, expert_idx)
         expert_dequant = _dequantize_expert_slice(expert_weight, expert_quant_state, target_dtype, quant_kind=quant_kind)
         if expert_dequant is None:
@@ -1022,20 +621,6 @@ def _unwrap_param_attr(module, name):
     return None
 
 
-def _call_with_temporary_moe_weights(experts_module, gate_up_proj, down_proj, forward_fn, *args):
-    old_gate_up = getattr(experts_module, "gate_up_proj")
-    old_down = getattr(experts_module, "down_proj")
-    gate_up_param = nn.Parameter(gate_up_proj, requires_grad=old_gate_up.requires_grad)
-    down_param = nn.Parameter(down_proj, requires_grad=old_down.requires_grad)
-    setattr(experts_module, "gate_up_proj", gate_up_param)
-    setattr(experts_module, "down_proj", down_param)
-    try:
-        return forward_fn(experts_module, *args)
-    finally:
-        setattr(experts_module, "gate_up_proj", old_gate_up)
-        setattr(experts_module, "down_proj", old_down)
-
-
 def _slice_fp8_linear_quant_state(experts_module, param_name: str, expert_idx: int):
     weight, quant_state, quant_kind = _get_moe_weight_and_quant_info(experts_module, param_name)
     expert_quant_state = _slice_fp8_quant_state(weight, quant_state, expert_idx)
@@ -1157,6 +742,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         forward_native_grouped_mm,
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
+        swap_moe_weights_for_call,
     )
 
     backend = select_moe_backend()
@@ -1194,7 +780,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
             _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-native_torch loop.")
             forward_fn = forward_native_moe_loop
 
-        return _call_with_temporary_moe_weights(
+        return swap_moe_weights_for_call(
             self,
             gate_up_weight,
             down_weight,
@@ -1213,6 +799,133 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
 
 
 # ============================================================================
+# Save-side hooks: dequant base FP8 weights before LoRA merge, requant after.
+# saving_utils.py consults `_MOE_QUANT_HANDLERS` for every expert weight key
+# it reads, so the FP8 plumbing stays local to this file instead of polluting
+# the generic save path.
+# ============================================================================
+
+# FP8 e4m3 max representable magnitude — matches transformers' Fp8Quantize.convert
+# (finegrained_fp8.py:838-859) and compressed-tensors' fp8 encode path.
+_FP8_E4M3_MAX = 448.0
+
+# Sentinel returned by a handler when it positively identifies its quant kind on
+# the key but cannot safely apply a LoRA merge (e.g. missing companion scale).
+# saving_utils.py treats this as "skip this expert, record a fallback".
+_MOE_QUANT_UNSAFE = object()
+
+
+def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+    """Block-wise dequant of float8_e4m3fn weight via per-block weight_scale_inv.
+
+    Inverse of compressed-tensors / DeepSeek-style FP8 quantization:
+        W_real = decode_fp8(W) * scale_inv_broadcast(block_size)
+    where scale_inv has shape (rows/bm, cols/bn) and each scalar tiles its
+    bm x bn block of the dequantized weight.
+    """
+    rows, cols = W_fp8.shape
+    srows, scols = scale_inv.shape
+    bm, bn = rows // srows, cols // scols
+    W_bf16 = W_fp8.to(scale_inv.dtype)
+    return (
+        W_bf16.reshape(srows, bm, scols, bn)
+        * scale_inv.unsqueeze(-1).unsqueeze(1)
+    ).reshape(rows, cols)
+
+
+def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: torch.dtype):
+    """Block-wise FP8 e4m3 re-quantization. Returns (W_fp8, new_scale_inv).
+
+    Per (bm, bn) block: scale_inv = max_abs / 448, W_fp8 = clamp(W / scale_inv, ±448).
+    Zero-blocks clamp scale_inv to 1e-12 (avoids div-by-zero; the encoded fp8
+    is 0 either way, so on reload `0 * 1e-12 == 0` round-trips cleanly).
+    """
+    rows, cols = W.shape
+    bm, bn = block_shape
+    srows, scols = rows // bm, cols // bn
+    W_blocks = W.to(torch.float32).reshape(srows, bm, scols, bn)
+    block_max = W_blocks.abs().amax(dim=(1, 3))
+    scale_inv = (block_max / _FP8_E4M3_MAX).clamp_min(1e-12)
+    W_scaled = (
+        W_blocks / scale_inv.unsqueeze(-1).unsqueeze(1)
+    ).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+    W_fp8 = W_scaled.reshape(rows, cols).to(torch.float8_e4m3fn)
+    return W_fp8, scale_inv.to(scale_dtype)
+
+
+def _fp8_save_handler(file, header_metadata, weight_key):
+    """MoE-quant save handler for FP8 base weights.
+
+    Returns:
+      - None if `weight_key` is not FP8 (so other handlers / the plain
+        `file.get_tensor(key)` path takes over).
+      - `(_MOE_QUANT_UNSAFE, None)` if FP8 is detected but the companion
+        `weight_scale_inv` / `weight_scale` cannot be located or its block
+        layout does not divide the weight cleanly.
+      - `(W_bf16, requant_fn)` otherwise, where `requant_fn(merged_W)` returns
+        `(W_fp8, "extra_writes": [(scale_key, scale_tensor, scale_dtype)],
+         storage_dtype)` so the caller can write the re-quantised data plus
+        the new scale alongside it.
+    """
+    dtype_str = header_metadata.get(weight_key, {}).get("dtype")
+    # Cheap probe: skip non-FP8 keys without paying for a tensor read.
+    if dtype_str not in ("F8_E4M3",):
+        # Only FP8 keys are our concern; let the generic loader handle the rest.
+        if dtype_str is None:
+            # Unknown layout — fall back to full read to learn the dtype.
+            W = file.get_tensor(weight_key)
+            if W.dtype != torch.float8_e4m3fn:
+                return None
+        else:
+            return None
+    else:
+        W = file.get_tensor(weight_key)
+        if W.dtype != torch.float8_e4m3fn:
+            return None
+
+    base = weight_key[: -len(".weight")] if weight_key.endswith(".weight") else weight_key
+    candidate_keys = (base + ".weight_scale_inv", base + ".weight_scale")
+    scale_key = next((k for k in candidate_keys if k in header_metadata), None)
+    if scale_key is None:
+        return _MOE_QUANT_UNSAFE, None
+    scale_inv = file.get_tensor(scale_key)
+    if scale_inv.ndim != 2 or W.ndim != 2:
+        return _MOE_QUANT_UNSAFE, None
+    rows, cols = W.shape
+    srows, scols = scale_inv.shape
+    if rows % srows != 0 or cols % scols != 0:
+        return _MOE_QUANT_UNSAFE, None
+    bm, bn = rows // srows, cols // scols
+    block_shape = (bm, bn)
+    scale_dtype = scale_inv.dtype
+    W_bf16 = _fp8_dequant_blockwise(W, scale_inv)
+
+    def _requant(merged_W):
+        W_fp8, new_scale = _fp8_requant_blockwise(merged_W, block_shape, scale_dtype)
+        return W_fp8, torch.float8_e4m3fn, [(scale_key, new_scale, scale_dtype)]
+
+    return W_bf16, _requant
+
+
+# Ordered list of save-side handlers. First non-None return wins.
+_MOE_QUANT_HANDLERS = [_fp8_save_handler]
+
+
+def apply_moe_quant_load(file, header_metadata, key):
+    """Public entry point used by saving_utils._merge_moe_experts_file.
+
+    Returns one of:
+      - `(W_real, requant_fn_or_None)`
+      - `(_MOE_QUANT_UNSAFE, None)`
+    """
+    for handler in _MOE_QUANT_HANDLERS:
+        result = handler(file, header_metadata, key)
+        if result is not None:
+            return result
+    return file.get_tensor(key), None
+
+
+# ============================================================================
 # Hook FP8 experts dispatch + relax HF Trainer FP8 guard
 # ============================================================================
 #
@@ -1223,7 +936,11 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
 # FP8 experts registry directly so every FP8Experts.forward routes through
 # forward_moe_backend_fp8.
 
-from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
+from .common import (
+    TEMPORARY_PATCHES,
+    UNSLOTH_ENABLE_LOGGING,
+    is_transformers_v5_moe_quantization_available,
+)
 from .utils import logger
 
 
@@ -1249,7 +966,6 @@ def patch_fp8_experts_interface():
     setattr(ALL_FP8_EXPERTS_FUNCTIONS, sentinel, True)
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: routed transformers ALL_FP8_EXPERTS_FUNCTIONS through forward_moe_backend_fp8")
-TEMPORARY_PATCHES.append(patch_fp8_experts_interface)
 
 
 def patch_fp8_validate_quantization_for_training():
@@ -1291,4 +1007,12 @@ def patch_fp8_validate_quantization_for_training():
     _trainer_mod.validate_quantization_for_training = _patched
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: relaxed HF validate_quantization_for_training for FP8+LoRA")
-TEMPORARY_PATCHES.append(patch_fp8_validate_quantization_for_training)
+
+
+def _register_transformers_v5_moe_fp8_patches():
+    if not is_transformers_v5_moe_quantization_available():
+        return
+    TEMPORARY_PATCHES.append(patch_fp8_experts_interface)
+    TEMPORARY_PATCHES.append(patch_fp8_validate_quantization_for_training)
+pass
+_register_transformers_v5_moe_fp8_patches()

@@ -30,7 +30,12 @@ from typing import Optional, List, Union
 import torch
 import torch.nn as nn
 
-from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
+from .common import (
+    TEMPORARY_PATCHES,
+    UNSLOTH_ENABLE_LOGGING,
+    is_transformers_v5_moe_quantization_available,
+    logger,
+)
 from .utils import patch_function, raise_error
 
 
@@ -106,24 +111,6 @@ def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
     return dequant.to(target_dtype)
 
 
-def _call_with_temporary_moe_weights(experts_module, gate_up_proj, down_proj, forward_fn, *args):
-    """Temporarily swap dequantized weights onto the experts module for one
-    forward call, then restore the originals.
-
-    Mirrors moe_utils_fp8._call_with_temporary_moe_weights so the bnb4bit and
-    fp8 dispatchers stay structurally identical.
-    """
-    original_gate_up = experts_module.gate_up_proj
-    original_down = experts_module.down_proj
-    object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
-    object.__setattr__(experts_module, "down_proj", down_proj)
-    try:
-        return forward_fn(experts_module, *args)
-    finally:
-        object.__setattr__(experts_module, "gate_up_proj", original_gate_up)
-        object.__setattr__(experts_module, "down_proj", original_down)
-
-
 # ============================================================================
 # Forward dispatcher
 # ============================================================================
@@ -153,6 +140,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         forward_native_grouped_mm,
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
+        swap_moe_weights_for_call,
     )
 
     target_dtype = hidden_states.dtype
@@ -176,7 +164,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-native_torch loop.")
         forward_fn = forward_native_moe_loop
 
-    return _call_with_temporary_moe_weights(
+    return swap_moe_weights_for_call(
         self,
         gate_up_weight,
         down_weight,
@@ -237,9 +225,6 @@ def replace_expert_params_with_bnb_params(
                 quant_storage=quantization_config.bnb_4bit_quant_storage,
             )
 
-        if pre_quantized:
-            placeholder_gate_up.data = placeholder_gate_up.data.to(dtype=quantization_config.bnb_4bit_quant_storage)
-            placeholder_down.data = placeholder_down.data.to(dtype=quantization_config.bnb_4bit_quant_storage)
         module.gate_up_proj = placeholder_gate_up
         module.down_proj = placeholder_down
         has_been_replaced = True
@@ -308,7 +293,6 @@ def patch_bnb4bit_quantize_convert():
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: Patched Bnb4bitQuantize.convert for MoE expert parameter support")
 pass
-TEMPORARY_PATCHES.append(patch_bnb4bit_quantize_convert)
 
 
 def patch_bnb4bit_quantizer_param_needs_quantization():
@@ -320,10 +304,12 @@ def patch_bnb4bit_quantizer_param_needs_quantization():
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_bnb_4bit.Bnb4BitHfQuantizer", e)
 
-    if hasattr(Bnb4BitHfQuantizer.param_needs_quantization, "_unsloth_moe_patched"):
+    original_param_needs_quantization = getattr(Bnb4BitHfQuantizer, "param_needs_quantization", None)
+    if original_param_needs_quantization is None:
         return
 
-    original_param_needs_quantization = Bnb4BitHfQuantizer.param_needs_quantization
+    if getattr(original_param_needs_quantization, "_unsloth_moe_patched", False):
+        return
 
     def patched_param_needs_quantization(self, model: "PreTrainedModel", param_name: str, **kwargs) -> bool:
         if original_param_needs_quantization(self, model, param_name, **kwargs):
@@ -347,7 +333,6 @@ def patch_bnb4bit_quantizer_param_needs_quantization():
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: Patched Bnb4BitHfQuantizer.param_needs_quantization for MoE expert parameters")
 pass
-TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_param_needs_quantization)
 
 
 def patch_bnb4bit_quantizer_process_model():
@@ -375,7 +360,6 @@ def patch_bnb4bit_quantizer_process_model():
     patched_process_model_before_weight_loading._unsloth_moe_patched = True
     patch_function(Bnb4BitHfQuantizer, "_process_model_before_weight_loading", patched_process_model_before_weight_loading, match_level = "relaxed")
 pass
-TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_process_model)
 
 
 def patch_transformers_weight_converter_kwargs():
@@ -412,4 +396,223 @@ def patch_transformers_weight_converter_kwargs():
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: Patched transformers WeightConverter.__init__ to ignore unknown kwargs (peft 0.19 forward-compat)")
 pass
-TEMPORARY_PATCHES.append(patch_transformers_weight_converter_kwargs)
+
+
+# ============================================================================
+# PEFT LoRA support for stacked-MoE bnb 4-bit experts.
+# These hooks teach peft.tuners.lora.layer.ParamWrapper how to expose the
+# logical 3-D shape of a Params4bit (so LoRA picks the right (E, out, in)
+# layout) and how to merge / unmerge through a dequant -> add -> requant
+# cycle (so merge_and_unload() works against packed 4-bit storage).
+# They live here rather than in misc.py because they are functionally
+# partners to replace_expert_params_with_bnb_params + patch_bnb4bit_*.
+# ============================================================================
+
+class _ParamShapeProxy:
+    """
+    Wrapper class so that attributes for 4bit MoE params are exposed correctly for compatibility with PEFT LoRA, everything else delegates.
+    """
+
+    def __init__(self, param, shape):
+        self._param = param
+        self._shape = shape
+        self._ndim = len(shape)
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def ndim(self) -> int:
+        return self._ndim
+
+    @property
+    def dtype(self):
+        # Surface the pre-quant compute dtype so PEFT's `tensor.to(param.dtype)`
+        # casts don't truncate bf16 LoRA deltas to the uint8 packed storage dtype.
+        quant_state = getattr(self._param, "quant_state", None)
+        qs_dtype = getattr(quant_state, "dtype", None) if quant_state is not None else None
+        if qs_dtype is not None and (qs_dtype.is_floating_point or qs_dtype.is_complex):
+            return qs_dtype
+        return self._param.dtype
+
+    def __getattr__(self, name):
+        return getattr(self._param, name)
+
+
+def patch_peft_param_wrapper_4bit_expert_shape():
+    """
+    ParamWrapper.get_param() derives shape from param.shape, which is incorrect for Params4bit parameters.
+    Patch ParamWrapper.get_param() to return a proxy that exposes .shape = _original_shape for 4bit MoE params.
+    """
+    try:
+        from peft.tuners.lora.layer import ParamWrapper
+        from peft.utils.integrations import get_bnb_param_type
+    except (ImportError, AttributeError):
+        return
+
+    if getattr(ParamWrapper.get_param, "_unsloth_4bit_expert_patched", False):
+        return
+
+    _original_get_param = ParamWrapper.get_param
+
+    def _patched_get_param(self):
+        param = _original_get_param(self)
+        if get_bnb_param_type(param) == "4bit":
+            shape = getattr(param, "_original_shape", None)
+            if shape is not None and len(shape) == 3:
+                # Don't touch in_features/out_features: PEFT 0.19's update_layer
+                # swaps them for 3D params and calls get_param() again afterwards.
+                self.num_experts = shape[0]
+                return _ParamShapeProxy(param, shape)
+            raise ValueError(
+                "unsloth: ParamWrapper.get_param() encountered a 4-bit Params4bit "
+                f"without a 3D _original_shape attribute (param shape={tuple(param.shape)}). "
+                "This usually means the MoE quantizer patch did not run during model load, "
+                "or this parameter is not a stacked MoE expert and should not be in "
+                "LoraConfig.target_parameters."
+            )
+        return param
+
+    _patched_get_param._unsloth_4bit_expert_patched = True
+    patch_function(ParamWrapper, "get_param", _patched_get_param)
+pass
+
+
+def patch_peft_param_wrapper_merge_4bit():
+    """
+    PEFT's ParamWrapper.merge does in-place `param.data += delta_weight`, which
+    fails for a Params4bit MoE expert because `param.data` is the packed
+    (N_packed, 1) uint8 storage and `delta_weight` is the logical 3D tensor.
+    Override merge/unmerge with a dequantize -> add -> re-quantize cycle when
+    the wrapped param is a Params4bit with a 3D _original_shape.
+    """
+    try:
+        from peft.tuners.lora.layer import ParamWrapper, check_adapters_to_merge
+    except (ImportError, AttributeError):
+        return
+    try:
+        import bitsandbytes as bnb
+        from bitsandbytes.nn import Params4bit
+    except ImportError:
+        return
+
+    if getattr(ParamWrapper.merge, "_unsloth_4bit_moe_patched", False):
+        return
+
+    _original_merge = ParamWrapper.merge
+    _original_unmerge = ParamWrapper.unmerge
+
+    def _is_4bit_moe_param(param):
+        return isinstance(param, Params4bit) and getattr(param, "_original_shape", None) is not None
+
+    def _dequant_param_for_merge(param, parameter_name):
+        """Dequantize a Params4bit MoE expert to its logical 3D shape at the
+        compute dtype. Raises if `quant_state` hasn't been populated yet.
+        Shared helper between merge and unmerge."""
+        quant_state = getattr(param, "quant_state", None)
+        if quant_state is None:
+            raise RuntimeError(
+                "unsloth: ParamWrapper saw a Params4bit MoE expert with "
+                f"quant_state=None on {parameter_name}. The MoE quantizer "
+                "patch likely did not finish before merge_and_unload()."
+            )
+        compute_dtype = getattr(quant_state, "dtype", None) or torch.bfloat16
+        dequant = _dequantize_bnb4bit_expert_weights(param, compute_dtype)
+        return dequant, compute_dtype
+
+    def _requantize_like(reference, new_data, original_shape):
+        kwargs = dict(
+            requires_grad=False,
+            blocksize=getattr(reference, "blocksize", 64),
+            compress_statistics=getattr(reference, "compress_statistics", True),
+            quant_type=getattr(reference, "quant_type", "nf4"),
+            quant_storage=getattr(reference, "quant_storage", torch.uint8),
+        )
+        device = reference.device
+        if device.type == "meta":
+            device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+        new_param = Params4bit(new_data.detach().to("cpu").contiguous(), **kwargs).to(device)
+        new_param._original_shape = torch.Size(original_shape)
+        return new_param
+
+    def _patched_merge(self, safe_merge=False, adapter_names=None):
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            return
+
+        base_layer = self.get_base_layer()
+        param = getattr(base_layer, self.parameter_name)
+
+        if not _is_4bit_moe_param(param):
+            return _original_merge(self, safe_merge=safe_merge, adapter_names=adapter_names)
+
+        for active_adapter in adapter_names:
+            if active_adapter not in self.lora_A.keys():
+                continue
+            param = getattr(base_layer, self.parameter_name)
+            original_shape = torch.Size(getattr(param, "_original_shape"))
+            dequant, compute_dtype = _dequant_param_for_merge(param, self.parameter_name)
+            delta_weight = self.get_delta_weight(active_adapter).to(
+                device=dequant.device, dtype=compute_dtype
+            )
+            if delta_weight.shape != dequant.shape:
+                raise RuntimeError(
+                    f"unsloth: delta_weight shape {tuple(delta_weight.shape)} does not "
+                    f"match dequantized expert shape {tuple(dequant.shape)} for "
+                    f"{self.parameter_name}/adapter={active_adapter}."
+                )
+            merged = dequant + delta_weight
+
+            if safe_merge and not torch.isfinite(merged).all():
+                raise ValueError(
+                    f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
+                )
+
+            new_param = _requantize_like(param, merged, original_shape)
+            setattr(base_layer, self.parameter_name, new_param)
+            self.merged_adapters.append(active_adapter)
+
+    def _patched_unmerge(self):
+        if not self.merged:
+            import warnings
+            warnings.warn("Already unmerged. Nothing to do.")
+            return
+
+        base_layer = self.get_base_layer()
+        param = getattr(base_layer, self.parameter_name)
+        if not _is_4bit_moe_param(param):
+            return _original_unmerge(self)
+
+        while len(self.merged_adapters) > 0:
+            active_adapter = self.merged_adapters.pop()
+            if active_adapter not in self.lora_A.keys():
+                continue
+            param = getattr(base_layer, self.parameter_name)
+            original_shape = torch.Size(getattr(param, "_original_shape"))
+            dequant, compute_dtype = _dequant_param_for_merge(param, self.parameter_name)
+            delta_weight = self.get_delta_weight(active_adapter).to(
+                device=dequant.device, dtype=compute_dtype
+            )
+            unmerged = dequant - delta_weight
+            new_param = _requantize_like(param, unmerged, original_shape)
+            setattr(base_layer, self.parameter_name, new_param)
+
+    _patched_merge._unsloth_4bit_moe_patched = True
+    _patched_unmerge._unsloth_4bit_moe_patched = True
+    patch_function(ParamWrapper, "merge", _patched_merge, match_level="relaxed")
+    patch_function(ParamWrapper, "unmerge", _patched_unmerge, match_level="relaxed")
+pass
+
+
+def _register_transformers_v5_moe_bnb4bit_patches():
+    if not is_transformers_v5_moe_quantization_available():
+        return
+    TEMPORARY_PATCHES.append(patch_bnb4bit_quantize_convert)
+    TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_param_needs_quantization)
+    TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_process_model)
+    TEMPORARY_PATCHES.append(patch_transformers_weight_converter_kwargs)
+    TEMPORARY_PATCHES.append(patch_peft_param_wrapper_4bit_expert_shape)
+    TEMPORARY_PATCHES.append(patch_peft_param_wrapper_merge_4bit)
+pass
+_register_transformers_v5_moe_bnb4bit_patches()

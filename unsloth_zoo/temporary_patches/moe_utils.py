@@ -278,6 +278,23 @@ def select_moe_backend():
     return "native_torch"
 
 
+def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_fn, *args):
+    """Temporarily install dequantized weights on the experts module for one
+    forward call, then restore the originals. Uses object.__setattr__ to bypass
+    nn.Module's Parameter (de)registration, which would re-register hooks and
+    is unnecessary for read-only temporary tensors. Used by both the FP8 and
+    bnb4bit MoE dispatchers."""
+    original_gate_up = experts_module.gate_up_proj
+    original_down = experts_module.down_proj
+    object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
+    object.__setattr__(experts_module, "down_proj", down_proj)
+    try:
+        return forward_fn(experts_module, *args)
+    finally:
+        object.__setattr__(experts_module, "gate_up_proj", original_gate_up)
+        object.__setattr__(experts_module, "down_proj", original_down)
+
+
 def forward_moe_backend(
     self,
     hidden_states: torch.Tensor,

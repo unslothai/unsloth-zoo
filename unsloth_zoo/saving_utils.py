@@ -1007,97 +1007,72 @@ def _resolve_num_experts_from_lora_stats(lora_stats, fallback):
     return fallback
 
 
-# FP8 e4m3 max representable magnitude — matches transformers' Fp8Quantize.convert
-# (finegrained_fp8.py:838-859) and compressed-tensors' fp8 encode path.
-_FP8_E4M3_MAX = 448.0
-
-
-def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
-    """Block-wise dequant of float8_e4m3fn weight via per-block weight_scale_inv.
-
-    Inverse of compressed-tensors / DeepSeek-style FP8 quantization:
-        W_real = decode_fp8(W) * scale_inv_broadcast(block_size)
-    where scale_inv has shape (rows/bm, cols/bn) and each scalar tiles its
-    bm x bn block of the dequantized weight.
-
-    Mirrors transformers.integrations.finegrained_fp8.Fp8Dequantize (lines
-    874-912) and unsloth_zoo.temporary_patches.moe_utils_fp8._dequantize_full_expert_weights_unsloth.
-    """
-    rows, cols = W_fp8.shape
-    srows, scols = scale_inv.shape
-    bm, bn = rows // srows, cols // scols
-    W_bf16 = W_fp8.to(scale_inv.dtype)
-    return (
-        W_bf16.reshape(srows, bm, scols, bn)
-        * scale_inv.unsqueeze(-1).unsqueeze(1)
-    ).reshape(rows, cols)
-
-
-def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: torch.dtype):
-    """Block-wise FP8 e4m3 re-quantization. Returns (W_fp8, new_scale_inv).
-
-    Per (bm, bn) block: scale_inv = max_abs / 448, W_fp8 = clamp(W / scale_inv, ±448).
-    Mirrors transformers Fp8Quantize.convert (finegrained_fp8.py:838-859).
-    Zero-blocks get clamped to scale_inv = 1e-12 (avoids div-by-zero; the
-    encoded fp8 is 0 either way, so on reload `0 * 1e-12 == 0` round-trips
-    cleanly).
-    """
-    rows, cols = W.shape
-    bm, bn = block_shape
-    srows, scols = rows // bm, cols // bn
-    # Compute in fp32 for numerical stability of the division
-    W_blocks = W.to(torch.float32).reshape(srows, bm, scols, bn)
-    block_max = W_blocks.abs().amax(dim=(1, 3))
-    scale_inv = (block_max / _FP8_E4M3_MAX).clamp_min(1e-12)
-    W_scaled = (
-        W_blocks / scale_inv.unsqueeze(-1).unsqueeze(1)
-    ).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    W_fp8 = W_scaled.reshape(rows, cols).to(torch.float8_e4m3fn)
-    return W_fp8, scale_inv.to(scale_dtype)
-
-
-_FP8_MERGE_UNSAFE = object()  # sentinel: FP8 base detected but cannot safely apply LoRA delta
-
-
-def _fp8_load_for_merge(file, header_metadata, weight_key):
-    """If `weight_key` points to an fp8 expert weight with a companion
-    `weight_scale_inv` (DeepSeek-style) or `weight_scale` (compressed-tensors
-    style), return (W_bf16, scale_meta) where scale_meta carries the info
-    needed to re-quantize on the way out. For non-fp8 weights return
-    (W_as_read, None). For fp8 weights where the companion scale cannot be
-    located or matched, return (_FP8_MERGE_UNSAFE, None) — the caller MUST
-    skip the LoRA merge for this key rather than cast fp8 → fp32 directly
-    (that drops the per-block scale and the merged checkpoint is corrupt).
-
-    scale_meta is a dict: {scale_key, scale_dtype, block_shape}
-    """
-    W = file.get_tensor(weight_key)
-    if W.dtype != torch.float8_e4m3fn:
-        return W, None
-    # DeepSeek-style scale_inv is preferred; compressed-tensors' weight_scale
-    # carries the same per-block magnitude.
-    base = weight_key[: -len(".weight")] if weight_key.endswith(".weight") else weight_key
-    candidate_keys = (
-        base + ".weight_scale_inv",
-        base + ".weight_scale",
+# MoE-quant save-side dispatch. Each quant kind (FP8 today, room for bnb4bit
+# later) registers a handler in `unsloth_zoo.temporary_patches.moe_utils_fp8.
+# _MOE_QUANT_HANDLERS`; we consult that list via `apply_moe_quant_load`
+# instead of inlining quant-specific dequant/requant math here.
+try:
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
+        apply_moe_quant_load as _apply_moe_quant_load,
+        _MOE_QUANT_UNSAFE,
     )
-    scale_key = next((k for k in candidate_keys if k in header_metadata), None)
-    if scale_key is None:
-        return _FP8_MERGE_UNSAFE, None
-    scale_inv = file.get_tensor(scale_key)
-    if scale_inv.ndim != 2 or W.ndim != 2:
-        return _FP8_MERGE_UNSAFE, None
-    rows, cols = W.shape
-    srows, scols = scale_inv.shape
-    if rows % srows != 0 or cols % scols != 0:
-        return _FP8_MERGE_UNSAFE, None
-    bm, bn = rows // srows, cols // scols
-    W_bf16 = _fp8_dequant_blockwise(W, scale_inv)
-    return W_bf16, {
-        "scale_key":   scale_key,
-        "scale_dtype": scale_inv.dtype,
-        "block_shape": (bm, bn),
-    }
+except ImportError:
+    _apply_moe_quant_load = None
+    _MOE_QUANT_UNSAFE = object()
+
+
+def _merge_moe_expert_quant_aware(
+    role: str,
+    key: str,
+    file,
+    header_metadata,
+    lora_stats,
+    expert_idx: int,
+    num_experts: int,
+    output_dtype,
+    mm,
+    length_of_header,
+    processed_mxfp4_keys,
+    merge_fn,
+) -> bool:
+    """Read one expert weight (dequantising any quant kind via the registry),
+    apply `merge_fn`, requantise (if the handler returned a requant closure),
+    write data + any companion scale tensors back to `mm`. Returns True on a
+    successful merge+write, False on skip (key missing or sentinel)."""
+    if key not in header_metadata:
+        return False
+
+    if _apply_moe_quant_load is None:
+        W = file.get_tensor(key)
+        requant_fn = None
+    else:
+        loaded = _apply_moe_quant_load(file, header_metadata, key)
+        if loaded[0] is _MOE_QUANT_UNSAFE:
+            _record_moe_merge_fallback(
+                role, expert_idx,
+                f"{role} base at {key} has no usable quant companion scale; "
+                "skipping LoRA merge to avoid scale-loss corruption",
+                lora_stats, None,
+            )
+            return False
+        W, requant_fn = loaded
+
+    merged = merge_fn(W, lora_stats, expert_idx, num_experts, output_dtype or W.dtype)
+
+    if requant_fn is None:
+        write_dtype = W.dtype
+    else:
+        merged, write_dtype, extra_writes = requant_fn(merged)
+        for extra_key, extra_tensor, extra_dtype in extra_writes:
+            _write_tensor_direct_torch(
+                mm, header_metadata, length_of_header,
+                extra_key, extra_tensor, extra_dtype,
+            )
+            processed_mxfp4_keys.add(extra_key)
+
+    _write_tensor_direct_torch(mm, header_metadata, length_of_header, key, merged, write_dtype)
+    processed_mxfp4_keys.add(key)
+    return True
 
 
 def _peft_paramwrapper_swaps_in_out():
@@ -1549,97 +1524,26 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
             if is_gate:
                 gate_key = f"{prefix}.{expert_idx}.gate_proj.weight"
                 up_key   = f"{prefix}.{expert_idx}.up_proj.weight"
-
-                # Check for gate_proj
-                if gate_key in header_metadata:
-                    # For fp8 base, dequantize via weight_scale_inv before merge
-                    # so the LoRA delta is added in bf16-real-weight space, not
-                    # the raw fp8-decoded space (which is off by 1/scale_inv).
-                    gate_W, gate_fp8_meta = _fp8_load_for_merge(file, header_metadata, gate_key)
-                    if gate_W is _FP8_MERGE_UNSAFE:
-                        _record_moe_merge_fallback(
-                            "gate", expert_idx,
-                            f"fp8 base at {gate_key} has no usable weight_scale_inv/weight_scale companion; skipping LoRA merge to avoid scale-loss corruption",
-                            lora_stats, None,
-                        )
-                        continue
-                    merged_gate = _merge_moe_gate_expert(
-                        gate_W, lora_stats, expert_idx, num_experts, output_dtype or gate_W.dtype
-                    )
-                    if gate_fp8_meta is not None:
-                        merged_gate, new_scale = _fp8_requant_blockwise(
-                            merged_gate, gate_fp8_meta["block_shape"], gate_fp8_meta["scale_dtype"],
-                        )
-                        _write_tensor_direct_torch(
-                            mm, header_metadata, length_of_header,
-                            gate_fp8_meta["scale_key"], new_scale, gate_fp8_meta["scale_dtype"],
-                        )
-                        processed_mxfp4_keys.add(gate_fp8_meta["scale_key"])
-                        gate_write_dtype = torch.float8_e4m3fn
-                    else:
-                        gate_write_dtype = gate_W.dtype
-                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, gate_key, merged_gate, gate_write_dtype)
-                    processed_mxfp4_keys.add(gate_key)
+                if _merge_moe_expert_quant_aware(
+                    "gate", gate_key, file, header_metadata, lora_stats,
+                    expert_idx, num_experts, output_dtype, mm, length_of_header,
+                    processed_mxfp4_keys, _merge_moe_gate_expert,
+                ):
                     module_updated = True
-
-                # Check for up_proj
-                if up_key in header_metadata:
-                    up_W, up_fp8_meta = _fp8_load_for_merge(file, header_metadata, up_key)
-                    if up_W is _FP8_MERGE_UNSAFE:
-                        _record_moe_merge_fallback(
-                            "up", expert_idx,
-                            f"fp8 base at {up_key} has no usable weight_scale_inv/weight_scale companion; skipping LoRA merge to avoid scale-loss corruption",
-                            lora_stats, None,
-                        )
-                        continue
-                    merged_up = _merge_moe_up_expert(
-                        up_W, lora_stats, expert_idx, num_experts, output_dtype or up_W.dtype
-                    )
-                    if up_fp8_meta is not None:
-                        merged_up, new_scale = _fp8_requant_blockwise(
-                            merged_up, up_fp8_meta["block_shape"], up_fp8_meta["scale_dtype"],
-                        )
-                        _write_tensor_direct_torch(
-                            mm, header_metadata, length_of_header,
-                            up_fp8_meta["scale_key"], new_scale, up_fp8_meta["scale_dtype"],
-                        )
-                        processed_mxfp4_keys.add(up_fp8_meta["scale_key"])
-                        up_write_dtype = torch.float8_e4m3fn
-                    else:
-                        up_write_dtype = up_W.dtype
-                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, up_key, merged_up, up_write_dtype)
-                    processed_mxfp4_keys.add(up_key)
+                if _merge_moe_expert_quant_aware(
+                    "up", up_key, file, header_metadata, lora_stats,
+                    expert_idx, num_experts, output_dtype, mm, length_of_header,
+                    processed_mxfp4_keys, _merge_moe_up_expert,
+                ):
                     module_updated = True
             else:
                 down_key = f"{prefix}.{expert_idx}.down_proj.weight"
-                if down_key not in header_metadata:
-                    continue
-                down_W, down_fp8_meta = _fp8_load_for_merge(file, header_metadata, down_key)
-                if down_W is _FP8_MERGE_UNSAFE:
-                    _record_moe_merge_fallback(
-                        "down", expert_idx,
-                        f"fp8 base at {down_key} has no usable weight_scale_inv/weight_scale companion; skipping LoRA merge to avoid scale-loss corruption",
-                        lora_stats, None,
-                    )
-                    continue
-                merged_down = _merge_moe_down_proj_expert(
-                    down_W, lora_stats, expert_idx, num_experts, output_dtype or down_W.dtype
-                )
-                if down_fp8_meta is not None:
-                    merged_down, new_scale = _fp8_requant_blockwise(
-                        merged_down, down_fp8_meta["block_shape"], down_fp8_meta["scale_dtype"],
-                    )
-                    _write_tensor_direct_torch(
-                        mm, header_metadata, length_of_header,
-                        down_fp8_meta["scale_key"], new_scale, down_fp8_meta["scale_dtype"],
-                    )
-                    processed_mxfp4_keys.add(down_fp8_meta["scale_key"])
-                    down_write_dtype = torch.float8_e4m3fn
-                else:
-                    down_write_dtype = down_W.dtype
-                _write_tensor_direct_torch(mm, header_metadata, length_of_header, down_key, merged_down, down_write_dtype)
-                processed_mxfp4_keys.add(down_key)
-                module_updated = True
+                if _merge_moe_expert_quant_aware(
+                    "down", down_key, file, header_metadata, lora_stats,
+                    expert_idx, num_experts, output_dtype, mm, length_of_header,
+                    processed_mxfp4_keys, _merge_moe_down_proj_expert,
+                ):
+                    module_updated = True
         if module_updated and not already_counted:
             count += 1
             counted_lora_modules.add(lora_key)
