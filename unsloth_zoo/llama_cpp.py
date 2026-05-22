@@ -802,75 +802,65 @@ def install_llama_cpp(
             build_errors.append(f"Windows cmake build failed: {str(e)}")
 
     else:
-        # Linux/macOS: Try make first, then cmake
+        # Linux/macOS: Use cmake to build (build using make is already removed from llama.cpp)
         try:
-            if print_output: print("Trying to build with make...")
-            try_execute("make clean", cwd = llama_cpp_folder, **kwargs)
-            try_execute(f"make all -j{cpu_count}", cwd = llama_cpp_folder, **kwargs)
+            # Clean up any partial build
+            try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
+
+            # Build cmake configure command with library detection
+            cmake_configure = (
+                f"cmake . -B build "
+                f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
+            )
+
+            # Detect OpenMP library path (fixes GOMP linker errors)
+            gomp_path = _find_lib_path('libgomp.so')
+            if gomp_path:
+                cmake_configure += (
+                    f" -DOpenMP_C_LIB_NAMES=gomp"
+                    f" -DOpenMP_CXX_LIB_NAMES=gomp"
+                    f" -DOpenMP_gomp_LIBRARY={gomp_path}"
+                )
+
+            # Detect OpenSSL library paths
+            ssl_path = _find_lib_path('libssl.so')
+            crypto_path = _find_lib_path('libcrypto.so')
+            if ssl_path and crypto_path:
+                cmake_configure += (
+                    f" -DOPENSSL_ROOT_DIR=/usr"
+                    f" -DOPENSSL_SSL_LIBRARY={ssl_path}"
+                    f" -DOPENSSL_CRYPTO_LIBRARY={crypto_path}"
+                )
+
+            # LLAMA_CURL is deprecated upstream (ggml-org/llama.cpp#18791),
+            # so we pass ignore_deprecation=True to handle any deprecation warnings.
+            try_execute(
+                cmake_configure,
+                cwd = llama_cpp_folder,
+                ignore_deprecation = True,
+                **kwargs
+            )
+            try_execute(
+                f"cmake --build build --config Release "\
+                f"-j{cpu_count} --clean-first --target "\
+                f"{' '.join(llama_cpp_targets)}",
+                cwd = llama_cpp_folder,
+                **kwargs
+            )
+            # Move compiled objects to main folder.
+            # Remove only the target binaries first to avoid
+            # "same file" errors when symlinks point into build/bin/.
+            try_execute(
+                "rm -f " + " ".join(llama_cpp_targets) + " && cp build/bin/llama-* .",
+                cwd = llama_cpp_folder,
+                **kwargs
+            )
             build_success = True
-            print("Successfully built with make")
+            # Remove build folder
+            try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
+            if print_output: print("Successfully built with cmake")
         except Exception as e:
-            build_errors.append(f"Make failed: {str(e)}")
-            if print_output: print(f"Make failed, trying cmake...")
-            # Use cmake instead
-            try:
-                # Clean up any partial build
-                try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
-
-                # Build cmake configure command with library detection
-                cmake_configure = (
-                    f"cmake . -B build "
-                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
-                )
-
-                # Detect OpenMP library path (fixes GOMP linker errors)
-                gomp_path = _find_lib_path('libgomp.so')
-                if gomp_path:
-                    cmake_configure += (
-                        f" -DOpenMP_C_LIB_NAMES=gomp"
-                        f" -DOpenMP_CXX_LIB_NAMES=gomp"
-                        f" -DOpenMP_gomp_LIBRARY={gomp_path}"
-                    )
-
-                # Detect OpenSSL library paths
-                ssl_path = _find_lib_path('libssl.so')
-                crypto_path = _find_lib_path('libcrypto.so')
-                if ssl_path and crypto_path:
-                    cmake_configure += (
-                        f" -DOPENSSL_ROOT_DIR=/usr"
-                        f" -DOPENSSL_SSL_LIBRARY={ssl_path}"
-                        f" -DOPENSSL_CRYPTO_LIBRARY={crypto_path}"
-                    )
-
-                # LLAMA_CURL is deprecated upstream (ggml-org/llama.cpp#18791),
-                # so we pass ignore_deprecation=True to handle any deprecation warnings.
-                try_execute(
-                    cmake_configure,
-                    cwd = llama_cpp_folder,
-                    ignore_deprecation = True,
-                    **kwargs
-                )
-                try_execute(
-                    f"cmake --build build --config Release "\
-                    f"-j{cpu_count} --clean-first --target "\
-                    f"{' '.join(llama_cpp_targets)}",
-                    cwd = llama_cpp_folder,
-                    **kwargs
-                )
-                # Move compiled objects to main folder.
-                # Remove only the target binaries first to avoid
-                # "same file" errors when symlinks point into build/bin/.
-                try_execute(
-                    "rm -f " + " ".join(llama_cpp_targets) + " && cp build/bin/llama-* .",
-                    cwd = llama_cpp_folder,
-                    **kwargs
-                )
-                build_success = True
-                # Remove build folder
-                try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
-                if print_output: print("Successfully built with cmake")
-            except Exception as e:
-                build_errors.append(f"CMake failed: {str(e)}")
+            build_errors.append(f"CMake failed: {str(e)}")
 
     if not build_success:
         error_msg = "=== Unsloth: FAILED building llama.cpp ===\n"
