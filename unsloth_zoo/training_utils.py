@@ -33,7 +33,6 @@ from .gradient_checkpointing import (
 import os
 import re
 import sys
-import types
 import functools
 
 __all__ = [
@@ -141,7 +140,7 @@ def _call_forward_with_bf16_autocast(forward, model, args, kwargs, compute_dtype
         return forward(*args, **kwargs)
 
 
-def _reconstruct_bf16_autocast_model(base_cls, compute_dtype):
+def _reconstruct_bf16_autocast_model(base_cls, compute_dtype, instance_mode=False):
     """Pickle / deepcopy reconstructor. Rebuilds (or fetches) the autocast
     subclass from the IMPORTABLE base class, then returns a blank instance for
     `__setstate__` to populate. Because reconstruction is driven by the base
@@ -149,45 +148,73 @@ def _reconstruct_bf16_autocast_model(base_cls, compute_dtype):
     runtime-generated subclass symbol, unpickling works in a FRESH interpreter
     where `_make_bf16_autocast_subclass` has not been called yet (e.g. loading
     a `torch.save(model)` checkpoint in another process / session)."""
-    cls = _make_bf16_autocast_subclass(base_cls, compute_dtype)
+    cls = _make_bf16_autocast_subclass(base_cls, compute_dtype, instance_mode)
     return cls.__new__(cls)
 
 
 def _bf16_autocast_reduce(self):
     """`__reduce__` for generated autocast subclasses. Serialize via the base
     class + the standard nn.Module state so no dynamically-generated class
-    symbol needs to be resolvable at unpickle time."""
+    symbol (and no instance-bound local function) needs to be resolvable at
+    unpickle time."""
     cls = type(self)
     base_cls = cls.__dict__.get("_unsloth_autocast_base", cls.__mro__[1])
     compute_dtype = cls.__dict__.get("_unsloth_autocast_dtype", torch.bfloat16)
+    instance_mode = cls.__dict__.get("_unsloth_autocast_instance_mode", False)
     getstate = getattr(self, "__getstate__", None)
     state = getstate() if getstate is not None else self.__dict__
-    return (_reconstruct_bf16_autocast_model, (base_cls, compute_dtype), state)
+    return (_reconstruct_bf16_autocast_model,
+            (base_cls, compute_dtype, instance_mode), state)
 
 
-def _make_bf16_autocast_subclass(cls, compute_dtype):
+def _bf16_autocast_instance_forward(self, *args, **kwargs):
+    """Class-level forward for the `instance_mode` subclass: wraps the model's
+    ORIGINAL instance-level forward (saved on `self._unsloth_autocast_orig_forward`)
+    in autocast. Defined at module scope (not a closure) and read from `self`,
+    so it pickles by import path and rebinds correctly on deepcopy."""
+    orig = self.__dict__["_unsloth_autocast_orig_forward"]
+    compute_dtype = type(self).__dict__.get(
+        "_unsloth_autocast_dtype", torch.bfloat16)
+    return _call_forward_with_bf16_autocast(orig, self, args, kwargs, compute_dtype)
+
+
+def _make_bf16_autocast_subclass(cls, compute_dtype, instance_forward=False):
     """Build (or fetch from cache) a subclass of `cls` whose `forward` is
     wrapped in `torch.amp.autocast(compute_dtype)`.
+
+    Two modes:
+      - default: wrap the base class's `forward`.
+      - `instance_forward=True`: wrap a per-instance original forward stored on
+        `self._unsloth_autocast_orig_forward` (used when the model carried an
+        instance-level `forward`, e.g. Unsloth runtime forward patching).
 
     Picklability: the subclass defines `__reduce__` (`_bf16_autocast_reduce`)
     so model instances serialize via their importable BASE class and are
     reconstructed by `_reconstruct_bf16_autocast_model` -- this is what makes
-    `torch.save(model)` checkpoints loadable in a fresh process. The subclass
-    is also registered as a module-level symbol so that pickling the class
-    object itself (and same-process `copy`/pickle) resolves by name.
+    `torch.save(model)` checkpoints loadable in a fresh process. `forward` is a
+    CLASS attribute (never instance state), so no instance-bound local function
+    is ever serialized. The subclass is also registered as a module-level symbol
+    so that pickling the class object itself resolves by name.
     """
-    cached = _BF16_AUTOCAST_SUBCLASSES.get((cls, compute_dtype))
+    cached = _BF16_AUTOCAST_SUBCLASSES.get((cls, compute_dtype, instance_forward))
     if cached is not None:
         return cached
 
-    _orig_forward = cls.forward
+    if instance_forward:
+        # Generic signature here -- the per-instance original forward is not
+        # available at class-creation time (the class is cached/shared), so
+        # `remove_unused_columns` falls back to keeping all columns for this
+        # (rare) path. Correctness/picklability take priority.
+        _wrapped = _bf16_autocast_instance_forward
+    else:
+        _orig_forward = cls.forward
 
-    @functools.wraps(_orig_forward)
-    def _wrapped(self, *args, **kwargs):
-        return _call_forward_with_bf16_autocast(
-            lambda *a, **k: _orig_forward(self, *a, **k),
-            self, args, kwargs, compute_dtype,
-        )
+        @functools.wraps(_orig_forward)
+        def _wrapped(self, *args, **kwargs):
+            return _call_forward_with_bf16_autocast(
+                lambda *a, **k: _orig_forward(self, *a, **k),
+                self, args, kwargs, compute_dtype,
+            )
 
     # `pickle_name` is unique (for the module-level registration / same-process
     # class pickling); the subclass keeps the ORIGINAL `__name__` so HF
@@ -204,11 +231,12 @@ def _make_bf16_autocast_subclass(cls, compute_dtype):
         "__reduce__": _bf16_autocast_reduce,
         "_unsloth_autocast_base": cls,
         "_unsloth_autocast_dtype": compute_dtype,
+        "_unsloth_autocast_instance_mode": instance_forward,
     })
     new_cls.__name__ = cls.__name__
     new_cls.__qualname__ = pickle_name
     setattr(module, pickle_name, new_cls)
-    _BF16_AUTOCAST_SUBCLASSES[(cls, compute_dtype)] = new_cls
+    _BF16_AUTOCAST_SUBCLASSES[(cls, compute_dtype, instance_forward)] = new_cls
     return new_cls
 
 
@@ -250,22 +278,18 @@ def _wrap_forward_in_bf16_autocast(model, compute_dtype):
     if instance_forward is not None:
         # An instance-level `forward` (e.g. Unsloth runtime forward patching)
         # shadows any class-method override -- `self.forward` resolves the
-        # instance attribute first -- so mutating `__class__` would NOT
-        # intercept it. Wrap the instance attribute directly.
-        #
-        # Bind as a `types.MethodType` so the wrapper receives `self` and reads
-        # the original forward from `self.__dict__` instead of closing over the
-        # original `model`. `copy.deepcopy` rebinds a bound method's `__self__`
-        # to the copy, so the copy's wrapped forward executes against the copy's
-        # parameters (EMA / model averaging / checkpoint paths).
-        @functools.wraps(instance_forward)
-        def _wrapped_instance_forward(self, *args, **kwargs):
-            orig = self.__dict__["_unsloth_autocast_orig_forward"]
-            return _call_forward_with_bf16_autocast(
-                orig, self, args, kwargs, compute_dtype,
-            )
+        # instance attribute first -- so mutating `__class__` alone would NOT
+        # intercept it. Move the original forward to
+        # `_unsloth_autocast_orig_forward`, drop the instance attribute, and
+        # route through the SAME generated-subclass machinery (instance_mode).
+        # This keeps `forward` a CLASS attribute (never serialized as instance
+        # state), so the model stays picklable / deepcopy-safe via `__reduce__`
+        # -- a `types.MethodType` bound to a local function in `__dict__` would
+        # not survive `torch.load` in a fresh interpreter.
         model._unsloth_autocast_orig_forward = instance_forward
-        model.forward = types.MethodType(_wrapped_instance_forward, model)
+        del model.__dict__["forward"]
+        model.__class__ = _make_bf16_autocast_subclass(
+            type(model), compute_dtype, instance_forward=True)
     else:
         model.__class__ = _make_bf16_autocast_subclass(type(model), compute_dtype)
     model._unsloth_bf16_autocast_wrapped = True
@@ -278,42 +302,15 @@ def _unwrap_forward_in_bf16_autocast(model):
     would leave a stale bf16 autocast forcing bf16 compute on fp32 weights."""
     if not getattr(model, "_unsloth_bf16_autocast_wrapped", False):
         return model
+    base_cls = getattr(type(model), "_unsloth_autocast_base", None)
     orig_forward = model.__dict__.pop("_unsloth_autocast_orig_forward", None)
+    if base_cls is not None:
+        model.__class__ = base_cls
     if orig_forward is not None:
+        # restore the original instance-level forward
         model.forward = orig_forward
-    else:
-        base_cls = getattr(type(model), "_unsloth_autocast_base", None)
-        if base_cls is not None:
-            model.__class__ = base_cls
     model._unsloth_bf16_autocast_wrapped = False
     return model
-
-
-def _canonical_module_name(name):
-    """Convert a `named_parameters` key into an attribute path to the owning
-    module (e.g. `model.layers.0.input_layernorm.weight` ->
-    `model.layers[0].input_layernorm`). Only a TRAILING `.weight` / `.bias`
-    parameter suffix is stripped (end-anchored) -- a plain `.replace(...)` would
-    corrupt module names that merely contain `.weight`/`.bias` as a substring
-    (e.g. `...self_attn.bias_proj.weight` or `...weight_scale.weight`)."""
-    module_name = name.replace("base_model", "model", 1)
-    while re.search(r"\.(\d+)\.", module_name) is not None:
-        module_name = re.sub(r"\.(\d+)\.", r"[\1].", module_name)
-    for suffix in (".weight", ".bias"):
-        if module_name.endswith(suffix):
-            return module_name[: -len(suffix)]
-    return module_name
-
-
-def _cast_named_module(model, name, dtype):
-    """Cast the module that owns parameter `name` to `dtype` in place. Shared by
-    the main full-FT cast path and the legacy UNSLOTH_UPCAST_LAYERNORM path so
-    both honour the same module resolution."""
-    module_name = _canonical_module_name(name)
-    try:
-        exec(f"{module_name}.to({str(dtype)})")
-    except Exception:
-        exec(f"model.{module_name}.to({str(dtype)})")
 
 
 @torch.no_grad
@@ -433,24 +430,30 @@ def prepare_model_for_training(
         else:
             param.requires_grad_(False)
 
-        # Upcast to float32 if needed. Skip params owned by a module that
-        # already has `_pre_set_compute_dtype` set (the external compute-dtype
-        # policy will have already cast them) so we don't silently downcast
-        # their fp32 storage back to the compute dtype here.
+        # Cast the parameter storage in place. `param.data = param.data.to(dtype)`
+        # is exactly what `nn.Module._apply` does for a dtype cast: it preserves
+        # the Parameter object identity (so tied weights stay tied) and updates
+        # the storage without the fragile param-name -> module-attribute-path
+        # resolution the old `exec(...)` caster needed. Skip params owned by a
+        # module that already has `_pre_set_compute_dtype` set (the external
+        # compute-dtype policy will have already cast them) so we don't silently
+        # downcast their fp32 storage back to the compute dtype here.
         if requires_grad and id(param) not in _externally_managed_param_ids:
             dtype = torch.float32 if upcast else mixed_precision_dtype
-            _cast_named_module(model, original_name, dtype)
+            if param.dtype != dtype:
+                param.data = param.data.to(dtype)
         pass
 
-        # Legacy UNSLOTH_UPCAST_LAYERNORM path. Now uses the SAME union matcher
-        # and honours the external-policy deferral guard, so it can no longer
+        # Legacy UNSLOTH_UPCAST_LAYERNORM path. Uses the SAME union matcher and
+        # honours the external-policy deferral guard, so it can no longer
         # (a) miss norm1/norm2/class-detected norms or (b) clobber an externally
         # managed norm. Fp32 norms it creates are still handled by the wrapper
         # because installation is gated on the presence of fp32 norms below.
         if (_is_norm
                 and id(param) not in _externally_managed_param_ids
                 and os.environ.get("UNSLOTH_UPCAST_LAYERNORM", "0") == "1"):
-            _cast_named_module(model, original_name, torch.float32)
+            if param.dtype != torch.float32:
+                param.data = param.data.to(torch.float32)
     pass
 
     # Install the bf16 autocast wrapper iff fp32 norm weights ACTUALLY exist

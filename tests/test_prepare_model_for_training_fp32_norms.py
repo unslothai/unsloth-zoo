@@ -689,26 +689,10 @@ def test_legacy_upcast_layernorm_defers_to_external_policy():
     assert m.managed_norm.weight.dtype == torch.float32
 
 
-def test_canonical_module_name_strips_only_trailing_suffix():
-    """#A: only a TRAILING .weight/.bias must be stripped; names that merely
-    contain those as substrings (bias_proj, weight_scale, bias_layernorm) must
-    keep their module path intact."""
-    from unsloth_zoo.training_utils import _canonical_module_name
-    assert _canonical_module_name("model.layers.0.input_layernorm.weight") == \
-        "model.layers[0].input_layernorm"
-    assert _canonical_module_name("model.layers.0.self_attn.bias_proj.weight") == \
-        "model.layers[0].self_attn.bias_proj"
-    assert _canonical_module_name("model.decoder.bias_layernorm.weight") == \
-        "model.decoder.bias_layernorm"
-    assert _canonical_module_name("model.x.weight_scale.weight") == \
-        "model.x.weight_scale"
-    assert _canonical_module_name("model.norm.bias") == "model.norm"
-
-
 def test_full_ft_handles_bias_substring_module_names():
-    """#A: a module named with a `.bias`/`.weight` substring must not crash
-    prepare_model_for_training (the canonicalizer used to resolve a bogus
-    attribute path)."""
+    """A module named with a `.bias`/`.weight` substring must not crash
+    prepare_model_for_training. The caster now sets `param.data` directly, so
+    there is no param-name -> module-path resolution to corrupt."""
     from unsloth_zoo.training_utils import prepare_model_for_training
 
     class _M(nn.Module):
@@ -773,3 +757,52 @@ def test_instance_forward_wrapper_rebinds_on_deepcopy():
     y2 = m2(x)  # copy weights = 2.0 -- must NOT see the original's 1.0
     assert torch.allclose(y1.float(), torch.full_like(y1, 1.0, dtype=torch.float32))
     assert torch.allclose(y2.float(), torch.full_like(y2, 2.0, dtype=torch.float32))
+
+
+def test_instance_forward_wrapper_is_picklable():
+    """#C: a model wrapped via the instance-forward path must stay picklable.
+    The wrapper must NOT store an instance-bound local function in __dict__
+    (that cannot be resolved by import path on torch.load); forward must be a
+    class attribute reconstructed via __reduce__."""
+    import io
+    from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+    from _pickle_base import PickleBaseNet
+
+    m = PickleBaseNet()
+    m.forward = m._impl  # instance-level forward (bound method, importable base)
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+    assert getattr(m, "_unsloth_bf16_autocast_wrapped", False)
+    assert "forward" not in m.__dict__  # routed through the subclass, not __dict__
+
+    buf = io.BytesIO()
+    torch.save(m, buf)  # would raise (local function) without the subclass route
+    buf.seek(0)
+    m2 = torch.load(buf, weights_only=False)
+    out = m2(torch.zeros(2, 8, dtype=torch.bfloat16))
+    assert out.shape == (2, 8)
+
+
+def test_instance_forward_wrapper_unpickles_in_fresh_interpreter(tmp_path):
+    """#C cross-process: instance-forward-wrapped model loads in a fresh
+    interpreter that never ran the wrapper."""
+    import os, subprocess, sys
+    from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+    from _pickle_base import PickleBaseNet
+
+    m = PickleBaseNet()
+    m.forward = m._impl
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+    blob = tmp_path / "m.pt"
+    torch.save(m, str(blob))
+
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    script = (
+        "import sys; sys.path.insert(0, %r);"
+        "import unsloth, torch;"
+        "m = torch.load(%r, weights_only=False);"
+        "out = m(torch.zeros(2, 8, dtype=torch.bfloat16));"
+        "assert tuple(out.shape) == (2, 8);"
+        "print('FRESH_OK')"
+    ) % (tests_dir, str(blob))
+    r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert "FRESH_OK" in r.stdout, (r.stdout + "\n" + r.stderr)[-2000:]
