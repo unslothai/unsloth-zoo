@@ -371,33 +371,32 @@ def test_wrapper_is_picklable():
     assert out.shape == (2, 8)
 
 
-def test_wrapper_unpickles_in_fresh_interpreter():
-    """Regression for the cross-process checkpoint handoff: a torch.save(model)
-    pickle must be loadable in a FRESH interpreter that never called
-    `_wrap_forward_in_bf16_autocast` (so the runtime-registered subclass symbol
-    does not exist there). We simulate that by pickling, then deleting the
-    registered symbol AND clearing the subclass cache before unpickling --
-    `__reduce__` must reconstruct the subclass from the importable base class."""
-    import pickle
-    import unsloth_zoo.training_utils as tu
+def test_wrapper_unpickles_in_fresh_interpreter(tmp_path):
+    """Cross-process checkpoint handoff: a torch.save(model) pickle must be
+    loadable in a genuinely FRESH interpreter that never called
+    `_wrap_forward_in_bf16_autocast`. Reconstruction is driven by `__reduce__`
+    via the importable base class, not by the runtime-registered symbol."""
+    import os, subprocess, sys
     from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+    from _pickle_base import PickleBaseNet
 
-    m = _TinyForSig()
+    m = PickleBaseNet()
     _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
-    gen_name = type(m).__name__
-    blob = pickle.dumps(m)
+    blob = tmp_path / "m.pt"
+    torch.save(m, str(blob))
 
-    # Simulate a fresh process: drop the runtime registration + cache so the
-    # generated symbol is NOT resolvable by name.
-    if hasattr(tu, gen_name):
-        delattr(tu, gen_name)
-    tu._BF16_AUTOCAST_SUBCLASSES.clear()
-
-    m2 = pickle.loads(blob)
-    assert type(m2).__name__ == gen_name
-    assert type(m2).__name__.endswith("WithUnslothBf16Autocast")
-    out = m2(torch.zeros(2, 8, dtype=torch.bfloat16))
-    assert out.shape == (2, 8)
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    script = (
+        "import sys; sys.path.insert(0, %r);"
+        "import unsloth, torch;"
+        "m = torch.load(%r, weights_only=False);"
+        "assert type(m).__qualname__.endswith('WithUnslothBf16Autocast'), type(m).__qualname__;"
+        "out = m(torch.zeros(2, 8, dtype=torch.bfloat16));"
+        "assert tuple(out.shape) == (2, 8);"
+        "print('FRESH_OK')"
+    ) % (tests_dir, str(blob))
+    r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert "FRESH_OK" in r.stdout, (r.stdout + "\n" + r.stderr)[-2000:]
 
 
 def test_wrapper_subclass_is_cached_across_instances():
@@ -494,3 +493,197 @@ def test_matcher_catches_norm_by_module_class_when_name_unmatched():
     assert m.audio_tower.norm_out.weight.dtype == torch.float32
     # non-norm linear stays bf16
     assert m.audio_tower.proj.weight.dtype == torch.bfloat16
+
+
+# ---------------- reviewer-driven regression tests ----------------
+
+
+def test_wrapper_intercepts_instance_level_forward():
+    """#2: an instance-level `forward` (e.g. Unsloth runtime forward patching)
+    shadows class-method overrides. The wrapper must wrap the instance
+    attribute, otherwise fp32 norm output meets a bf16 linear with no autocast
+    and crashes."""
+    from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = nn.LayerNorm(8).to(torch.float32)
+            self.lin = nn.Linear(8, 8).to(torch.bfloat16)
+            self.config = _Cfg(dtype=torch.bfloat16)
+
+        def _impl(self, x):
+            return self.lin(self.norm(x.float()))
+
+        def forward(self, x):
+            return self._impl(x)
+
+    m = _M()
+    m.forward = m._impl  # instance-level forward shadows the class method
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+    # Must not raise a dtype mismatch: autocast downcasts fp32 norm out to bf16.
+    out = m(torch.randn(2, 8))
+    assert out.dtype == torch.bfloat16
+
+
+def test_wrapper_not_installed_when_no_fp32_norm():
+    """#7: do not class-mutate / wrap a bf16 full-FT model that has no fp32
+    norm (e.g. train_layernorms=False)."""
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    m = _Tiny(dtype=torch.bfloat16)
+    prepare_model_for_training(
+        m, use_gradient_checkpointing=False, use_reentrant=False,
+        full_finetuning=True, train_layernorms=False,
+        float32_mixed_precision=False,
+    )
+    assert not getattr(m, "_unsloth_bf16_autocast_wrapped", False)
+    assert not type(m).__qualname__.endswith("WithUnslothBf16Autocast")
+
+
+def test_wrapper_installed_for_external_fp32_norm_even_when_upcast_disabled():
+    """#5: when an external `_pre_set_compute_dtype` policy leaves a norm in
+    fp32 but UNSLOTH_DISABLE_FLOAT32_UPCAST=1 suppresses our own upcast, the
+    wrapper must STILL be installed so the fp32 norm does not crash a bf16
+    linear without autocast."""
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    class _RMSNorm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(8))
+
+        def forward(self, x):
+            return self.weight * x
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = _RMSNorm()
+            self.proj = nn.Linear(8, 8, bias=False)
+            self.embed_tokens = nn.Embedding(16, 8)
+            self.to(torch.bfloat16)
+            self.norm.to(torch.float32)
+            self.norm._pre_set_compute_dtype = torch.float32
+            self.config = _Cfg(dtype=torch.bfloat16)
+
+        def get_input_embeddings(self):
+            return self.embed_tokens
+
+        def forward(self, x):
+            return self.proj(self.norm(x))
+
+    os.environ["UNSLOTH_DISABLE_FLOAT32_UPCAST"] = "1"
+    m = _M()
+    prepare_model_for_training(
+        m, use_gradient_checkpointing=False, use_reentrant=False,
+        full_finetuning=True, train_layernorms=True,
+        float32_mixed_precision=False,
+    )
+    assert m.norm.weight.dtype == torch.float32  # external policy preserved
+    assert getattr(m, "_unsloth_bf16_autocast_wrapped", False)
+    assert m(torch.ones(2, 8, dtype=torch.bfloat16)).dtype == torch.bfloat16
+
+
+def test_wrapper_preserves_save_pretrained_architecture(tmp_path):
+    """#8/#9: save_pretrained must record the BASE architecture, not the
+    generated wrapper class name."""
+    import json
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    cfg = LlamaConfig(vocab_size=32, hidden_size=8, intermediate_size=16,
+                      num_hidden_layers=1, num_attention_heads=2,
+                      num_key_value_heads=2, torch_dtype=torch.bfloat16)
+    model = LlamaForCausalLM(cfg).to(torch.bfloat16)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing=False, use_reentrant=False,
+        full_finetuning=True, train_layernorms=True,
+        float32_mixed_precision=False,
+    )
+    assert getattr(model, "_unsloth_bf16_autocast_wrapped", False)
+    model.save_pretrained(str(tmp_path))
+    arch = json.loads((tmp_path / "config.json").read_text())["architectures"]
+    assert arch == ["LlamaForCausalLM"], arch
+
+
+def test_wrapper_can_be_removed_on_reprepare(tmp_path):
+    """#10: preparing the same object bf16 then fp32 must drop the bf16 wrapper
+    so fp32 compute is not silently downcast to bf16."""
+    from unsloth_zoo.training_utils import (
+        _wrap_forward_in_bf16_autocast, _unwrap_forward_in_bf16_autocast)
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(8, 8)
+            self.config = _Cfg(dtype=torch.bfloat16)
+
+        def forward(self, x):
+            return self.lin(x)
+
+    m = _M()
+    _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
+    assert getattr(m, "_unsloth_bf16_autocast_wrapped", False)
+    _unwrap_forward_in_bf16_autocast(m)
+    assert not getattr(m, "_unsloth_bf16_autocast_wrapped", False)
+    assert not type(m).__qualname__.endswith("WithUnslothBf16Autocast")
+
+
+def test_wrapper_device_detection_in_nested_container():
+    """#11: a CPU dict/list batch must not be mis-detected as cuda; the wrapper
+    should find the tensor device (and not crash enabling cuda autocast on CPU
+    inputs)."""
+    from unsloth_zoo.training_utils import _find_tensor_device_type
+
+    x = torch.zeros(2, 8)
+    assert _find_tensor_device_type({"input_ids": x}) == "cpu"
+    assert _find_tensor_device_type([{"a": [x]}]) == "cpu"
+    assert _find_tensor_device_type({"no": "tensors"}) is None
+
+
+def test_legacy_upcast_layernorm_defers_to_external_policy():
+    """#1/#3/#4: the legacy UNSLOTH_UPCAST_LAYERNORM path must honour the
+    external `_pre_set_compute_dtype` deferral and the broadened matcher."""
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    class _RMSNorm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(8))
+
+        def forward(self, x):
+            return self.weight * x
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = nn.LayerNorm(8)   # name-matched
+            self.norm1 = nn.LayerNorm(8)             # union-matched (norm1.)
+            self.managed_norm = _RMSNorm()           # externally managed
+            self.proj = nn.Linear(8, 8)
+            self.embed_tokens = nn.Embedding(16, 8)
+            self.to(torch.bfloat16)
+            self.managed_norm.to(torch.float32)
+            self.managed_norm._pre_set_compute_dtype = torch.float32
+            self.config = _Cfg(dtype=torch.bfloat16)
+
+        def get_input_embeddings(self):
+            return self.embed_tokens
+
+        def forward(self, x):
+            return self.proj(x)
+
+    os.environ["UNSLOTH_UPCAST_LAYERNORM"] = "1"
+    os.environ["UNSLOTH_DISABLE_FLOAT32_UPCAST"] = "1"  # only legacy path upcasts
+    m = _M()
+    prepare_model_for_training(
+        m, use_gradient_checkpointing=False, use_reentrant=False,
+        full_finetuning=True, train_layernorms=True,
+        float32_mixed_precision=False,
+    )
+    # legacy path upcasts both name- and union-matched norms
+    assert m.input_layernorm.weight.dtype == torch.float32
+    assert m.norm1.weight.dtype == torch.float32
+    # externally managed norm preserved (fp32, untouched)
+    assert m.managed_norm.weight.dtype == torch.float32
