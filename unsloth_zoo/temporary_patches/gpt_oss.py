@@ -2155,7 +2155,31 @@ def patch_GptOssModel():
                         return arg
                 return f(*args, **kwargs)
             else:
-                # Eager
+                # Eager inference path. The config may still have
+                # _attn_implementation="flex_attention" (set for training), in
+                # which case the underlying mask factory returns a BlockMask.
+                # Unsloth uses eager attention for inference (flex with KV
+                # cache returns gibberish, see forward_function above), and
+                # the eager forward cannot index a BlockMask, raising
+                #   TypeError: unsupported operand type(s) for +=:
+                #       'Tensor' and 'BlockMask'
+                # Temporarily swap to eager so the factory returns a dense
+                # 4D float mask (0 / -inf) the eager path can consume.
+                config = kwargs.get("config", None)
+                if config is None:
+                    for arg in args:
+                        if hasattr(arg, "_attn_implementation"):
+                            config = arg
+                            break
+                if config is not None and getattr(
+                    config, "_attn_implementation", None
+                ) == "flex_attention":
+                    original_impl = config._attn_implementation
+                    config._attn_implementation = "eager"
+                    try:
+                        return f(*args, **kwargs)
+                    finally:
+                        config._attn_implementation = original_impl
                 return f(*args, **kwargs)
             pass
         return return_attention_mask
@@ -2185,6 +2209,29 @@ def patch_GptOssModel():
         transformers.generation.utils.create_masks_for_generate = wrap(transformers.generation.utils.create_masks_for_generate)
         transformers.masking_utils.__patched_causal_mask__ = True
     pass
+
+    # transformers 4.x uses `input_embeds` and accepts `cache_position`;
+    # transformers 5.x renamed to `inputs_embeds` and dropped `cache_position`.
+    # Inspect the mask factory signatures once and pass only the kwargs they
+    # actually accept so this patch works on both 4.x and 5.x.
+    import inspect as _inspect
+    _ccm_params = set(_inspect.signature(create_causal_mask).parameters)
+    _cswc_params = set(_inspect.signature(create_sliding_window_causal_mask).parameters)
+    _mask_params = _ccm_params | _cswc_params
+
+    def _build_mask_kwargs(config, inputs_embeds, attention_mask, cache_position, past_key_values):
+        mk = {
+            "config": config,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+        }
+        if "inputs_embeds" in _mask_params:
+            mk["inputs_embeds"] = inputs_embeds
+        if "input_embeds" in _mask_params:
+            mk["input_embeds"] = inputs_embeds
+        if "cache_position" in _mask_params:
+            mk["cache_position"] = cache_position
+        return mk
 
     from ..flex_attention import (
         is_flex_attention_decoding,
@@ -2378,17 +2425,33 @@ def patch_GptOssModel():
 
         # It may already have been prepared by e.g. `generate`
         if not self.training and not isinstance(attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-            }
-            attention_mask = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
+            # Inference uses eager attention. If the config still has
+            # _attn_implementation="flex_attention" (set for training), the
+            # mask factory returns a BlockMask which eager cannot consume.
+            # Temporarily swap to "eager" so a dense 4D float mask is built.
+            _orig_attn_impl = getattr(self.config, "_attn_implementation", None)
+            _swap_attn_impl = _orig_attn_impl == "flex_attention"
+            if _swap_attn_impl:
+                self.config._attn_implementation = "eager"
+            try:
+                mask_kwargs = _build_mask_kwargs(
+                    config=self.config,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    past_key_values=past_key_values,
+                )
+                attention_mask = {
+                    "full_attention": create_causal_mask(**{
+                        k: v for k, v in mask_kwargs.items() if k in _ccm_params
+                    }),
+                    "sliding_attention": create_sliding_window_causal_mask(**{
+                        k: v for k, v in mask_kwargs.items() if k in _cswc_params
+                    }),
+                }
+            finally:
+                if _swap_attn_impl:
+                    self.config._attn_implementation = _orig_attn_impl
 
         # is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         bsz, qlen, hd = hidden_states.shape
