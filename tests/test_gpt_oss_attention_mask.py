@@ -14,70 +14,32 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU-only regression tests for gpt-oss inference attention-mask patches.
+"""Runtime regression check for the gpt-oss BlockMask leak (PR #690).
 
-Covers two recent fixes:
+The behavioural sibling tests (static AST guards over wrap and the
+patched GptOssModel.forward, plus the PR #691 _align_kv_to_mask static
+check, plus the inspect-driven mask-kwargs filter check) live in
+tests/test_zoo_history_regressions.py so they auto-run under the
+consolidated Tests CI workflow.
 
-  PR 690 (BlockMask reaching the eager inference path). When
-    config._attn_implementation == "flex_attention" but Unsloth runs
-    inference through eager attention, the wrap over create_causal_mask
-    MUST NOT return a BlockMask. Without the fix the eager forward
-    crashes with:
-        TypeError: unsupported operand type(s) for +=:
-            'Tensor' and 'BlockMask'
+This file is the *runtime* invariant: actually call the wrapped
+transformers.masking_utils.create_causal_mask with a tiny GptOssConfig
+that has _attn_implementation="flex_attention" and assert the return is
+not a BlockMask. The check runs in a clean subprocess so torch.compile
+can be replaced with identity BEFORE any unsloth_zoo import -- the wrap
+captures _torch_compile = functools.partial(torch.compile, ...) at
+module load time and on CPU torch the compiled wrapper drops kwarg
+names, which would otherwise mask the real BlockMask invariant with a
+misleading "missing positional argument" error.
 
-  PR 691 (eager KV length must match attention-mask kv length). The
-    eager_attention_forward closures MUST trim KV (or the mask) to the
-    shorter length, otherwise pre-allocated cache slots crash with:
-        RuntimeError: The size of tensor a (N) must match the size of
-            tensor b (M) at non-singleton dimension 3
-
-Each fix has a runtime invariant check plus an AST / source check, so
-either a behavioural regression or a silent deletion of the guard
-fails CI. tests/conftest.py already preloads device_type, stubs
-torch.cuda.mem_get_info / get_device_capability, and sets
-UNSLOTH_ALLOW_CPU=1 -- no extra GPU spoofing is needed here.
+CPU-only; no GPU required. The repo's existing tests/conftest.py GPU-free
+harness (device_type preload, mem_get_info / get_device_capability
+stubs, UNSLOTH_ALLOW_CPU=1) handles the inner subprocess via env
+inheritance.
 """
 from __future__ import annotations
 
-import ast
-import inspect
-import os
-
-# Trigger the gpt_oss model gate before unsloth_zoo's temporary patches install.
-os.environ.setdefault("UNSLOTH_MODEL_NAME", "unsloth/gpt-oss-test")
-os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "0")
-
-# torch.compile around the wrap-around-create_causal_mask trick drops keyword
-# names on some torch CPU builds, which would mask the real BlockMask check.
-# Replace torch.compile with identity BEFORE unsloth_zoo imports so the wrap
-# can forward (*args, **kwargs) cleanly.
-import torch
-
-
-def _identity_compile(model=None, *args, **kwargs):
-    if model is None:
-        return lambda fn: fn
-    return model
-
-
-torch.compile = _identity_compile  # noqa: E305
-
-import pytest
-
-
-# ---------------------------------------------------------------------------
-# PR 690: BlockMask must not reach the eager inference path
-# ---------------------------------------------------------------------------
-
 _RUNTIME_SUBPROCESS = r"""
-# Run the runtime invariant in a clean subprocess so we can replace
-# torch.compile with identity BEFORE any unsloth_zoo import. The wrap
-# over create_causal_mask captures _torch_compile = functools.partial(
-# torch.compile, ...) at module load time, which on CPU torch drops
-# kwarg names and makes the underlying call fail with a misleading
-# "missing positional arg" instead of the real BlockMask invariant
-# we want to check.
 import os, sys, traceback
 os.environ['UNSLOTH_ALLOW_CPU'] = '1'
 os.environ['UNSLOTH_MODEL_NAME'] = 'unsloth/gpt-oss-test'
@@ -145,11 +107,14 @@ except Exception:
 """
 
 
-def test_pr690_runtime_flex_attention_inference_does_not_return_blockmask(tmp_path):
-    """With config._attn_implementation == 'flex_attention' and an inference
-    (no grad) inputs_embeds, the patched create_causal_mask must return a
-    tensor (or None), never a BlockMask. Without the fix this returns a
-    BlockMask and downstream eager attention crashes with TypeError."""
+def test_pr690_runtime_blockmask_does_not_reach_eager_inference_path():
+    """Runtime invariant: with _attn_implementation='flex_attention' and
+    a non-grad inputs_embeds, the patched create_causal_mask must return
+    a tensor (or None), never a BlockMask. Without PR #690 this returns
+    a BlockMask and gpt-oss generate() crashes with
+        TypeError: unsupported operand type(s) for +=:
+            'Tensor' and 'BlockMask'
+    """
     import subprocess
     import sys as _sys
 
@@ -163,81 +128,4 @@ def test_pr690_runtime_flex_attention_inference_does_not_return_blockmask(tmp_pa
     )
     assert "RUNTIME_OK" in proc.stdout, (
         f"missing RUNTIME_OK token in stdout: {proc.stdout}"
-    )
-
-
-def test_pr690_static_flex_attention_guard_present_in_wrap():
-    """AST-level guard: the wrap() returned by patch_GptOssModel must
-    branch on _attn_implementation == 'flex_attention' on its inference
-    side, even if it doesn't run in this environment."""
-    from unsloth_zoo.temporary_patches import gpt_oss as _M
-    src = inspect.getsource(_M.patch_GptOssModel)
-    tree = ast.parse(src)
-
-    # Find the inner wrap(f) -> return_attention_mask function.
-    wrap_fn = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "wrap":
-            for inner in ast.walk(node):
-                if (
-                    isinstance(inner, ast.FunctionDef)
-                    and inner.name == "return_attention_mask"
-                ):
-                    wrap_fn = inner
-                    break
-        if wrap_fn is not None:
-            break
-
-    assert wrap_fn is not None, "wrap.return_attention_mask not found"
-
-    body_src = ast.unparse(wrap_fn)
-    assert '"flex_attention"' in body_src or "'flex_attention'" in body_src, (
-        "wrap(f) for create_causal_mask must check for "
-        "_attn_implementation == 'flex_attention' to avoid leaking a "
-        "BlockMask to the eager inference path"
-    )
-    assert "_attn_implementation" in body_src, (
-        "wrap(f) must read config._attn_implementation"
-    )
-
-
-def test_pr690_static_flex_attention_guard_present_in_model_forward():
-    """AST-level guard: the patched GptOssModel.forward must also swap
-    flex_attention -> eager around its own create_causal_mask call."""
-    from unsloth_zoo.temporary_patches import gpt_oss as _M
-    src = inspect.getsource(_M.patch_GptOssModel)
-    assert (
-        '"flex_attention"' in src or "'flex_attention'" in src
-    ) and "_attn_implementation" in src, (
-        "patch_GptOssModel must guard mask creation against "
-        "_attn_implementation == 'flex_attention' during inference"
-    )
-
-
-# ---------------------------------------------------------------------------
-# PR 691: eager attention must align KV length to the mask
-# ---------------------------------------------------------------------------
-
-def test_pr691_static_align_kv_helper_present_and_called():
-    """Static check that _align_kv_to_mask exists in patch_GptOssAttention
-    and is invoked by both eager attention forwards. Catches accidental
-    deletion of the trim-to-shortest-length normalisation."""
-    from unsloth_zoo.temporary_patches import gpt_oss as _M
-    src = inspect.getsource(_M.patch_GptOssAttention)
-
-    assert "_align_kv_to_mask" in src, (
-        "patch_GptOssAttention must define _align_kv_to_mask "
-        "(PR 691) so eager attention can survive KV-vs-mask "
-        "length mismatches from pre-allocated caches"
-    )
-
-    # Should be invoked from BOTH eager forward variants so the inplace
-    # and non-inplace paths agree.
-    callsite_count = src.count("_align_kv_to_mask(")
-    # Definition is "def _align_kv_to_mask(" -- exclude that.
-    invocation_count = callsite_count - src.count("def _align_kv_to_mask(")
-    assert invocation_count >= 2, (
-        f"_align_kv_to_mask must be called from both eager attention "
-        f"forwards (inplace + non-inplace); found {invocation_count} "
-        f"invocations"
     )
