@@ -2681,10 +2681,10 @@ def _infer_mlx_lora_rank(module):
     lora_b = getattr(module, "lora_b", None)
     lora_a_shape = tuple(getattr(lora_a, "shape", ()) or ())
     lora_b_shape = tuple(getattr(lora_b, "shape", ()) or ())
-    # MoE/switch: lora_a (..., rank, in_dims); lora_b (..., rank, out_dims).
+    # MoE/switch: lora_a (..., rank, in_dims); lora_b (..., out_dims, rank).
     if len(lora_a_shape) >= 3:
         rank = lora_a_shape[-2]
-        if lora_b_shape and lora_b_shape[-2] != rank:
+        if lora_b_shape and lora_b_shape[-1] != rank:
             return None
         return int(rank)
     # Standard 2D LoRA: lora_a (in_dims, rank), lora_b (rank, out_dims).
