@@ -59,15 +59,6 @@ class _FakeLoRAModule:
         self.dropout = dropout
 
 
-class _FakeLoRAModuleUpper:
-    # PEFT-style adapters expose uppercase tensor names.
-    def __init__(self, lora_A, lora_B, scale=1.0, dropout=None):
-        self.lora_A = _FakeArray(lora_A)
-        self.lora_B = _FakeArray(lora_B)
-        self.scale = scale
-        self.dropout = dropout
-
-
 class _FakeModel:
     def __init__(self, modules):
         self._modules = modules
@@ -218,28 +209,28 @@ def test_enrich_does_not_raise_on_module_with_none_tensors():
     assert cfg["scale"] == 2.0
 
 
-def test_infer_rank_supports_uppercase_lora_pair():
-    # PEFT-style modules expose lora_A / lora_B. _infer_mlx_lora_rank must
-    # still recover the rank when the uppercase pair is the only one present.
+def test_infer_rank_rejects_switch_lora_b_without_expert_prefix():
+    # MoE/Switch lora_a (num_experts, rank, in_dims) paired with bare 2D
+    # lora_b (out_dims, rank) is malformed; the helper must reject it
+    # instead of returning a plausible rank.
     mlx_utils = _load_utils()
-    upper = _FakeLoRAModuleUpper((512, 4), (4, 512))
-    assert mlx_utils._infer_mlx_lora_rank(upper) == 4
+    bad = _FakeLoRAModule((8, 4, 512), (512, 4))
+    assert mlx_utils._infer_mlx_lora_rank(bad) is None
 
 
-def test_enrich_uppercase_lora_module_recorded_with_metadata():
-    # _enrich_mlx_adapter_config should also record uppercase LoRA modules
-    # so a future loader can recreate the matching wrappers.
+def test_enrich_normalizes_string_explicit_path():
+    # A caller-supplied single-string path must be normalized to a list so
+    # the loader does not iterate it character-by-character.
     mlx_utils = _load_utils()
     model = _FakeModel([
-        ("layers.0.q_proj", _FakeLoRAModuleUpper(
-            (512, 4), (4, 512), scale=2.5, dropout=_FakeDropout(0.75),
-        )),
+        ("layers.0.q_proj", _FakeLoRAModule((512, 4), (4, 512), scale=2.0,
+                                            dropout=_FakeDropout(0.8))),
     ])
-    cfg = mlx_utils._enrich_mlx_adapter_config(model, {})
+    cfg = mlx_utils._enrich_mlx_adapter_config(
+        model, {"unsloth_mlx_lora_module_paths": "layers.0.q_proj"},
+    )
     assert cfg["unsloth_mlx_lora_module_paths"] == ["layers.0.q_proj"]
     assert cfg["rank"] == 4
-    assert cfg["scale"] == 2.5
-    assert abs(cfg["dropout"] - 0.25) < 1e-9
 
 
 def test_typeerror_fallback_restores_scale_and_dropout_via_p1():
@@ -272,18 +263,14 @@ def test_typeerror_fallback_handles_shim_dropout_with_p_attr():
 
 
 def _trainer_loop_metadata(model):
+    # Mirror MLXTrainer.save_model()'s metadata extraction so the test
+    # tracks the trainer logic without depending on a real MLX runtime.
     mlx_utils = _load_utils()
-    _lora_attr_pairs = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
     rank, scale, dropout = 8, 1.0, 0.0
     for _, m in model.named_modules():
-        attr_pair = None
-        for a_attr, b_attr in _lora_attr_pairs:
-            if hasattr(m, a_attr) and hasattr(m, b_attr):
-                attr_pair = (a_attr, b_attr)
-                break
-        if attr_pair is None:
+        if not (hasattr(m, "lora_a") and hasattr(m, "lora_b")):
             continue
-        inferred_rank = mlx_utils._infer_mlx_lora_rank(m, *attr_pair)
+        inferred_rank = mlx_utils._infer_mlx_lora_rank(m)
         if inferred_rank is None:
             continue
         rank = inferred_rank
@@ -291,33 +278,6 @@ def _trainer_loop_metadata(model):
         dropout = mlx_utils._get_mlx_dropout_probability(getattr(m, "dropout", None))
         break
     return rank, scale, dropout
-
-
-def test_trainer_metadata_loop_uppercase_only_module():
-    model = _FakeModel([
-        ("layers.0.q_proj", _FakeLoRAModuleUpper(
-            (512, 4), (4, 512), scale=2.5, dropout=_FakeDropout(0.75),
-        )),
-    ])
-    rank, scale, dropout = _trainer_loop_metadata(model)
-    assert rank == 4
-    assert scale == 2.5
-    assert abs(dropout - 0.25) < 1e-9
-
-
-def test_trainer_metadata_loop_lowercase_still_wins_first():
-    model = _FakeModel([
-        ("layers.0.q_proj", _FakeLoRAModule(
-            (512, 4), (4, 512), scale=3.0, dropout=_FakeDropout(0.5),
-        )),
-        ("layers.1.q_proj", _FakeLoRAModuleUpper(
-            (512, 8), (8, 512), scale=1.5, dropout=_FakeDropout(0.9),
-        )),
-    ])
-    rank, scale, dropout = _trainer_loop_metadata(model)
-    assert rank == 4
-    assert scale == 3.0
-    assert abs(dropout - 0.5) < 1e-9
 
 
 def test_trainer_metadata_loop_no_lora_uses_defaults():

@@ -2684,23 +2684,16 @@ def _get_mlx_dropout_probability(drop):
     return 0.0
 
 
-def _infer_mlx_lora_rank(module, a_attr="lora_a", b_attr="lora_b"):
-    # also fall back to PEFT-style uppercase pair (lora_A / lora_B) so a
-    # later collector that selects uppercase modules can still infer rank.
-    lora_a = getattr(module, a_attr, None)
-    if lora_a is None and a_attr == "lora_a":
-        lora_a = getattr(module, "lora_A", None)
+def _infer_mlx_lora_rank(module):
+    # mlx-lm LoRA wrappers always expose lowercase lora_a / lora_b.
+    lora_a = getattr(module, "lora_a", None)
+    lora_b = getattr(module, "lora_b", None)
 
-    # Check if it's a layer (mlx-lm tuner uses nn.Linear wrappers)
+    # mlx-lm sometimes wraps tensors in nn.Linear layers; unwrap to .weight.
     is_layer = False
     if lora_a is not None and not hasattr(lora_a, "shape") and hasattr(lora_a, "weight"):
         lora_a = lora_a.weight
         is_layer = True
-
-    lora_b = getattr(module, b_attr, None)
-    if lora_b is None and b_attr == "lora_b":
-        lora_b = getattr(module, "lora_B", None)
-
     if lora_b is not None and not hasattr(lora_b, "shape") and hasattr(lora_b, "weight"):
         lora_b = lora_b.weight
         is_layer = True
@@ -2714,16 +2707,14 @@ def _infer_mlx_lora_rank(module, a_attr="lora_a", b_attr="lora_b"):
 
     # MoE/switch: lora_a (..., rank, in_dims); lora_b (..., out_dims, rank).
     if len(lora_a_shape) >= 3:
-        if len(lora_b_shape) < 2:
+        # Both halves must share the same expert / batch prefix; a bare 2-D
+        # lora_b means the pair cannot be a valid LoRASwitchLinear.
+        if len(lora_b_shape) != len(lora_a_shape):
             return None
         rank = lora_a_shape[-2]
         if lora_b_shape[-1] != rank:
             return None
-        # Expert/batch prefix must agree so the wrappers co-execute.
-        if (
-            len(lora_b_shape) >= 3
-            and lora_a_shape[:-2] != lora_b_shape[:-2]
-        ):
+        if lora_a_shape[:-2] != lora_b_shape[:-2]:
             return None
         return int(rank)
 
@@ -2804,36 +2795,34 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     # missing scale silently defaults to 1.0 even when training used alpha/r > 1.
     try:
         # distinguish "caller passed nothing" from "caller passed [] / None".
-        explicit_paths = (
-            adapter_config["unsloth_mlx_lora_module_paths"]
-            if "unsloth_mlx_lora_module_paths" in adapter_config
-            else None
+        has_explicit_paths = "unsloth_mlx_lora_module_paths" in adapter_config
+        raw_explicit_paths = (
+            adapter_config.get("unsloth_mlx_lora_module_paths")
+            if has_explicit_paths else None
         )
+        # Normalize bare strings to a single-element list so downstream
+        # loaders do not iterate the string character-by-character.
+        if isinstance(raw_explicit_paths, str):
+            explicit_paths = [raw_explicit_paths]
+        elif isinstance(raw_explicit_paths, (list, tuple)):
+            explicit_paths = [p for p in raw_explicit_paths if isinstance(p, str) and p]
+        else:
+            explicit_paths = None
+        if has_explicit_paths:
+            adapter_config["unsloth_mlx_lora_module_paths"] = explicit_paths or []
         # why: explicit empty list preserves caller topology but must not
         # suppress global LoRA parameter inference; treat empty as "no filter".
-        explicit_path_set = (
-            set(explicit_paths)
-            if isinstance(explicit_paths, (list, tuple)) and len(explicit_paths) > 0
-            else None
-        )
+        explicit_path_set = set(explicit_paths) if explicit_paths else None
 
-        # cover both mlx-lm (lower) and PEFT-style (upper) attribute pairs;
-        # require both halves to avoid recording half-built modules.
-        _lora_attr_pairs = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
         lora_paths = []
         lora_rank = None
         lora_scale = None
         lora_dropout = None
         for name, module in model.named_modules():
-            attr_pair = None
-            for a_attr, b_attr in _lora_attr_pairs:
-                if hasattr(module, a_attr) and hasattr(module, b_attr):
-                    attr_pair = (a_attr, b_attr)
-                    break
-            if attr_pair is None:
+            if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
                 continue
             lora_paths.append(name)
-            inferred_rank = _infer_mlx_lora_rank(module, *attr_pair)
+            inferred_rank = _infer_mlx_lora_rank(module)
             if inferred_rank is None:
                 continue
             # only infer rank/scale/dropout from modules the caller
@@ -2849,7 +2838,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 )
 
         # only auto-fill when caller did not supply the key at all.
-        if lora_paths and "unsloth_mlx_lora_module_paths" not in adapter_config:
+        if lora_paths and not has_explicit_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
 
         if lora_rank is not None:

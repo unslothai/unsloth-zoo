@@ -1395,16 +1395,10 @@ class MLXTrainer:
 
 
             _lora_rank, _lora_scale, _lora_dropout = 8, 1.0, 0.0
-            _lora_attr_pairs = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
             for _, m in self.model.named_modules():
-                attr_pair = None
-                for a_attr, b_attr in _lora_attr_pairs:
-                    if hasattr(m, a_attr) and hasattr(m, b_attr):
-                        attr_pair = (a_attr, b_attr)
-                        break
-                if attr_pair is None:
+                if not (hasattr(m, "lora_a") and hasattr(m, "lora_b")):
                     continue
-                inferred_rank = _infer_mlx_lora_rank(m, *attr_pair)
+                inferred_rank = _infer_mlx_lora_rank(m)
                 if inferred_rank is None:
                     continue
                 _lora_rank = inferred_rank
