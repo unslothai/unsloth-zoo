@@ -2668,11 +2668,21 @@ def _get_mlx_dropout_probability(drop):
     if drop is None:
         return 0.0
     # real MLX nn.Dropout stores keep-prob as _p_1; compat shims may set
-    # both .p (often a stale 0.0 default) and _p_1, so _p_1 must win.
-    if hasattr(drop, "_p_1"):
-        return float(1.0 - float(getattr(drop, "_p_1")))
-    if hasattr(drop, "p"):
-        return float(drop.p)
+    # both .p (stale 0.0 default) and _p_1, so _p_1 wins when usable.
+    # Tolerate _p_1=None / non-numeric and fall back to .p instead of
+    # raising TypeError on float(None).
+    p1 = getattr(drop, "_p_1", None)
+    if p1 is not None:
+        try:
+            return float(1.0 - float(p1))
+        except (TypeError, ValueError):
+            pass
+    p = getattr(drop, "p", None)
+    if p is not None:
+        try:
+            return float(p)
+        except (TypeError, ValueError):
+            pass
     return 0.0
 
 
@@ -2681,20 +2691,28 @@ def _infer_mlx_lora_rank(module):
     lora_b = getattr(module, "lora_b", None)
     lora_a_shape = tuple(lora_a.shape) if lora_a is not None and hasattr(lora_a, "shape") else ()
     lora_b_shape = tuple(lora_b.shape) if lora_b is not None and hasattr(lora_b, "shape") else ()
+    # Require both halves; a half-built LoRA module is not a reliable
+    # rank source, so callers can move on to the next module.
+    if not lora_a_shape or not lora_b_shape:
+        return None
     # MoE/switch: lora_a (..., rank, in_dims); lora_b (..., out_dims, rank).
     if len(lora_a_shape) >= 3:
+        if len(lora_b_shape) < 2:
+            return None
         rank = lora_a_shape[-2]
-        if lora_b_shape and lora_b_shape[-1] != rank:
+        if lora_b_shape[-1] != rank:
+            return None
+        # Expert/batch prefix must agree so the wrappers co-execute.
+        if (
+            len(lora_b_shape) >= 3
+            and lora_a_shape[:-2] != lora_b_shape[:-2]
+        ):
             return None
         return int(rank)
     # Standard 2D LoRA: lora_a (in_dims, rank), lora_b (rank, out_dims).
-    if lora_a_shape and lora_b_shape:
-        if lora_a_shape[-1] == lora_b_shape[0]:
-            return int(lora_a_shape[-1])
+    if lora_a_shape[-1] != lora_b_shape[0]:
         return None
-    if lora_a_shape:
-        return int(lora_a_shape[-1])
-    return None
+    return int(lora_a_shape[-1])
 
 
 def _enrich_mlx_adapter_config(model, adapter_config):

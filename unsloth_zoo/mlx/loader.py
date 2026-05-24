@@ -1123,36 +1123,7 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
             lora_cls = LoRAEmbedding
         else:
             continue
-        try:
-            wrapped = lora_cls.from_base(
-                module, r=rank, scale=scale, dropout=dropout,
-            )
-        except TypeError:
-            try:
-                wrapped = lora_cls.from_base(module, r=rank)
-            except TypeError:
-                wrapped = lora_cls.from_base(module)
-            # why: from_base() without scale/dropout kwargs leaves Python-side
-            # attributes at the wrapper defaults. Neither scale (a float) nor
-            # dropout (an nn.Dropout submodule attribute) is restored by
-            # load_weights(), so patch both to match the saved adapter config.
-            if hasattr(wrapped, "scale"):
-                try:
-                    wrapped.scale = scale
-                except Exception:
-                    pass
-            _drop = getattr(wrapped, "dropout", None)
-            if _drop is not None:
-                if hasattr(_drop, "_p_1"):
-                    try:
-                        _drop._p_1 = float(1.0 - float(dropout))
-                    except Exception:
-                        pass
-                elif hasattr(_drop, "p"):
-                    try:
-                        _drop.p = float(dropout)
-                    except Exception:
-                        pass
+        wrapped = _lora_from_base_compat(lora_cls, module, rank, scale, dropout)
         parent_path, _, leaf = name.rpartition(".")
         parent = by_name.get(parent_path, model) if parent_path else model
         if hasattr(parent, leaf):
@@ -1165,6 +1136,44 @@ def _eval_mlx_model_after_adapter_reload(model):
     except Exception:
         pass
     return model
+
+
+def _apply_lora_metadata_to_wrapper(wrapped, scale, dropout):
+    """Restore scale + dropout on a LoRA wrapper after a no-kwarg from_base()."""
+    if hasattr(wrapped, "scale"):
+        try:
+            wrapped.scale = scale
+        except Exception:
+            pass
+    _drop = getattr(wrapped, "dropout", None)
+    if _drop is not None:
+        if hasattr(_drop, "_p_1"):
+            try:
+                _drop._p_1 = float(1.0 - float(dropout))
+            except Exception:
+                pass
+        elif hasattr(_drop, "p"):
+            try:
+                _drop.p = float(dropout)
+            except Exception:
+                pass
+    return wrapped
+
+
+def _lora_from_base_compat(lora_cls, module, rank, scale, dropout):
+    """Call lora_cls.from_base with progressively older signatures.
+
+    Older mlx-lm releases reject scale/dropout kwargs. Falls back to the
+    minimum-arg form and restores scale/dropout on the wrapper directly.
+    """
+    try:
+        return lora_cls.from_base(module, r=rank, scale=scale, dropout=dropout)
+    except TypeError:
+        try:
+            wrapped = lora_cls.from_base(module, r=rank)
+        except TypeError:
+            wrapped = lora_cls.from_base(module)
+        return _apply_lora_metadata_to_wrapper(wrapped, scale, dropout)
 
 
 def _adapter_actual_quant_config(adapter_cfg, resolved_map):
@@ -2020,11 +2029,12 @@ def _lora_walk_module(
                 if not match_all_linear and not _lora_name_matches_target(name, target_modules):
                     continue
                 if isinstance(child, (nn.Linear, nn.QuantizedLinear)):
-                    lora_layer = LoRALinear.from_base(
+                    lora_layer = _lora_from_base_compat(
+                        LoRALinear,
                         child,
-                        r=lora_config["rank"],
-                        dropout=lora_config.get("dropout", 0.0),
+                        rank=lora_config["rank"],
                         scale=lora_config["scale"],
+                        dropout=lora_config.get("dropout", 0.0),
                     )
                     replacements += 1
                     if name == "":
