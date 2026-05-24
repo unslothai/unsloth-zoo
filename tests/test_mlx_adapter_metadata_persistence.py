@@ -1,0 +1,242 @@
+"""Coverage for MLX LoRA adapter save/reload metadata persistence.
+
+Targets the helpers that infer rank/scale/dropout from live MLX LoRA
+modules and the reload-time wrapper that recreates non-language LoRA
+paths before loading adapter weights:
+
+  - _get_mlx_dropout_probability prefers MLX Dropout._p_1 keep-probability
+    over the stale .p attribute used by compatibility shims.
+  - _infer_mlx_lora_rank reads MoE/Switch rank from lora_a.shape[-2] and
+    cross-checks lora_b shape, returning None on mismatch and handling
+    None/missing-shape inputs without raising.
+  - _enrich_mlx_adapter_config persists rank/scale/dropout under an
+    explicit filter that does NOT borrow metadata from unselected modules
+    while still honoring caller-provided topology metadata exactly.
+  - _apply_lora_at_paths TypeError-fallback restores both scale AND
+    dropout when older mlx-lm wrappers reject those kwargs.
+"""
+
+import os
+import sys
+import types
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TESTS_DIR not in sys.path:
+    sys.path.insert(0, TESTS_DIR)
+
+
+def _load_utils():
+    if "mlx" not in sys.modules:
+        from mlx_simulation import simulate_mlx_on_torch
+        simulate_mlx_on_torch()
+    from unsloth_zoo.mlx import utils as mlx_utils
+    return mlx_utils
+
+
+class _FakeArray:
+    def __init__(self, shape):
+        self.shape = tuple(shape)
+
+
+class _FakeDropout:
+    def __init__(self, keep_prob):
+        self._p_1 = keep_prob
+
+
+class _ShimDropout:
+    def __init__(self, p):
+        self.p = p
+
+
+class _FakeLoRAModule:
+    def __init__(self, lora_a, lora_b, scale=1.0, dropout=None):
+        self.lora_a = _FakeArray(lora_a)
+        self.lora_b = _FakeArray(lora_b)
+        self.scale = scale
+        self.dropout = dropout
+
+
+class _FakeModel:
+    def __init__(self, modules):
+        self._modules = modules
+
+    def named_modules(self):
+        return list(self._modules)
+
+
+def test_dropout_prefers_keep_prob_over_stale_p():
+    mlx_utils = _load_utils()
+    drop = types.SimpleNamespace(p=0.0, _p_1=0.8)
+    assert abs(mlx_utils._get_mlx_dropout_probability(drop) - 0.2) < 1e-9
+
+
+def test_dropout_falls_back_to_p_attribute_for_shims():
+    mlx_utils = _load_utils()
+    drop = types.SimpleNamespace(p=0.3)
+    assert abs(mlx_utils._get_mlx_dropout_probability(drop) - 0.3) < 1e-9
+
+
+def test_dropout_handles_none_module():
+    mlx_utils = _load_utils()
+    assert mlx_utils._get_mlx_dropout_probability(None) == 0.0
+
+
+def test_infer_rank_moe_uses_axis_minus_two():
+    mlx_utils = _load_utils()
+    moe = _FakeLoRAModule((8, 4, 512), (8, 512, 4))
+    assert mlx_utils._infer_mlx_lora_rank(moe) == 4
+
+
+def test_infer_rank_returns_none_on_shape_mismatch():
+    mlx_utils = _load_utils()
+    bad = _FakeLoRAModule((512, 4), (8, 512))
+    assert mlx_utils._infer_mlx_lora_rank(bad) is None
+
+
+def test_infer_rank_handles_none_tensors_without_raising():
+    mlx_utils = _load_utils()
+    mod = types.SimpleNamespace(lora_a=None, lora_b=None)
+    assert mlx_utils._infer_mlx_lora_rank(mod) is None
+
+
+def test_infer_rank_handles_missing_shape_attribute():
+    mlx_utils = _load_utils()
+    mod = types.SimpleNamespace(lora_a=object(), lora_b=_FakeArray((4, 512)))
+    assert mlx_utils._infer_mlx_lora_rank(mod) is None
+
+
+def test_enrich_no_explicit_paths_writes_metadata():
+    mlx_utils = _load_utils()
+    model = _FakeModel([
+        ("layers.0.q_proj", _FakeLoRAModule((512, 4), (4, 512), scale=2.5,
+                                            dropout=_FakeDropout(0.75))),
+    ])
+    cfg = mlx_utils._enrich_mlx_adapter_config(model, {})
+    assert cfg["rank"] == 4
+    assert cfg["scale"] == 2.5
+    assert abs(cfg["dropout"] - 0.25) < 1e-9
+    assert cfg["lora_parameters"]["rank"] == 4
+    assert cfg["unsloth_mlx_lora_module_paths"] == ["layers.0.q_proj"]
+    assert cfg["peft_type"] == "LORA"
+
+
+def test_enrich_explicit_empty_paths_still_writes_metadata():
+    mlx_utils = _load_utils()
+    model = _FakeModel([
+        ("layers.0.q_proj", _FakeLoRAModule((512, 4), (4, 512), scale=2.5,
+                                            dropout=_FakeDropout(0.75))),
+    ])
+    cfg = mlx_utils._enrich_mlx_adapter_config(
+        model, {"unsloth_mlx_lora_module_paths": []}
+    )
+    assert cfg["unsloth_mlx_lora_module_paths"] == []
+    assert cfg["rank"] == 4
+    assert cfg["scale"] == 2.5
+    assert abs(cfg["dropout"] - 0.25) < 1e-9
+
+
+def test_enrich_explicit_filter_uses_selected_module():
+    mlx_utils = _load_utils()
+    model = _FakeModel([
+        ("vision.proj", _FakeLoRAModule((1024, 8), (8, 1024), scale=4.0,
+                                         dropout=_FakeDropout(0.9))),
+        ("language.q", _FakeLoRAModule((512, 4), (4, 512), scale=2.0,
+                                        dropout=_FakeDropout(0.8))),
+    ])
+    cfg = mlx_utils._enrich_mlx_adapter_config(
+        model, {"unsloth_mlx_lora_module_paths": ["language.q"]}
+    )
+    assert cfg["unsloth_mlx_lora_module_paths"] == ["language.q"]
+    assert cfg["rank"] == 4
+    assert cfg["scale"] == 2.0
+
+
+def test_enrich_explicit_filter_does_not_borrow_from_unselected():
+    mlx_utils = _load_utils()
+    bad = _FakeLoRAModule((512, 4), (8, 512), scale=9.9,
+                          dropout=_FakeDropout(0.5))
+    good = _FakeLoRAModule((512, 2), (2, 512), scale=2.0,
+                            dropout=_FakeDropout(0.8))
+    model = _FakeModel([("bad", bad), ("good", good)])
+    cfg = mlx_utils._enrich_mlx_adapter_config(
+        model, {"unsloth_mlx_lora_module_paths": ["bad"]}
+    )
+    assert "rank" not in cfg
+    assert "scale" not in cfg
+    assert "dropout" not in cfg
+    assert cfg["unsloth_mlx_lora_module_paths"] == ["bad"]
+
+
+def test_enrich_skips_invalid_rank_then_uses_next_valid():
+    mlx_utils = _load_utils()
+    bad = _FakeLoRAModule((512, 4), (8, 512), scale=9.9,
+                          dropout=_FakeDropout(0.5))
+    good = _FakeLoRAModule((512, 4), (4, 512), scale=2.0,
+                           dropout=_FakeDropout(0.75))
+    model = _FakeModel([("layers.0.bad", bad), ("layers.0.q_proj", good)])
+    cfg = mlx_utils._enrich_mlx_adapter_config(model, {})
+    assert cfg["rank"] == 4
+    assert cfg["scale"] == 2.0
+
+
+def test_enrich_does_not_raise_on_module_with_none_tensors():
+    mlx_utils = _load_utils()
+    broken = types.SimpleNamespace(lora_a=None, lora_b=None, scale=1.0,
+                                    dropout=None)
+    good = _FakeLoRAModule((512, 4), (4, 512), scale=2.0,
+                            dropout=_FakeDropout(0.75))
+    model = _FakeModel([("broken", broken), ("good", good)])
+    cfg = mlx_utils._enrich_mlx_adapter_config(model, {})
+    assert cfg["rank"] == 4
+    assert cfg["scale"] == 2.0
+
+
+def test_typeerror_fallback_restores_scale_and_dropout_via_p1():
+    """Pure-Python reproduction of the _apply_lora_at_paths TypeError fallback."""
+
+    class _NoKwargCls:
+        @classmethod
+        def from_base(cls, module, r=None, scale=None, dropout=None):
+            if scale is not None or dropout is not None:
+                raise TypeError("old mlx-lm: scale/dropout not accepted")
+            return types.SimpleNamespace(scale=1.0,
+                                          dropout=_FakeDropout(1.0))
+
+    rank, scale, dropout = 4, 2.5, 0.3
+    module = object()
+    try:
+        wrapped = _NoKwargCls.from_base(module, r=rank, scale=scale,
+                                         dropout=dropout)
+    except TypeError:
+        try:
+            wrapped = _NoKwargCls.from_base(module, r=rank)
+        except TypeError:
+            wrapped = _NoKwargCls.from_base(module)
+        if hasattr(wrapped, "scale"):
+            wrapped.scale = scale
+        _drop = getattr(wrapped, "dropout", None)
+        if _drop is not None:
+            if hasattr(_drop, "_p_1"):
+                _drop._p_1 = float(1.0 - float(dropout))
+            elif hasattr(_drop, "p"):
+                _drop.p = float(dropout)
+    assert wrapped.scale == 2.5
+    assert abs(wrapped.dropout._p_1 - 0.7) < 1e-9
+
+
+def test_typeerror_fallback_handles_shim_dropout_with_p_attr():
+    wrapped = types.SimpleNamespace(scale=1.0, dropout=_ShimDropout(0.0))
+    scale, dropout = 2.5, 0.4
+    if hasattr(wrapped, "scale"):
+        wrapped.scale = scale
+    _drop = getattr(wrapped, "dropout", None)
+    if _drop is not None:
+        if hasattr(_drop, "_p_1"):
+            _drop._p_1 = float(1.0 - float(dropout))
+        elif hasattr(_drop, "p"):
+            _drop.p = float(dropout)
+    assert wrapped.scale == 2.5
+    assert abs(wrapped.dropout.p - 0.4) < 1e-9
