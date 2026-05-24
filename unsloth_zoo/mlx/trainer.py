@@ -306,8 +306,9 @@ class MLXTrainingConfig:
     adam_beta1: float | None = None
     adam_beta2: float | None = None
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
-    # Proportional per-tensor clipping. This is cheaper than global norm, but
-    # preserves each tensor's gradient direction unlike elementwise value clip.
+    # Elementwise clip: each gradient element is clamped to
+    # `[-max_grad_value, +max_grad_value]`. Per-leaf only, no cross-leaf
+    # reduction, so it does not pay the global-norm memory overhead.
     # None (default) keeps the cheap MLX default of 1.0 unless the user
     # passes max_grad_norm > 0, in which case global-norm clipping wins.
     # 0.0 disables. A positive float opts in explicitly and overrides
@@ -856,6 +857,18 @@ class MLXTrainer:
         args = self.args
         model = self.model
         cast_norm_output = bool(getattr(args, "cast_norm_output_to_input_dtype", True))
+        # Remember the Qwen3-VL vision-block flag so the finally block can
+        # restore the original value rather than always forcing it to
+        # False (which would otherwise leak across train() boundaries for
+        # subsequent inference in the same process).
+        _prev_qwen3_vision_cast = True
+        try:
+            from . import compile as _mlx_compile
+            _prev_qwen3_vision_cast = bool(
+                getattr(_mlx_compile, "_QWEN3_VISION_NORM_CAST_OUTPUT", True)
+            )
+        except Exception:
+            pass
         _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
         if cast_norm_output:
             print("Unsloth: Casting MLX norm outputs back to activation dtype.")
@@ -938,6 +951,16 @@ class MLXTrainer:
                     _set_norm_output_cast_to_input_dtype(False, model)
                 except Exception:
                     pass
+            # Restore the Qwen3-VL vision-block flag to whatever it was
+            # before train() started, instead of leaking the False that
+            # `_set_norm_output_cast_to_input_dtype(False, ...)` just set.
+            try:
+                from . import compile as _mlx_compile
+                _mlx_compile.set_qwen3_vision_norm_cast_output(
+                    _prev_qwen3_vision_cast
+                )
+            except Exception:
+                pass
 
     def _train_inner(self):
         """Inner training loop, separated for GC cleanup in finally block."""
@@ -1173,16 +1196,15 @@ class MLXTrainer:
             # This avoids adding a second consumer to the lazy backward graph.
             return getattr(optimizer, "betas", None)
 
-        def _clip_grad_by_leaf_norm(grad):
+        def _clip_grad_by_value(grad):
+            # Elementwise clip to [-max_grad_value, +max_grad_value],
+            # per-leaf, no cross-leaf reduction.
             if not _clip_grad_value:
                 return grad
-            def _clip_leaf_norm(g):
-                g_f = g.astype(mx.float32)
-                norm = mx.sqrt(mx.sum(g_f * g_f))
-                scale = mx.minimum(max_grad_value / (norm + 1e-6), 1.0)
-                return g * scale.astype(g.dtype)
-
-            return tree_map(_clip_leaf_norm, grad)
+            return tree_map(
+                lambda g: mx.clip(g, -max_grad_value, max_grad_value),
+                grad,
+            )
 
         def _apply_update(grad, toks_f):
             """Common gradient post-processing and optimizer update.
@@ -1209,7 +1231,7 @@ class MLXTrainer:
                     final_grad, max_norm=max_grad_norm
                 )
             if _clip_grad_value:
-                final_grad = _clip_grad_by_leaf_norm(final_grad)
+                final_grad = _clip_grad_by_value(final_grad)
             self._apply_manual_weight_decay(model, optimizer, final_grad)
             optimizer.update(model, final_grad)
             _restore_trainable_storage_dtypes()
@@ -1232,7 +1254,7 @@ class MLXTrainer:
             if max_grad_norm > 0:
                 grad, grad_norm = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
             if _clip_grad_value:
-                grad = _clip_grad_by_leaf_norm(grad)
+                grad = _clip_grad_by_value(grad)
             self._apply_manual_weight_decay(model, optimizer, grad)
             optimizer.update(model, grad)
             _restore_trainable_storage_dtypes()

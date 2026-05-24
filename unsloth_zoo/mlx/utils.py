@@ -2645,6 +2645,18 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                 yield _emit(items)
             epoch += 1
     else:
+        # Iterable / unsized datasets cannot honor dataset_order because
+        # they expose no index space to permute. Refuse rather than
+        # silently stream source order (matches the text streaming path
+        # at trainer.py for the same asymmetry).
+        if dataset_order not in (None, "default"):
+            raise ValueError(
+                "Unsloth MLX VLM: preserve_dataset_order / "
+                f"dataset_order={dataset_order!r} requires a sized "
+                "(`__len__`) dataset. Materialize the dataset (e.g. "
+                "via `dataset.to_iterable_dataset()` -> list) or drop "
+                "the order request."
+            )
         while True:
             pending = []
             yielded = False
@@ -2884,11 +2896,19 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         batch_items = [tokenized[i] for i in chunk]
 
         max_length = max(len(ids) for ids in batch_items)
+        # Prefer the tokenizer's declared pad id; only fall back to 0 if
+        # the tokenizer has none. Matches mlx-lm's iterate_batches pad
+        # convention so the model receives a known special id (not raw 0)
+        # for padded positions in the forward input.
+        _pad_id = getattr(tokenizer, "pad_token_id", None)
+        if _pad_id is None:
+            _pad_id = 0
+        _pad_id = int(_pad_id)
         batch_ids = []
         lengths = []
         for ids in batch_items:
             length = len(ids)
-            batch_ids.append(ids + [0] * (max_length - length))
+            batch_ids.append(ids + [_pad_id] * (max_length - length))
             lengths.append([0, length])
         batch_pairs.append((mx.array(batch_ids), mx.array(lengths), None))
 
