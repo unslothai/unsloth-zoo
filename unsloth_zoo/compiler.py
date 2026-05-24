@@ -1772,6 +1772,20 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
+elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+    # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
+    # already materialised the full lm_head matmul; apply the captured logit
+    # scale/softcap transforms and route loss through self.loss_function on
+    # those logits instead of letting unsloth_fused_ce_loss redo the matmul.
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) not in (None, (),):
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
+    loss = self.loss_function(logits, labels.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
 else:
     logits = self.lm_head(hidden_states\\1)
     if (\\2) != ():

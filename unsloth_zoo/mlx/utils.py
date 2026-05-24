@@ -2613,7 +2613,11 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                     indices[i : i + batch_size]
                     for i in range(0, len(indices), batch_size)
                 ]
-                order = np.random.permutation(len(batch_indices))
+                # Use a per-epoch local Generator so order is reproducible
+                # under `seed` and does not depend on global numpy RNG
+                # state. Mirrors the torch_randperm branch reseed above.
+                rng = np.random.default_rng(base_seed + epoch)
+                order = rng.permutation(len(batch_indices))
                 for b in order:
                     items = [dataset[idx] for idx in batch_indices[b]]
                     yield _emit(items)

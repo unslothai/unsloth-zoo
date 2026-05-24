@@ -97,13 +97,19 @@ _NORM_OUTPUT_CAST_BASE_CLASSES = (nn.RMSNorm, nn.LayerNorm)
 _NORM_OUTPUT_CAST_PATCHED_CLASSES = set()
 
 
+def _part_is_norm(part: str) -> bool:
+    # Match RMSNorm/LayerNorm/input_layernorm/etc. via "norm" substring,
+    # plus GPT-2 / GPT-OSS style ln_1, ln_2, ln_f.
+    return "norm" in part or part.startswith("ln_") or part == "ln_f"
+
+
 def _is_norm_parameter_path(path) -> bool:
     parts = str(path).lower().split(".")
-    return any("norm" in part for part in parts[:-1])
+    return any(_part_is_norm(part) for part in parts[:-1])
 
 
 def _is_norm_module_path(path) -> bool:
-    return any("norm" in part for part in str(path).lower().split("."))
+    return any(_part_is_norm(part) for part in str(path).lower().split("."))
 
 
 def _has_norm_selected_floating_parameter(module_path, module) -> bool:
@@ -219,6 +225,15 @@ def _set_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
     result back matches PyTorch autocast behavior more closely: fp32 norm math,
     bf16/fp16 downstream activations.
     """
+    # Keep the Qwen3-VL specialized vision-block norm patch in sync with
+    # the generic patcher below. Imported lazily to avoid a circular
+    # import at trainer-module load time.
+    try:
+        from . import compile as _mlx_compile
+        _mlx_compile.set_qwen3_vision_norm_cast_output(enabled)
+    except Exception:
+        pass
+
     norm_classes = list(_iter_norm_output_cast_classes(model))
     if not enabled:
         norm_classes.extend(
@@ -624,14 +639,15 @@ class MLXTrainer:
         leaf = parts[-1] if parts else str(name).lower()
         if leaf == "bias":
             return False
-        if any("norm" in part for part in parts):
+        # Cover RMSNorm/LayerNorm via "norm" + GPT-2 style ln_1/ln_2/ln_f.
+        if any(_part_is_norm(part) for part in parts):
             return False
         return True
 
     @staticmethod
     def _is_norm_parameter_name(name):
         return any(
-            "norm" in part.lower()
+            _part_is_norm(part.lower())
             for part in str(name).split(".")
             if part
         )

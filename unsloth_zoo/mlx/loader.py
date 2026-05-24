@@ -149,7 +149,12 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
 def _is_norm_parameter_path(path) -> bool:
     """Return whether a parameter path belongs to a normalization module."""
     parts = str(path).lower().split(".")
-    return any("norm" in part for part in parts[:-1])
+    # Match RMSNorm/LayerNorm via "norm" substring, plus GPT-2 / GPT-OSS
+    # style ln_1, ln_2, ln_f.
+    return any(
+        "norm" in part or part.startswith("ln_") or part == "ln_f"
+        for part in parts[:-1]
+    )
 
 
 def _keep_norm_parameters_float32(model) -> None:

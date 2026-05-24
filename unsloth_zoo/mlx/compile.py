@@ -56,6 +56,18 @@ _PATCHED_ARCHES: set[str] = set()
 _PATCHED_PATTERN_BUNDLES: set[str] = set()
 _PATCH_BINDINGS: set[tuple[str, str, str, str]] = set()
 
+# Controls whether the Qwen3-VL vision-block norm patch casts the fp32
+# norm output back to the activation dtype. Mirrors MLXTrainingConfig
+# `cast_norm_output_to_input_dtype`. Flipped by the trainer's
+# `_set_norm_output_cast_to_input_dtype` so the generic and Qwen3-VL
+# paths agree.
+_QWEN3_VISION_NORM_CAST_OUTPUT = True
+
+
+def set_qwen3_vision_norm_cast_output(enabled: bool) -> None:
+    global _QWEN3_VISION_NORM_CAST_OUTPUT
+    _QWEN3_VISION_NORM_CAST_OUTPUT = bool(enabled)
+
 # Architectures explicitly verified for mlx compile support.
 # Training verification currently covers:
 # - qwen2_5_vl: real end-to-end compiled training via train.py
@@ -2710,7 +2722,12 @@ def _install_qwen3_family_compile_patches():
         return rotated.astype(orig_dtype)
 
     def _qwen3_torch_like_layer_norm(norm, x):
-        """Match PyTorch bf16 LayerNorm: fp32 stats/affine, cast result back."""
+        """Match PyTorch bf16 LayerNorm: fp32 stats/affine, cast result back.
+
+        Honors the module-level `_QWEN3_VISION_NORM_CAST_OUTPUT` flag (set
+        from MLXTrainingConfig.cast_norm_output_to_input_dtype); when
+        disabled the fp32 result is returned without recasting.
+        """
         import mlx.core as mx
 
         source_dtype = x.dtype
@@ -2725,7 +2742,9 @@ def _install_qwen3_family_compile_patches():
         bias = getattr(norm, "bias", None)
         if bias is not None:
             y = y + bias.astype(mx.float32)
-        return y.astype(source_dtype)
+        if _QWEN3_VISION_NORM_CAST_OUTPUT:
+            return y.astype(source_dtype)
+        return y
 
     def patched_qwen3_vision_block_call(self, hidden_states, cu_seqlens, rotary_pos_emb):
         residual_dtype = hidden_states.dtype
