@@ -276,7 +276,7 @@ class MLXTrainer:
         """
         trainable = dict(tree_flatten(model.trainable_parameters()))
         if not trainable:
-            return  # why safe: no trainable params means nothing to suspect-freeze, and the model may not implement parameters() (stub trainers exercised in test_adam_optimizers_enable_bias_correction).
+            return  # why safe: nothing trainable means nothing to suspect-freeze; also avoids requiring model.parameters() on stub models.
         adapter_tensors = collect_mlx_lora_adapter_tensors(model)
         has_lora = any(name in trainable for name in adapter_tensors)
         if not has_lora:
@@ -1395,9 +1395,8 @@ class MLXTrainer:
         from .utils import _extract_mlx_lora_parameters
         output_dir = output_dir or self.args.output_dir
 
-        # Treat as a LoRA save whenever LoRA adapters exist. If we have
-        # trainable non-LoRA state (e.g. mixed fine-tune), it will be
-        # included in the adapter artifact via save_trainable_adapters().
+        # Detect LoRA from module structure so reloaded / frozen adapters
+        # still take the adapter-save path.
         adapter_tensors = collect_mlx_lora_adapter_tensors(self.model)
         has_lora = bool(adapter_tensors)
 
@@ -1441,10 +1440,9 @@ class MLXTrainer:
                 ),
             }
 
-            # Preserve intentionally trainable non-LoRA tensors (embeddings,
-            # projector, vision, ...) by saving the full trainable tree when
-            # the trainer touched anything beyond LoRA. Pure LoRA runs keep
-            # the lean adapter-only artifact mlx-lm load_adapters() expects.
+            # Mixed fine-tunes (embeddings / projector / vision trained
+            # alongside LoRA) route through the trainable-tree writer so the
+            # extra tensors land in the artifact; pure LoRA stays lean.
             trainable = dict(tree_flatten(self.model.trainable_parameters()))
             adapter_keys = set(adapter_tensors)
             has_trainable_non_lora = bool(set(trainable) - adapter_keys)

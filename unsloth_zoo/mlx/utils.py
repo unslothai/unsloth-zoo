@@ -2616,7 +2616,6 @@ def save_trainable_adapters(model, path, adapter_config=None):
     artifact remains a valid, reloadable adapter file.
     """
     tensors = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
-    # Ensure all LoRA adapter tensors are included (frozen or not)
     tensors.update(collect_mlx_lora_adapter_tensors(model))
 
     if not tensors:
