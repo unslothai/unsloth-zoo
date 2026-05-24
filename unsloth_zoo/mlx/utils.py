@@ -2582,7 +2582,7 @@ def collect_mlx_lora_adapter_tensors(model):
     """
     parameters = dict(mlx.utils.tree_flatten(model.parameters()))
     adapter_keys = set()
-    for module_name, _module, a_attr, b_attr in iter_mlx_lora_modules(model):
+    for module_name, _, a_attr, b_attr in iter_mlx_lora_modules(model):
         prefix = f"{module_name}." if module_name else ""
         adapter_keys.add(f"{prefix}{a_attr}")
         adapter_keys.add(f"{prefix}{b_attr}")
@@ -2592,6 +2592,12 @@ def collect_mlx_lora_adapter_tensors(model):
 def save_trainable_adapters(model, path, adapter_config=None):
     """Save the current trainable parameter tree for training checkpoints."""
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    if not trainable:
+        raise ValueError(
+            "Unsloth: save_trainable_adapters() found no trainable parameters. "
+            "The model may be fully frozen. Use save_lora_adapters() to export "
+            "LoRA adapter weights from a frozen model."
+        )
     _save_adapter_artifacts(model, path, trainable, adapter_config=adapter_config)
 
 

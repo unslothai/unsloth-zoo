@@ -64,6 +64,7 @@ from .utils import (
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
     collect_mlx_texts,
+    save_lora_adapters,
     save_trainable_adapters,
     collect_mlx_lora_adapter_tensors,
     iter_mlx_lora_modules,
@@ -274,7 +275,8 @@ class MLXTrainer:
         other intentionally trainable non-LoRA parameters.
         """
         trainable = dict(tree_flatten(model.trainable_parameters()))
-        has_lora = any(name in trainable for name in collect_mlx_lora_adapter_tensors(model))
+        adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+        has_lora = any(name in trainable for name in adapter_tensors)
         if not has_lora:
             return  # Not a LoRA model — don't touch
 
@@ -289,9 +291,10 @@ class MLXTrainer:
             "multi_modal_projector", "mm_projector", "connector", "aligner",
             "vision_tower", "vision_model", "vision_encoder",
         )
+        adapter_keys = set(adapter_tensors)
         suspect = [
             k for k in trainable
-            if "lora" not in k
+            if k not in adapter_keys
             and any(frag in k for frag in _NORM_FRAGMENTS)
             and not any(comp in k for comp in _INTENTIONAL_COMPONENTS)
         ]
@@ -1409,7 +1412,7 @@ class MLXTrainer:
 
 
             _lora_rank, _lora_scale, _lora_dropout = 8, 1.0, 0.0
-            for _, m, a_attr, _b_attr in iter_mlx_lora_modules(self.model):
+            for _, m, a_attr, _ in iter_mlx_lora_modules(self.model):
                 a_tensor = getattr(m, a_attr)
                 a_shape = tuple(getattr(a_tensor, "shape", ()))
                 # mlx-lm LoRASwitchLinear stores (num_experts, rank, in_dims);
@@ -1468,8 +1471,8 @@ class MLXTrainer:
                     self.model, output_dir, adapter_config=adapter_config,
                 )
             else:
-                self.model.save_lora_adapters(
-                    output_dir, adapter_config=adapter_config,
+                save_lora_adapters(
+                    self.model, output_dir, adapter_config=adapter_config,
                 )
             # why: VLM processors include the inner tokenizer; double-save
             # rewrites the same files. Skip when the processor will cover it.
