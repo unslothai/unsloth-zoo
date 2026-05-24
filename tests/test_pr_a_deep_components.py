@@ -121,13 +121,38 @@ def test_adamw_weight_decay_uses_hf_bias_norm_filter():
 
     optimizer = trainer._build_optimizer(total_steps=8)
 
-    assert trainer._manual_adamw_weight_decay == pytest.approx(0.1)
+    assert trainer._manual_weight_decay == pytest.approx(0.1)
     if hasattr(optimizer, "_kw"):
         assert optimizer._kw["weight_decay"] == 0.0
     assert MLXTrainer._should_apply_weight_decay("layers.0.mlp.down_proj.weight")
     assert not MLXTrainer._should_apply_weight_decay("layers.0.mlp.down_proj.bias")
     assert not MLXTrainer._should_apply_weight_decay("layers.0.input_layernorm.weight")
     assert not MLXTrainer._should_apply_weight_decay("vision.blocks.0.norm1.weight")
+
+
+@pytest.mark.parametrize("optim_name", ["sgd", "muon", "lion"])
+def test_non_adamw_optimizers_use_hf_parity_manual_decay(optim_name):
+    """SGD, Muon, and Lion must mirror the AdamW pattern: zero out the
+    optimizer's built-in `weight_decay` and let `_apply_manual_weight_decay`
+    own the decoupled decay so bias and norm params are excluded."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class DummyModel:
+        def trainable_parameters(self):
+            return {}
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = DummyModel()
+    trainer.args = MLXTrainingConfig(
+        optim=optim_name,
+        weight_decay=0.05,
+    )
+
+    optimizer = trainer._build_optimizer(total_steps=4)
+
+    assert trainer._manual_weight_decay == pytest.approx(0.05)
+    if hasattr(optimizer, "_kw"):
+        assert optimizer._kw["weight_decay"] == 0.0
 
 
 def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():

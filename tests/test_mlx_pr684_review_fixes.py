@@ -73,7 +73,7 @@ def test_vlm_label_mask_keeps_in_sequence_pad_eos_token():
     assert out.tolist() == [[101, 2, -100, -100]]
 
 
-def test_manual_adamw_weight_decay_accepts_scalar_lr_and_preserves_dtype():
+def test_manual_weight_decay_accepts_scalar_lr_and_preserves_dtype():
     from mlx.utils import tree_flatten
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
@@ -111,9 +111,9 @@ def test_manual_adamw_weight_decay_accepts_scalar_lr_and_preserves_dtype():
         "norm": {"weight": mx.array([1.0], dtype=mx.float32)},
     }
     trainer = object.__new__(MLXTrainer)
-    trainer._manual_adamw_weight_decay = 0.1
+    trainer._manual_weight_decay = 0.1
 
-    trainer._apply_manual_adamw_weight_decay(model, TinyOptimizer(), grad)
+    trainer._apply_manual_weight_decay(model, TinyOptimizer(), grad)
     flat = dict(tree_flatten(model.trainable_parameters()))
 
     assert flat["layer.weight"].dtype == mx.bfloat16

@@ -575,7 +575,7 @@ class MLXTrainer:
         initial_lr = self._schedule_value(schedule, 0)
         self._lr_schedule = schedule if callable(schedule) else None
         wd = self.args.weight_decay
-        self._manual_adamw_weight_decay = 0.0
+        self._manual_weight_decay = 0.0
         adam_beta1 = getattr(self.args, "adam_beta1", None)
         adam_beta2 = getattr(self.args, "adam_beta2", None)
         adam_kwargs = {}
@@ -610,7 +610,7 @@ class MLXTrainer:
         elif opt_name == "adamw":
             # Match HF/PyTorch AdamW semantics. MLX defaults bias_correction
             # to False, which makes early warmup updates much larger.
-            self._manual_adamw_weight_decay = float(wd or 0.0)
+            self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.AdamW(
                 learning_rate=initial_lr,
                 weight_decay=0.0,
@@ -624,17 +624,17 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name == "sgd":
-            # TODO: For HF Trainer parity, consider applying the same
-            # bias/norm weight-decay exclusion used by AdamW to SGD.
-            optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=wd)
+            # HF parity: decoupled bias/norm-aware decay, applied manually.
+            self._manual_weight_decay = float(wd or 0.0)
+            optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "muon":
-            # TODO: For HF Trainer parity, consider applying the same
-            # bias/norm weight-decay exclusion used by AdamW to Muon.
-            optimizer = optim.Muon(learning_rate=initial_lr, weight_decay=wd)
+            # HF parity: decoupled bias/norm-aware decay, applied manually.
+            self._manual_weight_decay = float(wd or 0.0)
+            optimizer = optim.Muon(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "lion":
-            # TODO: For HF Trainer parity, consider applying the same
-            # bias/norm weight-decay exclusion used by AdamW to Lion.
-            optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=wd)
+            # HF parity: decoupled bias/norm-aware decay, applied manually.
+            self._manual_weight_decay = float(wd or 0.0)
+            optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
         self._resolved_optimizer_name = opt_name
         return optimizer
 
@@ -666,9 +666,15 @@ class MLXTrainer:
             if part
         )
 
-    def _apply_manual_adamw_weight_decay(self, model, optimizer, grad):
-        """Apply decoupled AdamW decay to trainable non-bias/non-norm leaves."""
-        wd = float(getattr(self, "_manual_adamw_weight_decay", 0.0) or 0.0)
+    def _apply_manual_weight_decay(self, model, optimizer, grad):
+        """Decoupled HF-parity decay on trainable non-bias/non-norm leaves.
+
+        Active for AdamW, SGD, Muon, and Lion. The underlying MLX
+        optimizer is constructed with ``weight_decay=0.0`` so this
+        helper owns the full update for the weight-decay term and
+        matches what HF Trainer does via ``param_groups``.
+        """
+        wd = float(getattr(self, "_manual_weight_decay", 0.0) or 0.0)
         if wd <= 0:
             return
 
@@ -1204,7 +1210,7 @@ class MLXTrainer:
                 )
             if _clip_grad_value:
                 final_grad = _clip_grad_by_leaf_norm(final_grad)
-            self._apply_manual_adamw_weight_decay(model, optimizer, final_grad)
+            self._apply_manual_weight_decay(model, optimizer, final_grad)
             optimizer.update(model, final_grad)
             _restore_trainable_storage_dtypes()
             return grad_norm
@@ -1227,7 +1233,7 @@ class MLXTrainer:
                 grad, grad_norm = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
             if _clip_grad_value:
                 grad = _clip_grad_by_leaf_norm(grad)
-            self._apply_manual_adamw_weight_decay(model, optimizer, grad)
+            self._apply_manual_weight_decay(model, optimizer, grad)
             optimizer.update(model, grad)
             _restore_trainable_storage_dtypes()
             return grad_norm
