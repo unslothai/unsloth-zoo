@@ -154,11 +154,21 @@ def test_runtime_cce_invalid_labels_poison_loss_and_gradients(bad_target):
         return runtime_cce(h, w, targets).astype(mx.float32).sum()
 
     loss, grads = mx.value_and_grad(loss_fn, argnums=(0, 1))(hidden, weight)
+    grad_hidden, grad_weight = grads
     grad_norm = _stable_norm(grads)
-    mx.eval(loss, grad_norm)
+    mx.eval(loss, grad_norm, grad_hidden)
 
     assert math.isnan(loss.item())
     assert math.isnan(grad_norm.item())
+    # explicit: invalid-label row poisons its OWN grad_hidden row with NaN
+    # while valid and ignore_index rows must stay finite. Without this,
+    # an NaN leak from _poison_invalid_targets into valid rows' lse would
+    # be hidden by grad_weight's NaN contamination of grad_norm.
+    grad_hidden_rows = mx.sum(mx.abs(grad_hidden).astype(mx.float32), axis=1)
+    mx.eval(grad_hidden_rows)
+    assert math.isfinite(grad_hidden_rows[0].item()), "valid row must have finite grad_hidden"
+    assert math.isnan(grad_hidden_rows[1].item()), "invalid row must have NaN grad_hidden"
+    assert grad_hidden_rows[2].item() == pytest.approx(0.0), "ignore_index row must zero-grad"
 
 
 @pytest.mark.parametrize("bad_target", [-1, 32])

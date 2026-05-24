@@ -418,6 +418,16 @@ def _build_dlogits_kernel() -> Callable:
                 continue;
             }
 
+            // invalid-label rows arrive with lse[row]=NaN from
+            // _poison_invalid_targets. fast::exp() is not IEEE-754 strict
+            // (MSL spec 6.5.1) so NaN propagation is not guaranteed; emit
+            // an explicit NaN gradient via 0/0 (Metal C++ rejects the
+            // literal token 'nan').
+            if (isnan(lse[row])) {
+                d_logits[elem] = 0.0f / 0.0f;
+                continue;
+            }
+
             int global_v = v_start + int(col);
             float raw = logits[elem];
             float capped = raw;
