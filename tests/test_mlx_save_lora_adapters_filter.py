@@ -153,7 +153,9 @@ def test_save_trainable_adapters_preserves_full_trainable_tree(tmp_path):
 
 
 class _MockLoRALinearUpper:
-    # Some PEFT-style adapters expose uppercase tensor names.
+    # Some external adapters expose uppercase tensor names. mlx-lm reload
+    # only recreates lowercase wrappers so the collector should skip these,
+    # not silently emit unreloadable adapter weights.
     def __init__(self, in_features, out_features, rank, scale, dropout):
         self.weight = torch.zeros(out_features, in_features)
         self.lora_A = torch.zeros(in_features, rank)
@@ -208,9 +210,12 @@ def _make_model_with_named_modules(layers):
     return _M()
 
 
-def test_collect_lora_helper_accepts_uppercase_pair(tmp_path):
-    # PEFT-style adapters expose lora_A / lora_B; collector must yield
-    # those tensors so save_lora_adapters writes them intact.
+def test_collect_lora_helper_skips_uppercase_only_module(tmp_path):
+    # mlx-lm reload only recreates lowercase lora_a/lora_b wrappers, so
+    # adapter tensors saved under uppercase keys can never bind back to
+    # the recreated wrappers. The collector must skip these modules and
+    # save_lora_adapters must raise rather than silently produce an
+    # unreloadable artifact.
     from unsloth_zoo.mlx.utils import (
         collect_mlx_lora_adapter_tensors,
         save_lora_adapters,
@@ -220,14 +225,9 @@ def test_collect_lora_helper_accepts_uppercase_pair(tmp_path):
         "q_proj": _MockLoRALinearUpper(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0)),
         "up_proj": _MockPlainLinear(16, 32),
     })
-
-    found = collect_mlx_lora_adapter_tensors(model)
-    assert set(found.keys()) == {"q_proj.lora_A", "q_proj.lora_B"}, found
-
-    save_lora_adapters(model, tmp_path)
-    from safetensors.torch import load_file
-    keys = set(load_file(str(tmp_path / "adapters.safetensors")).keys())
-    assert keys == {"q_proj.lora_A", "q_proj.lora_B"}, sorted(keys)
+    assert collect_mlx_lora_adapter_tensors(model) == {}
+    with pytest.raises(ValueError, match="LoRA adapter tensors"):
+        save_lora_adapters(model, tmp_path)
 
 
 def test_collect_lora_helper_drops_half_adapter_module(tmp_path):
@@ -247,7 +247,7 @@ def test_collect_lora_helper_drops_half_adapter_module(tmp_path):
         save_lora_adapters(model, tmp_path)
 
 
-def test_iter_mlx_lora_modules_reports_attr_pair():
+def test_iter_mlx_lora_modules_yields_only_lowercase_pairs():
     from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
 
     model = _make_model_with_named_modules({
@@ -255,23 +255,20 @@ def test_iter_mlx_lora_modules_reports_attr_pair():
         "v_proj": _MockLoRALinearUpper(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0)),
         "up_proj": _MockPlainLinear(16, 32),
     })
-    rows = [(name, a, b) for name, _m, a, b in iter_mlx_lora_modules(model)]
-    assert sorted(rows) == [
-        ("q_proj", "lora_a", "lora_b"),
-        ("v_proj", "lora_A", "lora_B"),
-    ], rows
+    names = [name for name, _m in iter_mlx_lora_modules(model)]
+    assert names == ["q_proj"], names
 
 
-def test_enrich_adapter_config_records_uppercase_lora_paths():
-    # _enrich_mlx_adapter_config must record uppercase LoRA module paths so
-    # reload can recreate the matching wrappers.
+def test_enrich_adapter_config_skips_uppercase_only_modules():
+    # mlx-lm cannot reload uppercase tensors, so the enrich helper must not
+    # advertise uppercase-only modules as reloadable LoRA paths.
     from unsloth_zoo.mlx.utils import _enrich_mlx_adapter_config
 
     model = _make_model_with_named_modules({
         "q_proj": _MockLoRALinearUpper(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0)),
     })
     enriched = _enrich_mlx_adapter_config(model, {})
-    assert enriched.get("unsloth_mlx_lora_module_paths") == ["q_proj"]
+    assert "unsloth_mlx_lora_module_paths" not in enriched
 
 
 def test_collect_lora_helper_finds_adapters_after_reload():
@@ -459,6 +456,48 @@ def test_save_pretrained_merged_lora_method_raises_when_no_adapter_tensors(tmp_p
         save_pretrained_merged(_NoLora(), _Tok(), tmp_path, save_method="lora")
 
 
+def test_save_pretrained_merged_lora_strips_accidental_trainable_base_tensors(tmp_path):
+    # After a reload, base weights such as q_proj.weight may end up
+    # marked trainable. save_method="lora" must still ship a lean
+    # adapter file rather than leaking those base tensors.
+    from unsloth_zoo.mlx.utils import save_pretrained_merged
+
+    lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
+
+    class _ReloadedModel:
+        def __init__(self):
+            self.q_proj = lora
+            self._hf_repo = None
+            self._config = None
+            self._unsloth_quantization_config = None
+            self._unsloth_quantization_policy = None
+            self._unsloth_quantized_source = None
+            self._unsloth_base_revision = None
+            self._unsloth_base_commit_hash = None
+            self._src_path = None
+        def parameters(self):
+            return {
+                "q_proj.weight": lora.weight,
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+            }
+        def trainable_parameters(self):
+            return self.parameters()
+        def named_modules(self):
+            yield "", self
+            yield "q_proj", lora
+
+    class _Tok:
+        def save_pretrained(self, *_a, **_k):
+            pass
+
+    save_pretrained_merged(_ReloadedModel(), _Tok(), tmp_path, save_method="lora")
+
+    from safetensors.torch import load_file
+    keys = set(load_file(str(tmp_path / "adapters.safetensors")).keys())
+    assert keys == {"q_proj.lora_a", "q_proj.lora_b"}, sorted(keys)
+
+
 def test_save_pretrained_merged_merged_methods_skip_lora_collection(tmp_path, monkeypatch):
     # Merged exports (merged_16bit / merged_4bit) must not call the
     # adapter collector; the lora-only presence check belongs inside
@@ -572,14 +611,14 @@ def test_ensure_lora_frozen_freezes_norm_whose_name_contains_lora_substring():
     assert freeze_calls == [(["weight"], False)], freeze_calls
 
 
-def test_save_pretrained_merged_lora_method_preserves_trainable_non_lora(
+def test_save_pretrained_merged_lora_method_stays_lora_only_with_mixed_trainable(
     tmp_path, monkeypatch
 ):
-    # save_pretrained_merged(save_method='lora') must follow the same mixed
-    # trainable routing as MLXTrainer.save_model: when there is intentionally
-    # trainable non-LoRA state (embed_tokens, projector, vision), the public
-    # API has to write through save_trainable_adapters so the trained tensors
-    # are not silently dropped from the artifact.
+    # save_method='lora' must always produce a lean LoRA-only artifact
+    # that mlx-lm.load_adapters() can reload, even when other tensors are
+    # currently trainable. Mixed fine-tunes save their full trainable tree
+    # via the explicit save_trainable_adapters() API; the public 'lora'
+    # save method must not silently include non-LoRA state.
     from unsloth_zoo.mlx import utils as mlx_utils
 
     lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
@@ -630,7 +669,7 @@ def test_save_pretrained_merged_lora_method_preserves_trainable_non_lora(
     mlx_utils.save_pretrained_merged(
         _MixedModel(), _Tok(), tmp_path, save_method="lora",
     )
-    assert routed == ["trainable"], routed
+    assert routed == ["lora"], routed
 
 
 def test_save_pretrained_merged_lora_method_pure_lora_uses_lean_writer(

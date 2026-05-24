@@ -256,10 +256,16 @@ def _is_lm_head_trainable(model):
     when the weight should be wrapped with mx.stop_gradient.
     """
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    # Anchor LoRA detection on the module-anchored collector so unrelated
+    # trainables whose names happen to contain "lora" (e.g.
+    # lora_router.weight or base.lora_special.lm_head.weight) are not
+    # silently treated as adapter state.
+    adapter_keys = set(collect_mlx_lora_adapter_tensors(model))
     for key in trainable:
-        if 'lora' not in key:
-            if 'lm_head' in key or 'embed_tokens.weight' in key:
-                return True
+        if key in adapter_keys:
+            continue
+        if 'lm_head' in key or 'embed_tokens.weight' in key:
+            return True
     return len(trainable) == 0  # no LoRA = full fine-tuning = trainable
 
 
@@ -2557,8 +2563,8 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
 def _extract_mlx_lora_parameters(model):
     """Extract global rank, scale, and dropout from the model's first LoRA module."""
     rank, scale, dropout = 8, 1.0, 0.0
-    for _, m, a_attr, _ in iter_mlx_lora_modules(model):
-        a_tensor = getattr(m, a_attr)
+    for _, m in iter_mlx_lora_modules(model):
+        a_tensor = m.lora_a
         a_shape = tuple(getattr(a_tensor, "shape", ()))
         # mlx-lm LoRASwitchLinear stores (num_experts, rank, in_dims);
         # standard LoRALinear stores (in_dims, rank).
@@ -2569,26 +2575,36 @@ def _extract_mlx_lora_parameters(model):
         scale = getattr(m, "scale", 1.0)
 
         drop = getattr(m, "dropout", None)
-        dropout = getattr(drop, "p", 0.0) if drop else 0.0
+        # mlx.nn.Dropout stores keep probability in _p_1; fall back to .p
+        # for compatibility shims so we never silently lose nonzero dropout.
+        if drop is None:
+            dropout = 0.0
+        else:
+            keep = getattr(drop, "_p_1", None)
+            if keep is not None:
+                try:
+                    dropout = float(1.0 - float(keep))
+                except (TypeError, ValueError):
+                    dropout = 0.0
+            else:
+                p = getattr(drop, "p", None)
+                try:
+                    dropout = float(p) if p is not None else 0.0
+                except (TypeError, ValueError):
+                    dropout = 0.0
         break
     return rank, scale, dropout
 
 
-# mlx-lm uses lowercase pair; PEFT-style adapters may expose uppercase.
-_MLX_LORA_ATTR_PAIRS = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
-
-
 def iter_mlx_lora_modules(model):
-    """Yield (module_name, module, a_attr, b_attr) for each complete LoRA module.
+    """Yield (module_name, module) for each module that owns a complete LoRA pair.
 
-    Skips half-built modules (only one side) to avoid producing adapter files
-    that cannot be reloaded.
+    mlx-lm reload only recreates lowercase lora_a / lora_b wrappers, so we
+    skip uppercase or half-built modules that cannot be reloaded.
     """
     for module_name, module in model.named_modules():
-        for a_attr, b_attr in _MLX_LORA_ATTR_PAIRS:
-            if hasattr(module, a_attr) and hasattr(module, b_attr):
-                yield module_name, module, a_attr, b_attr
-                break
+        if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
+            yield module_name, module
 
 
 def collect_mlx_lora_adapter_tensors(model):
@@ -2602,10 +2618,10 @@ def collect_mlx_lora_adapter_tensors(model):
     """
     parameters = dict(mlx.utils.tree_flatten(model.parameters()))
     adapter_keys = set()
-    for module_name, _, a_attr, b_attr in iter_mlx_lora_modules(model):
+    for module_name, _ in iter_mlx_lora_modules(model):
         prefix = f"{module_name}." if module_name else ""
-        adapter_keys.add(f"{prefix}{a_attr}")
-        adapter_keys.add(f"{prefix}{b_attr}")
+        adapter_keys.add(f"{prefix}lora_a")
+        adapter_keys.add(f"{prefix}lora_b")
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
 
@@ -2819,10 +2835,23 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         adapter_config.setdefault("scale", scale)
         adapter_config.setdefault("dropout", dropout)
 
+    # mlx-lm.load_adapters() reads num_layers off the adapter config to
+    # decide how many transformer layers to wrap. Trainer.save_model fills
+    # this in directly; backfill the same key here so save_pretrained_merged
+    # also produces a loadable artifact.
+    if "num_layers" not in adapter_config:
+        try:
+            layers = _get_transformer_layers(model)
+            adapter_config["num_layers"] = len(layers) if layers else -1
+        except Exception:
+            adapter_config["num_layers"] = -1
+    adapter_config.setdefault("fine_tune_type", "lora")
+    adapter_config.setdefault("peft_type", "LORA")
+
     # why: record LoRA module paths so reload recreates vision/projector LoRA
     # layers (mlx-lm.load_adapters only knows the language tower).
     try:
-        lora_paths = [name for name, *_ in iter_mlx_lora_modules(model)]
+        lora_paths = [name for name, _ in iter_mlx_lora_modules(model)]
         if lora_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
     except Exception:
@@ -2964,19 +2993,19 @@ def save_pretrained_merged(
         )
 
     if method == "lora":
-        adapter_tensors = collect_mlx_lora_adapter_tensors(model)
-        if not adapter_tensors:
+        # save_method='lora' must always produce a clean LoRA-only artifact
+        # that mlx-lm.load_adapters() can reload. Routing through
+        # save_trainable_adapters here would leak base tensors that get
+        # accidentally marked trainable after a checkpoint reload.
+        # Callers that intentionally save mixed LoRA + embedding /
+        # projector / vision trainables should call save_trainable_adapters
+        # directly.
+        if not collect_mlx_lora_adapter_tensors(model):
             raise ValueError(
                 "Unsloth: save_method='lora' but the model has no LoRA "
                 "layers — there's nothing to save. Use 'merged_16bit' instead."
             )
-        trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
-        has_trainable_non_lora = bool(set(trainable) - set(adapter_tensors))
-
-        if has_trainable_non_lora:
-            save_trainable_adapters(model, save_directory)
-        else:
-            save_lora_adapters(model, save_directory)
+        save_lora_adapters(model, save_directory)
         try:
             tokenizer.save_pretrained(str(save_directory))
         except Exception:
