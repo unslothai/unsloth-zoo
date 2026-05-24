@@ -121,6 +121,19 @@ def patch_Gemma3Processor():
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
             **kwargs,
         )
+        # TRL GRPO paged + reward paths call Gemma3Processor(text=[...]) with no
+        # padding= kwarg; upstream Gemma3ProcessorKwargs default is padding=False
+        # so ragged completions blow up BatchFeature tensor stacking. Force
+        # longest-padding only when caller did not pin padding AND we have >1
+        # text row (single-image inference is byte-identical).
+        _user_padding = kwargs.get("padding", None)
+        if _user_padding is None:
+            _user_padding = kwargs.get("text_kwargs", {}).get("padding", None)
+        _text_rows = (
+            len(text) if isinstance(text, (list, tuple)) and not isinstance(text, str) else 1
+        )
+        if _user_padding is None and _text_rows > 1:
+            output_kwargs["text_kwargs"]["padding"] = "longest"
 
         batched_images = None
         if images is not None:

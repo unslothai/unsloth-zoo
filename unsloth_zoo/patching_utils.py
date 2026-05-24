@@ -110,7 +110,11 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     else:
         DEBUGGING = ""
         os.environ.pop("TORCHDYNAMO_VERBOSE", None)
-        os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
+        # Preserve the single-worker forcing put in place by unsloth/_gpu_init
+        # to keep cgroup-pinned containers from spawning Inductor subprocess
+        # workers that can't see the GPU.
+        if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") != "1":
+            os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
         os.environ.pop("TORCHINDUCTOR_FORCE_DISABLE_CACHES", None)
         os.environ.pop("TORCH_LOGS", None)
         torch._logging.set_logs(all = logging.CRITICAL)
