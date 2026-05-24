@@ -278,7 +278,18 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
-        acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        # Non-interactive contexts (Docker w/o TTY, headless CI) raise
+        # EOFError on input(). Treat that like an implicit ENTER ie accept
+        # the install. Opt out via UNSLOTH_AUTO_INSTALL=0.
+        try:
+            acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        except EOFError:
+            if os.environ.get("UNSLOTH_AUTO_INSTALL", "1") != "1":
+                raise RuntimeError(
+                    f"Unsloth: Execution of `{install_cmd}` was cancelled (no TTY and UNSLOTH_AUTO_INSTALL=0)!\n"\
+                    "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+                )
+            acceptance = ""
         if "no" in str(acceptance).lower():
             raise RuntimeError(
                 f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
