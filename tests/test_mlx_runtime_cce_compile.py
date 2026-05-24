@@ -57,6 +57,30 @@ def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
         runtime_cce(hidden, weight, targets)
 
 
+@pytest.mark.parametrize(
+    "bad_target",
+    [2**32, -(2**32), 2**32 + 5, 2**32 - 100],
+)
+def test_runtime_cce_int64_invalid_labels_do_not_wrap_to_valid(bad_target):
+    # int64 labels outside [-2**31, 2**31) get narrowed to int32 by .astype.
+    # Validating before the narrow keeps wraparound values from masquerading
+    # as valid class ids or ignore_index.
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    runtime_cce, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100,
+        chunk_size=16,
+    )
+    hidden = mx.ones((1, 16), dtype=mx.float32)
+    weight = mx.ones((32, 16), dtype=mx.float32)
+    targets = mx.array([bad_target], dtype=mx.int64)
+
+    losses = runtime_cce(hidden, weight, targets)
+    mx.eval(losses)
+    assert math.isnan(losses[0].item())
+
+
 def test_runtime_cce_rejects_non_flat_targets():
     # rank-2 (n, 1) targets would slip past the length check and crash inside
     # the kernels; reject up front with a clear ValueError instead.

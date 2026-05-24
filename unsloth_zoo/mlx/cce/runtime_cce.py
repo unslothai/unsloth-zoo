@@ -498,31 +498,39 @@ def _forward_chunked_fused_finalize(
 ) -> tuple[mx.array, mx.array]:
     hidden_compute = hidden
     weight_compute = weight
-    targets = targets.astype(mx.int32)
+    # Validate the original dtype first so wider ints (int64/uint32) cannot
+    # silently wrap into a valid class id or ignore_index after narrowing.
+    targets_raw = targets
 
     n, _ = hidden_compute.shape
     vocab_size = weight_compute.shape[0]
     # targets must be a flat 1D vector; rank-2 inputs like (n, 1) would slip
     # past the length check and explode later inside kernels.
-    if len(targets.shape) != 1:
+    if len(targets_raw.shape) != 1:
         raise ValueError(
             "MLX CCE: targets must be a flat 1D vector "
-            f"(hidden.shape={hidden_compute.shape}, targets.shape={targets.shape})."
+            f"(hidden.shape={hidden_compute.shape}, targets.shape={targets_raw.shape})."
         )
     if n == 0:
         # surface upstream shape mismatch instead of silently dropping labels.
-        if targets.shape[0] != 0:
+        if targets_raw.shape[0] != 0:
             raise ValueError(
                 "MLX CCE: hidden has 0 tokens but targets is non-empty "
-                f"(targets.shape={targets.shape})."
+                f"(targets.shape={targets_raw.shape})."
             )
         empty = mx.zeros((0,), dtype=mx.float32)
         return empty, empty
-    if targets.shape[0] != n:
+    if targets_raw.shape[0] != n:
         raise ValueError(
             "MLX CCE: targets length does not match hidden token count "
-            f"(hidden.shape={hidden_compute.shape}, targets.shape={targets.shape})."
+            f"(hidden.shape={hidden_compute.shape}, targets.shape={targets_raw.shape})."
         )
+    # Compute validity in the original dtype before narrowing to int32, then
+    # cast for the kernels and downstream indexing.
+    valid_pre, invalid_pre = _target_validity_masks(
+        targets_raw, vocab_size, ignore_index,
+    )
+    targets = targets_raw.astype(mx.int32)
     compute_bytes = 2 if hidden_compute.dtype in (mx.float16, mx.bfloat16) else 4
     chunk_size = _resolve_chunk_size(
         chunk_size,
@@ -565,10 +573,9 @@ def _forward_chunked_fused_finalize(
             target_logit = mx.where(in_chunk, chunk_target, target_logit)
 
         lse = running_max + mx.log(running_sum_exp + 1e-9)
-        valid, invalid = _target_validity_masks(targets, vocab_size, ignore_index)
-        loss = mx.where(valid, lse - target_logit, mx.zeros_like(lse))
-        loss = _poison_invalid_targets(loss, invalid)
-        lse = _poison_invalid_targets(lse, invalid)
+        loss = mx.where(valid_pre, lse - target_logit, mx.zeros_like(lse))
+        loss = _poison_invalid_targets(loss, invalid_pre)
+        lse = _poison_invalid_targets(lse, invalid_pre)
         return loss, lse
 
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
@@ -609,9 +616,8 @@ def _forward_chunked_fused_finalize(
                 grid=(n * 256, 1, 1),
                 threadgroup=(256, 1, 1),
             )
-            _, invalid = _target_validity_masks(targets, vocab_size, ignore_index)
-            loss = _poison_invalid_targets(loss, invalid)
-            lse = _poison_invalid_targets(lse, invalid)
+            loss = _poison_invalid_targets(loss, invalid_pre)
+            lse = _poison_invalid_targets(lse, invalid_pre)
             return loss, lse
 
         running_max, running_sum_exp, target_logit = forward_update_kernel(
