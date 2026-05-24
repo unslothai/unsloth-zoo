@@ -1161,11 +1161,8 @@ def _apply_lora_metadata_to_wrapper(wrapped, scale, dropout):
 
 
 def _lora_from_base_compat(lora_cls, module, rank, scale, dropout):
-    """Call lora_cls.from_base with progressively older signatures.
-
-    Older mlx-lm releases reject scale/dropout kwargs. Falls back to the
-    minimum-arg form and restores scale/dropout on the wrapper directly.
-    """
+    """Call lora_cls.from_base; fall back through older signatures and restore
+    scale/dropout on the wrapper when the kwargs are rejected."""
     try:
         return lora_cls.from_base(module, r=rank, scale=scale, dropout=dropout)
     except TypeError:

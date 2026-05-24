@@ -2667,10 +2667,8 @@ def _get_mlx_config_quantization(model):
 def _get_mlx_dropout_probability(drop):
     if drop is None:
         return 0.0
-    # real MLX nn.Dropout stores keep-prob as _p_1; compat shims may set
-    # both .p (stale 0.0 default) and _p_1, so _p_1 wins when usable.
-    # Tolerate _p_1=None / non-numeric and fall back to .p instead of
-    # raising TypeError on float(None).
+    # MLX nn.Dropout stores keep-prob as _p_1; shims may also set a stale .p,
+    # so _p_1 wins when numeric and we fall back to .p otherwise.
     p1 = getattr(drop, "_p_1", None)
     if p1 is not None:
         try:
@@ -2692,15 +2690,28 @@ def _infer_mlx_lora_rank(module, a_attr="lora_a", b_attr="lora_b"):
     lora_a = getattr(module, a_attr, None)
     if lora_a is None and a_attr == "lora_a":
         lora_a = getattr(module, "lora_A", None)
+
+    # Check if it's a layer (mlx-lm tuner uses nn.Linear wrappers)
+    is_layer = False
+    if lora_a is not None and not hasattr(lora_a, "shape") and hasattr(lora_a, "weight"):
+        lora_a = lora_a.weight
+        is_layer = True
+
     lora_b = getattr(module, b_attr, None)
     if lora_b is None and b_attr == "lora_b":
         lora_b = getattr(module, "lora_B", None)
+
+    if lora_b is not None and not hasattr(lora_b, "shape") and hasattr(lora_b, "weight"):
+        lora_b = lora_b.weight
+        is_layer = True
+
     lora_a_shape = tuple(lora_a.shape) if lora_a is not None and hasattr(lora_a, "shape") else ()
     lora_b_shape = tuple(lora_b.shape) if lora_b is not None and hasattr(lora_b, "shape") else ()
     # Require both halves; a half-built LoRA module is not a reliable
     # rank source, so callers can move on to the next module.
     if not lora_a_shape or not lora_b_shape:
         return None
+
     # MoE/switch: lora_a (..., rank, in_dims); lora_b (..., out_dims, rank).
     if len(lora_a_shape) >= 3:
         if len(lora_b_shape) < 2:
@@ -2715,10 +2726,19 @@ def _infer_mlx_lora_rank(module, a_attr="lora_a", b_attr="lora_b"):
         ):
             return None
         return int(rank)
-    # Standard 2D LoRA: lora_a (in_dims, rank), lora_b (rank, out_dims).
-    if lora_a_shape[-1] != lora_b_shape[0]:
+
+    # Standard 2D LoRA:
+    # 1. mlx-lm layer convention: lora_a (rank, in), lora_b (out, rank)
+    if is_layer:
+        if lora_a_shape[0] == lora_b_shape[-1]:
+            return int(lora_a_shape[0])
         return None
-    return int(lora_a_shape[-1])
+
+    # 2. Raw array convention: lora_a (in, rank), lora_b (rank, out)
+    if lora_a_shape[-1] == lora_b_shape[0]:
+        return int(lora_a_shape[-1])
+
+    return None
 
 
 def _enrich_mlx_adapter_config(model, adapter_config):
@@ -2780,9 +2800,8 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
-    # why: record LoRA module paths and parameters so reload recreates the same
-    # adapter topology. Without scale metadata, reload falls back to scale=1.0
-    # even when training used alpha/r > 1, changing post-reload logits.
+    # why: persist module paths + rank/scale/dropout so reload reproduces logits;
+    # missing scale silently defaults to 1.0 even when training used alpha/r > 1.
     try:
         # distinguish "caller passed nothing" from "caller passed [] / None".
         explicit_paths = (
@@ -2790,9 +2809,8 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             if "unsloth_mlx_lora_module_paths" in adapter_config
             else None
         )
-        # why: an explicit empty list/tuple preserves caller-provided topology
-        # (the auto-fill below skips when the key is present) but must not
-        # suppress global LoRA parameter inference. Treat empty as "no filter".
+        # why: explicit empty list preserves caller topology but must not
+        # suppress global LoRA parameter inference; treat empty as "no filter".
         explicit_path_set = (
             set(explicit_paths)
             if isinstance(explicit_paths, (list, tuple)) and len(explicit_paths) > 0
