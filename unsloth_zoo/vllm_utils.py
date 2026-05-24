@@ -708,6 +708,14 @@ def patch_vllm_graph_capture():
     import time
     from functools import wraps
 
+    # vLLM may not be installed (e.g. arm64 wheels, CPU-only, or images
+    # built without the vllm extra). Bail out cleanly instead of raising
+    # NameError on the `vllm.__version__` check below.
+    try:
+        import vllm
+    except ImportError:
+        return
+
     @contextmanager
     def suppress_gc_collect():
         original_gc_collect = gc.collect
