@@ -2788,17 +2788,17 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 inferred_rank = _infer_mlx_lora_rank(module)
                 if inferred_rank is None:
                     continue
+                # only infer rank/scale/dropout from modules the caller
+                # actually selected; otherwise an earlier unrelated LoRA
+                # would write the wrong language-tower params.
+                if explicit_path_set is not None and name not in explicit_path_set:
+                    continue
                 if fallback_rank is None:
                     fallback_rank = inferred_rank
                     fallback_scale = float(getattr(module, "scale", 1.0))
                     fallback_dropout = _get_mlx_dropout_probability(
                         getattr(module, "dropout", None)
                     )
-                # only infer rank/scale/dropout from modules the caller
-                # actually selected; otherwise an earlier unrelated LoRA
-                # would write the wrong language-tower params.
-                if explicit_path_set is not None and name not in explicit_path_set:
-                    continue
                 if lora_rank is None:
                     lora_rank = inferred_rank
                     lora_scale = float(getattr(module, "scale", 1.0))
