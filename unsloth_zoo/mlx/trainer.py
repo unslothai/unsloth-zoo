@@ -1939,7 +1939,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             seed=42, chat_template=None,
                             model_name=None, model_type=None,
                             append_eos=True, dataset_order="default",
-                            preserve_dataset_order=False):
+                            preserve_dataset_order=False,
+                            num_epochs=None):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -2017,80 +2018,84 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             "Check your dataset and formatting_func."
         )
 
-    # 2. Apply the requested sample order BEFORE batching so labeled
-    # and unlabeled paths produce identical sample streams.
+    # 2. Determine sample ordering strategy. The labeled and unlabeled
+    # paths must agree at sample granularity or `dataset_order="torch_randperm"`
+    # produces a different sample stream under `train_on_responses_only(...)`.
     #   - preserve_dataset_order=True / "sequential": dataset order.
     #   - "torch_randperm": deterministic torch.randperm permutation
     #     (matches `create_ordered_batches` -> `_torch_randperm_order`
-    #     at utils.py:2845-2849).
+    #     at utils.py:2845-2849), reseeded per epoch.
     #   - default / None: legacy mlx-lm length-sort + per-batch shuffle.
-    # The labeled and unlabeled paths must agree at sample granularity
-    # or `dataset_order="torch_randperm"` produces a different sample
-    # stream under `train_on_responses_only(...)`.
     _order_requested = preserve_dataset_order or (
         dataset_order not in (None, "default")
     )
-    if preserve_dataset_order or dataset_order == "sequential":
-        pass
-    elif dataset_order == "torch_randperm":
-        from .utils import _torch_randperm_order
-        order = _torch_randperm_order(len(all_items), seed)
-        all_items = [all_items[i] for i in order]
-    elif dataset_order in (None, "default"):
-        all_items.sort(key=lambda x: len(x[0]))
-    else:
+    if dataset_order not in (None, "default", "sequential", "torch_randperm"):
         raise ValueError(
             f"Unsloth MLX: unsupported dataset_order={dataset_order!r}. "
             "Expected one of: None, 'default', 'sequential', "
             "'torch_randperm'."
         )
 
-    # 3. Create padded batches
+    def _order_samples_for_epoch(items, epoch_idx):
+        if preserve_dataset_order or dataset_order == "sequential":
+            return list(items)
+        if dataset_order == "torch_randperm":
+            from .utils import _torch_randperm_order
+            # Match unlabeled `create_ordered_batches`: reseed per epoch
+            # so the second epoch sees a different sample order rather
+            # than repeating the first.
+            order = _torch_randperm_order(len(items), seed + epoch_idx)
+            return [items[i] for i in order]
+        # legacy default: length-sort once
+        return sorted(items, key=lambda x: len(x[0]))
+
+    # 3. Materialize batches for one or many epochs.
+    # When `num_epochs > 1` and the caller requested a specific order, build
+    # `num_epochs * batches_per_epoch` batches up front so the trainer's
+    # `batches[batch_idx % len(batches)]` cycle reproduces the same per-epoch
+    # reseed semantics as the unlabeled `create_ordered_batches` path.
+    _n_epochs_materialize = (
+        max(1, int(num_epochs)) if num_epochs is not None else 1
+    )
     rng = random.Random(seed)
     batches = []
-    for start in range(0, len(all_items), batch_size):
-        batch_items = all_items[start:start + batch_size]
-        if not batch_items:
-            continue
-        max_len = max(len(ids) for ids, _ in batch_items)
-        # Match mlx-lm iterate_batches: +1 gives the autoregressive
-        # shift headroom so post-shift length is a clean _PAD_MULTIPLE.
-        padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
-        padded_len = min(padded_len, max_seq_length)
+    for epoch_idx in range(_n_epochs_materialize):
+        epoch_items = _order_samples_for_epoch(all_items, epoch_idx)
+        epoch_batches = []
+        for start in range(0, len(epoch_items), batch_size):
+            batch_items = epoch_items[start:start + batch_size]
+            if not batch_items:
+                continue
+            max_len = max(len(ids) for ids, _ in batch_items)
+            # Match mlx-lm iterate_batches: +1 gives the autoregressive
+            # shift headroom so post-shift length is a clean _PAD_MULTIPLE.
+            padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
+            padded_len = min(padded_len, max_seq_length)
 
-        batch_ids = []
-        batch_labels = []
-        batch_lengths = []
-        for ids, lbls in batch_items:
-            L = min(len(ids), padded_len)
-            pad_len = padded_len - L
-            batch_ids.append(ids[:L] + [0] * pad_len)
-            batch_labels.append(lbls[:L] + [-100] * pad_len)
-            # Right-half-open [start, end) to match the loss masks in
-            # utils.py:360/:393/:429/:439 (`steps < lengths[:, 1:]`).
-            # Pre-fix this was `[1, L - 1]` which paired with the old
-            # `<=` mask; the PR flipped the mask to `<` so the end
-            # value must shift up by one to keep training on the
-            # final supervised token.
-            batch_lengths.append([1, L])
+            batch_ids = []
+            batch_labels = []
+            batch_lengths = []
+            for ids, lbls in batch_items:
+                L = min(len(ids), padded_len)
+                pad_len = padded_len - L
+                batch_ids.append(ids[:L] + [0] * pad_len)
+                batch_labels.append(lbls[:L] + [-100] * pad_len)
+                # Right-half-open [start, end) to match the loss masks in
+                # utils.py:360/:393/:429/:439 (`steps < lengths[:, 1:]`).
+                batch_lengths.append([1, L])
 
-        batches.append((
-            mx.array(batch_ids),
-            mx.array(batch_lengths),
-            mx.array(batch_labels),
-        ))
+            epoch_batches.append((
+                mx.array(batch_ids),
+                mx.array(batch_lengths),
+                mx.array(batch_labels),
+            ))
 
-    # 4. Order the batch sequence.
-    #   - preserve_dataset_order / "sequential": keep batch order
-    #     (samples were already in their target order at step 2).
-    #   - "torch_randperm": batches mirror torch.randperm at the
-    #     sample level (step 2 above), so keep batch order here.
-    #   - default / None: legacy length-sort emitted near-contiguous
-    #     batches; shuffle them so adjacent steps are not similar.
-    if _order_requested:
-        pass
-    else:
-        rng.shuffle(batches)
+        # 4. Order the batch sequence within the epoch.
+        # legacy default (length-sort) gets a per-batch shuffle so adjacent
+        # steps are not similar; explicit-order paths keep the sample order.
+        if not _order_requested:
+            rng.shuffle(epoch_batches)
+        batches.extend(epoch_batches)
 
     # Limit if needed
     if num_batches is not None and len(batches) > num_batches:
@@ -2298,11 +2303,18 @@ def train_on_responses_only(
             append_eos=bool(getattr(args, "append_eos", True)),
             dataset_order=getattr(args, "dataset_order", "default"),
             preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
+            num_epochs=(
+                int(args.num_train_epochs)
+                if getattr(args, "num_train_epochs", -1) > 0
+                else None
+            ),
         )
 
         # Safety check: detect all-masked labels early
         _check_all_masked(batches)
-
+        trainer._prepared_batches_include_epochs = (
+            getattr(args, "num_train_epochs", -1) > 0
+        )
         trainer._batches = batches
 
         # Process eval dataset too
