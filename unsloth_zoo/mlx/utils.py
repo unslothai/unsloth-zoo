@@ -2554,6 +2554,26 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
             json.dump(adapter_config, f, indent=2)
 
 
+def _extract_mlx_lora_parameters(model):
+    """Extract global rank, scale, and dropout from the model's first LoRA module."""
+    rank, scale, dropout = 8, 1.0, 0.0
+    for _, m, a_attr, _ in iter_mlx_lora_modules(model):
+        a_tensor = getattr(m, a_attr)
+        a_shape = tuple(getattr(a_tensor, "shape", ()))
+        # mlx-lm LoRASwitchLinear stores (num_experts, rank, in_dims);
+        # standard LoRALinear stores (in_dims, rank).
+        if len(a_shape) >= 3:
+            rank = int(a_shape[-2])
+        elif len(a_shape) >= 2:
+            rank = int(a_shape[-1])
+        scale = getattr(m, "scale", 1.0)
+
+        drop = getattr(m, "dropout", None)
+        dropout = getattr(drop, "p", 0.0) if drop else 0.0
+        break
+    return rank, scale, dropout
+
+
 # mlx-lm uses lowercase pair; PEFT-style adapters may expose uppercase.
 _MLX_LORA_ATTR_PAIRS = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
 
@@ -2590,15 +2610,21 @@ def collect_mlx_lora_adapter_tensors(model):
 
 
 def save_trainable_adapters(model, path, adapter_config=None):
-    """Save the current trainable parameter tree for training checkpoints."""
-    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
-    if not trainable:
+    """Save the current trainable parameter tree for training checkpoints.
+
+    Includes all LoRA adapter tensors (frozen or not) to ensure the
+    artifact remains a valid, reloadable adapter file.
+    """
+    tensors = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    # Ensure all LoRA adapter tensors are included (frozen or not)
+    tensors.update(collect_mlx_lora_adapter_tensors(model))
+
+    if not tensors:
         raise ValueError(
-            "Unsloth: save_trainable_adapters() found no trainable parameters. "
-            "The model may be fully frozen. Use save_lora_adapters() to export "
-            "LoRA adapter weights from a frozen model."
+            "Unsloth: save_trainable_adapters() found no trainable or LoRA "
+            "parameters to save. The model may be fully frozen without LoRA."
         )
-    _save_adapter_artifacts(model, path, trainable, adapter_config=adapter_config)
+    _save_adapter_artifacts(model, path, tensors, adapter_config=adapter_config)
 
 
 def save_lora_adapters(model, path, adapter_config=None):
@@ -2781,6 +2807,19 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
+    # Ensure LoRA parameters are present for mlx-lm compatibility
+    if "lora_parameters" not in adapter_config:
+        rank, scale, dropout = _extract_mlx_lora_parameters(model)
+        adapter_config["lora_parameters"] = {
+            "rank": rank,
+            "scale": scale,
+            "dropout": dropout,
+        }
+        # mlx-vlm expects these at top level too
+        adapter_config.setdefault("rank", rank)
+        adapter_config.setdefault("scale", scale)
+        adapter_config.setdefault("dropout", dropout)
+
     # why: record LoRA module paths so reload recreates vision/projector LoRA
     # layers (mlx-lm.load_adapters only knows the language tower).
     try:
@@ -2933,7 +2972,9 @@ def save_pretrained_merged(
                 "layers — there's nothing to save. Use 'merged_16bit' instead."
             )
         trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
-        if set(trainable) - set(adapter_tensors):
+        has_trainable_non_lora = bool(set(trainable) - set(adapter_tensors))
+
+        if has_trainable_non_lora:
             save_trainable_adapters(model, save_directory)
         else:
             save_lora_adapters(model, save_directory)

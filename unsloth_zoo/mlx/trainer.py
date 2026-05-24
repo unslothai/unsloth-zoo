@@ -275,6 +275,8 @@ class MLXTrainer:
         other intentionally trainable non-LoRA parameters.
         """
         trainable = dict(tree_flatten(model.trainable_parameters()))
+        if not trainable:
+            return  # why safe: no trainable params means nothing to suspect-freeze, and the model may not implement parameters() (stub trainers exercised in test_adam_optimizers_enable_bias_correction).
         adapter_tensors = collect_mlx_lora_adapter_tensors(model)
         has_lora = any(name in trainable for name in adapter_tensors)
         if not has_lora:
@@ -1390,47 +1392,19 @@ class MLXTrainer:
     def save_model(self, output_dir=None):
         """Save LoRA adapters or full merged model (if no LoRA)."""
         from .utils import save_merged_model
+        from .utils import _extract_mlx_lora_parameters
         output_dir = output_dir or self.args.output_dir
 
-        # Reloaded LoRA: adapters live in parameters() but may be absent
-        # from trainable_parameters(); the old substring check fell through
-        # to save_merged_model(). Compute the trainable split here so we can
-        # also route mixed LoRA + non-LoRA fine-tunes to the right writer.
+        # Treat as a LoRA save whenever LoRA adapters exist. If we have
+        # trainable non-LoRA state (e.g. mixed fine-tune), it will be
+        # included in the adapter artifact via save_trainable_adapters().
         adapter_tensors = collect_mlx_lora_adapter_tensors(self.model)
-        adapter_keys = set(adapter_tensors)
-        trainable = dict(tree_flatten(self.model.trainable_parameters()))
-        trainable_keys = set(trainable)
-        has_trainable_lora = bool(adapter_keys & trainable_keys)
-        has_trainable_non_lora = bool(trainable_keys - adapter_keys)
-        # Treat as a LoRA save when adapters exist AND either LoRA is actively
-        # training, or there are no other trainables to preserve. Frozen LoRA
-        # with only non-LoRA trainables (norm-only fine-tune over a reloaded
-        # adapter) falls through to save_merged_model so trained non-LoRA
-        # state survives.
-        has_lora = bool(adapter_tensors) and (
-            has_trainable_lora or not has_trainable_non_lora
-        )
+        has_lora = bool(adapter_tensors)
 
         if has_lora:
             hf_repo = getattr(self.model, "_hf_repo", None) or ""
 
-
-            _lora_rank, _lora_scale, _lora_dropout = 8, 1.0, 0.0
-            for _, m, a_attr, _ in iter_mlx_lora_modules(self.model):
-                a_tensor = getattr(m, a_attr)
-                a_shape = tuple(getattr(a_tensor, "shape", ()))
-                # mlx-lm LoRASwitchLinear stores (num_experts, rank, in_dims);
-                # standard LoRALinear stores (in_dims, rank).
-                if len(a_shape) >= 3:
-                    _lora_rank = int(a_shape[-2])
-                elif len(a_shape) >= 2:
-                    _lora_rank = int(a_shape[-1])
-                _lora_scale = getattr(m, "scale", 1.0)
-
-                _drop = getattr(m, "dropout", None)
-                _lora_dropout = getattr(_drop, "p", 0.0) if _drop else 0.0
-                break
-
+            _lora_rank, _lora_scale, _lora_dropout = _extract_mlx_lora_parameters(self.model)
 
             from .utils import _get_transformer_layers
             layers = _get_transformer_layers(self.model)
@@ -1466,10 +1440,15 @@ class MLXTrainer:
                     self.model, "_unsloth_quantized_source", None,
                 ),
             }
+
             # Preserve intentionally trainable non-LoRA tensors (embeddings,
             # projector, vision, ...) by saving the full trainable tree when
             # the trainer touched anything beyond LoRA. Pure LoRA runs keep
             # the lean adapter-only artifact mlx-lm load_adapters() expects.
+            trainable = dict(tree_flatten(self.model.trainable_parameters()))
+            adapter_keys = set(adapter_tensors)
+            has_trainable_non_lora = bool(set(trainable) - adapter_keys)
+
             if has_trainable_non_lora:
                 save_trainable_adapters(
                     self.model, output_dir, adapter_config=adapter_config,
