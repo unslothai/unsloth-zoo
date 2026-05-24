@@ -627,6 +627,10 @@ def _forward_chunked_fused_finalize(
     raise RuntimeError("Unreachable: fused finalize path did not return outputs.")
 
 
+# why: lse must arrive pre-poisoned with NaN for invalid-label rows
+# (targets outside [0, vocab_size) and not equal to ignore_index).
+# This function does not re-check vocab bounds; NaN propagation through
+# exp(capped - NaN) = NaN is what produces NaN gradients for those rows.
 def _fallback_dlogits(
     logits: mx.array,
     lse: mx.array,
