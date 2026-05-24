@@ -65,6 +65,7 @@ from .utils import (
     normalize_vlm_processor_chat_template,
     collect_mlx_texts,
     save_trainable_adapters,
+    collect_mlx_lora_adapter_tensors,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -1383,8 +1384,11 @@ class MLXTrainer:
         from .utils import save_merged_model
         output_dir = output_dir or self.args.output_dir
 
-        trainable = dict(tree_flatten(self.model.trainable_parameters()))
-        has_lora = any("lora" in k for k in trainable)
+        # detect LoRA from the full parameter tree, not trainable_parameters():
+        # after a reload/freeze, adapter tensors live in parameters() but are
+        # not necessarily marked trainable, and the previous trainable-only
+        # check let final export fall through to save_merged_model().
+        has_lora = bool(collect_mlx_lora_adapter_tensors(self.model))
 
         if has_lora:
             hf_repo = getattr(self.model, "_hf_repo", None) or ""

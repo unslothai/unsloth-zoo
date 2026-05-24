@@ -2550,8 +2550,27 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
 
     adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
     if adapter_config:
-        with open(path / "adapter_config.json", "w") as f:
+        with open(path / "adapter_config.json", "w", encoding="utf-8") as f:
             json.dump(adapter_config, f, indent=2)
+
+
+def collect_mlx_lora_adapter_tensors(model):
+    """Collect tensors for every module that exposes lora_a/lora_b.
+
+    Anchors on the modules themselves, not a substring of the flattened
+    parameter name, so unrelated paths containing 'lora_'
+    (e.g. ``router.lora_gate.weight``) are not exported, and so callers
+    can detect LoRA after reload/freeze when trainable_parameters() no
+    longer lists adapter tensors.
+    """
+    parameters = dict(mlx.utils.tree_flatten(model.parameters()))
+    adapter_keys = set()
+    for module_name, module in model.named_modules():
+        for attr in ("lora_a", "lora_b", "lora_A", "lora_B"):
+            if hasattr(module, attr):
+                key = f"{module_name}.{attr}" if module_name else attr
+                adapter_keys.add(key)
+    return {name: value for name, value in parameters.items() if name in adapter_keys}
 
 
 def save_trainable_adapters(model, path, adapter_config=None):
@@ -2561,25 +2580,21 @@ def save_trainable_adapters(model, path, adapter_config=None):
 
 
 def save_lora_adapters(model, path, adapter_config=None):
-    """Save LoRA adapter weights to disk.
+    """Save LoRA adapter weights (lora_a / lora_b only) to disk.
 
     Args:
-        model: MLX model with LoRA layers.
+        model: MLX model with LoRA-wrapped modules.
         path: Directory to save adapters.
         adapter_config: Optional dict with LoRA config metadata.
     """
-    parameters = dict(mlx.utils.tree_flatten(model.parameters()))
-    adapter_tensors = {
-        name: value
-        for name, value in parameters.items()
-        if "lora_" in name.lower()
-    }
-
+    adapter_tensors = collect_mlx_lora_adapter_tensors(model)
     if not adapter_tensors:
         raise ValueError(
-            "Unsloth: no MLX LoRA adapter tensors were found to save."
+            "Unsloth: no MLX LoRA adapter tensors were found to save. "
+            "The model may have no LoRA layers, or adapters may have been "
+            "merged. Use save_trainable_adapters() to checkpoint non-LoRA "
+            "trainable state instead."
         )
-
     _save_adapter_artifacts(
         model, path, adapter_tensors, adapter_config=adapter_config
     )
