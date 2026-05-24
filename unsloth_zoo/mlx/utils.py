@@ -2766,31 +2766,49 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             if "unsloth_mlx_lora_module_paths" in adapter_config
             else None
         )
+        # why: an explicit empty list/tuple preserves caller-provided topology
+        # (the auto-fill below skips when the key is present) but must not
+        # suppress global LoRA parameter inference. Treat empty as "no filter".
         explicit_path_set = (
-            set(explicit_paths) if isinstance(explicit_paths, (list, tuple)) else None
+            set(explicit_paths)
+            if isinstance(explicit_paths, (list, tuple)) and len(explicit_paths) > 0
+            else None
         )
 
         lora_paths = []
         lora_rank = None
         lora_scale = None
         lora_dropout = None
+        fallback_rank = None
+        fallback_scale = None
+        fallback_dropout = None
         for name, module in model.named_modules():
             if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
                 lora_paths.append(name)
+                inferred_rank = _infer_mlx_lora_rank(module)
+                if inferred_rank is None:
+                    continue
+                if fallback_rank is None:
+                    fallback_rank = inferred_rank
+                    fallback_scale = float(getattr(module, "scale", 1.0))
+                    fallback_dropout = _get_mlx_dropout_probability(
+                        getattr(module, "dropout", None)
+                    )
                 # only infer rank/scale/dropout from modules the caller
                 # actually selected; otherwise an earlier unrelated LoRA
                 # would write the wrong language-tower params.
                 if explicit_path_set is not None and name not in explicit_path_set:
                     continue
                 if lora_rank is None:
-                    inferred_rank = _infer_mlx_lora_rank(module)
-                    if inferred_rank is None:
-                        continue
                     lora_rank = inferred_rank
                     lora_scale = float(getattr(module, "scale", 1.0))
                     lora_dropout = _get_mlx_dropout_probability(
                         getattr(module, "dropout", None)
                     )
+        if lora_rank is None and fallback_rank is not None:
+            lora_rank = fallback_rank
+            lora_scale = fallback_scale
+            lora_dropout = fallback_dropout
 
         # only auto-fill when caller did not supply the key at all.
         if lora_paths and "unsloth_mlx_lora_module_paths" not in adapter_config:

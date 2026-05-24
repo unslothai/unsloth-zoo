@@ -1128,7 +1128,18 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
                 module, r=rank, scale=scale, dropout=dropout,
             )
         except TypeError:
-            wrapped = lora_cls.from_base(module)
+            try:
+                wrapped = lora_cls.from_base(module, r=rank)
+            except TypeError:
+                wrapped = lora_cls.from_base(module)
+            # why: from_base() without scale kwarg leaves the default scale
+            # (typically 1.0). LoRA scale is a Python attribute, not a
+            # checkpoint tensor, so load_weights() will not restore it.
+            if hasattr(wrapped, "scale"):
+                try:
+                    wrapped.scale = scale
+                except Exception:
+                    pass
         parent_path, _, leaf = name.rpartition(".")
         parent = by_name.get(parent_path, model) if parent_path else model
         if hasattr(parent, leaf):
