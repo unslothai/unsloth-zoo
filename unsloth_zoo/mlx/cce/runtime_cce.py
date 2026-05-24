@@ -126,8 +126,14 @@ def _target_validity_masks(
 
 
 def _poison_invalid_targets(values: mx.array, invalid: mx.array) -> mx.array:
-    # scalar NaN broadcasts; avoids O(n) alloc on every forward call.
-    return mx.where(invalid, mx.array(float("nan"), dtype=values.dtype), values)
+    # mx.full produces a real tensor; a 0-d scalar gets baked into the
+    # Metal kernel as the literal token `nan` which the Metal C++
+    # tokenizer rejects (use of undeclared identifier 'nan').
+    return mx.where(
+        invalid,
+        mx.full(values.shape, float("nan"), dtype=values.dtype),
+        values,
+    )
 
 
 def _chunk_matmul(
