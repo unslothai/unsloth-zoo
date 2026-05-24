@@ -57,6 +57,27 @@ def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
         runtime_cce(hidden, weight, targets)
 
 
+def test_runtime_cce_rejects_non_flat_targets():
+    # rank-2 (n, 1) targets would slip past the length check and crash inside
+    # the kernels; reject up front with a clear ValueError instead.
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    runtime_cce, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100,
+        chunk_size=16,
+    )
+    hidden = mx.zeros((4, 16), dtype=mx.float32)
+    weight = mx.zeros((32, 16), dtype=mx.float32)
+    targets_2d = mx.zeros((4, 1), dtype=mx.int32)
+    targets_scalar = mx.array(0, dtype=mx.int32)
+
+    with pytest.raises(ValueError, match="flat 1D vector"):
+        runtime_cce(hidden, weight, targets_2d)
+    with pytest.raises(ValueError, match="flat 1D vector"):
+        runtime_cce(hidden, weight, targets_scalar)
+
+
 def test_runtime_cce_zero_tokens_returns_empty_losses_and_zero_gradients():
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss

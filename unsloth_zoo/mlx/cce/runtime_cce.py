@@ -495,6 +495,13 @@ def _forward_chunked_fused_finalize(
 
     n, _ = hidden_compute.shape
     vocab_size = weight_compute.shape[0]
+    # targets must be a flat 1D vector; rank-2 inputs like (n, 1) would slip
+    # past the length check and explode later inside kernels.
+    if len(targets.shape) != 1:
+        raise ValueError(
+            "MLX CCE: targets must be a flat 1D vector "
+            f"(hidden.shape={hidden_compute.shape}, targets.shape={targets.shape})."
+        )
     if n == 0:
         # surface upstream shape mismatch instead of silently dropping labels.
         if targets.shape[0] != 0:
