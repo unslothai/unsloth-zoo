@@ -2059,7 +2059,7 @@ def check_libcurl_dev():
             return False, package_name
 
     elif system_type == "rpm":
-        package_name = "libcurl-dev"
+        package_name = "libcurl-devel"
         try:
             result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True)
             is_installed = result.returncode == 0
