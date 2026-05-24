@@ -75,7 +75,6 @@ from .compile import (
     build_compile_policy,
     explain_compile_support,
     get_compile_qualification,
-    get_model_architecture,
     normalize_mlx_patch_mode,
     resolve_training_compile,
     trace_compile_application,
@@ -869,79 +868,92 @@ class MLXTrainer:
             )
         except Exception:
             pass
-        _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
-        if cast_norm_output:
-            print("Unsloth: Casting MLX norm outputs back to activation dtype.")
-        args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
-        model._unsloth_patch_mode = args.patch_mode
-
-        self._memory_limits_applied = self._configure_memory_limits()
-
-        self._compile_decision = None
-        self._compile_trace = None
-        self._compile_auto_tune_applied = []
-        if self._is_vlm and (args.compile or args.compile_trace):
-            compile_policy = build_compile_policy(args=args)
-            qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
-            if qual is not None:
-                model._unsloth_compile_qualification = qual
-            self._compile_decision = resolve_training_compile(model, policy=compile_policy, args=args)
-            model._unsloth_compile_decision = self._compile_decision
-            if args.compile_trace:
-                self._compile_trace = trace_compile_application(model, policy=compile_policy, args=args)
-                model._unsloth_compile_trace = self._compile_trace
-                model._unsloth_compile_explain = explain_compile_support(model, policy=compile_policy, args=args)
-            if args.compile_auto_tune:
-                self._compile_auto_tune_applied = self._apply_compile_recommendations(
-                    args, self._compile_decision
-                )
-                for setting, value, reason in self._compile_auto_tune_applied:
-                    print(
-                        f"Unsloth: Auto-tuned {setting}={value!r} for MLX compile "
-                        f"({reason})"
-                    )
-
-        # (memory limits already applied above; just log what we configured)
-        if self._memory_limits_applied:
-            parts = []
-            if "memory_limit_gb" in self._memory_limits_applied:
-                parts.append(
-                    f"memory_limit={self._memory_limits_applied['memory_limit_gb']:.2f} GB"
-                )
-            if "cache_limit_gb" in self._memory_limits_applied:
-                parts.append(
-                    f"cache_limit={self._memory_limits_applied['cache_limit_gb']:.2f} GB"
-                )
-            if "wired_limit_gb" in self._memory_limits_applied:
-                parts.append(
-                    f"wired_limit={self._memory_limits_applied['wired_limit_gb']:.2f} GB"
-                )
-            print(
-                "Unsloth: MLX Metal memory guard enabled "
-                f"({', '.join(parts)})."
-            )
-
-        # Apply gradient checkpointing if requested
-        if args.gradient_checkpointing:
-            apply_gradient_checkpointing(model)
-            print("Unsloth: Using gradient checkpointing to reduce memory.")
-
-        # Qwen3.5-specific fixes
-        config = getattr(model, "_config", {})
-        model_type = config.get("model_type", "") if isinstance(config, dict) else ""
-        if "qwen3_5" in model_type:
-            from .loader import _fix_qwen35_attention_cache
-            _fix_qwen35_attention_cache(model)
-            from ..gated_delta_vjp import patch_gated_delta
-            patch_gated_delta()
-
+        # Install the norm-output cast INSIDE the try/finally so a raise
+        # during any of the steps below (patch-mode normalization, memory
+        # limit configuration, compile policy, gradient checkpointing,
+        # Qwen3.5 preflight) still triggers the cleanup that restores the
+        # global RMSNorm / LayerNorm / Qwen3-VL flags.
+        _norm_cast_applied = False
         try:
+            _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
+            _norm_cast_applied = True
+            if cast_norm_output:
+                print("Unsloth: Casting MLX norm outputs back to activation dtype.")
+            args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
+            model._unsloth_patch_mode = args.patch_mode
+
+            self._memory_limits_applied = self._configure_memory_limits()
+
+            self._compile_decision = None
+            self._compile_trace = None
+            self._compile_auto_tune_applied = []
+            if self._is_vlm and (args.compile or args.compile_trace):
+                compile_policy = build_compile_policy(args=args)
+                qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
+                if qual is not None:
+                    model._unsloth_compile_qualification = qual
+                self._compile_decision = resolve_training_compile(model, policy=compile_policy, args=args)
+                model._unsloth_compile_decision = self._compile_decision
+                if args.compile_trace:
+                    self._compile_trace = trace_compile_application(model, policy=compile_policy, args=args)
+                    model._unsloth_compile_trace = self._compile_trace
+                    model._unsloth_compile_explain = explain_compile_support(model, policy=compile_policy, args=args)
+                if args.compile_auto_tune:
+                    self._compile_auto_tune_applied = self._apply_compile_recommendations(
+                        args, self._compile_decision
+                    )
+                    for setting, value, reason in self._compile_auto_tune_applied:
+                        print(
+                            f"Unsloth: Auto-tuned {setting}={value!r} for MLX compile "
+                            f"({reason})"
+                        )
+
+            # (memory limits already applied above; just log what we configured)
+            if self._memory_limits_applied:
+                parts = []
+                if "memory_limit_gb" in self._memory_limits_applied:
+                    parts.append(
+                        f"memory_limit={self._memory_limits_applied['memory_limit_gb']:.2f} GB"
+                    )
+                if "cache_limit_gb" in self._memory_limits_applied:
+                    parts.append(
+                        f"cache_limit={self._memory_limits_applied['cache_limit_gb']:.2f} GB"
+                    )
+                if "wired_limit_gb" in self._memory_limits_applied:
+                    parts.append(
+                        f"wired_limit={self._memory_limits_applied['wired_limit_gb']:.2f} GB"
+                    )
+                print(
+                    "Unsloth: MLX Metal memory guard enabled "
+                    f"({', '.join(parts)})."
+                )
+
+            # Apply gradient checkpointing if requested
+            if args.gradient_checkpointing:
+                apply_gradient_checkpointing(model)
+                print("Unsloth: Using gradient checkpointing to reduce memory.")
+
+            # Qwen3.5-specific fixes
+            config = getattr(model, "_config", {})
+            model_type = config.get("model_type", "") if isinstance(config, dict) else ""
+            if "qwen3_5" in model_type:
+                from .loader import _fix_qwen35_attention_cache
+                _fix_qwen35_attention_cache(model)
+                from ..gated_delta_vjp import patch_gated_delta
+                patch_gated_delta()
+
             return self._train_inner()
         finally:
             if args.gradient_checkpointing:
-                remove_gradient_checkpointing(model)
-            self._restore_memory_limits()
-            if cast_norm_output:
+                try:
+                    remove_gradient_checkpointing(model)
+                except Exception:
+                    pass
+            try:
+                self._restore_memory_limits()
+            except Exception:
+                pass
+            if _norm_cast_applied and cast_norm_output:
                 # Undo the global norm-class monkey patch so later
                 # inference / unrelated trainers in the same Python
                 # process get the original RMSNorm / LayerNorm dtype
@@ -2005,16 +2017,33 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             "Check your dataset and formatting_func."
         )
 
-    # 2. Sort by length for efficient padding -- but only when the caller
-    # has NOT requested a specific dataset_order. Length sorting is the
-    # default mlx-lm pattern that improves padding efficiency, but it
-    # breaks `preserve_dataset_order=True` (Studio CUDA parity) and
-    # `dataset_order="torch_randperm"` (deterministic shuffle).
+    # 2. Apply the requested sample order BEFORE batching so labeled
+    # and unlabeled paths produce identical sample streams.
+    #   - preserve_dataset_order=True / "sequential": dataset order.
+    #   - "torch_randperm": deterministic torch.randperm permutation
+    #     (matches `create_ordered_batches` -> `_torch_randperm_order`
+    #     at utils.py:2845-2849).
+    #   - default / None: legacy mlx-lm length-sort + per-batch shuffle.
+    # The labeled and unlabeled paths must agree at sample granularity
+    # or `dataset_order="torch_randperm"` produces a different sample
+    # stream under `train_on_responses_only(...)`.
     _order_requested = preserve_dataset_order or (
         dataset_order not in (None, "default")
     )
-    if not _order_requested:
+    if preserve_dataset_order or dataset_order == "sequential":
+        pass
+    elif dataset_order == "torch_randperm":
+        from .utils import _torch_randperm_order
+        order = _torch_randperm_order(len(all_items), seed)
+        all_items = [all_items[i] for i in order]
+    elif dataset_order in (None, "default"):
         all_items.sort(key=lambda x: len(x[0]))
+    else:
+        raise ValueError(
+            f"Unsloth MLX: unsupported dataset_order={dataset_order!r}. "
+            "Expected one of: None, 'default', 'sequential', "
+            "'torch_randperm'."
+        )
 
     # 3. Create padded batches
     rng = random.Random(seed)
@@ -2052,16 +2081,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         ))
 
     # 4. Order the batch sequence.
-    #   - preserve_dataset_order=True: emit in dataset order (Studio CUDA
-    #     SequentialSampler parity).
-    #   - dataset_order="torch_randperm": deterministic shuffle seeded by
-    #     `seed`, matching the non-labeled `create_ordered_batches` path.
-    #   - default: legacy length-sorted-then-shuffled behavior.
-    if preserve_dataset_order:
-        pass
-    elif dataset_order == "torch_randperm":
-        rng.shuffle(batches)
-    elif dataset_order == "sequential":
+    #   - preserve_dataset_order / "sequential": keep batch order
+    #     (samples were already in their target order at step 2).
+    #   - "torch_randperm": batches mirror torch.randperm at the
+    #     sample level (step 2 above), so keep batch order here.
+    #   - default / None: legacy length-sort emitted near-contiguous
+    #     batches; shuffle them so adjacent steps are not similar.
+    if _order_requested:
         pass
     else:
         rng.shuffle(batches)
@@ -2072,8 +2098,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     # Evaluate all tensors
     all_tensors = []
-    for b, l, lb in batches:
-        all_tensors.extend([b, l, lb])
+    for batch_arr, lengths_arr, labels_arr in batches:
+        all_tensors.extend([batch_arr, lengths_arr, labels_arr])
     mx.eval(all_tensors)
 
     return batches

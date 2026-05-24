@@ -719,6 +719,10 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             # externally supplied labels compatible.
             targets = labels[:, 1:]
             targets = _mask_image_tokens(targets, _image_token_ids)
+            # Apply train_on_completions prompt masking even when labels
+            # were preset by _apply_vlm_label_masks (which only handles
+            # image/pad/ignore tokens, not assistant-token boundaries).
+            targets = _mask_prompt_tokens(targets, _assistant_token_id)
             logits, targets = _align_logits_with_labels(logits, targets)
             if attention_mask is not None:
                 length_mask = attention_mask[:, 1:][:, :targets.shape[1]]
@@ -907,6 +911,12 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
             masked_targets,
             -100,
         )
+        # Completion-only masking also has to run in the labels-aware
+        # branch because _apply_vlm_label_masks does not apply it. Pre-fix
+        # this was only applied in the labels=None branch, so VLM
+        # train_on_completions=True trained on prompt tokens whenever
+        # collation set batch["labels"].
+        masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
         ntoks = (masked_targets != -100).sum()
     else:
         targets = input_ids[:, 1:]
@@ -2804,7 +2814,10 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         if num_batches is not None and len(batch_pairs) >= num_batches:
             break
 
-    mx.eval([b for b, l, _ in batch_pairs] + [l for _, l, _ in batch_pairs])
+    mx.eval(
+        [b for b, lengths, _ in batch_pairs]
+        + [lengths for _, lengths, _ in batch_pairs]
+    )
     return batch_pairs
 
 
@@ -2879,7 +2892,13 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         # instead of mixing the last sample of one epoch with the first
         # sample of the next inside the same micro-batch.
         if order_pos >= len(order):
-            if num_batches is None:
+            # No more rows in this epoch. Stop only when we have hit
+            # either the requested number of batches or the requested
+            # total sample count (num_epochs * len(dataset)).
+            if (
+                num_batches is None
+                and (target_items is None or seen >= target_items)
+            ):
                 break
             epoch += 1
             order = make_order(epoch)
@@ -2915,7 +2934,10 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         if num_batches is None and target_items is not None and seen >= target_items:
             break
 
-    mx.eval([b for b, l, _ in batch_pairs] + [l for _, l, _ in batch_pairs])
+    mx.eval(
+        [b for b, lengths, _ in batch_pairs]
+        + [lengths for _, lengths, _ in batch_pairs]
+    )
     return batch_pairs
 
 
@@ -3401,7 +3423,6 @@ def save_pretrained_gguf(
     from ..llama_cpp import (
         convert_to_gguf,
         quantize_gguf,
-        install_llama_cpp,
         check_llama_cpp,
         _download_convert_hf_to_gguf,
     )

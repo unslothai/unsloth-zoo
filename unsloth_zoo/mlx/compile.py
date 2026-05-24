@@ -2103,7 +2103,6 @@ def _masked_scatter_no_numpy(final_embedding, image_mask_expanded, scaled_image_
     import mlx.core as mx
 
     final_shape = final_embedding.shape
-    hidden_dim = final_shape[-1]
     flat_mask = image_mask_expanded.reshape((-1,))
     flat_output = final_embedding.reshape((-1,))
     flat_features = scaled_image_features.reshape((-1,))
@@ -2437,7 +2436,6 @@ def _install_qwen2_5_compile_patches():
     def patched_qwen2_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
         explicit_position_ids = kwargs.get("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
@@ -2571,7 +2569,6 @@ def _install_qwen2_compile_patches():
         return rotary_pos_emb_full.reshape(pos_ids.shape[0], -1)
 
     def patched_qwen2_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
-        import mlx.core as mx
 
         grid_spec = _grid_to_tuple(grid_thw)
         hidden_states = self.patch_embed(hidden_states)
@@ -2591,7 +2588,6 @@ def _install_qwen2_compile_patches():
     def patched_qwen2_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
         explicit_position_ids = kwargs.get("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
@@ -2873,7 +2869,6 @@ def _install_qwen3_family_compile_patches():
         return mx.concatenate(patch_pos_embeds_permute)
 
     def patched_qwen3_vision_call(self, hidden_states, grid_thw, **kwargs):
-        import mlx.core as mx
 
         grid_spec = _grid_to_tuple(grid_thw)
         hidden_states = self.patch_embed(hidden_states)
@@ -2908,7 +2903,6 @@ def _install_qwen3_family_compile_patches():
     def patched_qwen3_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
         explicit_position_ids = kwargs.get("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
@@ -2956,7 +2950,6 @@ def _install_qwen3_family_compile_patches():
     def patched_qwen35_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
         explicit_position_ids = kwargs.get("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
@@ -3100,7 +3093,6 @@ def _install_glm_ocr_compile_patches():
         return (mx.cos(emb), mx.sin(emb)), pos_ids
 
     def patched_glm_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
-        import mlx.core as mx
 
         grid_spec = _grid_to_tuple(grid_thw)
         hidden_states = self.patch_embed(hidden_states)
@@ -3129,7 +3121,6 @@ def _install_glm_ocr_compile_patches():
     def patched_glm_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
         explicit_position_ids = kwargs.get("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
@@ -3311,7 +3302,6 @@ def _install_paddleocr_vl_compile_patches():
         return rotary_pos_emb_full.reshape(pos_ids.shape[0], -1)
 
     def patched_paddle_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
-        import mlx.core as mx
 
         grid_spec = _grid_to_tuple(grid_thw)
         hidden_states = self.embeddings(hidden_states, grid_spec)
@@ -3436,7 +3426,6 @@ def _install_qwen3_get_input_embeddings_patch():
     def patched_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:

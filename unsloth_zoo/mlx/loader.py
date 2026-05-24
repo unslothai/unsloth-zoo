@@ -27,7 +27,6 @@ import importlib
 import inspect
 import math
 import os
-import sys
 import types
 import warnings
 from contextlib import contextmanager
@@ -117,7 +116,6 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     """
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
-    from ..model_lists import FORCE_FLOAT32
     cast_pred = getattr(model, "cast_predicate", lambda _: True)
 
     needs_cast = False
@@ -652,8 +650,6 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
     if tree_unflatten is None or tree_flatten is None:
         return
 
-    original_sanitize = sanitize
-
     def patched_sanitize(self, weights):
         structured = tree_unflatten(list(weights.items()))
         target = structured.get("model")
@@ -1124,7 +1120,6 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
     scale = float(lora_params.get("scale", adapter_cfg.get("scale", 1.0)))
     dropout = float(lora_params.get("dropout", adapter_cfg.get("dropout", 0.0)))
 
-    wanted = set(module_paths)
     by_name = dict(model.named_modules())
     linear_types = (nn.Linear, nn.QuantizedLinear)
     for name in module_paths:
