@@ -273,7 +273,7 @@ class MLXTrainer:
         other intentionally trainable non-LoRA parameters.
         """
         trainable = dict(tree_flatten(model.trainable_parameters()))
-        has_lora = bool(collect_mlx_lora_adapter_tensors(model))
+        has_lora = any(name in trainable for name in collect_mlx_lora_adapter_tensors(model))
         if not has_lora:
             return  # Not a LoRA model — don't touch
 

@@ -2906,10 +2906,8 @@ def save_pretrained_merged(
             f"Use 'lora', 'merged_16bit', or 'merged_4bit'."
         )
 
-    has_lora = bool(collect_mlx_lora_adapter_tensors(model))
-
     if method == "lora":
-        if not has_lora:
+        if not collect_mlx_lora_adapter_tensors(model):
             raise ValueError(
                 "Unsloth: save_method='lora' but the model has no LoRA "
                 "layers — there's nothing to save. Use 'merged_16bit' instead."
