@@ -2686,9 +2686,15 @@ def _get_mlx_dropout_probability(drop):
     return 0.0
 
 
-def _infer_mlx_lora_rank(module):
-    lora_a = getattr(module, "lora_a", None)
-    lora_b = getattr(module, "lora_b", None)
+def _infer_mlx_lora_rank(module, a_attr="lora_a", b_attr="lora_b"):
+    # also fall back to PEFT-style uppercase pair (lora_A / lora_B) so a
+    # later collector that selects uppercase modules can still infer rank.
+    lora_a = getattr(module, a_attr, None)
+    if lora_a is None and a_attr == "lora_a":
+        lora_a = getattr(module, "lora_A", None)
+    lora_b = getattr(module, b_attr, None)
+    if lora_b is None and b_attr == "lora_b":
+        lora_b = getattr(module, "lora_B", None)
     lora_a_shape = tuple(lora_a.shape) if lora_a is not None and hasattr(lora_a, "shape") else ()
     lora_b_shape = tuple(lora_b.shape) if lora_b is not None and hasattr(lora_b, "shape") else ()
     # Require both halves; a half-built LoRA module is not a reliable
@@ -2793,27 +2799,36 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             else None
         )
 
+        # cover both mlx-lm (lower) and PEFT-style (upper) attribute pairs;
+        # require both halves to avoid recording half-built modules.
+        _lora_attr_pairs = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
         lora_paths = []
         lora_rank = None
         lora_scale = None
         lora_dropout = None
         for name, module in model.named_modules():
-            if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
-                lora_paths.append(name)
-                inferred_rank = _infer_mlx_lora_rank(module)
-                if inferred_rank is None:
-                    continue
-                # only infer rank/scale/dropout from modules the caller
-                # actually selected; otherwise an earlier unrelated LoRA
-                # would write the wrong language-tower params.
-                if explicit_path_set is not None and name not in explicit_path_set:
-                    continue
-                if lora_rank is None:
-                    lora_rank = inferred_rank
-                    lora_scale = float(getattr(module, "scale", 1.0))
-                    lora_dropout = _get_mlx_dropout_probability(
-                        getattr(module, "dropout", None)
-                    )
+            attr_pair = None
+            for a_attr, b_attr in _lora_attr_pairs:
+                if hasattr(module, a_attr) and hasattr(module, b_attr):
+                    attr_pair = (a_attr, b_attr)
+                    break
+            if attr_pair is None:
+                continue
+            lora_paths.append(name)
+            inferred_rank = _infer_mlx_lora_rank(module, *attr_pair)
+            if inferred_rank is None:
+                continue
+            # only infer rank/scale/dropout from modules the caller
+            # actually selected; otherwise an earlier unrelated LoRA
+            # would write the wrong language-tower params.
+            if explicit_path_set is not None and name not in explicit_path_set:
+                continue
+            if lora_rank is None:
+                lora_rank = inferred_rank
+                lora_scale = float(getattr(module, "scale", 1.0))
+                lora_dropout = _get_mlx_dropout_probability(
+                    getattr(module, "dropout", None)
+                )
 
         # only auto-fill when caller did not supply the key at all.
         if lora_paths and "unsloth_mlx_lora_module_paths" not in adapter_config:

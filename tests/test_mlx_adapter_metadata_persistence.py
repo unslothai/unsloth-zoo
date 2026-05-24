@@ -59,6 +59,15 @@ class _FakeLoRAModule:
         self.dropout = dropout
 
 
+class _FakeLoRAModuleUpper:
+    # PEFT-style adapters expose uppercase tensor names.
+    def __init__(self, lora_A, lora_B, scale=1.0, dropout=None):
+        self.lora_A = _FakeArray(lora_A)
+        self.lora_B = _FakeArray(lora_B)
+        self.scale = scale
+        self.dropout = dropout
+
+
 class _FakeModel:
     def __init__(self, modules):
         self._modules = modules
@@ -192,6 +201,30 @@ def test_enrich_does_not_raise_on_module_with_none_tensors():
     cfg = mlx_utils._enrich_mlx_adapter_config(model, {})
     assert cfg["rank"] == 4
     assert cfg["scale"] == 2.0
+
+
+def test_infer_rank_supports_uppercase_lora_pair():
+    # PEFT-style modules expose lora_A / lora_B. _infer_mlx_lora_rank must
+    # still recover the rank when the uppercase pair is the only one present.
+    mlx_utils = _load_utils()
+    upper = _FakeLoRAModuleUpper((512, 4), (4, 512))
+    assert mlx_utils._infer_mlx_lora_rank(upper) == 4
+
+
+def test_enrich_uppercase_lora_module_recorded_with_metadata():
+    # _enrich_mlx_adapter_config should also record uppercase LoRA modules
+    # so a future loader can recreate the matching wrappers.
+    mlx_utils = _load_utils()
+    model = _FakeModel([
+        ("layers.0.q_proj", _FakeLoRAModuleUpper(
+            (512, 4), (4, 512), scale=2.5, dropout=_FakeDropout(0.75),
+        )),
+    ])
+    cfg = mlx_utils._enrich_mlx_adapter_config(model, {})
+    assert cfg["unsloth_mlx_lora_module_paths"] == ["layers.0.q_proj"]
+    assert cfg["rank"] == 4
+    assert cfg["scale"] == 2.5
+    assert abs(cfg["dropout"] - 0.25) < 1e-9
 
 
 def test_typeerror_fallback_restores_scale_and_dropout_via_p1():
