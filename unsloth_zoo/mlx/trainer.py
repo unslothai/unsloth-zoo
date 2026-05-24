@@ -1384,10 +1384,9 @@ class MLXTrainer:
         from .utils import save_merged_model
         output_dir = output_dir or self.args.output_dir
 
-        # detect LoRA from the full parameter tree, not trainable_parameters():
-        # after a reload/freeze, adapter tensors live in parameters() but are
-        # not necessarily marked trainable, and the previous trainable-only
-        # check let final export fall through to save_merged_model().
+        # Reloaded LoRA: adapters live in parameters() but may be absent
+        # from trainable_parameters(); the old substring check fell through
+        # to save_merged_model().
         has_lora = bool(collect_mlx_lora_adapter_tensors(self.model))
 
         if has_lora:
