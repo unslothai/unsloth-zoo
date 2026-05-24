@@ -2906,7 +2906,7 @@ def save_pretrained_merged(
             f"Use 'lora', 'merged_16bit', or 'merged_4bit'."
         )
 
-    has_lora = any(hasattr(m, "fuse") for _, m in model.named_modules())
+    has_lora = bool(collect_mlx_lora_adapter_tensors(model))
 
     if method == "lora":
         if not has_lora:
