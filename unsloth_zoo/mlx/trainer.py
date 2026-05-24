@@ -916,6 +916,16 @@ class MLXTrainer:
             if args.gradient_checkpointing:
                 remove_gradient_checkpointing(model)
             self._restore_memory_limits()
+            if cast_norm_output:
+                # Undo the global norm-class monkey patch so later
+                # inference / unrelated trainers in the same Python
+                # process get the original RMSNorm / LayerNorm dtype
+                # behavior. Wrap in try/except: a partially patched
+                # state must still let `finally` run to completion.
+                try:
+                    _set_norm_output_cast_to_input_dtype(False, model)
+                except Exception:
+                    pass
 
     def _train_inner(self):
         """Inner training loop, separated for GC cleanup in finally block."""
@@ -1727,6 +1737,21 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
+                # `iterate_training_batches` does not yet take a
+                # `dataset_order` argument, so streaming text MLX
+                # training cannot honor `preserve_dataset_order` /
+                # `dataset_order="torch_randperm"`. Refuse instead of
+                # silently dropping the user-requested order so Studio
+                # / CUDA parity stays explicit.
+                if (
+                    getattr(args, "preserve_dataset_order", False)
+                    or getattr(args, "dataset_order", "default") != "default"
+                ):
+                    raise ValueError(
+                        "Unsloth MLX: preserve_dataset_order / dataset_order is not "
+                        "supported with streaming=True for text training. Disable "
+                        "streaming or materialize batches."
+                    )
                 return None, iterate_training_batches(
                     dataset=self.train_dataset,
                     tokenizer=self.tokenizer,

@@ -179,16 +179,13 @@ def test_scheduler_lr_matches_expected_optimizer_update_steps(scheduler, warmup)
     ]
 
     if scheduler == "linear" and warmup == 0:
-        expected = [
-            0.0,
-            trainer.args.learning_rate,
-            trainer.args.learning_rate * 6 / 7,
-            trainer.args.learning_rate * 5 / 7,
-            trainer.args.learning_rate * 4 / 7,
-            trainer.args.learning_rate * 3 / 7,
-            trainer.args.learning_rate * 2 / 7,
-            trainer.args.learning_rate * 1 / 7,
-        ]
+        # Match `transformers.get_scheduler("linear", num_warmup_steps=0,
+        # num_training_steps=total_steps)`: step 0 = learning_rate, then
+        # decays linearly to 0 over total_steps. The earlier expectation
+        # of `[0, lr, lr*6/7, ...]` would have the first optimizer
+        # update fire at zero LR and is inconsistent with HF behavior.
+        lr = trainer.args.learning_rate
+        expected = [lr * (total_steps - step) / total_steps for step in range(total_steps)]
         assert values == pytest.approx(expected)
     elif warmup > 0:
         assert values[0] == pytest.approx(0.0)

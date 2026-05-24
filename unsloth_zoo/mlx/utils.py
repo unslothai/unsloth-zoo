@@ -683,12 +683,15 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         attention_mask = batch_dict.get("attention_mask")
         labels = batch_dict.get("labels")
 
-        # Standard causal LM shift
-        inputs = input_ids[:, :-1]
-
+        # Match the CCE path semantics: forward the full multimodal
+        # sequence and shift the resulting logits afterwards. Qwen3-VL
+        # image / mRoPE / deepstack state depends on the complete
+        # sequence; trimming `input_ids[:, :-1]` before the multimodal
+        # forward gives a different loss from the full-logits CUDA
+        # path. Mirrors `_vlm_cce_forward` so use_cce=False stays in
+        # parity with use_cce=True.
+        inputs = input_ids
         fwd_mask = attention_mask
-        if attention_mask is not None and attention_mask.shape[-1] == input_ids.shape[-1]:
-            fwd_mask = attention_mask[:, :-1]
 
         # Forward pass — let the model create its own causal mask.
         # Pass extra keys (e.g. image_grid_thw for Qwen) that some models need.
@@ -701,6 +704,8 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         output = model(inputs, pixel_values=pixel_values, mask=fwd_mask, **fwd_kwargs)
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits.astype(mx.float32)
+        # Drop the final position so logits predict the next token.
+        logits = logits[:, :-1, :]
 
         if labels is not None:
             # Labels encode instruction/padding/special-token masking when
