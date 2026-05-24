@@ -494,6 +494,11 @@ def _forward_chunked_fused_finalize(
             )
         empty = mx.zeros((0,), dtype=mx.float32)
         return empty, empty
+    if targets.shape[0] != n:
+        raise ValueError(
+            "MLX CCE: targets length does not match hidden token count "
+            f"(hidden.shape={hidden_compute.shape}, targets.shape={targets.shape})."
+        )
     compute_bytes = 2 if hidden_compute.dtype in (mx.float16, mx.bfloat16) else 4
     chunk_size = _resolve_chunk_size(
         chunk_size,
