@@ -2903,6 +2903,7 @@ def _install_qwen3_family_compile_patches():
     def patched_qwen3_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
         explicit_position_ids = kwargs.get("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
@@ -2950,6 +2951,7 @@ def _install_qwen3_family_compile_patches():
     def patched_qwen35_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
         explicit_position_ids = kwargs.get("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
@@ -3121,6 +3123,7 @@ def _install_glm_ocr_compile_patches():
     def patched_glm_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
         explicit_position_ids = kwargs.get("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
@@ -3426,6 +3429,7 @@ def _install_qwen3_get_input_embeddings_patch():
     def patched_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
