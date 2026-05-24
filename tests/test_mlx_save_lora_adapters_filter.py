@@ -16,25 +16,19 @@
 
 """Regression coverage for save_lora_adapters / save_trainable_adapters.
 
-Verifies the split-save semantics introduced by this PR:
+- save_lora_adapters keeps only module-anchored lora_a / lora_b tensors,
+  even when base weights are listed as trainable, and raises if no
+  LoRA modules are present.
+- save_trainable_adapters preserves every trainable tensor for in-loop
+  checkpoints.
+- The module-anchored filter does not leak paths that merely contain
+  "lora_" (e.g. router.lora_gate.weight).
 
-- save_lora_adapters keeps only LoRA adapter tensors (lora_a / lora_b on
-  modules that actually expose those attributes), even after a reload
-  state where base weights are listed as trainable.
-- save_lora_adapters raises ValueError if no LoRA modules are present.
-- save_trainable_adapters preserves every trainable tensor, used for
-  in-loop training checkpoints.
-- The module-anchored filter does not leak unrelated paths whose names
-  happen to contain "lora_" (e.g. router.lora_gate.weight).
-
-Runs on Linux + Windows via the mlx_simulation shim, and on macOS
-against real MLX.
+Runs on Linux + Windows via the mlx_simulation shim, on macOS against
+real MLX.
 """
 
 from __future__ import annotations
-
-import json
-from pathlib import Path
 
 import pytest
 import torch
@@ -155,7 +149,7 @@ def test_save_trainable_adapters_preserves_full_trainable_tree(tmp_path):
     }, sorted(keys)
 
 
-def test_collect_lora_helper_finds_adapters_after_reload(tmp_path):
+def test_collect_lora_helper_finds_adapters_after_reload():
     # After a reload/freeze, LoRA tensors live in parameters() but are
     # not always listed in trainable_parameters(). The module-anchored
     # helper must still find them so MLXTrainer.save_model routes to
@@ -190,3 +184,189 @@ def test_collect_lora_helper_finds_adapters_after_reload(tmp_path):
 
     found = collect_mlx_lora_adapter_tensors(_ReloadedModel())
     assert set(found.keys()) == {"q_proj.lora_a", "q_proj.lora_b"}, found
+
+
+def test_ensure_lora_frozen_freezes_norm_when_lora_is_actively_trained():
+    # Active LoRA training with an accidentally trainable norm. The
+    # module-anchored detector finds q_proj.lora_a/lora_b in the
+    # trainable map, so the NaN safeguard runs and freezes norm.weight.
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
+
+    freeze_calls = []
+
+    class _NormStub:
+        def __init__(self):
+            self.weight = torch.zeros(16)
+        def freeze(self, keys=None, recurse=False):
+            freeze_calls.append((list(keys or []), recurse))
+
+    norm_stub = _NormStub()
+
+    class _ActiveLora:
+        def __init__(self):
+            self.q_proj = lora
+            self.norm = norm_stub
+        def parameters(self):
+            return {
+                "q_proj.weight": lora.weight,
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+                "norm.weight": norm_stub.weight,
+            }
+        def trainable_parameters(self):
+            return {
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+                "norm.weight": norm_stub.weight,
+            }
+        def named_modules(self):
+            yield "", self
+            yield "q_proj", lora
+            yield "norm", norm_stub
+
+    MLXTrainer._ensure_lora_frozen(_ActiveLora())
+    assert freeze_calls == [(["weight"], False)], freeze_calls
+
+
+def test_ensure_lora_frozen_skips_when_lora_tensors_present_but_not_trainable():
+    # Reloaded model where adapter tensors live in parameters() but none
+    # are trainable; the user is doing a non-LoRA fine-tune (norm-only)
+    # so the safeguard must NOT freeze the intentionally trainable norm.
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
+
+    freeze_calls = []
+
+    class _NormStub:
+        def __init__(self):
+            self.weight = torch.zeros(16)
+        def freeze(self, keys=None, recurse=False):
+            freeze_calls.append((list(keys or []), recurse))
+
+    norm_stub = _NormStub()
+
+    class _ReloadedFrozenLora:
+        def __init__(self):
+            self.q_proj = lora
+            self.norm = norm_stub
+        def parameters(self):
+            return {
+                "q_proj.weight": lora.weight,
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+                "norm.weight": norm_stub.weight,
+            }
+        def trainable_parameters(self):
+            return {"norm.weight": norm_stub.weight}
+        def named_modules(self):
+            yield "", self
+            yield "q_proj", lora
+            yield "norm", norm_stub
+
+    MLXTrainer._ensure_lora_frozen(_ReloadedFrozenLora())
+    assert freeze_calls == [], freeze_calls
+
+
+def test_ensure_lora_frozen_skips_when_no_lora_modules_present():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    freeze_calls = []
+
+    class _NormStub:
+        def __init__(self):
+            self.weight = torch.zeros(16)
+        def freeze(self, keys=None, recurse=False):
+            freeze_calls.append((list(keys or []), recurse))
+
+    norm_stub = _NormStub()
+
+    class _NoLora:
+        def __init__(self):
+            self.norm = norm_stub
+        def parameters(self):
+            return {"norm.weight": norm_stub.weight}
+        def trainable_parameters(self):
+            return {"norm.weight": norm_stub.weight}
+        def named_modules(self):
+            yield "", self
+            yield "norm", norm_stub
+
+    MLXTrainer._ensure_lora_frozen(_NoLora())
+    assert freeze_calls == [], freeze_calls
+
+
+def test_save_pretrained_merged_lora_method_raises_when_no_adapter_tensors(tmp_path):
+    # The new outer gate uses collect_mlx_lora_adapter_tensors, so the
+    # "no LoRA layers" ValueError is raised at the gate with the
+    # user-facing message rather than slipping past hasattr(m, "fuse")
+    # and bubbling the lower-level "no MLX LoRA adapter tensors" error.
+    from unsloth_zoo.mlx.utils import save_pretrained_merged
+
+    plain = _MockPlainLinear(16, 32)
+
+    class _NoLora:
+        def __init__(self):
+            self.up_proj = plain
+            self._hf_repo = None
+            self._config = None
+            self._unsloth_quantization_config = None
+            self._unsloth_quantization_policy = None
+            self._unsloth_quantized_source = None
+            self._unsloth_base_revision = None
+            self._unsloth_base_commit_hash = None
+            self._src_path = None
+        def parameters(self):
+            return {"up_proj.weight": plain.weight}
+        def trainable_parameters(self):
+            return self.parameters()
+        def named_modules(self):
+            yield "", self
+            yield "up_proj", plain
+
+    class _Tok:
+        def save_pretrained(self, *_a, **_k):
+            pass
+
+    with pytest.raises(ValueError, match="no LoRA layers"):
+        save_pretrained_merged(_NoLora(), _Tok(), tmp_path, save_method="lora")
+
+
+def test_save_pretrained_merged_merged_methods_skip_lora_collection(tmp_path, monkeypatch):
+    # Merged exports (merged_16bit / merged_4bit) must not call the
+    # adapter collector; the lora-only presence check belongs inside
+    # the method == "lora" branch.
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    collect_calls = []
+    merged_calls = []
+
+    def _spy_collect(model):
+        collect_calls.append(model)
+        return {}
+
+    def _stub_save_merged(model, tokenizer, path, dequantize=False):
+        merged_calls.append((path, dequantize))
+
+    monkeypatch.setattr(mlx_utils, "collect_mlx_lora_adapter_tensors", _spy_collect)
+    monkeypatch.setattr(mlx_utils, "save_merged_model", _stub_save_merged)
+
+    class _Model:
+        def parameters(self):
+            return {}
+        def named_modules(self):
+            yield "", self
+
+    class _Tok:
+        def save_pretrained(self, *_a, **_k):
+            pass
+
+    mlx_utils.save_pretrained_merged(_Model(), _Tok(), tmp_path, save_method="merged_16bit")
+    mlx_utils.save_pretrained_merged(_Model(), _Tok(), tmp_path, save_method="merged_4bit")
+
+    assert collect_calls == [], collect_calls
+    assert len(merged_calls) == 2
+    assert merged_calls[0][1] is True   # merged_16bit dequantizes
+    assert merged_calls[1][1] is False  # merged_4bit keeps quantization
