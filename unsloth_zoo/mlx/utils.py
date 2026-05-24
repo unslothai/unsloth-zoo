@@ -2541,79 +2541,27 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
         yield batch, lengths_info, None
 
 
-def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
-    path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
-
-    if tensors:
-        mx.save_safetensors(str(path / "adapters.safetensors"), tensors)
-
-    adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
-    if adapter_config:
-        with open(path / "adapter_config.json", "w", encoding="utf-8") as f:
-            json.dump(adapter_config, f, indent=2)
-
-
-# mlx-lm uses lowercase pair; PEFT-style adapters may expose uppercase.
-_MLX_LORA_ATTR_PAIRS = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
-
-
-def iter_mlx_lora_modules(model):
-    """Yield (module_name, module, a_attr, b_attr) for each complete LoRA module.
-
-    Skips half-built modules (only one side) to avoid producing adapter files
-    that cannot be reloaded.
-    """
-    for module_name, module in model.named_modules():
-        for a_attr, b_attr in _MLX_LORA_ATTR_PAIRS:
-            if hasattr(module, a_attr) and hasattr(module, b_attr):
-                yield module_name, module, a_attr, b_attr
-                break
-
-
-def collect_mlx_lora_adapter_tensors(model):
-    """Collect tensors for every module exposing a complete LoRA attr pair.
-
-    Anchors on the modules themselves, not a substring of the flattened
-    parameter name, so unrelated paths containing 'lora_'
-    (e.g. ``router.lora_gate.weight``) are not exported, and so callers
-    can detect LoRA after reload/freeze when trainable_parameters() no
-    longer lists adapter tensors.
-    """
-    parameters = dict(mlx.utils.tree_flatten(model.parameters()))
-    adapter_keys = set()
-    for module_name, _module, a_attr, b_attr in iter_mlx_lora_modules(model):
-        prefix = f"{module_name}." if module_name else ""
-        adapter_keys.add(f"{prefix}{a_attr}")
-        adapter_keys.add(f"{prefix}{b_attr}")
-    return {name: value for name, value in parameters.items() if name in adapter_keys}
-
-
-def save_trainable_adapters(model, path, adapter_config=None):
-    """Save the current trainable parameter tree for training checkpoints."""
-    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
-    _save_adapter_artifacts(model, path, trainable, adapter_config=adapter_config)
-
-
 def save_lora_adapters(model, path, adapter_config=None):
-    """Save LoRA adapter weights (lora_a / lora_b only) to disk.
+    """Save LoRA adapter weights to disk.
 
     Args:
-        model: MLX model with LoRA-wrapped modules.
+        model: MLX model with LoRA layers.
         path: Directory to save adapters.
         adapter_config: Optional dict with LoRA config metadata.
     """
-    adapter_tensors = collect_mlx_lora_adapter_tensors(model)
-    if not adapter_tensors:
-        raise ValueError(
-            "Unsloth: no MLX LoRA adapter tensors were found to save. "
-            "The model may have no LoRA layers, or adapters may have been "
-            "merged. Use save_trainable_adapters() to checkpoint non-LoRA "
-            "trainable state instead."
-        )
-    _save_adapter_artifacts(
-        model, path, adapter_tensors, adapter_config=adapter_config
-    )
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+    # Collect only trainable (LoRA) parameters — flatten nested dict for safetensors
+    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+
+    if trainable:
+        mx.save_safetensors(str(path / "adapters.safetensors"), trainable)
+
+    adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
+    if adapter_config:
+        with open(path / "adapter_config.json", "w") as f:
+            json.dump(adapter_config, f, indent=2)
 
 
 def _infer_snapshot_commit(path):
@@ -2778,7 +2726,10 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     # why: record LoRA module paths so reload recreates vision/projector LoRA
     # layers (mlx-lm.load_adapters only knows the language tower).
     try:
-        lora_paths = [name for name, *_ in iter_mlx_lora_modules(model)]
+        lora_paths = []
+        for name, module in model.named_modules():
+            if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
+                lora_paths.append(name)
         if lora_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
     except Exception:
@@ -2919,8 +2870,10 @@ def save_pretrained_merged(
             f"Use 'lora', 'merged_16bit', or 'merged_4bit'."
         )
 
+    has_lora = any(hasattr(m, "fuse") for _, m in model.named_modules())
+
     if method == "lora":
-        if not collect_mlx_lora_adapter_tensors(model):
+        if not has_lora:
             raise ValueError(
                 "Unsloth: save_method='lora' but the model has no LoRA "
                 "layers — there's nothing to save. Use 'merged_16bit' instead."
