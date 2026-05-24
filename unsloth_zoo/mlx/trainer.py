@@ -1240,8 +1240,12 @@ class MLXTrainer:
             # Checkpointing
             if args.save_steps > 0 and current_step % args.save_steps == 0:
                 ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
-                save_trainable_adapters(model, ckpt_dir)
-                print(f"  Saved checkpoint to {ckpt_dir}")
+                try:
+                    save_trainable_adapters(model, ckpt_dir)
+                except ValueError as e:
+                    print(f"  Unsloth: skipped checkpoint ({e})")
+                else:
+                    print(f"  Saved checkpoint to {ckpt_dir}")
 
         total_time = time.perf_counter() - start_time
         avg_loss = (

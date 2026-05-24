@@ -2926,12 +2926,17 @@ def save_pretrained_merged(
         )
 
     if method == "lora":
-        if not collect_mlx_lora_adapter_tensors(model):
+        adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+        if not adapter_tensors:
             raise ValueError(
                 "Unsloth: save_method='lora' but the model has no LoRA "
                 "layers — there's nothing to save. Use 'merged_16bit' instead."
             )
-        save_lora_adapters(model, save_directory)
+        trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+        if set(trainable) - set(adapter_tensors):
+            save_trainable_adapters(model, save_directory)
+        else:
+            save_lora_adapters(model, save_directory)
         try:
             tokenizer.save_pretrained(str(save_directory))
         except Exception:
