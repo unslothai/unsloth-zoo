@@ -2664,63 +2664,6 @@ def _get_mlx_config_quantization(model):
     return config.get("quantization") or config.get("quantization_config")
 
 
-def _get_mlx_dropout_probability(drop):
-    if drop is None:
-        return 0.0
-    # real MLX nn.Dropout stores keep-prob as _p_1; compat shims may set
-    # both .p (stale 0.0 default) and _p_1, so _p_1 wins when usable.
-    # Tolerate _p_1=None / non-numeric and fall back to .p instead of
-    # raising TypeError on float(None).
-    p1 = getattr(drop, "_p_1", None)
-    if p1 is not None:
-        try:
-            return float(1.0 - float(p1))
-        except (TypeError, ValueError):
-            pass
-    p = getattr(drop, "p", None)
-    if p is not None:
-        try:
-            return float(p)
-        except (TypeError, ValueError):
-            pass
-    return 0.0
-
-
-def _infer_mlx_lora_rank(module, a_attr="lora_a", b_attr="lora_b"):
-    # also fall back to PEFT-style uppercase pair (lora_A / lora_B) so a
-    # later collector that selects uppercase modules can still infer rank.
-    lora_a = getattr(module, a_attr, None)
-    if lora_a is None and a_attr == "lora_a":
-        lora_a = getattr(module, "lora_A", None)
-    lora_b = getattr(module, b_attr, None)
-    if lora_b is None and b_attr == "lora_b":
-        lora_b = getattr(module, "lora_B", None)
-    lora_a_shape = tuple(lora_a.shape) if lora_a is not None and hasattr(lora_a, "shape") else ()
-    lora_b_shape = tuple(lora_b.shape) if lora_b is not None and hasattr(lora_b, "shape") else ()
-    # Require both halves; a half-built LoRA module is not a reliable
-    # rank source, so callers can move on to the next module.
-    if not lora_a_shape or not lora_b_shape:
-        return None
-    # MoE/switch: lora_a (..., rank, in_dims); lora_b (..., out_dims, rank).
-    if len(lora_a_shape) >= 3:
-        if len(lora_b_shape) < 2:
-            return None
-        rank = lora_a_shape[-2]
-        if lora_b_shape[-1] != rank:
-            return None
-        # Expert/batch prefix must agree so the wrappers co-execute.
-        if (
-            len(lora_b_shape) >= 3
-            and lora_a_shape[:-2] != lora_b_shape[:-2]
-        ):
-            return None
-        return int(rank)
-    # Standard 2D LoRA: lora_a (in_dims, rank), lora_b (rank, out_dims).
-    if lora_a_shape[-1] != lora_b_shape[0]:
-        return None
-    return int(lora_a_shape[-1])
-
-
 def _enrich_mlx_adapter_config(model, adapter_config):
     adapter_config = dict(adapter_config or {})
     hf_repo = getattr(model, "_hf_repo", None) or adapter_config.get("base_model_name_or_path")
@@ -2780,82 +2723,15 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
-    # why: record LoRA module paths and parameters so reload recreates the same
-    # adapter topology. Without scale metadata, reload falls back to scale=1.0
-    # even when training used alpha/r > 1, changing post-reload logits.
+    # why: record LoRA module paths so reload recreates vision/projector LoRA
+    # layers (mlx-lm.load_adapters only knows the language tower).
     try:
-        # distinguish "caller passed nothing" from "caller passed [] / None".
-        explicit_paths = (
-            adapter_config["unsloth_mlx_lora_module_paths"]
-            if "unsloth_mlx_lora_module_paths" in adapter_config
-            else None
-        )
-        # why: an explicit empty list/tuple preserves caller-provided topology
-        # (the auto-fill below skips when the key is present) but must not
-        # suppress global LoRA parameter inference. Treat empty as "no filter".
-        explicit_path_set = (
-            set(explicit_paths)
-            if isinstance(explicit_paths, (list, tuple)) and len(explicit_paths) > 0
-            else None
-        )
-
-        # cover both mlx-lm (lower) and PEFT-style (upper) attribute pairs;
-        # require both halves to avoid recording half-built modules.
-        _lora_attr_pairs = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
         lora_paths = []
-        lora_rank = None
-        lora_scale = None
-        lora_dropout = None
         for name, module in model.named_modules():
-            attr_pair = None
-            for a_attr, b_attr in _lora_attr_pairs:
-                if hasattr(module, a_attr) and hasattr(module, b_attr):
-                    attr_pair = (a_attr, b_attr)
-                    break
-            if attr_pair is None:
-                continue
-            lora_paths.append(name)
-            inferred_rank = _infer_mlx_lora_rank(module, *attr_pair)
-            if inferred_rank is None:
-                continue
-            # only infer rank/scale/dropout from modules the caller
-            # actually selected; otherwise an earlier unrelated LoRA
-            # would write the wrong language-tower params.
-            if explicit_path_set is not None and name not in explicit_path_set:
-                continue
-            if lora_rank is None:
-                lora_rank = inferred_rank
-                lora_scale = float(getattr(module, "scale", 1.0))
-                lora_dropout = _get_mlx_dropout_probability(
-                    getattr(module, "dropout", None)
-                )
-
-        # only auto-fill when caller did not supply the key at all.
-        if lora_paths and "unsloth_mlx_lora_module_paths" not in adapter_config:
+            if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
+                lora_paths.append(name)
+        if lora_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
-
-        if lora_rank is not None:
-            lora_parameters = dict(adapter_config.get("lora_parameters") or {})
-            for key, value in (
-                ("rank", lora_rank), ("scale", lora_scale), ("dropout", lora_dropout),
-            ):
-                lora_parameters[key] = value
-            adapter_config["lora_parameters"] = lora_parameters
-            adapter_config["rank"] = lora_parameters["rank"]
-            adapter_config["scale"] = lora_parameters["scale"]
-            adapter_config["dropout"] = lora_parameters["dropout"]
-            adapter_config.setdefault("peft_type", "LORA")
-            adapter_config.setdefault("fine_tune_type", "lora")
-            # mlx-lm load_adapters dereferences config.num_layers; fill it
-            # in for direct save_lora_adapters() callers without trainer config.
-            if "num_layers" not in adapter_config:
-                layers = _get_transformer_layers(model)
-                try:
-                    n_layers = len(layers) if layers is not None else 0
-                except TypeError:
-                    n_layers = 0
-                if n_layers > 0:
-                    adapter_config["num_layers"] = n_layers
     except Exception:
         pass
     return adapter_config

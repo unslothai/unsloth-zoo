@@ -1380,11 +1380,7 @@ class MLXTrainer:
 
     def save_model(self, output_dir=None):
         """Save LoRA adapters or full merged model (if no LoRA)."""
-        from .utils import (
-            _get_mlx_dropout_probability,
-            _infer_mlx_lora_rank,
-            save_merged_model,
-        )
+        from .utils import save_merged_model
         output_dir = output_dir or self.args.output_dir
 
         trainable = dict(tree_flatten(self.model.trainable_parameters()))
@@ -1396,17 +1392,13 @@ class MLXTrainer:
 
             _lora_rank, _lora_scale, _lora_dropout = 8, 1.0, 0.0
             for _, m in self.model.named_modules():
-                if not (hasattr(m, "lora_a") and hasattr(m, "lora_b")):
-                    continue
-                inferred_rank = _infer_mlx_lora_rank(m)
-                if inferred_rank is None:
-                    continue
-                _lora_rank = inferred_rank
-                _lora_scale = getattr(m, "scale", 1.0)
-                _lora_dropout = _get_mlx_dropout_probability(
-                    getattr(m, "dropout", None)
-                )
-                break
+                if hasattr(m, "lora_a"):
+                    _lora_rank = m.lora_a.shape[-1]
+                    _lora_scale = getattr(m, "scale", 1.0)
+
+                    _drop = getattr(m, "dropout", None)
+                    _lora_dropout = getattr(_drop, "p", 0.0) if _drop else 0.0
+                    break
 
 
             from .utils import _get_transformer_layers
