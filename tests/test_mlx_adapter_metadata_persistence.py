@@ -99,6 +99,21 @@ def test_infer_rank_moe_uses_axis_minus_two():
     assert mlx_utils._infer_mlx_lora_rank(moe) == 4
 
 
+class _FakeWeightLayer:
+    def __init__(self, shape):
+        self.weight = _FakeArray(shape)
+
+
+def test_infer_rank_supports_nn_linear_layers():
+    # mlx-lm uses nn.Linear layers for lora_a/lora_b.
+    mlx_utils = _load_utils()
+    mod = types.SimpleNamespace(
+        lora_a=_FakeWeightLayer((4, 512)),
+        lora_b=_FakeWeightLayer((1024, 4)),
+    )
+    assert mlx_utils._infer_mlx_lora_rank(mod) == 4
+
+
 def test_infer_rank_returns_none_on_shape_mismatch():
     mlx_utils = _load_utils()
     bad = _FakeLoRAModule((512, 4), (8, 512))
@@ -228,7 +243,8 @@ def test_enrich_uppercase_lora_module_recorded_with_metadata():
 
 
 def test_typeerror_fallback_restores_scale_and_dropout_via_p1():
-    """Pure-Python reproduction of the _apply_lora_at_paths TypeError fallback."""
+    _load_utils()
+    from unsloth_zoo.mlx.loader import _lora_from_base_compat
 
     class _NoKwargCls:
         @classmethod
@@ -238,38 +254,75 @@ def test_typeerror_fallback_restores_scale_and_dropout_via_p1():
             return types.SimpleNamespace(scale=1.0,
                                           dropout=_FakeDropout(1.0))
 
-    rank, scale, dropout = 4, 2.5, 0.3
-    module = object()
-    try:
-        wrapped = _NoKwargCls.from_base(module, r=rank, scale=scale,
-                                         dropout=dropout)
-    except TypeError:
-        try:
-            wrapped = _NoKwargCls.from_base(module, r=rank)
-        except TypeError:
-            wrapped = _NoKwargCls.from_base(module)
-        if hasattr(wrapped, "scale"):
-            wrapped.scale = scale
-        _drop = getattr(wrapped, "dropout", None)
-        if _drop is not None:
-            if hasattr(_drop, "_p_1"):
-                _drop._p_1 = float(1.0 - float(dropout))
-            elif hasattr(_drop, "p"):
-                _drop.p = float(dropout)
+    wrapped = _lora_from_base_compat(
+        _NoKwargCls, object(), rank=4, scale=2.5, dropout=0.3,
+    )
     assert wrapped.scale == 2.5
     assert abs(wrapped.dropout._p_1 - 0.7) < 1e-9
 
 
 def test_typeerror_fallback_handles_shim_dropout_with_p_attr():
+    _load_utils()
+    from unsloth_zoo.mlx.loader import _apply_lora_metadata_to_wrapper
+
     wrapped = types.SimpleNamespace(scale=1.0, dropout=_ShimDropout(0.0))
-    scale, dropout = 2.5, 0.4
-    if hasattr(wrapped, "scale"):
-        wrapped.scale = scale
-    _drop = getattr(wrapped, "dropout", None)
-    if _drop is not None:
-        if hasattr(_drop, "_p_1"):
-            _drop._p_1 = float(1.0 - float(dropout))
-        elif hasattr(_drop, "p"):
-            _drop.p = float(dropout)
+    _apply_lora_metadata_to_wrapper(wrapped, scale=2.5, dropout=0.4)
     assert wrapped.scale == 2.5
     assert abs(wrapped.dropout.p - 0.4) < 1e-9
+
+
+def _trainer_loop_metadata(model):
+    mlx_utils = _load_utils()
+    _lora_attr_pairs = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
+    rank, scale, dropout = 8, 1.0, 0.0
+    for _, m in model.named_modules():
+        attr_pair = None
+        for a_attr, b_attr in _lora_attr_pairs:
+            if hasattr(m, a_attr) and hasattr(m, b_attr):
+                attr_pair = (a_attr, b_attr)
+                break
+        if attr_pair is None:
+            continue
+        inferred_rank = mlx_utils._infer_mlx_lora_rank(m, *attr_pair)
+        if inferred_rank is None:
+            continue
+        rank = inferred_rank
+        scale = getattr(m, "scale", 1.0)
+        dropout = mlx_utils._get_mlx_dropout_probability(getattr(m, "dropout", None))
+        break
+    return rank, scale, dropout
+
+
+def test_trainer_metadata_loop_uppercase_only_module():
+    model = _FakeModel([
+        ("layers.0.q_proj", _FakeLoRAModuleUpper(
+            (512, 4), (4, 512), scale=2.5, dropout=_FakeDropout(0.75),
+        )),
+    ])
+    rank, scale, dropout = _trainer_loop_metadata(model)
+    assert rank == 4
+    assert scale == 2.5
+    assert abs(dropout - 0.25) < 1e-9
+
+
+def test_trainer_metadata_loop_lowercase_still_wins_first():
+    model = _FakeModel([
+        ("layers.0.q_proj", _FakeLoRAModule(
+            (512, 4), (4, 512), scale=3.0, dropout=_FakeDropout(0.5),
+        )),
+        ("layers.1.q_proj", _FakeLoRAModuleUpper(
+            (512, 8), (8, 512), scale=1.5, dropout=_FakeDropout(0.9),
+        )),
+    ])
+    rank, scale, dropout = _trainer_loop_metadata(model)
+    assert rank == 4
+    assert scale == 3.0
+    assert abs(dropout - 0.5) < 1e-9
+
+
+def test_trainer_metadata_loop_no_lora_uses_defaults():
+    model = _FakeModel([
+        ("layers.0.q_proj", types.SimpleNamespace()),
+    ])
+    rank, scale, dropout = _trainer_loop_metadata(model)
+    assert (rank, scale, dropout) == (8, 1.0, 0.0)
