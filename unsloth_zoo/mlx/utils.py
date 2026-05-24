@@ -2554,8 +2554,25 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
             json.dump(adapter_config, f, indent=2)
 
 
+# mlx-lm uses lowercase pair; PEFT-style adapters may expose uppercase.
+_MLX_LORA_ATTR_PAIRS = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
+
+
+def iter_mlx_lora_modules(model):
+    """Yield (module_name, module, a_attr, b_attr) for each complete LoRA module.
+
+    Skips half-built modules (only one side) to avoid producing adapter files
+    that cannot be reloaded.
+    """
+    for module_name, module in model.named_modules():
+        for a_attr, b_attr in _MLX_LORA_ATTR_PAIRS:
+            if hasattr(module, a_attr) and hasattr(module, b_attr):
+                yield module_name, module, a_attr, b_attr
+                break
+
+
 def collect_mlx_lora_adapter_tensors(model):
-    """Collect tensors for every module that exposes lora_a/lora_b.
+    """Collect tensors for every module exposing a complete LoRA attr pair.
 
     Anchors on the modules themselves, not a substring of the flattened
     parameter name, so unrelated paths containing 'lora_'
@@ -2565,11 +2582,10 @@ def collect_mlx_lora_adapter_tensors(model):
     """
     parameters = dict(mlx.utils.tree_flatten(model.parameters()))
     adapter_keys = set()
-    for module_name, module in model.named_modules():
-        for attr in ("lora_a", "lora_b", "lora_A", "lora_B"):
-            if hasattr(module, attr):
-                key = f"{module_name}.{attr}" if module_name else attr
-                adapter_keys.add(key)
+    for module_name, _module, a_attr, b_attr in iter_mlx_lora_modules(model):
+        prefix = f"{module_name}." if module_name else ""
+        adapter_keys.add(f"{prefix}{a_attr}")
+        adapter_keys.add(f"{prefix}{b_attr}")
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
 
@@ -2762,10 +2778,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     # why: record LoRA module paths so reload recreates vision/projector LoRA
     # layers (mlx-lm.load_adapters only knows the language tower).
     try:
-        lora_paths = []
-        for name, module in model.named_modules():
-            if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
-                lora_paths.append(name)
+        lora_paths = [name for name, *_ in iter_mlx_lora_modules(model)]
         if lora_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
     except Exception:

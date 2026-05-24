@@ -149,6 +149,128 @@ def test_save_trainable_adapters_preserves_full_trainable_tree(tmp_path):
     }, sorted(keys)
 
 
+class _MockLoRALinearUpper:
+    # Some PEFT-style adapters expose uppercase tensor names.
+    def __init__(self, in_features, out_features, rank, scale, dropout):
+        self.weight = torch.zeros(out_features, in_features)
+        self.lora_A = torch.zeros(in_features, rank)
+        self.lora_B = torch.zeros(rank, out_features)
+        self.scale = scale
+        self.dropout = dropout
+
+
+class _MockHalfLoRA:
+    # Module that only exposes one side of the LoRA pair (e.g. half-built
+    # during construction). Saving such modules would produce unreloadable
+    # adapter files; the collector must drop them.
+    def __init__(self, in_features, rank):
+        self.weight = torch.zeros(in_features, in_features)
+        self.lora_a = torch.zeros(in_features, rank)
+
+
+def _make_model_with_named_modules(layers):
+    # Variant of _make_model that exposes upper- and lower-case LoRA attr
+    # pairs when listing parameters.
+    class _M:
+        def __init__(self):
+            for k, v in layers.items():
+                setattr(self, k, v)
+            self._hf_repo = None
+            self._config = None
+            self._unsloth_quantization_config = None
+            self._unsloth_quantization_policy = None
+            self._unsloth_quantized_source = None
+            self._unsloth_base_revision = None
+            self._unsloth_base_commit_hash = None
+            self._src_path = None
+
+        def parameters(self):
+            out = {}
+            for name, mod in layers.items():
+                for attr in ("weight", "bias", "lora_a", "lora_b",
+                             "lora_A", "lora_B"):
+                    v = getattr(mod, attr, None)
+                    if isinstance(v, torch.Tensor):
+                        out[f"{name}.{attr}"] = v
+            return out
+
+        def trainable_parameters(self):
+            return self.parameters()
+
+        def named_modules(self):
+            yield "", self
+            for name, mod in layers.items():
+                yield name, mod
+
+    return _M()
+
+
+def test_collect_lora_helper_accepts_uppercase_pair(tmp_path):
+    # PEFT-style adapters expose lora_A / lora_B; collector must yield
+    # those tensors so save_lora_adapters writes them intact.
+    from unsloth_zoo.mlx.utils import (
+        collect_mlx_lora_adapter_tensors,
+        save_lora_adapters,
+    )
+
+    model = _make_model_with_named_modules({
+        "q_proj": _MockLoRALinearUpper(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0)),
+        "up_proj": _MockPlainLinear(16, 32),
+    })
+
+    found = collect_mlx_lora_adapter_tensors(model)
+    assert set(found.keys()) == {"q_proj.lora_A", "q_proj.lora_B"}, found
+
+    save_lora_adapters(model, tmp_path)
+    from safetensors.torch import load_file
+    keys = set(load_file(str(tmp_path / "adapters.safetensors")).keys())
+    assert keys == {"q_proj.lora_A", "q_proj.lora_B"}, sorted(keys)
+
+
+def test_collect_lora_helper_drops_half_adapter_module(tmp_path):
+    # A module that only exposes lora_a (no lora_b) cannot be reloaded; the
+    # collector must skip it so save_lora_adapters surfaces the empty-set
+    # error rather than write a half-broken adapter file.
+    from unsloth_zoo.mlx.utils import (
+        collect_mlx_lora_adapter_tensors,
+        save_lora_adapters,
+    )
+
+    model = _make_model_with_named_modules({
+        "broken": _MockHalfLoRA(8, 4),
+    })
+    assert collect_mlx_lora_adapter_tensors(model) == {}
+    with pytest.raises(ValueError, match="LoRA adapter tensors"):
+        save_lora_adapters(model, tmp_path)
+
+
+def test_iter_mlx_lora_modules_reports_attr_pair():
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+
+    model = _make_model_with_named_modules({
+        "q_proj": _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0)),
+        "v_proj": _MockLoRALinearUpper(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0)),
+        "up_proj": _MockPlainLinear(16, 32),
+    })
+    rows = [(name, a, b) for name, _m, a, b in iter_mlx_lora_modules(model)]
+    assert sorted(rows) == [
+        ("q_proj", "lora_a", "lora_b"),
+        ("v_proj", "lora_A", "lora_B"),
+    ], rows
+
+
+def test_enrich_adapter_config_records_uppercase_lora_paths():
+    # _enrich_mlx_adapter_config must record uppercase LoRA module paths so
+    # reload can recreate the matching wrappers.
+    from unsloth_zoo.mlx.utils import _enrich_mlx_adapter_config
+
+    model = _make_model_with_named_modules({
+        "q_proj": _MockLoRALinearUpper(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0)),
+    })
+    enriched = _enrich_mlx_adapter_config(model, {})
+    assert enriched.get("unsloth_mlx_lora_module_paths") == ["q_proj"]
+
+
 def test_collect_lora_helper_finds_adapters_after_reload():
     # After a reload/freeze, LoRA tensors live in parameters() but are
     # not always listed in trainable_parameters(). The module-anchored

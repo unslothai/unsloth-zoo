@@ -66,6 +66,7 @@ from .utils import (
     collect_mlx_texts,
     save_trainable_adapters,
     collect_mlx_lora_adapter_tensors,
+    iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -1386,30 +1387,49 @@ class MLXTrainer:
 
         # Reloaded LoRA: adapters live in parameters() but may be absent
         # from trainable_parameters(); the old substring check fell through
-        # to save_merged_model().
-        has_lora = bool(collect_mlx_lora_adapter_tensors(self.model))
+        # to save_merged_model(). Compute the trainable split here so we can
+        # also route mixed LoRA + non-LoRA fine-tunes to the right writer.
+        adapter_tensors = collect_mlx_lora_adapter_tensors(self.model)
+        adapter_keys = set(adapter_tensors)
+        trainable = dict(tree_flatten(self.model.trainable_parameters()))
+        trainable_keys = set(trainable)
+        has_trainable_lora = bool(adapter_keys & trainable_keys)
+        has_trainable_non_lora = bool(trainable_keys - adapter_keys)
+        # Treat as a LoRA save when adapters exist AND either LoRA is actively
+        # training, or there are no other trainables to preserve. Frozen LoRA
+        # with only non-LoRA trainables (norm-only fine-tune over a reloaded
+        # adapter) falls through to save_merged_model so trained non-LoRA
+        # state survives.
+        has_lora = bool(adapter_tensors) and (
+            has_trainable_lora or not has_trainable_non_lora
+        )
 
         if has_lora:
             hf_repo = getattr(self.model, "_hf_repo", None) or ""
 
 
             _lora_rank, _lora_scale, _lora_dropout = 8, 1.0, 0.0
-            for _, m in self.model.named_modules():
-                if hasattr(m, "lora_a"):
-                    _lora_rank = m.lora_a.shape[-1]
-                    _lora_scale = getattr(m, "scale", 1.0)
+            for _, m, a_attr, _b_attr in iter_mlx_lora_modules(self.model):
+                a_tensor = getattr(m, a_attr)
+                a_shape = tuple(getattr(a_tensor, "shape", ()))
+                # mlx-lm LoRASwitchLinear stores (num_experts, rank, in_dims);
+                # standard LoRALinear stores (in_dims, rank).
+                if len(a_shape) >= 3:
+                    _lora_rank = int(a_shape[-2])
+                elif len(a_shape) >= 2:
+                    _lora_rank = int(a_shape[-1])
+                _lora_scale = getattr(m, "scale", 1.0)
 
-                    _drop = getattr(m, "dropout", None)
-                    _lora_dropout = getattr(_drop, "p", 0.0) if _drop else 0.0
-                    break
+                _drop = getattr(m, "dropout", None)
+                _lora_dropout = getattr(_drop, "p", 0.0) if _drop else 0.0
+                break
 
 
             from .utils import _get_transformer_layers
             layers = _get_transformer_layers(self.model)
             _num_layers = len(layers) if layers else -1
 
-            # Save in mlx-lm's expected format so load_adapters() works
-            self.model.save_lora_adapters(output_dir, adapter_config={
+            adapter_config = {
                 # mlx-lm format (load_adapters expects these)
                 "num_layers": _num_layers,
                 "lora_parameters": {
@@ -1438,7 +1458,19 @@ class MLXTrainer:
                 "base_quantized_source": getattr(
                     self.model, "_unsloth_quantized_source", None,
                 ),
-            })
+            }
+            # Preserve intentionally trainable non-LoRA tensors (embeddings,
+            # projector, vision, ...) by saving the full trainable tree when
+            # the trainer touched anything beyond LoRA. Pure LoRA runs keep
+            # the lean adapter-only artifact mlx-lm load_adapters() expects.
+            if has_trainable_non_lora:
+                save_trainable_adapters(
+                    self.model, output_dir, adapter_config=adapter_config,
+                )
+            else:
+                self.model.save_lora_adapters(
+                    output_dir, adapter_config=adapter_config,
+                )
             # why: VLM processors include the inner tokenizer; double-save
             # rewrites the same files. Skip when the processor will cover it.
             _processor = self.processor or getattr(self.model, "_processor", None)
