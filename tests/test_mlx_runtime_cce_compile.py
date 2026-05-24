@@ -39,6 +39,24 @@ def _skip_torch_shim():
         pytest.skip("requires real MLX runtime")
 
 
+def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
+    # hidden=0 but targets!=0 indicates an upstream shape mismatch we
+    # want to surface, not silently drop labels.
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    runtime_cce, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100,
+        chunk_size=16,
+    )
+    hidden = mx.zeros((0, 16), dtype=mx.float32)
+    weight = mx.zeros((32, 16), dtype=mx.float32)
+    targets = mx.array([0, 1, 2], dtype=mx.int32)
+
+    with pytest.raises(ValueError, match="hidden has 0 tokens"):
+        runtime_cce(hidden, weight, targets)
+
+
 def test_runtime_cce_zero_tokens_returns_empty_losses_and_zero_gradients():
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
@@ -143,7 +161,9 @@ def test_runtime_cce_invalid_labels_poison_loss_and_gradients(bad_target):
     assert math.isnan(grad_norm.item())
 
 
-def test_compiled_runtime_cce_invalid_labels_poison_loss():
+@pytest.mark.parametrize("bad_target", [-1, 32])
+def test_compiled_runtime_cce_invalid_labels_poison_loss(bad_target):
+    # cover both negative and >= vocab_size labels under mx.compile.
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 
@@ -153,7 +173,7 @@ def test_compiled_runtime_cce_invalid_labels_poison_loss():
     )
     hidden = mx.ones((2, 16), dtype=mx.float32)
     weight = mx.ones((32, 16), dtype=mx.float32)
-    targets = mx.array([0, 32], dtype=mx.int32)
+    targets = mx.array([0, bad_target], dtype=mx.int32)
 
     def losses_fn(h, w, t):
         return runtime_cce(h, w, t)

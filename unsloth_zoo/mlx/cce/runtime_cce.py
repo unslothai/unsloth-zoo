@@ -126,11 +126,8 @@ def _target_validity_masks(
 
 
 def _poison_invalid_targets(values: mx.array, invalid: mx.array) -> mx.array:
-    return mx.where(
-        invalid,
-        mx.full(values.shape, float("nan"), dtype=values.dtype),
-        values,
-    )
+    # scalar NaN broadcasts; avoids O(n) alloc on every forward call.
+    return mx.where(invalid, mx.array(float("nan"), dtype=values.dtype), values)
 
 
 def _chunk_matmul(
@@ -483,6 +480,12 @@ def _forward_chunked_fused_finalize(
     n, _ = hidden_compute.shape
     vocab_size = weight_compute.shape[0]
     if n == 0:
+        # surface upstream shape mismatch instead of silently dropping labels.
+        if targets.shape[0] != 0:
+            raise ValueError(
+                "MLX CCE: hidden has 0 tokens but targets is non-empty "
+                f"(targets.shape={targets.shape})."
+            )
         empty = mx.zeros((0,), dtype=mx.float32)
         return empty, empty
     compute_bytes = 2 if hidden_compute.dtype in (mx.float16, mx.bfloat16) else 4
