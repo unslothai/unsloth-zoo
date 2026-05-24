@@ -871,7 +871,11 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         **extra_kwargs,
     )
     merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
-    if "position_ids" in extra_kwargs:
+    # Prefer position_ids returned/stashed by get_input_embeddings (some
+    # VLM embedders, e.g. Qwen-VL family, adjust them for the merged
+    # multimodal sequence). Only fall back to the raw batch position_ids
+    # if the embedder did not produce its own.
+    if "position_ids" in extra_kwargs and "position_ids" not in backbone_kwargs:
         backbone_kwargs["position_ids"] = extra_kwargs["position_ids"]
 
     hidden = _forward_text_hidden_states(
