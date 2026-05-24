@@ -36,6 +36,9 @@ import torch
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_shim():
+    import sys
+    if "mlx" in sys.modules:
+        return
     from mlx_simulation import simulate_mlx_on_torch
     simulate_mlx_on_torch()
 
@@ -492,3 +495,286 @@ def test_save_pretrained_merged_merged_methods_skip_lora_collection(tmp_path, mo
     assert len(merged_calls) == 2
     assert merged_calls[0][1] is True   # merged_16bit dequantizes
     assert merged_calls[1][1] is False  # merged_4bit keeps quantization
+
+
+def test_save_trainable_adapters_raises_when_no_trainable_params(tmp_path):
+    # A fully frozen model has no trainable tensors, so writing a checkpoint
+    # would leave adapter_config.json next to a missing adapters.safetensors;
+    # the loader cannot consume that. The exporter must surface the empty
+    # case explicitly the same way save_lora_adapters() does.
+    from unsloth_zoo.mlx.utils import save_trainable_adapters
+
+    class _FrozenModel:
+        def __init__(self):
+            self._hf_repo = None
+            self._config = None
+            self._unsloth_quantization_config = None
+            self._unsloth_quantization_policy = None
+            self._unsloth_quantized_source = None
+            self._unsloth_base_revision = None
+            self._unsloth_base_commit_hash = None
+            self._src_path = None
+        def parameters(self):
+            return {}
+        def trainable_parameters(self):
+            return {}
+        def named_modules(self):
+            yield "", self
+
+    with pytest.raises(ValueError, match="no trainable or LoRA parameters"):
+        save_trainable_adapters(_FrozenModel(), tmp_path)
+    assert not (tmp_path / "adapters.safetensors").exists()
+    assert not (tmp_path / "adapter_config.json").exists()
+
+
+def test_ensure_lora_frozen_freezes_norm_whose_name_contains_lora_substring():
+    # Anchor-on-modules detection lets the norm safeguard flag accidentally
+    # trainable norms even when the parameter path happens to contain the
+    # literal "lora" substring (e.g. a norm sitting inside a module named
+    # `lora_router`). The previous "lora" not in k check let those through.
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
+
+    freeze_calls = []
+
+    class _NormStub:
+        def __init__(self):
+            self.weight = torch.zeros(16)
+        def freeze(self, keys=None, recurse=False):
+            freeze_calls.append((list(keys or []), recurse))
+
+    fake_norm = _NormStub()
+
+    class _ModelWithLoraNamedNorm:
+        def __init__(self):
+            self.q_proj = lora
+            self.lora_router_norm = fake_norm
+        def parameters(self):
+            return {
+                "q_proj.weight": lora.weight,
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+                "lora_router_norm.weight": fake_norm.weight,
+            }
+        def trainable_parameters(self):
+            return {
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+                "lora_router_norm.weight": fake_norm.weight,
+            }
+        def named_modules(self):
+            yield "", self
+            yield "q_proj", lora
+            yield "lora_router_norm", fake_norm
+
+    MLXTrainer._ensure_lora_frozen(_ModelWithLoraNamedNorm())
+    assert freeze_calls == [(["weight"], False)], freeze_calls
+
+
+def test_save_pretrained_merged_lora_method_preserves_trainable_non_lora(
+    tmp_path, monkeypatch
+):
+    # save_pretrained_merged(save_method='lora') must follow the same mixed
+    # trainable routing as MLXTrainer.save_model: when there is intentionally
+    # trainable non-LoRA state (embed_tokens, projector, vision), the public
+    # API has to write through save_trainable_adapters so the trained tensors
+    # are not silently dropped from the artifact.
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
+    embed = torch.zeros(32, 16)
+
+    class _MixedModel:
+        def __init__(self):
+            self.q_proj = lora
+            self._hf_repo = None
+            self._config = None
+            self._unsloth_quantization_config = None
+            self._unsloth_quantization_policy = None
+            self._unsloth_quantized_source = None
+            self._unsloth_base_revision = None
+            self._unsloth_base_commit_hash = None
+            self._src_path = None
+        def parameters(self):
+            return {
+                "q_proj.weight": lora.weight,
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+                "embed_tokens.weight": embed,
+            }
+        def trainable_parameters(self):
+            return {
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+                "embed_tokens.weight": embed,
+            }
+        def named_modules(self):
+            yield "", self
+            yield "q_proj", lora
+
+    class _Tok:
+        def save_pretrained(self, *_a, **_k):
+            pass
+
+    routed = []
+
+    def _spy_lora(model, path, adapter_config=None):
+        routed.append("lora")
+    def _spy_trainable(model, path, adapter_config=None):
+        routed.append("trainable")
+
+    monkeypatch.setattr(mlx_utils, "save_lora_adapters", _spy_lora)
+    monkeypatch.setattr(mlx_utils, "save_trainable_adapters", _spy_trainable)
+
+    mlx_utils.save_pretrained_merged(
+        _MixedModel(), _Tok(), tmp_path, save_method="lora",
+    )
+    assert routed == ["trainable"], routed
+
+
+def test_save_pretrained_merged_lora_method_pure_lora_uses_lean_writer(
+    tmp_path, monkeypatch
+):
+    # When no non-LoRA tensor is trainable, the public API keeps the lean
+    # adapter-only artifact (no over-eager routing to the trainable writer).
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
+
+    class _PureLoraModel:
+        def __init__(self):
+            self.q_proj = lora
+            self._hf_repo = None
+            self._config = None
+            self._unsloth_quantization_config = None
+            self._unsloth_quantization_policy = None
+            self._unsloth_quantized_source = None
+            self._unsloth_base_revision = None
+            self._unsloth_base_commit_hash = None
+            self._src_path = None
+        def parameters(self):
+            return {
+                "q_proj.weight": lora.weight,
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+            }
+        def trainable_parameters(self):
+            return {
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+            }
+        def named_modules(self):
+            yield "", self
+            yield "q_proj", lora
+
+    class _Tok:
+        def save_pretrained(self, *_a, **_k):
+            pass
+
+    routed = []
+    monkeypatch.setattr(
+        mlx_utils, "save_lora_adapters",
+        lambda model, path, adapter_config=None: routed.append("lora"),
+    )
+    monkeypatch.setattr(
+        mlx_utils, "save_trainable_adapters",
+        lambda model, path, adapter_config=None: routed.append("trainable"),
+    )
+
+    mlx_utils.save_pretrained_merged(
+        _PureLoraModel(), _Tok(), tmp_path, save_method="lora",
+    )
+    assert routed == ["lora"], routed
+
+
+def test_save_trainable_adapters_preserves_frozen_lora_alongside_trainable_norm(
+    tmp_path,
+):
+    # After a checkpoint reload + norm-only fine-tune, the LoRA pair lives
+    # in parameters() but is absent from trainable_parameters(). The
+    # checkpoint writer must still emit the LoRA tensors so the saved
+    # artifact remains a valid, reloadable adapter file.
+    from unsloth_zoo.mlx.utils import save_trainable_adapters
+
+    lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
+    norm_w = torch.zeros(16)
+
+    class _FrozenLoraTrainableNorm:
+        def __init__(self):
+            self.q_proj = lora
+            self.norm = self
+            self.weight = norm_w
+            self._hf_repo = None
+            self._config = None
+            self._unsloth_quantization_config = None
+            self._unsloth_quantization_policy = None
+            self._unsloth_quantized_source = None
+            self._unsloth_base_revision = None
+            self._unsloth_base_commit_hash = None
+            self._src_path = None
+        def parameters(self):
+            return {
+                "q_proj.weight": lora.weight,
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+                "norm.weight": norm_w,
+            }
+        def trainable_parameters(self):
+            return {"norm.weight": norm_w}
+        def named_modules(self):
+            yield "", self
+            yield "q_proj", lora
+
+    save_trainable_adapters(_FrozenLoraTrainableNorm(), tmp_path)
+
+    from safetensors.torch import load_file
+    keys = set(load_file(str(tmp_path / "adapters.safetensors")).keys())
+    assert keys == {"q_proj.lora_a", "q_proj.lora_b", "norm.weight"}, sorted(keys)
+
+
+def test_save_pretrained_merged_lora_writes_complete_adapter_config(tmp_path):
+    # adapter_config.json shipped from save_pretrained_merged(save_method='lora')
+    # must include lora_parameters with rank/scale/dropout so mlx-lm
+    # load_adapters can recreate the wrappers; previously these were absent
+    # whenever the caller did not pass an explicit adapter_config.
+    import json
+    from unsloth_zoo.mlx.utils import save_pretrained_merged
+
+    lora = _MockLoRALinear(8, 16, 4, 2.5, _MockDropoutKeepProb(0.1))
+
+    class _PureLoraModel:
+        def __init__(self):
+            self.q_proj = lora
+            self._hf_repo = None
+            self._config = None
+            self._unsloth_quantization_config = None
+            self._unsloth_quantization_policy = None
+            self._unsloth_quantized_source = None
+            self._unsloth_base_revision = None
+            self._unsloth_base_commit_hash = None
+            self._src_path = None
+        def parameters(self):
+            return {
+                "q_proj.weight": lora.weight,
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+            }
+        def trainable_parameters(self):
+            return {
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+            }
+        def named_modules(self):
+            yield "", self
+            yield "q_proj", lora
+
+    class _Tok:
+        def save_pretrained(self, *_a, **_k):
+            pass
+
+    save_pretrained_merged(_PureLoraModel(), _Tok(), tmp_path, save_method="lora")
+    cfg = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert "lora_parameters" in cfg, cfg
+    assert cfg["lora_parameters"]["rank"] == 4, cfg
+    assert cfg["lora_parameters"]["scale"] == 2.5, cfg
