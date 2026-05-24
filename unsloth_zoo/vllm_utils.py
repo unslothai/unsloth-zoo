@@ -1779,6 +1779,17 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
+    # `vllm_version` only exists when `vllm` was importable at module-load
+    # time (see the find_spec guard near top of file). Raise an actionable
+    # error here instead of NameError, e.g. on the unsloth-blackwell
+    # no-vllm image or on arm64 where no vllm wheel is published.
+    if "vllm_version" not in globals():
+        raise ImportError(
+            "vLLM is required for `load_vllm`/SyntheticDataKit/`fast_inference=True` "
+            "but it is not installed. Install it with `pip install vllm` (CUDA only; "
+            "no wheel exists for arm64/aarch64 as of this writing)."
+        )
+
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
     standby_util_override = os.getenv("UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE", "0") != "0"
