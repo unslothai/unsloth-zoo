@@ -226,9 +226,15 @@ def test_mlx_text_dataset_does_not_append_eos(monkeypatch):
             assert text == "hello"
             return [1, 2, 3]
 
-    dataset = _prepare_dataset([{"text": "hello"}], Tokenizer())
-
+    # append_eos=False is what Studio passes (chat-template renders EOS).
+    dataset = _prepare_dataset([{"text": "hello"}], Tokenizer(), append_eos=False)
     assert dataset[0] == ([1, 2, 3], 0)
+
+    # Default (mlx-lm parity for direct MLX text fine-tuning callers)
+    # appends the tokenizer EOS so a raw `{"text": str}` row still
+    # trains the model to predict EOS.
+    dataset_default = _prepare_dataset([{"text": "hello"}], Tokenizer())
+    assert dataset_default[0] == ([1, 2, 3, 99], 0)
 
 
 def test_mlx_text_loss_masks_exclude_position_at_sequence_length():

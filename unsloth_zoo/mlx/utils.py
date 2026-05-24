@@ -421,12 +421,18 @@ def make_baseline_loss_fn():
     """
     def loss_fn(model, batch, lengths, labels=None):
         if labels is None:
-            # byte-identical to mlx_lm.tuner.trainer.default_loss
+            # Match the CCE (`utils.py:360`, `:393`) and labels-aware
+            # baseline (`utils.py:439`) masks: end is exclusive. The
+            # pre-PR `<=` was inclusive and the comment said "byte-identical
+            # to mlx_lm.tuner.trainer.default_loss", but mlx_lm's lengths
+            # convention is right-half-open (`[start, end)`), so the
+            # consistent CCE / labels-aware paths are also the correct
+            # ones for the unlabeled baseline.
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
             logits = model(inputs)
             steps = mx.arange(1, targets.shape[1] + 1)
-            mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             ce = nn.losses.cross_entropy(logits, targets) * mask
             ntoks = mask.sum()
             ce = ce.astype(mx.float32).sum() / ntoks
@@ -2657,13 +2663,21 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
 
 def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
                      formatting_func=None, chat_template=None,
-                     model_name=None, model_type=None):
+                     model_name=None, model_type=None,
+                     append_eos=True):
     """Wrap a HuggingFace dataset into mlx-lm's dataset classes.
 
     Uses CacheDataset from mlx_lm while leaving rendered text token-exact.
 
     If a formatting_func is provided, each item is pre-formatted into a
     ``{"text": ...}`` dict before wrapping.
+
+    ``append_eos`` controls whether the tokenizer's EOS id is appended to
+    each encoded row. Default True preserves the pre-PR behavior that
+    delegated EOS appending to ``mlx_lm.tuner.datasets.TextDataset`` for
+    direct MLX text fine-tuning callers (raw ``{"text": str}`` rows
+    without already-rendered EOS). Studio passes False because its
+    chat-template rendering already includes EOS.
 
     Returns:
         A CacheDataset ready for ``iterate_batches``.
@@ -2705,17 +2719,26 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
             "a formatting_func that returns text."
         )
 
-    class _StudioTextDataset:
-        """TextDataset variant that does not append EOS behind Studio's back."""
+    _eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
 
-        def __init__(self, data, tokenizer, text_key="text"):
+    class _StudioTextDataset:
+        """TextDataset variant. Optionally appends EOS (mlx-lm parity);
+        Studio passes append_eos=False because chat templates already render it."""
+
+        def __init__(self, data, tokenizer, text_key="text", eos_id=None):
             self._data = data
             self.tokenizer = tokenizer
             self.text_key = text_key
+            self._eos_id = eos_id
 
         def process(self, item):
-            # Studio/chat templates own EOS; adding one here changes labels.
-            return (self.tokenizer.encode(item[self.text_key]), 0)
+            encoded = self.tokenizer.encode(item[self.text_key])
+            if (
+                self._eos_id is not None
+                and (not encoded or encoded[-1] != self._eos_id)
+            ):
+                encoded = list(encoded) + [int(self._eos_id)]
+            return (encoded, 0)
 
         def __getitem__(self, idx):
             return self._data[idx]
@@ -2723,13 +2746,15 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
         def __len__(self):
             return len(self._data)
 
-    return CacheDataset(_StudioTextDataset(formatted, tokenizer, text_key="text"))
+    return CacheDataset(
+        _StudioTextDataset(formatted, tokenizer, text_key="text", eos_id=_eos_id)
+    )
 
 
 def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                    num_batches=None, seed=42, dataset_text_field="text",
                    formatting_func=None, chat_template=None,
-                   model_name=None, model_type=None):
+                   model_name=None, model_type=None, append_eos=True):
     """Pre-tokenize and batch a HuggingFace dataset for MLX training.
 
     Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
@@ -2752,6 +2777,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         chat_template=chat_template,
         model_name=model_name,
         model_type=model_type,
+        append_eos=append_eos,
     )
 
     batch_pairs = []
@@ -2788,7 +2814,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
                            dataset_text_field="text",
                            formatting_func=None, chat_template=None,
                            model_name=None, model_type=None,
-                           num_epochs=None):
+                           num_epochs=None, append_eos=True):
     """Create text batches with an explicit dataset order.
 
     Studio uses this to mirror CUDA's effective sampler stream without
@@ -2800,6 +2826,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         chat_template=chat_template,
         model_name=model_name,
         model_type=model_type,
+        append_eos=append_eos,
     )
 
     tokenized = []
@@ -2833,17 +2860,28 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         if num_batches is None else None
     )
     while num_batches is None or len(batch_pairs) < num_batches:
-        batch_items = []
-        for _ in range(batch_size):
-            if order_pos >= len(order):
-                epoch += 1
-                order = make_order(epoch)
-                order_pos = 0
-            batch_items.append(tokenized[order[order_pos]])
-            order_pos += 1
-            seen += 1
-            if num_batches is None and target_items is not None and seen >= target_items:
+        # Take up to batch_size contiguous indices from the current epoch.
+        # If the epoch tail is shorter, emit a partial batch and start
+        # the next batch fresh at epoch+1. Matches CUDA / SequentialSampler
+        # `drop_last=False` and the VLM ordered path at utils.py:2539,
+        # instead of mixing the last sample of one epoch with the first
+        # sample of the next inside the same micro-batch.
+        if order_pos >= len(order):
+            if num_batches is None:
                 break
+            epoch += 1
+            order = make_order(epoch)
+            order_pos = 0
+
+        chunk = order[order_pos : order_pos + batch_size]
+        if not chunk:
+            break
+        order_pos += len(chunk)
+        seen += len(chunk)
+        if num_batches is None and target_items is not None and seen > target_items:
+            chunk = chunk[: len(chunk) - (seen - target_items)]
+            seen = target_items
+        batch_items = [tokenized[i] for i in chunk]
 
         max_length = max(len(ids) for ids in batch_items)
         batch_ids = []
@@ -2864,7 +2902,8 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
 def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              seed=42, dataset_text_field="text",
                              formatting_func=None, chat_template=None,
-                             model_name=None, model_type=None):
+                             model_name=None, model_type=None,
+                             append_eos=True):
     """Streaming batch generator for MLX training.
 
     Wraps mlx-lm's iterate_batches(loop=True) as a generator, avoiding
@@ -2880,6 +2919,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
         chat_template=chat_template,
         model_name=model_name,
         model_type=model_type,
+        append_eos=append_eos,
     )
 
     for batch, lengths_info in iterate_batches(

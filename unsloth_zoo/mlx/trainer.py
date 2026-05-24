@@ -352,6 +352,12 @@ class MLXTrainingConfig:
     wired_limit_gb: float | None = None  # None = min(recommended working set, memory limit); <= 0 disables
     disable_memory_limits: bool = False
     cast_norm_output_to_input_dtype: bool = True  # fp32 norm storage/math, bf16/fp16 downstream activations
+    # Append the tokenizer EOS id to each encoded text row before batching.
+    # Default True mirrors mlx-lm's TextDataset behavior so direct MLX
+    # text fine-tuning callers (raw `{"text": str}` rows) still train the
+    # model to predict EOS. Studio passes False because its chat template
+    # already renders EOS.
+    append_eos: bool = True
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
@@ -1359,6 +1365,7 @@ class MLXTrainer:
                         if isinstance(getattr(self.model, "_config", {}), dict)
                         else None
                     ),
+                    append_eos=bool(getattr(args, "append_eos", True)),
                 )
             if eval_batches:
                 print(f"Unsloth: Eval enabled every {args.eval_steps} steps "
@@ -1763,6 +1770,7 @@ class MLXTrainer:
                     chat_template=chat_tmpl,
                     model_name=model_name,
                     model_type=model_type,
+                    append_eos=bool(getattr(args, "append_eos", True)),
                 )
             else:
                 batch_kwargs = dict(
@@ -1777,6 +1785,7 @@ class MLXTrainer:
                     chat_template=chat_tmpl,
                     model_name=model_name,
                     model_type=model_type,
+                    append_eos=bool(getattr(args, "append_eos", True)),
                 )
                 if (
                     getattr(args, "preserve_dataset_order", False)
@@ -1888,7 +1897,9 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             max_seq_length, formatting_func=None,
                             dataset_text_field="text", num_batches=None,
                             seed=42, chat_template=None,
-                            model_name=None, model_type=None):
+                            model_name=None, model_type=None,
+                            append_eos=True, dataset_order="default",
+                            preserve_dataset_order=False):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -1897,7 +1908,10 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     Returns:
         List of (batch, lengths, labels) tuples where:
         - batch: mx.array (BS, padded_len) — input_ids padded with 0
-        - lengths: mx.array (BS, 2) — [1, actual_len - 1] per sequence
+        - lengths: mx.array of shape (BS, 2) holding [1, actual_len]
+          per sequence. Right-half-open `[start, end)` matching the
+          exclusive-end loss masks in `utils.py:360`, `:393`, `:429`,
+          `:439`.
         - labels: mx.array (BS, padded_len) — labels padded with -100
     """
     eos_id = tokenizer.eos_token_id
@@ -1933,7 +1947,12 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     #    slow tokenizers degrade gracefully via the GIL)
     def _process_text(text):
         encoded = tokenizer.encode(text)
-        if eos_id is not None and (not encoded or encoded[-1] != eos_id):
+        # Honor the same `append_eos` contract as `_prepare_dataset`; the
+        # unlabeled text path (`_prepare_dataset` -> mlx-lm CacheDataset)
+        # appends or skips EOS based on the trainer's config, so the
+        # labeled `train_on_responses_only` path must match or the two
+        # produce different supervised tokens for the same input.
+        if append_eos and eos_id is not None and (not encoded or encoded[-1] != eos_id):
             encoded.append(eos_id)
         if len(encoded) > max_seq_length:
             encoded = encoded[:max_seq_length]
@@ -1958,8 +1977,16 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             "Check your dataset and formatting_func."
         )
 
-    # 2. Sort by length for efficient padding
-    all_items.sort(key=lambda x: len(x[0]))
+    # 2. Sort by length for efficient padding -- but only when the caller
+    # has NOT requested a specific dataset_order. Length sorting is the
+    # default mlx-lm pattern that improves padding efficiency, but it
+    # breaks `preserve_dataset_order=True` (Studio CUDA parity) and
+    # `dataset_order="torch_randperm"` (deterministic shuffle).
+    _order_requested = preserve_dataset_order or (
+        dataset_order not in (None, "default")
+    )
+    if not _order_requested:
+        all_items.sort(key=lambda x: len(x[0]))
 
     # 3. Create padded batches
     rng = random.Random(seed)
@@ -1982,7 +2009,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             pad_len = padded_len - L
             batch_ids.append(ids[:L] + [0] * pad_len)
             batch_labels.append(lbls[:L] + [-100] * pad_len)
-            batch_lengths.append([1, L - 1])
+            # Right-half-open [start, end) to match the loss masks in
+            # utils.py:360/:393/:429/:439 (`steps < lengths[:, 1:]`).
+            # Pre-fix this was `[1, L - 1]` which paired with the old
+            # `<=` mask; the PR flipped the mask to `<` so the end
+            # value must shift up by one to keep training on the
+            # final supervised token.
+            batch_lengths.append([1, L])
 
         batches.append((
             mx.array(batch_ids),
@@ -1990,8 +2023,20 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             mx.array(batch_labels),
         ))
 
-    # 4. Shuffle batches
-    rng.shuffle(batches)
+    # 4. Order the batch sequence.
+    #   - preserve_dataset_order=True: emit in dataset order (Studio CUDA
+    #     SequentialSampler parity).
+    #   - dataset_order="torch_randperm": deterministic shuffle seeded by
+    #     `seed`, matching the non-labeled `create_ordered_batches` path.
+    #   - default: legacy length-sorted-then-shuffled behavior.
+    if preserve_dataset_order:
+        pass
+    elif dataset_order == "torch_randperm":
+        rng.shuffle(batches)
+    elif dataset_order == "sequential":
+        pass
+    else:
+        rng.shuffle(batches)
 
     # Limit if needed
     if num_batches is not None and len(batches) > num_batches:
@@ -2196,6 +2241,9 @@ def train_on_responses_only(
                 if isinstance(getattr(trainer.model, "_config", {}), dict)
                 else None
             ),
+            append_eos=bool(getattr(args, "append_eos", True)),
+            dataset_order=getattr(args, "dataset_order", "default"),
+            preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
         )
 
         # Safety check: detect all-masked labels early
@@ -2221,6 +2269,9 @@ def train_on_responses_only(
                     if isinstance(getattr(trainer.model, "_config", {}), dict)
                     else None
                 ),
+                append_eos=bool(getattr(args, "append_eos", True)),
+                dataset_order=getattr(args, "dataset_order", "default"),
+                preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
             )
             trainer._eval_batches_labeled = eval_batches
 
