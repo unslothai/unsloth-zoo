@@ -2679,8 +2679,8 @@ def _get_mlx_dropout_probability(drop):
 def _infer_mlx_lora_rank(module):
     lora_a = getattr(module, "lora_a", None)
     lora_b = getattr(module, "lora_b", None)
-    lora_a_shape = tuple(getattr(lora_a, "shape", ()) or ())
-    lora_b_shape = tuple(getattr(lora_b, "shape", ()) or ())
+    lora_a_shape = tuple(lora_a.shape) if lora_a is not None and hasattr(lora_a, "shape") else ()
+    lora_b_shape = tuple(lora_b.shape) if lora_b is not None and hasattr(lora_b, "shape") else ()
     # MoE/switch: lora_a (..., rank, in_dims); lora_b (..., out_dims, rank).
     if len(lora_a_shape) >= 3:
         rank = lora_a_shape[-2]
@@ -2779,9 +2779,6 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         lora_rank = None
         lora_scale = None
         lora_dropout = None
-        fallback_rank = None
-        fallback_scale = None
-        fallback_dropout = None
         for name, module in model.named_modules():
             if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
                 lora_paths.append(name)
@@ -2793,22 +2790,12 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 # would write the wrong language-tower params.
                 if explicit_path_set is not None and name not in explicit_path_set:
                     continue
-                if fallback_rank is None:
-                    fallback_rank = inferred_rank
-                    fallback_scale = float(getattr(module, "scale", 1.0))
-                    fallback_dropout = _get_mlx_dropout_probability(
-                        getattr(module, "dropout", None)
-                    )
                 if lora_rank is None:
                     lora_rank = inferred_rank
                     lora_scale = float(getattr(module, "scale", 1.0))
                     lora_dropout = _get_mlx_dropout_probability(
                         getattr(module, "dropout", None)
                     )
-        if lora_rank is None and fallback_rank is not None:
-            lora_rank = fallback_rank
-            lora_scale = fallback_scale
-            lora_dropout = fallback_dropout
 
         # only auto-fill when caller did not supply the key at all.
         if lora_paths and "unsloth_mlx_lora_module_paths" not in adapter_config:
