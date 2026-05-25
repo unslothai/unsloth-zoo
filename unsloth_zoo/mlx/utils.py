@@ -261,8 +261,18 @@ def _is_lm_head_trainable(model):
     # lora_router.weight or base.lora_special.lm_head.weight) are not
     # silently treated as adapter state.
     adapter_keys = set(collect_mlx_lora_adapter_tensors(model))
+    # Base tensors INSIDE a LoRA-wrapped lm_head (e.g. lm_head.weight under
+    # a LoRA-wrapped lm_head) are reload-leaked artifacts, not real user
+    # intent. Skip them so the CCE memory guard still kicks in: computing
+    # the full V x H weight gradient just because a wrapper exposed its
+    # base is exactly the OOM defeat the guard exists to prevent.
+    lora_module_prefixes = tuple(
+        f"{name}." for name, _ in iter_mlx_lora_modules(model) if name
+    )
     for key in trainable:
         if key in adapter_keys:
+            continue
+        if any(key.startswith(p) for p in lora_module_prefixes):
             continue
         if 'lm_head' in key or 'embed_tokens.weight' in key:
             return True
@@ -2862,6 +2872,14 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     # wrappers before binding the saved full-precision weights.
     has_lora_modules = any(True for _ in iter_mlx_lora_modules(model))
     declared_lora_artifact = adapter_config.get("fine_tune_type") in {"lora", "dora"}
+    # Detect DoRA so the adapter ships with fine_tune_type='dora' instead
+    # of 'lora'. mlx-lm's load_adapters() only recreates DoRA wrappers when
+    # the config says 'dora'; without this the saved q_proj.m magnitude
+    # tensor cannot bind on reload and DoRA semantics are silently lost.
+    has_dora_modules = any(
+        type(module).__name__.startswith("DoRA")
+        for _, module in iter_mlx_lora_modules(model)
+    )
     if has_lora_modules or declared_lora_artifact:
         if "lora_parameters" not in adapter_config:
             rank, scale, dropout = _extract_mlx_lora_parameters(model)
@@ -2870,10 +2888,13 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 "scale": scale,
                 "dropout": dropout,
             }
-            # mlx-vlm expects these at top level too
-            adapter_config.setdefault("rank", rank)
-            adapter_config.setdefault("scale", scale)
-            adapter_config.setdefault("dropout", dropout)
+        # mlx-vlm expects these at top level too; backfill regardless of
+        # whether lora_parameters was caller-supplied or computed above so
+        # that mlx-vlm reload always sees a consistent top-level view.
+        lora_parameters = adapter_config["lora_parameters"]
+        for key in ("rank", "scale", "dropout"):
+            if key not in adapter_config and key in lora_parameters:
+                adapter_config[key] = lora_parameters[key]
         # mlx-lm.load_adapters() reads num_layers off the adapter config to
         # decide how many transformer layers to wrap. Trainer.save_model
         # fills this in directly; backfill it here too so save_pretrained_merged
@@ -2881,11 +2902,23 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         if "num_layers" not in adapter_config:
             try:
                 layers = _get_transformer_layers(model)
-                adapter_config["num_layers"] = len(layers) if layers else -1
+                if layers and len(layers) > 0:
+                    adapter_config["num_layers"] = len(layers)
             except Exception:
-                adapter_config["num_layers"] = -1
-        adapter_config.setdefault("fine_tune_type", "lora")
+                pass
+        # Choose dora over lora when DoRA modules are actually present so
+        # the saved q_proj.m tensor rebinds via DoRALinear on reload.
+        if has_dora_modules and adapter_config.get("fine_tune_type") not in {"dora"}:
+            adapter_config["fine_tune_type"] = "dora"
+        else:
+            adapter_config.setdefault("fine_tune_type", "lora")
         adapter_config.setdefault("peft_type", "LORA")
+    else:
+        # Full fine-tune checkpoint: mlx-lm's load_adapters() defaults a
+        # missing fine_tune_type to 'lora' and then reads num_layers /
+        # lora_parameters, so the saved tensors fail to reload. Stamp
+        # 'full' explicitly so reload routes to the no-LoRA path.
+        adapter_config.setdefault("fine_tune_type", "full")
 
     # why: record LoRA module paths so reload recreates vision/projector LoRA
     # layers (mlx-lm.load_adapters only knows the language tower).
@@ -3060,6 +3093,34 @@ def _push_lora_adapters_to_hub(
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
+    # Restrict the upload to adapter-relevant files so a save_directory
+    # that already contained stale merged-model artifacts (e.g. from a
+    # prior save_pretrained_merged(save_method='merged_16bit') run, or
+    # external GGUF exports) does not silently get pushed under the LoRA
+    # adapter repo. This is a data-leak guard for the public-by-default
+    # case where private is not set.
+    _lora_allow_patterns = [
+        "adapters.safetensors",
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "tokenizer.model",
+        "chat_template.jinja",
+        "chat_template.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "added_tokens.json",
+        "vocab.json",
+        "merges.txt",
+        "spiece.model",
+        "config.json",
+        "generation_config.json",
+        "README.md",
+        ".gitattributes",
+    ]
+
     # LoRA adapter dirs are small (typically <500MB, ~5 files), so
     # upload_folder's single-commit semantics fit and let us honor the
     # caller's commit_message / commit_description / create_pr / revision.
@@ -3075,6 +3136,7 @@ def _push_lora_adapters_to_hub(
             commit_description=commit_description,
             create_pr=create_pr,
             revision=revision,
+            allow_patterns=_lora_allow_patterns,
         )
     except (AttributeError, TypeError):
         api.upload_large_folder(
@@ -3082,6 +3144,7 @@ def _push_lora_adapters_to_hub(
             repo_id=repo_id,
             repo_type="model",
             revision=revision,
+            allow_patterns=_lora_allow_patterns,
         )
     print(f"Unsloth: Pushed LoRA adapters to https://huggingface.co/{repo_id}")
 

@@ -954,6 +954,142 @@ def test_push_lora_adapters_routes_commit_metadata_through_upload_folder(
     assert sent["repo_id"] == "me/adapter"
 
 
+def test_enrich_stamps_fine_tune_type_full_when_no_lora_modules(tmp_path):
+    # Full-finetune / no-LoRA checkpoints must NOT default to lora on
+    # reload. mlx-lm's load_adapters() defaults missing fine_tune_type
+    # to "lora" and then reads num_layers / lora_parameters, so a no-LoRA
+    # save with no fine_tune_type stamp fails to reload as a full model.
+    from unsloth_zoo.mlx.utils import _enrich_mlx_adapter_config
+
+    class _Model:
+        def named_modules(self):
+            return iter(())  # no LoRA modules
+        def parameters(self):
+            return {}
+
+    cfg = _enrich_mlx_adapter_config(_Model(), {})
+    assert cfg.get("fine_tune_type") == "full", cfg
+    # Should NOT have peft_type=LORA on a full-finetune save.
+    assert cfg.get("peft_type") is None or cfg.get("peft_type") != "LORA", cfg
+
+
+def test_enrich_stamps_fine_tune_type_dora_when_dora_modules_present():
+    # mlx-lm's linear_to_lora_layers(..., use_dora=(fine_tune_type=="dora"))
+    # only recreates DoRA wrappers when the config says "dora". Without
+    # the right stamp, the saved q_proj.m magnitude tensor cannot bind
+    # via DoRALinear on reload, dropping the learned DoRA magnitudes.
+    from unsloth_zoo.mlx.utils import _enrich_mlx_adapter_config
+    import torch as _t
+
+    class DoRALinear:
+        def __init__(self):
+            self.lora_a = _t.zeros(8, 4)
+            self.lora_b = _t.zeros(4, 8)
+            self.m = _t.zeros(8)
+        # mlx-lm names this attr `m`; the gate on type(module).__name__
+        # is what triggers the dora stamp.
+
+    class _DoRAModel:
+        def __init__(self):
+            self._mod = DoRALinear()
+        def named_modules(self):
+            yield "q_proj", self._mod
+        def parameters(self):
+            return {
+                "q_proj": {
+                    "lora_a": self._mod.lora_a,
+                    "lora_b": self._mod.lora_b,
+                    "m": self._mod.m,
+                }
+            }
+
+    cfg = _enrich_mlx_adapter_config(_DoRAModel(), {})
+    assert cfg.get("fine_tune_type") == "dora", cfg
+
+
+def test_is_lm_head_trainable_skips_base_weight_under_lora_wrapped_lm_head():
+    # After reload, mlx-lm wrappers may leak the inner base .weight as
+    # trainable. For a LoRA-wrapped lm_head the leaked lm_head.weight is
+    # not real user intent; treating it as trainable defeats the CCE
+    # memory guard and forces a V x H weight gradient per chunk.
+    from unsloth_zoo.mlx.utils import _is_lm_head_trainable
+    import torch as _t
+
+    class _LoRAlmHead:
+        def __init__(self):
+            self.lora_a = _t.zeros(4, 1024)
+            self.lora_b = _t.zeros(1024, 4)
+            self.weight = _t.zeros(1024, 1024)  # leaked base
+
+    class _Model:
+        def __init__(self):
+            self._lm = _LoRAlmHead()
+        def trainable_parameters(self):
+            return {
+                "lm_head": {
+                    "lora_a": self._lm.lora_a,
+                    "lora_b": self._lm.lora_b,
+                    "weight": self._lm.weight,
+                }
+            }
+        def parameters(self):
+            return self.trainable_parameters()
+        def named_modules(self):
+            yield "lm_head", self._lm
+
+    # lm_head.weight under a LoRA-wrapped lm_head must be filtered out;
+    # the trainable check should return False (LoRA-only training).
+    assert _is_lm_head_trainable(_Model()) is False
+
+
+def test_push_lora_adapters_uses_allow_patterns_to_avoid_stale_uploads(
+    tmp_path, monkeypatch,
+):
+    # If the save_directory already contains stale full-model files
+    # (e.g. from a prior save_pretrained_merged(save_method='merged_16bit')
+    # run), the LoRA push must NOT upload them. Public-by-default repos
+    # would otherwise expose merged weights under a "LoRA adapter" repo.
+    import huggingface_hub
+    from unsloth_zoo.mlx.utils import _push_lora_adapters_to_hub
+
+    (tmp_path / "adapters.safetensors").write_bytes(b"\x00")
+    (tmp_path / "adapter_config.json").write_text("{}")
+    (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"stale-full-model")
+    (tmp_path / "tokenizer.json").write_text("{}")
+
+    calls = {"folder": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kwargs):
+            return None
+
+        def update_repo_settings(self, **kwargs):
+            return None
+
+        def upload_folder(self, **kwargs):
+            calls["folder"].append(kwargs)
+
+        def upload_large_folder(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    _push_lora_adapters_to_hub(tmp_path, repo_id="me/adapter")
+
+    assert len(calls["folder"]) == 1, calls
+    sent = calls["folder"][0]
+    assert "allow_patterns" in sent, sent
+    patterns = sent["allow_patterns"]
+    assert "adapters.safetensors" in patterns
+    assert "adapter_config.json" in patterns
+    # No catch-all that would re-include the stale merged-model shard.
+    assert "*.safetensors" not in patterns
+    assert "*" not in patterns
+
+
 def test_collect_lora_includes_m_on_real_dora_class():
     # Positive twin of the DoRA-gate negative test: if a module's class
     # name starts with "DoRA" (matches mlx-lm's DoRALinear / DoRAEmbedding),
