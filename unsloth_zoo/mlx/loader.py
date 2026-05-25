@@ -1143,7 +1143,12 @@ def _infer_rank_from_saved_adapter(adapter_weights_file, module_path):
         ".lora_a.weight",
         ".lora_A",
         ".lora_A.weight",
-        ".lora_embedding_a.weight",
+        # NOTE: `.lora_embedding_a*` is intentionally NOT here. mlx-lm's
+        # LoRAEmbedding saves the A tensor as `(num_embeddings, rank)`,
+        # not `(rank, in_dims)`, so rank is shape[-1] (the default
+        # branch). Putting it in this set would return num_embeddings
+        # (e.g. 32000) as the inferred rank and bind an absurd-rank
+        # wrapper to the saved rank-4 tensor.
     })
     try:
         with safe_open(adapter_weights_file, framework="numpy") as _f:

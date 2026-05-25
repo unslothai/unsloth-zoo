@@ -2909,7 +2909,6 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             key in existing_lora_parameters or key in adapter_config
             for key in ("rank", "scale", "dropout")
         )
-        explicit_filter_narrowed = explicit_path_set is not None
 
         if lora_rank is not None and not has_caller_lora_metadata:
             lora_parameters = existing_lora_parameters
@@ -2937,21 +2936,30 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             # Keep the caller's metadata coherent: copy top-level
             # rank/scale/dropout into lora_parameters (or vice versa) so
             # both shapes that mlx-lm's load_adapters checks agree.
-            # Backfill scale/dropout from the inferred module when caller
-            # provided only `rank`, so the LoRA parameters dict ships
-            # complete (mlx-lm.load_adapters consults it for both halves
-            # and rejects missing fields). Runs whether or not the caller
-            # also pinned `unsloth_mlx_lora_module_paths`.
+            # Backfill rank/scale/dropout from the inferred module when
+            # the caller provided a partial set (e.g. only `scale`), so
+            # the LoRA parameters dict always ships complete (mlx-lm's
+            # load_adapters consults it for both halves and rejects
+            # missing fields). Runs whether or not the caller also
+            # pinned `unsloth_mlx_lora_module_paths`.
             lora_parameters = existing_lora_parameters
             for key in ("rank", "scale", "dropout"):
                 if key not in lora_parameters and key in adapter_config:
                     lora_parameters[key] = adapter_config[key]
+            # Rank goes first because it gates the final write below;
+            # without backfilling rank a `{"scale": 9.0}` caller would
+            # otherwise produce a saved config with no rank at all.
             inferred_fallbacks = (
+                ("rank", lora_rank, None),
                 ("scale", lora_scale, 1.0),
                 ("dropout", lora_dropout, 0.0),
             )
             for key, inferred_value, default_value in inferred_fallbacks:
                 if key in lora_parameters:
+                    continue
+                if inferred_value is None and default_value is None:
+                    # No inferred value AND no safe default (rank);
+                    # leave it absent so the gate below skips the write.
                     continue
                 lora_parameters[key] = (
                     inferred_value if inferred_value is not None else default_value

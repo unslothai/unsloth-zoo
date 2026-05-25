@@ -1421,16 +1421,21 @@ class MLXTrainer:
 
             from .utils import _get_transformer_layers
             layers = _get_transformer_layers(self.model)
-            # Use None as the sentinel so a missing layer count is omitted
-            # from adapter_config entirely. Writing num_layers=-1 makes
-            # mlx-lm's load_adapters slice range(-1) and silently apply
-            # zero LoRA layers on reload.
+            # mlx-lm's load_adapters() does `config.num_layers` (attr
+            # access on a SimpleNamespace built from adapter_config.json),
+            # so the key MUST be present or reload raises AttributeError.
+            # Pre-PR wrote -1 as the legacy "all layers" sentinel; keep
+            # that as the fallback when we can't detect a layer count so
+            # reload still works, even though some downstream variants
+            # of load_adapters treat `range(-1)` as "no layers". A clean
+            # positive count from `_get_transformer_layers()` is always
+            # preferred.
             try:
-                _num_layers = len(layers) if layers is not None else None
+                _num_layers = len(layers) if layers is not None else -1
             except TypeError:
-                _num_layers = None
-            if _num_layers is not None and _num_layers <= 0:
-                _num_layers = None
+                _num_layers = -1
+            if _num_layers <= 0:
+                _num_layers = -1
 
             _adapter_config = {
                 "fine_tune_type": "lora",
@@ -1450,8 +1455,8 @@ class MLXTrainer:
                     self.model, "_unsloth_quantized_source", None,
                 ),
             }
-            if _num_layers is not None:
-                _adapter_config["num_layers"] = _num_layers
+            # Always present so mlx-lm load_adapters() can attr-access it.
+            _adapter_config["num_layers"] = _num_layers
             if _lora_rank is not None:
                 _adapter_config["lora_parameters"] = {
                     "rank": _lora_rank,
