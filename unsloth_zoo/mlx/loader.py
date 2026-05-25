@@ -1288,9 +1288,19 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
     by_name = dict(model.named_modules())
     linear_types = (nn.Linear, nn.QuantizedLinear)
     attached = 0
+    # Track every aux-path skip with a reason so the caller can warn
+    # specifically about which saved paths could not be re-wrapped. The
+    # saved-vs-live key diff is already the source-of-truth gate (it
+    # raises in the fallback and success branches), but a per-path
+    # warning surfaces WHY each path failed so the user knows whether
+    # to rename a module, upgrade mlx-lm, or re-save without that
+    # auxiliary group. Doesn't change the return value to avoid breaking
+    # callers that count on a bare int.
+    _skipped_paths = []
     for name in module_paths:
         module = by_name.get(name)
         if module is None:
+            _skipped_paths.append((name, "module_missing"))
             continue
         # Skip paths that are already LoRA-wrapped (e.g. mlx-lm's
         # load_adapters() already rebuilt the language tower). Without
@@ -1354,6 +1364,9 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
                     )
                 lora_cls = LoRAEmbedding
         if lora_cls is None:
+            _skipped_paths.append(
+                (name, f"unhandled_type:{type(module).__name__}"),
+            )
             continue
         _ensure_metadata(module_path=name)
         wrapped = _lora_from_base_compat(
@@ -1363,9 +1376,24 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
         parent_path, _, leaf = name.rpartition(".")
         parent = by_name.get(parent_path) if parent_path else model
         if parent is None or not hasattr(parent, leaf):
+            _skipped_paths.append((name, "parent_unreachable"))
             continue
         setattr(parent, leaf, wrapped)
         attached += 1
+
+    if _skipped_paths:
+        _preview = ", ".join(
+            f"{name} ({reason})" for name, reason in _skipped_paths[:5]
+        )
+        if len(_skipped_paths) > 5:
+            _preview += f", ... (+{len(_skipped_paths) - 5} more)"
+        warnings.warn(
+            f"Unsloth MLX: skipped {len(_skipped_paths)} saved auxiliary "
+            f"LoRA path(s) during reload: {_preview}. Their saved tensors "
+            "will not bind into the live model; the saved-vs-live key diff "
+            "may also raise.",
+            stacklevel=2,
+        )
     return attached
 
 
@@ -1468,15 +1496,58 @@ def _apply_lora_metadata_to_wrapper(wrapped, scale, dropout):
     return wrapped
 
 
+_FROM_BASE_KWARG_TYPEERROR_NEEDLES = (
+    "unexpected keyword",
+    "got an unexpected",
+    "got multiple values",
+    "no argument named",
+    "takes no keyword",
+    # The kwarg names too so a custom mlx-lm wrapper that raises a
+    # different-shape TypeError ("LoRALinear.from_base does not accept
+    # scale", "old mlx-lm: scale/dropout not accepted") still qualifies
+    # as a signature mismatch and falls through to the older shape. Add
+    # both single-quoted and plain forms.
+    "'scale'", "'dropout'", "'r'",
+    "scale", "dropout",
+)
+
+
+def _is_from_base_kwarg_typeerror(exc, kwarg=None):
+    """True when `exc` looks like an mlx-lm `from_base()` signature
+    mismatch (older wheel rejecting `scale=` / `dropout=` / `r=`),
+    not an internal `TypeError` raised by the wrapper itself (e.g.
+    "from_base requires nn.Linear, got SwitchLinear").
+
+    Falling back through fewer-arg signatures on an unrelated TypeError
+    can silently downgrade rank to the upstream default (`r=8`) and bind
+    a wrong-rank wrapper to a saved different-rank tensor, which
+    `strict=False` then drops.
+    """
+    msg = str(exc).lower()
+    if kwarg is not None and f"'{kwarg.lower()}'" in msg:
+        return True
+    return any(needle.lower() in msg for needle in _FROM_BASE_KWARG_TYPEERROR_NEEDLES)
+
+
 def _lora_from_base_compat(lora_cls, module, rank, scale, dropout):
     """Call lora_cls.from_base; fall back through older signatures and restore
-    scale/dropout on the wrapper when the kwargs are rejected."""
+    scale/dropout on the wrapper when the kwargs are rejected.
+
+    Only retries on signature-mismatch TypeErrors. An internal TypeError
+    raised by the wrapper itself propagates instead of being silently
+    downgraded to the upstream default rank (r=8), which would otherwise
+    mis-bind a wrong-rank wrapper to a saved different-rank tensor.
+    """
     try:
         return lora_cls.from_base(module, r=rank, scale=scale, dropout=dropout)
-    except TypeError:
+    except TypeError as exc:
+        if not _is_from_base_kwarg_typeerror(exc):
+            raise
         try:
             wrapped = lora_cls.from_base(module, r=rank)
-        except TypeError:
+        except TypeError as exc2:
+            if not _is_from_base_kwarg_typeerror(exc2, kwarg="r"):
+                raise
             wrapped = lora_cls.from_base(module)
         return _apply_lora_metadata_to_wrapper(wrapped, scale, dropout)
 
@@ -1536,13 +1607,21 @@ def _patch_mlx_lora_from_base_compat():
             ):
                 # Pass-through on new mlx-lm; fall back through older signatures
                 # the same way _lora_from_base_compat() does for aux modules so
-                # language and aux paths agree on metadata restoration.
+                # language and aux paths agree on metadata restoration. Only
+                # signature-mismatch TypeErrors retry; an unrelated TypeError
+                # raised by the wrapper itself propagates so we never silently
+                # downgrade to the upstream default r=8 and bind a wrong-rank
+                # wrapper to a saved different-rank tensor.
                 try:
                     return _orig(module, r=r, scale=scale, dropout=dropout)
-                except TypeError:
+                except TypeError as exc:
+                    if not _is_from_base_kwarg_typeerror(exc):
+                        raise
                     try:
                         wrapped = _orig(module, r=r)
-                    except TypeError:
+                    except TypeError as exc2:
+                        if not _is_from_base_kwarg_typeerror(exc2, kwarg="r"):
+                            raise
                         wrapped = _orig(module)
                     return _apply_lora_metadata_to_wrapper(wrapped, scale, dropout)
 
@@ -2979,12 +3058,42 @@ class FastMLXModel:
                     # Diagnose missing keys via the shared helper so the
                     # success branch surfaces silent drops the same way
                     # the fallback branch does.
-                    if _load_adapters_ok and _aux_attached > 0:
-                        if os.path.exists(adapter_weights_file):
-                            _warn_missing_adapter_keys(
-                                model, adapter_weights_file,
-                            )
+                    if _load_adapters_ok and os.path.exists(adapter_weights_file):
+                        # Always diff saved-vs-live keys when load_adapters
+                        # succeeded, even if _aux_attached == 0. Otherwise a
+                        # caller-declared aux path that the live tree no
+                        # longer satisfies (renamed vision tower, removed
+                        # projector, unhandled module type) gets silently
+                        # ignored: load_adapters bound the language tower,
+                        # _apply_lora_at_paths skipped every aux path, and
+                        # the saved aux tensors stay in adapters.safetensors
+                        # with no live module to bind into.
+                        _missing_after_success = _warn_missing_adapter_keys(
+                            model, adapter_weights_file,
+                        )
+                        if _aux_attached > 0:
                             model.load_weights(adapter_weights_file, strict=False)
+                        elif _saved_lora_paths and _missing_after_success:
+                            # Refuse to return a partial adapter: caller
+                            # declared aux paths in adapter_config but none
+                            # of them attached AND the saved-vs-live diff
+                            # shows real saved tensors are unbound. The
+                            # fallback branch already raises in this shape;
+                            # mirror it on the success branch so user-
+                            # facing semantics are consistent.
+                            _preview = ", ".join(_missing_after_success[:5])
+                            if len(_missing_after_success) > 5:
+                                _preview += (
+                                    f", ... (+{len(_missing_after_success) - 5} more)"
+                                )
+                            raise RuntimeError(
+                                "Unsloth MLX: load_adapters succeeded for the "
+                                "language tower but every saved auxiliary "
+                                f"LoRA path was skipped; {len(_missing_after_success)} "
+                                "saved LoRA tensor(s) have no live module to "
+                                f"bind into ({_preview}). Refusing to return "
+                                "a partially loaded adapter."
+                            )
 
                     if not _load_adapters_ok:
                         # No wrappers means load_weights(strict=False)
