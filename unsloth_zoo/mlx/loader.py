@@ -1085,7 +1085,22 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
     has no `.m` parameter.
     """
     import mlx.nn as nn
-    from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
+    # LoRALinear is the only mlx-lm LoRA class that has shipped on every
+    # mlx-lm version we support; LoRAEmbedding and LoRASwitchLinear were
+    # added later. Older installs that only expose LoRALinear must still
+    # be able to reload language-tower / projector LoRA adapters, so
+    # wrap the optional imports in try/except and treat the missing
+    # classes as "skip this module type" instead of crashing the whole
+    # reload path before any wrapper is attached.
+    from mlx_lm.tuner.lora import LoRALinear
+    try:
+        from mlx_lm.tuner.lora import LoRAEmbedding
+    except (ImportError, AttributeError):
+        LoRAEmbedding = None
+    try:
+        from mlx_lm.tuner.lora import LoRASwitchLinear
+    except (ImportError, AttributeError):
+        LoRASwitchLinear = None
 
     use_dora = adapter_cfg.get("fine_tune_type") == "dora"
     try:
@@ -1129,11 +1144,19 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
         elif isinstance(module, embedding_types):
             if use_dora and dora_available:
                 wrapper_cls = DoRAEmbedding
-            else:
+            elif LoRAEmbedding is not None:
                 wrapper_cls = LoRAEmbedding
+            else:
+                # Older mlx-lm: skip embedding LoRA on reload rather than
+                # crashing the whole adapter load. The saved embedding
+                # LoRA tensors will drop via the downstream
+                # load_weights(strict=False), but linear paths still bind.
+                continue
         elif switch_types and isinstance(module, switch_types):
             # mlx-lm has no DoRA switch wrapper; fall back to plain LoRA
             # for switch modules even when the rest of the model is DoRA.
+            if LoRASwitchLinear is None:
+                continue
             wrapper_cls = LoRASwitchLinear
         else:
             continue

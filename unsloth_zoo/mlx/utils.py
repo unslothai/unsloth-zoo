@@ -2601,9 +2601,20 @@ def _extract_mlx_lora_parameters(model):
     for _, m in iter_mlx_lora_modules(model):
         a_tensor = m.lora_a
         a_shape = tuple(getattr(a_tensor, "shape", ()))
-        # mlx-lm LoRASwitchLinear stores (num_experts, rank, in_dims);
-        # standard LoRALinear stores (in_dims, rank).
-        if len(a_shape) >= 3:
+        # Switch LoRA layouts vary across mlx-lm versions; lora_b is the
+        # only tensor that consistently exposes rank at a known axis:
+        #   - newer mlx-lm: lora_a=(num_experts, rank, in_dims),
+        #     lora_b=(num_experts, out_dims, rank)
+        #   - mlx-lm 0.22.x: lora_a=(rank * num_experts, in_dims),
+        #     lora_b=(num_experts, out_dims, rank)
+        # In both layouts lora_b ends with `rank`, so prefer that when
+        # the module declares num_experts. Plain LoRALinear keeps the
+        # (in_dims, rank) layout where rank is shape[-1].
+        b_tensor = getattr(m, "lora_b", None)
+        b_shape = tuple(getattr(b_tensor, "shape", ())) if b_tensor is not None else ()
+        if hasattr(m, "num_experts") and len(b_shape) >= 3:
+            rank = int(b_shape[-1])
+        elif len(a_shape) >= 3:
             rank = int(a_shape[-2])
         elif len(a_shape) >= 2:
             rank = int(a_shape[-1])
@@ -3164,6 +3175,66 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     print(f"Unsloth: Merged model saved to {path}")
 
 
+def _ensure_hub_repo_visibility(api, repo_id, private):
+    """create_repo + targeted update_repo_settings + post-failure verify.
+
+    `create_repo(exist_ok=True)` is a no-op on visibility for repos that
+    already exist, so a re-push with `private=True` requires an explicit
+    `update_repo_settings()` call. That call can fail spuriously even
+    when the repo is already private (e.g. token lacks `write:repo_settings`
+    on a repo that was just created private by the same call). Distinguish:
+
+      - private=None: caller leaves visibility to the Hub policy. Skip
+        the visibility update entirely.
+      - private=False: caller wants public. If update fails, print and
+        continue (a stuck-private repo is a soft annoyance, not a leak).
+      - private=True: caller MUST end with a private repo. If update
+        fails, double-check via `repo_info` whether the repo is already
+        private (which is the case when the prior create_repo just
+        created it private). Only raise when the repo is confirmed
+        non-private after the failed update.
+    """
+    _create_repo_kwargs = {"repo_id": repo_id, "exist_ok": True}
+    if private is not None:
+        _create_repo_kwargs["private"] = bool(private)
+    api.create_repo(**_create_repo_kwargs)
+
+    if private is None:
+        return
+
+    try:
+        api.update_repo_settings(
+            repo_id=repo_id,
+            private=bool(private),
+            repo_type="model",
+        )
+        return
+    except Exception as exc:
+        if not bool(private):
+            print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
+            return
+
+        # private=True branch. Verify the repo is actually public before
+        # blocking the upload; a freshly created private repo can hit
+        # this path when update_repo_settings is unauthorized even
+        # though the prior create_repo already produced a private repo.
+        try:
+            info = api.repo_info(repo_id=repo_id, repo_type="model")
+            if bool(getattr(info, "private", False)):
+                return
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            "Unsloth: private=True was requested but the Hub "
+            f"repo {repo_id!r} visibility could not be confirmed "
+            "private (likely token lacks `write:repo_settings` or "
+            "the repo is owned by another user). Refusing to upload "
+            "to avoid publishing artifacts to an existing public "
+            "repository."
+        ) from exc
+
+
 def _push_lora_adapters_to_hub(
     save_directory,
     repo_id=None,
@@ -3211,41 +3282,11 @@ def _push_lora_adapters_to_hub(
         commit_description += " (Trained with Unsloth 2x faster)"
 
     api = HfApi(token=token)
-    # Only forward `private` when the caller actually set it. Passing
-    # private=False unconditionally overrides org-level default-private
-    # repo creation: a user inside an org that auto-creates new repos
-    # as private would get a public repo on first push. Omitting the
-    # kwarg lets the Hub's account/org policy decide initial visibility.
-    _create_repo_kwargs = {"repo_id": repo_id, "exist_ok": True}
-    if private is not None:
-        _create_repo_kwargs["private"] = bool(private)
-    api.create_repo(**_create_repo_kwargs)
-    # create_repo(exist_ok=True) is a no-op on existing repos, so an
-    # explicit private toggle on a re-push needs update_repo_settings.
-    if private is not None:
-        try:
-            api.update_repo_settings(
-                repo_id=repo_id,
-                private=bool(private),
-                repo_type="model",
-            )
-        except Exception as exc:
-            # Fail loud when private=True was requested: silently
-            # continuing means an existing public repo stays public
-            # (create_repo(exist_ok=True) is a no-op for the visibility
-            # flag), and the upload below would push the adapters to a
-            # public Hub URL the caller explicitly tried to make private.
-            # Only print-and-continue when the caller asked for public.
-            if bool(private):
-                raise RuntimeError(
-                    "Unsloth: private=True was requested but the Hub "
-                    f"repo {repo_id!r} visibility could not be set to "
-                    "private (likely token lacks `write:repo_settings` "
-                    "or the repo is owned by another user). Refusing to "
-                    "upload to avoid publishing artifacts to an existing "
-                    "public repository."
-                ) from exc
-            print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
+    # _ensure_hub_repo_visibility handles the private=None / False / True
+    # decision tree (skip / soft-fail / verify-and-fail) without spuriously
+    # blocking when a freshly created private repo cannot run
+    # update_repo_settings under the current token.
+    _ensure_hub_repo_visibility(api, repo_id, private)
 
     if tags:
         try:
@@ -3784,37 +3825,11 @@ def push_to_hub_merged(
     # repo creation: a user inside an org that auto-creates new repos
     # as private would get a public repo on first push. Omitting the
     # kwarg lets the Hub's account/org policy decide initial visibility.
-    _create_repo_kwargs = {"repo_id": repo_id, "exist_ok": True}
-    if private is not None:
-        _create_repo_kwargs["private"] = bool(private)
-    api.create_repo(**_create_repo_kwargs)
-    # create_repo(exist_ok=True) is a no-op when the repo already exists,
-    # so toggling `private` on a re-push wouldn't change visibility unless
-    # we update it explicitly.
-    if private is not None:
-        try:
-            api.update_repo_settings(
-                repo_id=repo_id,
-                private=bool(private),
-                repo_type="model",
-            )
-        except Exception as exc:
-            # Fail loud when private=True was requested: silently
-            # continuing means an existing public repo stays public
-            # (create_repo(exist_ok=True) is a no-op for the visibility
-            # flag), and the upload below would push the adapters to a
-            # public Hub URL the caller explicitly tried to make private.
-            # Only print-and-continue when the caller asked for public.
-            if bool(private):
-                raise RuntimeError(
-                    "Unsloth: private=True was requested but the Hub "
-                    f"repo {repo_id!r} visibility could not be set to "
-                    "private (likely token lacks `write:repo_settings` "
-                    "or the repo is owned by another user). Refusing to "
-                    "upload to avoid publishing artifacts to an existing "
-                    "public repository."
-                ) from exc
-            print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
+    # _ensure_hub_repo_visibility handles the private=None / False / True
+    # decision tree (skip / soft-fail / verify-and-fail) without spuriously
+    # blocking when a freshly created private repo cannot run
+    # update_repo_settings under the current token.
+    _ensure_hub_repo_visibility(api, repo_id, private)
 
     if tags:
         try:
@@ -3936,34 +3951,13 @@ def push_to_hub_gguf(
     # repo creation: a user inside an org that auto-creates new repos
     # as private would get a public repo on first push. Omitting the
     # kwarg lets the Hub's account/org policy decide initial visibility.
-    _create_repo_kwargs = {"repo_id": repo_id, "exist_ok": True}
-    if private is not None:
-        _create_repo_kwargs["private"] = bool(private)
-    api.create_repo(**_create_repo_kwargs)
-    # create_repo(exist_ok=True) is a no-op for the visibility flag on
-    # existing repos. A caller passing private=True on a repo that
-    # already exists as public would otherwise silently upload the GGUF
-    # weights (often multi-GB merged shards) to a public Hub URL. Apply
-    # the same fail-loud rule as push_to_hub_merged and _push_lora_adapters_to_hub
-    # so private=True never silently leaks.
-    if private is not None:
-        try:
-            api.update_repo_settings(
-                repo_id=repo_id,
-                private=bool(private),
-                repo_type="model",
-            )
-        except Exception as exc:
-            if bool(private):
-                raise RuntimeError(
-                    "Unsloth: private=True was requested but the Hub "
-                    f"repo {repo_id!r} visibility could not be set to "
-                    "private (likely token lacks `write:repo_settings` "
-                    "or the repo is owned by another user). Refusing "
-                    "to upload GGUF weights to avoid publishing to an "
-                    "existing public repository."
-                ) from exc
-            print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
+    # _ensure_hub_repo_visibility handles the private=None / False / True
+    # decision tree (skip / soft-fail / verify-and-fail) without spuriously
+    # blocking when a freshly created private repo cannot run
+    # update_repo_settings under the current token. Multi-GB GGUF shards
+    # need the same fail-loud rule as the LoRA / merged paths so a
+    # private=True request never silently leaks weights to a public repo.
+    _ensure_hub_repo_visibility(api, repo_id, private)
 
     gguf_files = list(save_directory.glob("*.gguf"))
     for gguf_file in gguf_files:
