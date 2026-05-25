@@ -3454,6 +3454,203 @@ def _save_mlx_config(config, config_path, *, is_vlm=False):
         save_lm_config(config, config_path)
 
 
+def _has_tied_word_embeddings(config):
+    """Return whether any text config declares tied input/output embeddings."""
+    if not isinstance(config, dict):
+        return False
+    candidates = [
+        config,
+        config.get("text_config"),
+        config.get("language_config"),
+        (config.get("thinker_config") or {}).get("text_config"),
+    ]
+    return any(
+        isinstance(item, dict) and item.get("tie_word_embeddings") is True
+        for item in candidates
+    )
+
+
+def _lm_head_key_for_embed_key(embed_key):
+    """Map an input embedding tensor key to the matching tied LM head key."""
+    if embed_key == "embed_tokens.weight":
+        return "lm_head.weight"
+    if embed_key == "model.embed_tokens.weight":
+        return "lm_head.weight"
+
+    suffix = ".model.embed_tokens.weight"
+    if embed_key.endswith(suffix):
+        prefix = embed_key[:-len(suffix)]
+        return f"{prefix}.lm_head.weight" if prefix else "lm_head.weight"
+
+    suffix = ".embed_tokens.weight"
+    if embed_key.endswith(suffix):
+        prefix = embed_key[:-len(suffix)]
+        if not prefix or prefix == "model":
+            return "lm_head.weight"
+        return f"{prefix}.lm_head.weight"
+
+    return None
+
+
+def _safetensor_names(path):
+    """Read tensor names from a safetensors directory or index file."""
+    path = Path(path)
+    index_path = path / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path, "r") as f:
+            return set(json.load(f).get("weight_map", {}))
+
+    try:
+        from safetensors import safe_open
+    except Exception:
+        return set()
+
+    names = set()
+    for file in sorted(path.glob("*.safetensors")):
+        with safe_open(str(file), framework="np") as f:
+            names.update(f.keys())
+    return names
+
+
+def _source_has_lm_head_tensor(source_path, lm_head_key):
+    """Check whether the source checkpoint explicitly stored an LM head."""
+    if source_path is None:
+        return None
+    source_path = Path(source_path)
+    if not source_path.exists():
+        return None
+
+    names = _safetensor_names(source_path)
+    if not names:
+        return None
+    if lm_head_key in names:
+        return True
+    if lm_head_key.endswith(".lm_head.weight") and "lm_head.weight" in names:
+        return True
+    return False
+
+
+def _tensor_nbytes(tensor):
+    """Return tensor byte size across MLX, NumPy, and torch-like objects."""
+    value = getattr(tensor, "nbytes", None)
+    if callable(value):
+        value = value()
+    if value is not None:
+        return int(value)
+    itemsize = getattr(tensor, "itemsize", None)
+    if callable(itemsize):
+        itemsize = itemsize()
+    if itemsize is None:
+        element_size = getattr(tensor, "element_size", None)
+        itemsize = element_size() if callable(element_size) else 0
+    return int(_tensor_size(tensor) * itemsize)
+
+
+def _tensor_size(tensor):
+    """Return tensor element count across MLX, NumPy, and torch-like objects."""
+    value = getattr(tensor, "size", None)
+    if callable(value):
+        numel = getattr(tensor, "numel", None)
+        if callable(numel):
+            return int(numel())
+        shape = getattr(tensor, "shape", ())
+        total = 1
+        for dim in shape:
+            total *= int(dim)
+        return total
+    if value is not None:
+        return int(value)
+    return 0
+
+
+def _duplicate_tensor_for_safetensors(tensor):
+    """Clone tensors when available before writing a tied duplicate key."""
+    clone = getattr(tensor, "clone", None)
+    if callable(clone):
+        return clone()
+    return tensor
+
+
+def _materialize_tied_lm_head_in_saved_model(
+    path,
+    config,
+    *,
+    source_path=None,
+    is_vlm=False,
+):
+    """Duplicate tied input embeddings into the saved LM head when CUDA does."""
+    if not _has_tied_word_embeddings(config):
+        return 0
+
+    path = Path(path)
+    index_path = path / "model.safetensors.index.json"
+    if not index_path.exists():
+        return 0
+
+    with open(index_path, "r") as f:
+        index_data = json.load(f)
+
+    weight_map = dict(index_data.get("weight_map", {}))
+    additions = []
+    for embed_key in sorted(weight_map):
+        if not embed_key.endswith("embed_tokens.weight"):
+            continue
+        lm_head_key = _lm_head_key_for_embed_key(embed_key)
+        if lm_head_key is None or lm_head_key in weight_map:
+            continue
+
+        source_has_lm_head = _source_has_lm_head_tensor(source_path, lm_head_key)
+        if source_has_lm_head is False:
+            continue
+        if source_has_lm_head is None and is_vlm:
+            continue
+        if source_has_lm_head is None and lm_head_key != "lm_head.weight":
+            continue
+
+        additions.append((embed_key, lm_head_key))
+
+    added = 0
+    added_bytes = 0
+    added_parameters = 0
+    for embed_key, lm_head_key in additions:
+        shard_name = weight_map[embed_key]
+        shard_path = path / shard_name
+        tensors = mx.load(str(shard_path))
+        if lm_head_key in tensors:
+            weight_map[lm_head_key] = shard_name
+            continue
+        if embed_key not in tensors:
+            continue
+
+        tensor = tensors[embed_key]
+        tensors[lm_head_key] = _duplicate_tensor_for_safetensors(tensor)
+        mx.eval(*tensors.values())
+        tmp_file = shard_path.with_name(f"{shard_path.stem}.tmp{shard_path.suffix}")
+        mx.save_safetensors(str(tmp_file), tensors, metadata={"format": "mlx"})
+        os.replace(tmp_file, shard_path)
+
+        weight_map[lm_head_key] = shard_name
+        added += 1
+        added_bytes += _tensor_nbytes(tensor)
+        added_parameters += _tensor_size(tensor)
+
+    if added:
+        metadata = index_data.setdefault("metadata", {})
+        if "total_size" in metadata:
+            metadata["total_size"] = int(metadata["total_size"]) + added_bytes
+        if "total_parameters" in metadata:
+            metadata["total_parameters"] = (
+                int(metadata["total_parameters"]) + added_parameters
+            )
+        index_data["weight_map"] = {
+            key: weight_map[key] for key in sorted(weight_map)
+        }
+        with open(index_path, "w") as f:
+            json.dump(index_data, f, indent=4)
+
+    return added
+
+
 def save_merged_model(model, tokenizer, path, dequantize=False):
     """Fuse LoRA weights and save the full merged model.
 
@@ -3500,10 +3697,22 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     # Save config.json
     config = _get_model_config(model)
     if config:
+        is_vlm = _is_vlm_model(model) or "vision_config" in config
+        materialized = _materialize_tied_lm_head_in_saved_model(
+            path,
+            config,
+            source_path=_get_src_path(model),
+            is_vlm=is_vlm,
+        )
+        if materialized:
+            print(
+                "Unsloth: Materialized "
+                f"{materialized} tied lm_head tensor(s) for CUDA export parity."
+            )
         _save_mlx_config(
             config,
             path / "config.json",
-            is_vlm=_is_vlm_model(model) or "vision_config" in config,
+            is_vlm=is_vlm,
         )
 
     # Save tokenizer
