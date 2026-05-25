@@ -27,6 +27,7 @@ import mlx.nn as nn
 import mlx.utils
 import copy
 import inspect
+import importlib
 import json
 import numpy as np
 import os
@@ -3651,6 +3652,256 @@ def _materialize_tied_lm_head_in_saved_model(
     return added
 
 
+def _has_vision_config(config):
+    """Return whether a raw or thinker-wrapped VLM config has vision settings."""
+    thinker_config = config.get("thinker_config") or {}
+    return "vision_config" in config or "vision_config" in thinker_config
+
+
+class _MlxVlmSanitizeProxy:
+    """Minimal instance shim for mlx-vlm class sanitize methods."""
+    def __init__(self, config):
+        self.config = config
+        self.args = config
+
+
+def _copy_mlx_vlm_sanitize_weights(weights):
+    """Copy MLX arrays before replaying sanitizer transforms."""
+    return {
+        key: mx.array(value) if isinstance(value, mx.array) else value
+        for key, value in weights.items()
+    }
+
+
+def _call_mlx_vlm_sanitize(cls, config, weights):
+    """Call an mlx-vlm sanitize method with its expected signature."""
+    sanitize = getattr(cls, "sanitize", None)
+    if sanitize is None:
+        return weights
+
+    weights = _copy_mlx_vlm_sanitize_weights(weights)
+    params = inspect.signature(sanitize).parameters
+    if len(params) == 1:
+        return sanitize(weights)
+    return sanitize(_MlxVlmSanitizeProxy(config), weights)
+
+
+def _get_nested_config(config, *names):
+    """Walk nested config attributes, returning None for missing segments."""
+    cur = config
+    for name in names:
+        cur = getattr(cur, name, None)
+        if cur is None:
+            return None
+    return cur
+
+
+def _build_mlx_vlm_sanitize_steps(config):
+    """Build class-based mlx-vlm sanitizer steps from a saved VLM config."""
+    if not _has_vision_config(config):
+        return []
+
+    try:
+        from mlx_vlm.utils import get_model_and_args, update_module_configs
+
+        config_copy = copy.deepcopy(config)
+        model_module, model_type = get_model_and_args(config_copy)
+        config_copy.setdefault("text_config", config_copy.pop("llm_config", {}))
+        config_copy.setdefault("vision_config", {})
+        config_copy.setdefault("audio_config", {})
+
+        model_config = model_module.ModelConfig.from_dict(config_copy)
+        try:
+            model_config = update_module_configs(
+                model_config,
+                model_module,
+                config_copy,
+                ["text", "vision", "perceiver", "projector", "audio"],
+            )
+        except Exception:
+            pass
+    except Exception:
+        return []
+
+    steps = []
+    if hasattr(model_module, "Model"):
+        steps.append((model_module.Model, model_config))
+
+    thinker_config = _get_nested_config(model_config, "thinker_config")
+    if thinker_config is not None:
+        thinker_cls = getattr(model_module, "Thinker", None)
+        if thinker_cls is None:
+            try:
+                thinker_mod = importlib.import_module(
+                    f"mlx_vlm.models.{model_type}.thinker"
+                )
+                thinker_cls = getattr(thinker_mod, "Thinker", None)
+            except Exception:
+                thinker_cls = None
+        if thinker_cls is not None:
+            steps.append((thinker_cls, thinker_config))
+
+    vision_config = (
+        _get_nested_config(model_config, "vision_config")
+        or _get_nested_config(model_config, "thinker_config", "vision_config")
+    )
+    if vision_config is not None and hasattr(model_module, "VisionModel"):
+        steps.append((model_module.VisionModel, vision_config))
+
+    return [
+        (cls, step_config)
+        for cls, step_config in steps
+        if getattr(cls, "sanitize", None) is not None
+    ]
+
+
+def _apply_mlx_vlm_sanitizers(steps, weights):
+    """Replay a sanitizer pipeline and return None if any step rejects it."""
+    sanitized = dict(weights)
+    for cls, config in steps:
+        try:
+            sanitized = _call_mlx_vlm_sanitize(cls, config, sanitized)
+        except Exception:
+            return None
+    return sanitized
+
+
+def _vlm_gguf_name_candidates(name):
+    """Yield HF/llama.cpp tensor-name candidates for an MLX VLM tensor."""
+    candidates = []
+
+    def add(value):
+        if value != name and value not in candidates:
+            candidates.append(value)
+
+    if name.startswith("thinker.vision_tower."):
+        suffix = name[len("thinker.vision_tower."):]
+        add(f"thinker.visual.{suffix}")
+    if name.startswith("model.vision_tower."):
+        suffix = name[len("model.vision_tower."):]
+        add(f"model.visual.{suffix}")
+    if name.startswith("vision_tower."):
+        suffix = name[len("vision_tower."):]
+        add(f"visual.{suffix}")
+        add(f"model.visual.{suffix}")
+        add(f"model.language_model.visual.{suffix}")
+        add(f"vit.{suffix}")
+
+    return candidates
+
+
+def _vlm_gguf_tensor_candidates(tensor):
+    """Yield HF-layout tensor candidates for an MLX VLM tensor."""
+    candidates = []
+    shape = getattr(tensor, "shape", ())
+
+    if len(shape) == 5:
+        candidates.append(mx.transpose(tensor, (0, 4, 1, 2, 3)))
+    elif len(shape) == 4:
+        candidates.append(mx.transpose(tensor, (0, 3, 1, 2)))
+
+    if len(shape) == 1 and mx.issubdtype(tensor.dtype, mx.floating):
+        candidates.append(tensor - 1)
+
+    candidates.append(tensor)
+    return candidates
+
+
+def _mlx_arrays_match(actual, expected):
+    """Compare MLX-like arrays without assuming a concrete backend type."""
+    shape = getattr(actual, "shape", None)
+    if shape != getattr(expected, "shape", None):
+        return False
+    if actual is expected:
+        return True
+    if shape is None:
+        return actual == expected
+    if len(shape) not in (1, 4, 5):
+        return True
+    try:
+        return bool(mx.all(actual == expected).item())
+    except Exception:
+        return False
+
+
+def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
+    """Invert mlx-vlm sanitizers to recover HF tensor names/layouts for GGUF."""
+    for candidate_name in _vlm_gguf_name_candidates(name):
+        for candidate_tensor in _vlm_gguf_tensor_candidates(tensor):
+            sanitized = _apply_mlx_vlm_sanitizers(
+                sanitize_steps,
+                {candidate_name: candidate_tensor},
+            )
+            if not sanitized or len(sanitized) != 1:
+                continue
+            sanitized_name, sanitized_tensor = next(iter(sanitized.items()))
+            if sanitized_name != name:
+                continue
+            if not _mlx_arrays_match(sanitized_tensor, tensor):
+                continue
+            return candidate_name, candidate_tensor, True
+
+    return name, tensor, False
+
+
+def _prepare_vlm_gguf_export_directory(path):
+    """Rewrite MLX-native VLM tensor names in the temporary GGUF export dir."""
+    path = Path(path)
+    config_path = path / "config.json"
+    if not config_path.exists():
+        return 0
+    with open(config_path, "r") as f:
+        config = json.load(f)
+    sanitize_steps = _build_mlx_vlm_sanitize_steps(config)
+    if not sanitize_steps:
+        return 0
+
+    rewritten = 0
+    name_map = {}
+    for file in sorted(path.glob("*.safetensors")):
+        tensors = mx.load(str(file))
+        updated = {}
+        file_rewritten = 0
+        for name, tensor in tensors.items():
+            new_name, tensor, changed = _rewrite_mlx_vlm_tensor_for_gguf(
+                name, tensor, sanitize_steps
+            )
+            if new_name in updated:
+                raise RuntimeError(
+                    f"Unsloth: duplicate tensor name after GGUF VLM rewrite: {new_name}"
+                )
+            updated[new_name] = tensor
+            name_map[name] = new_name
+            file_rewritten += int(changed)
+        if file_rewritten:
+            # mx.load() may return arrays backed by the source safetensors file.
+            # Saving back to the same path can truncate those backing bytes before
+            # unchanged tensors are materialized, so write beside it and replace.
+            mx.eval(*updated.values())
+            tmp_file = file.with_name(f"{file.stem}.tmp{file.suffix}")
+            mx.save_safetensors(str(tmp_file), updated, metadata={"format": "mlx"})
+            os.replace(tmp_file, file)
+            rewritten += file_rewritten
+
+    index_path = path / "model.safetensors.index.json"
+    if rewritten and index_path.exists():
+        with open(index_path, "r") as f:
+            index_data = json.load(f)
+        weight_map = {}
+        for name, shard in index_data.get("weight_map", {}).items():
+            new_name = name_map.get(name, name)
+            if new_name in weight_map:
+                raise RuntimeError(
+                    f"Unsloth: duplicate index tensor name after GGUF VLM rewrite: {new_name}"
+                )
+            weight_map[new_name] = shard
+        index_data["weight_map"] = dict(sorted(weight_map.items()))
+        with open(index_path, "w") as f:
+            json.dump(index_data, f, indent=4)
+
+    return rewritten
+
+
 def save_merged_model(model, tokenizer, path, dequantize=False):
     """Fuse LoRA weights and save the full merged model.
 
@@ -4183,8 +4434,16 @@ def save_pretrained_gguf(
     # Step 1: Save merged model to a temp HF-format directory
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir) / "merged"
+        is_vlm_model = _is_vlm_model(model)
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
         save_merged_model(model, tokenizer, tmp_path, dequantize=True)
+        if is_vlm_model:
+            rewritten = _prepare_vlm_gguf_export_directory(tmp_path)
+            if rewritten:
+                print(
+                    "Unsloth: Rewrote "
+                    f"{rewritten} MLX VLM tensors for llama.cpp GGUF export."
+                )
 
         # Step 2: Ensure llama.cpp is installed and gguf package is available
         llama_cpp_folder = "llama.cpp"
@@ -4236,7 +4495,6 @@ def save_pretrained_gguf(
 
         # Step 5: Convert HF -> GGUF
         print(f"Unsloth: Converting to GGUF format...")
-        is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
         kwargs = dict(
             model_name=output_base,
             input_folder=str(tmp_path),
