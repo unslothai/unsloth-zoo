@@ -2938,15 +2938,43 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             # Keep the caller's global metadata coherent: copy top-level
             # rank/scale/dropout into lora_parameters (or vice versa) so
             # both shapes that mlx-lm's load_adapters checks agree.
+            # Backfill scale/dropout from the inferred aux module when
+            # caller provided only `rank`, so the language tower's
+            # `lora_parameters` dict ships complete (mlx-lm.load_adapters
+            # consults it for both halves and rejects missing fields).
             lora_parameters = existing_lora_parameters
             for key in ("rank", "scale", "dropout"):
                 if key not in lora_parameters and key in adapter_config:
                     lora_parameters[key] = adapter_config[key]
+            inferred_fallbacks = (
+                ("scale", lora_scale, 1.0),
+                ("dropout", lora_dropout, 0.0),
+            )
+            for key, inferred_value, default_value in inferred_fallbacks:
+                if key in lora_parameters:
+                    continue
+                lora_parameters[key] = (
+                    inferred_value if inferred_value is not None else default_value
+                )
             if "rank" in lora_parameters:
                 adapter_config["lora_parameters"] = lora_parameters
                 for key in ("rank", "scale", "dropout"):
                     if key in lora_parameters:
                         adapter_config[key] = lora_parameters[key]
+                adapter_config.setdefault("peft_type", "LORA")
+                adapter_config.setdefault("fine_tune_type", "lora")
+                # mlx-lm.load_adapters() reads num_layers off the
+                # adapter config; the main branch above backfills it,
+                # so mirror the same logic here when the caller pinned
+                # explicit paths but did not provide num_layers.
+                if "num_layers" not in adapter_config:
+                    layers = _get_transformer_layers(model)
+                    try:
+                        n_layers = len(layers) if layers is not None else 0
+                    except TypeError:
+                        n_layers = 0
+                    if n_layers > 0:
+                        adapter_config["num_layers"] = n_layers
     except (TypeError, ValueError, AttributeError) as _enrich_exc:
         # Surface enrichment failures (e.g. caller passed garbage
         # lora_parameters, mx.array scale that could not coerce, an
