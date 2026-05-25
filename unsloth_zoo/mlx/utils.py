@@ -3048,16 +3048,13 @@ def _push_lora_adapters_to_hub(
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
-    # upload_large_folder chunks + resumes; falls back to upload_folder on
-    # older huggingface_hub.
+    # LoRA adapter dirs are small (typically <500MB, ~5 files), so
+    # upload_folder's single-commit semantics fit and let us honor the
+    # caller's commit_message / commit_description / create_pr / revision.
+    # upload_large_folder ignores those kwargs and would commit with the
+    # default "Upload N LFS files" message on `main`, so we use it only
+    # as a fallback when upload_folder is unavailable.
     try:
-        api.upload_large_folder(
-            folder_path=str(save_directory),
-            repo_id=repo_id,
-            repo_type="model",
-            revision=revision,
-        )
-    except (AttributeError, TypeError):
         api.upload_folder(
             folder_path=str(save_directory),
             repo_id=repo_id,
@@ -3065,6 +3062,13 @@ def _push_lora_adapters_to_hub(
             commit_message=commit_message,
             commit_description=commit_description,
             create_pr=create_pr,
+            revision=revision,
+        )
+    except (AttributeError, TypeError):
+        api.upload_large_folder(
+            folder_path=str(save_directory),
+            repo_id=repo_id,
+            repo_type="model",
             revision=revision,
         )
     print(f"Unsloth: Pushed LoRA adapters to https://huggingface.co/{repo_id}")

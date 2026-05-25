@@ -893,3 +893,101 @@ def test_save_pretrained_merged_lora_writes_complete_adapter_config(tmp_path):
     assert "lora_parameters" in cfg, cfg
     assert cfg["lora_parameters"]["rank"] == 4, cfg
     assert cfg["lora_parameters"]["scale"] == 2.5, cfg
+
+
+def test_push_lora_adapters_routes_commit_metadata_through_upload_folder(
+    tmp_path, monkeypatch,
+):
+    # Regression: huggingface_hub>=0.34's upload_large_folder() does NOT
+    # accept commit_message / commit_description / create_pr / revision in
+    # any way that lands them on the commit. Routing LoRA pushes through
+    # upload_folder (which honors those kwargs) is the only way the
+    # caller's commit string and PR flag survive to the Hub.
+    import huggingface_hub
+    from unsloth_zoo.mlx.utils import _push_lora_adapters_to_hub
+
+    (tmp_path / "adapters.safetensors").write_bytes(b"\x00")
+    (tmp_path / "adapter_config.json").write_text("{}")
+
+    calls = {"folder": [], "large": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            self.token = token
+
+        def create_repo(self, **kwargs):
+            return None
+
+        def update_repo_settings(self, **kwargs):
+            return None
+
+        def upload_folder(self, **kwargs):
+            calls["folder"].append(kwargs)
+
+        def upload_large_folder(self, **kwargs):
+            calls["large"].append(kwargs)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    _push_lora_adapters_to_hub(
+        tmp_path,
+        repo_id="me/adapter",
+        token="hf_dummy",
+        commit_message="Release v1",
+        commit_description="Custom desc",
+        create_pr=True,
+        revision="main",
+    )
+
+    # upload_folder must be the primary path, with all caller kwargs
+    # threaded through; upload_large_folder must not be hit in the happy
+    # case (it would commit with the default "Upload N LFS files" string).
+    assert len(calls["folder"]) == 1, calls
+    assert calls["large"] == [], calls
+    sent = calls["folder"][0]
+    # Commit message gets a " (Trained with Unsloth)" suffix per Unsloth
+    # commit-history convention; substring check tolerates the suffix.
+    assert "Release v1" in sent["commit_message"], sent
+    assert "Custom desc" in sent["commit_description"], sent
+    assert sent["create_pr"] is True
+    assert sent["revision"] == "main"
+    assert sent["repo_id"] == "me/adapter"
+
+
+def test_push_lora_adapters_falls_back_to_large_folder_when_unavailable(
+    tmp_path, monkeypatch,
+):
+    # On a hypothetical environment without upload_folder (or with a
+    # TypeError signature mismatch), the helper should still complete the
+    # upload via upload_large_folder rather than crash silently.
+    import huggingface_hub
+    from unsloth_zoo.mlx.utils import _push_lora_adapters_to_hub
+
+    (tmp_path / "adapters.safetensors").write_bytes(b"\x00")
+
+    calls = {"folder": 0, "large": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kwargs):
+            return None
+
+        def update_repo_settings(self, **kwargs):
+            return None
+
+        def upload_folder(self, **kwargs):
+            calls["folder"] += 1
+            raise TypeError("simulated old huggingface_hub signature")
+
+        def upload_large_folder(self, **kwargs):
+            calls["large"].append(kwargs)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    _push_lora_adapters_to_hub(tmp_path, repo_id="me/adapter")
+
+    assert calls["folder"] == 1
+    assert len(calls["large"]) == 1, calls
+    assert calls["large"][0]["repo_id"] == "me/adapter"
