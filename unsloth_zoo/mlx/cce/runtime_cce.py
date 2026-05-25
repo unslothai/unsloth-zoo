@@ -120,8 +120,29 @@ def _target_validity_masks(
     vocab_size: int,
     ignore_index: int,
 ) -> tuple[mx.array, mx.array]:
-    in_vocab = (targets >= 0) & (targets < vocab_size)
-    not_ignored = targets != ignore_index
+    # Validate unsigned-integer labels through a signed dtype before any
+    # comparisons. Direct `targets >= 0` on uint16/uint32/uint64 crashes
+    # the torch-backed MLX simulation kernel ("ge_cpu" not implemented for
+    # UInt32). Casting to int64 keeps wide-int wraparound (e.g. 2**32-100
+    # under uint32) classified as out-of-vocab rather than silently
+    # crashing the validity step itself. On real Apple-Metal MLX this is
+    # a defensive no-op cost; on the simulation path it preserves the
+    # PR's "validate before narrow" contract for wide invalid labels.
+    _unsigned_safe_to_i64 = tuple(
+        dtype for dtype in (
+            getattr(mx, "uint8", None),
+            getattr(mx, "uint16", None),
+            getattr(mx, "uint32", None),
+        )
+        if dtype is not None
+    )
+    targets_for_validation = (
+        targets.astype(mx.int64)
+        if targets.dtype in _unsigned_safe_to_i64
+        else targets
+    )
+    in_vocab = (targets_for_validation >= 0) & (targets_for_validation < vocab_size)
+    not_ignored = targets_for_validation != ignore_index
     return not_ignored & in_vocab, not_ignored & ~in_vocab
 
 

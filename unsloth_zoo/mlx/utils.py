@@ -2225,9 +2225,17 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
     prompt_inputs = _processor_vlm_inputs(
         processor, prompt_texts, all_images, max_seq_length
     )
+
+    # Build labels from the processor output BEFORE _to_mx_vlm_batch
+    # casts model inputs to mx.int32. The runtime CCE validity check
+    # classifies out-of-vocab and wide-int (e.g. uint32 wrap) labels by
+    # NaN-poisoning the row, but only if the original label range survives
+    # to the check. Narrowing through `np.int32` here would discard wide
+    # invalids before classification, matching the upstream bug the rest
+    # of this PR removes from text/VLM batch collators.
+    labels_np = np.asarray(combined_inputs["input_ids"], dtype=np.int64).copy()
     batch = _to_mx_vlm_batch(combined_inputs)
 
-    labels_np = np.array(batch["input_ids"].tolist(), dtype=np.int32)
     prompt_batch = _to_mx_vlm_batch(prompt_inputs)
     prompt_mask = prompt_batch.get("attention_mask")
     prompt_ids = prompt_batch["input_ids"]
@@ -2239,9 +2247,11 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
         labels_np[row, :prompt_len] = -100
     labels = mx.array(labels_np)
     if "attention_mask" in batch:
-        labels = mx.where(batch["attention_mask"] == 0, mx.array(-100), labels)
-    # labels_np was built as np.int32 already; do not re-narrow here so
-    # the runtime CCE validity check sees the labels' original dtype.
+        labels = mx.where(
+            batch["attention_mask"] == 0,
+            mx.array(-100, dtype=labels.dtype),
+            labels,
+        )
     batch["labels"] = labels
     return batch
 
