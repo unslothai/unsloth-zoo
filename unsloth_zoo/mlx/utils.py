@@ -2990,12 +2990,15 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 "scale": scale,
                 "dropout": dropout,
             }
-        # mlx-vlm expects these at top level too; backfill regardless of
-        # whether lora_parameters was caller-supplied or computed above so
-        # that mlx-vlm reload always sees a consistent top-level view.
+        # mlx-vlm expects these at top level too; mirror lora_parameters
+        # verbatim so a stale caller-supplied top-level `rank` / `scale`
+        # / `dropout` (e.g. carried over from a re-used adapter_config
+        # dict) cannot contradict the canonical values in
+        # `lora_parameters`. Previously only absent keys were backfilled,
+        # which let stale `rank=99` shadow the real `lora_parameters.rank=4`.
         lora_parameters = adapter_config["lora_parameters"]
         for key in ("rank", "scale", "dropout"):
-            if key not in adapter_config and key in lora_parameters:
+            if key in lora_parameters:
                 adapter_config[key] = lora_parameters[key]
         # mlx-lm.load_adapters() reads num_layers off the adapter config to
         # decide how many transformer layers to wrap. Trainer.save_model
@@ -3008,13 +3011,14 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     adapter_config["num_layers"] = len(layers)
             except Exception:
                 pass
-        # Choose dora over lora when DoRA modules are actually present so
-        # the saved q_proj.m tensor rebinds via DoRALinear on reload.
-        if has_dora_modules and adapter_config.get("fine_tune_type") not in {"dora"}:
-            adapter_config["fine_tune_type"] = "dora"
-        else:
-            adapter_config.setdefault("fine_tune_type", "lora")
-        adapter_config.setdefault("peft_type", "LORA")
+        # Derive fine_tune_type strictly from the live model. A caller-
+        # supplied stale value (e.g. carried over from a previous DoRA
+        # run while the current model is plain LoRA) must NOT survive:
+        # mlx-lm would otherwise rebuild DoRA wrappers expecting a
+        # `m` magnitude tensor that the current adapters.safetensors
+        # does not contain, dropping every adapter via strict=False.
+        adapter_config["fine_tune_type"] = "dora" if has_dora_modules else "lora"
+        adapter_config["peft_type"] = "LORA"
     else:
         # Full fine-tune checkpoint: mlx-lm's load_adapters() defaults a
         # missing fine_tune_type to 'lora' and then reads num_layers /
@@ -3199,6 +3203,21 @@ def _push_lora_adapters_to_hub(
                 repo_type="model",
             )
         except Exception as exc:
+            # Fail loud when private=True was requested: silently
+            # continuing means an existing public repo stays public
+            # (create_repo(exist_ok=True) is a no-op for the visibility
+            # flag), and the upload below would push the adapters to a
+            # public Hub URL the caller explicitly tried to make private.
+            # Only print-and-continue when the caller asked for public.
+            if bool(private):
+                raise RuntimeError(
+                    "Unsloth: private=True was requested but the Hub "
+                    f"repo {repo_id!r} visibility could not be set to "
+                    "private (likely token lacks `write:repo_settings` "
+                    "or the repo is owned by another user). Refusing to "
+                    "upload to avoid publishing artifacts to an existing "
+                    "public repository."
+                ) from exc
             print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
 
     if tags:
@@ -3749,6 +3768,21 @@ def push_to_hub_merged(
                 repo_type="model",
             )
         except Exception as exc:
+            # Fail loud when private=True was requested: silently
+            # continuing means an existing public repo stays public
+            # (create_repo(exist_ok=True) is a no-op for the visibility
+            # flag), and the upload below would push the adapters to a
+            # public Hub URL the caller explicitly tried to make private.
+            # Only print-and-continue when the caller asked for public.
+            if bool(private):
+                raise RuntimeError(
+                    "Unsloth: private=True was requested but the Hub "
+                    f"repo {repo_id!r} visibility could not be set to "
+                    "private (likely token lacks `write:repo_settings` "
+                    "or the repo is owned by another user). Refusing to "
+                    "upload to avoid publishing artifacts to an existing "
+                    "public repository."
+                ) from exc
             print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
 
     if tags:
