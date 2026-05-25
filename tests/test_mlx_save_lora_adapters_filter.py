@@ -954,6 +954,57 @@ def test_push_lora_adapters_routes_commit_metadata_through_upload_folder(
     assert sent["repo_id"] == "me/adapter"
 
 
+def test_collect_lora_skips_unrelated_m_attribute_on_non_dora_module():
+    # `m` is a generic 1-letter attr name; if a future LoRA wrapper
+    # exposes self.m as a learned mixing scalar that is not a DoRA
+    # magnitude vector, we must not ship it under DoRA semantics.
+    # Gate on the class name starting with "DoRA".
+    from unsloth_zoo.mlx.utils import collect_mlx_lora_adapter_tensors
+    import torch as _t
+
+    class _MockLoRAWithUnrelatedM:
+        def __init__(self):
+            self.lora_a = _t.zeros(8, 4)
+            self.lora_b = _t.zeros(4, 8)
+            self.m = _t.zeros(1)  # unrelated; not a DoRA magnitude
+
+    class _Model:
+        def parameters(self):
+            mod = _MockLoRAWithUnrelatedM()
+            return {
+                "q_proj": {
+                    "lora_a": mod.lora_a,
+                    "lora_b": mod.lora_b,
+                    "m": mod.m,
+                }
+            }
+        def named_modules(self):
+            yield "q_proj", _MockLoRAWithUnrelatedM()
+
+    tensors = collect_mlx_lora_adapter_tensors(_Model())
+    # lora_a / lora_b must be collected; `m` must not (non-DoRA class).
+    assert "q_proj.lora_a" in tensors
+    assert "q_proj.lora_b" in tensors
+    assert "q_proj.m" not in tensors
+
+
+def test_save_adapter_artifacts_rejects_empty_tensors():
+    # Defensive: any future direct caller of the private helper with
+    # tensors={} must hit a clear error, not silently write an
+    # adapter_config.json without weights next to it.
+    import pytest as _pytest
+    from unsloth_zoo.mlx.utils import _save_adapter_artifacts
+
+    class _Model:
+        def parameters(self):
+            return {}
+        def named_modules(self):
+            return iter(())
+
+    with _pytest.raises(ValueError, match="non-empty"):
+        _save_adapter_artifacts(_Model(), "/tmp/zzz_unsloth_test_empty", tensors={})
+
+
 def test_push_to_hub_merged_honors_create_pr_via_upload_folder(
     tmp_path, monkeypatch,
 ):

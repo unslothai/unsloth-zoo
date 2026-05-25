@@ -2548,11 +2548,21 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
 
 
 def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
+    # Public callers (save_lora_adapters, save_trainable_adapters,
+    # save_pretrained_merged) already guard empty tensors with a clear
+    # ValueError; assert it locally so any future direct call cannot
+    # write an adapter_config.json with no adapters.safetensors next
+    # to it (mlx-lm reload chokes on the missing weights file).
+    if not tensors:
+        raise ValueError(
+            "Unsloth: _save_adapter_artifacts() requires non-empty "
+            "tensors; use save_lora_adapters() or "
+            "save_trainable_adapters() at the public entry point."
+        )
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
-    if tensors:
-        mx.save_safetensors(str(path / "adapters.safetensors"), tensors)
+    mx.save_safetensors(str(path / "adapters.safetensors"), tensors)
 
     adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
     if adapter_config:
@@ -2624,8 +2634,10 @@ def collect_mlx_lora_adapter_tensors(model):
         adapter_keys.add(f"{prefix}lora_b")
         # mlx-lm DoRA exposes lora_a / lora_b plus a trained magnitude
         # vector m; include it when present so DoRA reload keeps the
-        # learned magnitudes.
-        if hasattr(module, "m"):
+        # learned magnitudes. Gate on the DoRA class name so a future
+        # LoRA wrapper that incidentally exposes an unrelated `m`
+        # attribute does not get exported under DoRA semantics.
+        if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
             adapter_keys.add(f"{prefix}m")
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
