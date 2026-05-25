@@ -2683,6 +2683,13 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
     ".linear.weight",
     ".linear.scales",
     ".linear.biases",
+    # LoRAEmbedding / DoRAEmbedding wraps an inner nn.Embedding at
+    # `.embedding` rather than `.linear`; the base embedding tensor and
+    # its quantization state are reload-leaked the same way, so include
+    # both the dense and quantized variants here.
+    ".embedding.weight",
+    ".embedding.scales",
+    ".embedding.biases",
 )
 
 # Top-level base-tensor keys for the rare case where a LoRA wrapper is
@@ -2691,9 +2698,15 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
 # QuantizedLinear variants (`linear.weight` / `linear.scales` /
 # `linear.biases`); both shapes are reload-leaked base state and must be
 # dropped from adapter saves identically to non-root LoRA wrappers.
+# Embedding LoRA wrappers (LoRAEmbedding / DoRAEmbedding) keep the inner
+# nn.Embedding at `.embedding` rather than `.linear`, so the same
+# wrapped-base-state filter also needs `embedding.weight` /
+# `embedding.scales` / `embedding.biases` for root-level embedding
+# adapters.
 _ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
     "weight", "scales", "biases",
     "linear.weight", "linear.scales", "linear.biases",
+    "embedding.weight", "embedding.scales", "embedding.biases",
 })
 
 
@@ -3188,11 +3201,15 @@ def _push_lora_adapters_to_hub(
         commit_description += " (Trained with Unsloth 2x faster)"
 
     api = HfApi(token=token)
-    api.create_repo(
-        repo_id=repo_id,
-        private=bool(private) if private is not None else False,
-        exist_ok=True,
-    )
+    # Only forward `private` when the caller actually set it. Passing
+    # private=False unconditionally overrides org-level default-private
+    # repo creation: a user inside an org that auto-creates new repos
+    # as private would get a public repo on first push. Omitting the
+    # kwarg lets the Hub's account/org policy decide initial visibility.
+    _create_repo_kwargs = {"repo_id": repo_id, "exist_ok": True}
+    if private is not None:
+        _create_repo_kwargs["private"] = bool(private)
+    api.create_repo(**_create_repo_kwargs)
     # create_repo(exist_ok=True) is a no-op on existing repos, so an
     # explicit private toggle on a re-push needs update_repo_settings.
     if private is not None:
@@ -3752,11 +3769,15 @@ def push_to_hub_merged(
         commit_description += " (Trained with Unsloth 2x faster)"
 
     api = HfApi(token=token)
-    api.create_repo(
-        repo_id=repo_id,
-        private=bool(private) if private is not None else False,
-        exist_ok=True,
-    )
+    # Only forward `private` when the caller actually set it. Passing
+    # private=False unconditionally overrides org-level default-private
+    # repo creation: a user inside an org that auto-creates new repos
+    # as private would get a public repo on first push. Omitting the
+    # kwarg lets the Hub's account/org policy decide initial visibility.
+    _create_repo_kwargs = {"repo_id": repo_id, "exist_ok": True}
+    if private is not None:
+        _create_repo_kwargs["private"] = bool(private)
+    api.create_repo(**_create_repo_kwargs)
     # create_repo(exist_ok=True) is a no-op when the repo already exists,
     # so toggling `private` on a re-push wouldn't change visibility unless
     # we update it explicitly.
@@ -3900,11 +3921,15 @@ def push_to_hub_gguf(
 
     # Upload GGUF files
     api = HfApi(token=token)
-    api.create_repo(
-        repo_id=repo_id,
-        private=bool(private) if private is not None else False,
-        exist_ok=True,
-    )
+    # Only forward `private` when the caller actually set it. Passing
+    # private=False unconditionally overrides org-level default-private
+    # repo creation: a user inside an org that auto-creates new repos
+    # as private would get a public repo on first push. Omitting the
+    # kwarg lets the Hub's account/org policy decide initial visibility.
+    _create_repo_kwargs = {"repo_id": repo_id, "exist_ok": True}
+    if private is not None:
+        _create_repo_kwargs["private"] = bool(private)
+    api.create_repo(**_create_repo_kwargs)
     # create_repo(exist_ok=True) is a no-op for the visibility flag on
     # existing repos. A caller passing private=True on a repo that
     # already exists as public would otherwise silently upload the GGUF
