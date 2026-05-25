@@ -1381,6 +1381,7 @@ class MLXTrainer:
     def save_model(self, output_dir=None):
         """Save LoRA adapters or full merged model (if no LoRA)."""
         from .utils import (
+            _coerce_mlx_lora_scale,
             _get_mlx_dropout_probability,
             _infer_mlx_lora_rank,
             save_merged_model,
@@ -1407,20 +1408,11 @@ class MLXTrainer:
                 if inferred_rank is None:
                     continue
                 _lora_rank = inferred_rank
-                _scale = getattr(m, "scale", 1.0)
-                # LoRASwitchLinear stores scale as a per-expert mx.array;
-                # float() on a non-0-D array raises, so coerce via .item()
-                # when available and fall back to 1.0 if the array is wider.
-                if hasattr(_scale, "item"):
-                    try:
-                        _lora_scale = float(_scale.item())
-                    except Exception:
-                        _lora_scale = 1.0
-                else:
-                    try:
-                        _lora_scale = float(_scale)
-                    except Exception:
-                        _lora_scale = 1.0
+                # _coerce_mlx_lora_scale handles 0-D scalars AND LoRASwitchLinear's
+                # per-expert mx.array (where float()/.item() both raise). Reading
+                # the first broadcast value preserves the actual alpha/r instead
+                # of overwriting it with a silent placeholder 1.0.
+                _lora_scale = _coerce_mlx_lora_scale(getattr(m, "scale", 1.0))
                 _lora_dropout = _get_mlx_dropout_probability(
                     getattr(m, "dropout", None)
                 )

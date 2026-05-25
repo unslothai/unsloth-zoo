@@ -2684,6 +2684,44 @@ def _get_mlx_dropout_probability(drop):
     return 0.0
 
 
+def _coerce_mlx_lora_scale(scale, default=1.0):
+    """Return a Python float from an mlx-lm LoRA wrapper's `.scale` attribute.
+
+    LoRASwitchLinear stores `.scale` as a per-expert (non-0-D) mx.array
+    so a raw `float()` raises and a plain `.item()` fails. Falling back to
+    `1.0` silently changes adapter behavior after reload when the trained
+    adapter used a different `alpha/r`; instead reshape/flatten and read
+    the first broadcast value, which is the per-expert constant for the
+    common alpha/r setting. `default` is only used as a last resort when
+    no numeric value can be recovered.
+    """
+    if scale is None:
+        return float(default)
+
+    # 0-D Python scalar or mx.array with numeric coercion.
+    try:
+        return float(scale)
+    except Exception:
+        pass
+
+    if hasattr(scale, "item"):
+        try:
+            return float(scale.item())
+        except Exception:
+            pass
+
+    # Multi-element mx.array (LoRASwitchLinear / MoE LoRA): take the first
+    # broadcast value, which equals alpha/r for every expert.
+    try:
+        flat = scale.reshape((-1,))
+        first = flat[0]
+        if hasattr(first, "item"):
+            return float(first.item())
+        return float(first)
+    except Exception:
+        return float(default)
+
+
 def _infer_mlx_lora_rank(module):
     # mlx-lm LoRA wrappers always expose lowercase lora_a / lora_b.
     lora_a = getattr(module, "lora_a", None)
@@ -2838,24 +2876,16 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 continue
             if lora_rank is None:
                 lora_rank = inferred_rank
-                # Match MLXTrainer.save_model's coercion: LoRASwitchLinear's
-                # per-expert scale is an mx.array, and a raw float() on a
-                # non-0-D array raises. Without this fallback the outer
-                # try/except: pass would silently abandon lora_paths and
-                # leave vision/projector LoRA tensors unrecorded in
-                # adapter_config, so they vanish on reload via
-                # load_weights(strict=False).
-                _scale = getattr(module, "scale", 1.0)
-                if hasattr(_scale, "item"):
-                    try:
-                        lora_scale = float(_scale.item())
-                    except Exception:
-                        lora_scale = 1.0
-                else:
-                    try:
-                        lora_scale = float(_scale)
-                    except Exception:
-                        lora_scale = 1.0
+                # _coerce_mlx_lora_scale handles 0-D scalars AND LoRASwitchLinear's
+                # per-expert mx.array. Falling back to 1.0 silently would change
+                # adapter behavior after reload when the trained adapter used a
+                # different alpha/r, and the outer try/except: pass would also
+                # silently abandon lora_paths, leaving vision/projector LoRA
+                # tensors unrecorded in adapter_config (so they vanish on reload
+                # via load_weights(strict=False)).
+                lora_scale = _coerce_mlx_lora_scale(
+                    getattr(module, "scale", 1.0),
+                )
                 lora_dropout = _get_mlx_dropout_probability(
                     getattr(module, "dropout", None)
                 )
@@ -2864,8 +2894,26 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         if lora_paths and not has_explicit_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
 
-        if lora_rank is not None:
-            lora_parameters = dict(adapter_config.get("lora_parameters") or {})
+        # When the caller already provided global LoRA metadata AND the
+        # explicit-path filter narrowed inference to a subset (e.g. only
+        # vision/projector aux modules with a different rank than the
+        # language tower), do NOT overwrite the caller's global rank/scale
+        # /dropout. mlx-lm's load_adapters() then rebuilds the language
+        # LoRA with the correct global rank, and the aux paths still get
+        # re-wrapped with their own metadata. Otherwise the language tower
+        # silently inherits the aux rank and runs at the wrong adapter
+        # capacity on reload.
+        existing_lora_parameters = dict(adapter_config.get("lora_parameters") or {})
+        has_caller_lora_metadata = any(
+            key in existing_lora_parameters or key in adapter_config
+            for key in ("rank", "scale", "dropout")
+        )
+        explicit_filter_narrowed = explicit_path_set is not None
+
+        if lora_rank is not None and not (
+            explicit_filter_narrowed and has_caller_lora_metadata
+        ):
+            lora_parameters = existing_lora_parameters
             for key, value in (
                 ("rank", lora_rank), ("scale", lora_scale), ("dropout", lora_dropout),
             ):
@@ -2886,6 +2934,19 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     n_layers = 0
                 if n_layers > 0:
                     adapter_config["num_layers"] = n_layers
+        elif explicit_filter_narrowed and has_caller_lora_metadata:
+            # Keep the caller's global metadata coherent: copy top-level
+            # rank/scale/dropout into lora_parameters (or vice versa) so
+            # both shapes that mlx-lm's load_adapters checks agree.
+            lora_parameters = existing_lora_parameters
+            for key in ("rank", "scale", "dropout"):
+                if key not in lora_parameters and key in adapter_config:
+                    lora_parameters[key] = adapter_config[key]
+            if "rank" in lora_parameters:
+                adapter_config["lora_parameters"] = lora_parameters
+                for key in ("rank", "scale", "dropout"):
+                    if key in lora_parameters:
+                        adapter_config[key] = lora_parameters[key]
     except (TypeError, ValueError, AttributeError) as _enrich_exc:
         # Surface enrichment failures (e.g. caller passed garbage
         # lora_parameters, mx.array scale that could not coerce, an
