@@ -2672,8 +2672,15 @@ def save_trainable_adapters(model, path, adapter_config=None):
     for key, value in trainable.items():
         if key in adapter_tensors:
             continue
-        if any(key.startswith(p) for p in lora_module_prefixes):
-            # base tensor inside a LoRA module — skip to prevent reload leak.
+        # The reload-leak we are guarding against is specifically the
+        # wrapped base Linear's `.weight` exposed at the LoRA module's
+        # path (e.g. q_proj.weight under a LoRA-wrapped q_proj). Keep
+        # other params under the same prefix (e.g. q_proj.bias) so a
+        # user who intentionally trained bias=True on a LoRA-wrapped
+        # module doesn't silently lose the trained bias on checkpoint.
+        if key.endswith(".weight") and any(
+            key.startswith(p) for p in lora_module_prefixes
+        ):
             continue
         tensors[key] = value
 
@@ -3212,12 +3219,23 @@ def save_pretrained_merged(
         lora_module_prefixes = tuple(
             f"{name}." for name, _ in iter_mlx_lora_modules(model) if name
         )
-        has_external_non_lora_trainable = any(
-            key not in adapter_keys
-            and not any(key.startswith(p) for p in lora_module_prefixes)
+        # Route to save_trainable_adapters whenever the trainable tree
+        # contains anything that save_lora_adapters would not preserve:
+        # either an external (non-LoRA) param, OR an intentionally
+        # trainable non-base-weight inside a LoRA module (e.g.
+        # q_proj.bias on a LoRA-wrapped Linear with bias=True). The
+        # save_trainable_adapters filter drops only `.weight` under LoRA
+        # prefixes so the bias / other params survive.
+        def _is_base_weight_inside_lora(key):
+            if not key.endswith(".weight"):
+                return False
+            return any(key.startswith(p) for p in lora_module_prefixes)
+
+        has_non_lora_trainable = any(
+            key not in adapter_keys and not _is_base_weight_inside_lora(key)
             for key in trainable
         )
-        if has_external_non_lora_trainable:
+        if has_non_lora_trainable:
             save_trainable_adapters(model, save_directory)
         else:
             save_lora_adapters(model, save_directory)

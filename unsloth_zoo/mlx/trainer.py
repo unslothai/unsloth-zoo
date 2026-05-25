@@ -1456,12 +1456,22 @@ class MLXTrainer:
                 f"{name}." for name, _ in iter_mlx_lora_modules(self.model)
                 if name
             )
-            has_external_non_lora_trainable = any(
-                key not in adapter_keys
-                and not any(key.startswith(p) for p in lora_module_prefixes)
+            # Route to save_trainable_adapters whenever the trainable tree
+            # has anything save_lora_adapters would not preserve: either an
+            # external param OR an intentionally-trainable non-`.weight`
+            # under a LoRA module (e.g. q_proj.bias). The save filter
+            # drops only `.weight` under LoRA prefixes so .bias and other
+            # params survive the routing.
+            def _is_base_weight_inside_lora(key):
+                if not key.endswith(".weight"):
+                    return False
+                return any(key.startswith(p) for p in lora_module_prefixes)
+
+            has_non_lora_trainable = any(
+                key not in adapter_keys and not _is_base_weight_inside_lora(key)
                 for key in trainable
             )
-            if has_external_non_lora_trainable:
+            if has_non_lora_trainable:
                 save_trainable_adapters(
                     self.model, output_dir, adapter_config=adapter_config,
                 )

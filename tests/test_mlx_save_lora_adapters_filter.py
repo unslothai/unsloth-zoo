@@ -954,6 +954,58 @@ def test_push_lora_adapters_routes_commit_metadata_through_upload_folder(
     assert sent["repo_id"] == "me/adapter"
 
 
+def test_save_trainable_adapters_preserves_bias_under_lora_wrapped_linear(tmp_path):
+    # Refinement of the lora_module_prefixes filter: only the wrapped
+    # base `.weight` is a reload-leak risk (the V x H matmul gradient).
+    # Other trainable params under the LoRA module (e.g. q_proj.bias
+    # when bias=True is explicitly trained) must survive the filter so
+    # the user's bias training isn't silently dropped on checkpoint.
+    from unsloth_zoo.mlx.utils import save_trainable_adapters
+    import torch as _t
+    from safetensors.torch import load_file
+
+    class _LoRALinearWithBias:
+        # Path: q_proj has lora_a / lora_b plus the wrapped base
+        # Linear's weight + bias (flattened to q_proj.weight, q_proj.bias).
+        def __init__(self):
+            self.lora_a = _t.zeros(4, 8)
+            self.lora_b = _t.zeros(8, 4)
+            self.weight = _t.zeros(8, 8)
+            self.bias = _t.zeros(8)
+
+    class _Model:
+        def __init__(self):
+            self._lora = _LoRALinearWithBias()
+            self._up = type("UpProj", (), {"weight": _t.zeros(8, 8)})()
+        def named_modules(self):
+            yield "q_proj", self._lora
+            yield "up_proj", self._up
+        def parameters(self):
+            return {
+                "q_proj": {
+                    "lora_a": self._lora.lora_a,
+                    "lora_b": self._lora.lora_b,
+                    "weight": self._lora.weight,
+                    "bias": self._lora.bias,
+                },
+                "up_proj": {"weight": self._up.weight},
+            }
+        def trainable_parameters(self):
+            return self.parameters()
+
+    out = tmp_path / "ckpt"
+    save_trainable_adapters(_Model(), out)
+    keys = set(load_file(out / "adapters.safetensors").keys())
+
+    # LoRA tensors kept; base weight inside LoRA dropped; bias kept;
+    # external weight kept.
+    assert "q_proj.lora_a" in keys
+    assert "q_proj.lora_b" in keys
+    assert "q_proj.weight" not in keys
+    assert "q_proj.bias" in keys, "trainable .bias under LoRA module must not be dropped"
+    assert "up_proj.weight" in keys
+
+
 def test_enrich_stamps_fine_tune_type_full_when_no_lora_modules(tmp_path):
     # Full-finetune / no-LoRA checkpoints must NOT default to lora on
     # reload. mlx-lm's load_adapters() defaults missing fine_tune_type
