@@ -500,6 +500,40 @@ def _get_image_token_ids(model):
     return ids  # plain Python list; avoids mx.eval in the hot path
 
 
+def _normalize_cce_label_dtype(labels):
+    """Widen unsigned label dtypes to int64 so masking can inject -100.
+
+    `_to_mx_vlm_batch` deliberately stopped narrowing labels to mx.int32
+    so runtime CCE could classify wide invalid labels before its own
+    narrow. That left unsigned tokenizer labels (np.uint32 from some
+    processors, uint16 from sentencepiece) intact, but `mx.where(..., -100,
+    targets)` then has to inject a signed sentinel into an unsigned tensor
+    and crashes on the torch-backed MLX simulation ("where_cpu" not
+    implemented for UInt32). Widen to int64 here so the subsequent mask
+    + runtime CCE both see well-defined signed values, while still
+    preserving the wide-range visibility that the PR added.
+
+    Returns the labels unchanged for signed/float dtypes.
+    """
+    if labels is None:
+        return labels
+    dtype = getattr(labels, "dtype", None)
+    if dtype is None:
+        return labels
+    unsigned_dtypes = tuple(
+        d for d in (
+            getattr(mx, "uint8", None),
+            getattr(mx, "uint16", None),
+            getattr(mx, "uint32", None),
+            getattr(mx, "uint64", None),
+        )
+        if d is not None
+    )
+    if dtype in unsigned_dtypes:
+        return labels.astype(mx.int64)
+    return labels
+
+
 def _mask_image_tokens(targets, image_token_ids):
     """Set image token positions in targets to -100 (ignore_index).
 
@@ -512,11 +546,13 @@ def _mask_image_tokens(targets, image_token_ids):
     """
     if not image_token_ids:
         return targets
+    targets = _normalize_cce_label_dtype(targets)
     # Build a mask: True where target is any image token
     is_image = targets == image_token_ids[0]
     for tok_id in image_token_ids[1:]:
         is_image = is_image | (targets == tok_id)
-    return mx.where(is_image, -100, targets)
+    ignore = mx.array(-100, dtype=targets.dtype)
+    return mx.where(is_image, ignore, targets)
 
 
 def _mask_prompt_tokens(targets, assistant_token_id):
@@ -530,11 +566,13 @@ def _mask_prompt_tokens(targets, assistant_token_id):
     """
     if assistant_token_id <= 0:
         return targets
+    targets = _normalize_cce_label_dtype(targets)
     is_assistant = (targets == assistant_token_id)
     cumulative = mx.cumsum(is_assistant.astype(mx.int32), axis=1)
     has_assistant = mx.any(is_assistant, axis=1, keepdims=True)
     prompt_mask = mx.logical_and(has_assistant, cumulative == 0)
-    return mx.where(prompt_mask, -100, targets)
+    ignore = mx.array(-100, dtype=targets.dtype)
+    return mx.where(prompt_mask, ignore, targets)
 
 
 def _is_vlm_model(model) -> bool:
@@ -2168,10 +2206,18 @@ def _to_mx_vlm_batch(inputs):
         batch["input_ids"] = batch["input_ids"].astype(mx.int32)
     if "attention_mask" in batch:
         batch["attention_mask"] = batch["attention_mask"].astype(mx.int32)
-    # Do NOT narrow labels here. Runtime CCE now validates the original
+    # Do NOT narrow labels to mx.int32: runtime CCE validates the original
     # dtype/range before its own int32 narrow so wide invalid labels
     # (e.g. 2**32 - 100 wrapping to -100) get NaN-poisoned instead of
-    # silently treated as ignore_index. Casting upstream defeats that.
+    # silently treated as ignore_index. But unsigned tokenizer labels
+    # (np.uint32 from some VLM processors) still need to be widened to
+    # signed int64 here: the masking helpers below this point inject the
+    # `-100` ignore_index sentinel via mx.where(..., -100, targets),
+    # which crashes on unsigned tensors under the torch-backed MLX
+    # simulation. int64 keeps wide-range visibility AND lets masking
+    # inject the signed sentinel cleanly.
+    if "labels" in batch:
+        batch["labels"] = _normalize_cce_label_dtype(batch["labels"])
 
     return batch
 

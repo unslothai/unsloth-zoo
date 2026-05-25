@@ -123,11 +123,11 @@ def _target_validity_masks(
     # Validate unsigned-integer labels through a signed dtype before any
     # comparisons. Direct `targets >= 0` on uint16/uint32/uint64 crashes
     # the torch-backed MLX simulation kernel ("ge_cpu" not implemented for
-    # UInt32). Casting to int64 keeps wide-int wraparound (e.g. 2**32-100
-    # under uint32) classified as out-of-vocab rather than silently
-    # crashing the validity step itself. On real Apple-Metal MLX this is
-    # a defensive no-op cost; on the simulation path it preserves the
-    # PR's "validate before narrow" contract for wide invalid labels.
+    # UInt32 / UInt64). Casting to int64 keeps wide-int wraparound (e.g.
+    # 2**32-100 under uint32) classified as out-of-vocab rather than
+    # silently crashing the validity step itself. On real Apple-Metal MLX
+    # this is a defensive no-op cost; on the simulation path it preserves
+    # the PR's "validate before narrow" contract for wide invalid labels.
     _unsigned_safe_to_i64 = tuple(
         dtype for dtype in (
             getattr(mx, "uint8", None),
@@ -136,6 +136,28 @@ def _target_validity_masks(
         )
         if dtype is not None
     )
+    _uint64_dtype = getattr(mx, "uint64", None)
+    if _uint64_dtype is not None and targets.dtype == _uint64_dtype:
+        # int64 cannot represent the full uint64 range; promoting via
+        # int64 first would wrap large unsigned values (e.g. 2**64 - 100)
+        # into negative ints that ignore_index=-100 might match. Use
+        # float64 (or float32 as a fallback) for the comparisons, which
+        # losslessly represents every value up to 2**53 and saturates
+        # cleanly above that into the "out of vocab" bucket.
+        _validation_dtype = getattr(mx, "float64", mx.float32)
+        targets_for_validation = targets.astype(_validation_dtype)
+        in_vocab = (targets_for_validation >= 0.0) & (
+            targets_for_validation < float(vocab_size)
+        )
+        if ignore_index < 0:
+            # Unsigned 0..2**64 can never equal a negative ignore_index,
+            # so every position is "not_ignored" by construction. Skip
+            # the float compare to avoid float-equality surprises.
+            not_ignored = mx.ones(targets.shape, dtype=mx.bool_)
+        else:
+            not_ignored = targets_for_validation != float(ignore_index)
+        return not_ignored & in_vocab, not_ignored & ~in_vocab
+
     targets_for_validation = (
         targets.astype(mx.int64)
         if targets.dtype in _unsigned_safe_to_i64
