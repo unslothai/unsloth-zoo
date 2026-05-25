@@ -3160,12 +3160,28 @@ def _push_lora_adapters_to_hub(
         try:
             from huggingface_hub import ModelCard
             card_path = save_directory / "README.md"
-            if card_path.exists():
-                card = ModelCard.load(card_path)
-                existing = list(getattr(card.data, "tags", None) or [])
-                merged = list(dict.fromkeys(existing + list(tags) + ["mlx", "unsloth"]))
-                card.data.tags = merged
-                card.save(card_path)
+            # Fresh LoRA adapter directories contain adapter files +
+            # tokenizer files but no model card, so without this seed
+            # ModelCard.load() raises FileNotFoundError and the requested
+            # tags silently never reach the Hub. Merged saves usually have
+            # a card from save_merged_model()'s create_model_card path,
+            # but seed defensively here as well so an upstream card-fallback
+            # failure doesn't quietly drop tags either.
+            if not card_path.exists():
+                card_path.write_text(
+                    "---\n"
+                    "library_name: mlx\n"
+                    "tags:\n"
+                    "- mlx\n"
+                    "- unsloth\n"
+                    "---\n",
+                    encoding="utf-8",
+                )
+            card = ModelCard.load(card_path)
+            existing = list(getattr(card.data, "tags", None) or [])
+            merged = list(dict.fromkeys(existing + list(tags) + ["mlx", "unsloth"]))
+            card.data.tags = merged
+            card.save(card_path)
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
@@ -3688,12 +3704,28 @@ def push_to_hub_merged(
         try:
             from huggingface_hub import ModelCard
             card_path = save_directory / "README.md"
-            if card_path.exists():
-                card = ModelCard.load(card_path)
-                existing = list(getattr(card.data, "tags", None) or [])
-                merged = list(dict.fromkeys(existing + list(tags) + ["mlx", "unsloth"]))
-                card.data.tags = merged
-                card.save(card_path)
+            # Fresh LoRA adapter directories contain adapter files +
+            # tokenizer files but no model card, so without this seed
+            # ModelCard.load() raises FileNotFoundError and the requested
+            # tags silently never reach the Hub. Merged saves usually have
+            # a card from save_merged_model()'s create_model_card path,
+            # but seed defensively here as well so an upstream card-fallback
+            # failure doesn't quietly drop tags either.
+            if not card_path.exists():
+                card_path.write_text(
+                    "---\n"
+                    "library_name: mlx\n"
+                    "tags:\n"
+                    "- mlx\n"
+                    "- unsloth\n"
+                    "---\n",
+                    encoding="utf-8",
+                )
+            card = ModelCard.load(card_path)
+            existing = list(getattr(card.data, "tags", None) or [])
+            merged = list(dict.fromkeys(existing + list(tags) + ["mlx", "unsloth"]))
+            card.data.tags = merged
+            card.save(card_path)
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
