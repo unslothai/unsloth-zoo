@@ -521,8 +521,12 @@ def _forward_chunked_fused_finalize(
                 "MLX CCE: hidden has 0 tokens but targets is non-empty "
                 f"(targets.shape={targets_raw.shape})."
             )
-        empty = mx.zeros((0,), dtype=mx.float32)
-        return empty, empty
+        # Separate allocations so downstream VJP / in-place views cannot
+        # alias loss into lse.
+        return (
+            mx.zeros((0,), dtype=mx.float32),
+            mx.zeros((0,), dtype=mx.float32),
+        )
     if targets_raw.shape[0] != n:
         raise ValueError(
             "MLX CCE: targets length does not match hidden token count "
