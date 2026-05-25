@@ -1086,6 +1086,9 @@ def _normalize_mlx_lora_module_paths(module_paths):
         return []
     if isinstance(module_paths, str):
         return [module_paths] if module_paths else []
+    if isinstance(module_paths, os.PathLike):
+        s = os.fspath(module_paths)
+        return [s] if s else []
     if isinstance(module_paths, dict):
         out = []
         for value in module_paths.values():
@@ -2573,6 +2576,13 @@ class FastMLXModel:
                             # language_model.model.layers...) doesn't fire
                             # false positives for non-LoRA tensors that
                             # mlx-lm rebinds under a different prefix.
+                            # Diagnostic: diff saved-vs-live keys before
+                            # load_weights(strict=False) silently drops any
+                            # tensor without a matching live module. The
+                            # actual load_weights call MUST run regardless
+                            # of whether the diagnostic succeeds, so the
+                            # diff is wrapped in its own try/except and
+                            # load_weights is called outside that block.
                             try:
                                 from safetensors import safe_open
                                 from mlx.utils import tree_flatten as _tree_flatten
@@ -2602,11 +2612,12 @@ class FastMLXModel:
                                         f"module and will not load: {_preview}",
                                         stacklevel=2,
                                     )
-                            except (ImportError, OSError) as _diff_exc:
-                                # Narrow the swallow so unrelated bugs (e.g.
-                                # accidental NameError) still surface. Tell
-                                # the user the diagnostic was skipped, then
-                                # still run the load below.
+                            except Exception as _diff_exc:
+                                # Catch anything (SafetensorError, ValueError,
+                                # AttributeError, ImportError) so a bug in the
+                                # diagnostic never blocks the actual load.
+                                # Surface the skip so the user knows the
+                                # silent-drop warning was bypassed.
                                 warnings.warn(
                                     f"Unsloth MLX: skipped saved-vs-live "
                                     f"adapter key diff ({_diff_exc!r}); "

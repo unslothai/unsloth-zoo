@@ -2885,8 +2885,18 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     n_layers = 0
                 if n_layers > 0:
                     adapter_config["num_layers"] = n_layers
-    except Exception:
-        pass
+    except (TypeError, ValueError, AttributeError) as _enrich_exc:
+        # Surface enrichment failures (e.g. caller passed garbage
+        # lora_parameters, mx.array scale that could not coerce, an
+        # unexpected None on a getattr chain) so the user knows
+        # adapter_config metadata may be incomplete on reload.
+        import warnings as _warnings
+        _warnings.warn(
+            f"Unsloth MLX: skipped LoRA metadata enrichment "
+            f"({_enrich_exc!r}); reloaded adapters may use placeholder "
+            f"rank/scale until adapter_config is rewritten.",
+            stacklevel=2,
+        )
     return adapter_config
 
 
