@@ -29,6 +29,7 @@ _ALLOW_LIST = {
     "addict":        None,           # Deepseek-OCR config dicts
     "einops":        None,           # Deepseek-OCR deepencoder + many other vision models
     "easydict":      None,           # Deepseek-OCR deepencoder.py:12 `from easydict import EasyDict`
+    "snac":          None,           # Orpheus TTS neural audio codec
     "matplotlib":    None,           # Deepseek-OCR + a few HF image utils
     "traitlets":     None,           # Jupyter/IPython widget chain
     "soundfile":     None,           # audio processors
