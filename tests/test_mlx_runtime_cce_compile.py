@@ -57,6 +57,36 @@ def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
         runtime_cce(hidden, weight, targets)
 
 
+def test_runtime_cce_int64_wrap_to_ignore_index_poisons_gradients():
+    # A wide invalid label like 2**32 - 100 narrows to -100 (= ignore_index)
+    # inside int32. The forward loss is NaN, but the backward must NOT zero
+    # the gradient: it must propagate NaN from the poisoned lse so callers
+    # cannot silently keep training on the bad row.
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    runtime_cce, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100,
+        chunk_size=16,
+    )
+    hidden = mx.ones((3, 16), dtype=mx.float32)
+    weight = mx.ones((32, 16), dtype=mx.float32)
+    targets = mx.array([0, 2**32 - 100, -100], dtype=mx.int64)
+
+    def loss_fn(h, w):
+        return runtime_cce(h, w, targets).astype(mx.float32).sum()
+
+    loss, grads = mx.value_and_grad(loss_fn, argnums=(0, 1))(hidden, weight)
+    grad_hidden, _ = grads
+    rows = mx.sum(mx.abs(grad_hidden).astype(mx.float32), axis=1)
+    mx.eval(loss, rows)
+
+    assert math.isnan(loss.item())
+    assert math.isfinite(rows[0].item()), "valid row must have finite grad"
+    assert math.isnan(rows[1].item()), "wrap-to-ignore_index row must NaN grad"
+    assert rows[2].item() == pytest.approx(0.0), "real ignore_index row zero"
+
+
 @pytest.mark.parametrize(
     "bad_target",
     [2**32, -(2**32), 2**32 + 5, 2**32 - 100],

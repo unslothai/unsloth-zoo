@@ -361,7 +361,7 @@ def make_cce_loss_fn(model):
             masked_targets = mx.where(mask, targets, -100)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -394,7 +394,7 @@ def make_cce_loss_fn(model):
             masked_targets = mx.where(mask, targets, -100)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -1542,7 +1542,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
             # gradients (see runtime_cce.py VJP), so stop_gradient is
             # redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -1563,7 +1563,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks

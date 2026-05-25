@@ -420,18 +420,21 @@ def _build_dlogits_kernel() -> Callable:
             uint row = elem / chunk_v;
             uint col = elem % chunk_v;
             int target = targets[row];
-            if (target == ignore_index) {
-                d_logits[elem] = 0.0f;
-                continue;
-            }
 
             // invalid-label rows arrive with lse[row]=NaN from
             // _poison_invalid_targets. fast::exp() is not IEEE-754 strict
             // (MSL spec 6.5.1) so NaN propagation is not guaranteed; emit
             // an explicit NaN gradient via 0/0 (Metal C++ rejects the
-            // literal token 'nan').
+            // literal token 'nan'). MUST run before the ignore_index check
+            // so wider invalid labels that wrap to ignore_index after the
+            // int32 narrow still emit NaN instead of a zero gradient.
             if (isnan(lse[row])) {
                 d_logits[elem] = 0.0f / 0.0f;
+                continue;
+            }
+
+            if (target == ignore_index) {
+                d_logits[elem] = 0.0f;
                 continue;
             }
 
@@ -671,7 +674,15 @@ def _fallback_dlogits(
         t = mx.tanh(logits / softcap)
         d_capped = d_capped * (1.0 - t * t)
 
-    ignore_mask = targets == ignore_index
+    # Invalid-label rows arrive with lse=NaN from _poison_invalid_targets;
+    # force their gradient to NaN before the ignore_index mask zeroes them
+    # out, otherwise a wider invalid label that narrows to ignore_index
+    # would silently emit zeros.
+    invalid_lse = mx.isnan(lse)
+    nan_grad = mx.full(d_capped.shape, float("nan"), dtype=d_capped.dtype)
+    d_capped = mx.where(mx.expand_dims(invalid_lse, -1), nan_grad, d_capped)
+
+    ignore_mask = (targets == ignore_index) & ~invalid_lse
     return mx.where(mx.expand_dims(ignore_mask, -1), mx.zeros_like(d_capped), d_capped)
 
 
