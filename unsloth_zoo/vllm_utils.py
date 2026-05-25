@@ -785,6 +785,124 @@ def patch_vllm_graph_capture():
 pass
 
 
+def patch_vllm_decompose_size_nodes():
+    """
+    Workaround for vLLM upstream bug: ``_decompose_size_nodes`` only rewrites
+    top-level ``user.args`` references to size nodes, missing the ones nested
+    inside ``slice(start, stop, step)``, tuples/lists, and kwargs. The trailing
+    ``graph.graph.erase_node(node)`` then trips ``torch.fx`` with
+    ``RuntimeError: Tried to erase Node size_N but it still had K users``.
+    Manifests on Qwen3-(4B)-GRPO, Advanced Llama3.2 GRPO LoRA, Qwen3 8B FP8 GRPO,
+    Llama FP8 GRPO, Qwen2.5-7B VL GRPO during ``FastVisionModel.from_pretrained
+    (fast_inference=True)``. Qwen3-VL-(8B) Vision-GRPO is unaffected because its
+    graph only emits ``getitem(size, idx)`` users (handled by the upstream
+    ``if`` branch). Canonical upstream fix: vllm-project/vllm#42543 (open at
+    SHA 51fd86e). Port the recursive rewrite + add a kwargs sweep PR #42543
+    misses + final ``if node.users: warn-and-skip`` safety net.
+
+    Opt out with ``UNSLOTH_DISABLE_VLLM_DECOMPOSE_SIZE_PATCH=1``.
+    """
+    if os.environ.get("UNSLOTH_DISABLE_VLLM_DECOMPOSE_SIZE_PATCH", "0") == "1":
+        return
+    try:
+        import vllm
+    except ImportError:
+        return
+    if not (Version("0.11.0") <= Version(vllm_version) < Version("0.99")):
+        return
+    try:
+        import vllm.compilation.backends as _B
+    except Exception:
+        return
+    if not hasattr(_B, "_decompose_size_nodes"):
+        return
+    _orig = _B._decompose_size_nodes
+    if getattr(_orig, "_unsloth_patched", False):
+        return
+    try:
+        import operator
+        from torch import fx
+    except Exception:
+        return
+
+    def _replace_in_slice(s, node, dims):
+        def _sub(b):
+            if isinstance(b, fx.Node) and b is node:
+                sym = [d for d in dims if isinstance(d, fx.Node)]
+                return sym[0] if len(sym) == 1 else dims[0]
+            return b
+        ns, no, nt = _sub(s.start), _sub(s.stop), _sub(s.step)
+        if (ns, no, nt) != (s.start, s.stop, s.step):
+            return slice(ns, no, nt)
+        return s
+
+    def _replace_in_args(args, node, dims):
+        out = []
+        for a in args:
+            if isinstance(a, fx.Node) and a is node:
+                out.extend(dims)
+            elif isinstance(a, slice):
+                out.append(_replace_in_slice(a, node, dims))
+            elif isinstance(a, (tuple, list)):
+                out.append(type(a)(_replace_in_args(list(a), node, dims)))
+            else:
+                out.append(a)
+        return out
+
+    def _decompose_size_nodes(graph):
+        size_nodes = list(graph.graph.find_nodes(op="call_method", target="size"))
+        for node in size_nodes:
+            tensor_node = node.args[0]
+            ev = tensor_node.meta.get("example_value")
+            if ev is None:
+                continue
+            dims = []
+            with graph.graph.inserting_after(tensor_node):
+                for i in range(ev.dim()):
+                    dv = ev.shape[i]
+                    if isinstance(dv, torch.SymInt):
+                        dn = graph.graph.call_function(
+                            torch.ops.aten.sym_size.int, args = (tensor_node, i),
+                        )
+                        dn.meta["example_value"] = dv
+                        dims.append(dn)
+                    else:
+                        dims.append(int(dv))
+            for user in list(node.users):
+                if (
+                    user.op == "call_function"
+                    and user.target is operator.getitem
+                    and len(user.args) == 2
+                    and user.args[0] is node
+                ):
+                    user.replace_all_uses_with(dims[user.args[1]])
+                    graph.graph.erase_node(user)
+                else:
+                    user.args = tuple(_replace_in_args(list(user.args), node, dims))
+                    if user.kwargs:
+                        new_kwargs = {}
+                        for k, v in user.kwargs.items():
+                            if isinstance(v, (tuple, list)):
+                                new_kwargs[k] = type(v)(_replace_in_args(list(v), node, dims))
+                            else:
+                                new_kwargs[k] = _replace_in_args([v], node, dims)[0]
+                        user.kwargs = new_kwargs
+            if node.users:
+                logger.warning(
+                    f"Unsloth: vllm _decompose_size_nodes left {node.name} "
+                    f"with users {dict(node.users)}; skipping erase. "
+                    f"See vllm-project/vllm#42543."
+                )
+                continue
+            graph.graph.erase_node(node)
+    pass
+
+    _decompose_size_nodes._unsloth_patched = True
+    _B._decompose_size_nodes = _decompose_size_nodes
+    logger.info("Unsloth: patched vllm.compilation.backends._decompose_size_nodes (vllm#42543).")
+pass
+
+
 def patch_vllm(debug = True):
     # Temporary patch to disable multiprocessing for vLLM
     # Allows accessing model_executor
@@ -814,6 +932,7 @@ def patch_vllm(debug = True):
         logger.info(f'Unsloth: Patching vLLM to enable standby.')
         patch_vllm_enable_sleep_mode()
     patch_vllm_graph_capture()
+    patch_vllm_decompose_size_nodes()
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
 pass
