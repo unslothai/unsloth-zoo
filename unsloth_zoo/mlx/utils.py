@@ -3480,12 +3480,16 @@ def push_to_hub_merged(
 
     # Detect whether the caller passed custom commit metadata BEFORE we
     # normalize the strings. upload_large_folder ignores commit_message /
-    # commit_description / create_pr; falling through to upload_folder is
-    # the only way those kwargs survive to the Hub.
+    # commit_description / create_pr / revision; falling through to
+    # upload_folder is the only way those kwargs survive to the Hub.
+    # revision in particular: upload_large_folder silently lands on main
+    # regardless of the kwarg, so a non-default revision must force the
+    # upload_folder route.
     _caller_wants_commit_metadata = bool(
         create_pr
         or commit_message != _PUSH_MERGED_DEFAULT_COMMIT_MESSAGE
         or commit_description != _PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION
+        or revision is not None
     )
 
     # Match the GPU path's "(Trained with Unsloth)" suffix convention so

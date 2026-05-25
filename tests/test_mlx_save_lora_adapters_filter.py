@@ -954,6 +954,41 @@ def test_push_lora_adapters_routes_commit_metadata_through_upload_folder(
     assert sent["repo_id"] == "me/adapter"
 
 
+def test_collect_lora_includes_m_on_real_dora_class():
+    # Positive twin of the DoRA-gate negative test: if a module's class
+    # name starts with "DoRA" (matches mlx-lm's DoRALinear / DoRAEmbedding),
+    # collect_mlx_lora_adapter_tensors MUST include the m magnitude
+    # tensor. A future typo (e.g. startswith("DORA"), wrong attr name)
+    # would silently drop DoRA magnitudes from every export.
+    from unsloth_zoo.mlx.utils import collect_mlx_lora_adapter_tensors
+    import torch as _t
+
+    class DoRALinear:
+        def __init__(self):
+            self.lora_a = _t.zeros(8, 4)
+            self.lora_b = _t.zeros(4, 8)
+            self.m = _t.zeros(8)
+
+    class _Model:
+        def __init__(self):
+            self._mod = DoRALinear()
+        def parameters(self):
+            return {
+                "q_proj": {
+                    "lora_a": self._mod.lora_a,
+                    "lora_b": self._mod.lora_b,
+                    "m": self._mod.m,
+                }
+            }
+        def named_modules(self):
+            yield "q_proj", self._mod
+
+    tensors = collect_mlx_lora_adapter_tensors(_Model())
+    assert "q_proj.lora_a" in tensors
+    assert "q_proj.lora_b" in tensors
+    assert "q_proj.m" in tensors, "DoRA magnitude tensor must be exported"
+
+
 def test_collect_lora_skips_unrelated_m_attribute_on_non_dora_module():
     # `m` is a generic 1-letter attr name; if a future LoRA wrapper
     # exposes self.m as a learned mixing scalar that is not a DoRA
@@ -1055,6 +1090,49 @@ def test_push_to_hub_merged_honors_create_pr_via_upload_folder(
     sent = calls["folder"][0]
     assert "Release v2" in sent["commit_message"], sent
     assert sent["create_pr"] is True
+
+
+def test_push_to_hub_merged_honors_revision_via_upload_folder(
+    tmp_path, monkeypatch,
+):
+    # Regression: a custom revision must force the upload_folder route
+    # because upload_large_folder silently lands on main regardless.
+    import huggingface_hub
+    from unsloth_zoo.mlx.utils import push_to_hub_merged
+
+    (tmp_path / "model.safetensors.index.json").write_text("{}")
+
+    calls = {"folder": [], "large": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kwargs):
+            return None
+
+        def update_repo_settings(self, **kwargs):
+            return None
+
+        def upload_folder(self, **kwargs):
+            calls["folder"].append(kwargs)
+
+        def upload_large_folder(self, **kwargs):
+            calls["large"].append(kwargs)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    push_to_hub_merged(
+        model=None,
+        tokenizer=None,
+        save_directory=tmp_path,
+        repo_id="me/merged",
+        revision="release-v3",
+    )
+
+    assert len(calls["folder"]) == 1, calls
+    assert calls["large"] == [], calls
+    assert calls["folder"][0]["revision"] == "release-v3"
 
 
 def test_push_to_hub_merged_uses_large_folder_when_no_custom_metadata(
