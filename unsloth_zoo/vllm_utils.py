@@ -880,22 +880,25 @@ def patch_vllm_decompose_size_nodes():
                                 new_kwargs[k] = _replace_in_args([v], node, dims)[0]
                         user.kwargs = new_kwargs
             if node.users:
-                # If the recursive rewrite did not actually replace every
-                # reference, surface the failure loudly rather than masking
-                # it. Erasing a still-referenced node leaves the graph in
-                # an inconsistent state and aot_autograd will fail much
-                # later with a worse stacktrace. Better to fail here so
-                # the regression is visible.
-                logger.error(
+                # The recursive rewrite did not replace every reference.
+                # Raise cleanly without calling `graph.graph.erase_node`
+                # again: by this point we have already mutated
+                # `user.args` / `user.kwargs` for the users we *did*
+                # rewrite, and a stray erase_node would amplify the
+                # partial-rewrite damage on the fx graph. Surface the
+                # original ground-truth error message vllm would have
+                # raised so a vllm-side fix can be debugged from the
+                # stacktrace alone.
+                raise RuntimeError(
                     f"Unsloth: vllm _decompose_size_nodes left {node.name} "
-                    f"with users {dict(node.users)} after rewrite. The "
-                    f"recursive sweep missed a reference; see "
-                    f"vllm-project/vllm#42543 + this monkey-patch. "
-                    f"Set UNSLOTH_DISABLE_VLLM_DECOMPOSE_SIZE_PATCH=1 to "
+                    f"with users {dict(node.users)} after the recursive "
+                    f"rewrite. This indicates a node-reference shape we "
+                    f"did not handle (please report). See "
+                    f"vllm-project/vllm#42543 + unsloth-zoo "
+                    f"patch_vllm_decompose_size_nodes. Set "
+                    f"UNSLOTH_DISABLE_VLLM_DECOMPOSE_SIZE_PATCH=1 to "
                     f"opt out and surface upstream's original error."
                 )
-                graph.graph.erase_node(node)  # raises RuntimeError loudly
-                continue
             graph.graph.erase_node(node)
     pass
 
@@ -905,28 +908,57 @@ def patch_vllm_decompose_size_nodes():
 pass
 
 
+def _flashinfer_toolchain_present() -> bool:
+    """Return True iff nvcc and ninja are both available.
+
+    Duplicated check from `load_vllm` so `_poison_flashinfer_if_unusable`
+    can run BEFORE `load_vllm` is called (the env var
+    `UNSLOTH_VLLM_NO_FLASHINFER` is only flipped to "1" inside `load_vllm`,
+    so gating the poison on it alone made it a no-op in the normal
+    `patch_vllm` -> `load_vllm` chain).
+    """
+    _has_nvcc = (
+        shutil.which("nvcc") is not None
+        or os.path.isfile(os.path.join(os.environ.get("CUDA_HOME", ""), "bin", "nvcc"))
+        or os.path.isfile(os.path.join(os.environ.get("CUDA_PATH", ""), "bin", "nvcc"))
+        or os.path.isfile("/usr/local/cuda/bin/nvcc")
+    )
+    _has_ninja = shutil.which("ninja") is not None
+    return bool(_has_nvcc and _has_ninja)
+
+
 def _poison_flashinfer_if_unusable() -> None:
     """Block ``import flashinfer`` early when nvcc / ninja are missing.
 
     vllm's ``vllm.utils.flashinfer.has_flashinfer`` is ``@functools.cache``-
     decorated, so the first caller wins for the lifetime of the process.
-    The poison previously lived inside ``load_vllm`` (line 2116-ish); any
-    caller that materialised a VllmConfig before reaching that line would
-    cache ``has_flashinfer() == True`` and the backend selector would
-    still pick FLASHINFER. Move the poison up to ``patch_vllm`` so it
-    runs before the first ``vllm.LLM(...)`` call and clear the
-    `has_flashinfer` cache defensively.
+    The poison previously lived inside ``load_vllm``; any caller that
+    materialised a VllmConfig before reaching that line would cache
+    ``has_flashinfer() == True`` and the backend selector would still
+    pick FLASHINFER. Run the same nvcc+ninja preflight here so the
+    poison fires under `patch_vllm` even when the user has not set
+    `UNSLOTH_VLLM_NO_FLASHINFER` manually.
     """
-    if os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") != "1":
-        # Only poison when the user (or load_vllm preflight) explicitly
-        # requested it. Otherwise leave FlashInfer alone -- a real
-        # nvcc+ninja host should keep using it.
+    # Explicit user opt-out: skip the poison entirely.
+    if os.environ.get("UNSLOTH_VLLM_FORCE_FLASHINFER", "0") == "1":
         return
+    # Explicit user opt-in still works.
+    forced = os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "1"
+    # Otherwise probe the toolchain ourselves. The probe is cheap.
+    if not forced and _flashinfer_toolchain_present():
+        return
+    # Mark for downstream code that may read the env var.
+    os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
+    # Atomic-ish swap: set the sentinel FIRST so any parallel importer
+    # racing against us sees `None` rather than a missing key.
     try:
-        for _name in list(sys.modules):
-            if _name == "flashinfer" or _name.startswith("flashinfer."):
-                del sys.modules[_name]
         sys.modules["flashinfer"] = None
+        for _name in list(sys.modules):
+            if _name.startswith("flashinfer.") and _name != "flashinfer":
+                # Re-pin the children after the parent sentinel is in
+                # place; an `import flashinfer.foo` after this point
+                # will get the parent's `None` and raise ImportError.
+                sys.modules[_name] = None
     except Exception:
         pass
     try:
@@ -935,6 +967,9 @@ def _poison_flashinfer_if_unusable() -> None:
                 hasattr(_vllm_fi.has_flashinfer, "cache_clear"):
             _vllm_fi.has_flashinfer.cache_clear()
     except Exception:
+        # vllm < 0.10.x lacks `vllm.utils.flashinfer`. Poison still
+        # works via the sys.modules sentinel; the cache_clear was
+        # belt + suspenders.
         pass
 
 
