@@ -135,7 +135,11 @@ def test_save_lora_adapters_raises_when_no_lora_modules(tmp_path):
         save_lora_adapters(model, tmp_path)
 
 
-def test_save_trainable_adapters_preserves_full_trainable_tree(tmp_path):
+def test_save_trainable_adapters_preserves_external_trainables_and_lora(tmp_path):
+    # External trainables (up_proj.weight, outside any LoRA module) survive
+    # alongside the LoRA tensors. A reload-leaked base weight INSIDE a LoRA
+    # module (q_proj.weight under wrapped q_proj) is dropped so the adapter
+    # file stays loadable as an adapter rather than a partial base dump.
     from unsloth_zoo.mlx.utils import save_trainable_adapters
 
     model = _make_model({
@@ -147,8 +151,7 @@ def test_save_trainable_adapters_preserves_full_trainable_tree(tmp_path):
     from safetensors.torch import load_file
     keys = set(load_file(str(tmp_path / "adapters.safetensors")).keys())
     assert keys == {
-        "q_proj.weight", "q_proj.lora_a", "q_proj.lora_b",
-        "up_proj.weight",
+        "q_proj.lora_a", "q_proj.lora_b", "up_proj.weight",
     }, sorted(keys)
 
 
@@ -475,6 +478,57 @@ def test_save_pretrained_merged_lora_method_raises_when_no_adapter_tensors(tmp_p
 
     with pytest.raises(ValueError, match="no LoRA layers"):
         save_pretrained_merged(_NoLora(), _Tok(), tmp_path, save_method="lora")
+
+
+def test_save_pretrained_merged_lora_mixed_external_drops_inside_lora_base(tmp_path):
+    # When the user trains intentional non-LoRA tensors OUTSIDE a LoRA
+    # module (embed_tokens) AND a reload-leaked base weight INSIDE a LoRA
+    # module is also marked trainable (q_proj.weight under wrapped q_proj),
+    # the public save_method='lora' path must preserve the external
+    # trainable WITHOUT leaking the inside-LoRA base weight.
+    import torch
+    from unsloth_zoo.mlx.utils import save_pretrained_merged
+
+    lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
+    embed = torch.zeros(32, 16)
+
+    class _MixedReloadedModel:
+        def __init__(self):
+            self.q_proj = lora
+            self._hf_repo = None
+            self._config = None
+            self._unsloth_quantization_config = None
+            self._unsloth_quantization_policy = None
+            self._unsloth_quantized_source = None
+            self._unsloth_base_revision = None
+            self._unsloth_base_commit_hash = None
+            self._src_path = None
+        def parameters(self):
+            return {
+                "q_proj.weight": lora.weight,
+                "q_proj.lora_a": lora.lora_a,
+                "q_proj.lora_b": lora.lora_b,
+                "embed_tokens.weight": embed,
+            }
+        def trainable_parameters(self):
+            # mimic reload: base weight inside the LoRA module is unfrozen
+            # AND user intentionally trains the embedding.
+            return self.parameters()
+        def named_modules(self):
+            yield "", self
+            yield "q_proj", lora
+
+    class _Tok:
+        def save_pretrained(self, *_a, **_k):
+            pass
+
+    save_pretrained_merged(_MixedReloadedModel(), _Tok(), tmp_path, save_method="lora")
+
+    from safetensors.torch import load_file
+    keys = set(load_file(str(tmp_path / "adapters.safetensors")).keys())
+    assert keys == {
+        "q_proj.lora_a", "q_proj.lora_b", "embed_tokens.weight",
+    }, sorted(keys)
 
 
 def test_save_pretrained_merged_lora_strips_accidental_trainable_base_tensors(tmp_path):

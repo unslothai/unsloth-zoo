@@ -2633,11 +2633,27 @@ def collect_mlx_lora_adapter_tensors(model):
 def save_trainable_adapters(model, path, adapter_config=None):
     """Save the current trainable parameter tree for training checkpoints.
 
-    Includes all LoRA adapter tensors (frozen or not) to ensure the
-    artifact remains a valid, reloadable adapter file.
+    Includes all LoRA adapter tensors (frozen or not) so the artifact
+    stays a valid, reloadable adapter file. Excludes base weights that
+    live INSIDE a LoRA-wrapped module (e.g. ``q_proj.weight`` under a
+    LoRA-wrapped ``q_proj``); those tensors can be silently marked
+    trainable after a checkpoint reload, and leaking them would
+    reintroduce the original Studio adapter-export bloat.
     """
-    tensors = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
-    tensors.update(collect_mlx_lora_adapter_tensors(model))
+    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+    lora_module_prefixes = tuple(
+        f"{name}." for name, _ in iter_mlx_lora_modules(model) if name
+    )
+
+    tensors = dict(adapter_tensors)
+    for key, value in trainable.items():
+        if key in adapter_tensors:
+            continue
+        if any(key.startswith(p) for p in lora_module_prefixes):
+            # base tensor inside a LoRA module — skip to prevent reload leak.
+            continue
+        tensors[key] = value
 
     if not tensors:
         raise ValueError(
@@ -2967,6 +2983,93 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     print(f"Unsloth: Merged model saved to {path}")
 
 
+def _push_lora_adapters_to_hub(
+    save_directory,
+    repo_id=None,
+    token=None,
+    private=None,
+    tags=None,
+    commit_message=None,
+    commit_description=None,
+    create_pr=False,
+    revision=None,
+):
+    """Upload an already-written LoRA adapter directory to the Hub.
+
+    Mirrors push_to_hub_merged's repo / commit / privacy / tag / upload
+    semantics, but skips the merged save_model fallback so it does not
+    overwrite adapters.safetensors with a full merged model.
+    """
+    from huggingface_hub import HfApi
+
+    save_directory = Path(save_directory)
+    if repo_id is None:
+        repo_id = save_directory.name
+
+    # Match push_to_hub_merged's commit conventions so the history is
+    # recognizable across CUDA and MLX backends.
+    if commit_message is None:
+        commit_message = "Trained with Unsloth"
+    if "Unsloth" not in commit_message:
+        commit_message = (commit_message + " (Trained with Unsloth)").lstrip()
+    if commit_description is None:
+        commit_description = "Upload LoRA adapters trained with Unsloth 2x faster"
+    elif "Unsloth 2x faster" not in commit_description:
+        commit_description += " (Trained with Unsloth 2x faster)"
+
+    api = HfApi(token=token)
+    api.create_repo(
+        repo_id=repo_id,
+        private=bool(private) if private is not None else False,
+        exist_ok=True,
+    )
+    # create_repo(exist_ok=True) is a no-op on existing repos, so an
+    # explicit private toggle on a re-push needs update_repo_settings.
+    if private is not None:
+        try:
+            api.update_repo_settings(
+                repo_id=repo_id,
+                private=bool(private),
+                repo_type="model",
+            )
+        except Exception as exc:
+            print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
+
+    if tags:
+        try:
+            from huggingface_hub import ModelCard
+            card_path = save_directory / "README.md"
+            if card_path.exists():
+                card = ModelCard.load(card_path)
+                existing = list(getattr(card.data, "tags", None) or [])
+                merged = list(dict.fromkeys(existing + list(tags) + ["mlx", "unsloth"]))
+                card.data.tags = merged
+                card.save(card_path)
+        except Exception as exc:
+            print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
+
+    # upload_large_folder chunks + resumes; falls back to upload_folder on
+    # older huggingface_hub.
+    try:
+        api.upload_large_folder(
+            folder_path=str(save_directory),
+            repo_id=repo_id,
+            repo_type="model",
+            revision=revision,
+        )
+    except (AttributeError, TypeError):
+        api.upload_folder(
+            folder_path=str(save_directory),
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            commit_description=commit_description,
+            create_pr=create_pr,
+            revision=revision,
+        )
+    print(f"Unsloth: Pushed LoRA adapters to https://huggingface.co/{repo_id}")
+
+
 def save_pretrained_merged(
     model,
     tokenizer,
@@ -2976,6 +3079,11 @@ def save_pretrained_merged(
     token=None,
     private=None,
     tags=None,
+    repo_id=None,
+    commit_message=None,
+    commit_description=None,
+    create_pr=False,
+    revision=None,
 ):
     """Save the model in HF-compatible format using the requested method.
 
@@ -2995,6 +3103,11 @@ def save_pretrained_merged(
         token: HuggingFace token for pushing.
         private: Whether the HF repo should be private.
         tags: Additional tags for the model card.
+        repo_id: HuggingFace repo ID. If None, uses save_directory name.
+        commit_message: Commit title for the upload.
+        commit_description: Optional longer commit body.
+        create_pr: If True, push to a PR branch instead of main.
+        revision: Target branch (defaults to main).
     """
     method = (save_method or "lora").lower().replace(" ", "_")
     if method not in ("lora", "merged_16bit", "merged_4bit"):
@@ -3043,30 +3156,36 @@ def save_pretrained_merged(
 
     if push_to_hub:
         if method == "lora":
-            # Upload the LoRA adapter directory verbatim instead of routing
-            # through push_to_hub_merged, which would re-save a full merged
-            # model on top of the adapter-only artifact we just wrote.
-            from pathlib import Path
-            from huggingface_hub import HfApi
-
-            repo_id = Path(save_directory).name
-            api = HfApi(token=token)
-            api.create_repo(
+            # LoRA artifacts must NOT route through push_to_hub_merged: that
+            # helper falls back to save_merged_model() when it does not see
+            # model.safetensors.index.json next to the adapter file, which
+            # would re-save a full merged model on top of our adapter dir.
+            # Preserve the merged helper's full feature surface here so the
+            # public save_pretrained_merged API stays consistent across save
+            # methods (repo_id, private, tags, commit message + description,
+            # PR branch, revision, upload-large-folder resume).
+            _push_lora_adapters_to_hub(
+                save_directory,
                 repo_id=repo_id,
-                private=bool(private) if private is not None else False,
-                exist_ok=True,
+                token=token,
+                private=private,
+                tags=tags,
+                commit_message=commit_message,
+                commit_description=commit_description,
+                create_pr=create_pr,
+                revision=revision,
             )
-            api.upload_folder(
-                folder_path=str(save_directory),
-                repo_id=repo_id,
-                repo_type="model",
-                commit_message="Upload LoRA adapters trained with Unsloth",
-            )
-            print(f"Unsloth: Pushed LoRA adapters to https://huggingface.co/{repo_id}")
         else:
             push_to_hub_merged(
                 model, tokenizer, save_directory,
+                repo_id=repo_id,
                 token=token, private=private, tags=tags,
+                commit_message=commit_message or "Trained with Unsloth",
+                commit_description=commit_description or (
+                    "Upload model trained with Unsloth 2x faster"
+                ),
+                create_pr=create_pr,
+                revision=revision,
             )
 
 
