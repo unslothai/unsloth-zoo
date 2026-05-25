@@ -1109,13 +1109,20 @@ def _normalize_mlx_lora_module_paths(module_paths):
 
 
 def _apply_lora_at_paths(model, module_paths, adapter_cfg):
-    """Recreate LoRA layers at saved module paths so vision/projector and
-    MoE/embedding LoRA survives reload (mlx-lm's load_adapters only rebuilds
-    the language tower's Linear layers)."""
+    """Recreate LoRA/DoRA layers at saved module paths so vision/projector
+    and MoE/embedding LoRA survives reload (mlx-lm's load_adapters only
+    rebuilds the language tower's Linear layers).
+
+    Returns the number of new wrappers attached, so callers can decide
+    whether a follow-up load_weights() call is needed to bind the
+    auxiliary tensors after a successful load_adapters().
+    """
     import mlx.nn as nn
     from mlx_lm.tuner.lora import LoRALinear
 
     module_paths = _normalize_mlx_lora_module_paths(module_paths)
+    if not module_paths:
+        return 0
 
     # MoE switch layers and embedding LoRA: import lazily and tolerate
     # older mlx-lm without the symbols.
@@ -1141,24 +1148,58 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
         if t is not None
     )
 
-    # Refuse to wrap with placeholder metadata. Save side now omits these
-    # keys entirely when inference cannot trust them, so a missing rank
-    # means the saved adapter is unsupported -- not "rebuild at rank=8
-    # and bind whatever tensors happen to match".
-    lora_params = adapter_cfg.get("lora_parameters") or {}
-    raw_rank = lora_params.get("rank", adapter_cfg.get("rank"))
-    if raw_rank is None:
-        raise ValueError(
-            "Unsloth MLX: adapter_config.json is missing LoRA rank metadata; "
-            "refusing to recreate adapter wrappers with placeholder rank=8. "
-            "Re-save the adapter with rank/scale/dropout populated."
+    # DoRA path: PR #692 stamps fine_tune_type='dora' when the saved
+    # model contained DoRA modules. Without DoRA-aware reload, the saved
+    # q_proj.m magnitude tensors would silently drop via strict=False
+    # because we'd recreate plain LoRALinear at the same paths.
+    fine_tune_type = str(adapter_cfg.get("fine_tune_type", "lora")).lower()
+    use_dora = fine_tune_type == "dora"
+    DoRALinear_cls = DoRAEmbedding_cls = None
+    if use_dora:
+        try:
+            from mlx_lm.tuner.dora import DoRALinear as DoRALinear_cls
+        except Exception:
+            DoRALinear_cls = None
+        try:
+            from mlx_lm.tuner.dora import DoRAEmbedding as DoRAEmbedding_cls
+        except Exception:
+            DoRAEmbedding_cls = None
+        if DoRALinear_cls is None and DoRAEmbedding_cls is None:
+            raise ImportError(
+                "Unsloth MLX: adapter_config.json says fine_tune_type='dora' "
+                "but mlx_lm.tuner.dora is unavailable. Upgrade mlx-lm to a "
+                "version with DoRA support or re-save as plain LoRA."
+            )
+
+    # Defer rank/scale/dropout validation until the first module that
+    # actually needs wrapping; a legacy adapter with no rank but with
+    # paths that mlx-lm.load_adapters already wrapped (so the loop
+    # skips all of them) should not crash here.
+    _metadata = {"rank": None, "scale": None, "dropout": None}
+
+    def _ensure_metadata():
+        if _metadata["rank"] is not None:
+            return
+        lora_params = adapter_cfg.get("lora_parameters") or {}
+        raw_rank = lora_params.get("rank", adapter_cfg.get("rank"))
+        if raw_rank is None:
+            raise ValueError(
+                "Unsloth MLX: adapter_config.json is missing LoRA rank "
+                "metadata; refusing to recreate adapter wrappers with "
+                "placeholder rank=8. Re-save the adapter with "
+                "rank/scale/dropout populated."
+            )
+        _metadata["rank"] = int(raw_rank)
+        _metadata["scale"] = float(
+            lora_params.get("scale", adapter_cfg.get("scale", 1.0))
         )
-    rank = int(raw_rank)
-    scale = float(lora_params.get("scale", adapter_cfg.get("scale", 1.0)))
-    dropout = float(lora_params.get("dropout", adapter_cfg.get("dropout", 0.0)))
+        _metadata["dropout"] = float(
+            lora_params.get("dropout", adapter_cfg.get("dropout", 0.0))
+        )
 
     by_name = dict(model.named_modules())
     linear_types = (nn.Linear, nn.QuantizedLinear)
+    attached = 0
     for name in module_paths:
         module = by_name.get(name)
         if module is None:
@@ -1170,20 +1211,35 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
         # nested LoRALinear(LoRALinear(Linear)).
         if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
             continue
+        lora_cls = None
         if isinstance(module, linear_types):
-            lora_cls = LoRALinear
+            # Prefer DoRALinear when the adapter declared dora and the
+            # module is a Linear; fall back to LoRALinear when DoRA isn't
+            # importable for the linear case (still ships base weights).
+            lora_cls = DoRALinear_cls if (use_dora and DoRALinear_cls is not None) else LoRALinear
         elif switch_types and LoRASwitchLinear is not None and isinstance(module, switch_types):
+            # mlx-lm does not provide DoRA on switch layers; LoRA is the
+            # only option there.
             lora_cls = LoRASwitchLinear
-        elif embedding_types and LoRAEmbedding is not None and isinstance(module, embedding_types):
-            lora_cls = LoRAEmbedding
-        else:
+        elif embedding_types and isinstance(module, embedding_types):
+            if use_dora and DoRAEmbedding_cls is not None:
+                lora_cls = DoRAEmbedding_cls
+            elif LoRAEmbedding is not None:
+                lora_cls = LoRAEmbedding
+        if lora_cls is None:
             continue
-        wrapped = _lora_from_base_compat(lora_cls, module, rank, scale, dropout)
+        _ensure_metadata()
+        wrapped = _lora_from_base_compat(
+            lora_cls, module,
+            _metadata["rank"], _metadata["scale"], _metadata["dropout"],
+        )
         parent_path, _, leaf = name.rpartition(".")
         parent = by_name.get(parent_path) if parent_path else model
         if parent is None or not hasattr(parent, leaf):
             continue
         setattr(parent, leaf, wrapped)
+        attached += 1
+    return attached
 
 
 def _eval_mlx_model_after_adapter_reload(model):
@@ -2609,6 +2665,7 @@ class FastMLXModel:
                         # so we can re-raise it if the fallback can't run.
                         _load_adapters_exc = _exc
 
+                    _aux_attached = 0
                     if _saved_lora_paths:
                         # Auxiliary LoRA paths (vision / projector / MoE)
                         # that mlx-lm's linear_to_lora_layers does not walk.
@@ -2616,7 +2673,9 @@ class FastMLXModel:
                         # _apply_lora_at_paths means language-tower paths
                         # land as no-ops here when load_adapters succeeded.
                         try:
-                            _apply_lora_at_paths(model, _saved_lora_paths, adapter_cfg)
+                            _aux_attached = _apply_lora_at_paths(
+                                model, _saved_lora_paths, adapter_cfg,
+                            ) or 0
                         except ValueError:
                             raise
                         except Exception as _exc:
@@ -2627,7 +2686,28 @@ class FastMLXModel:
                                 stacklevel=2,
                             )
 
+                    # load_adapters() bound only the language-tower
+                    # tensors, not the auxiliary paths we just attached.
+                    # Run load_weights once more to bind the aux tensors;
+                    # strict=False is safe because both language-tower
+                    # and aux wrappers exist by this point.
+                    if _load_adapters_ok and _aux_attached > 0:
+                        if os.path.exists(adapter_weights_file):
+                            model.load_weights(adapter_weights_file, strict=False)
+
                     if not _load_adapters_ok:
+                        # No wrappers means load_weights(strict=False)
+                        # would silently drop every saved LoRA tensor and
+                        # return a base model. Re-raise the original
+                        # load_adapters error instead.
+                        if _aux_attached == 0:
+                            if _load_adapters_exc is not None:
+                                raise _load_adapters_exc
+                            raise RuntimeError(
+                                "Unsloth MLX: adapter load failed and no "
+                                "live LoRA wrappers exist to bind the "
+                                "saved tensors against."
+                            )
                         if os.path.exists(adapter_weights_file):
                             # load_weights(strict=False) silently drops saved
                             # keys with no matching live module; warn so the
