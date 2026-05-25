@@ -1450,22 +1450,42 @@ def _warn_missing_adapter_keys(model, adapter_weights_file):
         from mlx.utils import tree_flatten as _tree_flatten
 
         with safe_open(adapter_weights_file, framework="numpy") as _f:
-            _saved_keys = {
-                k for k in _f.keys() if k.endswith(_ADAPTER_LORA_KEY_SUFFIXES)
+            _saved_shapes = {
+                k: tuple(_f.get_tensor(k).shape)
+                for k in _f.keys()
+                if k.endswith(_ADAPTER_LORA_KEY_SUFFIXES)
             }
-        _bound_keys = {
-            k for k, _ in _tree_flatten(model.parameters())
-            if k.endswith(_ADAPTER_LORA_KEY_SUFFIXES)
-        }
-        _missing = sorted(_saved_keys - _bound_keys)
+        _bound_shapes = {}
+        for k, v in _tree_flatten(model.parameters()):
+            if not k.endswith(_ADAPTER_LORA_KEY_SUFFIXES):
+                continue
+            shape = getattr(v, "shape", None)
+            _bound_shapes[k] = tuple(shape) if shape is not None else None
+        # Compare both presence AND shape so a wrong-rank live wrapper at
+        # a matching key name (e.g. mlx-lm.load_adapters wrapped the
+        # language tower at the upstream default rank=8 while saved
+        # tensors are rank-4) is reported as a missing key. Pure key-set
+        # diff would treat that as "fully bound" and the downstream
+        # load_weights(strict=False) would silently drop the saved
+        # rank-4 tensors.
+        _missing = sorted(
+            k for k, saved_shape in _saved_shapes.items()
+            if k not in _bound_shapes or _bound_shapes[k] != saved_shape
+        )
         if _missing:
-            _preview = ", ".join(_missing[:5])
+            def _describe(k):
+                live = _bound_shapes.get(k)
+                if live is None:
+                    return f"{k} saved={_saved_shapes[k]} live=<missing>"
+                return f"{k} saved={_saved_shapes[k]} live={live}"
+
+            _preview = ", ".join(_describe(k) for k in _missing[:5])
             if len(_missing) > 5:
                 _preview += f", ... (+{len(_missing) - 5} more)"
             warnings.warn(
                 f"Unsloth MLX: {len(_missing)} saved LoRA adapter "
-                f"tensor(s) have no live module and will not load: "
-                f"{_preview}",
+                f"tensor(s) are missing or shape-incompatible with the "
+                f"live module tree and will not load: {_preview}",
                 stacklevel=3,
             )
         return _missing
@@ -1566,6 +1586,22 @@ def _is_from_base_kwarg_typeerror(exc, kwarg=None, kwargs=None):
     )
 
 
+def _no_rank_fallback_or_fail(from_base, module, rank):
+    """Call `from_base(module)` only when the requested rank is the upstream
+    default (8). Any other requested rank must NOT silently downgrade,
+    because the downstream `load_weights(strict=False)` would then drop
+    the saved different-rank LoRA tensors instead of binding them.
+    """
+    if int(rank) != 8:
+        raise ValueError(
+            f"Unsloth MLX: this mlx-lm wrapper's from_base() does not "
+            f"accept a LoRA rank argument; refusing to recreate a rank-"
+            f"{rank} adapter as the upstream default rank=8. Upgrade "
+            f"mlx-lm or re-save the adapter at rank=8."
+        )
+    return from_base(module)
+
+
 def _lora_from_base_compat(lora_cls, module, rank, scale, dropout):
     """Call lora_cls.from_base; fall back through older signatures and restore
     scale/dropout on the wrapper when the kwargs are rejected.
@@ -1585,7 +1621,7 @@ def _lora_from_base_compat(lora_cls, module, rank, scale, dropout):
         except TypeError as exc2:
             if not _is_from_base_kwarg_typeerror(exc2, kwargs=("r",)):
                 raise
-            wrapped = lora_cls.from_base(module)
+            wrapped = _no_rank_fallback_or_fail(lora_cls.from_base, module, rank)
         return _apply_lora_metadata_to_wrapper(wrapped, scale, dropout)
 
 
@@ -1665,7 +1701,7 @@ def _patch_mlx_lora_from_base_compat():
                     except TypeError as exc2:
                         if not _is_from_base_kwarg_typeerror(exc2, kwargs=("r",)):
                             raise
-                        wrapped = _orig(module)
+                        wrapped = _no_rank_fallback_or_fail(_orig, module, r)
                     return _apply_lora_metadata_to_wrapper(wrapped, scale, dropout)
 
             # Skip simulation stubs that block attribute assignment

@@ -2978,18 +2978,22 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                         adapter_config[key] = lora_parameters[key]
                 adapter_config.setdefault("peft_type", "LORA")
                 adapter_config.setdefault("fine_tune_type", "lora")
-                # mlx-lm.load_adapters() reads num_layers off the
-                # adapter config; the main branch above backfills it,
-                # so mirror the same logic here when the caller pinned
-                # explicit paths but did not provide num_layers.
+                # mlx-lm.load_adapters() does `config.num_layers` (attr
+                # access on a SimpleNamespace built from adapter_config.json),
+                # so the key MUST be present or reload raises AttributeError.
+                # Mirror the main branch's `-1` sentinel fallback here so a
+                # direct `save_lora_adapters()` caller that supplied valid
+                # rank/scale/dropout but no num_layers still produces a
+                # loadable config.
                 if "num_layers" not in adapter_config:
                     layers = _get_transformer_layers(model)
                     try:
-                        n_layers = len(layers) if layers is not None else 0
+                        n_layers = len(layers) if layers is not None else -1
                     except TypeError:
-                        n_layers = 0
-                    if n_layers > 0:
-                        adapter_config["num_layers"] = n_layers
+                        n_layers = -1
+                    if n_layers <= 0:
+                        n_layers = -1
+                    adapter_config["num_layers"] = n_layers
     except (TypeError, ValueError, AttributeError) as _enrich_exc:
         # Surface enrichment failures (e.g. caller passed garbage
         # lora_parameters, mx.array scale that could not coerce, an
