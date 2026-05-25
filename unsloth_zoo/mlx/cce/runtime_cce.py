@@ -138,13 +138,14 @@ def _target_validity_masks(
     )
     _uint64_dtype = getattr(mx, "uint64", None)
     if _uint64_dtype is not None and targets.dtype == _uint64_dtype:
-        # int64 cannot represent the full uint64 range; promoting via
-        # int64 first would wrap large unsigned values (e.g. 2**64 - 100)
-        # into negative ints that ignore_index=-100 might match. Use
-        # float64 (or float32 as a fallback) for the comparisons, which
-        # losslessly represents every value up to 2**53 and saturates
-        # cleanly above that into the "out of vocab" bucket.
-        _validation_dtype = getattr(mx, "float64", mx.float32)
+        # Avoid float64 here: MLX documents float64 arrays as CPU-only
+        # ("only supported on CPU"), so promoting validation to float64
+        # would break this code path on real Apple-Silicon/Metal. float32
+        # cannot exactly represent every uint64 value, but it is more
+        # than enough to separate normal vocabulary-sized labels (< 2**24)
+        # from uint64 overflow sentinels, which is all this validity
+        # check needs before runtime CCE NaN-poisons the bad rows.
+        _validation_dtype = mx.float32
         targets_for_validation = targets.astype(_validation_dtype)
         in_vocab = (targets_for_validation >= 0.0) & (
             targets_for_validation < float(vocab_size)

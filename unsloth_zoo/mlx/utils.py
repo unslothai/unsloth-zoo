@@ -546,15 +546,17 @@ def _normalize_cce_label_dtype(labels):
         return labels
     uint64_dtype = getattr(mx, "uint64", None)
     if uint64_dtype is not None and dtype == uint64_dtype:
-        # Values >= 2**63 cannot fit in int64; route them to a sentinel
-        # that runtime CCE will classify as out-of-vocab. mx.full of the
-        # int64 max keeps `>= 0` true and `< vocab_size` false for any
-        # realistic vocab, so the row gets NaN-poisoned during validation
+        # Avoid raw uint64 comparisons: the torch-backed MLX shim raises
+        # NotImplementedError "gt_cpu" / "where_cpu" not implemented for
+        # UInt64, so the prior `labels > max_i63` direct compare crashed
+        # before validation could classify the row. Cast to signed int64
+        # first, then detect overflow via `labels_i64 < 0` (any uint64
+        # value >= 2**63 wraps negative). Route those to a positive
+        # out-of-vocab sentinel so runtime CCE NaN-poisons the row
         # instead of silently colliding with ignore_index.
-        max_i63 = mx.array((1 << 63) - 1, dtype=mx.uint64)
         labels_i64 = labels.astype(mx.int64)
         invalid_sentinel = mx.array((1 << 62), dtype=mx.int64)
-        return mx.where(labels > max_i63, invalid_sentinel, labels_i64)
+        return mx.where(labels_i64 < 0, invalid_sentinel, labels_i64)
     unsigned_dtypes = tuple(
         d for d in (
             getattr(mx, "uint8", None),
@@ -864,16 +866,21 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         masked_targets = _mask_image_tokens(targets, image_token_ids)
         ntoks = (masked_targets != -100).sum()
     else:
-        targets = input_ids[:, 1:]
+        # Normalize unsigned/uint64 input_ids to signed int64 before injecting
+        # the -100 ignore sentinel. mx.where(..., -100, targets) crashes on
+        # unsigned dtypes under the torch-backed MLX shim, and uint64 cannot
+        # losslessly fit -100 even on native MLX.
+        targets = _normalize_cce_label_dtype(input_ids[:, 1:])
 
         if attention_mask is not None:
             length_mask = attention_mask[:, 1:][:, :targets.shape[1]]
         else:
             length_mask = mx.ones_like(targets, dtype=mx.float32)
 
-        masked_targets = mx.where(length_mask, targets, -100)
+        ignore = mx.array(-100, dtype=targets.dtype)
+        masked_targets = mx.where(length_mask, targets, ignore)
 
-        # Mask image placeholder tokens — they're fixed special tokens that
+        # Mask image placeholder tokens, they're fixed special tokens that
         # provide no useful gradient signal.
         masked_targets = _mask_image_tokens(masked_targets, image_token_ids)
 
@@ -953,6 +960,31 @@ def _normalize_int_tuple(values):
     return tuple(int(x) for x in values)
 
 
+def _normalize_numpy_cce_labels(labels):
+    """numpy-side analogue of `_normalize_cce_label_dtype` for VLM expand paths.
+
+    `_expand_image_token_sequences` and `_expand_token_runs` build the per-row
+    label buffer by calling `.tolist()` on the input labels and packing the
+    resulting Python ints into an int64 padded buffer. Direct np.uint64 values
+    above 2**63-1 raise `OverflowError: Python int too large to convert to C
+    long` when assigned into the int64 buffer, before runtime CCE can NaN-
+    poison the invalid row. Route any uint64 value that does not fit in signed
+    int64 to a positive out-of-vocab sentinel (1<<62) and downcast remaining
+    unsigned dtypes to int64.
+    """
+    labels_np = np.asarray(labels)
+    if labels_np.dtype == np.uint64:
+        overflow_mask = labels_np > np.uint64((1 << 63) - 1)
+        return np.where(
+            overflow_mask,
+            np.int64(1 << 62),
+            labels_np.astype(np.int64),
+        )
+    if np.issubdtype(labels_np.dtype, np.unsignedinteger):
+        return labels_np.astype(np.int64)
+    return labels_np
+
+
 def _expand_image_token_sequences(
     input_ids,
     attention_mask,
@@ -966,7 +998,7 @@ def _expand_image_token_sequences(
         if attention_mask is not None
         else np.ones_like(input_ids_np, dtype=np.int32)
     )
-    labels_np = np.asarray(labels) if labels is not None else None
+    labels_np = _normalize_numpy_cce_labels(labels) if labels is not None else None
 
     expanded_ids = []
     expanded_masks = []
@@ -1027,7 +1059,7 @@ def _expand_token_runs(
         if attention_mask is not None
         else np.ones_like(input_ids_np, dtype=np.int32)
     )
-    labels_np = np.asarray(labels) if labels is not None else None
+    labels_np = _normalize_numpy_cce_labels(labels) if labels is not None else None
 
     expanded_ids = []
     expanded_masks = []
