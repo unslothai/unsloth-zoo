@@ -924,8 +924,11 @@ def _expand_image_token_sequences(
 
     padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
     padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
+    # Allocate labels as int64 so wide invalid labels (e.g. 2**32 - 100)
+    # do not OverflowError into the buffer before the runtime CCE validity
+    # check runs. The CCE wrapper now owns dtype narrowing post-validate.
     padded_labels = (
-        np.full((len(expanded_labels), max_len), -100, dtype=np.int32)
+        np.full((len(expanded_labels), max_len), -100, dtype=np.int64)
         if expanded_labels is not None else None
     )
     for row_idx, (row_ids, row_mask) in enumerate(zip(expanded_ids, expanded_masks)):
@@ -996,8 +999,9 @@ def _expand_token_runs(
 
     padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
     padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
+    # int64 so wide invalid labels survive expansion without OverflowError.
     padded_labels = (
-        np.full((len(expanded_labels), max_len), -100, dtype=np.int32)
+        np.full((len(expanded_labels), max_len), -100, dtype=np.int64)
         if expanded_labels is not None else None
     )
     for row_idx, (row_ids, row_mask) in enumerate(zip(expanded_ids, expanded_masks)):
