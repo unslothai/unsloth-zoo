@@ -954,6 +954,143 @@ def test_push_lora_adapters_routes_commit_metadata_through_upload_folder(
     assert sent["repo_id"] == "me/adapter"
 
 
+def test_save_trainable_adapters_drops_quantized_base_scales_biases(tmp_path):
+    # Reload-leaked state on mlx-lm QuantizedLinear includes .scales and
+    # .biases alongside .weight; the filter must drop ALL three under
+    # LoRA prefixes so a QLoRA reload-trainable layer's quantization
+    # tensors don't slip into the adapter save.
+    from unsloth_zoo.mlx.utils import save_trainable_adapters
+    import torch as _t
+    from safetensors.torch import load_file
+
+    class _QLoRAModule:
+        def __init__(self):
+            self.lora_a = _t.zeros(4, 8)
+            self.lora_b = _t.zeros(8, 4)
+            self.weight = _t.zeros(8, 8)
+            self.scales = _t.zeros(8)
+            self.biases = _t.zeros(8)
+            self.bias = _t.zeros(8)  # legitimate Linear bias (preserved)
+
+    class _Model:
+        def __init__(self):
+            self._lora = _QLoRAModule()
+        def named_modules(self):
+            yield "q_proj", self._lora
+        def parameters(self):
+            return {"q_proj": {
+                "lora_a": self._lora.lora_a,
+                "lora_b": self._lora.lora_b,
+                "weight": self._lora.weight,
+                "scales": self._lora.scales,
+                "biases": self._lora.biases,
+                "bias": self._lora.bias,
+            }}
+        def trainable_parameters(self):
+            return self.parameters()
+
+    out = tmp_path / "qlora_ckpt"
+    save_trainable_adapters(_Model(), out)
+    keys = set(load_file(out / "adapters.safetensors").keys())
+
+    assert "q_proj.lora_a" in keys
+    assert "q_proj.lora_b" in keys
+    assert "q_proj.weight" not in keys
+    assert "q_proj.scales" not in keys
+    assert "q_proj.biases" not in keys
+    # Singular `.bias` is a legitimate Linear bias, not quantization state.
+    assert "q_proj.bias" in keys
+
+
+def test_enrich_overrides_caller_full_when_lora_modules_present(tmp_path):
+    # If the caller passes adapter_config={"fine_tune_type": "full"}
+    # but the model has LoRA modules, the saved tensors are *.lora_a /
+    # *.lora_b. mlx-lm reload would skip LoRA wrapping because the
+    # config says "full", silently dropping the adapter. Override to
+    # "lora" so the artifact stays consistent.
+    from unsloth_zoo.mlx.utils import _enrich_mlx_adapter_config
+    import torch as _t
+
+    class _LoRAModule:
+        def __init__(self):
+            self.lora_a = _t.zeros(4, 8)
+            self.lora_b = _t.zeros(8, 4)
+
+    class _Model:
+        def __init__(self):
+            self._lora = _LoRAModule()
+        def named_modules(self):
+            yield "q_proj", self._lora
+        def parameters(self):
+            return {"q_proj": {
+                "lora_a": self._lora.lora_a,
+                "lora_b": self._lora.lora_b,
+            }}
+
+    cfg = _enrich_mlx_adapter_config(_Model(), {"fine_tune_type": "full"})
+    assert cfg["fine_tune_type"] == "lora", cfg
+
+
+def test_enrich_strips_stale_lora_fields_on_full_finetune():
+    # A no-LoRA save reusing a config dict from a prior LoRA save would
+    # otherwise carry stale peft_type / lora_parameters / rank etc.
+    # alongside the new fine_tune_type=full stamp.
+    from unsloth_zoo.mlx.utils import _enrich_mlx_adapter_config
+
+    class _Model:
+        def named_modules(self):
+            return iter(())
+        def parameters(self):
+            return {}
+
+    stale_cfg = {
+        "peft_type": "LORA",
+        "lora_parameters": {"rank": 8, "scale": 1.0, "dropout": 0.0},
+        "rank": 8,
+        "scale": 1.0,
+        "dropout": 0.0,
+        "num_layers": 24,
+        "unsloth_mlx_lora_module_paths": ["layers.0.q_proj"],
+    }
+    cfg = _enrich_mlx_adapter_config(_Model(), stale_cfg)
+    assert cfg.get("fine_tune_type") == "full"
+    for stale_key in (
+        "peft_type", "lora_parameters", "rank", "scale", "dropout",
+        "num_layers", "unsloth_mlx_lora_module_paths",
+    ):
+        assert stale_key not in cfg, f"stale {stale_key} should be stripped: {cfg}"
+
+
+def test_push_lora_adapters_create_pr_failure_raises_instead_of_silent_main(
+    tmp_path, monkeypatch,
+):
+    # When upload_folder raises on a create_pr=True request, falling
+    # back to upload_large_folder would silently push to main. Refuse
+    # to do that and raise a clear RuntimeError instead.
+    import pytest as _pytest
+    import huggingface_hub
+    from unsloth_zoo.mlx.utils import _push_lora_adapters_to_hub
+
+    (tmp_path / "adapters.safetensors").write_bytes(b"\x00")
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+        def create_repo(self, **kwargs):
+            return None
+        def update_repo_settings(self, **kwargs):
+            return None
+        def upload_folder(self, **kwargs):
+            raise TypeError("simulated old huggingface_hub signature")
+        def upload_large_folder(self, **kwargs):
+            raise AssertionError("must not silently push to main on create_pr=True")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    with _pytest.raises(RuntimeError, match="create_pr=True"):
+        _push_lora_adapters_to_hub(tmp_path, repo_id="me/adapter", create_pr=True)
+
+
 def test_save_trainable_adapters_preserves_bias_under_lora_wrapped_linear(tmp_path):
     # Refinement of the lora_module_prefixes filter: only the wrapped
     # base `.weight` is a reload-leak risk (the V x H matmul gradient).
@@ -1280,11 +1417,14 @@ def test_push_to_hub_merged_honors_create_pr_via_upload_folder(
     assert sent["create_pr"] is True
 
 
-def test_push_to_hub_merged_honors_revision_via_upload_folder(
+def test_push_to_hub_merged_revision_alone_keeps_large_folder_route(
     tmp_path, monkeypatch,
 ):
-    # Regression: a custom revision must force the upload_folder route
-    # because upload_large_folder silently lands on main regardless.
+    # upload_large_folder natively supports revision, so a revision-only
+    # push should keep the resumable/chunked large-folder route for
+    # multi-GB merged models. Only commit_message / commit_description /
+    # create_pr force the upload_folder route (those are the kwargs
+    # upload_large_folder cannot represent).
     import huggingface_hub
     from unsloth_zoo.mlx.utils import push_to_hub_merged
 
@@ -1318,9 +1458,9 @@ def test_push_to_hub_merged_honors_revision_via_upload_folder(
         revision="release-v3",
     )
 
-    assert len(calls["folder"]) == 1, calls
-    assert calls["large"] == [], calls
-    assert calls["folder"][0]["revision"] == "release-v3"
+    assert calls["folder"] == [], calls
+    assert len(calls["large"]) == 1, calls
+    assert calls["large"][0]["revision"] == "release-v3"
 
 
 def test_push_to_hub_merged_uses_large_folder_when_no_custom_metadata(

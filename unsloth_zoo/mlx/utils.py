@@ -261,18 +261,22 @@ def _is_lm_head_trainable(model):
     # lora_router.weight or base.lora_special.lm_head.weight) are not
     # silently treated as adapter state.
     adapter_keys = set(collect_mlx_lora_adapter_tensors(model))
-    # Base tensors INSIDE a LoRA-wrapped lm_head (e.g. lm_head.weight under
-    # a LoRA-wrapped lm_head) are reload-leaked artifacts, not real user
-    # intent. Skip them so the CCE memory guard still kicks in: computing
-    # the full V x H weight gradient just because a wrapper exposed its
-    # base is exactly the OOM defeat the guard exists to prevent.
-    lora_module_prefixes = tuple(
-        f"{name}." for name, _ in iter_mlx_lora_modules(model) if name
-    )
+    # Reload-leaked base tensors INSIDE a LoRA-wrapped lm_head (e.g.
+    # lm_head.weight under a LoRA-wrapped lm_head) defeat the CCE memory
+    # guard - we'd compute the full V x H weight gradient just because
+    # the wrapper exposed its base. Use the same suffix-aware filter as
+    # save_trainable_adapters so intentional trainables (e.g.
+    # lm_head.bias) DO trigger the guard while reload-leaked base
+    # weights/quantization state do not.
+    _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
+    lora_module_prefixes = tuple(f"{name}." for name in _lora_module_names if name)
+    has_root_lora_module = any(name == "" for name in _lora_module_names)
     for key in trainable:
         if key in adapter_keys:
             continue
-        if any(key.startswith(p) for p in lora_module_prefixes):
+        if _is_base_tensor_inside_lora_module(
+            key, lora_module_prefixes, has_root_lora_module,
+        ):
             continue
         if 'lm_head' in key or 'embed_tokens.weight' in key:
             return True
@@ -2652,6 +2656,56 @@ def collect_mlx_lora_adapter_tensors(model):
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
 
+# Suffixes of wrapped base tensors that mlx-lm's LoRALinear / DoRALinear
+# exposes under the wrapper module's path. These are the reload-leaked
+# state we must drop from adapter saves to keep artifacts lean and avoid
+# defeating the CCE memory guard. The list includes mlx-lm's nn.Linear
+# (`.weight`) AND nn.QuantizedLinear (`.scales`, `.biases`), plus their
+# explicit `.linear.*` variants in case a wrapper exposes the inner
+# layer directly. Trainable params NOT in this list (e.g. `.bias` on a
+# nn.Linear with bias=True) are intentional user training state and
+# survive the filter.
+_LORA_WRAPPED_BASE_SUFFIXES = (
+    ".weight",
+    ".scales",
+    ".biases",
+    ".linear.weight",
+    ".linear.scales",
+    ".linear.biases",
+)
+
+
+def _is_base_tensor_inside_lora_module(
+    key, lora_module_prefixes, has_root_lora_module=False,
+):
+    """True when `key` looks like the wrapped base tensor of a LoRA module.
+
+    Combines a path-prefix check against the LoRA module names with a
+    suffix whitelist of base/quantization tensor names. Used by save
+    paths to skip reload-leaked base state without dropping intentional
+    trainables (e.g. `.bias`) under the same prefix.
+
+    `has_root_lora_module` covers the case where a LoRA wrapper lives at
+    the top level (module_name == ""); the prefix-walk would otherwise
+    skip its bare `weight` / `scales` / `biases` since the empty-name
+    prefix is intentionally excluded from `lora_module_prefixes` (to
+    avoid swallowing every key in the model). When the model has a
+    root-level LoRA module, bare-name base tensors are also leaks.
+    """
+    matches_prefix = lora_module_prefixes and any(
+        key.startswith(p) for p in lora_module_prefixes
+    )
+    # Bare top-level base tensors (no `.` in the key) only count when
+    # the model actually carries a root-level LoRA wrapper.
+    matches_root = has_root_lora_module and "." not in key
+    if not (matches_prefix or matches_root):
+        return False
+    if matches_root:
+        # Allow plain "weight" / "scales" / "biases" without a leading dot.
+        return key in {"weight", "scales", "biases"} or key.endswith(_LORA_WRAPPED_BASE_SUFFIXES)
+    return key.endswith(_LORA_WRAPPED_BASE_SUFFIXES)
+
+
 def save_trainable_adapters(model, path, adapter_config=None):
     """Save the current trainable parameter tree for training checkpoints.
 
@@ -2664,22 +2718,21 @@ def save_trainable_adapters(model, path, adapter_config=None):
     """
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
-    lora_module_prefixes = tuple(
-        f"{name}." for name, _ in iter_mlx_lora_modules(model) if name
-    )
+    _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
+    lora_module_prefixes = tuple(f"{name}." for name in _lora_module_names if name)
+    has_root_lora_module = any(name == "" for name in _lora_module_names)
 
     tensors = dict(adapter_tensors)
     for key, value in trainable.items():
         if key in adapter_tensors:
             continue
-        # The reload-leak we are guarding against is specifically the
-        # wrapped base Linear's `.weight` exposed at the LoRA module's
-        # path (e.g. q_proj.weight under a LoRA-wrapped q_proj). Keep
-        # other params under the same prefix (e.g. q_proj.bias) so a
-        # user who intentionally trained bias=True on a LoRA-wrapped
-        # module doesn't silently lose the trained bias on checkpoint.
-        if key.endswith(".weight") and any(
-            key.startswith(p) for p in lora_module_prefixes
+        # Drop wrapped base tensors (`.weight`/`.scales`/`.biases` and
+        # their `.linear.*` variants on quantized layers) under LoRA
+        # module prefixes. Other trainable params under the same prefix
+        # (e.g. `.bias` on nn.Linear with bias=True) are intentional
+        # user state and survive.
+        if _is_base_tensor_inside_lora_module(
+            key, lora_module_prefixes, has_root_lora_module,
         ):
             continue
         tensors[key] = value
@@ -2879,6 +2932,15 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     # wrappers before binding the saved full-precision weights.
     has_lora_modules = any(True for _ in iter_mlx_lora_modules(model))
     declared_lora_artifact = adapter_config.get("fine_tune_type") in {"lora", "dora"}
+    # If the live model has LoRA modules but the caller passed an
+    # `adapter_config={"fine_tune_type": "full"}` (re-used config or
+    # stale dict), the saved tensors would be lora_a / lora_b while
+    # the config claimed a full save. mlx-lm reload would then skip
+    # LoRA wrapping and silently drop the adapter. Override the caller
+    # in this case so the artifact stays consistent.
+    if has_lora_modules and adapter_config.get("fine_tune_type") == "full":
+        adapter_config["fine_tune_type"] = "lora"
+        declared_lora_artifact = True
     # Detect DoRA so the adapter ships with fine_tune_type='dora' instead
     # of 'lora'. mlx-lm's load_adapters() only recreates DoRA wrappers when
     # the config says 'dora'; without this the saved q_proj.m magnitude
@@ -2924,8 +2986,15 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         # Full fine-tune checkpoint: mlx-lm's load_adapters() defaults a
         # missing fine_tune_type to 'lora' and then reads num_layers /
         # lora_parameters, so the saved tensors fail to reload. Stamp
-        # 'full' explicitly so reload routes to the no-LoRA path.
-        adapter_config.setdefault("fine_tune_type", "full")
+        # 'full' explicitly so reload routes to the no-LoRA path. Also
+        # strip stale LoRA fields the caller may have copied from a
+        # previous config so reload sees a clean full-finetune dict.
+        adapter_config["fine_tune_type"] = "full"
+        for _stale in (
+            "peft_type", "lora_parameters", "rank", "scale", "dropout",
+            "num_layers", "unsloth_mlx_lora_module_paths",
+        ):
+            adapter_config.pop(_stale, None)
 
     # why: record LoRA module paths so reload recreates vision/projector LoRA
     # layers (mlx-lm.load_adapters only knows the language tower).
@@ -3146,6 +3215,18 @@ def _push_lora_adapters_to_hub(
             allow_patterns=_lora_allow_patterns,
         )
     except (AttributeError, TypeError):
+        # upload_large_folder cannot represent commit_message /
+        # commit_description / create_pr. Falling back here when the
+        # caller asked for create_pr=True would silently push to the
+        # main branch instead. Refuse to do that; let the caller fix
+        # the environment (upgrade huggingface_hub) or drop the kwarg.
+        if create_pr:
+            raise RuntimeError(
+                "Unsloth: upload_folder() failed but create_pr=True was "
+                "requested; upload_large_folder() cannot create a PR. "
+                "Upgrade huggingface_hub or call create_pull_request() "
+                "yourself and pass revision=<pr-branch> instead."
+            )
         api.upload_large_folder(
             folder_path=str(save_directory),
             repo_id=repo_id,
@@ -3219,20 +3300,22 @@ def save_pretrained_merged(
         lora_module_prefixes = tuple(
             f"{name}." for name, _ in iter_mlx_lora_modules(model) if name
         )
-        # Route to save_trainable_adapters whenever the trainable tree
-        # contains anything that save_lora_adapters would not preserve:
-        # either an external (non-LoRA) param, OR an intentionally
-        # trainable non-base-weight inside a LoRA module (e.g.
-        # q_proj.bias on a LoRA-wrapped Linear with bias=True). The
-        # save_trainable_adapters filter drops only `.weight` under LoRA
-        # prefixes so the bias / other params survive.
-        def _is_base_weight_inside_lora(key):
-            if not key.endswith(".weight"):
-                return False
-            return any(key.startswith(p) for p in lora_module_prefixes)
-
+        # Route to save_trainable_adapters when the trainable tree has
+        # anything save_lora_adapters cannot preserve: an external param
+        # or an intentionally trainable non-base param inside a LoRA
+        # module (e.g. q_proj.bias). The shared
+        # _is_base_tensor_inside_lora_module filter recognises the
+        # wrapped base `.weight`/`.scales`/`.biases` and their
+        # `.linear.*` variants as reload-leak risks; everything else
+        # under a LoRA prefix is intentional user state.
+        has_root_lora_module = any(
+            name == "" for name, _ in iter_mlx_lora_modules(model)
+        )
         has_non_lora_trainable = any(
-            key not in adapter_keys and not _is_base_weight_inside_lora(key)
+            key not in adapter_keys
+            and not _is_base_tensor_inside_lora_module(
+                key, lora_module_prefixes, has_root_lora_module,
+            )
             for key in trainable
         )
         if has_non_lora_trainable:
@@ -3560,17 +3643,15 @@ def push_to_hub_merged(
         repo_id = save_directory.name
 
     # Detect whether the caller passed custom commit metadata BEFORE we
-    # normalize the strings. upload_large_folder ignores commit_message /
-    # commit_description / create_pr / revision; falling through to
-    # upload_folder is the only way those kwargs survive to the Hub.
-    # revision in particular: upload_large_folder silently lands on main
-    # regardless of the kwarg, so a non-default revision must force the
-    # upload_folder route.
+    # normalize the strings. upload_large_folder accepts `revision`
+    # natively, so a custom branch alone does NOT need upload_folder.
+    # It cannot represent commit_message / commit_description /
+    # create_pr though, so those three are what trigger the
+    # upload_folder route (which preserves them).
     _caller_wants_commit_metadata = bool(
         create_pr
         or commit_message != _PUSH_MERGED_DEFAULT_COMMIT_MESSAGE
         or commit_description != _PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION
-        or revision is not None
     )
 
     # Match the GPU path's "(Trained with Unsloth)" suffix convention so
@@ -3634,6 +3715,16 @@ def push_to_hub_merged(
                 revision=revision,
             )
         except (AttributeError, TypeError):
+            # Same constraint as the LoRA helper: upload_large_folder
+            # cannot represent create_pr. Refuse to silently lose it.
+            if create_pr:
+                raise RuntimeError(
+                    "Unsloth: upload_folder() failed but create_pr=True "
+                    "was requested; upload_large_folder() cannot create "
+                    "a PR. Upgrade huggingface_hub or call "
+                    "create_pull_request() yourself and pass "
+                    "revision=<pr-branch> instead."
+                )
             api.upload_large_folder(
                 folder_path=str(save_directory),
                 repo_id=repo_id,

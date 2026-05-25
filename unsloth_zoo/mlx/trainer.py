@@ -784,8 +784,17 @@ class MLXTrainer:
             # lora_b_router.weight) do not receive the LoRA+ multiplier.
             if use_lora_plus and (name == "lora_b" or name.endswith(".lora_b")):
                 scale = scale * lora_plus_ratio
-            if use_embedding_lr and ("embed_tokens" in name or "lm_head" in name):
-                scale = scale * embedding_lr_ratio
+            # Anchor on the path segment so unrelated names with these
+            # substrings (e.g. decoder.not_lm_head_router.weight or
+            # foo.embed_tokens_aux.weight) do not pick up the embedding LR.
+            if use_embedding_lr:
+                _segments = name.split(".")
+                _is_embed_or_lm_head = (
+                    "embed_tokens" in _segments
+                    or "lm_head" in _segments
+                )
+                if _is_embed_or_lm_head:
+                    scale = scale * embedding_lr_ratio
             if clip_scale is not None:
                 scale = scale * clip_scale
             if dtype is not None and scale.dtype != dtype:
@@ -1456,19 +1465,20 @@ class MLXTrainer:
                 f"{name}." for name, _ in iter_mlx_lora_modules(self.model)
                 if name
             )
-            # Route to save_trainable_adapters whenever the trainable tree
-            # has anything save_lora_adapters would not preserve: either an
-            # external param OR an intentionally-trainable non-`.weight`
-            # under a LoRA module (e.g. q_proj.bias). The save filter
-            # drops only `.weight` under LoRA prefixes so .bias and other
-            # params survive the routing.
-            def _is_base_weight_inside_lora(key):
-                if not key.endswith(".weight"):
-                    return False
-                return any(key.startswith(p) for p in lora_module_prefixes)
-
+            # Route via the shared filter in utils so the routing here
+            # stays in lockstep with save_trainable_adapters/save_pretrained_merged.
+            # That filter drops wrapped base `.weight`/`.scales`/`.biases`
+            # under LoRA prefixes as reload-leaks but preserves
+            # intentional trainables like `.bias`.
+            from .utils import _is_base_tensor_inside_lora_module
+            has_root_lora_module = any(
+                name == "" for name, _ in iter_mlx_lora_modules(self.model)
+            )
             has_non_lora_trainable = any(
-                key not in adapter_keys and not _is_base_weight_inside_lora(key)
+                key not in adapter_keys
+                and not _is_base_tensor_inside_lora_module(
+                    key, lora_module_prefixes, has_root_lora_module,
+                )
                 for key in trainable
             )
             if has_non_lora_trainable:
