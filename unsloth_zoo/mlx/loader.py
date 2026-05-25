@@ -2530,8 +2530,16 @@ class FastMLXModel:
                         # rebuilt and the saved tensors bind to either set.
                         try:
                             _apply_lora_at_paths(model, _saved_lora_paths, adapter_cfg)
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            # Surface failures: combined with the strict=False
+                            # fallback below, a silent pass here lets saved
+                            # adapter tensors disappear with no warning.
+                            warnings.warn(
+                                f"Unsloth MLX: failed to re-attach auxiliary "
+                                f"LoRA wrappers ({_exc!r}); some adapter "
+                                f"tensors may not load.",
+                                stacklevel=2,
+                            )
                     from mlx_lm.tuner.utils import load_adapters
                     try:
                         model = load_adapters(model, local_path)
@@ -2541,6 +2549,31 @@ class FastMLXModel:
                         # raw safetensors against the wrappers we just attached.
                         adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
                         if os.path.exists(adapter_weights_file):
+                            # load_weights(strict=False) silently drops saved
+                            # keys with no matching live module; warn so the
+                            # caller can tell training weights vanished.
+                            try:
+                                from safetensors import safe_open
+                                from mlx.utils import tree_flatten as _tree_flatten
+
+                                with safe_open(adapter_weights_file, framework="numpy") as _f:
+                                    _saved_keys = set(_f.keys())
+                                _bound_keys = {
+                                    k for k, _ in _tree_flatten(model.parameters())
+                                }
+                                _missing = sorted(_saved_keys - _bound_keys)
+                                if _missing:
+                                    _preview = ", ".join(_missing[:5])
+                                    if len(_missing) > 5:
+                                        _preview += f", ... (+{len(_missing) - 5} more)"
+                                    warnings.warn(
+                                        f"Unsloth MLX: {len(_missing)} saved "
+                                        f"adapter tensor(s) have no live "
+                                        f"module and will not load: {_preview}",
+                                        stacklevel=2,
+                                    )
+                            except Exception:
+                                pass
                             model.load_weights(adapter_weights_file, strict=False)
                         else:
                             raise

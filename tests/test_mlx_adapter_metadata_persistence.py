@@ -289,7 +289,7 @@ def _trainer_loop_metadata(model):
     # Mirror MLXTrainer.save_model()'s metadata extraction so the test
     # tracks the trainer logic without depending on a real MLX runtime.
     mlx_utils = _load_utils()
-    rank, scale, dropout = 8, 1.0, 0.0
+    rank = scale = dropout = None
     for _, m in model.named_modules():
         if not (hasattr(m, "lora_a") and hasattr(m, "lora_b")):
             continue
@@ -297,15 +297,109 @@ def _trainer_loop_metadata(model):
         if inferred_rank is None:
             continue
         rank = inferred_rank
-        scale = getattr(m, "scale", 1.0)
+        _scale = getattr(m, "scale", 1.0)
+        if hasattr(_scale, "item"):
+            try:
+                scale = float(_scale.item())
+            except Exception:
+                scale = 1.0
+        else:
+            try:
+                scale = float(_scale)
+            except Exception:
+                scale = 1.0
         dropout = mlx_utils._get_mlx_dropout_probability(getattr(m, "dropout", None))
         break
     return rank, scale, dropout
 
 
-def test_trainer_metadata_loop_no_lora_uses_defaults():
+def test_trainer_metadata_loop_returns_none_when_no_lora_modules():
+    # No LoRA modules means we cannot produce trustworthy rank/scale/dropout.
+    # Returning None lets the caller omit the keys from adapter_config so
+    # reload fails loudly instead of silently scaling with rank=8.
     model = _FakeModel([
         ("layers.0.q_proj", types.SimpleNamespace()),
     ])
-    rank, scale, dropout = _trainer_loop_metadata(model)
-    assert (rank, scale, dropout) == (8, 1.0, 0.0)
+    assert _trainer_loop_metadata(model) == (None, None, None)
+
+
+def test_trainer_metadata_loop_returns_none_when_rank_inference_fails():
+    # Module has lora_a/lora_b but _infer_mlx_lora_rank returns None
+    # (e.g. 1-D lora_b). Trainer must not persist the old placeholder
+    # rank=8 / scale=1.0 / dropout=0.0 defaults.
+    one_d_lora = _FakeLoRAModule(lora_a=(8, 4), lora_b=(8,))
+    model = _FakeModel([("layers.0.q_proj", one_d_lora)])
+    assert _trainer_loop_metadata(model) == (None, None, None)
+
+
+def test_trainer_metadata_loop_coerces_mxarray_scale_safely():
+    # LoRASwitchLinear stores scale as a per-expert mx.array. float() on a
+    # non-0-D array raises; the trainer loop must coerce via .item() and
+    # fall back to 1.0 if the array is wider than 0-D.
+    class _ZeroDArray:
+        def item(self):
+            return 2.5
+
+        @property
+        def shape(self):
+            return ()
+
+    class _MultiExpertArray:
+        def item(self):
+            raise ValueError("only one element tensors can be converted")
+
+        @property
+        def shape(self):
+            return (4,)
+
+    m_zero_d = _FakeLoRAModule(lora_a=(8, 4), lora_b=(4, 8), scale=_ZeroDArray())
+    m_wide   = _FakeLoRAModule(lora_a=(8, 4), lora_b=(4, 8), scale=_MultiExpertArray())
+
+    _, scale_zero_d, _ = _trainer_loop_metadata(_FakeModel([("q", m_zero_d)]))
+    _, scale_wide,   _ = _trainer_loop_metadata(_FakeModel([("q", m_wide)]))
+
+    assert scale_zero_d == 2.5
+    assert scale_wide == 1.0  # safe fallback, not a crash
+
+
+def _build_trainer_adapter_dict(rank, scale, dropout, num_layers, hf_repo=""):
+    # Mirror the dict-building gate in MLXTrainer.save_model: keys are only
+    # included when their source values are valid, so reload sees no
+    # placeholder sentinels.
+    cfg = {
+        "fine_tune_type": "lora",
+        "peft_type": "LORA",
+        "base_model_name_or_path": hf_repo,
+    }
+    if num_layers is not None and num_layers > 0:
+        cfg["num_layers"] = num_layers
+    if rank is not None:
+        cfg["lora_parameters"] = {"rank": rank, "scale": scale, "dropout": dropout}
+        cfg["rank"] = rank
+        cfg["scale"] = scale
+        cfg["dropout"] = dropout
+    return cfg
+
+
+def test_trainer_adapter_dict_omits_num_layers_sentinel():
+    # _num_layers=None must not land in adapter_config as num_layers=-1
+    # or 0; mlx-lm's load_adapters would slice range(-1) and apply zero
+    # LoRA layers on reload.
+    cfg = _build_trainer_adapter_dict(rank=8, scale=1.0, dropout=0.0, num_layers=None)
+    assert "num_layers" not in cfg
+    cfg2 = _build_trainer_adapter_dict(rank=8, scale=1.0, dropout=0.0, num_layers=0)
+    assert "num_layers" not in cfg2
+
+
+def test_trainer_adapter_dict_omits_rank_when_inference_failed():
+    # No LoRA found -> trainer must NOT write the placeholder rank=8 /
+    # scale=1.0 / dropout=0.0 trio. Reload should fail loud instead.
+    cfg = _build_trainer_adapter_dict(rank=None, scale=None, dropout=None, num_layers=24)
+    assert "rank" not in cfg
+    assert "scale" not in cfg
+    assert "dropout" not in cfg
+    assert "lora_parameters" not in cfg
+    assert cfg["num_layers"] == 24
+    # Identity keys still present so HF PEFT and mlx-lm can route the load.
+    assert cfg["peft_type"] == "LORA"
+    assert cfg["fine_tune_type"] == "lora"
