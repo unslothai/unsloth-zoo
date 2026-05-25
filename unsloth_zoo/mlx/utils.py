@@ -2862,17 +2862,26 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         lora_rank = None
         lora_scale = None
         lora_dropout = None
+        # When the caller pins an explicit path filter, track whether any
+        # selected live LoRA module existed at all. If the explicit set
+        # selected real modules but none of them produced trustworthy
+        # rank inference (e.g. malformed half-built LoRA wrapper), we
+        # must NOT later fall back to the caller's stale top-level
+        # rank/scale/dropout because that would persist placeholder
+        # metadata against the actual saved tensor shapes.
+        selected_lora_seen = False
         for name, module in model.named_modules():
             if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
                 continue
             lora_paths.append(name)
             inferred_rank = _infer_mlx_lora_rank(module)
-            if inferred_rank is None:
-                continue
             # only infer rank/scale/dropout from modules the caller
             # actually selected; otherwise an earlier unrelated LoRA
             # would write the wrong language-tower params.
             if explicit_path_set is not None and name not in explicit_path_set:
+                continue
+            selected_lora_seen = True
+            if inferred_rank is None:
                 continue
             if lora_rank is None:
                 lora_rank = inferred_rank
@@ -2908,6 +2917,18 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             key in existing_lora_parameters or key in adapter_config
             for key in ("rank", "scale", "dropout")
         )
+        # If the caller pinned explicit paths AND those paths selected
+        # real LoRA modules that all failed trustworthy rank inference,
+        # do NOT fall through to caller metadata as the truth. The
+        # caller's top-level rank/scale/dropout is stale by construction
+        # (the selected live modules disagree with it), so persisting
+        # those would reintroduce the rank=8/placeholder problem the
+        # earlier explicit-filter narrowing was meant to prevent.
+        allow_caller_metadata_fallback = not (
+            explicit_path_set is not None
+            and selected_lora_seen
+            and lora_rank is None
+        )
 
         if lora_rank is not None:
             lora_parameters = existing_lora_parameters
@@ -2916,6 +2937,14 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 "scale": lora_scale,
                 "dropout": lora_dropout,
             })
+            # Constrain mlx-lm.load_adapters() to the saved topology by
+            # writing the path list under `lora_parameters["keys"]`.
+            # Without this, upstream interprets missing `keys` as "scan
+            # every Linear / Embedding / Switch layer" and creates extra
+            # zero-init LoRA wrappers outside the saved adapter set.
+            saved_paths = adapter_config.get("unsloth_mlx_lora_module_paths")
+            if saved_paths and "keys" not in lora_parameters:
+                lora_parameters["keys"] = list(saved_paths)
             adapter_config["lora_parameters"] = lora_parameters
             adapter_config["rank"] = lora_rank
             adapter_config["scale"] = lora_scale
@@ -2939,7 +2968,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 # legacy "all layers" sentinel, consistent with the
                 # trainer's save_model() fallback for wrapped models.
                 adapter_config["num_layers"] = n_layers
-        elif has_caller_lora_metadata:
+        elif has_caller_lora_metadata and allow_caller_metadata_fallback:
             # Keep the caller's metadata coherent: copy top-level
             # rank/scale/dropout into lora_parameters (or vice versa) so
             # both shapes that mlx-lm's load_adapters checks agree.
@@ -2972,6 +3001,9 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     inferred_value if inferred_value is not None else default_value
                 )
             if "rank" in lora_parameters:
+                saved_paths = adapter_config.get("unsloth_mlx_lora_module_paths")
+                if saved_paths and "keys" not in lora_parameters:
+                    lora_parameters["keys"] = list(saved_paths)
                 adapter_config["lora_parameters"] = lora_parameters
                 for key in ("rank", "scale", "dropout"):
                     if key in lora_parameters:

@@ -3152,27 +3152,29 @@ class FastMLXModel:
                         )
                         if _aux_attached > 0:
                             model.load_weights(adapter_weights_file, strict=False)
-                        # Refuse to return a partial adapter in EITHER
-                        # shape: (a) none of the declared aux paths
-                        # attached AND saved tensors remain unbound, or
-                        # (b) some aux paths attached but others were
-                        # skipped (mixed partial) and saved tensors for
-                        # the skipped paths remain unbound. The fallback
-                        # branch raises in the equivalent shape; mirror
-                        # the same semantics on the success branch so
-                        # user-facing behaviour is consistent.
-                        if _saved_lora_paths and _missing_after_success:
+                        # Refuse to return a partial adapter whenever the
+                        # saved-vs-live shape diff flagged anything: the
+                        # fallback branch raises on the equivalent shape,
+                        # and a stale language-only config (e.g. rank=8
+                        # metadata over rank-4 saved tensors) gets caught
+                        # via the same shape comparison even when no
+                        # auxiliary paths were declared. Dropping the
+                        # `_saved_lora_paths` guard here keeps the
+                        # success branch and the fallback branch in
+                        # lockstep so a partial language adapter never
+                        # slips through unannounced.
+                        if _missing_after_success:
                             _preview = ", ".join(_missing_after_success[:5])
                             if len(_missing_after_success) > 5:
                                 _preview += (
                                     f", ... (+{len(_missing_after_success) - 5} more)"
                                 )
                             raise RuntimeError(
-                                "Unsloth MLX: load_adapters succeeded for the "
-                                "language tower but "
-                                f"{len(_missing_after_success)} saved auxiliary "
-                                "LoRA tensor(s) have no live module to bind "
-                                f"into ({_preview}). Refusing to return a "
+                                "Unsloth MLX: load_adapters succeeded but "
+                                f"{len(_missing_after_success)} saved LoRA "
+                                "tensor(s) are missing or shape-incompatible "
+                                "with the live module tree "
+                                f"({_preview}). Refusing to return a "
                                 "partially loaded adapter."
                             )
 
