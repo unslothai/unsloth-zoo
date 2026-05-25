@@ -1502,13 +1502,17 @@ _FROM_BASE_KWARG_TYPEERROR_NEEDLES = (
     "got multiple values",
     "no argument named",
     "takes no keyword",
-    # The kwarg names too so a custom mlx-lm wrapper that raises a
-    # different-shape TypeError ("LoRALinear.from_base does not accept
-    # scale", "old mlx-lm: scale/dropout not accepted") still qualifies
-    # as a signature mismatch and falls through to the older shape. Add
-    # both single-quoted and plain forms.
+    # Single-quoted kwarg names — CPython's TypeError for an unexpected
+    # keyword always quotes the offending name (e.g. `got an unexpected
+    # keyword argument 'scale'`).
     "'scale'", "'dropout'", "'r'",
-    "scale", "dropout",
+    # Common manual-rejection phrasings used by custom mlx-lm wrappers
+    # / shims that don't follow the canonical signature error format.
+    # These match "scale/dropout not accepted", "scale not supported",
+    # etc. without catching internal validator errors like "scale must
+    # be a finite float" or "Dropout(p=...) expected float".
+    "not accepted",
+    "not supported",
 )
 
 
@@ -3073,14 +3077,16 @@ class FastMLXModel:
                         )
                         if _aux_attached > 0:
                             model.load_weights(adapter_weights_file, strict=False)
-                        elif _saved_lora_paths and _missing_after_success:
-                            # Refuse to return a partial adapter: caller
-                            # declared aux paths in adapter_config but none
-                            # of them attached AND the saved-vs-live diff
-                            # shows real saved tensors are unbound. The
-                            # fallback branch already raises in this shape;
-                            # mirror it on the success branch so user-
-                            # facing semantics are consistent.
+                        # Refuse to return a partial adapter in EITHER
+                        # shape: (a) none of the declared aux paths
+                        # attached AND saved tensors remain unbound, or
+                        # (b) some aux paths attached but others were
+                        # skipped (mixed partial) and saved tensors for
+                        # the skipped paths remain unbound. The fallback
+                        # branch raises in the equivalent shape; mirror
+                        # the same semantics on the success branch so
+                        # user-facing behaviour is consistent.
+                        if _saved_lora_paths and _missing_after_success:
                             _preview = ", ".join(_missing_after_success[:5])
                             if len(_missing_after_success) > 5:
                                 _preview += (
@@ -3088,11 +3094,11 @@ class FastMLXModel:
                                 )
                             raise RuntimeError(
                                 "Unsloth MLX: load_adapters succeeded for the "
-                                "language tower but every saved auxiliary "
-                                f"LoRA path was skipped; {len(_missing_after_success)} "
-                                "saved LoRA tensor(s) have no live module to "
-                                f"bind into ({_preview}). Refusing to return "
-                                "a partially loaded adapter."
+                                "language tower but "
+                                f"{len(_missing_after_success)} saved auxiliary "
+                                "LoRA tensor(s) have no live module to bind "
+                                f"into ({_preview}). Refusing to return a "
+                                "partially loaded adapter."
                             )
 
                     if not _load_adapters_ok:

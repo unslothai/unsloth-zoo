@@ -2894,15 +2894,16 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         if lora_paths and not has_explicit_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
 
-        # When the caller already provided global LoRA metadata AND the
-        # explicit-path filter narrowed inference to a subset (e.g. only
-        # vision/projector aux modules with a different rank than the
-        # language tower), do NOT overwrite the caller's global rank/scale
-        # /dropout. mlx-lm's load_adapters() then rebuilds the language
-        # LoRA with the correct global rank, and the aux paths still get
-        # re-wrapped with their own metadata. Otherwise the language tower
-        # silently inherits the aux rank and runs at the wrong adapter
-        # capacity on reload.
+        # Honour caller-supplied LoRA metadata regardless of whether the
+        # caller pinned `unsloth_mlx_lora_module_paths`. Two cases:
+        # (1) caller supplied metadata -> keep it as canonical, backfill
+        #     any missing keys from inferred / defaults.
+        # (2) caller supplied nothing -> overwrite from inferred values.
+        # The previous "narrow filter required" guard let case (1) silently
+        # drop on save_lora_adapters() callers without explicit paths,
+        # producing reload-time shape mismatches when the saved tensors
+        # were a different rank than what the inferred first-LoRA-module
+        # walk happened to pick.
         existing_lora_parameters = dict(adapter_config.get("lora_parameters") or {})
         has_caller_lora_metadata = any(
             key in existing_lora_parameters or key in adapter_config
@@ -2910,9 +2911,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         )
         explicit_filter_narrowed = explicit_path_set is not None
 
-        if lora_rank is not None and not (
-            explicit_filter_narrowed and has_caller_lora_metadata
-        ):
+        if lora_rank is not None and not has_caller_lora_metadata:
             lora_parameters = existing_lora_parameters
             for key, value in (
                 ("rank", lora_rank), ("scale", lora_scale), ("dropout", lora_dropout),
@@ -2934,14 +2933,15 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     n_layers = 0
                 if n_layers > 0:
                     adapter_config["num_layers"] = n_layers
-        elif explicit_filter_narrowed and has_caller_lora_metadata:
-            # Keep the caller's global metadata coherent: copy top-level
+        elif has_caller_lora_metadata:
+            # Keep the caller's metadata coherent: copy top-level
             # rank/scale/dropout into lora_parameters (or vice versa) so
             # both shapes that mlx-lm's load_adapters checks agree.
-            # Backfill scale/dropout from the inferred aux module when
-            # caller provided only `rank`, so the language tower's
-            # `lora_parameters` dict ships complete (mlx-lm.load_adapters
-            # consults it for both halves and rejects missing fields).
+            # Backfill scale/dropout from the inferred module when caller
+            # provided only `rank`, so the LoRA parameters dict ships
+            # complete (mlx-lm.load_adapters consults it for both halves
+            # and rejects missing fields). Runs whether or not the caller
+            # also pinned `unsloth_mlx_lora_module_paths`.
             lora_parameters = existing_lora_parameters
             for key in ("rank", "scale", "dropout"):
                 if key not in lora_parameters and key in adapter_config:
