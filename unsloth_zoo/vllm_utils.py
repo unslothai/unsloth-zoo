@@ -880,11 +880,21 @@ def patch_vllm_decompose_size_nodes():
                                 new_kwargs[k] = _replace_in_args([v], node, dims)[0]
                         user.kwargs = new_kwargs
             if node.users:
-                logger.warning(
+                # If the recursive rewrite did not actually replace every
+                # reference, surface the failure loudly rather than masking
+                # it. Erasing a still-referenced node leaves the graph in
+                # an inconsistent state and aot_autograd will fail much
+                # later with a worse stacktrace. Better to fail here so
+                # the regression is visible.
+                logger.error(
                     f"Unsloth: vllm _decompose_size_nodes left {node.name} "
-                    f"with users {dict(node.users)}; skipping erase. "
-                    f"See vllm-project/vllm#42543."
+                    f"with users {dict(node.users)} after rewrite. The "
+                    f"recursive sweep missed a reference; see "
+                    f"vllm-project/vllm#42543 + this monkey-patch. "
+                    f"Set UNSLOTH_DISABLE_VLLM_DECOMPOSE_SIZE_PATCH=1 to "
+                    f"opt out and surface upstream's original error."
                 )
+                graph.graph.erase_node(node)  # raises RuntimeError loudly
                 continue
             graph.graph.erase_node(node)
     pass
@@ -895,6 +905,39 @@ def patch_vllm_decompose_size_nodes():
 pass
 
 
+def _poison_flashinfer_if_unusable() -> None:
+    """Block ``import flashinfer`` early when nvcc / ninja are missing.
+
+    vllm's ``vllm.utils.flashinfer.has_flashinfer`` is ``@functools.cache``-
+    decorated, so the first caller wins for the lifetime of the process.
+    The poison previously lived inside ``load_vllm`` (line 2116-ish); any
+    caller that materialised a VllmConfig before reaching that line would
+    cache ``has_flashinfer() == True`` and the backend selector would
+    still pick FLASHINFER. Move the poison up to ``patch_vllm`` so it
+    runs before the first ``vllm.LLM(...)`` call and clear the
+    `has_flashinfer` cache defensively.
+    """
+    if os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") != "1":
+        # Only poison when the user (or load_vllm preflight) explicitly
+        # requested it. Otherwise leave FlashInfer alone -- a real
+        # nvcc+ninja host should keep using it.
+        return
+    try:
+        for _name in list(sys.modules):
+            if _name == "flashinfer" or _name.startswith("flashinfer."):
+                del sys.modules[_name]
+        sys.modules["flashinfer"] = None
+    except Exception:
+        pass
+    try:
+        from vllm.utils import flashinfer as _vllm_fi
+        if hasattr(_vllm_fi, "has_flashinfer") and \
+                hasattr(_vllm_fi.has_flashinfer, "cache_clear"):
+            _vllm_fi.has_flashinfer.cache_clear()
+    except Exception:
+        pass
+
+
 def patch_vllm(debug = True):
     # Temporary patch to disable multiprocessing for vLLM
     # Allows accessing model_executor
@@ -903,6 +946,7 @@ def patch_vllm(debug = True):
     if debug or os.getenv("UNSLOTH_ENABLE_LOGGING", "0") == "1":
         os.environ["VLLM_LOGGING_LEVEL"] = "INFO"
     # os.environ["VLLM_TRACE_FUNCTION"] = "1"
+    _poison_flashinfer_if_unusable()
     patch_vllm_set_inductor_config()
     patch_bitsandbytes_quant_state()
     patch_vllm_bitsandbytes()

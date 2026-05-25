@@ -206,13 +206,39 @@ def patch_check_imports_autoinstall():
     dmu.check_imports = check_imports
 
 
+def _looks_like_jupyter_chain() -> bool:
+    """Cheap probe for "this process is going to import IPython somewhere".
+
+    Pre-emptive ``traitlets`` install used to fire on every import of
+    ``unsloth_zoo`` -- including from server jobs that never touch a
+    notebook -- which blocked ``import unsloth_zoo`` for up to 300 s on
+    machines without traitlets. Gate the eager install on signals that
+    we are actually in a Jupyter / Colab / IPython context.
+    """
+    if (
+        "JPY_PARENT_PID" in os.environ
+        or "COLAB_RELEASE_TAG" in os.environ
+        or "VSCODE_PID" in os.environ  # VS Code python kernel
+    ):
+        return True
+    for m in ("IPython", "ipykernel", "google.colab"):
+        if m in sys.modules:
+            return True
+    return False
+
+
 def _ensure_notebook_chain():
     """
     Pre-emptive ensure for deps that raise bare ModuleNotFoundError outside
     transformers (the Jupyter/IPython chain). Kept tiny: only ``traitlets``
     is touched today; expand only when a new failure mode appears.
+
+    Skipped on non-notebook hosts so a fresh server import of
+    ``unsloth_zoo`` does not block on a pip subprocess.
     """
     if not _AUTO_INSTALL or _NO_NETWORK:
+        return
+    if not _looks_like_jupyter_chain():
         return
     for pkg in ("traitlets",):
         if importlib.util.find_spec(pkg) is None:
