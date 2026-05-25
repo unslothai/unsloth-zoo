@@ -1077,15 +1077,31 @@ def _normalize_mlx_lora_module_paths(module_paths):
     """Normalize stored module paths into a list of non-empty strings.
 
     Hand-authored adapter_config.json files sometimes store a single path
-    as a bare string. Iterating the raw string with `for name in path`
-    would walk its characters and never wrap a real LoRA layer.
+    as a bare string, a dict grouping {"language": [...], "vision": [...]},
+    or pathlib.Path objects. Iterating a bare string would walk characters
+    and never wrap a real LoRA layer. Coerce all known shapes so future
+    config layouts do not silently drop paths.
     """
     if module_paths is None:
         return []
     if isinstance(module_paths, str):
         return [module_paths] if module_paths else []
+    if isinstance(module_paths, dict):
+        out = []
+        for value in module_paths.values():
+            out.extend(_normalize_mlx_lora_module_paths(value))
+        return out
     if isinstance(module_paths, (list, tuple, set)):
-        return [p for p in module_paths if isinstance(p, str) and p]
+        out = []
+        for p in module_paths:
+            if isinstance(p, str):
+                if p:
+                    out.append(p)
+            elif isinstance(p, os.PathLike):
+                s = os.fspath(p)
+                if s:
+                    out.append(s)
+        return out
     return []
 
 
@@ -2586,8 +2602,18 @@ class FastMLXModel:
                                         f"module and will not load: {_preview}",
                                         stacklevel=2,
                                     )
-                            except Exception:
-                                pass
+                            except (ImportError, OSError) as _diff_exc:
+                                # Narrow the swallow so unrelated bugs (e.g.
+                                # accidental NameError) still surface. Tell
+                                # the user the diagnostic was skipped, then
+                                # still run the load below.
+                                warnings.warn(
+                                    f"Unsloth MLX: skipped saved-vs-live "
+                                    f"adapter key diff ({_diff_exc!r}); "
+                                    f"silently-dropped LoRA tensors will not "
+                                    f"be surfaced.",
+                                    stacklevel=2,
+                                )
                             model.load_weights(adapter_weights_file, strict=False)
                         else:
                             raise

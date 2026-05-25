@@ -405,6 +405,28 @@ def test_trainer_adapter_dict_omits_rank_when_inference_failed():
     assert cfg["fine_tune_type"] == "lora"
 
 
+def test_normalize_mlx_lora_module_paths_handles_dict_input():
+    # Older / hand-authored configs sometimes group paths by tower.
+    # Dict input must flatten into a list, not silently return [].
+    from unsloth_zoo.mlx.loader import _normalize_mlx_lora_module_paths
+
+    grouped = {"language": ["layers.0.q_proj"], "vision": ["vision.proj"]}
+    paths = _normalize_mlx_lora_module_paths(grouped)
+    assert set(paths) == {"layers.0.q_proj", "vision.proj"}
+
+
+def test_normalize_mlx_lora_module_paths_handles_pathlike_elements():
+    # pathlib.Path elements in the saved list must coerce via os.fspath,
+    # not be silently dropped by the isinstance(p, str) gate.
+    import pathlib
+    from unsloth_zoo.mlx.loader import _normalize_mlx_lora_module_paths
+
+    paths = _normalize_mlx_lora_module_paths(
+        [pathlib.PurePosixPath("layers.0.q_proj"), "layers.1.q_proj"]
+    )
+    assert paths == ["layers.0.q_proj", "layers.1.q_proj"]
+
+
 def test_enrich_mlx_adapter_config_coerces_mxarray_scale_without_aborting():
     # _enrich_mlx_adapter_config previously used raw float(module.scale).
     # A LoRASwitchLinear that exposes scale as a multi-element mx.array
