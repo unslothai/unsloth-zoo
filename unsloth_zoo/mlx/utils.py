@@ -2837,7 +2837,24 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 continue
             if lora_rank is None:
                 lora_rank = inferred_rank
-                lora_scale = float(getattr(module, "scale", 1.0))
+                # Match MLXTrainer.save_model's coercion: LoRASwitchLinear's
+                # per-expert scale is an mx.array, and a raw float() on a
+                # non-0-D array raises. Without this fallback the outer
+                # try/except: pass would silently abandon lora_paths and
+                # leave vision/projector LoRA tensors unrecorded in
+                # adapter_config, so they vanish on reload via
+                # load_weights(strict=False).
+                _scale = getattr(module, "scale", 1.0)
+                if hasattr(_scale, "item"):
+                    try:
+                        lora_scale = float(_scale.item())
+                    except Exception:
+                        lora_scale = 1.0
+                else:
+                    try:
+                        lora_scale = float(_scale)
+                    except Exception:
+                        lora_scale = 1.0
                 lora_dropout = _get_mlx_dropout_probability(
                     getattr(module, "dropout", None)
                 )

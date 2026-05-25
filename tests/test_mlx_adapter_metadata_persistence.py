@@ -403,3 +403,48 @@ def test_trainer_adapter_dict_omits_rank_when_inference_failed():
     # Identity keys still present so HF PEFT and mlx-lm can route the load.
     assert cfg["peft_type"] == "LORA"
     assert cfg["fine_tune_type"] == "lora"
+
+
+def test_enrich_mlx_adapter_config_coerces_mxarray_scale_without_aborting():
+    # _enrich_mlx_adapter_config previously used raw float(module.scale).
+    # A LoRASwitchLinear that exposes scale as a multi-element mx.array
+    # made float() raise, which the outer try/except: pass swallowed -
+    # silently dropping unsloth_mlx_lora_module_paths so the reload path
+    # could not re-attach vision/projector LoRA wrappers. Mirror the
+    # trainer-side .item() / fallback-1.0 coercion in enrich too.
+    mlx_utils = _load_utils()
+
+    class _MultiExpertScale:
+        def item(self):
+            raise ValueError("only one element tensors can be converted")
+
+        @property
+        def shape(self):
+            return (4,)
+
+    class _ZeroDScale:
+        def item(self):
+            return 0.5
+
+        @property
+        def shape(self):
+            return ()
+
+    m_wide = _FakeLoRAModule(lora_a=(8, 4), lora_b=(4, 8), scale=_MultiExpertScale())
+    m_zerod = _FakeLoRAModule(lora_a=(8, 4), lora_b=(4, 8), scale=_ZeroDScale())
+
+    cfg_wide = mlx_utils._enrich_mlx_adapter_config(
+        _FakeModel([("vision.q_proj", m_wide)]), {},
+    )
+    cfg_zd = mlx_utils._enrich_mlx_adapter_config(
+        _FakeModel([("vision.q_proj", m_zerod)]), {},
+    )
+
+    # Both must complete with metadata and module-path list, not silently
+    # abandon after the float() raise.
+    assert cfg_wide.get("unsloth_mlx_lora_module_paths") == ["vision.q_proj"]
+    assert cfg_wide.get("scale") == 1.0  # safe fallback
+    assert cfg_wide.get("rank") == 4
+    assert cfg_zd.get("unsloth_mlx_lora_module_paths") == ["vision.q_proj"]
+    assert cfg_zd.get("scale") == 0.5
+    assert cfg_zd.get("rank") == 4

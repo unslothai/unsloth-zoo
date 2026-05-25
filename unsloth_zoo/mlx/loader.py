@@ -2552,14 +2552,28 @@ class FastMLXModel:
                             # load_weights(strict=False) silently drops saved
                             # keys with no matching live module; warn so the
                             # caller can tell training weights vanished.
+                            # Filter the diff to LoRA-suffix keys so VLM
+                            # key-spelling drift (model.layers... vs
+                            # language_model.model.layers...) doesn't fire
+                            # false positives for non-LoRA tensors that
+                            # mlx-lm rebinds under a different prefix.
                             try:
                                 from safetensors import safe_open
                                 from mlx.utils import tree_flatten as _tree_flatten
 
+                                _lora_suffixes = (
+                                    ".lora_a", ".lora_b",
+                                    ".lora_A", ".lora_B",
+                                    ".lora_embedding_a", ".lora_embedding_b",
+                                )
                                 with safe_open(adapter_weights_file, framework="numpy") as _f:
-                                    _saved_keys = set(_f.keys())
+                                    _saved_keys = {
+                                        k for k in _f.keys()
+                                        if k.endswith(_lora_suffixes)
+                                    }
                                 _bound_keys = {
                                     k for k, _ in _tree_flatten(model.parameters())
+                                    if k.endswith(_lora_suffixes)
                                 }
                                 _missing = sorted(_saved_keys - _bound_keys)
                                 if _missing:
@@ -2568,7 +2582,7 @@ class FastMLXModel:
                                         _preview += f", ... (+{len(_missing) - 5} more)"
                                     warnings.warn(
                                         f"Unsloth MLX: {len(_missing)} saved "
-                                        f"adapter tensor(s) have no live "
+                                        f"LoRA adapter tensor(s) have no live "
                                         f"module and will not load: {_preview}",
                                         stacklevel=2,
                                     )
