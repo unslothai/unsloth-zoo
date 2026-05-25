@@ -27,6 +27,7 @@ from ..log import logger
 _ALLOW_LIST = {
     "timm":          None,           # vision backbones (TimmWrapperModel)
     "addict":        None,           # Deepseek-OCR config dicts
+    "einops":        None,           # Deepseek-OCR deepencoder + many other vision models
     "matplotlib":    None,           # Deepseek-OCR + a few HF image utils
     "traitlets":     None,           # Jupyter/IPython widget chain
     "soundfile":     None,           # audio processors
