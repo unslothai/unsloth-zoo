@@ -2100,11 +2100,18 @@ def load_vllm(
                 f"    ninja - pip install ninja\n"
                 f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
             )
-            # Clear any externally-set FlashInfer env vars so vLLM uses defaults
-            if os.environ.get("VLLM_USE_FLASHINFER_SAMPLER", "") == "1":
-                del os.environ["VLLM_USE_FLASHINFER_SAMPLER"]
-            if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
-                del os.environ["VLLM_ATTENTION_BACKEND"]
+            # Force vLLM off FlashInfer when nvcc/ninja are missing.
+            # `del`-ing the vars wasn't enough: vLLM's nightly v1 engine
+            # picks FlashInfer as the *default* attention backend on
+            # sm_100/sm_120 (Blackwell), then still JIT-compiles the
+            # trtllm-gen kernels and crashes inside `vllm.LLM()`. Pin the
+            # backend to FLASH_ATTN and the sampler off so vLLM never even
+            # tries to import FlashInfer's JIT path. Also propagate to
+            # UNSLOTH_VLLM_NO_FLASHINFER so any downstream code path in
+            # unsloth_zoo / load_vllm sees a consistent disable signal.
+            os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+            os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+            os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
         else:
             # Check if FLASHINFER is supported - for eg Qwen3-VL and Qwen2-VL do not work
             if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
