@@ -978,9 +978,8 @@ class UnslothVisionDataCollator:
                 image[i] = img.resize(image_size, LANCZOS)
             elif self.size_func(img) > image_size and hasattr(img, "resize"):
                 w, h = img.size
-                # integer math rounding; clamp to >=1 so degenerate aspect
-                # ratios (e.g. 1024x1, 4000x4) where the downscale would
-                # round one side to 0 do not crash PIL.resize.
+                # integer math rounding; max(1, _) avoids zero-side crash
+                # on degenerate aspect ratios (e.g. 1024x1 with image_size=256).
                 new_w = max(1, (w * image_size + self.size_func(img) // 2) // self.size_func(img))
                 new_h = max(1, (h * image_size + self.size_func(img) // 2) // self.size_func(img))
                 if self.snap_to_patch_size:
