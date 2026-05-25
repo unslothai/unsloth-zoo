@@ -278,7 +278,18 @@ def _is_lm_head_trainable(model):
             key, lora_module_prefixes, has_root_lora_module,
         ):
             continue
-        if 'lm_head' in key or 'embed_tokens.weight' in key:
+        # Segment-match instead of substring so unrelated names like
+        # `decoder.not_lm_head_router.weight` or `foo.embed_tokens_aux.weight`
+        # do not get classified as the real LM head / embedding. mirrors
+        # the trainer-side LR-multiplier fix that already segment-matches.
+        segments = key.split(".")
+        is_lm_head_param = "lm_head" in segments
+        is_embed_tokens_weight = (
+            len(segments) >= 2
+            and segments[-2] == "embed_tokens"
+            and segments[-1] == "weight"
+        )
+        if is_lm_head_param or is_embed_tokens_weight:
             return True
     return len(trainable) == 0  # no LoRA = full fine-tuning = trainable
 
@@ -2674,6 +2685,17 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
     ".linear.biases",
 )
 
+# Top-level base-tensor keys for the rare case where a LoRA wrapper is
+# the root module of the model. The wrapper exposes both the bare
+# nn.Linear shape (`weight` / `scales` / `biases`) and the inner-layer
+# QuantizedLinear variants (`linear.weight` / `linear.scales` /
+# `linear.biases`); both shapes are reload-leaked base state and must be
+# dropped from adapter saves identically to non-root LoRA wrappers.
+_ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
+    "weight", "scales", "biases",
+    "linear.weight", "linear.scales", "linear.biases",
+})
+
 
 def _is_base_tensor_inside_lora_module(
     key, lora_module_prefixes, has_root_lora_module=False,
@@ -2695,15 +2717,18 @@ def _is_base_tensor_inside_lora_module(
     matches_prefix = lora_module_prefixes and any(
         key.startswith(p) for p in lora_module_prefixes
     )
-    # Bare top-level base tensors (no `.` in the key) only count when
-    # the model actually carries a root-level LoRA wrapper.
-    matches_root = has_root_lora_module and "." not in key
-    if not (matches_prefix or matches_root):
-        return False
-    if matches_root:
-        # Allow plain "weight" / "scales" / "biases" without a leading dot.
-        return key in {"weight", "scales", "biases"} or key.endswith(_LORA_WRAPPED_BASE_SUFFIXES)
-    return key.endswith(_LORA_WRAPPED_BASE_SUFFIXES)
+    if matches_prefix:
+        return key.endswith(_LORA_WRAPPED_BASE_SUFFIXES)
+    # Root-level LoRA wrappers expose their base tensors at the top of
+    # the tree (no module prefix). The bare names are `weight`,
+    # `scales`, `biases`, and the wrapper-internal `linear.weight` /
+    # `linear.scales` / `linear.biases` variants for QuantizedLinear-
+    # wrapped roots. Only these specific keys count; we cannot match
+    # by suffix here because every other tensor in the model also has
+    # no leading prefix once you strip the implicit module path.
+    if has_root_lora_module:
+        return key in _ROOT_LORA_WRAPPED_BASE_KEYS
+    return False
 
 
 def save_trainable_adapters(model, path, adapter_config=None):
@@ -2931,7 +2956,15 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     # fine-tune checkpoint causes mlx-lm.load_adapters() to inject LoRA
     # wrappers before binding the saved full-precision weights.
     has_lora_modules = any(True for _ in iter_mlx_lora_modules(model))
-    declared_lora_artifact = adapter_config.get("fine_tune_type") in {"lora", "dora"}
+    # Cross-check the caller-declared artifact against the live model so
+    # stale `fine_tune_type="lora"` from a re-used adapter_config dict
+    # does NOT survive a save where the live model has zero LoRA modules.
+    # mlx-lm.load_adapters() would otherwise try to inject LoRA wrappers
+    # before binding the saved full-precision weights, breaking reload.
+    declared_lora_artifact = (
+        has_lora_modules
+        and adapter_config.get("fine_tune_type") in {"lora", "dora"}
+    )
     # If the live model has LoRA modules but the caller passed an
     # `adapter_config={"fine_tune_type": "full"}` (re-used config or
     # stale dict), the saved tensors would be lora_a / lora_b while
@@ -3127,6 +3160,18 @@ def _push_lora_adapters_to_hub(
     if repo_id is None:
         repo_id = save_directory.name
 
+    # Capture caller intent BEFORE we overwrite None with the Unsloth
+    # defaults; once we backfill, both `None` and `"My message"` look
+    # identical and the fallback can no longer detect that the caller
+    # asked for a non-default commit string. upload_large_folder cannot
+    # represent commit_message / commit_description, so a silent fallback
+    # would drop them on the floor.
+    _caller_wants_commit_metadata = bool(
+        create_pr
+        or commit_message is not None
+        or commit_description is not None
+    )
+
     # Match push_to_hub_merged's commit conventions so the history is
     # recognizable across CUDA and MLX backends.
     if commit_message is None:
@@ -3230,19 +3275,21 @@ def _push_lora_adapters_to_hub(
             revision=revision,
             allow_patterns=_lora_allow_patterns,
         )
-    except (AttributeError, TypeError):
+    except (AttributeError, TypeError) as exc:
         # upload_large_folder cannot represent commit_message /
         # commit_description / create_pr. Falling back here when the
-        # caller asked for create_pr=True would silently push to the
-        # main branch instead. Refuse to do that; let the caller fix
-        # the environment (upgrade huggingface_hub) or drop the kwarg.
-        if create_pr:
+        # caller asked for any of those would silently push to main with
+        # the default Unsloth commit string instead of what was requested.
+        # Refuse to do that; let the caller fix the environment (upgrade
+        # huggingface_hub) or drop the kwarg.
+        if _caller_wants_commit_metadata:
             raise RuntimeError(
-                "Unsloth: upload_folder() failed but create_pr=True was "
-                "requested; upload_large_folder() cannot create a PR. "
-                "Upgrade huggingface_hub or call create_pull_request() "
-                "yourself and pass revision=<pr-branch> instead."
-            )
+                "Unsloth: upload_folder() failed but commit metadata or "
+                "create_pr=True was requested; upload_large_folder() "
+                "cannot preserve commit_message, commit_description, or "
+                "create a PR. Upgrade huggingface_hub or retry without "
+                "those kwargs."
+            ) from exc
         api.upload_large_folder(
             folder_path=str(save_directory),
             repo_id=repo_id,
@@ -3664,10 +3711,14 @@ def push_to_hub_merged(
     # It cannot represent commit_message / commit_description /
     # create_pr though, so those three are what trigger the
     # upload_folder route (which preserves them).
+    # An explicit `commit_message=None` from a wrapper is functionally
+    # equivalent to "use the default" (it is what the wrapper passed
+    # through when no commit message was set by the user) and must not
+    # force the upload_folder route just because `None != <default>`.
     _caller_wants_commit_metadata = bool(
         create_pr
-        or commit_message != _PUSH_MERGED_DEFAULT_COMMIT_MESSAGE
-        or commit_description != _PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION
+        or commit_message not in (None, _PUSH_MERGED_DEFAULT_COMMIT_MESSAGE)
+        or commit_description not in (None, _PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION)
     )
 
     # Match the GPU path's "(Trained with Unsloth)" suffix convention so
@@ -3746,17 +3797,19 @@ def push_to_hub_merged(
                 create_pr=create_pr,
                 revision=revision,
             )
-        except (AttributeError, TypeError):
+        except (AttributeError, TypeError) as exc:
             # Same constraint as the LoRA helper: upload_large_folder
-            # cannot represent create_pr. Refuse to silently lose it.
-            if create_pr:
+            # cannot represent commit_message / commit_description /
+            # create_pr. Refuse to silently swap them for the default
+            # Unsloth strings when the caller explicitly asked otherwise.
+            if _caller_wants_commit_metadata:
                 raise RuntimeError(
-                    "Unsloth: upload_folder() failed but create_pr=True "
-                    "was requested; upload_large_folder() cannot create "
-                    "a PR. Upgrade huggingface_hub or call "
-                    "create_pull_request() yourself and pass "
-                    "revision=<pr-branch> instead."
-                )
+                    "Unsloth: upload_folder() failed but commit metadata "
+                    "or create_pr=True was requested; upload_large_folder() "
+                    "cannot preserve commit_message, commit_description, or "
+                    "create a PR. Upgrade huggingface_hub or retry without "
+                    "those kwargs."
+                ) from exc
             api.upload_large_folder(
                 folder_path=str(save_directory),
                 repo_id=repo_id,
