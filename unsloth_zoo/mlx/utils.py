@@ -2164,8 +2164,10 @@ def _to_mx_vlm_batch(inputs):
         batch["input_ids"] = batch["input_ids"].astype(mx.int32)
     if "attention_mask" in batch:
         batch["attention_mask"] = batch["attention_mask"].astype(mx.int32)
-    if "labels" in batch:
-        batch["labels"] = batch["labels"].astype(mx.int32)
+    # Do NOT narrow labels here. Runtime CCE now validates the original
+    # dtype/range before its own int32 narrow so wide invalid labels
+    # (e.g. 2**32 - 100 wrapping to -100) get NaN-poisoned instead of
+    # silently treated as ignore_index. Casting upstream defeats that.
 
     return batch
 
@@ -2234,7 +2236,9 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
     labels = mx.array(labels_np)
     if "attention_mask" in batch:
         labels = mx.where(batch["attention_mask"] == 0, mx.array(-100), labels)
-    batch["labels"] = labels.astype(mx.int32)
+    # labels_np was built as np.int32 already; do not re-narrow here so
+    # the runtime CCE validity check sees the labels' original dtype.
+    batch["labels"] = labels
     return batch
 
 
