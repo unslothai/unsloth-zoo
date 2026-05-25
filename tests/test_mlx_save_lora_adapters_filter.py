@@ -420,6 +420,27 @@ def test_ensure_lora_frozen_skips_when_no_lora_modules_present():
     assert freeze_calls == [], freeze_calls
 
 
+def test_save_trainable_adapters_omits_lora_metadata_for_full_checkpoint(tmp_path):
+    # A full fine-tune (no LoRA modules) must not stamp fine_tune_type='lora'
+    # or default lora_parameters on its adapter_config.json; mlx-lm would
+    # otherwise inject LoRA wrappers before binding the saved full weights.
+    from unsloth_zoo.mlx.utils import save_trainable_adapters
+    import json
+
+    plain = _MockPlainLinear(16, 32)
+    model = _make_model({"dense": plain})
+
+    save_trainable_adapters(model, tmp_path)
+    with open(tmp_path / "adapter_config.json", "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    assert "lora_parameters" not in cfg, cfg
+    assert "rank" not in cfg, cfg
+    assert "num_layers" not in cfg, cfg
+    assert cfg.get("fine_tune_type") != "lora", cfg
+    assert cfg.get("peft_type") != "LORA", cfg
+
+
 def test_save_pretrained_merged_lora_method_raises_when_no_adapter_tensors(tmp_path):
     # The new outer gate uses collect_mlx_lora_adapter_tensors, so the
     # "no LoRA layers" ValueError is raised at the gate with the
@@ -611,14 +632,15 @@ def test_ensure_lora_frozen_freezes_norm_whose_name_contains_lora_substring():
     assert freeze_calls == [(["weight"], False)], freeze_calls
 
 
-def test_save_pretrained_merged_lora_method_stays_lora_only_with_mixed_trainable(
+def test_save_pretrained_merged_lora_method_preserves_external_trainables(
     tmp_path, monkeypatch
 ):
-    # save_method='lora' must always produce a lean LoRA-only artifact
-    # that mlx-lm.load_adapters() can reload, even when other tensors are
-    # currently trainable. Mixed fine-tunes save their full trainable tree
-    # via the explicit save_trainable_adapters() API; the public 'lora'
-    # save method must not silently include non-LoRA state.
+    # When the user intentionally trains non-LoRA tensors OUTSIDE a
+    # LoRA-wrapped module (embed_tokens, lm_head, projector, vision,
+    # norm), save_method='lora' must preserve them via the trainable
+    # writer. Base weights INSIDE a LoRA module are still excluded so
+    # accidentally-trainable q_proj.weight under a wrapped q_proj does
+    # not leak (covered by the reload regression test above).
     from unsloth_zoo.mlx import utils as mlx_utils
 
     lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
@@ -669,7 +691,7 @@ def test_save_pretrained_merged_lora_method_stays_lora_only_with_mixed_trainable
     mlx_utils.save_pretrained_merged(
         _MixedModel(), _Tok(), tmp_path, save_method="lora",
     )
-    assert routed == ["lora"], routed
+    assert routed == ["trainable"], routed
 
 
 def test_save_pretrained_merged_lora_method_pure_lora_uses_lean_writer(

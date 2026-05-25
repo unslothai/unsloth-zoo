@@ -67,6 +67,7 @@ from .utils import (
     save_lora_adapters,
     save_trainable_adapters,
     collect_mlx_lora_adapter_tensors,
+    iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -778,7 +779,10 @@ class MLXTrainer:
             optimizer.update to promote params/m/v to fp32 too.
             """
             scale = mx.array(1.0, dtype=mx.float32) / safe_toks_f
-            if use_lora_plus and "lora_b" in name:
+            # anchor on the parameter suffix so unrelated keys whose path
+            # merely contains "lora_b" (e.g. a routing layer literally named
+            # lora_b_router.weight) do not receive the LoRA+ multiplier.
+            if use_lora_plus and (name == "lora_b" or name.endswith(".lora_b")):
                 scale = scale * lora_plus_ratio
             if use_embedding_lr and ("embed_tokens" in name or "lm_head" in name):
                 scale = scale * embedding_lr_ratio
@@ -1439,16 +1443,32 @@ class MLXTrainer:
                 ),
             }
 
-            # save_model() must always produce a clean LoRA-only artifact
-            # that mlx-lm.load_adapters() can reload; routing through
-            # save_trainable_adapters here would leak base tensors that get
-            # accidentally marked trainable after a checkpoint reload.
-            # Mixed LoRA + embedding / projector / vision trainables are
-            # already preserved in the in-loop save_trainable_adapters()
-            # checkpoints, and callers can also invoke that helper directly.
-            save_lora_adapters(
-                self.model, output_dir, adapter_config=adapter_config,
+            # Preserve intentionally trained non-LoRA tensors (embeddings,
+            # lm_head, projector, vision, norm) when they live OUTSIDE any
+            # LoRA-wrapped module, while still dropping accidentally trainable
+            # base weights INSIDE a LoRA module (q_proj.weight under a
+            # LoRA-wrapped q_proj would re-leak the original Studio reload
+            # bug). When the only non-LoRA trainables sit under a LoRA
+            # module, the artifact stays lean and LoRA-only.
+            trainable = dict(tree_flatten(self.model.trainable_parameters()))
+            adapter_keys = set(adapter_tensors)
+            lora_module_prefixes = tuple(
+                f"{name}." for name, _ in iter_mlx_lora_modules(self.model)
+                if name
             )
+            has_external_non_lora_trainable = any(
+                key not in adapter_keys
+                and not any(key.startswith(p) for p in lora_module_prefixes)
+                for key in trainable
+            )
+            if has_external_non_lora_trainable:
+                save_trainable_adapters(
+                    self.model, output_dir, adapter_config=adapter_config,
+                )
+            else:
+                save_lora_adapters(
+                    self.model, output_dir, adapter_config=adapter_config,
+                )
             # why: VLM processors include the inner tokenizer; double-save
             # rewrites the same files. Skip when the processor will cover it.
             _processor = self.processor or getattr(self.model, "_processor", None)
