@@ -14,16 +14,14 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-PR-A integration: exercise unsloth_zoo.mlx.loader._dequantize_selected_mlx_modules.
+"""Exercise unsloth_zoo.mlx.loader._dequantize_selected_mlx_modules.
 
 Builds a synthetic MLX-style model with one QuantizedLinear submodule,
-runs PR-A's dequantize-and-replace helper, verifies the result is
-a numerically correct nn.Linear with the dequantized weight.
-
-This is the canonical PR-A code path: load_in_4bit=False (or
-selective requantize) walks named_modules, finds QuantizedLinear,
-calls mx.dequantize with mode='affine', and swaps in nn.Linear.
+runs the dequantize-and-replace helper, and verifies the result is a
+numerically correct nn.Linear with the dequantized weight. Mirrors the
+load_in_4bit=False / selective requantize path: walks named_modules,
+finds QuantizedLinear, calls mx.dequantize with mode='affine', swaps
+in nn.Linear.
 """
 
 from __future__ import annotations

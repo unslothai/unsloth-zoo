@@ -97,8 +97,7 @@ _NORM_OUTPUT_CAST_PATCHED_CLASSES = set()
 
 
 def _part_is_norm(part: str) -> bool:
-    # Match RMSNorm/LayerNorm/input_layernorm/etc. via "norm" substring,
-    # plus GPT-2 / GPT-OSS style ln_1, ln_2, ln_f.
+    # "norm" matches RMSNorm/LayerNorm/input_layernorm; ln_* covers GPT-2/GPT-OSS.
     return "norm" in part or part.startswith("ln_") or part == "ln_f"
 
 
@@ -224,9 +223,7 @@ def _set_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
     result back matches PyTorch autocast behavior more closely: fp32 norm math,
     bf16/fp16 downstream activations.
     """
-    # Keep the Qwen3-VL specialized vision-block norm patch in sync with
-    # the generic patcher below. Imported lazily to avoid a circular
-    # import at trainer-module load time.
+    # Sync Qwen3-VL vision-block patch with generic patcher (lazy import: cycle).
     try:
         from . import compile as _mlx_compile
         _mlx_compile.set_qwen3_vision_norm_cast_output(enabled)
@@ -305,13 +302,8 @@ class MLXTrainingConfig:
     adam_beta1: float | None = None
     adam_beta2: float | None = None
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
-    # Elementwise clip: each gradient element is clamped to
-    # `[-max_grad_value, +max_grad_value]`. Per-leaf only, no cross-leaf
-    # reduction, so it does not pay the global-norm memory overhead.
-    # None (default) keeps the cheap MLX default of 1.0 unless the user
-    # passes max_grad_norm > 0, in which case global-norm clipping wins.
-    # 0.0 disables. A positive float opts in explicitly and overrides
-    # max_grad_norm with a warning.
+    # Per-leaf elementwise clip to `[-v, +v]`. None defaults to 1.0
+    # unless max_grad_norm > 0 (global-norm wins). 0.0 disables.
     max_grad_value: float | None = None
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
@@ -352,12 +344,7 @@ class MLXTrainingConfig:
     wired_limit_gb: float | None = None  # None = min(recommended working set, memory limit); <= 0 disables
     disable_memory_limits: bool = False
     cast_norm_output_to_input_dtype: bool = True  # fp32 norm storage/math, bf16/fp16 downstream activations
-    # Append the tokenizer EOS id to each encoded text row before batching.
-    # Default True mirrors mlx-lm's TextDataset behavior so direct MLX
-    # text fine-tuning callers (raw `{"text": str}` rows) still train the
-    # model to predict EOS. Studio passes False because its chat template
-    # already renders EOS.
-    append_eos: bool = True
+    append_eos: bool = True  # True = mlx-lm parity; Studio sets False (template owns EOS)
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
@@ -528,8 +515,7 @@ class MLXTrainer:
             ) / mx.array(max(total_steps - warmup, 1), dtype=mx.float32)
 
         def schedule(step):
-            # Match HuggingFace/Trainer LR as seen by the optimizer before
-            # each update. ``step`` is zero-based optimizer-step index.
+            # HF Trainer LR parity; `step` is zero-based optimizer-step index.
             step = mx.array(step).astype(mx.float32)
             if warmup > 0:
                 warm = lr * warmup_multiplier(step)
@@ -624,15 +610,13 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name == "sgd":
-            # HF parity: decoupled bias/norm-aware decay, applied manually.
+            # HF parity: manual bias/norm-aware decoupled decay.
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "muon":
-            # HF parity: decoupled bias/norm-aware decay, applied manually.
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Muon(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "lion":
-            # HF parity: decoupled bias/norm-aware decay, applied manually.
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
         self._resolved_optimizer_name = opt_name
@@ -856,10 +840,7 @@ class MLXTrainer:
         args = self.args
         model = self.model
         cast_norm_output = bool(getattr(args, "cast_norm_output_to_input_dtype", True))
-        # Remember the Qwen3-VL vision-block flag so the finally block can
-        # restore the original value rather than always forcing it to
-        # False (which would otherwise leak across train() boundaries for
-        # subsequent inference in the same process).
+        # Save Qwen3-VL vision-block flag so finally restores it (not just False).
         _prev_qwen3_vision_cast = True
         try:
             from . import compile as _mlx_compile
@@ -868,11 +849,7 @@ class MLXTrainer:
             )
         except Exception:
             pass
-        # Install the norm-output cast INSIDE the try/finally so a raise
-        # during any of the steps below (patch-mode normalization, memory
-        # limit configuration, compile policy, gradient checkpointing,
-        # Qwen3.5 preflight) still triggers the cleanup that restores the
-        # global RMSNorm / LayerNorm / Qwen3-VL flags.
+        # Patch INSIDE try/finally so any raise during setup still restores globals.
         _norm_cast_applied = False
         try:
             _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
@@ -954,18 +931,12 @@ class MLXTrainer:
             except Exception:
                 pass
             if _norm_cast_applied and cast_norm_output:
-                # Undo the global norm-class monkey patch so later
-                # inference / unrelated trainers in the same Python
-                # process get the original RMSNorm / LayerNorm dtype
-                # behavior. Wrap in try/except: a partially patched
-                # state must still let `finally` run to completion.
+                # Undo the global norm-class patch; tolerate partial state.
                 try:
                     _set_norm_output_cast_to_input_dtype(False, model)
                 except Exception:
                     pass
-            # Restore the Qwen3-VL vision-block flag to whatever it was
-            # before train() started, instead of leaking the False that
-            # `_set_norm_output_cast_to_input_dtype(False, ...)` just set.
+            # Restore Qwen3-VL vision-block flag to its pre-train value.
             try:
                 from . import compile as _mlx_compile
                 _mlx_compile.set_qwen3_vision_norm_cast_output(
@@ -986,9 +957,7 @@ class MLXTrainer:
 
         if is_vlm:
             processor = self._resolve_vlm_processor()
-            # VLM collation owns label creation/masking. These IDs should be
-            # redundant for normal SFT batches and are only a loss-side
-            # compatibility backstop for missing or externally supplied labels.
+            # Backstop only; VLM collation already owns label masking.
             _vlm_ignore_token_ids = _get_vlm_ignore_token_ids(
                 processor=processor,
                 config=getattr(model, "_config", {}),
@@ -1209,8 +1178,7 @@ class MLXTrainer:
             return getattr(optimizer, "betas", None)
 
         def _clip_grad_by_value(grad):
-            # Elementwise clip to [-max_grad_value, +max_grad_value],
-            # per-leaf, no cross-leaf reduction.
+            # Per-leaf elementwise clip; no cross-leaf reduction.
             if not _clip_grad_value:
                 return grad
             return tree_map(
@@ -1784,12 +1752,7 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
-                # `iterate_training_batches` does not yet take a
-                # `dataset_order` argument, so streaming text MLX
-                # training cannot honor `preserve_dataset_order` /
-                # `dataset_order="torch_randperm"`. Refuse instead of
-                # silently dropping the user-requested order so Studio
-                # / CUDA parity stays explicit.
+                # Streaming has no index space; refuse explicit order requests.
                 if (
                     getattr(args, "preserve_dataset_order", False)
                     or getattr(args, "dataset_order", "default") != "default"
@@ -1988,11 +1951,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     #    slow tokenizers degrade gracefully via the GIL)
     def _process_text(text):
         encoded = tokenizer.encode(text)
-        # Honor the same `append_eos` contract as `_prepare_dataset`; the
-        # unlabeled text path (`_prepare_dataset` -> mlx-lm CacheDataset)
-        # appends or skips EOS based on the trainer's config, so the
-        # labeled `train_on_responses_only` path must match or the two
-        # produce different supervised tokens for the same input.
+        # Mirror `_prepare_dataset`'s EOS contract; mismatch desyncs labeled vs unlabeled.
         if append_eos and eos_id is not None and (not encoded or encoded[-1] != eos_id):
             encoded.append(eos_id)
         if len(encoded) > max_seq_length:
@@ -2018,14 +1977,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             "Check your dataset and formatting_func."
         )
 
-    # 2. Determine sample ordering strategy. The labeled and unlabeled
-    # paths must agree at sample granularity or `dataset_order="torch_randperm"`
-    # produces a different sample stream under `train_on_responses_only(...)`.
-    #   - preserve_dataset_order=True / "sequential": dataset order.
-    #   - "torch_randperm": deterministic torch.randperm permutation
-    #     (matches `create_ordered_batches` -> `_torch_randperm_order`
-    #     at utils.py:2845-2849), reseeded per epoch.
-    #   - default / None: legacy mlx-lm length-sort + per-batch shuffle.
+    # 2. Sample order; must agree with unlabeled `create_ordered_batches`
+    # (utils.py:2845-2849) so `train_on_responses_only` sees the same stream.
     _order_requested = preserve_dataset_order or (
         dataset_order not in (None, "default")
     )
@@ -2041,19 +1994,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             return list(items)
         if dataset_order == "torch_randperm":
             from .utils import _torch_randperm_order
-            # Match unlabeled `create_ordered_batches`: reseed per epoch
-            # so the second epoch sees a different sample order rather
-            # than repeating the first.
+            # Reseed per epoch (matches `create_ordered_batches`).
             order = _torch_randperm_order(len(items), seed + epoch_idx)
             return [items[i] for i in order]
         # legacy default: length-sort once
         return sorted(items, key=lambda x: len(x[0]))
 
-    # 3. Materialize batches for one or many epochs.
-    # When `num_epochs > 1` and the caller requested a specific order, build
-    # `num_epochs * batches_per_epoch` batches up front so the trainer's
-    # `batches[batch_idx % len(batches)]` cycle reproduces the same per-epoch
-    # reseed semantics as the unlabeled `create_ordered_batches` path.
+    # 3. Build `num_epochs` blocks so `batches[i % len]` cycle reseeds correctly.
     _n_epochs_materialize = (
         max(1, int(num_epochs)) if num_epochs is not None else 1
     )
@@ -2067,8 +2014,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             if not batch_items:
                 continue
             max_len = max(len(ids) for ids, _ in batch_items)
-            # Match mlx-lm iterate_batches: +1 gives the autoregressive
-            # shift headroom so post-shift length is a clean _PAD_MULTIPLE.
+            # +1 for autoregressive shift (mlx-lm iterate_batches parity).
             padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
             padded_len = min(padded_len, max_seq_length)
 
@@ -2080,8 +2026,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                 pad_len = padded_len - L
                 batch_ids.append(ids[:L] + [0] * pad_len)
                 batch_labels.append(lbls[:L] + [-100] * pad_len)
-                # Right-half-open [start, end) to match the loss masks in
-                # utils.py:360/:393/:429/:439 (`steps < lengths[:, 1:]`).
+                # [start, end) matches loss masks in utils.py:360/:393/:429/:439.
                 batch_lengths.append([1, L])
 
             epoch_batches.append((
@@ -2090,9 +2035,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                 mx.array(batch_labels),
             ))
 
-        # 4. Order the batch sequence within the epoch.
-        # legacy default (length-sort) gets a per-batch shuffle so adjacent
-        # steps are not similar; explicit-order paths keep the sample order.
+        # 4. Legacy length-sort: shuffle batches so adjacent steps differ.
         if not _order_requested:
             rng.shuffle(epoch_batches)
         batches.extend(epoch_batches)

@@ -147,8 +147,7 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
 def _is_norm_parameter_path(path) -> bool:
     """Return whether a parameter path belongs to a normalization module."""
     parts = str(path).lower().split(".")
-    # Match RMSNorm/LayerNorm via "norm" substring, plus GPT-2 / GPT-OSS
-    # style ln_1, ln_2, ln_f.
+    # "norm" matches RMSNorm/LayerNorm; ln_* covers GPT-2/GPT-OSS.
     return any(
         "norm" in part or part.startswith("ln_") or part == "ln_f"
         for part in parts[:-1]
@@ -792,8 +791,7 @@ _MULTIMODAL_SKIP_FRAGMENTS = (
 
 _MLX_QUANT_MODE_DEFAULTS = {
     "affine": (64, 4),
-    # Diagnostic CUDA bitsandbytes NF4 parity mode. This quantizes and then
-    # immediately dequantizes into dense Linear weights; it is not memory-saving.
+    # CUDA bnb NF4 parity (diagnostic): quantize then dequantize; not memory-saving.
     "nf4_dense": (64, 4),
     "mxfp4": (32, 4),
     "nvfp4": (16, 4),

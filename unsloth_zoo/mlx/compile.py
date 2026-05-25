@@ -2683,9 +2683,7 @@ def _install_qwen3_family_compile_patches():
 
         attn_outputs = []
         for q_chunk, k_chunk, v_chunk in zip(*splits):
-            # MLX fused SDPA currently has a forward/value mismatch under
-            # value_and_grad for Qwen3-VL vision chunks. Use explicit attention
-            # here so training loss and plain forward loss agree.
+            # MLX fused SDPA mismatches value_and_grad for Qwen3-VL vision; use explicit.
             scores = (
                 q_chunk.astype(mx.float32)
                 @ mx.swapaxes(k_chunk.astype(mx.float32), -1, -2)

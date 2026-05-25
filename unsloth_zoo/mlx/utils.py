@@ -421,13 +421,8 @@ def make_baseline_loss_fn():
     """
     def loss_fn(model, batch, lengths, labels=None):
         if labels is None:
-            # Match the CCE (`utils.py:360`, `:393`) and labels-aware
-            # baseline (`utils.py:439`) masks: end is exclusive. The
-            # pre-PR `<=` was inclusive and the comment said "byte-identical
-            # to mlx_lm.tuner.trainer.default_loss", but mlx_lm's lengths
-            # convention is right-half-open (`[start, end)`), so the
-            # consistent CCE / labels-aware paths are also the correct
-            # ones for the unlabeled baseline.
+            # Half-open [start, end) end-exclusive mask; matches CCE/labels paths
+            # (:360, :393, :439) and mlx_lm's lengths convention.
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
             logits = model(inputs)
@@ -689,18 +684,12 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         attention_mask = batch_dict.get("attention_mask")
         labels = batch_dict.get("labels")
 
-        # Match the CCE path semantics: forward the full multimodal
-        # sequence and shift the resulting logits afterwards. Qwen3-VL
-        # image / mRoPE / deepstack state depends on the complete
-        # sequence; trimming `input_ids[:, :-1]` before the multimodal
-        # forward gives a different loss from the full-logits CUDA
-        # path. Mirrors `_vlm_cce_forward` so use_cce=False stays in
-        # parity with use_cce=True.
+        # Forward full sequence then shift (Qwen3-VL mRoPE/deepstack need it);
+        # mirrors `_vlm_cce_forward` so use_cce={True,False} stay in parity.
         inputs = input_ids
         fwd_mask = attention_mask
 
-        # Forward pass — let the model create its own causal mask.
-        # Pass extra keys (e.g. image_grid_thw for Qwen) that some models need.
+        # Pass through extras (e.g. image_grid_thw for Qwen); model owns causal mask.
         fwd_kwargs = {
             k: v for k, v in batch_dict.items()
             if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
@@ -714,14 +703,10 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         logits = logits[:, :-1, :]
 
         if labels is not None:
-            # Labels encode instruction/padding/special-token masking when
-            # produced by MLX VLM collation. The extra mask keeps legacy
-            # externally supplied labels compatible.
+            # Extra masks keep externally supplied labels compatible.
             targets = labels[:, 1:]
             targets = _mask_image_tokens(targets, _image_token_ids)
-            # Apply train_on_completions prompt masking even when labels
-            # were preset by _apply_vlm_label_masks (which only handles
-            # image/pad/ignore tokens, not assistant-token boundaries).
+            # _apply_vlm_label_masks ignores assistant boundaries; mask here.
             targets = _mask_prompt_tokens(targets, _assistant_token_id)
             logits, targets = _align_logits_with_labels(logits, targets)
             if attention_mask is not None:
@@ -858,11 +843,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     attention_mask = batch_dict.get("attention_mask")
     labels = batch_dict.get("labels")
 
-    # Match the standard VLM forward semantics: run the full multimodal
-    # sequence, then use hidden[:, :-1] to predict labels[:, 1:].  Qwen3-VL
-    # image/mRoPE/deepstack state depends on the complete sequence; trimming
-    # input_ids before the multimodal forward produces a different loss from
-    # the full-logits path and from CUDA.
+    # Forward full sequence then shift hidden[:, :-1] (Qwen3-VL mRoPE/deepstack).
     inputs = input_ids
     fwd_attn_mask = attention_mask
 
@@ -881,10 +862,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         **extra_kwargs,
     )
     merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
-    # Prefer position_ids returned/stashed by get_input_embeddings (some
-    # VLM embedders, e.g. Qwen-VL family, adjust them for the merged
-    # multimodal sequence). Only fall back to the raw batch position_ids
-    # if the embedder did not produce its own.
+    # Prefer embedder-produced position_ids (Qwen-VL adjusts for merged seq).
     if "position_ids" in extra_kwargs and "position_ids" not in backbone_kwargs:
         backbone_kwargs["position_ids"] = extra_kwargs["position_ids"]
 
@@ -897,9 +875,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     hidden = hidden[:, :-1, :]
 
     if labels is not None:
-        # Labels are the source of truth. Collation should already encode
-        # instruction/padding/special-token masking; the extra mask preserves
-        # compatibility for externally supplied labels.
+        # Extra mask keeps externally supplied labels compatible.
         targets = labels[:, 1:]
         masked_targets = _mask_image_tokens(targets, image_token_ids)
         if attention_mask is not None:
@@ -911,11 +887,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
             masked_targets,
             -100,
         )
-        # Completion-only masking also has to run in the labels-aware
-        # branch because _apply_vlm_label_masks does not apply it. Pre-fix
-        # this was only applied in the labels=None branch, so VLM
-        # train_on_completions=True trained on prompt tokens whenever
-        # collation set batch["labels"].
+        # Completion-only masking; _apply_vlm_label_masks doesn't do this.
         masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
         ntoks = (masked_targets != -100).sum()
     else:
@@ -2281,9 +2253,7 @@ def _nest_vlm_images_by_sample(all_images):
 def _vlm_processor_prefers_nested_images(processor):
     cls = processor.__class__
     marker = f"{getattr(cls, '__module__', '')}.{getattr(cls, '__name__', '')}".lower()
-    # Some mlx-vlm processors count images per prompt and require
-    # images=[[sample0_img0, ...], [sample1_img0, ...]]. Qwen/LLaVA/Gemma4-style
-    # processors consume a flat image stream and are handled by the default path.
+    # These processors need images grouped per-prompt; others take a flat list.
     return any(
         name in marker
         for name in (
@@ -2638,9 +2608,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                     indices[i : i + batch_size]
                     for i in range(0, len(indices), batch_size)
                 ]
-                # Use a per-epoch local Generator so order is reproducible
-                # under `seed` and does not depend on global numpy RNG
-                # state. Mirrors the torch_randperm branch reseed above.
+                # Local RNG keeps order reproducible under `seed`; reseed per epoch.
                 rng = np.random.default_rng(base_seed + epoch)
                 order = rng.permutation(len(batch_indices))
                 for b in order:
@@ -2655,10 +2623,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                 yield _emit(items)
             epoch += 1
     else:
-        # Iterable / unsized datasets cannot honor dataset_order because
-        # they expose no index space to permute. Refuse rather than
-        # silently stream source order (matches the text streaming path
-        # at trainer.py for the same asymmetry).
+        # Streaming has no index space; refuse rather than silently misorder.
         if dataset_order not in (None, "default"):
             raise ValueError(
                 "Unsloth MLX VLM: preserve_dataset_order / "
@@ -2885,16 +2850,10 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         if num_batches is None else None
     )
     while num_batches is None or len(batch_pairs) < num_batches:
-        # Take up to batch_size contiguous indices from the current epoch.
-        # If the epoch tail is shorter, emit a partial batch and start
-        # the next batch fresh at epoch+1. Matches CUDA / SequentialSampler
-        # `drop_last=False` and the VLM ordered path at utils.py:2539,
-        # instead of mixing the last sample of one epoch with the first
-        # sample of the next inside the same micro-batch.
+        # Don't mix epochs in one batch; emit a partial then restart at epoch+1.
+        # Matches CUDA SequentialSampler `drop_last=False` and VLM path at :2539.
         if order_pos >= len(order):
-            # No more rows in this epoch. Stop only when we have hit
-            # either the requested number of batches or the requested
-            # total sample count (num_epochs * len(dataset)).
+            # Stop when num_batches or num_epochs*len(dataset) reached.
             if (
                 num_batches is None
                 and (target_items is None or seen >= target_items)
@@ -2915,10 +2874,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         batch_items = [tokenized[i] for i in chunk]
 
         max_length = max(len(ids) for ids in batch_items)
-        # Prefer the tokenizer's declared pad id; only fall back to 0 if
-        # the tokenizer has none. Matches mlx-lm's iterate_batches pad
-        # convention so the model receives a known special id (not raw 0)
-        # for padded positions in the forward input.
+        # mlx-lm iterate_batches pad convention; raw 0 only if no pad_token_id.
         _pad_id = getattr(tokenizer, "pad_token_id", None)
         if _pad_id is None:
             _pad_id = 0

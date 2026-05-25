@@ -19,7 +19,7 @@ Smoke + Tier 1 + Tier 2 tests for the mlx_stub package.
 
 Verifies:
 1. simulate_mlx_on_torch() succeeds and registers all named submodules.
-2. PR-B's 5 fresh symbols (mx.metal.is_available, set_wired_limit,
+2. Studio backend's 5 fresh symbols (mx.metal.is_available, set_wired_limit,
    device_info, clear_cache, synchronize) work as expected.
 3. The ~70 trivial passthroughs round-trip vs torch on random inputs.
 4. Sub-architecture VLM submodules auto-resolve via the MetaPathFinder.
@@ -100,7 +100,7 @@ def test_vlm_subarch_auto_resolve(submodule):
 
 
 # ---------------------------------------------------------------------------
-# 2. Tier 1: PR-B fresh symbols.
+# 2. Tier 1: Studio backend fresh symbols.
 # ---------------------------------------------------------------------------
 
 def test_metal_is_available_returns_false():

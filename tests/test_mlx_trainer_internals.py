@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-PR-A deeper component exercises: trainer, compile discovery,
-cce backward, and quantization helpers — beyond just imports.
+"""Deeper MLX component exercises: trainer, compile discovery,
+cce backward, and quantization helpers, beyond just imports.
 
 If a test fails, the failing component identifies the next gap.
 """
@@ -68,7 +67,7 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
 
 @pytest.mark.parametrize("optim_name", ["adamw", "adam", "sgd", "adafactor"])
 def test_mlx_training_config_each_optim(optim_name):
-    """Every PR-A-supported optim string at least constructs cleanly in config."""
+    """Every supported optim string constructs cleanly in config."""
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
     cfg = MLXTrainingConfig(optim=optim_name)
     assert cfg.optim == optim_name

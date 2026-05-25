@@ -190,7 +190,7 @@ def test_vlm_torch_randperm_seed_none_and_multi_epoch_batches():
     assert first_epoch != second_epoch
 
 
-def test_pr684_compiler_review_guards_are_present():
+def test_compiler_review_guards_are_present():
     import unsloth_zoo.compiler as compiler
     import unsloth_zoo.mlx.compile as mlx_compile
 
