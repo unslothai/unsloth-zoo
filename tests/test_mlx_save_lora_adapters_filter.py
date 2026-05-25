@@ -954,6 +954,100 @@ def test_push_lora_adapters_routes_commit_metadata_through_upload_folder(
     assert sent["repo_id"] == "me/adapter"
 
 
+def test_push_to_hub_merged_honors_create_pr_via_upload_folder(
+    tmp_path, monkeypatch,
+):
+    # Regression for the same upload_large_folder kwarg-drop defect on the
+    # merged-save path: with create_pr=True or a custom commit_message,
+    # the merged push must route through upload_folder so the kwargs land.
+    import huggingface_hub
+    from unsloth_zoo.mlx.utils import push_to_hub_merged
+
+    # Pretend the model was already saved so push_to_hub_merged skips the
+    # merge step and only runs the upload path under test.
+    (tmp_path / "model.safetensors.index.json").write_text("{}")
+
+    calls = {"folder": [], "large": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kwargs):
+            return None
+
+        def update_repo_settings(self, **kwargs):
+            return None
+
+        def upload_folder(self, **kwargs):
+            calls["folder"].append(kwargs)
+
+        def upload_large_folder(self, **kwargs):
+            calls["large"].append(kwargs)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    push_to_hub_merged(
+        model=None,
+        tokenizer=None,
+        save_directory=tmp_path,
+        repo_id="me/merged",
+        commit_message="Release v2",
+        create_pr=True,
+    )
+
+    # Custom commit_message + create_pr=True must route through
+    # upload_folder so both reach the Hub. upload_large_folder would
+    # silently drop them.
+    assert len(calls["folder"]) == 1, calls
+    assert calls["large"] == [], calls
+    sent = calls["folder"][0]
+    assert "Release v2" in sent["commit_message"], sent
+    assert sent["create_pr"] is True
+
+
+def test_push_to_hub_merged_uses_large_folder_when_no_custom_metadata(
+    tmp_path, monkeypatch,
+):
+    # When the caller did NOT pass custom commit metadata, prefer
+    # upload_large_folder so multi-GB merged dirs get chunked uploads
+    # with resume. This preserves the original large-merge behavior.
+    import huggingface_hub
+    from unsloth_zoo.mlx.utils import push_to_hub_merged
+
+    (tmp_path / "model.safetensors.index.json").write_text("{}")
+
+    calls = {"folder": [], "large": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kwargs):
+            return None
+
+        def update_repo_settings(self, **kwargs):
+            return None
+
+        def upload_folder(self, **kwargs):
+            calls["folder"].append(kwargs)
+
+        def upload_large_folder(self, **kwargs):
+            calls["large"].append(kwargs)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    push_to_hub_merged(
+        model=None,
+        tokenizer=None,
+        save_directory=tmp_path,
+        repo_id="me/merged",
+    )
+
+    assert calls["folder"] == [], calls
+    assert len(calls["large"]) == 1, calls
+
+
 def test_push_lora_adapters_falls_back_to_large_folder_when_unavailable(
     tmp_path, monkeypatch,
 ):

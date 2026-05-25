@@ -3422,6 +3422,10 @@ def save_pretrained_gguf(
     print(f"Unsloth: GGUF export complete -> {save_directory}")
 
 
+_PUSH_MERGED_DEFAULT_COMMIT_MESSAGE = "Trained with Unsloth"
+_PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION = "Upload model trained with Unsloth 2x faster"
+
+
 def push_to_hub_merged(
     model,
     tokenizer,
@@ -3430,8 +3434,8 @@ def push_to_hub_merged(
     token=None,
     private=None,
     tags=None,
-    commit_message="Trained with Unsloth",
-    commit_description="Upload model trained with Unsloth 2x faster",
+    commit_message=_PUSH_MERGED_DEFAULT_COMMIT_MESSAGE,
+    commit_description=_PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION,
     create_pr=False,
     revision=None,
 ):
@@ -3461,6 +3465,16 @@ def push_to_hub_merged(
 
     if repo_id is None:
         repo_id = save_directory.name
+
+    # Detect whether the caller passed custom commit metadata BEFORE we
+    # normalize the strings. upload_large_folder ignores commit_message /
+    # commit_description / create_pr; falling through to upload_folder is
+    # the only way those kwargs survive to the Hub.
+    _caller_wants_commit_metadata = bool(
+        create_pr
+        or commit_message != _PUSH_MERGED_DEFAULT_COMMIT_MESSAGE
+        or commit_description != _PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION
+    )
 
     # Match the GPU path's "(Trained with Unsloth)" suffix convention so
     # the commit history is recognizable across both backends.
@@ -3505,25 +3519,48 @@ def push_to_hub_merged(
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
-    # why: upload_large_folder resumes and chunks; upload_folder fails
-    # mid-push on large VLM merges.
-    try:
-        api.upload_large_folder(
-            folder_path=str(save_directory),
-            repo_id=repo_id,
-            repo_type="model",
-            revision=revision,
-        )
-    except (AttributeError, TypeError):
-        api.upload_folder(
-            folder_path=str(save_directory),
-            repo_id=repo_id,
-            repo_type="model",
-            commit_message=commit_message,
-            commit_description=commit_description,
-            create_pr=create_pr,
-            revision=revision,
-        )
+    # Route choice: upload_large_folder resumes and chunks (good for
+    # multi-GB merged dirs) but silently drops commit_message,
+    # commit_description, and create_pr on huggingface_hub>=0.34. When
+    # the caller passed custom commit metadata or create_pr=True, honor
+    # them via upload_folder; otherwise default to upload_large_folder
+    # for large-merge resume semantics.
+    if _caller_wants_commit_metadata:
+        try:
+            api.upload_folder(
+                folder_path=str(save_directory),
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=commit_message,
+                commit_description=commit_description,
+                create_pr=create_pr,
+                revision=revision,
+            )
+        except (AttributeError, TypeError):
+            api.upload_large_folder(
+                folder_path=str(save_directory),
+                repo_id=repo_id,
+                repo_type="model",
+                revision=revision,
+            )
+    else:
+        try:
+            api.upload_large_folder(
+                folder_path=str(save_directory),
+                repo_id=repo_id,
+                repo_type="model",
+                revision=revision,
+            )
+        except (AttributeError, TypeError):
+            api.upload_folder(
+                folder_path=str(save_directory),
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=commit_message,
+                commit_description=commit_description,
+                create_pr=create_pr,
+                revision=revision,
+            )
     print(f"Unsloth: Pushed to https://huggingface.co/{repo_id}")
 
 
