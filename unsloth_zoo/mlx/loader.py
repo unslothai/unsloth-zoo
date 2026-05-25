@@ -1074,29 +1074,77 @@ def _quant_config_from_resolved_map(resolved_map):
 
 
 def _apply_lora_at_paths(model, module_paths, adapter_cfg):
-    """Recreate LoRA layers at saved module paths so vision/projector LoRA
-    survives reload (mlx-lm's load_adapters only rebuilds the language tower)."""
+    """Recreate LoRA / DoRA layers at saved module paths so vision/projector
+    LoRA survives reload (mlx-lm's load_adapters only rebuilds the language
+    tower).
+
+    Honours adapter_config['fine_tune_type']=='dora' by wrapping with DoRA
+    classes instead of plain LoRA; otherwise `q_proj.m` magnitude tensors
+    from DoRA exports would be silently dropped by the downstream
+    `model.load_weights(..., strict=False)` because the recreated wrapper
+    has no `.m` parameter.
+    """
     import mlx.nn as nn
-    from mlx_lm.tuner.lora import LoRALinear
+    from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
+
+    use_dora = adapter_cfg.get("fine_tune_type") == "dora"
+    try:
+        from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
+        dora_available = True
+    except Exception:
+        DoRAEmbedding = DoRALinear = None
+        dora_available = False
+        if use_dora:
+            raise RuntimeError(
+                "Unsloth MLX: adapter_config declares fine_tune_type='dora' but "
+                "mlx_lm.tuner.dora is unavailable; install a DoRA-capable mlx-lm "
+                "or convert the adapter to plain LoRA before reload."
+            )
+
+    try:
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+        switch_types = (SwitchLinear, QuantizedSwitchLinear)
+    except Exception:
+        switch_types = ()
 
     lora_params = adapter_cfg.get("lora_parameters") or {}
     rank = int(lora_params.get("rank", adapter_cfg.get("rank", 8)))
     scale = float(lora_params.get("scale", adapter_cfg.get("scale", 1.0)))
     dropout = float(lora_params.get("dropout", adapter_cfg.get("dropout", 0.0)))
 
-    wanted = set(module_paths)
     by_name = dict(model.named_modules())
     linear_types = (nn.Linear, nn.QuantizedLinear)
+    embedding_types = (nn.Embedding, nn.QuantizedEmbedding)
+
     for name in module_paths:
         module = by_name.get(name)
-        if module is None or not isinstance(module, linear_types):
+        if module is None:
             continue
+
+        if isinstance(module, linear_types):
+            if use_dora and dora_available:
+                wrapper_cls = DoRALinear
+            else:
+                wrapper_cls = LoRALinear
+        elif isinstance(module, embedding_types):
+            if use_dora and dora_available:
+                wrapper_cls = DoRAEmbedding
+            else:
+                wrapper_cls = LoRAEmbedding
+        elif switch_types and isinstance(module, switch_types):
+            # mlx-lm has no DoRA switch wrapper; fall back to plain LoRA
+            # for switch modules even when the rest of the model is DoRA.
+            wrapper_cls = LoRASwitchLinear
+        else:
+            continue
+
         try:
-            wrapped = LoRALinear.from_base(
+            wrapped = wrapper_cls.from_base(
                 module, r=rank, scale=scale, dropout=dropout,
             )
         except TypeError:
-            wrapped = LoRALinear.from_base(module)
+            wrapped = wrapper_cls.from_base(module)
+
         parent_path, _, leaf = name.rpartition(".")
         parent = by_name.get(parent_path, model) if parent_path else model
         if hasattr(parent, leaf):

@@ -2681,6 +2681,14 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
     ".scales",
     ".biases",
     ".linear.weight",
+    # `.linear.bias` is the wrapped base bias of an mlx-lm `LoRALinear`
+    # whose inner `nn.Linear` was constructed with bias=True; without it
+    # `q_proj.linear.bias` / `lm_head.linear.bias` leak into adapter
+    # saves and `_is_lm_head_trainable()` reports True for adapter-only
+    # training. NOTE: a bare `.bias` is NOT in this list because
+    # `q_proj.bias` at the LoRA-module level is user-trained bias state
+    # that the existing filter intentionally preserves.
+    ".linear.bias",
     ".linear.scales",
     ".linear.biases",
     # LoRAEmbedding / DoRAEmbedding wraps an inner nn.Embedding at
@@ -2705,7 +2713,9 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
 # adapters.
 _ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
     "weight", "scales", "biases",
-    "linear.weight", "linear.scales", "linear.biases",
+    # Cover the wrapped inner bias for a root-level LoRALinear / DoRALinear
+    # the same way `.linear.bias` is filtered for non-root wrappers above.
+    "linear.weight", "linear.bias", "linear.scales", "linear.biases",
     "embedding.weight", "embedding.scales", "embedding.biases",
 })
 
