@@ -2082,17 +2082,30 @@ def load_vllm(
                 f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
             )
             # Force vLLM off FlashInfer when nvcc/ninja are missing.
-            # `del`-ing the vars wasn't enough: vLLM's nightly v1 engine
-            # picks FlashInfer as the *default* attention backend on
-            # sm_100/sm_120 (Blackwell), then still JIT-compiles the
-            # trtllm-gen kernels and crashes inside `vllm.LLM()`. Pin the
-            # backend to FLASH_ATTN and the sampler off so vLLM never even
-            # tries to import FlashInfer's JIT path. Also propagate to
-            # UNSLOTH_VLLM_NO_FLASHINFER so any downstream code path in
-            # unsloth_zoo / load_vllm sees a consistent disable signal.
-            os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+            # Env-var nudging is not enough: `VLLM_ATTENTION_BACKEND` is
+            # not recognised by vllm 0.19.1 (envs.py reports "Unknown
+            # vLLM environment variable detected") and vLLM still picks
+            # FLASHINFER from `['FLASHINFER', 'FLASH_ATTN', 'TRITON_ATTN',
+            # 'FLEX_ATTENTION']` on sm_100/sm_120, then JIT-compiles the
+            # trtllm-gen kernels and crashes inside `vllm.LLM()`. Block
+            # `import flashinfer` at the module level so vLLM's
+            # `try: import flashinfer except ImportError` branch in
+            # `vllm.platforms.cuda.get_attn_backend_cls` picks FLASH_ATTN
+            # instead. Also clear any user-set env vars and propagate to
+            # UNSLOTH_VLLM_NO_FLASHINFER for the rest of unsloth_zoo.
             os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
             os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
+            try:
+                # Drop any cached flashinfer module then mark it None so
+                # `import flashinfer` raises ImportError. None-in-sys.modules
+                # is the documented Python idiom for "this module fails to
+                # import"; see https://docs.python.org/3/reference/import.html.
+                for _name in list(sys.modules):
+                    if _name == "flashinfer" or _name.startswith("flashinfer."):
+                        del sys.modules[_name]
+                sys.modules["flashinfer"] = None
+            except Exception:
+                pass
         else:
             # Check if FLASHINFER is supported - for eg Qwen3-VL and Qwen2-VL do not work
             if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
