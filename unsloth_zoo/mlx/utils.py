@@ -2894,32 +2894,32 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         if lora_paths and not has_explicit_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
 
-        # Honour caller-supplied LoRA metadata regardless of whether the
-        # caller pinned `unsloth_mlx_lora_module_paths`. Two cases:
-        # (1) caller supplied metadata -> keep it as canonical, backfill
-        #     any missing keys from inferred / defaults.
-        # (2) caller supplied nothing -> overwrite from inferred values.
-        # The previous "narrow filter required" guard let case (1) silently
-        # drop on save_lora_adapters() callers without explicit paths,
-        # producing reload-time shape mismatches when the saved tensors
-        # were a different rank than what the inferred first-LoRA-module
-        # walk happened to pick.
+        # Resolution rule: live LoRA module state describes the tensors
+        # being saved now, so when an inferable live rank exists it MUST
+        # override stale scalar metadata from caller-supplied configs.
+        # Only fall back to caller metadata when no trustworthy live rank
+        # could be inferred (e.g. caller wrote adapter_config manually
+        # before LoRA modules were attached, or the inference walk hit a
+        # custom wrapper). The earlier "honour caller" branch silently
+        # wrote rank=8 / scale=1.0 for a live rank-4 module, producing
+        # reload-time shape mismatches.
         existing_lora_parameters = dict(adapter_config.get("lora_parameters") or {})
         has_caller_lora_metadata = any(
             key in existing_lora_parameters or key in adapter_config
             for key in ("rank", "scale", "dropout")
         )
 
-        if lora_rank is not None and not has_caller_lora_metadata:
+        if lora_rank is not None:
             lora_parameters = existing_lora_parameters
-            for key, value in (
-                ("rank", lora_rank), ("scale", lora_scale), ("dropout", lora_dropout),
-            ):
-                lora_parameters[key] = value
+            lora_parameters.update({
+                "rank": lora_rank,
+                "scale": lora_scale,
+                "dropout": lora_dropout,
+            })
             adapter_config["lora_parameters"] = lora_parameters
-            adapter_config["rank"] = lora_parameters["rank"]
-            adapter_config["scale"] = lora_parameters["scale"]
-            adapter_config["dropout"] = lora_parameters["dropout"]
+            adapter_config["rank"] = lora_rank
+            adapter_config["scale"] = lora_scale
+            adapter_config["dropout"] = lora_dropout
             adapter_config.setdefault("peft_type", "LORA")
             adapter_config.setdefault("fine_tune_type", "lora")
             # mlx-lm load_adapters dereferences config.num_layers; fill it
@@ -2927,11 +2927,18 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             if "num_layers" not in adapter_config:
                 layers = _get_transformer_layers(model)
                 try:
-                    n_layers = len(layers) if layers is not None else 0
+                    n_layers = len(layers) if layers is not None else -1
                 except TypeError:
-                    n_layers = 0
-                if n_layers > 0:
-                    adapter_config["num_layers"] = n_layers
+                    n_layers = -1
+                if n_layers <= 0:
+                    n_layers = -1
+                # Always write the key so mlx-lm.load_adapters() can
+                # attribute-access `config.num_layers` (it builds a
+                # SimpleNamespace from adapter_config.json and raises
+                # AttributeError when the key is absent). -1 is the
+                # legacy "all layers" sentinel, consistent with the
+                # trainer's save_model() fallback for wrapped models.
+                adapter_config["num_layers"] = n_layers
         elif has_caller_lora_metadata:
             # Keep the caller's metadata coherent: copy top-level
             # rank/scale/dropout into lora_parameters (or vice versa) so

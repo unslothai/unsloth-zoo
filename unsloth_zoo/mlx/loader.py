@@ -1501,41 +1501,69 @@ def _apply_lora_metadata_to_wrapper(wrapped, scale, dropout):
     return wrapped
 
 
-_FROM_BASE_KWARG_TYPEERROR_NEEDLES = (
+_FROM_BASE_SIGNATURE_NEEDLES = (
     "unexpected keyword",
     "got an unexpected",
     "got multiple values",
     "no argument named",
     "takes no keyword",
-    # Single-quoted kwarg names — CPython's TypeError for an unexpected
-    # keyword always quotes the offending name (e.g. `got an unexpected
-    # keyword argument 'scale'`).
-    "'scale'", "'dropout'", "'r'",
-    # Common manual-rejection phrasings used by custom mlx-lm wrappers
-    # / shims that don't follow the canonical signature error format.
-    # These match "scale/dropout not accepted", "scale not supported",
-    # etc. without catching internal validator errors like "scale must
-    # be a finite float" or "Dropout(p=...) expected float".
+    # Manual-rejection phrasings used by custom mlx-lm wrappers / shims
+    # that do not follow the canonical CPython signature error format,
+    # e.g. "scale/dropout not accepted" or "scale not supported".
+    # These are intentionally narrow: a broad match like "not supported"
+    # alone would also catch internal validator errors such as
+    # "rank 4 not supported" and silently downgrade rank to the upstream
+    # default. The classifier below only treats these needles as
+    # signature mismatches when the error message ALSO names one of the
+    # kwargs we are trying to send, not for unrelated semantic errors.
     "not accepted",
     "not supported",
 )
 
 
-def _is_from_base_kwarg_typeerror(exc, kwarg=None):
+def _is_from_base_kwarg_typeerror(exc, kwarg=None, kwargs=None):
     """True when `exc` looks like an mlx-lm `from_base()` signature
     mismatch (older wheel rejecting `scale=` / `dropout=` / `r=`),
     not an internal `TypeError` raised by the wrapper itself (e.g.
-    "from_base requires nn.Linear, got SwitchLinear").
+    "from_base requires nn.Linear, got SwitchLinear" or
+    "rank 4 not supported by this wrapper").
 
     Falling back through fewer-arg signatures on an unrelated TypeError
     can silently downgrade rank to the upstream default (`r=8`) and bind
     a wrong-rank wrapper to a saved different-rank tensor, which
     `strict=False` then drops.
     """
+    import re
+
     msg = str(exc).lower()
-    if kwarg is not None and f"'{kwarg.lower()}'" in msg:
+    if kwargs is None:
+        if kwarg is not None:
+            kwargs = (kwarg,)
+        else:
+            kwargs = ("r", "scale", "dropout")
+    kwargs_lower = tuple(k.lower() for k in kwargs)
+
+    # CPython quotes the rejected keyword name (e.g. `got an unexpected
+    # keyword argument 'scale'`); accept either quote style and treat
+    # that as a strong, unambiguous signature mismatch.
+    quoted = tuple(f"'{k}'" for k in kwargs_lower) + tuple(
+        f'"{k}"' for k in kwargs_lower
+    )
+    if any(q in msg for q in quoted):
         return True
-    return any(needle.lower() in msg for needle in _FROM_BASE_KWARG_TYPEERROR_NEEDLES)
+
+    if not any(needle in msg for needle in _FROM_BASE_SIGNATURE_NEEDLES):
+        return False
+
+    # Generic internal errors like "rank 4 not supported" / "embedding
+    # type not accepted" do not name the rejected kwarg in CPython's
+    # quoted form; require the kwarg to appear as a standalone word so
+    # short kwargs like "r" do not match "rank" / "wrapper" / "are" and
+    # silently downgrade the requested rank to the upstream default.
+    return any(
+        re.search(rf"(?<![\w]){re.escape(k)}(?![\w])", msg)
+        for k in kwargs_lower
+    )
 
 
 def _lora_from_base_compat(lora_cls, module, rank, scale, dropout):
@@ -1555,7 +1583,7 @@ def _lora_from_base_compat(lora_cls, module, rank, scale, dropout):
         try:
             wrapped = lora_cls.from_base(module, r=rank)
         except TypeError as exc2:
-            if not _is_from_base_kwarg_typeerror(exc2, kwarg="r"):
+            if not _is_from_base_kwarg_typeerror(exc2, kwargs=("r",)):
                 raise
             wrapped = lora_cls.from_base(module)
         return _apply_lora_metadata_to_wrapper(wrapped, scale, dropout)
@@ -1610,8 +1638,8 @@ def _patch_mlx_lora_from_base_compat():
                 cls,
                 module,
                 r=8,
-                scale=20.0,
                 dropout=0.0,
+                scale=20.0,
                 _orig=original_from_base,
             ):
                 # Pass-through on new mlx-lm; fall back through older signatures
@@ -1621,15 +1649,21 @@ def _patch_mlx_lora_from_base_compat():
                 # raised by the wrapper itself propagates so we never silently
                 # downgrade to the upstream default r=8 and bind a wrong-rank
                 # wrapper to a saved different-rank tensor.
+                #
+                # Positional order MUST match upstream mlx-lm
+                # `LoRALinear.from_base(linear, r=8, dropout=0.0, scale=20.0)`
+                # so external callers that pass positional arguments do not
+                # silently get `scale` and `dropout` swapped after the
+                # monkey-patch is installed.
                 try:
-                    return _orig(module, r=r, scale=scale, dropout=dropout)
+                    return _orig(module, r=r, dropout=dropout, scale=scale)
                 except TypeError as exc:
                     if not _is_from_base_kwarg_typeerror(exc):
                         raise
                     try:
                         wrapped = _orig(module, r=r)
                     except TypeError as exc2:
-                        if not _is_from_base_kwarg_typeerror(exc2, kwarg="r"):
+                        if not _is_from_base_kwarg_typeerror(exc2, kwargs=("r",)):
                             raise
                         wrapped = _orig(module)
                     return _apply_lora_metadata_to_wrapper(wrapped, scale, dropout)
