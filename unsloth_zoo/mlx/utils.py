@@ -3900,7 +3900,35 @@ def push_to_hub_gguf(
 
     # Upload GGUF files
     api = HfApi(token=token)
-    api.create_repo(repo_id=repo_id, exist_ok=True, private=private)
+    api.create_repo(
+        repo_id=repo_id,
+        private=bool(private) if private is not None else False,
+        exist_ok=True,
+    )
+    # create_repo(exist_ok=True) is a no-op for the visibility flag on
+    # existing repos. A caller passing private=True on a repo that
+    # already exists as public would otherwise silently upload the GGUF
+    # weights (often multi-GB merged shards) to a public Hub URL. Apply
+    # the same fail-loud rule as push_to_hub_merged and _push_lora_adapters_to_hub
+    # so private=True never silently leaks.
+    if private is not None:
+        try:
+            api.update_repo_settings(
+                repo_id=repo_id,
+                private=bool(private),
+                repo_type="model",
+            )
+        except Exception as exc:
+            if bool(private):
+                raise RuntimeError(
+                    "Unsloth: private=True was requested but the Hub "
+                    f"repo {repo_id!r} visibility could not be set to "
+                    "private (likely token lacks `write:repo_settings` "
+                    "or the repo is owned by another user). Refusing "
+                    "to upload GGUF weights to avoid publishing to an "
+                    "existing public repository."
+                ) from exc
+            print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
 
     gguf_files = list(save_directory.glob("*.gguf"))
     for gguf_file in gguf_files:
