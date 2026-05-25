@@ -536,17 +536,13 @@ def _normalize_cce_label_dtype(labels):
 
     uint8/16/32 fit losslessly in int64, so a direct cast preserves all
     values. uint64 does NOT fit: values in (2**63, 2**64) wrap into
-    negative int64 when cast, and 2**64-100 wraps to exactly -100 which
-    is the canonical ignore_index. The routing here is:
-
-    1. If the post-cast value equals -100, preserve it as the ignore
-       sentinel so collators that pre-encoded ignore as uint64(2**64-100)
-       still see those rows skipped downstream rather than NaN-poisoned.
-    2. Otherwise, any uint64 value that overflows the signed range maps
-       to a known-invalid out-of-vocab sentinel (1 << 62) so runtime CCE's
-       validity check still flags those rows as invalid (NaN-poisoned),
-       preserving the "wide invalid labels classify before narrowing"
-       contract.
+    negative int64 when cast. Any uint64 value that overflows the signed
+    range maps to a known-invalid out-of-vocab sentinel (1 << 62) so
+    runtime CCE's validity check still flags those rows as invalid
+    (NaN-poisoned). uint64(2**64-100) is treated as a wrap-around
+    artifact, NOT as an intentionally encoded ignore_index=-100; an
+    out-of-range unsigned label must NaN-poison the loss rather than be
+    silently treated as the signed ignore sentinel.
 
     Returns the labels unchanged for signed/float dtypes.
     """
@@ -564,21 +560,13 @@ def _normalize_cce_label_dtype(labels):
         # first, then detect overflow via `labels_i64 < 0` (any uint64
         # value >= 2**63 wraps negative). Route those to a positive
         # out-of-vocab sentinel (1 << 62) so runtime CCE NaN-poisons the
-        # row instead of silently colliding with ignore_index.
-        #
-        # Special case: collators that pre-encode `ignore_index=-100`
-        # into uint64 produce 2**64-100, which wraps to exactly -100
-        # after the int64 cast. Preserve that as the canonical ignore
-        # sentinel BEFORE the overflow routing so legitimate ignore
-        # rows are not NaN-poisoned downstream.
+        # row. An overflowed uint64 value such as 2**64-100 is an
+        # invalid out-of-range unsigned label, not an intentionally
+        # encoded ignore_index, so it must reach the sentinel and not
+        # be silently ignored downstream.
         labels_i64 = labels.astype(mx.int64)
-        ignore = mx.array(-100, dtype=mx.int64)
         invalid_sentinel = mx.array((1 << 62), dtype=mx.int64)
-        return mx.where(
-            labels_i64 == ignore,
-            ignore,
-            mx.where(labels_i64 < 0, invalid_sentinel, labels_i64),
-        )
+        return mx.where(labels_i64 < 0, invalid_sentinel, labels_i64)
     unsigned_dtypes = tuple(
         d for d in (
             getattr(mx, "uint8", None),
@@ -701,9 +689,14 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
 
         # Forward pass — let the model create its own causal mask.
         # Pass extra keys (e.g. image_grid_thw for Qwen) that some models need.
+        # Strip the private raw-input-ids carrier so the backbone never
+        # sees an unrelated kwarg.
         fwd_kwargs = {
             k: v for k, v in batch_dict.items()
-            if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+            if k not in (
+                "input_ids", "pixel_values", "attention_mask", "labels",
+                _RAW_INPUT_IDS_FOR_LABELS,
+            )
             and v is not None
         }
         fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
@@ -719,10 +712,15 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
             logits, targets = _align_logits_with_labels(logits, targets)
             mask = (targets != -100).astype(mx.float32)
         else:
-            # Normalize unsigned input_ids before injecting -100 / running
-            # `mx.where(targets == -100, ...)`, both of which crash on the
-            # torch-backed MLX shim for unsigned dtypes.
-            targets = _normalize_cce_label_dtype(input_ids[:, 1:])
+            # Prefer the raw (pre-narrow) input_ids preserved by
+            # `_to_mx_vlm_batch` so wide invalid ids (e.g. np.uint32
+            # 2**32-100) reach runtime CCE as out-of-vocab sentinels
+            # instead of silently wrapping to -100 via the int32 narrow.
+            # Falls back to the narrowed `input_ids` only when no raw
+            # copy was preserved (e.g. caller built the batch dict
+            # manually without going through `_to_mx_vlm_batch`).
+            target_source = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, input_ids)
+            targets = _normalize_cce_label_dtype(target_source[:, 1:])
 
             # Handle sequence length mismatch from vision token injection
             logits, targets = _align_logits_with_labels(logits, targets)
@@ -865,9 +863,14 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         fwd_attn_mask = attention_mask[:, :-1]
 
     # Collect extra keys (e.g. image_grid_thw for Qwen) that some models need.
+    # Strip the private raw-input-ids carrier so the embedder/backbone
+    # never sees an unrelated kwarg.
     extra_kwargs = {
         k: v for k, v in batch_dict.items()
-        if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+        if k not in (
+            "input_ids", "pixel_values", "attention_mask", "labels",
+            _RAW_INPUT_IDS_FOR_LABELS,
+        )
         and v is not None
     }
     extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
@@ -897,11 +900,15 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         masked_targets = _mask_image_tokens(targets, image_token_ids)
         ntoks = (masked_targets != -100).sum()
     else:
-        # Normalize unsigned/uint64 input_ids to signed int64 before injecting
-        # the -100 ignore sentinel. mx.where(..., -100, targets) crashes on
-        # unsigned dtypes under the torch-backed MLX shim, and uint64 cannot
-        # losslessly fit -100 even on native MLX.
-        targets = _normalize_cce_label_dtype(input_ids[:, 1:])
+        # Prefer the raw (pre-narrow) input_ids preserved by
+        # `_to_mx_vlm_batch` so wide invalid ids (e.g. np.uint32
+        # 2**32-100) reach runtime CCE as out-of-vocab sentinels
+        # instead of silently wrapping to -100 via the int32 narrow.
+        # Falls back to the narrowed `input_ids` only when no raw
+        # copy was preserved (e.g. caller built the batch dict
+        # manually without going through `_to_mx_vlm_batch`).
+        target_source = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, input_ids)
+        targets = _normalize_cce_label_dtype(target_source[:, 1:])
 
         if attention_mask is not None:
             length_mask = attention_mask[:, 1:][:, :targets.shape[1]]
@@ -1001,22 +1008,18 @@ def _normalize_numpy_cce_labels(labels):
     long` when assigned into the int64 buffer, before runtime CCE can NaN-
     poison the invalid row. Route any uint64 value that does not fit in signed
     int64 to a positive out-of-vocab sentinel (1<<62) and downcast remaining
-    unsigned dtypes to int64. Preserve the canonical encoded ignore_index
-    (uint64(2**64-100), which wraps to int64(-100) on cast) so collators that
-    pre-encoded ignore rows are still skipped downstream.
+    unsigned dtypes to int64. An overflowed uint64 value such as 2**64-100 is
+    an invalid out-of-range unsigned label, not an intentionally encoded
+    ignore_index, so it must reach the sentinel and not be silently treated
+    as -100 downstream.
     """
     labels_np = np.asarray(labels)
     if labels_np.dtype == np.uint64:
-        encoded_ignore = labels_np == np.uint64((1 << 64) - 100)
         overflow_mask = labels_np > np.uint64((1 << 63) - 1)
         return np.where(
-            encoded_ignore,
-            np.int64(-100),
-            np.where(
-                overflow_mask,
-                np.int64(1 << 62),
-                labels_np.astype(np.int64),
-            ),
+            overflow_mask,
+            np.int64(1 << 62),
+            labels_np.astype(np.int64),
         )
     if np.issubdtype(labels_np.dtype, np.unsignedinteger):
         return labels_np.astype(np.int64)
@@ -2288,6 +2291,12 @@ def _format_vlm_images_for_processor(all_images):
     return all_images
 
 
+# Private key used to pass raw (pre-int32-narrowing) input_ids through
+# the VLM batch dict to labels-free / response-mask paths. Stripped from
+# model forward kwargs so the backbone never sees it.
+_RAW_INPUT_IDS_FOR_LABELS = "_unsloth_raw_input_ids_for_labels"
+
+
 def _to_mx_vlm_batch(inputs):
     batch = {}
     for key, value in inputs.items():
@@ -2307,6 +2316,16 @@ def _to_mx_vlm_batch(inputs):
             batch[key] = value
 
     if "input_ids" in batch:
+        # Preserve the raw input_ids under a private key BEFORE the
+        # int32 narrow so labels-free / response-mask paths can derive
+        # labels from the original processor output. Without this, a
+        # wide invalid id such as np.uint32(2**32-100) becomes -100
+        # after narrowing and is silently treated as ignore_index
+        # downstream instead of being NaN-poisoned by runtime CCE.
+        if "labels" not in batch:
+            batch[_RAW_INPUT_IDS_FOR_LABELS] = _normalize_cce_label_dtype(
+                batch["input_ids"]
+            )
         batch["input_ids"] = batch["input_ids"].astype(mx.int32)
     if "attention_mask" in batch:
         batch["attention_mask"] = batch["attention_mask"].astype(mx.int32)
@@ -2481,8 +2500,15 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn):
     dataset_utils.train_on_responses_only, and stores the result as
     an mx.array in batch_dict["labels"].
     """
-    input_ids = batch_dict["input_ids"]
-    ids_list = input_ids.tolist()
+    # Prefer the raw (pre-int32-narrowing) input_ids preserved by
+    # `_to_mx_vlm_batch` so the masking closure sees the original
+    # processor ids. Without this, a wide invalid id such as
+    # np.uint32(2**32-100) would have already wrapped to -100 in
+    # batch_dict["input_ids"] and the mask_fn would treat the row as
+    # ignore_index instead of letting runtime CCE NaN-poison it.
+    raw_input_ids = batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+    input_ids = raw_input_ids if raw_input_ids is not None else batch_dict["input_ids"]
+    ids_list = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
     result = mask_fn({"input_ids": ids_list})
     labels_list = result["labels"]
     if hasattr(labels_list, "tolist"):

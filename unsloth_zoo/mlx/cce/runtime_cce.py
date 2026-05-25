@@ -145,15 +145,11 @@ def _target_validity_masks(
         # through signed int64 instead: any uint64 value that does not
         # fit in int64 wraps negative on cast, which `< 0` cleanly
         # routes to the overflow sentinel before the in-vocab check.
+        # An overflowed uint64 such as 2**64-100 is an invalid
+        # out-of-range unsigned label, NOT an intentionally encoded
+        # ignore_index. Route it to the sentinel so runtime CCE
+        # NaN-poisons the row instead of silently ignoring it.
         targets_i64 = targets.astype(mx.int64)
-        # Pre-encoded ignore (uint64(2**64-100) -> int64(-100)) MUST be
-        # preserved as ignore, not poisoned. Detect it before the
-        # overflow routing below collapses every wrapped-negative value
-        # to the invalid sentinel.
-        if ignore_index < 0:
-            encoded_ignore = targets_i64 == ignore_index
-        else:
-            encoded_ignore = mx.zeros(targets.shape, dtype=mx.bool_)
         overflow = targets_i64 < 0
         invalid_sentinel = mx.array(1 << 62, dtype=mx.int64)
         targets_for_validation = mx.where(
@@ -162,10 +158,7 @@ def _target_validity_masks(
         in_vocab = (targets_for_validation >= 0) & (
             targets_for_validation < vocab_size
         )
-        if ignore_index < 0:
-            not_ignored = mx.logical_not(encoded_ignore)
-        else:
-            not_ignored = targets_for_validation != ignore_index
+        not_ignored = targets_for_validation != ignore_index
         return not_ignored & in_vocab, not_ignored & ~in_vocab
 
     targets_for_validation = (
