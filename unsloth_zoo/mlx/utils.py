@@ -2718,6 +2718,11 @@ def _infer_mlx_lora_rank(module):
             return None
         return int(rank)
 
+    # Both halves of a 2D LoRA must be at least 2-D; a 1D lora_b is a
+    # half-built tensor we cannot trust for rank inference.
+    if len(lora_a_shape) < 2 or len(lora_b_shape) < 2:
+        return None
+
     # Standard 2D LoRA:
     # 1. mlx-lm layer convention: lora_a (rank, in), lora_b (out, rank)
     if is_layer:

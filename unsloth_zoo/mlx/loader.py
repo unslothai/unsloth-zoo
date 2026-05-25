@@ -1073,12 +1073,30 @@ def _quant_config_from_resolved_map(resolved_map):
     }
 
 
+def _normalize_mlx_lora_module_paths(module_paths):
+    """Normalize stored module paths into a list of non-empty strings.
+
+    Hand-authored adapter_config.json files sometimes store a single path
+    as a bare string. Iterating the raw string with `for name in path`
+    would walk its characters and never wrap a real LoRA layer.
+    """
+    if module_paths is None:
+        return []
+    if isinstance(module_paths, str):
+        return [module_paths] if module_paths else []
+    if isinstance(module_paths, (list, tuple, set)):
+        return [p for p in module_paths if isinstance(p, str) and p]
+    return []
+
+
 def _apply_lora_at_paths(model, module_paths, adapter_cfg):
     """Recreate LoRA layers at saved module paths so vision/projector and
     MoE/embedding LoRA survives reload (mlx-lm's load_adapters only rebuilds
     the language tower's Linear layers)."""
     import mlx.nn as nn
     from mlx_lm.tuner.lora import LoRALinear
+
+    module_paths = _normalize_mlx_lora_module_paths(module_paths)
 
     # MoE switch layers and embedding LoRA: import lazily and tolerate
     # older mlx-lm without the symbols.
@@ -2126,11 +2144,23 @@ def _apply_mlx_lora_initialization(model, init_lora_weights):
 
     import mlx.core as mx
 
+    def _lora_tensor_shape(tensor):
+        # mlx-lm wraps lora tensors in nn.Linear; unwrap to .weight when
+        # the bare object doesn't expose .shape.
+        if hasattr(tensor, "shape"):
+            return tensor.shape
+        weight = getattr(tensor, "weight", None)
+        if weight is not None and hasattr(weight, "shape"):
+            return weight.shape
+        return None
+
     for _, module in model.named_modules():
         if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
             continue
-        a_shape = module.lora_a.shape
-        b_shape = module.lora_b.shape
+        a_shape = _lora_tensor_shape(module.lora_a)
+        b_shape = _lora_tensor_shape(module.lora_b)
+        if a_shape is None or b_shape is None:
+            continue
         if init_lora_weights == "gaussian":
             if hasattr(module, "embedding"):
                 module.lora_a = mx.zeros(a_shape)
@@ -2490,22 +2520,30 @@ class FastMLXModel:
                     # why: load_adapters only rebuilds language-tower LoRA;
                     # vision/projector LoRA must be re-attached at the saved
                     # paths first so load_weights binds the trained tensors.
-                    _saved_lora_paths = adapter_cfg.get("unsloth_mlx_lora_module_paths") or []
+                    _saved_lora_paths = _normalize_mlx_lora_module_paths(
+                        adapter_cfg.get("unsloth_mlx_lora_module_paths"),
+                    )
                     if _saved_lora_paths:
+                        # Re-attach auxiliary LoRA (vision / projector / MoE)
+                        # at the saved paths BEFORE delegating to mlx-lm's
+                        # load_adapters so the language-tower LoRA is also
+                        # rebuilt and the saved tensors bind to either set.
                         try:
                             _apply_lora_at_paths(model, _saved_lora_paths, adapter_cfg)
-                            adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
-                            if os.path.exists(adapter_weights_file):
-                                model.load_weights(adapter_weights_file, strict=False)
-                            else:
-                                from mlx_lm.tuner.utils import load_adapters
-                                model = load_adapters(model, local_path)
                         except Exception:
-                            from mlx_lm.tuner.utils import load_adapters
-                            model = load_adapters(model, local_path)
-                    else:
-                        from mlx_lm.tuner.utils import load_adapters
+                            pass
+                    from mlx_lm.tuner.utils import load_adapters
+                    try:
                         model = load_adapters(model, local_path)
+                    except Exception:
+                        # Fallback for adapter sets that lack mlx-lm metadata
+                        # (e.g. external configs missing num_layers): load the
+                        # raw safetensors against the wrappers we just attached.
+                        adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
+                        if os.path.exists(adapter_weights_file):
+                            model.load_weights(adapter_weights_file, strict=False)
+                        else:
+                            raise
                     model = _eval_mlx_model_after_adapter_reload(model)
                     loaded_model_config = getattr(model, "_config", None)
                     is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
