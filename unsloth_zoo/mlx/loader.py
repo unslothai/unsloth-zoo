@@ -1168,10 +1168,42 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
         except TypeError:
             wrapped = wrapper_cls.from_base(module)
 
-        parent_path, _, leaf = name.rpartition(".")
-        parent = by_name.get(parent_path, model) if parent_path else model
-        if hasattr(parent, leaf):
-            setattr(parent, leaf, wrapped)
+        # Some VLM trees (e.g. Qwen2.5-VL's vision merger / projector
+        # `layers` list) install LoRA at a numeric path segment such as
+        # `vision_tower.merger.layers.0`, mirroring the navigation that
+        # `_lora_walk_module` uses at training time. A bare
+        # `setattr(parent, "0", wrapped)` is a silent no-op because
+        # `hasattr(parent, "0")` returns False; the following
+        # `load_weights(strict=False)` would then silently drop every
+        # saved tensor for that numeric leaf. Navigate the path
+        # segment-by-segment, preferring `parent[int(seg)]` for list /
+        # tuple containers and falling back to `getattr` for attribute
+        # access. Apply the same try-int / fallback-setattr pattern to
+        # the leaf so list-indexed wrappers install correctly.
+        parts = name.split(".")
+        parent = model
+        for seg in parts[:-1]:
+            try:
+                parent = parent[int(seg)]
+            except (ValueError, TypeError):
+                next_parent = getattr(parent, seg, None)
+                if next_parent is None:
+                    parent = None
+                    break
+                parent = next_parent
+            except (IndexError, KeyError):
+                parent = None
+                break
+        if parent is None:
+            continue
+        leaf = parts[-1]
+        try:
+            parent[int(leaf)] = wrapped
+        except (ValueError, TypeError):
+            if hasattr(parent, leaf):
+                setattr(parent, leaf, wrapped)
+        except (IndexError, KeyError):
+            pass
 
 
 def _adapter_actual_quant_config(adapter_cfg, resolved_map):
