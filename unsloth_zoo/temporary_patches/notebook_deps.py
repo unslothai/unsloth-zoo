@@ -79,13 +79,19 @@ def _pip_install(pkg: str) -> bool:
         # Outside a venv on Linux/Mac as non-root: probe write access to
         # site-packages and fall back to --user. Windows has no geteuid;
         # site-packages there is usually writable inside the venv anyway.
+        # Use os.access instead of touching disk to avoid leaving a
+        # `.unsloth_write_probe` file behind if the process dies between
+        # open() and remove(). Also check ALL site-packages entries:
+        # macOS / Debian split user vs system into [0] and [1] and the
+        # first writable one wins for pip install.
         if not _in_venv() and hasattr(os, "geteuid") and os.geteuid() != 0:
             try:
-                sp = site.getsitepackages()[0]
-                probe = os.path.join(sp, ".unsloth_write_probe")
-                open(probe, "w").close()
-                os.remove(probe)
+                writable = any(
+                    os.access(sp, os.W_OK) for sp in site.getsitepackages()
+                )
             except Exception:
+                writable = False
+            if not writable:
                 cmd.append("--user")
     logger.warning(
         f"Unsloth: auto-installing missing notebook dep `{pkg}` via "

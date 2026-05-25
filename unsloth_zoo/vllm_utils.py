@@ -818,25 +818,34 @@ def patch_vllm_decompose_size_nodes():
         return
 
     def _replace_in_slice(s, node, dims):
-        def _sub(b):
-            if isinstance(b, fx.Node) and b is node:
-                sym = [d for d in dims if isinstance(d, fx.Node)]
-                return sym[0] if len(sym) == 1 else dims[0]
-            return b
-        ns, no, nt = _sub(s.start), _sub(s.stop), _sub(s.step)
-        if (ns, no, nt) != (s.start, s.stop, s.step):
-            return slice(ns, no, nt)
+        # Picking a single dim from a multi-dim list is a heuristic with
+        # no sound mapping (`sym[0]` was arbitrary). Leave the slice
+        # untouched so `node.users` retains the reference and the safety
+        # net at the end of `_decompose_size_nodes` raises a clean error
+        # surfacing the unhandled shape.
         return s
 
-    def _replace_in_args(args, node, dims):
+    def _replace_in_args(args, node, dims, _depth=0):
+        # `node` appears in user.args / user.kwargs in one of two shapes
+        # we are confident about:
+        #   1. As a varargs spread: `fn(t.size(), other)` -- expand dims
+        #      inline at the TOP level. This matches the upstream call
+        #      sites of getitem-on-size.
+        #   2. As a getitem consumer: `getitem(t.size(), i)` -- handled
+        #      at the call site via `user.args[1]` indexing and never
+        #      reaches this helper.
+        # Anything nested inside a tuple / list / kwargs is NOT safe to
+        # silently expand: it would shift element positions in ways the
+        # consumer never asked for. Leave it unchanged so the
+        # `node.users` safety net surfaces it cleanly.
         out = []
         for a in args:
-            if isinstance(a, fx.Node) and a is node:
+            if isinstance(a, fx.Node) and a is node and _depth == 0:
                 out.extend(dims)
             elif isinstance(a, slice):
                 out.append(_replace_in_slice(a, node, dims))
             elif isinstance(a, (tuple, list)):
-                out.append(type(a)(_replace_in_args(list(a), node, dims)))
+                out.append(type(a)(_replace_in_args(list(a), node, dims, _depth + 1)))
             else:
                 out.append(a)
         return out
@@ -946,6 +955,22 @@ def _poison_flashinfer_if_unusable() -> None:
     forced = os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "1"
     # Otherwise probe the toolchain ourselves. The probe is cheap.
     if not forced and _flashinfer_toolchain_present():
+        return
+    # Refuse to clobber an already-loaded flashinfer. If the user (or
+    # some other library) imported flashinfer BEFORE patch_vllm ran, the
+    # module is presumably usable in that environment. Overwriting
+    # `sys.modules["flashinfer"]` with `None` would break their code at
+    # the next attribute access. Log a warning so the situation is
+    # visible and skip the poison.
+    existing = sys.modules.get("flashinfer")
+    if existing is not None and getattr(existing, "__file__", None):
+        logger.warning(
+            "Unsloth: flashinfer is already imported (%s); skipping the "
+            "auto-disable poison so we do not break the live reference. "
+            "Set UNSLOTH_VLLM_NO_FLASHINFER=1 before importing flashinfer "
+            "to force the off path.",
+            getattr(existing, "__file__", "?"),
+        )
         return
     # Mark for downstream code that may read the env var.
     os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
