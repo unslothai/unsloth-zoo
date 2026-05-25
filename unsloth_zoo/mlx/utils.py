@@ -354,11 +354,19 @@ def make_cce_loss_fn(model):
             bi = layer.biases if _has_biases else mx.zeros_like(layer.scales)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            # Normalize unsigned label dtypes before `mx.where(..., -100, ...)`
+            # so the signed sentinel injection works (mx.where on uint
+            # tensors crashes on the torch-backed shim). The VLM masking
+            # helpers do the same; mirror the contract here for the text
+            # CCE quantized path so unsigned tokenizer labels don't break
+            # training mid-step.
+            targets = _normalize_cce_label_dtype(targets)
             if labels is None:
                 mask = length_mask
             else:
                 mask = mx.logical_and(targets != -100, length_mask)
-            masked_targets = mx.where(mask, targets, -100)
+            ignore = mx.array(-100, dtype=targets.dtype)
+            masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
@@ -387,11 +395,18 @@ def make_cce_loss_fn(model):
                 w = mx.stop_gradient(w)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            # Same normalization rationale as the quantized branch above:
+            # unsigned tokenizer labels would crash the mx.where on the
+            # torch-backed shim, and uint64 wrap labels must survive to
+            # the runtime CCE validity check rather than collide with
+            # ignore_index here.
+            targets = _normalize_cce_label_dtype(targets)
             if labels is None:
                 mask = length_mask
             else:
                 mask = mx.logical_and(targets != -100, length_mask)
-            masked_targets = mx.where(mask, targets, -100)
+            ignore = mx.array(-100, dtype=targets.dtype)
+            masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
@@ -513,6 +528,15 @@ def _normalize_cce_label_dtype(labels):
     + runtime CCE both see well-defined signed values, while still
     preserving the wide-range visibility that the PR added.
 
+    uint8/16/32 fit losslessly in int64, so a direct cast preserves all
+    values. uint64 does NOT fit: values in (2**63, 2**64) wrap into
+    negative int64 when cast, and 2**64-100 wraps to exactly -100 which
+    collides with ignore_index. Explicitly map any uint64 value that
+    overflows the signed range to a known-invalid out-of-vocab sentinel
+    (mx.iinfo(int64).max) so runtime CCE's validity check still flags
+    those rows as invalid (NaN-poisoned), preserving the "wide invalid
+    labels classify before narrowing" contract.
+
     Returns the labels unchanged for signed/float dtypes.
     """
     if labels is None:
@@ -520,12 +544,22 @@ def _normalize_cce_label_dtype(labels):
     dtype = getattr(labels, "dtype", None)
     if dtype is None:
         return labels
+    uint64_dtype = getattr(mx, "uint64", None)
+    if uint64_dtype is not None and dtype == uint64_dtype:
+        # Values >= 2**63 cannot fit in int64; route them to a sentinel
+        # that runtime CCE will classify as out-of-vocab. mx.full of the
+        # int64 max keeps `>= 0` true and `< vocab_size` false for any
+        # realistic vocab, so the row gets NaN-poisoned during validation
+        # instead of silently colliding with ignore_index.
+        max_i63 = mx.array((1 << 63) - 1, dtype=mx.uint64)
+        labels_i64 = labels.astype(mx.int64)
+        invalid_sentinel = mx.array((1 << 62), dtype=mx.int64)
+        return mx.where(labels > max_i63, invalid_sentinel, labels_i64)
     unsigned_dtypes = tuple(
         d for d in (
             getattr(mx, "uint8", None),
             getattr(mx, "uint16", None),
             getattr(mx, "uint32", None),
-            getattr(mx, "uint64", None),
         )
         if d is not None
     )
@@ -2279,7 +2313,20 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
     # to the check. Narrowing through `np.int32` here would discard wide
     # invalids before classification, matching the upstream bug the rest
     # of this PR removes from text/VLM batch collators.
-    labels_np = np.asarray(combined_inputs["input_ids"], dtype=np.int64).copy()
+    # `np.asarray(..., dtype=np.int64)` of a uint64 array would wrap
+    # values >= 2**63 into negatives (and 2**64-100 lands on exactly -100,
+    # colliding with ignore_index). Preserve invalidity by saturating
+    # those rows to a known out-of-vocab sentinel that survives the
+    # int32 narrow later.
+    _raw_input_ids = np.asarray(combined_inputs["input_ids"])
+    if _raw_input_ids.dtype == np.uint64:
+        labels_np = np.where(
+            _raw_input_ids > np.uint64((1 << 63) - 1),
+            np.int64(1 << 62),
+            _raw_input_ids.astype(np.int64),
+        ).copy()
+    else:
+        labels_np = _raw_input_ids.astype(np.int64, copy=True)
     batch = _to_mx_vlm_batch(combined_inputs)
 
     prompt_batch = _to_mx_vlm_batch(prompt_inputs)
