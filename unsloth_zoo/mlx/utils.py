@@ -444,14 +444,20 @@ def make_baseline_loss_fn():
             return ce, ntoks
         # labels-aware path: train_on_responses_only style masking.
         inputs = batch[:, :-1]
-        targets = labels[:, 1:]
+        # Normalize unsigned dtypes so `mx.where(..., -100, ...)` and the
+        # `targets != -100` mask comparison both see signed int64 values;
+        # without this the torch-backed MLX shim raises NotImplementedError
+        # on uint16/uint32/uint64 labels.
+        targets = _normalize_cce_label_dtype(labels[:, 1:])
         logits = model(inputs)
         steps = mx.arange(1, targets.shape[1] + 1)
         length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
         mask = mx.logical_and(targets != -100, length_mask).astype(mx.float32)
-        # Replace -100 with 0 before CE — MLX has no ignore_index;
+        # Replace -100 with 0 before CE, MLX has no ignore_index;
         # the mask already zeros out these positions in the loss.
-        safe_targets = mx.where(targets == -100, 0, targets)
+        safe_targets = mx.where(
+            targets == -100, mx.array(0, dtype=targets.dtype), targets,
+        )
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -531,11 +537,16 @@ def _normalize_cce_label_dtype(labels):
     uint8/16/32 fit losslessly in int64, so a direct cast preserves all
     values. uint64 does NOT fit: values in (2**63, 2**64) wrap into
     negative int64 when cast, and 2**64-100 wraps to exactly -100 which
-    collides with ignore_index. Explicitly map any uint64 value that
-    overflows the signed range to a known-invalid out-of-vocab sentinel
-    (mx.iinfo(int64).max) so runtime CCE's validity check still flags
-    those rows as invalid (NaN-poisoned), preserving the "wide invalid
-    labels classify before narrowing" contract.
+    is the canonical ignore_index. The routing here is:
+
+    1. If the post-cast value equals -100, preserve it as the ignore
+       sentinel so collators that pre-encoded ignore as uint64(2**64-100)
+       still see those rows skipped downstream rather than NaN-poisoned.
+    2. Otherwise, any uint64 value that overflows the signed range maps
+       to a known-invalid out-of-vocab sentinel (1 << 62) so runtime CCE's
+       validity check still flags those rows as invalid (NaN-poisoned),
+       preserving the "wide invalid labels classify before narrowing"
+       contract.
 
     Returns the labels unchanged for signed/float dtypes.
     """
@@ -552,11 +563,22 @@ def _normalize_cce_label_dtype(labels):
         # before validation could classify the row. Cast to signed int64
         # first, then detect overflow via `labels_i64 < 0` (any uint64
         # value >= 2**63 wraps negative). Route those to a positive
-        # out-of-vocab sentinel so runtime CCE NaN-poisons the row
-        # instead of silently colliding with ignore_index.
+        # out-of-vocab sentinel (1 << 62) so runtime CCE NaN-poisons the
+        # row instead of silently colliding with ignore_index.
+        #
+        # Special case: collators that pre-encode `ignore_index=-100`
+        # into uint64 produce 2**64-100, which wraps to exactly -100
+        # after the int64 cast. Preserve that as the canonical ignore
+        # sentinel BEFORE the overflow routing so legitimate ignore
+        # rows are not NaN-poisoned downstream.
         labels_i64 = labels.astype(mx.int64)
+        ignore = mx.array(-100, dtype=mx.int64)
         invalid_sentinel = mx.array((1 << 62), dtype=mx.int64)
-        return mx.where(labels_i64 < 0, invalid_sentinel, labels_i64)
+        return mx.where(
+            labels_i64 == ignore,
+            ignore,
+            mx.where(labels_i64 < 0, invalid_sentinel, labels_i64),
+        )
     unsigned_dtypes = tuple(
         d for d in (
             getattr(mx, "uint8", None),
@@ -692,12 +714,15 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
         if labels is not None:
             # train_on_responses_only: labels encode instruction/padding masking.
             # Still mask image placeholder tokens.
-            targets = labels[:, 1:]
+            targets = _normalize_cce_label_dtype(labels[:, 1:])
             targets = _mask_image_tokens(targets, _image_token_ids)
             logits, targets = _align_logits_with_labels(logits, targets)
             mask = (targets != -100).astype(mx.float32)
         else:
-            targets = input_ids[:, 1:]
+            # Normalize unsigned input_ids before injecting -100 / running
+            # `mx.where(targets == -100, ...)`, both of which crash on the
+            # torch-backed MLX shim for unsigned dtypes.
+            targets = _normalize_cce_label_dtype(input_ids[:, 1:])
 
             # Handle sequence length mismatch from vision token injection
             logits, targets = _align_logits_with_labels(logits, targets)
@@ -713,11 +738,17 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
             targets = _mask_image_tokens(targets, _image_token_ids)
             targets = _mask_prompt_tokens(targets, _assistant_token_id)
             # Update length_mask to exclude masked positions
-            mask = mx.where(targets == -100, 0, length_mask)
+            mask = mx.where(
+                targets == -100,
+                mx.array(0, dtype=length_mask.dtype),
+                length_mask,
+            )
 
-        # Replace -100 with 0 before CE — MLX has no ignore_index;
+        # Replace -100 with 0 before CE, MLX has no ignore_index;
         # the mask already zeros out these positions in the loss.
-        safe_targets = mx.where(targets == -100, 0, targets)
+        safe_targets = mx.where(
+            targets == -100, mx.array(0, dtype=targets.dtype), targets,
+        )
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -970,15 +1001,22 @@ def _normalize_numpy_cce_labels(labels):
     long` when assigned into the int64 buffer, before runtime CCE can NaN-
     poison the invalid row. Route any uint64 value that does not fit in signed
     int64 to a positive out-of-vocab sentinel (1<<62) and downcast remaining
-    unsigned dtypes to int64.
+    unsigned dtypes to int64. Preserve the canonical encoded ignore_index
+    (uint64(2**64-100), which wraps to int64(-100) on cast) so collators that
+    pre-encoded ignore rows are still skipped downstream.
     """
     labels_np = np.asarray(labels)
     if labels_np.dtype == np.uint64:
+        encoded_ignore = labels_np == np.uint64((1 << 64) - 100)
         overflow_mask = labels_np > np.uint64((1 << 63) - 1)
         return np.where(
-            overflow_mask,
-            np.int64(1 << 62),
-            labels_np.astype(np.int64),
+            encoded_ignore,
+            np.int64(-100),
+            np.where(
+                overflow_mask,
+                np.int64(1 << 62),
+                labels_np.astype(np.int64),
+            ),
         )
     if np.issubdtype(labels_np.dtype, np.unsignedinteger):
         return labels_np.astype(np.int64)
@@ -2449,11 +2487,17 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn):
     labels_list = result["labels"]
     if hasattr(labels_list, "tolist"):
         labels_list = labels_list.tolist()
+    # Route unsigned label dtypes through the numpy + mx normalizers so the
+    # downstream `mx.where(..., -100, labels)` does not crash on uint16 /
+    # uint32 / uint64 under the torch-backed MLX shim, and so wide invalid
+    # ids reach runtime CCE as out-of-vocab sentinels instead of silently
+    # wrapping to -100 via the int32 narrow.
+    labels_np = _normalize_numpy_cce_labels(labels_list)
+    labels_array = _normalize_cce_label_dtype(mx.array(labels_np))
     attention_mask = batch_dict.get("attention_mask")
     if attention_mask is not None:
-        labels_array = mx.where(attention_mask == 0, mx.array(-100), mx.array(labels_list))
-    else:
-        labels_array = mx.array(labels_list)
+        ignore = mx.array(-100, dtype=labels_array.dtype)
+        labels_array = mx.where(attention_mask == 0, ignore, labels_array)
     batch_dict["labels"] = labels_array
     return batch_dict
 

@@ -138,25 +138,34 @@ def _target_validity_masks(
     )
     _uint64_dtype = getattr(mx, "uint64", None)
     if _uint64_dtype is not None and targets.dtype == _uint64_dtype:
-        # Avoid float64 here: MLX documents float64 arrays as CPU-only
-        # ("only supported on CPU"), so promoting validation to float64
-        # would break this code path on real Apple-Silicon/Metal. float32
-        # cannot exactly represent every uint64 value, but it is more
-        # than enough to separate normal vocabulary-sized labels (< 2**24)
-        # from uint64 overflow sentinels, which is all this validity
-        # check needs before runtime CCE NaN-poisons the bad rows.
-        _validation_dtype = mx.float32
-        targets_for_validation = targets.astype(_validation_dtype)
-        in_vocab = (targets_for_validation >= 0.0) & (
-            targets_for_validation < float(vocab_size)
+        # Avoid float-based validation here. MLX float64 arrays are
+        # CPU-only per the public docs (would break real Metal); float32
+        # cannot exactly represent labels above 2**24, so labels near
+        # vocab boundaries above that get misclassified. Validate
+        # through signed int64 instead: any uint64 value that does not
+        # fit in int64 wraps negative on cast, which `< 0` cleanly
+        # routes to the overflow sentinel before the in-vocab check.
+        targets_i64 = targets.astype(mx.int64)
+        # Pre-encoded ignore (uint64(2**64-100) -> int64(-100)) MUST be
+        # preserved as ignore, not poisoned. Detect it before the
+        # overflow routing below collapses every wrapped-negative value
+        # to the invalid sentinel.
+        if ignore_index < 0:
+            encoded_ignore = targets_i64 == ignore_index
+        else:
+            encoded_ignore = mx.zeros(targets.shape, dtype=mx.bool_)
+        overflow = targets_i64 < 0
+        invalid_sentinel = mx.array(1 << 62, dtype=mx.int64)
+        targets_for_validation = mx.where(
+            overflow, invalid_sentinel, targets_i64,
+        )
+        in_vocab = (targets_for_validation >= 0) & (
+            targets_for_validation < vocab_size
         )
         if ignore_index < 0:
-            # Unsigned 0..2**64 can never equal a negative ignore_index,
-            # so every position is "not_ignored" by construction. Skip
-            # the float compare to avoid float-equality surprises.
-            not_ignored = mx.ones(targets.shape, dtype=mx.bool_)
+            not_ignored = mx.logical_not(encoded_ignore)
         else:
-            not_ignored = targets_for_validation != float(ignore_index)
+            not_ignored = targets_for_validation != ignore_index
         return not_ignored & in_vocab, not_ignored & ~in_vocab
 
     targets_for_validation = (
