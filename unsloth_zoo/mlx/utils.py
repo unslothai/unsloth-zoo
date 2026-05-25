@@ -2692,14 +2692,12 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
     ".scales",
     ".biases",
     ".linear.weight",
-    # `.linear.bias` is the wrapped base bias of an mlx-lm `LoRALinear`
-    # whose inner `nn.Linear` was constructed with bias=True; without it
-    # `q_proj.linear.bias` / `lm_head.linear.bias` leak into adapter
-    # saves and `_is_lm_head_trainable()` reports True for adapter-only
-    # training. NOTE: a bare `.bias` is NOT in this list because
-    # `q_proj.bias` at the LoRA-module level is user-trained bias state
-    # that the existing filter intentionally preserves.
-    ".linear.bias",
+    # `.linear.bias` is NOT in this list: upstream MLX LoRALinear
+    # stores the legitimate wrapped Linear bias at `q_proj.linear.bias`,
+    # and it must survive trainable checkpoint saves when the user
+    # trains bias. Round-16 dropping it broke that user contract. The
+    # filter only needs to drop the reload-leaked base WEIGHT / quant
+    # state; bias is intentional training state.
     ".linear.scales",
     ".linear.biases",
     # LoRAEmbedding / DoRAEmbedding wraps an inner nn.Embedding at
@@ -2724,9 +2722,11 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
 # adapters.
 _ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
     "weight", "scales", "biases",
-    # Cover the wrapped inner bias for a root-level LoRALinear / DoRALinear
-    # the same way `.linear.bias` is filtered for non-root wrappers above.
-    "linear.weight", "linear.bias", "linear.scales", "linear.biases",
+    # `linear.bias` is NOT in this set for the same reason as the
+    # non-root suffix list above: an mlx-lm LoRALinear stores
+    # legitimate trainable bias at `linear.bias`, and dropping it
+    # silently loses user training state.
+    "linear.weight", "linear.scales", "linear.biases",
     "embedding.weight", "embedding.scales", "embedding.biases",
 })
 
@@ -3017,7 +3017,24 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         for _, module in iter_mlx_lora_modules(model)
     )
     if has_lora_modules or declared_lora_artifact:
-        if "lora_parameters" not in adapter_config:
+        # Saved tensor shapes are authoritative. A reused caller
+        # `adapter_config` can carry stale `lora_parameters` (e.g.
+        # `rank=99` from another run) that contradicts the actual
+        # saved tensor shapes; round-17 only filled lora_parameters
+        # when absent and left stale values intact. Always derive
+        # rank/scale/dropout from the live LoRA modules when any are
+        # present so the persisted config can not contradict
+        # adapters.safetensors. Skip the override only when the
+        # live model carries no LoRA modules (declared_lora_artifact
+        # path) and the caller already shipped lora_parameters.
+        if has_lora_modules:
+            rank, scale, dropout = _extract_mlx_lora_parameters(model)
+            adapter_config["lora_parameters"] = {
+                "rank": rank,
+                "scale": scale,
+                "dropout": dropout,
+            }
+        elif "lora_parameters" not in adapter_config:
             rank, scale, dropout = _extract_mlx_lora_parameters(model)
             adapter_config["lora_parameters"] = {
                 "rank": rank,
@@ -3326,7 +3343,14 @@ def _push_lora_adapters_to_hub(
     _lora_allow_patterns = [
         "adapters.safetensors",
         "adapter_config.json",
-        "adapter_model.safetensors",
+        # NOTE: `adapter_model.safetensors` is intentionally NOT in this
+        # allow-list. The MLX adapter save path writes
+        # `adapters.safetensors`, never `adapter_model.safetensors`; a
+        # matching file in the directory is therefore stale by definition
+        # (left over from a PEFT/HF adapter save the user did
+        # separately). Including it would re-upload that stale PEFT
+        # adapter alongside the current MLX adapter and corrupt the
+        # remote artifact.
         "tokenizer.json",
         "tokenizer_config.json",
         "special_tokens_map.json",

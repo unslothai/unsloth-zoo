@@ -2500,6 +2500,23 @@ class FastMLXModel:
                             else:
                                 from mlx_lm.tuner.utils import load_adapters
                                 model = load_adapters(model, local_path)
+                        except RuntimeError as _exc:
+                            # `_apply_lora_at_paths` raises a namespaced
+                            # RuntimeError when the adapter declares
+                            # fine_tune_type='dora' but mlx_lm.tuner.dora
+                            # is unavailable. Falling back to
+                            # `load_adapters()` here would silently drop
+                            # the saved DoRA `*.m` magnitude tensors
+                            # because upstream would rebuild plain
+                            # LoRALinear wrappers. Re-raise the DoRA
+                            # signal instead of swallowing it.
+                            if (
+                                adapter_cfg.get("fine_tune_type") == "dora"
+                                and "mlx_lm.tuner.dora is unavailable" in str(_exc)
+                            ):
+                                raise
+                            from mlx_lm.tuner.utils import load_adapters
+                            model = load_adapters(model, local_path)
                         except Exception:
                             from mlx_lm.tuner.utils import load_adapters
                             model = load_adapters(model, local_path)
