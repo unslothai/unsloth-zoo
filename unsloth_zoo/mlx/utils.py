@@ -2799,22 +2799,23 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     # why: persist module paths + rank/scale/dropout so reload reproduces logits;
     # missing scale silently defaults to 1.0 even when training used alpha/r > 1.
     try:
+        # Reuse the loader-side normalizer so save and load accept exactly
+        # the same shapes (str / list / tuple / set / dict / pathlib.Path).
+        # Without this, dict-grouped or pathlib explicit paths got silently
+        # erased by save-side normalization, dropping aux LoRA topology
+        # before it ever reached adapter_config.json.
+        from .loader import _normalize_mlx_lora_module_paths
         # distinguish "caller passed nothing" from "caller passed [] / None".
         has_explicit_paths = "unsloth_mlx_lora_module_paths" in adapter_config
         raw_explicit_paths = (
             adapter_config.get("unsloth_mlx_lora_module_paths")
             if has_explicit_paths else None
         )
-        # Normalize bare strings to a single-element list so downstream
-        # loaders do not iterate the string character-by-character.
-        if isinstance(raw_explicit_paths, str):
-            explicit_paths = [raw_explicit_paths]
-        elif isinstance(raw_explicit_paths, (list, tuple)):
-            explicit_paths = [p for p in raw_explicit_paths if isinstance(p, str) and p]
+        if has_explicit_paths:
+            explicit_paths = _normalize_mlx_lora_module_paths(raw_explicit_paths)
+            adapter_config["unsloth_mlx_lora_module_paths"] = explicit_paths
         else:
             explicit_paths = None
-        if has_explicit_paths:
-            adapter_config["unsloth_mlx_lora_module_paths"] = explicit_paths or []
         # why: explicit empty list preserves caller topology but must not
         # suppress global LoRA parameter inference; treat empty as "no filter".
         explicit_path_set = set(explicit_paths) if explicit_paths else None

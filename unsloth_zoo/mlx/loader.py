@@ -1141,8 +1141,19 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
         if t is not None
     )
 
+    # Refuse to wrap with placeholder metadata. Save side now omits these
+    # keys entirely when inference cannot trust them, so a missing rank
+    # means the saved adapter is unsupported -- not "rebuild at rank=8
+    # and bind whatever tensors happen to match".
     lora_params = adapter_cfg.get("lora_parameters") or {}
-    rank = int(lora_params.get("rank", adapter_cfg.get("rank", 8)))
+    raw_rank = lora_params.get("rank", adapter_cfg.get("rank"))
+    if raw_rank is None:
+        raise ValueError(
+            "Unsloth MLX: adapter_config.json is missing LoRA rank metadata; "
+            "refusing to recreate adapter wrappers with placeholder rank=8. "
+            "Re-save the adapter with rank/scale/dropout populated."
+        )
+    rank = int(raw_rank)
     scale = float(lora_params.get("scale", adapter_cfg.get("scale", 1.0)))
     dropout = float(lora_params.get("dropout", adapter_cfg.get("dropout", 0.0)))
 
@@ -1151,6 +1162,13 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
     for name in module_paths:
         module = by_name.get(name)
         if module is None:
+            continue
+        # Skip paths that are already LoRA-wrapped (e.g. mlx-lm's
+        # load_adapters() already rebuilt the language tower). Without
+        # this guard, calling _apply_lora_at_paths after load_adapters
+        # would either re-wrap and crash on type mismatch, or produce
+        # nested LoRALinear(LoRALinear(Linear)).
+        if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
             continue
         if isinstance(module, linear_types):
             lora_cls = LoRALinear
@@ -1162,9 +1180,10 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
             continue
         wrapped = _lora_from_base_compat(lora_cls, module, rank, scale, dropout)
         parent_path, _, leaf = name.rpartition(".")
-        parent = by_name.get(parent_path, model) if parent_path else model
-        if hasattr(parent, leaf):
-            setattr(parent, leaf, wrapped)
+        parent = by_name.get(parent_path) if parent_path else model
+        if parent is None or not hasattr(parent, leaf):
+            continue
+        setattr(parent, leaf, wrapped)
 
 
 def _eval_mlx_model_after_adapter_reload(model):
@@ -2173,6 +2192,22 @@ def _apply_mlx_lora_initialization(model, init_lora_weights):
             return weight.shape
         return None
 
+    def _assign_lora_tensor(module, attr, value):
+        # mlx-lm wraps lora_a / lora_b in nn.Linear; assigning a raw
+        # mx.array to the slot replaces the entire wrapper, destroying
+        # the layer object and any methods/parameters that came with it.
+        # Update .weight when the slot is a layer; only fall back to a
+        # direct setattr when the slot is a bare array.
+        current = getattr(module, attr, None)
+        if current is not None and hasattr(current, "weight") \
+                and hasattr(getattr(current, "weight"), "shape"):
+            try:
+                current.weight = value
+                return
+            except Exception:
+                pass
+        setattr(module, attr, value)
+
     for _, module in model.named_modules():
         if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
             continue
@@ -2182,21 +2217,30 @@ def _apply_mlx_lora_initialization(model, init_lora_weights):
             continue
         if init_lora_weights == "gaussian":
             if hasattr(module, "embedding"):
-                module.lora_a = mx.zeros(a_shape)
-                module.lora_b = mx.random.normal(shape=b_shape)
+                _assign_lora_tensor(module, "lora_a", mx.zeros(a_shape))
+                _assign_lora_tensor(module, "lora_b", mx.random.normal(shape=b_shape))
             else:
-                module.lora_a = mx.random.normal(shape=a_shape) * (1.0 / b_shape[0])
-                module.lora_b = mx.zeros(b_shape)
+                _assign_lora_tensor(
+                    module, "lora_a",
+                    mx.random.normal(shape=a_shape) * (1.0 / b_shape[0]),
+                )
+                _assign_lora_tensor(module, "lora_b", mx.zeros(b_shape))
         elif init_lora_weights is False:
-            module.lora_a = mx.random.uniform(
-                low=-1.0 / math.sqrt(a_shape[0]),
-                high=1.0 / math.sqrt(a_shape[0]),
-                shape=a_shape,
+            _assign_lora_tensor(
+                module, "lora_a",
+                mx.random.uniform(
+                    low=-1.0 / math.sqrt(a_shape[0]),
+                    high=1.0 / math.sqrt(a_shape[0]),
+                    shape=a_shape,
+                ),
             )
-            module.lora_b = mx.random.uniform(
-                low=-1.0 / math.sqrt(b_shape[0]),
-                high=1.0 / math.sqrt(b_shape[0]),
-                shape=b_shape,
+            _assign_lora_tensor(
+                module, "lora_b",
+                mx.random.uniform(
+                    low=-1.0 / math.sqrt(b_shape[0]),
+                    high=1.0 / math.sqrt(b_shape[0]),
+                    shape=b_shape,
+                ),
             )
 
 
@@ -2542,31 +2586,48 @@ class FastMLXModel:
                     _saved_lora_paths = _normalize_mlx_lora_module_paths(
                         adapter_cfg.get("unsloth_mlx_lora_module_paths"),
                     )
+                    # Call mlx-lm's load_adapters FIRST so the standard
+                    # language-tower LoRA gets rebuilt by its own canonical
+                    # walk. _apply_lora_at_paths runs AFTER and skips paths
+                    # that are already wrapped, leaving only the auxiliary
+                    # (vision / projector / MoE / embedding) paths to attach.
+                    # The previous ordering pre-wrapped every saved path,
+                    # which forced load_adapters to always fail or produce
+                    # nested LoRALinear(LoRALinear(Linear)).
+                    from mlx_lm.tuner.utils import load_adapters
+                    adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
+                    _load_adapters_ok = False
+                    _load_adapters_exc = None
+                    try:
+                        model = load_adapters(model, local_path)
+                        _load_adapters_ok = True
+                    except Exception as _exc:
+                        # Fall through to the manual-wrap + strict=False
+                        # fallback below; needed for adapter sets that
+                        # lack mlx-lm metadata (e.g. external configs
+                        # missing num_layers). Remember the original error
+                        # so we can re-raise it if the fallback can't run.
+                        _load_adapters_exc = _exc
+
                     if _saved_lora_paths:
-                        # Re-attach auxiliary LoRA (vision / projector / MoE)
-                        # at the saved paths BEFORE delegating to mlx-lm's
-                        # load_adapters so the language-tower LoRA is also
-                        # rebuilt and the saved tensors bind to either set.
+                        # Auxiliary LoRA paths (vision / projector / MoE)
+                        # that mlx-lm's linear_to_lora_layers does not walk.
+                        # The skip-if-already-wrapped guard inside
+                        # _apply_lora_at_paths means language-tower paths
+                        # land as no-ops here when load_adapters succeeded.
                         try:
                             _apply_lora_at_paths(model, _saved_lora_paths, adapter_cfg)
+                        except ValueError:
+                            raise
                         except Exception as _exc:
-                            # Surface failures: combined with the strict=False
-                            # fallback below, a silent pass here lets saved
-                            # adapter tensors disappear with no warning.
                             warnings.warn(
                                 f"Unsloth MLX: failed to re-attach auxiliary "
                                 f"LoRA wrappers ({_exc!r}); some adapter "
                                 f"tensors may not load.",
                                 stacklevel=2,
                             )
-                    from mlx_lm.tuner.utils import load_adapters
-                    try:
-                        model = load_adapters(model, local_path)
-                    except Exception:
-                        # Fallback for adapter sets that lack mlx-lm metadata
-                        # (e.g. external configs missing num_layers): load the
-                        # raw safetensors against the wrappers we just attached.
-                        adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
+
+                    if not _load_adapters_ok:
                         if os.path.exists(adapter_weights_file):
                             # load_weights(strict=False) silently drops saved
                             # keys with no matching live module; warn so the
@@ -2587,10 +2648,19 @@ class FastMLXModel:
                                 from safetensors import safe_open
                                 from mlx.utils import tree_flatten as _tree_flatten
 
+                                # Cover both raw-array (lora_a is an
+                                # mx.array) and layer-backed (lora_a is an
+                                # nn.Linear with .weight) save shapes. Without
+                                # the .weight variants the diff would miss
+                                # half the saved LoRA tensors and silently
+                                # underreport drops.
                                 _lora_suffixes = (
                                     ".lora_a", ".lora_b",
+                                    ".lora_a.weight", ".lora_b.weight",
                                     ".lora_A", ".lora_B",
+                                    ".lora_A.weight", ".lora_B.weight",
                                     ".lora_embedding_a", ".lora_embedding_b",
+                                    ".lora_embedding_a.weight", ".lora_embedding_b.weight",
                                 )
                                 with safe_open(adapter_weights_file, framework="numpy") as _f:
                                     _saved_keys = {
@@ -2627,7 +2697,14 @@ class FastMLXModel:
                                 )
                             model.load_weights(adapter_weights_file, strict=False)
                         else:
-                            raise
+                            # No safetensors fallback available; surface
+                            # the original load_adapters failure.
+                            if _load_adapters_exc is not None:
+                                raise _load_adapters_exc
+                            raise RuntimeError(
+                                "Unsloth MLX: adapter load failed and "
+                                "adapters.safetensors is missing."
+                            )
                     model = _eval_mlx_model_after_adapter_reload(model)
                     loaded_model_config = getattr(model, "_config", None)
                     is_vlm_model = bool(getattr(model, "_is_vlm_model", False))

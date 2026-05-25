@@ -408,6 +408,7 @@ def test_trainer_adapter_dict_omits_rank_when_inference_failed():
 def test_normalize_mlx_lora_module_paths_handles_dict_input():
     # Older / hand-authored configs sometimes group paths by tower.
     # Dict input must flatten into a list, not silently return [].
+    _load_utils()  # installs mlx torch simulation so loader imports cleanly
     from unsloth_zoo.mlx.loader import _normalize_mlx_lora_module_paths
 
     grouped = {"language": ["layers.0.q_proj"], "vision": ["vision.proj"]}
@@ -419,12 +420,60 @@ def test_normalize_mlx_lora_module_paths_handles_pathlike_elements():
     # pathlib.Path elements in the saved list must coerce via os.fspath,
     # not be silently dropped by the isinstance(p, str) gate.
     import pathlib
+    _load_utils()
     from unsloth_zoo.mlx.loader import _normalize_mlx_lora_module_paths
 
     paths = _normalize_mlx_lora_module_paths(
         [pathlib.PurePosixPath("layers.0.q_proj"), "layers.1.q_proj"]
     )
     assert paths == ["layers.0.q_proj", "layers.1.q_proj"]
+
+
+def test_normalize_mlx_lora_module_paths_handles_bare_pathlike():
+    # A bare pathlib.Path (not wrapped in a list) should also coerce.
+    import pathlib
+    _load_utils()
+    from unsloth_zoo.mlx.loader import _normalize_mlx_lora_module_paths
+
+    paths = _normalize_mlx_lora_module_paths(
+        pathlib.PurePosixPath("layers.0.q_proj")
+    )
+    assert paths == ["layers.0.q_proj"]
+
+
+def test_enrich_mlx_adapter_config_normalizes_dict_explicit_paths():
+    # Save-side path normalization must accept the same shapes the load
+    # side does: dict-grouped paths, pathlib.Path elements, set, etc.
+    # Otherwise vision/projector LoRA topology is silently erased before
+    # it reaches adapter_config.json.
+    mlx_utils = _load_utils()
+    model = _FakeModel([
+        ("layers.0.q_proj", _FakeLoRAModule((512, 4), (4, 512), scale=2.0)),
+        ("vision.proj", _FakeLoRAModule((512, 4), (4, 512), scale=2.0)),
+    ])
+    cfg = mlx_utils._enrich_mlx_adapter_config(
+        model,
+        {"unsloth_mlx_lora_module_paths": {"language": ["layers.0.q_proj"],
+                                            "vision": ["vision.proj"]}},
+    )
+    assert set(cfg["unsloth_mlx_lora_module_paths"]) == {
+        "layers.0.q_proj", "vision.proj",
+    }
+
+
+def test_enrich_mlx_adapter_config_normalizes_pathlike_explicit_paths():
+    import pathlib
+    mlx_utils = _load_utils()
+    model = _FakeModel([
+        ("layers.0.q_proj", _FakeLoRAModule((512, 4), (4, 512), scale=2.0)),
+    ])
+    cfg = mlx_utils._enrich_mlx_adapter_config(
+        model,
+        {"unsloth_mlx_lora_module_paths": [
+            pathlib.PurePosixPath("layers.0.q_proj"),
+        ]},
+    )
+    assert cfg["unsloth_mlx_lora_module_paths"] == ["layers.0.q_proj"]
 
 
 def test_enrich_mlx_adapter_config_coerces_mxarray_scale_without_aborting():
