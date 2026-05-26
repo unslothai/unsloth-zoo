@@ -88,21 +88,55 @@ def _temporary_hf_token_env(token):
                     os.environ[name] = value
 
 
-def _convert_mlx_dtype(model, target_dtype) -> None:
+def _is_force_float32_arch(model_type: str) -> bool:
+    """Case-insensitive lookup of ``model_type`` in
+    ``unsloth_zoo.FORCE_FLOAT32``. Strips ``-``/``_`` and treats a
+    trailing comma on a list entry as an exact-match marker."""
+    if not model_type:
+        return False
+    from ..model_lists import FORCE_FLOAT32
+    def _norm(s: str) -> str:
+        return s.lower().replace("-", "").replace("_", "")
+    norm_input = _norm(model_type)
+    for entry in FORCE_FLOAT32:
+        e = entry.lower()
+        if e.endswith(","):
+            e = e[:-1]
+        if _norm(e) == norm_input:
+            return True
+    return False
+
+
+def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     """Cast floating-point params to target_dtype (preserves quantized ints)
     while honoring the model's optional path-based ``cast_predicate``.
+
+    Warns on bfloat16 -> float16 for architectures in
+    ``unsloth_zoo.FORCE_FLOAT32`` (Gemma3 family, gpt_oss, Qwen3.5) where
+    fp16's narrower range silently NaN/Infs at training time.
     """
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
+    from ..model_lists import FORCE_FLOAT32
     cast_pred = getattr(model, "cast_predicate", lambda _: True)
 
     needs_cast = False
+    has_bf16 = False
     for k, v in tree_flatten(model.parameters()):
         if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) and v.dtype != target_dtype:
             needs_cast = True
-            break
+            if v.dtype == mx.bfloat16:
+                has_bf16 = True
     if not needs_cast:
         return
+
+    if has_bf16 and target_dtype == mx.float16 and _is_force_float32_arch(model_type):
+        warnings.warn(
+            f"Unsloth: downcasting bfloat16 -> float16 on {model_type!r}, "
+            "which is known to NaN/Inf in fp16. Pass dtype=None to keep "
+            "native bf16, or dtype='float32' for full precision.",
+            stacklevel=2,
+        )
 
     model.update(tree_map_with_path(
         lambda k, v: v.astype(target_dtype)
@@ -2533,7 +2567,7 @@ class FastMLXModel:
                 )
 
             if target_dtype is not None:
-                _convert_mlx_dtype(model, target_dtype)
+                _convert_mlx_dtype(model, target_dtype, model_type=model_type)
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
@@ -2644,7 +2678,7 @@ class FastMLXModel:
                 )
 
             if target_dtype is not None:
-                _convert_mlx_dtype(model, target_dtype)
+                _convert_mlx_dtype(model, target_dtype, model_type=model_type)
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
@@ -2696,6 +2730,7 @@ class FastMLXModel:
         finetune_language_layers=True,
         finetune_attention_modules=True,
         finetune_mlp_modules=True,
+        finetune_last_n_layers=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Apply LoRA via mlx-lm on Apple Silicon.
@@ -2739,10 +2774,6 @@ class FastMLXModel:
                 "Unsloth: mlx-lm is required for LoRA on Apple Silicon. "
                 "Install via: pip install unsloth-zoo[mlx]"
             )
-
-        # Seed mlx random state so LoRA matrix init (lora_b is zero, lora_a
-        # is random Gaussian) is reproducible across runs.
-        _seed_mlx_random_state(random_state)
 
         # finetune_vision_layers (None = use train_vision arg; bool overrides it)
         if finetune_vision_layers is not None:
@@ -2819,8 +2850,14 @@ class FastMLXModel:
                 num_layers = 0
                 if hasattr(lm, "model") and hasattr(lm.model, "layers"):
                     num_layers = len(lm.model.layers)
+                if finetune_last_n_layers is not None and num_layers > 0:
+                    num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = _resolve_lora_keys(lm, target_modules)
                 if language_lora_keys is None or len(language_lora_keys) > 0:
+                    # Match mlx_lm/tuner/lora.py (def train) -- seed
+                    # mx.random immediately before LoRA init; lazy MLX
+                    # state advances otherwise leak into lora_a sampling.
+                    _seed_mlx_random_state(random_state)
                     linear_to_lora_layers(
                         lm,
                         num_layers=num_layers,
@@ -2899,9 +2936,15 @@ class FastMLXModel:
                 num_layers = 0
                 if hasattr(model, "model") and hasattr(model.model, "layers"):
                     num_layers = len(model.model.layers)
+                if finetune_last_n_layers is not None and num_layers > 0:
+                    num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = _resolve_lora_keys(model, target_modules)
                 if language_lora_keys is not None and len(language_lora_keys) == 0:
                     _raise_no_lora_targets(target_modules)
+                # Match mlx_lm/tuner/lora.py (def train) -- seed
+                # mx.random immediately before LoRA init; lazy MLX
+                # state advances otherwise leak into lora_a sampling.
+                _seed_mlx_random_state(random_state)
                 linear_to_lora_layers(
                     model,
                     num_layers=num_layers,
