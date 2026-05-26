@@ -727,6 +727,134 @@ def _fix_gemma3_vision_attention_fp32_sdpa(model=None):
     return True
 
 
+def _fix_gemma3_vision_mlp_fp32_activation(model=None):
+    """Match CUDA SigLIP GELU: compute activation in fp32, then cast back."""
+
+    try:
+        import mlx.core as mx
+        vision_module = importlib.import_module("mlx_vlm.models.gemma3.vision")
+    except Exception:
+        return False
+
+    mlp_cls = getattr(vision_module, "MLP", None)
+    if mlp_cls is None:
+        return False
+    if getattr(mlp_cls, "_unsloth_fp32_activation_patched", False):
+        if model is not None:
+            model._unsloth_gemma3_vision_mlp_fp32_activation = True
+        return True
+
+    def patched_mlp_call(self, x):
+        x = self.fc1(x)
+        orig_dtype = x.dtype
+        x = self.activation_fn(x.astype(mx.float32)).astype(orig_dtype)
+        x = self.fc2(x)
+        return x
+
+    try:
+        mlp_cls.__call__ = patched_mlp_call
+        mlp_cls._unsloth_fp32_activation_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_vision_mlp_fp32_activation = True
+    return True
+
+
+def _fix_gemma3_vision_encoder_fp32_layernorm(model=None):
+    """Match CUDA SigLIP LayerNorm math in fp32 while preserving bf16 activations."""
+
+    try:
+        import mlx.core as mx
+        vision_module = importlib.import_module("mlx_vlm.models.gemma3.vision")
+    except Exception:
+        return False
+
+    encoder_layer_cls = getattr(vision_module, "EncoderLayer", None)
+    if encoder_layer_cls is None:
+        return False
+    if getattr(encoder_layer_cls, "_unsloth_fp32_layernorm_patched", False):
+        if model is not None:
+            model._unsloth_gemma3_vision_encoder_fp32_layernorm = True
+        return True
+
+    def torch_like_layer_norm(norm, x):
+        orig_dtype = x.dtype
+        x_f = x.astype(mx.float32)
+        mean = mx.mean(x_f, axis=-1, keepdims=True)
+        centered = x_f - mean
+        var = mx.mean(centered * centered, axis=-1, keepdims=True)
+        y = centered * mx.rsqrt(var + norm.eps)
+        if "weight" in norm:
+            y = y * norm.weight.astype(mx.float32)
+        if "bias" in norm:
+            y = y + norm.bias.astype(mx.float32)
+        return y.astype(orig_dtype)
+
+    def patched_encoder_layer_call(self, x, mask=None):
+        r = self.self_attn(torch_like_layer_norm(self.layer_norm1, x), mask)
+        h = x + r
+        r = self.mlp(torch_like_layer_norm(self.layer_norm2, h))
+        return h + r
+
+    try:
+        encoder_layer_cls.__call__ = patched_encoder_layer_call
+        encoder_layer_cls._unsloth_fp32_layernorm_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_vision_encoder_fp32_layernorm = True
+    return True
+
+
+def _fix_gemma3_vision_post_layernorm_fp32(model=None):
+    """Run Gemma3 final SigLIP vision LayerNorm in fp32, then cast back."""
+
+    try:
+        import mlx.core as mx
+        vision_module = importlib.import_module("mlx_vlm.models.gemma3.vision")
+    except Exception:
+        return False
+
+    siglip_cls = getattr(vision_module, "SigLipVisionModel", None)
+    if siglip_cls is None:
+        return False
+    if getattr(siglip_cls, "_unsloth_fp32_post_layernorm_patched", False):
+        if model is not None:
+            model._unsloth_gemma3_vision_post_layernorm_fp32 = True
+        return True
+
+    def torch_like_layer_norm(norm, x):
+        orig_dtype = x.dtype
+        x_f = x.astype(mx.float32)
+        mean = mx.mean(x_f, axis=-1, keepdims=True)
+        centered = x_f - mean
+        var = mx.mean(centered * centered, axis=-1, keepdims=True)
+        y = centered * mx.rsqrt(var + norm.eps)
+        if "weight" in norm:
+            y = y * norm.weight.astype(mx.float32)
+        if "bias" in norm:
+            y = y + norm.bias.astype(mx.float32)
+        return y.astype(orig_dtype)
+
+    def patched_siglip_call(self, x, output_hidden_states=None):
+        x = self.embeddings(x)
+        encoder_outputs = self.encoder(
+            x=x, output_hidden_states=output_hidden_states, mask=None,
+        )
+        pooler_output = torch_like_layer_norm(self.post_layernorm, encoder_outputs[0])
+        return pooler_output, x, encoder_outputs[-1]
+
+    try:
+        siglip_cls.__call__ = patched_siglip_call
+        siglip_cls._unsloth_fp32_post_layernorm_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_vision_post_layernorm_fp32 = True
+    return True
+
+
 def _fix_gemma3_multimodal_image_feature_scale(model=None):
     """Use text embedding width when compensating Gemma3 image feature scaling."""
 
@@ -3005,6 +3133,9 @@ class FastMLXModel:
             _fix_gemma4_kv_sharing(model)
             _fix_gemma3_vision_post_layernorm_eps(model)
             _fix_gemma3_vision_attention_fp32_sdpa(model)
+            _fix_gemma3_vision_encoder_fp32_layernorm(model)
+            _fix_gemma3_vision_post_layernorm_fp32(model)
+            _fix_gemma3_vision_mlp_fp32_activation(model)
             _fix_gemma3_multimodal_image_feature_scale(model)
 
             model._config = getattr(model, "_config", config_data)

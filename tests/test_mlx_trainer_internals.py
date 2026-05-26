@@ -412,6 +412,50 @@ def test_mlx_loader_patches_gemma3_vision_attention_fp32_sdpa():
     assert "output.astype(orig_dtype)" in source
 
 
+def test_mlx_loader_patches_gemma3_vision_mlp_fp32_activation():
+    import inspect
+
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import _fix_gemma3_vision_mlp_fp32_activation
+
+    patched = _fix_gemma3_vision_mlp_fp32_activation()
+    assert patched in {True, False}
+
+    source = inspect.getsource(loader._fix_gemma3_vision_mlp_fp32_activation)
+    assert "activation_fn(x.astype(mx.float32)).astype(orig_dtype)" in source
+    assert "_unsloth_fp32_activation_patched" in source
+
+
+def test_mlx_loader_patches_gemma3_vision_encoder_fp32_layernorm():
+    import inspect
+
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import _fix_gemma3_vision_encoder_fp32_layernorm
+
+    patched = _fix_gemma3_vision_encoder_fp32_layernorm()
+    assert patched in {True, False}
+
+    source = inspect.getsource(loader._fix_gemma3_vision_encoder_fp32_layernorm)
+    assert "x.astype(mx.float32)" in source
+    assert "return y.astype(orig_dtype)" in source
+    assert "_unsloth_fp32_layernorm_patched" in source
+
+
+def test_mlx_loader_patches_gemma3_vision_post_layernorm_fp32():
+    import inspect
+
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import _fix_gemma3_vision_post_layernorm_fp32
+
+    patched = _fix_gemma3_vision_post_layernorm_fp32()
+    assert patched in {True, False}
+
+    source = inspect.getsource(loader._fix_gemma3_vision_post_layernorm_fp32)
+    assert "pooler_output = torch_like_layer_norm" in source
+    assert "return y.astype(orig_dtype)" in source
+    assert "_unsloth_fp32_post_layernorm_patched" in source
+
+
 def test_mlx_loader_patches_gemma3_image_feature_scale():
     import inspect
 
