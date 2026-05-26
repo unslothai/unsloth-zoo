@@ -2542,18 +2542,22 @@ class FastMLXModel:
                                 model = load_adapters(model, local_path)
                         except RuntimeError as _exc:
                             # `_apply_lora_at_paths` raises a namespaced
-                            # RuntimeError when the adapter declares
-                            # fine_tune_type='dora' but mlx_lm.tuner.dora
-                            # is unavailable. Falling back to
-                            # `load_adapters()` here would silently drop
-                            # the saved DoRA `*.m` magnitude tensors
-                            # because upstream would rebuild plain
-                            # LoRALinear wrappers. Re-raise the DoRA
-                            # signal instead of swallowing it.
-                            if (
-                                adapter_cfg.get("fine_tune_type") == "dora"
-                                and "mlx_lm.tuner.dora is unavailable" in str(_exc)
-                            ):
+                            # `RuntimeError("Unsloth MLX: ...")` for two
+                            # capability gaps: (a) the adapter declares
+                            # `fine_tune_type='dora'` but `mlx_lm.tuner.dora`
+                            # is unavailable, or (b) the adapter pinned an
+                            # embedding LoRA path but `mlx_lm.tuner.lora.`
+                            # `LoRAEmbedding` is unavailable. Falling back
+                            # to `load_adapters()` in either case silently
+                            # drops the saved DoRA `.m` magnitudes or
+                            # `embed_tokens.lora_a` / `.lora_b` tensors via
+                            # the strict=False reload, defeating the
+                            # fail-loud guards inside `_apply_lora_at_paths`.
+                            # Re-raise any `"Unsloth MLX:"` namespaced
+                            # signal so the caller sees the capability gap
+                            # explicitly; mirrors the outer handler's
+                            # broader check below.
+                            if "Unsloth MLX:" in str(_exc):
                                 raise
                             from mlx_lm.tuner.utils import load_adapters
                             model = load_adapters(model, local_path)
