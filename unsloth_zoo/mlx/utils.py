@@ -2775,6 +2775,26 @@ def _infer_mlx_lora_rank(module):
     return None
 
 
+def _sync_mlx_lora_keys(adapter_config, lora_parameters):
+    """Keep `lora_parameters["keys"]` in lockstep with the authoritative
+    `unsloth_mlx_lora_module_paths`. mlx-lm.load_adapters() consults
+    `lora_parameters.keys` to decide which submodules get wrapped on reload,
+    so a stale or absent `keys` field is the difference between binding the
+    saved adapter and either scanning every layer or wrapping ghost paths.
+    When the authoritative path list is present (including an explicit empty
+    list, which is its own valid pin) we mirror it; otherwise we drop any
+    caller-supplied `keys` so mlx-lm falls back to its scan-everything default
+    instead of trusting an out-of-date list.
+    """
+    if "unsloth_mlx_lora_module_paths" in adapter_config:
+        lora_parameters["keys"] = list(
+            adapter_config.get("unsloth_mlx_lora_module_paths") or []
+        )
+    else:
+        lora_parameters.pop("keys", None)
+    return lora_parameters
+
+
 def _enrich_mlx_adapter_config(model, adapter_config):
     adapter_config = dict(adapter_config or {})
     hf_repo = getattr(model, "_hf_repo", None) or adapter_config.get("base_model_name_or_path")
@@ -2938,13 +2958,15 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 "dropout": lora_dropout,
             })
             # Constrain mlx-lm.load_adapters() to the saved topology by
-            # writing the path list under `lora_parameters["keys"]`.
-            # Without this, upstream interprets missing `keys` as "scan
-            # every Linear / Embedding / Switch layer" and creates extra
-            # zero-init LoRA wrappers outside the saved adapter set.
-            saved_paths = adapter_config.get("unsloth_mlx_lora_module_paths")
-            if saved_paths and "keys" not in lora_parameters:
-                lora_parameters["keys"] = list(saved_paths)
+            # writing the path list under `lora_parameters["keys"]`. Without
+            # this, upstream interprets missing `keys` as "scan every Linear
+            # / Embedding / Switch layer" and creates extra zero-init LoRA
+            # wrappers outside the saved adapter set. The sync helper also
+            # writes `keys=[]` when the caller pinned an empty path list (a
+            # valid no-LoRA-binding instruction, distinct from "scan all"),
+            # and drops any stale caller-supplied `keys` when no authoritative
+            # path list is present.
+            lora_parameters = _sync_mlx_lora_keys(adapter_config, lora_parameters)
             adapter_config["lora_parameters"] = lora_parameters
             adapter_config["rank"] = lora_rank
             adapter_config["scale"] = lora_scale
@@ -3001,9 +3023,10 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     inferred_value if inferred_value is not None else default_value
                 )
             if "rank" in lora_parameters:
-                saved_paths = adapter_config.get("unsloth_mlx_lora_module_paths")
-                if saved_paths and "keys" not in lora_parameters:
-                    lora_parameters["keys"] = list(saved_paths)
+                # Same sync as the main branch: mirror the authoritative path
+                # list under `keys` (covering the empty-pin case) and drop
+                # stale caller keys when no path list survived.
+                lora_parameters = _sync_mlx_lora_keys(adapter_config, lora_parameters)
                 adapter_config["lora_parameters"] = lora_parameters
                 for key in ("rank", "scale", "dropout"):
                     if key in lora_parameters:
