@@ -269,6 +269,18 @@ def test_mlx_trainer_does_not_attach_processor_for_loss_masking():
     assert "_get_vlm_ignore_token_ids(" in trainer_source
 
 
+def test_text_only_vlm_wrapper_uses_text_training_path():
+    from unsloth_zoo.mlx.utils import _is_vlm_model
+
+    class TextOnlyVLMWrapper:
+        _is_vlm_model = True
+        _unsloth_text_only_vlm = True
+        language_model = object()
+        vision_tower = object()
+
+    assert _is_vlm_model(TextOnlyVLMWrapper()) is False
+
+
 def test_gemma3_vlm_cce_does_not_forward_outer_product_attention_mask():
     from types import SimpleNamespace
 

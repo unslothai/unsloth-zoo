@@ -676,6 +676,8 @@ def _mask_prompt_tokens(targets, assistant_token_id):
 
 def _is_vlm_model(model) -> bool:
     """Check if model is a VLM (has language_model + vision component)."""
+    if getattr(model, "_unsloth_text_only_vlm", False):
+        return False
     explicit_flag = getattr(model, "_is_vlm_model", None)
     if explicit_flag is not None:
         return bool(explicit_flag)
