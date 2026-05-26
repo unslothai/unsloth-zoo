@@ -4053,6 +4053,53 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
     return rewritten
 
 
+_CORE_SAVE_FILENAMES = {
+    "config.json",
+    "model.safetensors.index.json",
+    "README.md",
+    ".gitattributes",
+}
+_MODEL_WEIGHT_SUFFIXES = (
+    ".safetensors",
+    ".bin",
+    ".gguf",
+    ".h5",
+    ".msgpack",
+    ".onnx",
+    ".pt",
+    ".pth",
+)
+_MODEL_SIDECAR_SUFFIXES = (".json", ".jinja", ".model", ".txt", ".py")
+
+
+def _copy_source_sidecars(src_path, path):
+    """Copy non-weight source sidecars that tokenizer/model saves may omit."""
+    copied = 0
+    src_path = Path(src_path)
+    path = Path(path)
+    if not src_path.exists():
+        return copied
+    for source in src_path.iterdir():
+        if not source.is_file():
+            continue
+        name = source.name
+        if name in _CORE_SAVE_FILENAMES:
+            continue
+        if name.startswith("model-") or name.startswith("pytorch_model"):
+            continue
+        suffix = source.suffix
+        if suffix in _MODEL_WEIGHT_SUFFIXES:
+            continue
+        if suffix not in _MODEL_SIDECAR_SUFFIXES:
+            continue
+        target = path / name
+        if target.exists():
+            continue
+        shutil.copy2(source, target)
+        copied += 1
+    return copied
+
+
 def save_merged_model(model, tokenizer, path, dequantize=False):
     """Fuse LoRA weights and save the full merged model.
 
@@ -4120,15 +4167,10 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     # Save tokenizer
     tokenizer.save_pretrained(str(path))
 
-    # Copy auxiliary files (generation_config.json, *.py) from source
+    # Copy auxiliary source files that tokenizer/model saves may omit.
     src_path = _get_src_path(model)
     if src_path is not None:
-        src_path = Path(src_path)
-        if src_path.exists():
-            import glob as globmod
-            for pattern in ["generation_config.json", "*.py"]:
-                for f in globmod.glob(str(src_path / pattern)):
-                    shutil.copy(f, path)
+        _copy_source_sidecars(src_path, path)
 
     # Model card
     hf_repo = getattr(model, "_hf_repo", None)
