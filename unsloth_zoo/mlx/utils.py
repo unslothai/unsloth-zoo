@@ -3771,7 +3771,7 @@ def _vlm_gguf_name_candidates(name):
     candidates = []
 
     def add(value):
-        if value != name and value not in candidates:
+        if value not in candidates:
             candidates.append(value)
 
     if name.startswith("thinker.vision_tower."):
@@ -3787,6 +3787,7 @@ def _vlm_gguf_name_candidates(name):
         add(f"model.language_model.visual.{suffix}")
         add(f"vit.{suffix}")
 
+    add(name)
     return candidates
 
 
@@ -3838,6 +3839,12 @@ def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
             if sanitized_name != name:
                 continue
             if not _mlx_arrays_match(sanitized_tensor, tensor):
+                continue
+            changed = (
+                candidate_name != name
+                or not _mlx_arrays_match(candidate_tensor, tensor)
+            )
+            if not changed:
                 continue
             return candidate_name, candidate_tensor, True
 
