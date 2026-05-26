@@ -3939,6 +3939,54 @@ def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
     return name, tensor, False
 
 
+def _sync_gguf_nextn_layer_config(config, model):
+    """Align speculative-layer config metadata with exported MLX layers."""
+    if model is None or not isinstance(config, dict):
+        return False
+
+    layers = _get_transformer_layers(model)
+    if layers is None:
+        return False
+    try:
+        actual_layers = len(layers)
+    except Exception:
+        return False
+
+    text_configs = [
+        config.get("text_config"),
+        config.get("language_config"),
+        (config.get("thinker_config") or {}).get("text_config"),
+    ]
+    changed = False
+    for text_config in text_configs:
+        if not isinstance(text_config, dict):
+            continue
+        num_hidden_layers = text_config.get("num_hidden_layers")
+        if not isinstance(num_hidden_layers, int):
+            continue
+
+        actual_nextn = actual_layers - num_hidden_layers
+        for key in (
+            "num_nextn_predict_layers",
+            "mtp_num_hidden_layers",
+            "nextn_predict_layers",
+        ):
+            num_nextn = text_config.get(key)
+            if not isinstance(num_nextn, int) or num_nextn <= 0:
+                continue
+            if actual_layers < num_hidden_layers:
+                continue
+            if actual_nextn >= num_nextn:
+                continue
+            if actual_nextn > 0:
+                text_config[key] = actual_nextn
+            else:
+                text_config.pop(key, None)
+            changed = True
+
+    return changed
+
+
 def _prepare_vlm_gguf_export_directory(path, model=None):
     """Rewrite MLX-native VLM tensor names in the temporary GGUF export dir."""
     path = Path(path)
@@ -3947,8 +3995,12 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
         return 0
     with open(config_path, "r") as f:
         config = json.load(f)
+    config_changed = _sync_gguf_nextn_layer_config(config, model)
     sanitize_steps = _build_mlx_vlm_sanitize_pipelines(config, model=model)
     if not sanitize_steps:
+        if config_changed:
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=4)
         return 0
 
     rewritten = 0
@@ -3993,6 +4045,10 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
         index_data["weight_map"] = dict(sorted(weight_map.items()))
         with open(index_path, "w") as f:
             json.dump(index_data, f, indent=4)
+
+    if config_changed:
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=4)
 
     return rewritten
 
