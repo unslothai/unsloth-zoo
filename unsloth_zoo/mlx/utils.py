@@ -3252,6 +3252,15 @@ def _ensure_hub_repo_visibility(api, repo_id, private):
         ) from exc
 
 
+# Default commit metadata strings for LoRA adapter pushes. These have to be
+# module-level constants (not defaults inside the function signature) because
+# _caller_wants_commit_metadata compares the incoming values against them to
+# distinguish "caller explicitly wants this Unsloth default" from "caller
+# wants their own commit string", same pattern as _push_merged_model_to_hub.
+_LORA_DEFAULT_COMMIT_MESSAGE = "Trained with Unsloth"
+_LORA_DEFAULT_COMMIT_DESCRIPTION = "Upload LoRA adapters trained with Unsloth 2x faster"
+
+
 def _push_lora_adapters_to_hub(
     save_directory,
     repo_id=None,
@@ -3280,21 +3289,26 @@ def _push_lora_adapters_to_hub(
     # identical and the fallback can no longer detect that the caller
     # asked for a non-default commit string. upload_large_folder cannot
     # represent commit_message / commit_description, so a silent fallback
-    # would drop them on the floor.
+    # would drop them on the floor. Treat the Unsloth default strings the
+    # same as None so an outer wrapper that forwards the default verbatim
+    # (e.g. push_to_hub_lora calling _push_lora_adapters_to_hub with
+    # commit_message="Trained with Unsloth") does not look like a custom
+    # request and refuse the upload_large_folder fallback. Mirrors the
+    # default-string comparison in _push_merged_model_to_hub.
     _caller_wants_commit_metadata = bool(
         create_pr
-        or commit_message is not None
-        or commit_description is not None
+        or commit_message not in (None, _LORA_DEFAULT_COMMIT_MESSAGE)
+        or commit_description not in (None, _LORA_DEFAULT_COMMIT_DESCRIPTION)
     )
 
     # Match push_to_hub_merged's commit conventions so the history is
     # recognizable across CUDA and MLX backends.
     if commit_message is None:
-        commit_message = "Trained with Unsloth"
+        commit_message = _LORA_DEFAULT_COMMIT_MESSAGE
     if "Unsloth" not in commit_message:
         commit_message = (commit_message + " (Trained with Unsloth)").lstrip()
     if commit_description is None:
-        commit_description = "Upload LoRA adapters trained with Unsloth 2x faster"
+        commit_description = _LORA_DEFAULT_COMMIT_DESCRIPTION
     elif "Unsloth 2x faster" not in commit_description:
         commit_description += " (Trained with Unsloth 2x faster)"
 

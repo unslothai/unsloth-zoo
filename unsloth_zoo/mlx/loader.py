@@ -1147,11 +1147,19 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
             elif LoRAEmbedding is not None:
                 wrapper_cls = LoRAEmbedding
             else:
-                # Older mlx-lm: skip embedding LoRA on reload rather than
-                # crashing the whole adapter load. The saved embedding
-                # LoRA tensors will drop via the downstream
-                # load_weights(strict=False), but linear paths still bind.
-                continue
+                # mlx-lm older than the LoRAEmbedding release cannot
+                # rebuild an embedding LoRA wrapper. Silently skipping
+                # would drop the saved embed_tokens.lora_a/lora_b tensors
+                # in the downstream strict=False reload, leaving the user
+                # with a partially-loaded adapter and no warning. Fail
+                # loudly, parallel to the DoRA-unavailable guard above.
+                raise RuntimeError(
+                    "Unsloth MLX: adapter_config_json contains an embedding "
+                    f"LoRA path {name!r}, but this mlx-lm version does not "
+                    "expose mlx_lm.tuner.lora.LoRAEmbedding. Upgrade mlx-lm "
+                    "before loading this adapter so embedding adapter tensors "
+                    "are not silently dropped."
+                )
         elif switch_types and isinstance(module, switch_types):
             # mlx-lm has no DoRA switch wrapper; fall back to plain LoRA
             # for switch modules even when the rest of the model is DoRA.
@@ -2553,6 +2561,24 @@ class FastMLXModel:
                             from mlx_lm.tuner.utils import load_adapters
                             model = load_adapters(model, local_path)
                     else:
+                        # Mirror the saved-paths DoRA capability guard: if
+                        # the adapter declares fine_tune_type='dora' but
+                        # mlx_lm.tuner.dora is unavailable, falling through
+                        # to load_adapters() rebuilds plain LoRA wrappers
+                        # and silently drops the saved .m magnitude tensors
+                        # via the strict=False reload. Fail loudly here so
+                        # the user knows to install a DoRA-capable mlx-lm.
+                        if adapter_cfg.get("fine_tune_type") == "dora":
+                            try:
+                                import mlx_lm.tuner.dora  # noqa: F401
+                            except Exception as _dora_exc:
+                                raise RuntimeError(
+                                    "Unsloth MLX: adapter_config declares "
+                                    "fine_tune_type='dora' but mlx_lm.tuner.dora "
+                                    "is unavailable; install a DoRA-capable "
+                                    "mlx-lm or convert the adapter to plain "
+                                    "LoRA before reload."
+                                ) from _dora_exc
                         from mlx_lm.tuner.utils import load_adapters
                         model = load_adapters(model, local_path)
                     loaded_model_config = getattr(model, "_config", None)
