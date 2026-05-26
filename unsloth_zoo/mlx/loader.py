@@ -674,6 +674,41 @@ def _fix_gemma3_vision_post_layernorm_eps(model):
     return True
 
 
+def _fix_gemma3_text_rmsnorm_fp32(model=None):
+    """Match HF Gemma3 text RMSNorm: fp32 math, then cast back to activation dtype."""
+
+    try:
+        import mlx.core as mx
+        language_module = importlib.import_module("mlx_vlm.models.gemma3.language")
+    except Exception:
+        return False
+
+    rmsnorm_cls = getattr(language_module, "RMSNorm", None)
+    if rmsnorm_cls is None:
+        return False
+    if getattr(rmsnorm_cls, "_unsloth_fp32_rmsnorm_patched", False):
+        if model is not None:
+            model._unsloth_gemma3_text_rmsnorm_fp32 = True
+        return True
+
+    def patched_rmsnorm_call(self, x):
+        orig_dtype = x.dtype
+        x_f = x.astype(mx.float32)
+        y = x_f * mx.rsqrt(mx.mean(x_f * x_f, axis=-1, keepdims=True) + self.eps)
+        if "weight" in self:
+            y = y * (1.0 + self.weight.astype(mx.float32))
+        return y.astype(orig_dtype)
+
+    try:
+        rmsnorm_cls.__call__ = patched_rmsnorm_call
+        rmsnorm_cls._unsloth_fp32_rmsnorm_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_text_rmsnorm_fp32 = True
+    return True
+
+
 def _fix_gemma3_vision_attention_fp32_sdpa(model=None):
     """Run Gemma3 vision SDPA in fp32, then cast back before the output proj."""
 
@@ -3131,6 +3166,7 @@ class FastMLXModel:
             model._is_vlm_model = True
             model._processor = processor
             _fix_gemma4_kv_sharing(model)
+            _fix_gemma3_text_rmsnorm_fp32(model)
             _fix_gemma3_vision_post_layernorm_eps(model)
             _fix_gemma3_vision_attention_fp32_sdpa(model)
             _fix_gemma3_vision_encoder_fp32_layernorm(model)

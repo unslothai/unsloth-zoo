@@ -412,6 +412,22 @@ def test_mlx_loader_patches_gemma3_vision_attention_fp32_sdpa():
     assert "output.astype(orig_dtype)" in source
 
 
+def test_mlx_loader_patches_gemma3_text_rmsnorm_fp32():
+    import inspect
+
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import _fix_gemma3_text_rmsnorm_fp32
+
+    patched = _fix_gemma3_text_rmsnorm_fp32()
+    assert patched in {True, False}
+
+    source = inspect.getsource(loader._fix_gemma3_text_rmsnorm_fp32)
+    assert "x.astype(mx.float32)" in source
+    assert "mx.rsqrt(mx.mean(x_f * x_f" in source
+    assert "return y.astype(orig_dtype)" in source
+    assert "_unsloth_fp32_rmsnorm_patched" in source
+
+
 def test_mlx_loader_patches_gemma3_vision_mlp_fp32_activation():
     import inspect
 
