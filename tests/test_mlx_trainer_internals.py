@@ -400,6 +400,43 @@ def test_mlx_loader_patches_gemma3_vision_attention_fp32_sdpa():
     assert "output.astype(orig_dtype)" in source
 
 
+def test_mlx_loader_patches_gemma3_image_feature_scale():
+    import inspect
+
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import _fix_gemma3_multimodal_image_feature_scale
+
+    patched = _fix_gemma3_multimodal_image_feature_scale()
+    assert patched in {True, False}
+
+    source = inspect.getsource(loader._fix_gemma3_multimodal_image_feature_scale)
+    assert "embed_dim = image_features.shape[-1]" in source
+    assert "image_features / (embed_dim**0.5)" in source
+    assert "del hidden_size" in source
+
+    if patched:
+        from mlx_vlm.models.gemma3.gemma3 import Model
+
+        image_token_id = 99
+        input_ids = mx.array([[1, image_token_id, image_token_id]])
+        inputs_embeds = mx.ones((1, 3, 4))
+        image_features = mx.ones((1, 2, 4))
+        attention_mask = mx.ones((1, 3))
+
+        embeds, _ = Model.prepare_inputs_for_multimodal(
+            9,
+            0,
+            image_token_id,
+            image_features,
+            inputs_embeds,
+            input_ids,
+            attention_mask,
+        )
+
+        assert mx.allclose(embeds[0, 1:], mx.full((2, 4), 0.5))
+
+
 def test_qwen3_vl_vision_rotary_uses_transformers_fp32_math():
     import inspect
     import unsloth_zoo.mlx.compile as mc

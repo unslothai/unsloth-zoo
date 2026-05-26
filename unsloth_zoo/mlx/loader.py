@@ -727,6 +727,79 @@ def _fix_gemma3_vision_attention_fp32_sdpa(model=None):
     return True
 
 
+def _fix_gemma3_multimodal_image_feature_scale(model=None):
+    """Use text embedding width when compensating Gemma3 image feature scaling."""
+
+    try:
+        import mlx.core as mx
+        gemma3_module = importlib.import_module("mlx_vlm.models.gemma3.gemma3")
+    except Exception:
+        return False
+
+    model_cls = getattr(gemma3_module, "Model", None)
+    masked_scatter = getattr(gemma3_module, "masked_scatter", None)
+    if model_cls is None or masked_scatter is None:
+        return False
+    if getattr(model_cls, "_unsloth_image_feature_scale_patched", False):
+        if model is not None:
+            model._unsloth_gemma3_image_feature_scale = "text_embed_dim"
+        return True
+
+    def prepare_inputs_for_multimodal(
+        hidden_size,
+        pad_token_id,
+        image_token_index,
+        image_features,
+        inputs_embeds,
+        input_ids,
+        attention_mask,
+    ):
+        del hidden_size
+        embed_dim = image_features.shape[-1]
+        batch_size, sequence_length = input_ids.shape
+        # Gemma3's language model scales all inputs_embeds by sqrt(text hidden
+        # size). Compensate image features with the actual embedding width, not
+        # the top-level multimodal config hidden_size.
+        scaled_image_features = image_features / (embed_dim**0.5)
+        final_embedding = mx.zeros((batch_size, sequence_length, embed_dim))
+
+        pad_token_id = pad_token_id if pad_token_id is not None else 0
+        text_mask = (input_ids != image_token_index) & (input_ids != pad_token_id)
+        image_mask = input_ids == image_token_index
+        pad_mask = input_ids == pad_token_id
+
+        text_mask_expanded = mx.repeat(mx.expand_dims(text_mask, -1), embed_dim, axis=-1)
+        pad_mask_expanded = mx.repeat(mx.expand_dims(pad_mask, -1), embed_dim, axis=-1)
+        image_mask_expanded = mx.repeat(mx.expand_dims(image_mask, -1), embed_dim, axis=-1)
+
+        final_embedding = mx.where(text_mask_expanded, inputs_embeds, final_embedding)
+        final_embedding = mx.where(
+            pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding,
+        )
+        final_embedding = masked_scatter(
+            final_embedding, image_mask_expanded, scaled_image_features,
+        )
+
+        attention_mask_expanded_1 = mx.expand_dims(attention_mask, 1)
+        attention_mask_expanded_2 = mx.expand_dims(attention_mask, 2)
+        final_attention_mask_4d = mx.expand_dims(
+            attention_mask_expanded_1 * attention_mask_expanded_2,
+            1,
+        )
+        return final_embedding.astype(inputs_embeds.dtype), final_attention_mask_4d
+
+    try:
+        model_cls.prepare_inputs_for_multimodal = staticmethod(
+            prepare_inputs_for_multimodal,
+        )
+        model_cls._unsloth_image_feature_scale_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_image_feature_scale = "text_embed_dim"
+    return True
+
+
 def _safe_getsource(obj) -> str:
     try:
         return inspect.getsource(obj)
@@ -2932,6 +3005,7 @@ class FastMLXModel:
             _fix_gemma4_kv_sharing(model)
             _fix_gemma3_vision_post_layernorm_eps(model)
             _fix_gemma3_vision_attention_fp32_sdpa(model)
+            _fix_gemma3_multimodal_image_feature_scale(model)
 
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name
