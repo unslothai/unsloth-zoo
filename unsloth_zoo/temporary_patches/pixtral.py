@@ -105,6 +105,7 @@ def patch_PixtralAttention():
         target_cls,
         "forward",
         forward,
+        match_level="relaxed",
     )
 pass
 TEMPORARY_PATCHES.append(patch_PixtralAttention)
