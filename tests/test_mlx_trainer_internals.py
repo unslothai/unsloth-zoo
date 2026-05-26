@@ -52,6 +52,7 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "optim",
         "weight_decay",
         "max_grad_norm",
+        "max_grad_leaf_norm",
         "seed",
         "logging_steps",
         "output_dir",

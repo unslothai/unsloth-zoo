@@ -283,6 +283,57 @@ def _normalize_mlx_scheduler_type(name):
     return sched_type
 
 
+def _resolve_mlx_grad_clipping(args):
+    """Resolve mutually exclusive MLX clipping knobs.
+
+    Returns ``(max_grad_norm, max_grad_value, max_grad_leaf_norm, mode)``.
+    ``max_grad_value`` keeps elementwise clamp semantics. ``max_grad_leaf_norm``
+    is the cheap proportional alternative: cap each gradient leaf's L2 norm
+    without a cross-tree global reduction.
+    """
+    max_grad_norm = float(getattr(args, "max_grad_norm", 0.0) or 0.0)
+    raw_value = getattr(args, "max_grad_value", None)
+    raw_leaf = getattr(args, "max_grad_leaf_norm", None)
+    user_set_value = raw_value is not None
+    user_set_leaf = raw_leaf is not None
+
+    max_grad_value = float(raw_value or 0.0) if user_set_value else 0.0
+    max_grad_leaf_norm = float(raw_leaf or 0.0) if user_set_leaf else 0.0
+
+    if max_grad_value > 0:
+        # Preserve the public meaning of max_grad_value as elementwise clamp.
+        return 0.0, max_grad_value, 0.0, "value"
+
+    if max_grad_leaf_norm > 0:
+        return 0.0, 0.0, max_grad_leaf_norm, "leaf_norm"
+
+    if max_grad_norm > 0:
+        return max_grad_norm, 0.0, 0.0, "global_norm"
+
+    if user_set_value or user_set_leaf:
+        # Explicit 0.0 disables cheap clipping.
+        return 0.0, 0.0, 0.0, "none"
+
+    # MLX default: cheap proportional clipping without global norm memory cost.
+    return 0.0, 0.0, 1.0, "leaf_norm"
+
+
+def _clip_grad_by_value(grad, max_grad_value):
+    """Elementwise clamp; preserves the historical max_grad_value contract."""
+    return tree_map(lambda g: mx.clip(g, -max_grad_value, max_grad_value), grad)
+
+
+def _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm):
+    """Scale each gradient leaf to a max L2 norm, preserving leaf direction."""
+    def _clip_leaf_norm(g):
+        g_f = g.astype(mx.float32)
+        norm = mx.sqrt(mx.sum(g_f * g_f))
+        scale = mx.minimum(max_grad_leaf_norm / (norm + 1e-6), 1.0)
+        return g * scale.astype(g.dtype)
+
+    return tree_map(_clip_leaf_norm, grad)
+
+
 @dataclass
 class MLXTrainingConfig:
     """Training configuration mirroring SFTConfig / TrainingArguments field names."""
@@ -302,9 +353,13 @@ class MLXTrainingConfig:
     adam_beta1: float | None = None
     adam_beta2: float | None = None
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
-    # Per-leaf elementwise clip to `[-v, +v]`. None defaults to 1.0
-    # unless max_grad_norm > 0 (global-norm wins). 0.0 disables.
+    # Elementwise clip to `[-v, +v]`. None means "not requested";
+    # positive values override other clipping modes to preserve API meaning.
     max_grad_value: float | None = None
+    # Proportional per-leaf L2 norm cap. This preserves each tensor's gradient
+    # direction and avoids max_grad_norm's cross-tree memory overhead.
+    # None uses MLX's cheap default of 1.0 unless another clip knob is explicit.
+    max_grad_leaf_norm: float | None = None
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
     embedding_learning_rate: float = 0.0  # 0 = disabled, 5e-5 = recommended
@@ -1044,35 +1099,38 @@ class MLXTrainer:
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
         _warned_skip_optimizer_state_grad_norm = False
 
-        # Build step functions following mlx-lm's pattern.
-        # Resolution rule:
-        #   * max_grad_value=None (default) -> cheap MLX elementwise clip
-        #     at 1.0, unless the user also passed max_grad_norm > 0 -- in
-        #     that case the user opted into global-norm clipping (HF/TRL
-        #     parity) and elementwise is disabled to avoid double-clip.
-        #   * max_grad_value explicit (float or 0.0) -> honor exactly;
-        #     if both modes are positive, elementwise wins (warn).
-        # max_grad_norm uses MLX's clip_grad_norm helper which materially
-        # increases peak memory on bf16 VLM runs, hence the elementwise
-        # default.
-        max_grad_norm = float(args.max_grad_norm or 0.0)
-        _raw_mgv = getattr(args, "max_grad_value", None)  # TODO: expose MLX grad-clip in Studio UI for power users
-        _user_set_mgv = _raw_mgv is not None
-        if _user_set_mgv:
-            max_grad_value = float(_raw_mgv or 0.0)
-            if max_grad_norm > 0 and max_grad_value > 0:
+        # Build step functions following mlx-lm's pattern. `max_grad_value`
+        # remains an elementwise clamp. MLX's cheap default is now the clearer
+        # `max_grad_leaf_norm`, a proportional per-leaf norm cap that avoids
+        # global norm clipping's cross-tree memory overhead.
+        (
+            max_grad_norm,
+            max_grad_value,
+            max_grad_leaf_norm,
+            _grad_clip_mode,
+        ) = _resolve_mlx_grad_clipping(args)
+        _raw_mgln = getattr(args, "max_grad_leaf_norm", None)
+        if max_grad_value > 0:
+            conflicts = []
+            if float(getattr(args, "max_grad_norm", 0.0) or 0.0) > 0:
+                conflicts.append("max_grad_norm")
+            if _raw_mgln is not None and float(_raw_mgln or 0.0) > 0:
+                conflicts.append("max_grad_leaf_norm")
+            if conflicts:
                 print(
-                    "Unsloth: max_grad_norm and max_grad_value are both enabled; "
-                    "ignoring max_grad_norm in favor of max_grad_value."
+                    "Unsloth: max_grad_value is elementwise and overrides "
+                    f"{', '.join(conflicts)}."
                 )
-                max_grad_norm = 0.0
-        elif max_grad_norm > 0:
-            # User opted into global-norm clipping; suppress the default elementwise.
-            max_grad_value = 0.0
-        else:
-            # Neither requested -> cheap MLX default.
-            max_grad_value = 1.0
+        elif (
+            max_grad_leaf_norm > 0
+            and float(getattr(args, "max_grad_norm", 0.0) or 0.0) > 0
+        ):
+            print(
+                "Unsloth: max_grad_leaf_norm is enabled; ignoring "
+                "max_grad_norm to avoid double clipping."
+            )
         _clip_grad_value = max_grad_value > 0
+        _clip_grad_leaf_norm = max_grad_leaf_norm > 0
         state = [model.state, optimizer.state, mx.random.state]
         # The direct grad_accum==1 fast path delegates clipping to
         # mlx.optimizers.clip_grad_norm(). That helper is exact, but on current
@@ -1082,7 +1140,8 @@ class MLXTrainer:
             grad_accum == 1 and
             not _needs_grad_scaling and
             max_grad_norm <= 0 and
-            not _clip_grad_value
+            not _clip_grad_value and
+            not _clip_grad_leaf_norm
         )
 
         _restore_storage_after_norm_clip = max_grad_norm > 0
@@ -1177,15 +1236,6 @@ class MLXTrainer:
             # This avoids adding a second consumer to the lazy backward graph.
             return getattr(optimizer, "betas", None)
 
-        def _clip_grad_by_value(grad):
-            # Per-leaf elementwise clip; no cross-leaf reduction.
-            if not _clip_grad_value:
-                return grad
-            return tree_map(
-                lambda g: mx.clip(g, -max_grad_value, max_grad_value),
-                grad,
-            )
-
         def _apply_update(grad, toks_f):
             """Common gradient post-processing and optimizer update.
 
@@ -1211,7 +1261,9 @@ class MLXTrainer:
                     final_grad, max_norm=max_grad_norm
                 )
             if _clip_grad_value:
-                final_grad = _clip_grad_by_value(final_grad)
+                final_grad = _clip_grad_by_value(final_grad, max_grad_value)
+            if _clip_grad_leaf_norm:
+                final_grad = _clip_grad_by_leaf_norm(final_grad, max_grad_leaf_norm)
             self._apply_manual_weight_decay(model, optimizer, final_grad)
             optimizer.update(model, final_grad)
             _restore_trainable_storage_dtypes()
@@ -1234,7 +1286,9 @@ class MLXTrainer:
             if max_grad_norm > 0:
                 grad, grad_norm = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
             if _clip_grad_value:
-                grad = _clip_grad_by_value(grad)
+                grad = _clip_grad_by_value(grad, max_grad_value)
+            if _clip_grad_leaf_norm:
+                grad = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm)
             self._apply_manual_weight_decay(model, optimizer, grad)
             optimizer.update(model, grad)
             _restore_trainable_storage_dtypes()
