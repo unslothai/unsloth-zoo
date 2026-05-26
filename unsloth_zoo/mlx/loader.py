@@ -637,6 +637,43 @@ def _fix_qwen35_attention_cache(model):
     print("Unsloth: Fixed Qwen3.5 attention for training (cache=None).")
 
 
+def _fix_gemma3_vision_post_layernorm_eps(model):
+    """Match HF Gemma3/SigLIP final vision LayerNorm epsilon.
+
+    mlx-vlm constructs ``post_layernorm`` with MLX's default eps=1e-5, while
+    the checkpoint config and Transformers path use vision_config.layer_norm_eps
+    (1e-6 for Gemma3). The mismatch only appears after the full vision tower,
+    so it is easy to misdiagnose as attention drift.
+    """
+
+    vision_tower = getattr(model, "vision_tower", None)
+    vision_model = getattr(vision_tower, "vision_model", None)
+    post_layernorm = getattr(vision_model, "post_layernorm", None)
+    if post_layernorm is None or not hasattr(post_layernorm, "eps"):
+        return False
+
+    config = getattr(model, "config", None)
+    vision_config = getattr(config, "vision_config", None)
+    if vision_config is None and isinstance(config, dict):
+        vision_config = config.get("vision_config")
+
+    eps = None
+    if isinstance(vision_config, dict):
+        eps = vision_config.get("layer_norm_eps")
+    elif vision_config is not None:
+        eps = getattr(vision_config, "layer_norm_eps", None)
+    if eps is None:
+        return False
+
+    eps = float(eps)
+    if float(getattr(post_layernorm, "eps")) == eps:
+        return False
+
+    post_layernorm.eps = eps
+    model._unsloth_gemma3_vision_post_layernorm_eps = eps
+    return True
+
+
 def _safe_getsource(obj) -> str:
     try:
         return inspect.getsource(obj)
@@ -2840,6 +2877,7 @@ class FastMLXModel:
             model._is_vlm_model = True
             model._processor = processor
             _fix_gemma4_kv_sharing(model)
+            _fix_gemma3_vision_post_layernorm_eps(model)
 
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name

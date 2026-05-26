@@ -365,6 +365,26 @@ def test_mlx_loader_keeps_norm_parameters_float32():
     )
 
 
+def test_mlx_loader_fixes_gemma3_vision_post_layernorm_eps():
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.loader import _fix_gemma3_vision_post_layernorm_eps
+
+    post_layernorm = SimpleNamespace(eps=1e-5)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            vision_config=SimpleNamespace(layer_norm_eps=1e-6),
+        ),
+        vision_tower=SimpleNamespace(
+            vision_model=SimpleNamespace(post_layernorm=post_layernorm),
+        ),
+    )
+
+    assert _fix_gemma3_vision_post_layernorm_eps(model) is True
+    assert post_layernorm.eps == 1e-6
+    assert model._unsloth_gemma3_vision_post_layernorm_eps == 1e-6
+
+
 def test_qwen3_vl_vision_rotary_uses_transformers_fp32_math():
     import inspect
     import unsloth_zoo.mlx.compile as mc
