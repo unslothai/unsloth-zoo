@@ -1475,23 +1475,29 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
         input_ids = batch_dict.get("input_ids")
         if input_ids is not None:
             _labels = batch_dict.get("labels")
+            _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+            # When labels are absent, expand the raw pre-narrow carrier
+            # alongside input_ids so the labels-free loss paths still see
+            # wide invalid ids (e.g. np.uint32(2**32 - 100)) at their
+            # original positions for NaN-poisoning. When labels are present
+            # the carrier is redundant; pop it so a stale pre-expansion
+            # copy left by _collate_vlm_prompt_completion_batch cannot
+            # crash _apply_response_mask_to_vlm_batch with a shape mismatch.
+            _label_source = _labels if _labels is not None else _raw_labels
             _expanded = _expand_image_token_sequences(
                 input_ids=input_ids,
                 attention_mask=batch_dict.get("attention_mask"),
                 image_token_id=int(_config_get(config, "image_token_index")),
                 repeat_count=int(_config_get(config, "num_image_tokens")),
-                labels=_labels,
+                labels=_label_source,
             )
             if _labels is not None:
                 batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+            elif _raw_labels is not None:
+                batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
             else:
                 batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
-                # The raw-ids carrier captured pre-expansion ids in
-                # _to_mx_vlm_batch and is now stale relative to the expanded
-                # sequence. Drop it so the labels-free loss paths fall back
-                # to the freshly expanded input_ids instead of misaligning
-                # targets against the longer hidden-state sequence.
-                batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
 
     if model_type in {"phi4-siglip", "phi4_siglip"}:
         input_ids = batch_dict.get("input_ids")
@@ -1522,17 +1528,23 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                         image_idx += 1
                     replacements.append(tuple(batch_replacements))
                 _labels = batch_dict.get("labels")
+                _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+                # See multi_modality branch above for why we expand the raw
+                # carrier when labels are absent and pop it when labels exist.
+                _label_source = _labels if _labels is not None else _raw_labels
                 _expanded = _expand_token_runs(
                     input_ids=input_ids,
                     attention_mask=batch_dict.get("attention_mask"),
                     replacements_by_batch=tuple(replacements),
-                    labels=_labels,
+                    labels=_label_source,
                 )
                 if _labels is not None:
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+                elif _raw_labels is not None:
+                    batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
-                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
 
     if model_type == "phi4mm":
         input_ids = batch_dict.get("input_ids")
@@ -1595,17 +1607,23 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                 replacements.append(tuple(batch_replacements))
             if replacements:
                 _labels = batch_dict.get("labels")
+                _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+                # See multi_modality branch above for why we expand the raw
+                # carrier when labels are absent and pop it when labels exist.
+                _label_source = _labels if _labels is not None else _raw_labels
                 _expanded = _expand_token_runs(
                     input_ids=input_ids,
                     attention_mask=batch_dict.get("attention_mask"),
                     replacements_by_batch=tuple(replacements),
-                    labels=_labels,
+                    labels=_label_source,
                 )
                 if _labels is not None:
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+                elif _raw_labels is not None:
+                    batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
-                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
 
     return batch_dict
 
