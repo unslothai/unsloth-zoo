@@ -4490,6 +4490,7 @@ def save_pretrained_gguf(
         quantize_gguf,
         install_llama_cpp,
         check_llama_cpp,
+        LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
     )
 
@@ -4541,12 +4542,13 @@ def save_pretrained_gguf(
                 )
 
         # Step 2: Ensure llama.cpp is installed and gguf package is available
-        llama_cpp_folder = "llama.cpp"
+        llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
         try:
-            check_llama_cpp(llama_cpp_folder)
+            quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         except Exception:
             print("Unsloth: Installing llama.cpp (this only happens once)...")
-            _install_llama_cpp_macos(llama_cpp_folder)
+            quantizer_location, converter_location = install_llama_cpp(llama_cpp_folder)
+        llama_cpp_folder = os.path.dirname(converter_location)
 
         # Ensure gguf Python package is installed (may be missing if
         # llama.cpp was built in a different venv)
@@ -4573,7 +4575,16 @@ def save_pretrained_gguf(
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
         supported_text_archs = None
         supported_vision_archs = None
-        result = _download_convert_hf_to_gguf()  # no args — uses defaults
+        old_scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+        if old_scripts_dir is None:
+            os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = llama_cpp_folder
+        try:
+            result = _download_convert_hf_to_gguf()
+        finally:
+            if old_scripts_dir is None:
+                os.environ.pop("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", None)
+            else:
+                os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = old_scripts_dir
         if isinstance(result, tuple) and len(result) >= 3:
             converter, supported_text_archs, supported_vision_archs = result[:3]
         elif isinstance(result, str):
@@ -4607,7 +4618,7 @@ def save_pretrained_gguf(
 
         # Step 6: Quantize if the target quant differs from first_conversion
         if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
-            quantizer = os.path.join(llama_cpp_folder, "llama-quantize")
+            quantizer = quantizer_location
             base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
             final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
 
