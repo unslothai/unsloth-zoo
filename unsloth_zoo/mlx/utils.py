@@ -781,13 +781,16 @@ def _unpack_embed_result(embed_result, model):
     else:
         merged_embeds = embed_result
 
-    # Qwen-VL family: get_input_embeddings stashes position_ids on the
+    # Qwen-VL family: some get_input_embeddings paths stash position_ids on the
     # language model wrapper; the inner backbone needs them explicitly.
+    # Do not override position_ids explicitly returned by InputEmbeddingsFeatures
+    # (for example when the collator passed CUDA-parity mRoPE IDs through the
+    # embedder).
     # When no position_ids were stashed (e.g. text-only samples or simple
     # images without grid_thw), generate sequential ones so the backbone
     # doesn't crash accessing cache.offset with cache=None.
     lm = getattr(model, "language_model", None)
-    if lm is not None:
+    if lm is not None and "position_ids" not in backbone_kwargs:
         _MISSING = object()
         pos_ids = getattr(lm, "_position_ids", _MISSING)
         if pos_ids is not _MISSING and pos_ids is not None:
