@@ -862,8 +862,11 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         **extra_kwargs,
     )
     merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
-    # Prefer embedder-produced position_ids (Qwen-VL adjusts for merged seq).
-    if "position_ids" in extra_kwargs and "position_ids" not in backbone_kwargs:
+    # Collation builds CUDA-parity mRoPE position_ids for the full sequence.
+    # Use them over embedder fallbacks; preserving Qwen3-VL embedder-produced
+    # position_ids here shifts the first real-cat training loss from ~6.45 to
+    # ~6.90.
+    if "position_ids" in extra_kwargs:
         backbone_kwargs["position_ids"] = extra_kwargs["position_ids"]
 
     hidden = _forward_text_hidden_states(

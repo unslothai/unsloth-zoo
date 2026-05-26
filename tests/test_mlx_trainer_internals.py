@@ -270,6 +270,15 @@ def test_mlx_text_loss_masks_exclude_position_at_sequence_length():
     assert "steps < lengths[:, 1:]" in source
 
 
+def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
+    import inspect
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    source = inspect.getsource(mlx_utils._vlm_cce_forward)
+    assert 'if "position_ids" in extra_kwargs:' in source
+    assert 'and "position_ids" not in backbone_kwargs' not in source
+
+
 def test_mlx_train_result_reports_base_quantization():
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer
