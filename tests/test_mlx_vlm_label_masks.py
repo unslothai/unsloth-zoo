@@ -173,6 +173,28 @@ def test_vlm_processor_inputs_known_arch_image_layouts(module_name, expected):
     assert processor.seen_images == expected
 
 
+def test_vlm_resize_int_does_not_upscale_small_images():
+    from PIL import Image
+
+    from unsloth_zoo.mlx.utils import _resize_vlm_images
+
+    image = Image.new("RGB", (512, 512))
+    resized = _resize_vlm_images([image], 896)
+
+    assert resized[0].size == (512, 512)
+
+
+def test_vlm_resize_int_downscales_large_images_like_cuda_collator():
+    from PIL import Image
+
+    from unsloth_zoo.mlx.utils import _resize_vlm_images
+
+    image = Image.new("RGB", (1024, 512))
+    resized = _resize_vlm_images([image], 512)
+
+    assert resized[0].size == (512, 256)
+
+
 def test_vlm_processor_inputs_retries_duplicate_add_special_tokens():
     from unsloth_zoo.mlx.utils import _processor_vlm_inputs
 

@@ -2314,7 +2314,18 @@ def _resize_vlm_images(images, image_size):
     resized = []
     for image in images:
         if isinstance(image, Image.Image):
-            resized.append(image.convert("RGB").resize(target, Image.Resampling.LANCZOS))
+            image = image.convert("RGB")
+            if isinstance(image_size, int):
+                # Match UnslothVisionDataCollator resize="min": shrink large
+                # images to the model limit, but let processors handle upscaling.
+                if image.size[0] > image_size:
+                    width, height = image.size
+                    new_width = (width * image_size + width // 2) // width
+                    new_height = (height * image_size + width // 2) // width
+                    image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            else:
+                image = image.resize(target, Image.Resampling.LANCZOS)
+            resized.append(image)
         else:
             resized.append(image)
     return resized
