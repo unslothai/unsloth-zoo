@@ -198,6 +198,7 @@ def _run_hidden_stack(stack, inputs, inputs_embeds=None, **kwargs):
     """Execute a language stack up to pre-lm_head hidden states."""
     from mlx_vlm.models.base import create_attention_mask
 
+    config = getattr(stack, "config", None)
     norm_weight = getattr(getattr(stack, "norm", None), "weight", None)
     if inputs_embeds is None:
         h = stack.embed_tokens(inputs)
@@ -205,6 +206,8 @@ def _run_hidden_stack(stack, inputs, inputs_embeds=None, **kwargs):
         h = inputs_embeds.astype(norm_weight.dtype)
     else:
         h = inputs_embeds
+    if inputs_embeds is not None and _config_get(config, "model_type") == "gemma3_text":
+        h *= mx.array(_config_get(config, "hidden_size")**0.5, mx.bfloat16).astype(h.dtype)
 
     cache = kwargs.get("cache")
     if cache is None:
@@ -257,6 +260,13 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
     tm = _get_text_model(model)
     backbone = getattr(tm, "model", None)
     if backbone is not None:
+        if (
+            inputs_embeds is not None
+            and "token_type_ids" in kwargs
+            and _config_get(getattr(backbone, "config", None), "model_type") == "gemma3_text"
+            and _has_hidden_stack(backbone)
+        ):
+            return _run_hidden_stack(backbone, inputs, inputs_embeds=inputs_embeds, **kwargs)
         if getattr(backbone, "lm_head", None) is not None and _has_hidden_stack(backbone):
             return _run_hidden_stack(backbone, inputs, inputs_embeds=inputs_embeds, **kwargs)
         embed_kwarg = _get_backbone_embed_kwarg(backbone)

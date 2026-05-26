@@ -353,3 +353,49 @@ def test_gemma_image_attention_mask_allows_bidirectional_image_block():
     assert mask[1] == [True, True, True, False]
     assert mask[2] == [True, True, True, False]
     assert mask[3] == [True, True, True, True]
+
+
+def test_gemma3_vlm_hidden_stack_uses_image_mask_and_embed_scale():
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _forward_text_hidden_states
+
+    class RecordingLayer:
+        def __init__(self):
+            self.seen_h = None
+            self.seen_mask = None
+
+        def __call__(self, h, mask, _cache):
+            self.seen_h = h
+            self.seen_mask = mask
+            return h
+
+    class IdentityNorm:
+        weight = mx.ones((4,), dtype=mx.float32)
+
+        def __call__(self, h):
+            return h
+
+    layer = RecordingLayer()
+    stack = SimpleNamespace(
+        config=SimpleNamespace(model_type="gemma3_text", hidden_size=4),
+        embed_tokens=object(),
+        layers=[layer],
+        norm=IdentityNorm(),
+        sliding_window_pattern=1,
+        window_size=2,
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(model=stack))
+    embeds = mx.ones((1, 4, 4), dtype=mx.float32)
+    token_type_ids = mx.array([[0, 1, 1, 0]], dtype=mx.int32)
+
+    out = _forward_text_hidden_states(
+        model,
+        mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+        inputs_embeds=embeds,
+        token_type_ids=token_type_ids,
+    )
+
+    assert mx.allclose(out, mx.full((1, 4, 4), 2.0))
+    assert mx.allclose(layer.seen_h, mx.full((1, 4, 4), 2.0))
+    assert layer.seen_mask[0, 0].tolist()[1] == [True, True, True, False]
