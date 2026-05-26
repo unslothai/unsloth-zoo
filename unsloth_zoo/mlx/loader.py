@@ -360,6 +360,154 @@ def _load_mlx_vlm_with_extra_weight_filter(
                 nn.Module.load_weights = original_load_weights
 
 
+def _read_json_file(path):
+    """Read a JSON object, returning an empty dict for missing/bad sidecars."""
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return {}
+
+
+def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
+    """Resolve a custom mlx-vlm or Transformers processor class by name."""
+    if not processor_class_name:
+        return None
+
+    module_model_type = (model_type or "").replace("-", "_")
+    module_candidates = (
+        f"mlx_vlm.models.{module_model_type}.processing",
+        f"mlx_vlm.models.{module_model_type}.processing_{module_model_type}",
+    )
+    for module_name in module_candidates:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        processor_class = getattr(module, processor_class_name, None)
+        if processor_class is not None:
+            return processor_class
+
+    try:
+        import transformers
+        return getattr(transformers, processor_class_name, None)
+    except Exception:
+        return None
+
+
+def _build_vlm_image_processor_from_config(model_path, processor_config, preprocessor_config):
+    """Recreate the image processor from saved processor sidecar configs."""
+    image_config = processor_config.get("image_processor")
+    if not isinstance(image_config, dict):
+        image_config = preprocessor_config
+    if not isinstance(image_config, dict):
+        image_config = {}
+
+    image_processor_type = (
+        image_config.get("image_processor_type")
+        or preprocessor_config.get("image_processor_type")
+    )
+    image_kwargs = dict(image_config)
+    image_kwargs.pop("image_processor_type", None)
+    image_kwargs.pop("processor_class", None)
+
+    if image_processor_type:
+        try:
+            import transformers
+            image_processor_class = getattr(transformers, image_processor_type, None)
+            if image_processor_class is not None:
+                return image_processor_class(**image_kwargs)
+        except Exception:
+            pass
+
+    try:
+        from transformers import AutoImageProcessor
+        return AutoImageProcessor.from_pretrained(model_path)
+    except Exception:
+        return None
+
+
+def _repair_degraded_vlm_processor(
+    processor,
+    model_path,
+    model_type,
+    *,
+    token=None,
+    trust_remote_code=False,
+):
+    """Rebuild VLM processors when mlx-vlm falls back to tokenizer-only.
+
+    mlx-vlm registers several custom processors through an AutoProcessor patch.
+    If the custom processor's image processor cannot be constructed through
+    AutoImageProcessor, the patch falls back to the prior tokenizer-only loader.
+    Rebuild from the source processor configs so downstream saves preserve real
+    multimodal processor metadata.
+    """
+    if processor is None or getattr(processor, "image_processor", None) is not None:
+        return processor
+
+    if not model_path or not os.path.isdir(str(model_path)):
+        return processor
+
+    processor_config = _read_json_file(
+        os.path.join(str(model_path), "processor_config.json")
+    )
+    preprocessor_config = _read_json_file(
+        os.path.join(str(model_path), "preprocessor_config.json")
+    )
+    processor_class_name = (
+        processor_config.get("processor_class")
+        or preprocessor_config.get("processor_class")
+    )
+    processor_class = _resolve_mlx_vlm_processor_class(
+        model_type, processor_class_name,
+    )
+    if processor_class is None:
+        return processor
+
+    image_processor = _build_vlm_image_processor_from_config(
+        model_path, processor_config, preprocessor_config,
+    )
+    if image_processor is None:
+        return processor
+
+    tokenizer = getattr(processor, "tokenizer", None) or processor
+    if tokenizer is None or not hasattr(tokenizer, "save_pretrained"):
+        try:
+            from transformers import AutoTokenizer
+            tokenizer_kwargs = {"trust_remote_code": trust_remote_code}
+            if token:
+                tokenizer_kwargs["token"] = token
+            tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
+        except Exception:
+            return processor
+
+    chat_template = getattr(processor, "chat_template", None)
+    if chat_template is not None and getattr(tokenizer, "chat_template", None) is None:
+        tokenizer.chat_template = chat_template
+
+    try:
+        repaired = processor_class(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+        )
+    except TypeError:
+        try:
+            repaired = processor_class(
+                image_processor=image_processor,
+                tokenizer=tokenizer,
+            )
+        except Exception:
+            return processor
+    except Exception:
+        return processor
+
+    if chat_template is not None and getattr(repaired, "chat_template", None) is None:
+        repaired.chat_template = chat_template
+    return repaired
+
+
 def _build_vlm_model_types():
     """Build the set of model_type strings that mlx_vlm supports.
 
@@ -3303,6 +3451,14 @@ class FastMLXModel:
                     vlm_kwargs,
                     hf_token=token,
                 )
+
+            processor = _repair_degraded_vlm_processor(
+                processor,
+                local_path or model_name,
+                model_type,
+                token=token,
+                trust_remote_code=trust_remote_code,
+            )
 
             if target_dtype is not None:
                 _convert_mlx_dtype(model, target_dtype, model_type=model_type)
