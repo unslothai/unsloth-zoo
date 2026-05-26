@@ -1580,6 +1580,51 @@ def _nf4_dense_dequantize_weight(weight, group_size=64):
         ],
         dtype=mx.float32,
     )
+
+    def _bnb_dynamic_codebook():
+        data = []
+        max_exponent_bits = 7
+        total_bits = 8
+        non_sign_bits = total_bits - 1
+        additional_items = 2 ** (non_sign_bits - max_exponent_bits) - 1
+        for i in range(max_exponent_bits):
+            fraction_items = int(2 ** (i + non_sign_bits - max_exponent_bits) + 1)
+            boundaries = mx.linspace(0.1, 1.0, fraction_items, dtype=mx.float32)
+            means = (boundaries[:-1] + boundaries[1:]) / 2.0
+            scale = 10 ** (-(max_exponent_bits - 1) + i)
+            data.extend((scale * means).tolist())
+            data.extend((-scale * means).tolist())
+        if additional_items > 0:
+            boundaries = mx.linspace(0.1, 1.0, additional_items + 1, dtype=mx.float32)
+            means = (boundaries[:-1] + boundaries[1:]) / 2.0
+            scale = 10 ** (-(max_exponent_bits - 1) + i)
+            data.extend((scale * means).tolist())
+            data.extend((-scale * means).tolist())
+        data.append(0.0)
+        data.append(1.0)
+        data.sort()
+        return mx.array(data, dtype=mx.float32)
+
+    def _bnb_nested_absmax(absmax):
+        dynamic_codebook = _bnb_dynamic_codebook()
+        original_size = (
+            absmax.numel()
+            if callable(getattr(absmax, "numel", None))
+            else (absmax.size() if callable(getattr(absmax, "size", None)) else absmax.size)
+        )
+        offset = mx.mean(absmax)
+        shifted = (absmax - offset).reshape((-1,))
+        pad = (-original_size) % 256
+        if pad:
+            shifted = mx.concatenate([shifted, mx.zeros((pad,), dtype=mx.float32)])
+        scale_groups = shifted.reshape((-1, 256))
+        scale_absmax = mx.max(mx.abs(scale_groups), axis=1, keepdims=True)
+        scale_denom = mx.where(scale_absmax > 0, scale_absmax, mx.ones_like(scale_absmax))
+        scaled = scale_groups / scale_denom
+        scale_indices = mx.argmin(mx.abs(scaled[..., None] - dynamic_codebook), axis=-1)
+        nested = (dynamic_codebook[scale_indices] * scale_absmax).reshape((-1,))[:original_size]
+        return nested + offset
+
     original_shape = weight.shape
     original_dtype = weight.dtype
     flat = weight.astype(mx.float32).reshape((-1,))
@@ -1596,6 +1641,7 @@ def _nf4_dense_dequantize_weight(weight, group_size=64):
     denom = mx.where(absmax > 0, absmax, mx.ones_like(absmax))
     scaled = groups / denom
     indices = mx.argmin(mx.abs(scaled[..., None] - codebook), axis=-1)
+    absmax = _bnb_nested_absmax(absmax.reshape((-1,))).reshape((-1, 1))
     dequantized = (codebook[indices] * absmax).reshape((-1,))[:original_size]
     return dequantized.reshape(original_shape).astype(original_dtype)
 
