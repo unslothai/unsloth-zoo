@@ -27,6 +27,7 @@ import importlib
 import inspect
 import math
 import os
+import tempfile
 import types
 import warnings
 from contextlib import contextmanager
@@ -288,6 +289,81 @@ def _message_matches_known_fallback(message, rule):
     return all(token in message for token in rule.get("message_tokens", ()))
 
 
+def _patch_deepseek_ocr_transformers_import_compat(model_type):
+    """Let DeepSeek-OCR remote config imports survive newer Transformers.
+
+    The MLX path does not instantiate the Torch Llama flash-attention class,
+    but DeepSeek-OCR's tokenizer/config import still imports that symbol from
+    Transformers. Recent Transformers releases removed it, so provide the
+    nearest eager-attention alias only for this import-time compatibility case.
+    """
+    if model_type not in {"deepseekocr", "deepseekocr_2", "deepseek_vl_v2"}:
+        return
+    try:
+        from transformers.models.llama import modeling_llama
+    except Exception:
+        return
+    if (
+        not hasattr(modeling_llama, "LlamaFlashAttention2")
+        and hasattr(modeling_llama, "LlamaAttention")
+    ):
+        modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
+    try:
+        from transformers.utils import import_utils
+    except Exception:
+        return
+    if not hasattr(import_utils, "is_torch_fx_available"):
+        import_utils.is_torch_fx_available = lambda: False
+
+
+def _deepseek_ocr_config_model_type(config_data):
+    architectures = config_data.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    normalized = {str(arch).lower() for arch in architectures}
+    if "deepseekocrforcausallm" in normalized:
+        return "deepseekocr"
+    if "deepseekocr2forcausallm" in normalized:
+        return "deepseekocr_2"
+    return None
+
+
+def _materialize_mlx_vlm_config_override(local_path, config_data):
+    """Return a load path whose config routes known repos to the right mlx-vlm class."""
+    if not local_path:
+        return local_path, config_data
+    corrected_model_type = _deepseek_ocr_config_model_type(config_data)
+    if (
+        corrected_model_type is None
+        or config_data.get("model_type") == corrected_model_type
+    ):
+        return local_path, config_data
+
+    patched_config = dict(config_data)
+    patched_config["model_type"] = corrected_model_type
+    # mlx-vlm supplies the model/processor implementation locally. Keeping the
+    # Torch remote-code auto_map here makes AutoProcessor import incompatible
+    # DeepSeek OCR Torch modules during MLX loads.
+    patched_config.pop("auto_map", None)
+    override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
+    for name in os.listdir(local_path):
+        src = os.path.join(local_path, name)
+        dst = os.path.join(override_dir, name)
+        if name == "config.json":
+            continue
+        try:
+            os.symlink(src, dst)
+        except FileExistsError:
+            pass
+    with open(os.path.join(override_dir, "config.json"), "w") as f:
+        json.dump(patched_config, f, indent=2)
+    print(
+        "Unsloth: Routing DeepSeek OCR checkpoint through "
+        f"mlx-vlm model_type={corrected_model_type!r}."
+    )
+    return override_dir, patched_config
+
+
 def _load_mlx_lm_with_strict_fallback(
     model_name,
     model_type,
@@ -358,6 +434,7 @@ def _load_mlx_vlm_with_extra_weight_filter(
     through load(), so retry with a temporary load_weights shim only for
     registered mismatch signatures and exact allow-listed keys.
     """
+    _patch_deepseek_ocr_transformers_import_compat(model_type)
     try:
         with _temporary_hf_token_env(hf_token):
             return vlm_load(model_name, **vlm_kwargs)
@@ -2388,6 +2465,10 @@ class FastMLXModel:
                         config_data = json.load(f)
                 except (json.JSONDecodeError, KeyError):
                     config_data = {}
+            local_path, config_data = _materialize_mlx_vlm_config_override(
+                local_path,
+                config_data,
+            )
 
         # Reject full_finetuning against a pre-quantized repo. The weights on
         # disk are int4/int8 packed; full FT would need them in a trainable
@@ -2653,14 +2734,16 @@ class FastMLXModel:
                 from mlx_vlm.utils import load_config as _vlm_load_config
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
                       f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")
+                _patch_deepseek_ocr_transformers_import_compat(model_type)
+                vlm_load_target = local_path or model_name
                 with _temporary_hf_token_env(token):
                     model, processor = vlm_load(
-                        model_name,
+                        vlm_load_target,
                         lazy=True,
                         revision=revision,
                         **extra_kwargs,
                     )
-                    vlm_cfg = _vlm_load_config(local_path or model_name)
+                    vlm_cfg = _vlm_load_config(vlm_load_target)
                 model, vlm_cfg = _apply_mlx_quantization(
                     model, vlm_cfg, quantization_spec,
                     is_vlm=True, user_predicate=quant_predicate,
@@ -2676,7 +2759,7 @@ class FastMLXModel:
                 if target_dtype is not None:
                     vlm_kwargs["lazy"] = True
                 model, processor = _load_mlx_vlm_with_extra_weight_filter(
-                    model_name,
+                    local_path or model_name,
                     model_type,
                     vlm_load,
                     vlm_kwargs,

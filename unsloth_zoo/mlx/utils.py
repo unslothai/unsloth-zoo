@@ -164,6 +164,36 @@ def _has_hidden_stack(obj):
     )
 
 
+def _build_gemma_image_attention_mask(token_type_ids, attention_mask=None,
+                                      window_size=None):
+    seq_len = token_type_ids.shape[1]
+    q_idx = mx.arange(seq_len)[:, None]
+    kv_idx = mx.arange(seq_len)[None, :]
+    causal = q_idx >= kv_idx
+    if window_size is not None:
+        causal = mx.logical_and(causal, q_idx < kv_idx + int(window_size))
+
+    is_image = token_type_ids == 1
+    previous_image = mx.concatenate(
+        [mx.zeros_like(is_image[:, :1]), is_image[:, :-1]],
+        axis=1,
+    )
+    new_image_start = mx.logical_and(is_image, mx.logical_not(previous_image))
+    group_ids = mx.cumsum(new_image_start.astype(mx.int32), axis=1) - 1
+    group_ids = mx.where(is_image, group_ids, -1)
+    same_image_group = mx.logical_and(
+        group_ids[:, :, None] == group_ids[:, None, :],
+        group_ids[:, :, None] >= 0,
+    )
+
+    mask = mx.logical_or(causal[None, :, :], same_image_group)
+    if attention_mask is not None:
+        valid = attention_mask.astype(mx.bool_)
+        mask = mx.logical_and(mask, valid[:, :, None])
+        mask = mx.logical_and(mask, valid[:, None, :])
+    return mx.expand_dims(mask, axis=1)
+
+
 def _run_hidden_stack(stack, inputs, inputs_embeds=None, **kwargs):
     """Execute a language stack up to pre-lm_head hidden states."""
     from mlx_vlm.models.base import create_attention_mask
@@ -184,11 +214,35 @@ def _run_hidden_stack(stack, inputs, inputs_embeds=None, **kwargs):
         mask = kwargs.get("attention_mask_4d")
     if mask is None:
         mask = kwargs.get("attention_mask")
-    if mask is None:
+    token_type_ids = kwargs.get("token_type_ids")
+    token_type_mask = None
+    if token_type_ids is not None:
+        attention_mask = kwargs.get("attention_mask")
+        token_type_mask = _build_gemma_image_attention_mask(
+            token_type_ids,
+            attention_mask=attention_mask,
+        )
+    if mask is None and token_type_mask is None:
         mask = create_attention_mask(h, cache)
 
-    for layer, c in zip(stack.layers, cache):
-        h = layer(h, mask, c)
+    sliding_window_pattern = getattr(stack, "sliding_window_pattern", None)
+    window_size = getattr(stack, "window_size", None)
+    sliding_token_type_mask = None
+    if token_type_ids is not None and sliding_window_pattern and window_size:
+        sliding_token_type_mask = _build_gemma_image_attention_mask(
+            token_type_ids,
+            attention_mask=kwargs.get("attention_mask"),
+            window_size=window_size,
+        )
+
+    for i, (layer, c) in enumerate(zip(stack.layers, cache)):
+        local_mask = mask
+        if token_type_mask is not None:
+            is_global = not sliding_window_pattern or (
+                i % sliding_window_pattern == sliding_window_pattern - 1
+            )
+            local_mask = token_type_mask if is_global else sliding_token_type_mask
+        h = layer(h, local_mask, c)
     return stack.norm(h)
 
 
@@ -755,7 +809,9 @@ def _unpack_embed_result(embed_result, model):
     if hasattr(embed_result, "inputs_embeds"):
         merged_embeds = embed_result.inputs_embeds
         if getattr(embed_result, "attention_mask_4d", None) is not None:
-            backbone_kwargs["attention_mask_4d"] = embed_result.attention_mask_4d
+            model_type = _config_get(getattr(model, "config", None), "model_type")
+            if model_type != "gemma3":
+                backbone_kwargs["attention_mask_4d"] = embed_result.attention_mask_4d
         if getattr(embed_result, "position_ids", None) is not None:
             backbone_kwargs["position_ids"] = embed_result.position_ids
         # Gemma4: per-layer inputs for vision token injection
@@ -874,6 +930,10 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     # Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
     if use_collated_position_ids and "position_ids" in extra_kwargs:
         backbone_kwargs["position_ids"] = extra_kwargs["position_ids"]
+    if "token_type_ids" in extra_kwargs:
+        backbone_kwargs["token_type_ids"] = extra_kwargs["token_type_ids"]
+        if attention_mask is not None:
+            backbone_kwargs["attention_mask"] = attention_mask
 
     hidden = _forward_text_hidden_states(
         model,
@@ -961,6 +1021,12 @@ def _normalize_grid_thw(grid_thw):
             item = item.tolist()
         normalized.append(tuple(int(x) for x in item))
     return tuple(normalized)
+
+
+def _grid_thw_to_mx_array(grid_thw):
+    if grid_thw is None:
+        return None
+    return mx.array(grid_thw, dtype=mx.int32)
 
 
 def _normalize_size_tuples(values):
@@ -1336,10 +1402,17 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
+    grid_as_array = model_type in {"glm4v", "glm_ocr"}
     if image_grid_thw is not None:
-        batch_dict["image_grid_thw"] = image_grid_thw
+        # GLM native mlx-vlm paths call .tolist(), .prod(), and slicing on
+        # grids; Qwen/Paddle compile patches expect Python tuples.
+        batch_dict["image_grid_thw"] = (
+            _grid_thw_to_mx_array(image_grid_thw) if grid_as_array else image_grid_thw
+        )
     if video_grid_thw is not None:
-        batch_dict["video_grid_thw"] = video_grid_thw
+        batch_dict["video_grid_thw"] = (
+            _grid_thw_to_mx_array(video_grid_thw) if grid_as_array else video_grid_thw
+        )
     if image_sizes is not None:
         batch_dict["image_sizes"] = image_sizes
     if spatial_shapes is not None:
@@ -2002,6 +2075,42 @@ def _flatten_vlm_messages_to_content_parts(messages):
     return parts
 
 
+def _count_vlm_image_parts(messages):
+    if isinstance(messages, str):
+        return 0
+    count = 0
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image":
+                count += 1
+    return count
+
+
+def _repair_deepseek_rendered_image_tokens(processor, text, messages):
+    if not isinstance(text, str) or not text.strip():
+        return text
+    marker = (
+        f"{processor.__class__.__module__}.{processor.__class__.__name__}"
+    ).lower()
+    if "deepseek" not in marker:
+        return text
+    image_count = _count_vlm_image_parts(messages)
+    if image_count <= 0:
+        return text
+    image_token = getattr(processor, "image_token", None)
+    if not image_token:
+        return text
+    missing = image_count - text.count(image_token)
+    if missing <= 0:
+        return text
+    return (image_token * missing) + text
+
+
 def _processor_accepts_assistant_list_content(processor):
     cached = getattr(processor, "_unsloth_assistant_single_content", None)
     if cached is not None:
@@ -2044,6 +2153,7 @@ def _render_vlm_messages(processor, messages):
             tokenize=False,
             add_generation_prompt=False,
         )
+        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
         if isinstance(text, str) and text.strip():
             return text
     except Exception as first_exc:
@@ -2057,6 +2167,7 @@ def _render_vlm_messages(processor, messages):
             tokenize=False,
             add_generation_prompt=False,
         )
+        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
         if isinstance(text, str) and text.strip():
             return text
     except Exception as second_exc:
@@ -2070,6 +2181,7 @@ def _render_vlm_messages(processor, messages):
             tokenize=False,
             add_generation_prompt=False,
         )
+        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
         if isinstance(text, str) and text.strip():
             return text
     except Exception as third_exc:
@@ -2320,6 +2432,10 @@ def _to_mx_vlm_batch(inputs):
         batch["attention_mask"] = batch["attention_mask"].astype(mx.int32)
     if "labels" in batch:
         batch["labels"] = batch["labels"].astype(mx.int32)
+    if "token_type_ids" in batch:
+        batch["token_type_ids"] = batch["token_type_ids"].astype(mx.int32)
+    if "mm_token_type_ids" in batch:
+        batch["mm_token_type_ids"] = batch["mm_token_type_ids"].astype(mx.int32)
 
     return batch
 
@@ -2344,6 +2460,14 @@ def _processor_vlm_inputs(processor, texts, all_images, max_seq_length, suffixes
         image_layouts = (None,)
     if suffixes is not None and any(suffix is not None for suffix in suffixes):
         base_kwargs["suffix"] = [suffix or "" for suffix in suffixes]
+    marker = f"{processor.__class__.__module__}.{processor.__class__.__name__}".lower()
+    if (
+        "gemma3" in marker
+        or "gemma4" in marker
+        or "qwen3_vl" in marker
+        or "qwen3_5" in marker
+    ):
+        base_kwargs["return_mm_token_type_ids"] = True
 
     first_error = None
     for image_layout in image_layouts:
@@ -2356,6 +2480,25 @@ def _processor_vlm_inputs(processor, texts, all_images, max_seq_length, suffixes
             )
         try:
             return processor(**proc_kwargs)
+        except TypeError as exc:
+            if (
+                "add_special_tokens" in str(exc)
+                and "multiple values" in str(exc)
+                and "add_special_tokens" in proc_kwargs
+            ):
+                proc_kwargs.pop("add_special_tokens", None)
+                try:
+                    return processor(**proc_kwargs)
+                except Exception as retry_exc:
+                    if first_error is None:
+                        first_error = retry_exc
+                    if len(image_layouts) == 1:
+                        raise
+                    continue
+            if first_error is None:
+                first_error = exc
+            if len(image_layouts) == 1:
+                raise
         except Exception as exc:
             if first_error is None:
                 first_error = exc

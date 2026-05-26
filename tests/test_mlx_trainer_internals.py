@@ -205,10 +205,8 @@ def test_scheduler_lr_matches_expected_optimizer_update_steps(scheduler, warmup)
 
     if scheduler == "linear" and warmup == 0:
         # Match `transformers.get_scheduler("linear", num_warmup_steps=0,
-        # num_training_steps=total_steps)`: step 0 = learning_rate, then
-        # decays linearly to 0 over total_steps. The earlier expectation
-        # of `[0, lr, lr*6/7, ...]` would have the first optimizer
-        # update fire at zero LR and is inconsistent with HF behavior.
+        # num_training_steps=total_steps)` as seen by optimizer steps across
+        # Transformers 4.56.1 through 5.5.0: step 1 uses base LR, then decays.
         lr = trainer.args.learning_rate
         expected = [lr * (total_steps - step) / total_steps for step in range(total_steps)]
         assert values == pytest.approx(expected)

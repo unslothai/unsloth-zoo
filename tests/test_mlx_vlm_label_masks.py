@@ -173,6 +173,71 @@ def test_vlm_processor_inputs_known_arch_image_layouts(module_name, expected):
     assert processor.seen_images == expected
 
 
+def test_vlm_processor_inputs_retries_duplicate_add_special_tokens():
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs
+
+    class PaddleLikeProcessor:
+        __module__ = "mlx_vlm.models.paddleocr_vl.processing_paddleocr_vl"
+
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, text, images=None, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "add_special_tokens" in kwargs:
+                raise TypeError(
+                    "got multiple values for keyword argument 'add_special_tokens'"
+                )
+            return {
+                "input_ids": np.ones((len(text), 2), dtype=np.int32),
+                "attention_mask": np.ones((len(text), 2), dtype=np.int32),
+            }
+
+    processor = PaddleLikeProcessor()
+    _processor_vlm_inputs(processor, ["a"], [["img0"]], 8)
+
+    assert "add_special_tokens" in processor.calls[0]
+    assert "add_special_tokens" not in processor.calls[1]
+
+
+def test_deepseek_ocr_loader_patches_removed_llama_flash_attention(monkeypatch):
+    import sys
+    import types
+
+    from unsloth_zoo.mlx.loader import _patch_deepseek_ocr_transformers_import_compat
+
+    llama_module = types.SimpleNamespace(LlamaAttention=object)
+    package = types.ModuleType("transformers.models.llama")
+    package.modeling_llama = llama_module
+    monkeypatch.setitem(sys.modules, "transformers.models.llama", package)
+    import transformers.utils.import_utils as import_utils
+    monkeypatch.delattr(import_utils, "is_torch_fx_available", raising=False)
+
+    _patch_deepseek_ocr_transformers_import_compat("deepseekocr")
+
+    assert llama_module.LlamaFlashAttention2 is llama_module.LlamaAttention
+    assert import_utils.is_torch_fx_available() is False
+
+
+def test_deepseek_rendering_repairs_missing_image_token():
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    class DeepseekProcessor:
+        __module__ = "mlx_vlm.models.deepseekocr.processing_deepseekocr"
+        image_token = "<image>"
+        chat_template = "deepseek"
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+            return "question"
+
+    text = _render_vlm_messages(
+        DeepseekProcessor(),
+        [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "question"}]}],
+    )
+
+    assert text == "<image>question"
+
+
 def test_token_expansion_masks_inserted_label_positions():
     from unsloth_zoo.mlx.utils import _expand_token_runs
 
@@ -202,3 +267,55 @@ def test_mlx_trainer_does_not_attach_processor_for_loss_masking():
 
     assert "self.model._processor =" not in trainer_source
     assert "_get_vlm_ignore_token_ids(" in trainer_source
+
+
+def test_gemma3_vlm_cce_does_not_forward_outer_product_attention_mask():
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _unpack_embed_result
+
+    embeds = mx.ones((1, 4, 8))
+    outer_mask = mx.ones((1, 1, 4, 4), dtype=mx.int32)
+    embed_result = SimpleNamespace(
+        inputs_embeds=embeds,
+        attention_mask_4d=outer_mask,
+    )
+
+    _merged, kwargs = _unpack_embed_result(
+        embed_result,
+        SimpleNamespace(config=SimpleNamespace(model_type="gemma3")),
+    )
+
+    assert "attention_mask_4d" not in kwargs
+
+
+def test_non_gemma3_vlm_cce_keeps_embedder_attention_mask():
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _unpack_embed_result
+
+    embeds = mx.ones((1, 4, 8))
+    outer_mask = mx.ones((1, 1, 4, 4), dtype=mx.int32)
+    embed_result = SimpleNamespace(
+        inputs_embeds=embeds,
+        attention_mask_4d=outer_mask,
+    )
+
+    _merged, kwargs = _unpack_embed_result(
+        embed_result,
+        SimpleNamespace(config=SimpleNamespace(model_type="gemma3n")),
+    )
+
+    assert kwargs["attention_mask_4d"] is outer_mask
+
+
+def test_gemma_image_attention_mask_allows_bidirectional_image_block():
+    from unsloth_zoo.mlx.utils import _build_gemma_image_attention_mask
+
+    token_type_ids = mx.array([[0, 1, 1, 0]], dtype=mx.int32)
+    mask = _build_gemma_image_attention_mask(token_type_ids)[0, 0].tolist()
+
+    assert mask[0] == [True, False, False, False]
+    assert mask[1] == [True, True, True, False]
+    assert mask[2] == [True, True, True, False]
+    assert mask[3] == [True, True, True, True]
