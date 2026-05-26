@@ -3686,6 +3686,36 @@ def _call_mlx_vlm_sanitize(cls, config, weights):
     return sanitize(_MlxVlmSanitizeProxy(config), weights)
 
 
+def _add_mlx_vlm_sanitize_step(steps, module):
+    """Append a real mlx-vlm module sanitizer once, preserving order."""
+    if module is None or getattr(module, "sanitize", None) is None:
+        return
+    if all(existing is not module for existing, _ in steps):
+        steps.append((module, None))
+
+
+def _get_mlx_vlm_model_sanitize_pipelines(model):
+    """Build sanitizer pipelines from a loaded mlx-vlm model and submodules."""
+    if model is None or getattr(model, "sanitize", None) is None:
+        return []
+
+    model_step = [(model, None)]
+    pipelines = [model_step]
+
+    extra_steps = []
+    for attr in ("thinker", "vision_tower", "vision_model", "vision_encoder", "visual"):
+        _add_mlx_vlm_sanitize_step(extra_steps, getattr(model, attr, None))
+
+    thinker = getattr(model, "thinker", None)
+    for attr in ("vision_tower", "vision_model", "vision_encoder", "visual"):
+        _add_mlx_vlm_sanitize_step(extra_steps, getattr(thinker, attr, None))
+
+    for idx in range(len(extra_steps)):
+        pipelines.append(model_step + extra_steps[: idx + 1])
+
+    return pipelines
+
+
 def _get_nested_config(config, *names):
     """Walk nested config attributes, returning None for missing segments."""
     cur = config
@@ -3753,6 +3783,15 @@ def _build_mlx_vlm_sanitize_steps(config):
         for cls, step_config in steps
         if getattr(cls, "sanitize", None) is not None
     ]
+
+
+def _build_mlx_vlm_sanitize_pipelines(config, model=None):
+    """Combine real-model and config-derived sanitizer replay pipelines."""
+    pipelines = _get_mlx_vlm_model_sanitize_pipelines(model)
+    class_steps = _build_mlx_vlm_sanitize_steps(config)
+    if class_steps:
+        pipelines.append(class_steps)
+    return pipelines
 
 
 def _apply_mlx_vlm_sanitizers(steps, weights):
@@ -3825,33 +3864,48 @@ def _mlx_arrays_match(actual, expected):
         return False
 
 
+def _is_mlx_vlm_sanitize_step(value):
+    """Return whether a value is one sanitizer step tuple."""
+    return isinstance(value, tuple) and len(value) == 2
+
+
+def _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
+    """Normalize legacy step lists and multi-pipeline sanitizer inputs."""
+    if not sanitize_steps:
+        return []
+    if all(_is_mlx_vlm_sanitize_step(step) for step in sanitize_steps):
+        return [sanitize_steps]
+    return sanitize_steps
+
+
 def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
     """Invert mlx-vlm sanitizers to recover HF tensor names/layouts for GGUF."""
     for candidate_name in _vlm_gguf_name_candidates(name):
         for candidate_tensor in _vlm_gguf_tensor_candidates(tensor):
-            sanitized = _apply_mlx_vlm_sanitizers(
-                sanitize_steps,
-                {candidate_name: candidate_tensor},
-            )
-            if not sanitized or len(sanitized) != 1:
-                continue
-            sanitized_name, sanitized_tensor = next(iter(sanitized.items()))
-            if sanitized_name != name:
-                continue
-            if not _mlx_arrays_match(sanitized_tensor, tensor):
-                continue
-            changed = (
-                candidate_name != name
-                or not _mlx_arrays_match(candidate_tensor, tensor)
-            )
-            if not changed:
-                continue
-            return candidate_name, candidate_tensor, True
+            for pipeline in _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
+                sanitized = _apply_mlx_vlm_sanitizers(
+                    pipeline,
+                    {candidate_name: candidate_tensor},
+                )
+                if not sanitized or len(sanitized) != 1:
+                    continue
+                sanitized_name, sanitized_tensor = next(iter(sanitized.items()))
+                if sanitized_name != name:
+                    continue
+                if not _mlx_arrays_match(sanitized_tensor, tensor):
+                    continue
+                changed = (
+                    candidate_name != name
+                    or not _mlx_arrays_match(candidate_tensor, tensor)
+                )
+                if not changed:
+                    continue
+                return candidate_name, candidate_tensor, True
 
     return name, tensor, False
 
 
-def _prepare_vlm_gguf_export_directory(path):
+def _prepare_vlm_gguf_export_directory(path, model=None):
     """Rewrite MLX-native VLM tensor names in the temporary GGUF export dir."""
     path = Path(path)
     config_path = path / "config.json"
@@ -3859,7 +3913,7 @@ def _prepare_vlm_gguf_export_directory(path):
         return 0
     with open(config_path, "r") as f:
         config = json.load(f)
-    sanitize_steps = _build_mlx_vlm_sanitize_steps(config)
+    sanitize_steps = _build_mlx_vlm_sanitize_pipelines(config, model=model)
     if not sanitize_steps:
         return 0
 
@@ -4445,7 +4499,7 @@ def save_pretrained_gguf(
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
         save_merged_model(model, tokenizer, tmp_path, dequantize=True)
         if is_vlm_model:
-            rewritten = _prepare_vlm_gguf_export_directory(tmp_path)
+            rewritten = _prepare_vlm_gguf_export_directory(tmp_path, model=model)
             if rewritten:
                 print(
                     "Unsloth: Rewrote "
