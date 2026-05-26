@@ -514,6 +514,12 @@ def test_qwen3_vl_training_compile_verified():
     assert "qwen3_vl_moe" in mc._VERIFIED_TRAINING_ARCHES
 
 
+def test_gemma3_training_compile_not_verified_until_loss_parity():
+    import unsloth_zoo.mlx.compile as mc
+
+    assert "gemma3" not in mc._VERIFIED_TRAINING_ARCHES
+
+
 # ---------------------------------------------------------------------------
 # 2. compile module-level discovery functions return sensible defaults
 #    on a host with no real MLX architectures.
