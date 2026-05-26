@@ -674,6 +674,59 @@ def _fix_gemma3_vision_post_layernorm_eps(model):
     return True
 
 
+def _fix_gemma3_vision_attention_fp32_sdpa(model=None):
+    """Run Gemma3 vision SDPA in fp32, then cast back before the output proj."""
+
+    try:
+        import mlx.core as mx
+        vision_module = importlib.import_module("mlx_vlm.models.gemma3.vision")
+    except Exception:
+        return False
+
+    attention_cls = getattr(vision_module, "Attention", None)
+    if attention_cls is None:
+        return False
+    if getattr(attention_cls, "_unsloth_fp32_sdpa_patched", False):
+        return False
+
+    def patched_attention_call(self, x, mask=None):
+        queries = self.q_proj(x)
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
+        orig_dtype = queries.dtype
+
+        num_heads = self.num_heads
+        batch_size, query_length, hidden_size = queries.shape
+        _, key_length, _ = keys.shape
+        queries = queries.reshape(
+            batch_size, query_length, num_heads, -1,
+        ).transpose(0, 2, 1, 3).astype(mx.float32)
+        keys = keys.reshape(
+            batch_size, key_length, num_heads, -1,
+        ).transpose(0, 2, 1, 3).astype(mx.float32)
+        values = values.reshape(
+            batch_size, key_length, num_heads, -1,
+        ).transpose(0, 2, 1, 3).astype(mx.float32)
+
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask,
+        )
+        output = output.astype(orig_dtype)
+        output = output.transpose(0, 2, 1, 3).reshape(
+            batch_size, query_length, hidden_size,
+        )
+        return self.out_proj(output)
+
+    try:
+        attention_cls.__call__ = patched_attention_call
+        attention_cls._unsloth_fp32_sdpa_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_vision_attention_fp32_sdpa = True
+    return True
+
+
 def _safe_getsource(obj) -> str:
     try:
         return inspect.getsource(obj)
@@ -2878,6 +2931,7 @@ class FastMLXModel:
             model._processor = processor
             _fix_gemma4_kv_sharing(model)
             _fix_gemma3_vision_post_layernorm_eps(model)
+            _fix_gemma3_vision_attention_fp32_sdpa(model)
 
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name

@@ -385,6 +385,21 @@ def test_mlx_loader_fixes_gemma3_vision_post_layernorm_eps():
     assert model._unsloth_gemma3_vision_post_layernorm_eps == 1e-6
 
 
+def test_mlx_loader_patches_gemma3_vision_attention_fp32_sdpa():
+    import inspect
+
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import _fix_gemma3_vision_attention_fp32_sdpa
+
+    patched = _fix_gemma3_vision_attention_fp32_sdpa()
+    assert patched in {True, False}
+
+    source = inspect.getsource(loader._fix_gemma3_vision_attention_fp32_sdpa)
+    assert "scaled_dot_product_attention" in source
+    assert "astype(mx.float32)" in source
+    assert "output.astype(orig_dtype)" in source
+
+
 def test_qwen3_vl_vision_rotary_uses_transformers_fp32_math():
     import inspect
     import unsloth_zoo.mlx.compile as mc
