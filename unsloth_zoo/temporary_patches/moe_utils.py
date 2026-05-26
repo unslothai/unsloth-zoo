@@ -136,8 +136,35 @@ def _grouped_mm_with_backward_fix(
     Grouped matmul with working backward pass.
 
     Uses native torch._grouped_mm with contiguous inputs for correct gradients.
+    Some low-rank LoRA weights are contiguous but still have row strides below
+    the kernel alignment requirement, so keep a narrow fallback for those cases.
     """
-    return torch._grouped_mm(inputs, weight, offs=offsets)
+    inputs = inputs.contiguous()
+    weight = weight.contiguous()
+    try:
+        return torch._grouped_mm(inputs, weight, offs=offsets)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "strides should be multiple of 16 bytes" not in message:
+            raise
+        return _manual_grouped_mm(inputs, weight, offsets)
+
+
+def _manual_grouped_mm(
+    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    """
+    Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps.
+    """
+    outputs = []
+    start = 0
+    for expert_idx, end in enumerate(offsets.detach().cpu().tolist()):
+        if start < end:
+            outputs.append(torch.matmul(inputs[start:end], weight[expert_idx]))
+        start = end
+    if outputs:
+        return torch.cat(outputs, dim=0)
+    return inputs.new_empty((0, weight.shape[-1]))
 
 
 # Global flag to check if grouped GEMM is available
