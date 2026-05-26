@@ -274,9 +274,11 @@ def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
 
-    source = inspect.getsource(mlx_utils._vlm_cce_forward)
-    assert 'if "position_ids" in extra_kwargs:' in source
-    assert 'and "position_ids" not in backbone_kwargs' not in source
+    forward_source = inspect.getsource(mlx_utils._vlm_cce_forward)
+    prepare_source = inspect.getsource(mlx_utils._prepare_vlm_batch_for_compile)
+    assert '"_unsloth_collated_position_ids"' in prepare_source
+    assert 'not k.startswith("_unsloth_")' in forward_source
+    assert 'use_collated_position_ids and "position_ids" in extra_kwargs' in forward_source
 
 
 def test_mlx_train_result_reports_base_quantization():

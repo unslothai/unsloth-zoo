@@ -848,9 +848,13 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     fwd_attn_mask = attention_mask
 
     # Collect extra keys (e.g. image_grid_thw for Qwen) that some models need.
+    use_collated_position_ids = bool(
+        batch_dict.get("_unsloth_collated_position_ids")
+    )
     extra_kwargs = {
         k: v for k, v in batch_dict.items()
         if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+        and not k.startswith("_unsloth_")
         and v is not None
     }
     extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
@@ -862,11 +866,10 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         **extra_kwargs,
     )
     merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
-    # Collation builds CUDA-parity mRoPE position_ids for the full sequence.
-    # Use them over embedder fallbacks; preserving Qwen3-VL embedder-produced
-    # position_ids here shifts the first real-cat training loss from ~6.45 to
-    # ~6.90.
-    if "position_ids" in extra_kwargs:
+    # Prefer collator-built mRoPE IDs when present. Qwen/GLM collators build
+    # CUDA-parity full-sequence positions; recomputing inside the embedder moved
+    # Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
+    if use_collated_position_ids and "position_ids" in extra_kwargs:
         backbone_kwargs["position_ids"] = extra_kwargs["position_ids"]
 
     hidden = _forward_text_hidden_states(
@@ -1370,6 +1373,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                 video_token_id=int(_config_get(config, "video_token_id", _config_get(config, "video_token_index"))),
                 spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
             )
+            batch_dict["_unsloth_collated_position_ids"] = True
 
     if model_type == "glm_ocr":
         input_ids = batch_dict.get("input_ids")
@@ -1391,6 +1395,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                 video_token_id=int(_config_get(config, "video_token_id")),
                 spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
             )
+            batch_dict["_unsloth_collated_position_ids"] = True
 
     if model_type == "phi3_v":
         input_ids = batch_dict.get("input_ids")
