@@ -3418,21 +3418,55 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     return adapter_config
 
 
+def _config_to_plain_python(value):
+    """Recursively convert config dataclasses and containers to plain Python."""
+    import dataclasses
+
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        value = dataclasses.asdict(value)
+    elif isinstance(value, dict):
+        value = copy.deepcopy(value)
+    elif isinstance(value, (list, tuple)):
+        return [_config_to_plain_python(item) for item in value]
+    else:
+        return value
+
+    if isinstance(value, dict):
+        return {
+            key: _config_to_plain_python(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 def _get_model_config(model):
     """Extract config dict from an MLX model.
 
     mlx-lm stores the raw config dict at model._config when loaded.
+    mlx-vlm exposes config dataclasses at model.config.
     Falls back to reconstructing from model.args dataclass.
     """
+    import dataclasses
+
     # Prefer the raw config dict stashed by our loader
     if hasattr(model, "_config") and isinstance(model._config, dict):
-        return dict(model._config)
+        return _config_to_plain_python(model._config)
+
+    if hasattr(model, "config"):
+        config = model.config
+        if isinstance(config, dict) or (
+            dataclasses.is_dataclass(config) and not isinstance(config, type)
+        ):
+            return _config_to_plain_python(config)
+        if hasattr(config, "to_dict"):
+            config = config.to_dict()
+            if isinstance(config, dict):
+                return _config_to_plain_python(config)
 
     # Reconstruct from the ModelArgs dataclass
     if hasattr(model, "args"):
-        import dataclasses
-        if dataclasses.is_dataclass(model.args):
-            return dataclasses.asdict(model.args)
+        if dataclasses.is_dataclass(model.args) and not isinstance(model.args, type):
+            return _config_to_plain_python(model.args)
 
     return {}
 
