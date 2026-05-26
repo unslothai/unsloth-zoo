@@ -119,8 +119,9 @@ def add_new_tokens(
     # Add tokens!
     old_length = len(tokenizer)
     tokenizer.add_tokens(new_tokens)
+    new_vocab_length = len(tokenizer)
     # Also resizes lm_head as well!
-    model.resize_token_embeddings(len(tokenizer))
+    model.resize_token_embeddings(new_vocab_length)
 
     # If we use interpolation, we interpolate between the mean embeddings and
     # the Word2Vec sum of the other vectors
@@ -128,15 +129,15 @@ def add_new_tokens(
     lm_head_matrix   = model.get_output_embeddings().weight
 
     # Confirm sizes are correct
-    if embedding_matrix.shape[0] != (old_input_length  + len(new_tokens)):
+    if embedding_matrix.shape[0] != new_vocab_length:
         raise RuntimeError(
             "Unsloth: Embedding matrix size did not get resized properly. Please file a bug report!"
         )
-    if lm_head_matrix.shape[0]   != (old_output_length + len(new_tokens)):
+    if lm_head_matrix.shape[0]   != new_vocab_length:
         raise RuntimeError(
             "Unsloth: LM Head matrix size did not get resized properly. Please file a bug report!"
         )
-    if model.config.vocab_size   != (old_config_size   + len(new_tokens)):
+    if model.config.vocab_size   != new_vocab_length:
         raise RuntimeError(
             "Unsloth: Model's config vocab_size did not get resized properly. Please file a bug report!"
         )

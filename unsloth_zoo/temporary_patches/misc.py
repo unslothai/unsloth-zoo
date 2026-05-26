@@ -517,6 +517,137 @@ pass
 TEMPORARY_PATCHES.append(patch_transformers_masks)
 
 
+def patch_sdpa_bool_causal_mask():
+    """Fix unslothai/unsloth#4906: inf grad_norm on Qwen3.5 at seq_len > 65536.
+
+    Upstream bug: pytorch/pytorch#162588. Cutlass SDPA returns garbage
+    gradients on bool causal masks at seq_len >= 2**16 (bf16, head_dim=256,
+    no flash-attn). Drop pure causal bool masks and call with is_causal=True;
+    convert non-pure bool masks to float additive bias. Below 2**16 we skip
+    the wrapper since the bug cannot fire.
+    """
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+        return
+    try:
+        import transformers.integrations.sdpa_attention as sdpa_mod
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    except Exception as e:
+        return raise_error("transformers.integrations.sdpa_attention", e)
+
+    current = getattr(sdpa_mod, "sdpa_attention_forward", None)
+    if current is None:
+        return
+    if getattr(current, "__unsloth_bool_causal_mask_fix__", False):
+        return  # already installed
+
+    _orig = current
+
+    def sdpa_attention_forward_unsloth(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout = 0.0,
+        scaling = None,
+        is_causal = None,
+        **kwargs,
+    ):
+        m = attention_mask
+
+        # Below 2**16 the Cutlass bool-mask overflow cannot fire
+        # (pytorch/pytorch#162588), so skip the wrapper. The pure-causal
+        # rewrite picks a heavier SDPA backend and costs ~2.5 GB on
+        # Gemma4-31B LoRA SFT (8192 seq_len).
+        _q_len = query.shape[2] if query.dim() >= 3 else 0
+        _mask_key_len = m.shape[-1] if isinstance(m, torch.Tensor) and m.dim() >= 1 else 0
+        if _q_len < 65536 and _mask_key_len < 65536:
+            return _orig(
+                module, query, key, value, attention_mask,
+                dropout = dropout, scaling = scaling, is_causal = is_causal,
+                **kwargs,
+            )
+
+        # Non-causal modules (BERT, SigLIP) keep their masks; explicit param wins.
+        resolved_is_causal = (
+            is_causal if is_causal is not None
+            else getattr(module, "is_causal", True)
+        )
+        if not resolved_is_causal:
+            return _orig(
+                module, query, key, value, attention_mask,
+                dropout = dropout, scaling = scaling, is_causal = is_causal,
+                **kwargs,
+            )
+
+        # Sliding-window layers (Gemma2, Mistral, Qwen2/3) keep windowed masks.
+        if kwargs.get("sliding_window", None) is not None:
+            return _orig(
+                module, query, key, value, attention_mask,
+                dropout = dropout, scaling = scaling, is_causal = is_causal,
+                **kwargs,
+            )
+
+        # Hybrid models (Qwen3.5) may pass a dict keyed by layer type.
+        if isinstance(m, dict):
+            layer_type = getattr(module, "layer_type", None)
+            if layer_type not in m:
+                return _orig(
+                    module, query, key, value, attention_mask,
+                    dropout = dropout, scaling = scaling, is_causal = is_causal,
+                    **kwargs,
+                )
+            m = m[layer_type]
+
+        # Only intercept 4D bool self-attn masks (not cross-attn or kv-cache decode).
+        if not (
+            isinstance(m, torch.Tensor)
+            and m.dtype == torch.bool
+            and m.dim() == 4
+            and m.shape[-1] == m.shape[-2]
+            and m.shape[-1] == query.shape[2]
+        ):
+            return _orig(
+                module, query, key, value, attention_mask,
+                dropout = dropout, scaling = scaling, is_causal = is_causal,
+                **kwargs,
+            )
+
+        # Pure lower-triangular check via two O(1) probes: upper-tri is False
+        # and last row sees first col. Packed/padded masks fail the second.
+        S = m.shape[-1]
+        is_pure_causal = (
+            (S < 2)
+            or (
+                not m[0, 0, 0, 1].item()
+                and m[0, 0, S - 1, 0].item()
+            )
+        )
+
+        if is_pure_causal:
+            # Drop mask, use native is_causal path (avoids Cutlass >65536 bug, faster).
+            return _orig(
+                module, query, key, value, None,
+                dropout = dropout, scaling = scaling, is_causal = True,
+                **kwargs,
+            )
+
+        # Non-pure bool mask (packed sequences, custom patterns): convert to float
+        # additive bias so SDPA dispatches to the working (non-bool) kernel.
+        m_float = torch.where(m, 0.0, torch.finfo(query.dtype).min).to(query.dtype)
+        return _orig(
+            module, query, key, value, m_float,
+            dropout = dropout, scaling = scaling, is_causal = False,
+            **kwargs,
+        )
+
+    sdpa_attention_forward_unsloth.__unsloth_bool_causal_mask_fix__ = True
+    sdpa_mod.sdpa_attention_forward = sdpa_attention_forward_unsloth
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_attention_forward_unsloth
+pass
+TEMPORARY_PATCHES.append(patch_sdpa_bool_causal_mask)
+
+
 def patch_modernbert_attention_mask():
     """Fix ModernBERT attn_bias stride alignment for SDPA backward pass.
 

@@ -23,6 +23,7 @@ import warnings
 from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype
 from .hf_utils import dtype_from_config
+from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache, device_synchronize
 from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
 
@@ -156,11 +157,31 @@ from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
 
 
+@functools.lru_cache(maxsize = 1)
+def _active_merge_device():
+    """Pick the active accelerator family for LoRA merge math.
+
+    Hardcoding ``"cuda"`` breaks ROCm (AMD), XPU (Intel), and MPS (Apple
+    Silicon) backends. Routing through ``DEVICE_TYPE_TORCH`` only covers
+    cuda/xpu/hip and silently drops MPS, which the MLX backend relies on
+    for the on-host LoRA merge step. Probe the available accelerator
+    family at first call and cache the result.
+    """
+    if torch.cuda.is_available():
+        return "cuda"  # PyTorch ROCm aliases the cuda API, so this also covers HIP
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+pass
+
 def _merge_lora(W, lora_stats, name):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
-    W = W.to("cuda", dtype = torch.float32, non_blocking = True)
-    lora_B = lora_stats.lora_B.to("cuda", dtype = torch.float32, non_blocking = True)
-    lora_A = lora_stats.lora_A.to("cuda", dtype = torch.float32, non_blocking = True)
+    device = _active_merge_device()
+    W = W.to(device, dtype = torch.float32, non_blocking = True)
+    lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
+    lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
     # Handle vocab resize: LoRA may have more rows than base safetensors weight
     if lora_B.shape[0] != W.shape[0]:
         new_size = lora_B.shape[0]
@@ -588,6 +609,15 @@ def _merge_and_overwrite_lora(
                 safetensor_keys,
                 model_class_name = model_class_name,
             )
+            # #5410: use the wrapped module's num_experts, not the shard-local one.
+            for _lk, _ls in converted_lora_weights.items():
+                if not isinstance(_lk, str): continue
+                _pm = re.match(r"^(.*mlp\.experts)(?:\.base_layer)?$", _lk)
+                if not _pm: continue
+                _prefix = _pm.group(1)
+                _ne = _resolve_num_experts_from_lora_stats(_ls, fallback = None)
+                if _ne is not None and _ne > 1:
+                    moe_num_experts[_prefix] = _ne
             processed_mxfp4_keys = set()
             if UNSLOTH_ENABLE_LOGGING:
                 try:
@@ -623,9 +653,8 @@ def _merge_and_overwrite_lora(
                     logger.info(f"[merge_debug] First shard key example: {key}")
 
                 # FORCE memory cleanup before processing each tensor
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
+                device_empty_cache()
+                device_synchronize()
 
                 # ---------- Special handling for MoE stacked expert params ----------
                 # gate_up_proj is stored fused in the model but sharded as gate_proj & up_proj per expert on disk.
@@ -772,7 +801,7 @@ def _merge_and_overwrite_lora(
                     )
 
                 del W
-                torch.cuda.empty_cache()
+                device_empty_cache()
             pass
             # Success! Direct overwrite completed
         pass
@@ -792,15 +821,96 @@ def _merge_and_overwrite_lora(
                         tensors[key] = resized[key]
                     else:
                         tensors[key] = f.get_tensor(key)
-            save_file(tensors, filename_original)
-            del tensors
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            # POSIX: direct save. Windows: temp-file + os.replace to
+            # avoid WinError 1224 (mmap section release can lag).
+            if os.name != "nt":
+                save_file(tensors, filename_original)
+                del tensors
+            else:
+                gc.collect()
+                device_empty_cache()
+
+                max_retries = 5
+                base_delay  = 0.2  # seconds
+                temp_dir    = os.path.dirname(os.path.abspath(filename_original))
+                try:
+                    original_mode = os.stat(filename_original).st_mode
+                except OSError:
+                    original_mode = None
+
+                fd, tmp_path = tempfile.mkstemp(dir=temp_dir, suffix=".safetensors.tmp")
+                os.close(fd)
+
+                try:
+                    save_file(tensors, tmp_path)
+                    if original_mode is not None:
+                        try:
+                            os.chmod(tmp_path, original_mode)
+                        except OSError:
+                            pass
+
+                    # Drop mmap refs before os.replace
+                    del tensors
+                    gc.collect()
+                    device_empty_cache()
+
+                    for attempt in range(max_retries):
+                        try:
+                            os.replace(tmp_path, filename_original)
+                            tmp_path = None
+                            break
+                        except OSError as e:
+                            winerror  = getattr(e, "winerror", None)
+                            error_msg = str(e).lower()
+                            is_lock_error = (
+                                winerror in {32, 1224}
+                                or (
+                                    winerror == 5 and (
+                                        "user-mapped" in error_msg
+                                        or "being used by another process" in error_msg
+                                        or "sharing violation" in error_msg
+                                    )
+                                )
+                                or "user-mapped" in error_msg
+                                or "being used by another process" in error_msg
+                            )
+                            if is_lock_error and attempt < max_retries - 1:
+                                delay = base_delay * (2 ** attempt)
+                                if UNSLOTH_ENABLE_LOGGING:
+                                    logger.warning(
+                                        f"[Retry {attempt + 1}/{max_retries}] Windows file lock "
+                                        f"detected for {filename_original}: {e}. "
+                                        f"Waiting {delay:.1f}s before retry..."
+                                    )
+                                gc.collect()
+                                time.sleep(delay)
+                                continue
+                            if is_lock_error:
+                                raise RuntimeError(
+                                    f"Failed to rewrite {filename_original} after {max_retries} "
+                                    f"attempts due to Windows file lock. Original shard is intact "
+                                    f"(atomic replace never committed). "
+                                    f"Solutions: 1) Restart Unsloth Studio 2) Disable antivirus "
+                                    f"3) Close File Explorer windows"
+                                ) from e
+                            raise RuntimeError(
+                                f"Model merge failed while rewriting {filename_original}: {e}"
+                            ) from e
+                finally:
+                    if tmp_path is not None and os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+
+        device_empty_cache()
         return count, safetensor_keys_seen
 
+    except RuntimeError:
+        raise
     except Exception as e:
-        raise RuntimeError(f"Model merge failed with error: {e}")
+        raise RuntimeError(f"Model merge failed with error: {e}") from e
 
     finally:
         # Cleanup memory mapping
@@ -817,128 +927,216 @@ def _merge_and_overwrite_lora(
     return count, safetensor_keys_seen
 pass
 
-def _merge_moe_gate_expert(gate_W, lora_stats, expert_idx, num_experts, output_dtype):
-    """
-    Merge LoRA for a single expert of gate_proj part of gate_up_proj.
-    """
+# Per-expert MoE LoRA merge helpers (#5410). PEFT 0.18 = "swapped", PEFT 0.19+
+# = "standard" (huggingface/peft#3165). Layout detected by shape vs the
+# per-expert disk weight; unrecognised shapes increment fallback and the
+# outer raises so partial merges cannot save.
+
+_MOE_MERGE_STATE = {
+    "attempted":   0,
+    "applied":     0,
+    "fallback":    0,
+    "first_error": None,
+}
+
+
+def _reset_moe_merge_state():
+    _MOE_MERGE_STATE["attempted"]   = 0
+    _MOE_MERGE_STATE["applied"]     = 0
+    _MOE_MERGE_STATE["fallback"]    = 0
+    _MOE_MERGE_STATE["first_error"] = None
+
+
+def _record_moe_merge_fallback(role, expert_idx, reason, lora_stats, W_shape):
+    _MOE_MERGE_STATE["fallback"] += 1
+    if _MOE_MERGE_STATE["first_error"] is None:
+        try:
+            a_shape = tuple(lora_stats.lora_A.shape) if lora_stats is not None and lora_stats.lora_A is not None else None
+            b_shape = tuple(lora_stats.lora_B.shape) if lora_stats is not None and lora_stats.lora_B is not None else None
+        except Exception:
+            a_shape, b_shape = None, None
+        _MOE_MERGE_STATE["first_error"] = {
+            "role":          role,
+            "expert_idx":    expert_idx,
+            "reason":        str(reason),
+            "lora_A_shape":  a_shape,
+            "lora_B_shape":  b_shape,
+            "per_expert_W":  W_shape,
+        }
+    logger.warning(
+        f"[Unsloth MoE merge fallback] role={role} expert={expert_idx} reason={reason}. "
+        f"per_expert_W={W_shape}. The base weight is being written through; "
+        "the merged checkpoint will be missing this delta."
+    )
+
+
+def _resolve_num_experts_from_lora_stats(lora_stats, fallback):
+    """Walk module.base_layer for num_experts; bounded so cycles cannot hang."""
     try:
-        if lora_stats.lora_A is None or lora_stats.lora_B is None:
-            return gate_W
-
-        total_rank, two_inter = lora_stats.lora_A.shape
-        in_dim, total_rank_B = lora_stats.lora_B.shape
-
-        # Validation checks
-        if total_rank_B != total_rank or two_inter % 2 != 0:
-            return gate_W
-
-        if num_experts is None or num_experts <= 0:
-            num_experts = total_rank // max(1, getattr(lora_stats, "rank", 0) or 1)
-        if num_experts <= 0 or total_rank % num_experts != 0:
-            return gate_W
-
-        rank = total_rank // num_experts
-        start, end = expert_idx * rank, (expert_idx + 1) * rank
-        if end > total_rank:
-            return gate_W
-
-        a_slice = lora_stats.lora_A[start:end, :]          # (r, 2I)
-        b_slice = lora_stats.lora_B[:, start:end]          # (H, r)
-        inter_dim = two_inter // 2
-
-        # gate_proj corresponds to first half of A
-        gate_a = a_slice[:, :inter_dim]                    # (r, I)
-
-        device = gate_W.device if gate_W.is_cuda else ("cuda" if torch.cuda.is_available() else "cpu")
-        gate_delta = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ gate_a.to(device, dtype = torch.float32, non_blocking = True)
-
-        gate_merged = gate_W.to(device, dtype = torch.float32, non_blocking = True)
-        gate_merged = gate_merged.add(gate_delta.transpose(0, 1), alpha = lora_stats.alpha)
-
-        return gate_merged.to(output_dtype)
+        module = getattr(lora_stats, "module", None)
     except Exception:
-        return gate_W
+        return fallback
+    seen = set()
+    for _ in range(16):
+        if module is None:
+            break
+        try:
+            mid = id(module)
+        except Exception:
+            break
+        if mid in seen:
+            break
+        seen.add(mid)
+        for attr in (
+            "num_experts",
+            "num_experts_per_group",
+            "num_routed_experts",
+            "num_local_experts",
+            "num_moe_experts",
+        ):
+            try:
+                value = getattr(module, attr, None)
+            except Exception:
+                value = None
+            if isinstance(value, int) and value > 1:
+                return value
+        try:
+            module = getattr(module, "base_layer", None)
+        except Exception:
+            break
+    return fallback
+
+
+def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim):
+    """Shape-classify as 'swapped' / 'standard' / 'unknown'; returns (layout, r)."""
+    total_rank_A, dim_A = lora_A.shape
+    dim_B, total_rank_B = lora_B.shape
+    if total_rank_A != total_rank_B or num_experts is None or num_experts <= 0:
+        return "unknown", 0
+    if total_rank_A % num_experts != 0:
+        return "unknown", 0
+    r = total_rank_A // num_experts
+    if dim_A == out_dim and dim_B == in_dim:
+        return "swapped", r
+    if dim_A == in_dim and dim_B == out_dim:
+        return "standard", r
+    return "unknown", r
+
+
+def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_dtype, *, role):
+    """Per-expert merge for gate_proj / up_proj. role='gate' -> first I, 'up' -> last I."""
+    if lora_stats is None or lora_stats.lora_A is None or lora_stats.lora_B is None:
+        return W
+    _MOE_MERGE_STATE["attempted"] += 1
+    try:
+        num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
+        if num_experts is None or num_experts <= 0:
+            num_experts = lora_stats.lora_A.shape[0] // max(1, getattr(lora_stats, "rank", 0) or 1)
+
+        I, H = W.shape
+        layout, r = _detect_moe_lora_layout(
+            lora_stats.lora_A, lora_stats.lora_B,
+            num_experts = num_experts, out_dim = 2 * I, in_dim = H,
+        )
+        if layout == "unknown" or r <= 0:
+            _record_moe_merge_fallback(
+                role, expert_idx,
+                f"layout not detected (A={tuple(lora_stats.lora_A.shape)}, B={tuple(lora_stats.lora_B.shape)})",
+                lora_stats, (I, H),
+            )
+            return W
+
+        start, end = expert_idx * r, (expert_idx + 1) * r
+        if end > num_experts * r:
+            _record_moe_merge_fallback(role, expert_idx, "expert_idx out of range", lora_stats, (I, H))
+            return W
+
+        a_slice = lora_stats.lora_A[start:end, :]
+        b_slice = lora_stats.lora_B[:, start:end]
+        device  = _active_merge_device()
+        a_f     = a_slice.to(device, dtype = torch.float32, non_blocking = True)
+        b_f     = b_slice.to(device, dtype = torch.float32, non_blocking = True)
+
+        if layout == "swapped":
+            half = a_f[:, :I] if role == "gate" else a_f[:, I:]
+            delta = b_f @ half
+            merged = W.to(device, dtype = torch.float32, non_blocking = True).add(
+                delta.transpose(0, 1), alpha = lora_stats.alpha,
+            )
+        else:
+            half = b_f[:I, :] if role == "gate" else b_f[I:, :]
+            delta = half @ a_f
+            merged = W.to(device, dtype = torch.float32, non_blocking = True).add(
+                delta, alpha = lora_stats.alpha,
+            )
+
+        _MOE_MERGE_STATE["applied"] += 1
+        return merged.to(output_dtype)
+    except Exception as exc:
+        _record_moe_merge_fallback(role, expert_idx, repr(exc), lora_stats, tuple(W.shape))
+        return W
+
+
+def _merge_moe_gate_expert(gate_W, lora_stats, expert_idx, num_experts, output_dtype):
+    return _merge_moe_gate_or_up_expert(
+        gate_W, lora_stats, expert_idx, num_experts, output_dtype, role = "gate",
+    )
 
 
 def _merge_moe_up_expert(up_W, lora_stats, expert_idx, num_experts, output_dtype):
-    """
-    Merge LoRA for a single expert of up_proj part of gate_up_proj.
-    """
-    try:
-        if lora_stats.lora_A is None or lora_stats.lora_B is None:
-            return up_W
-
-        total_rank, two_inter = lora_stats.lora_A.shape
-        in_dim, total_rank_B = lora_stats.lora_B.shape
-
-        # Validation checks
-        if total_rank_B != total_rank or two_inter % 2 != 0:
-            return up_W
-
-        if num_experts is None or num_experts <= 0:
-            num_experts = total_rank // max(1, getattr(lora_stats, "rank", 0) or 1)
-        if num_experts <= 0 or total_rank % num_experts != 0:
-            return up_W
-
-        rank = total_rank // num_experts
-        start, end = expert_idx * rank, (expert_idx + 1) * rank
-        if end > total_rank:
-            return up_W
-
-        a_slice = lora_stats.lora_A[start:end, :]          # (r, 2I)
-        b_slice = lora_stats.lora_B[:, start:end]          # (H, r)
-        inter_dim = two_inter // 2
-
-        # up_proj corresponds to second half of A
-        up_a   = a_slice[:, inter_dim:]                    # (r, I)
-
-        device = up_W.device if up_W.is_cuda else ("cuda" if torch.cuda.is_available() else "cpu")
-        up_delta   = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ up_a.to(device, dtype = torch.float32, non_blocking = True)
-
-        up_merged = up_W.to(device, dtype = torch.float32, non_blocking = True)
-        up_merged = up_merged.add(up_delta.transpose(0, 1), alpha = lora_stats.alpha)
-
-        return up_merged.to(output_dtype)
-    except Exception:
-        return up_W
+    return _merge_moe_gate_or_up_expert(
+        up_W, lora_stats, expert_idx, num_experts, output_dtype, role = "up",
+    )
 pass
 
+
 def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, output_dtype):
-    """
-    Merge LoRA for a single expert of down_proj.
-    LoRA weights are stacked per expert:
-      lora_A: (E*R, H)    (swapped)
-      lora_B: (I, E*R)    (swapped)
-    delta = (lora_B @ lora_A)^T
-    """
+    if lora_stats is None or lora_stats.lora_A is None or lora_stats.lora_B is None:
+        return down_W
+    _MOE_MERGE_STATE["attempted"] += 1
     try:
-        if lora_stats.lora_A is None or lora_stats.lora_B is None:
-            return down_W
-
-        total_rank, out_dim = lora_stats.lora_A.shape
-        in_dim, total_rank_B = lora_stats.lora_B.shape
-        if total_rank_B != total_rank:
-            return down_W
-
+        num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
         if num_experts is None or num_experts <= 0:
-            num_experts = total_rank // max(1, getattr(lora_stats, "rank", 0) or 1)
-        if num_experts <= 0 or total_rank % num_experts != 0:
+            num_experts = lora_stats.lora_A.shape[0] // max(1, getattr(lora_stats, "rank", 0) or 1)
+
+        H, I = down_W.shape
+        layout, r = _detect_moe_lora_layout(
+            lora_stats.lora_A, lora_stats.lora_B,
+            num_experts = num_experts, out_dim = H, in_dim = I,
+        )
+        if layout == "unknown" or r <= 0:
+            _record_moe_merge_fallback(
+                "down", expert_idx,
+                f"layout not detected (A={tuple(lora_stats.lora_A.shape)}, B={tuple(lora_stats.lora_B.shape)})",
+                lora_stats, (H, I),
+            )
             return down_W
 
-        rank = total_rank // num_experts
-        start, end = expert_idx * rank, (expert_idx + 1) * rank
-        if end > total_rank:
+        start, end = expert_idx * r, (expert_idx + 1) * r
+        if end > num_experts * r:
+            _record_moe_merge_fallback("down", expert_idx, "expert_idx out of range", lora_stats, (H, I))
             return down_W
 
-        a_slice = lora_stats.lora_A[start:end, :]     # (r, H_out)
-        b_slice = lora_stats.lora_B[:, start:end]     # (I_in, r)
+        a_slice = lora_stats.lora_A[start:end, :]
+        b_slice = lora_stats.lora_B[:, start:end]
+        device  = _active_merge_device()
+        a_f     = a_slice.to(device, dtype = torch.float32, non_blocking = True)
+        b_f     = b_slice.to(device, dtype = torch.float32, non_blocking = True)
 
-        device = down_W.device if down_W.is_cuda else ("cuda" if torch.cuda.is_available() else "cpu")
-        delta = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ a_slice.to(device, dtype = torch.float32, non_blocking = True)
-        merged = down_W.to(device, dtype = torch.float32, non_blocking = True)
-        merged = merged.add(delta.transpose(0, 1), alpha = lora_stats.alpha)
+        delta = b_f @ a_f
+        if layout == "swapped":
+            merged = down_W.to(device, dtype = torch.float32, non_blocking = True).add(
+                delta.transpose(0, 1), alpha = lora_stats.alpha,
+            )
+        else:
+            merged = down_W.to(device, dtype = torch.float32, non_blocking = True).add(
+                delta, alpha = lora_stats.alpha,
+            )
+
+        _MOE_MERGE_STATE["applied"] += 1
         return merged.to(output_dtype)
-    except Exception:
+    except Exception as exc:
+        _record_moe_merge_fallback("down", expert_idx, repr(exc), lora_stats, tuple(down_W.shape))
         return down_W
 pass
 
@@ -1238,11 +1436,7 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
         else:
             return gate_up_W
 
-        device = (
-            gate_up_W.device
-            if gate_up_W.is_cuda
-            else ("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        device = _active_merge_device()
         gate_up_merged = gate_up_W.to(device, dtype=torch.float32, non_blocking=True)
 
         for expert_idx in range(num_experts):
@@ -1294,11 +1488,7 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
         else:
             return down_W
 
-        device = (
-            down_W.device
-            if down_W.is_cuda
-            else ("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        device = _active_merge_device()
         down_merged = down_W.to(device, dtype=torch.float32, non_blocking=True)
 
         for expert_idx in range(num_experts):
@@ -1356,9 +1546,8 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 continue
 
             # FORCE memory cleanup before processing each tensor
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+            device_empty_cache()
+            device_synchronize()
 
             W = None
             output_key = key
@@ -1379,9 +1568,8 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
 
                 blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
 
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()  # Wait for previous operations to complete
-                    torch.cuda.empty_cache()
+                device_synchronize()
+                device_empty_cache()
 
                 # Determine optimal device and chunk size for mxfp4 dequantization
                 device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
@@ -1463,7 +1651,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
             tensors[output_key] = W
 
             # Free up VRAM after each merge
-            torch.cuda.empty_cache()
+            device_empty_cache()
 
     # CRITICAL: Force cleanup to release file handles on Windows
     if os.name == 'nt':
@@ -2006,6 +2194,15 @@ def merge_and_overwrite_lora(
         config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
+        # #5410: keep trained eos / sampling defaults on reload.
+        try:
+            gen_cfg = getattr(model, "generation_config", None)
+            if gen_cfg is None:
+                gen_cfg = getattr(getattr(model, "config", None), "generation_config", None)
+            if gen_cfg is not None:
+                gen_cfg.save_pretrained(save_directory)
+        except Exception as gen_cfg_err:
+            print(f"Unsloth: failed to save generation_config.json: {gen_cfg_err}")
     elif save_method == "mxfp4":
         from transformers import AutoConfig
         model_config = AutoConfig.from_pretrained(
@@ -2024,7 +2221,7 @@ def merge_and_overwrite_lora(
 
     # Step 3: Conditional index handling
     import subprocess
-    is_t4 = "Tesla T4" in str(torch.cuda.get_device_name(0))
+    is_t4 = DEVICE_TYPE == "cuda" and "Tesla T4" in torch.cuda.get_device_name(0)
     needs_splitting = should_split_shards(is_t4, config, safetensors_list, max_size_in_bytes) if save_method == "merged_16bit" else False
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
@@ -2105,6 +2302,8 @@ def merge_and_overwrite_lora(
 
     final_safetensors_list = []
 
+    _reset_moe_merge_state()  # #5410
+
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
     for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
         file_path = os.path.join(save_directory, filename)
@@ -2181,7 +2380,7 @@ def merge_and_overwrite_lora(
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
-        torch.cuda.empty_cache()
+        device_empty_cache()
 
         file_path = os.path.join(save_directory, filename)
 
@@ -2241,6 +2440,27 @@ def merge_and_overwrite_lora(
             f"does not match # of saved modules = {n_saved_modules}. Please file a bug report!"
         )
     pass
+
+    if _MOE_MERGE_STATE["fallback"] > 0:  # #5410: never claim success on a partial merge
+        err = _MOE_MERGE_STATE.get("first_error") or {}
+        raise RuntimeError(
+            "Unsloth: MoE LoRA merge fell back to the base weight on "
+            f"{_MOE_MERGE_STATE['fallback']} per-expert tensor(s) "
+            f"(of {_MOE_MERGE_STATE['attempted']} attempted, {_MOE_MERGE_STATE['applied']} applied). "
+            "The merged checkpoint would be missing the expert LoRA delta. "
+            f"First failure: role={err.get('role')} expert={err.get('expert_idx')} "
+            f"reason={err.get('reason')} lora_A={err.get('lora_A_shape')} "
+            f"lora_B={err.get('lora_B_shape')} per_expert_W={err.get('per_expert_W')}. "
+            "This usually means an unrecognised PEFT/Transformers MoE LoRA layout. "
+            "Please file a bug at https://github.com/unslothai/unsloth-zoo/issues "
+            "with these shapes."
+        )
+    if _MOE_MERGE_STATE["attempted"] > 0:
+        print(
+            f"Unsloth: MoE LoRA merge applied to "
+            f"{_MOE_MERGE_STATE['applied']}/{_MOE_MERGE_STATE['attempted']} "
+            "per-expert tensors."
+        )
 
     # --- Cleanup
     if temp_file is not None:
@@ -2543,6 +2763,47 @@ def merge_and_dequantize_lora(
     spaces = save_pretrained.find("def")
     save_pretrained = save_pretrained.split("\n")
     save_pretrained = "\n".join(x[spaces:] for x in save_pretrained)
+
+    # transformers 5.x rewrote PreTrainedModel.save_pretrained -- the
+    # source-string anchors zoo's LoRA-merge optimization relies on are
+    # gone. Detect that upfront and fall back to vanilla save_pretrained
+    # so users on 5.x don't see a hard `Failed to find ...` RuntimeError
+    # from the per-anchor checks below. The LoRA merge won't run, so
+    # callers must `model.merge_and_unload()` (or equivalent) themselves
+    # before saving on 5.x.
+    _required_anchors = [
+        "state_dict_split = split_torch_state_dict_into_shards",
+        "state_dict[tensor].contiguous()",
+        "def save_pretrained",
+    ]
+    if push_to_hub:
+        _required_anchors.append("for shard_file, tensors in filename_to_tensors")
+    _missing_anchors = [a for a in _required_anchors if a not in save_pretrained]
+    if _missing_anchors:
+        import transformers as _tx
+        warnings.warn(
+            "Unsloth: transformers "
+            f"{getattr(_tx, '__version__', 'unknown')} rewrote "
+            f"PreTrainedModel.save_pretrained -- the source-string "
+            f"anchors {_missing_anchors!r} are missing, so the "
+            "LoRA-merge-on-save optimization is skipped. Calling "
+            "vanilla model.save_pretrained instead; merge LoRA "
+            "explicitly (e.g. model.merge_and_unload()) before "
+            "saving if you need the merged weights on disk.",
+            stacklevel = 2,
+        )
+        model.save_pretrained(
+            save_directory     = save_directory,
+            push_to_hub        = push_to_hub,
+            max_shard_size     = max_shard_size,
+            safe_serialization = safe_serialization,
+            token              = token,
+            private            = private,
+            revision           = revision,
+        )
+        if tokenizer is not None:
+            tokenizer.save_pretrained(save_directory = save_directory)
+        return
 
     # Now patch for incremental pushing to hub
     if push_to_hub:

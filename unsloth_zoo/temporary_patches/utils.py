@@ -20,11 +20,12 @@ __all__ = [
     "process_return",
     "process_output_options",
     "KWARGS_TYPE",
-    "raise_error"
+    "raise_error",
     "Unpack",
     "Cache",
     "DynamicCache",
     "HybridCache",
+    "HAS_HYBRID_CACHE",
     "StaticCache",
     "TextInput",
     "PreTokenizedInput",
@@ -265,8 +266,12 @@ DynamicCache = t.Any
 try: from transformers.cache_utils import DynamicCache
 except: pass
 HybridCache = t.Any
-try: from transformers.cache_utils import HybridCache
-except: pass
+HAS_HYBRID_CACHE = False
+try:
+    from transformers.cache_utils import HybridCache
+    HAS_HYBRID_CACHE = True
+except Exception:
+    pass
 StaticCache = t.Any
 try: from transformers.cache_utils import StaticCache
 except: pass
