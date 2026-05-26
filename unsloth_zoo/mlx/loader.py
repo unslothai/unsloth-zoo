@@ -2413,12 +2413,18 @@ def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
     save_pretrained_merged(self, tokenizer, save_directory, **kwargs)
 
 
+def _mlx_supported_kwargs(kwargs, supported):
+    """Keep CUDA-compatible kwargs out of MLX-only save/export APIs."""
+    return {key: kwargs[key] for key in supported if key in kwargs}
+
+
 def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                                quantization_method="fast_quantized", **kwargs):
     from .utils import save_pretrained_gguf
     tokenizer = tokenizer or self._tokenizer
+    kwargs = _mlx_supported_kwargs(kwargs, ("first_conversion",))
     save_pretrained_gguf(self, tokenizer, save_directory,
-                         quantization_method=quantization_method)
+                         quantization_method=quantization_method, **kwargs)
 
 
 def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, **kwargs):
@@ -2435,6 +2441,7 @@ def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                             quantization_method="fast_quantized", **kwargs):
     from .utils import push_to_hub_gguf
     tokenizer = tokenizer or self._tokenizer
+    kwargs = _mlx_supported_kwargs(kwargs, ("first_conversion", "token", "private"))
     push_to_hub_gguf(self, tokenizer, repo_id, repo_id=repo_id,
                      quantization_method=quantization_method, **kwargs)
 

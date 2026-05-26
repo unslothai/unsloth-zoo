@@ -4430,6 +4430,7 @@ def push_to_hub_gguf(
     save_directory,
     repo_id,
     quantization_method="fast_quantized",
+    first_conversion=None,
     token=None,
     private=None,
 ):
@@ -4441,6 +4442,8 @@ def push_to_hub_gguf(
         save_directory: Local path for GGUF output.
         repo_id: HuggingFace repo ID.
         quantization_method: GGUF quantization type.
+        first_conversion: Optional intermediate GGUF dtype passed through to
+            save_pretrained_gguf.
         token: HuggingFace token.
         private: Whether repo should be private.
     """
@@ -4449,7 +4452,13 @@ def push_to_hub_gguf(
     save_directory = Path(save_directory)
 
     # Export to GGUF
-    save_pretrained_gguf(model, tokenizer, save_directory, quantization_method)
+    save_pretrained_gguf(
+        model,
+        tokenizer,
+        save_directory,
+        quantization_method=quantization_method,
+        first_conversion=first_conversion,
+    )
 
     # Upload GGUF files
     api = HfApi(token=token)
