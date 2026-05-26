@@ -46,7 +46,7 @@ import time
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
@@ -332,6 +332,29 @@ def _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm):
         return g * scale.astype(g.dtype)
 
     return tree_map(_clip_leaf_norm, grad)
+
+
+def _clip_grad_norm_fp32(grad, max_norm):
+    """Global norm clipping with a float32 norm reduction.
+
+    ``mlx.optimizers.clip_grad_norm`` reduces each leaf in its storage dtype.
+    For bf16/fp16 VLMs, that can move the global scale away from PyTorch/HF,
+    which computes the clipping norm in fp32. Keep clipped leaves in their
+    original dtype, but compute the single global scale in fp32.
+    """
+    norm_squared = tree_reduce(
+        lambda acc, g: acc + mx.sum(mx.square(g.astype(mx.float32))),
+        grad,
+        mx.array(0.0, dtype=mx.float32),
+    )
+    total_norm = mx.sqrt(norm_squared)
+    scale = mx.minimum(
+        mx.array(max_norm, dtype=mx.float32) / (
+            total_norm + mx.array(1e-6, dtype=mx.float32)
+        ),
+        mx.array(1.0, dtype=mx.float32),
+    )
+    return tree_map(lambda g: g * scale.astype(g.dtype), grad), total_norm
 
 
 @dataclass
@@ -1257,7 +1280,7 @@ class MLXTrainer:
                 final_items.append((name, scaled))
             final_grad = tree_unflatten(final_items)
             if max_grad_norm > 0:
-                final_grad, grad_norm = optim.clip_grad_norm(
+                final_grad, grad_norm = _clip_grad_norm_fp32(
                     final_grad, max_norm=max_grad_norm
                 )
             if _clip_grad_value:
@@ -1284,7 +1307,7 @@ class MLXTrainer:
             """
             grad_norm = None
             if max_grad_norm > 0:
-                grad, grad_norm = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
+                grad, grad_norm = _clip_grad_norm_fp32(grad, max_norm=max_grad_norm)
             if _clip_grad_value:
                 grad = _clip_grad_by_value(grad, max_grad_value)
             if _clip_grad_leaf_norm:
