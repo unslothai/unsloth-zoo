@@ -72,6 +72,15 @@ def test_get_peft_model_passes_finetune_last_n_layers_through():
         _is_vlm_model = False
         def freeze(self): pass
         def unfreeze(self, **kwargs): pass
+        # get_peft_model prints a "Unsloth: LoRA applied -- N trainable
+        # params (P% of T total)" stats line at the tail of the function
+        # via mlx.utils.tree_flatten(model.trainable_parameters()) and
+        # model.parameters(). The synthetic FakeModel doesn't carry real
+        # mlx parameters; return empty dicts so tree_flatten yields zero
+        # entries and the stats line prints "0.00% of 0 total" without
+        # raising AttributeError.
+        def trainable_parameters(self): return {}
+        def parameters(self): return {}
 
     # Capture num_layers values seen by linear_to_lora_layers.
     captured = {"calls": []}

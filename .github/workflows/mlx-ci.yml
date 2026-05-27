@@ -51,8 +51,17 @@ jobs:
       - name: Install zoo with MLX extras
         # pyproject gates MLX deps on darwin+arm64; `.[mlx]` picks them up
         # without the torch-on-Linux-CUDA path.
+        #
+        # NOTE: pyproject also gates `torch` OFF on darwin+arm64 (mlx is the
+        # native path on Apple Silicon), but tests/mlx_simulation/__init__.py
+        # unconditionally `import torch` so the torch-spoof shim that powers
+        # the test suite can monkeypatch torch.Tensor with MLX-only methods.
+        # Install the CPU wheel explicitly first so collection of
+        # tests/test_mlx_torch_shim_smoke.py does not fail with
+        # ModuleNotFoundError: No module named 'torch'.
         run: |
           python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.11.0"
           pip install -e .[mlx]
           pip install pytest==9.0.3
 
