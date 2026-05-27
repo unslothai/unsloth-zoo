@@ -199,11 +199,8 @@ def _run_hidden_stack(stack, inputs, inputs_embeds=None, **kwargs):
     from mlx_vlm.models.base import create_attention_mask
 
     config = getattr(stack, "config", None)
-    norm_weight = getattr(getattr(stack, "norm", None), "weight", None)
     if inputs_embeds is None:
         h = stack.embed_tokens(inputs)
-    elif norm_weight is not None:
-        h = inputs_embeds.astype(norm_weight.dtype)
     else:
         h = inputs_embeds
     if inputs_embeds is not None and _config_get(config, "model_type") == "gemma3_text":

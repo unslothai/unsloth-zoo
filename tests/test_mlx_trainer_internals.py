@@ -428,6 +428,16 @@ def test_mlx_loader_patches_gemma3_text_rmsnorm_fp32():
     assert "_unsloth_fp32_rmsnorm_patched" in source
 
 
+def test_vlm_hidden_stack_preserves_inputs_embed_dtype():
+    import inspect
+
+    import unsloth_zoo.mlx.utils as utils
+
+    source = inspect.getsource(utils._run_hidden_stack)
+    assert "h = inputs_embeds" in source
+    assert "inputs_embeds.astype(norm_weight.dtype)" not in source
+
+
 def test_mlx_loader_patches_gemma3_vision_mlp_fp32_activation():
     import inspect
 
