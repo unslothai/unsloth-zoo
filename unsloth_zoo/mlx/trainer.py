@@ -1395,11 +1395,9 @@ class MLXTrainer:
             hf_repo = getattr(self.model, "_hf_repo", None) or ""
 
 
-            # Infer rank/scale/dropout from the first reloadable LoRA module.
-            # Leave as None on failure so we never persist placeholder values
-            # (rank=8, scale=1.0, dropout=0.0) that silently mis-scale the
-            # adapter on reload; _enrich_mlx_adapter_config gets another shot
-            # at filling these in from the live module tree.
+            # Infer rank/scale/dropout from the first reloadable LoRA module;
+            # leave as None on failure so we never persist placeholders
+            # (rank=8, scale=1.0) that silently mis-scale on reload.
             _lora_rank = _lora_scale = _lora_dropout = None
             for _, m in self.model.named_modules():
                 if not (hasattr(m, "lora_a") and hasattr(m, "lora_b")):
@@ -1408,10 +1406,8 @@ class MLXTrainer:
                 if inferred_rank is None:
                     continue
                 _lora_rank = inferred_rank
-                # _coerce_mlx_lora_scale handles 0-D scalars AND LoRASwitchLinear's
-                # per-expert mx.array (where float()/.item() both raise). Reading
-                # the first broadcast value preserves the actual alpha/r instead
-                # of overwriting it with a silent placeholder 1.0.
+                # _coerce_mlx_lora_scale preserves alpha/r for LoRASwitchLinear's
+                # per-expert mx.array where float()/.item() both raise.
                 _lora_scale = _coerce_mlx_lora_scale(getattr(m, "scale", 1.0))
                 _lora_dropout = _get_mlx_dropout_probability(
                     getattr(m, "dropout", None)
@@ -1421,15 +1417,9 @@ class MLXTrainer:
 
             from .utils import _get_transformer_layers
             layers = _get_transformer_layers(self.model)
-            # mlx-lm's load_adapters() does `config.num_layers` (attr
-            # access on a SimpleNamespace built from adapter_config.json),
-            # so the key MUST be present or reload raises AttributeError.
-            # Pre-PR wrote -1 as the legacy "all layers" sentinel; keep
-            # that as the fallback when we can't detect a layer count so
-            # reload still works, even though some downstream variants
-            # of load_adapters treat `range(-1)` as "no layers". A clean
-            # positive count from `_get_transformer_layers()` is always
-            # preferred.
+            # mlx-lm load_adapters does attr-access on config.num_layers,
+            # so the key MUST be present. -1 is the legacy "all layers"
+            # sentinel; a positive count from _get_transformer_layers() wins.
             try:
                 _num_layers = len(layers) if layers is not None else -1
             except TypeError:
@@ -1463,8 +1453,7 @@ class MLXTrainer:
                     "scale": _lora_scale,
                     "dropout": _lora_dropout,
                 }
-                # mlx-vlm reads these top-level keys instead of
-                # lora_parameters.{rank,scale,dropout}.
+                # mlx-vlm reads these top-level instead of lora_parameters.*.
                 _adapter_config["rank"] = _lora_rank
                 _adapter_config["scale"] = _lora_scale
                 _adapter_config["dropout"] = _lora_dropout

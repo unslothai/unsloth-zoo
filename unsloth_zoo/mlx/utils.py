@@ -2667,8 +2667,7 @@ def _get_mlx_config_quantization(model):
 def _get_mlx_dropout_probability(drop):
     if drop is None:
         return 0.0
-    # MLX nn.Dropout stores keep-prob as _p_1; shims may also set a stale .p,
-    # so _p_1 wins when numeric and we fall back to .p otherwise.
+    # MLX nn.Dropout stores keep-prob as _p_1; .p may be a stale shim value.
     p1 = getattr(drop, "_p_1", None)
     if p1 is not None:
         try:
@@ -2685,20 +2684,15 @@ def _get_mlx_dropout_probability(drop):
 
 
 def _coerce_mlx_lora_scale(scale, default=1.0):
-    """Return a Python float from an mlx-lm LoRA wrapper's `.scale` attribute.
+    """Return a Python float for an mlx-lm LoRA wrapper's `.scale`.
 
-    LoRASwitchLinear stores `.scale` as a per-expert (non-0-D) mx.array
-    so a raw `float()` raises and a plain `.item()` fails. Falling back to
-    `1.0` silently changes adapter behavior after reload when the trained
-    adapter used a different `alpha/r`; instead reshape/flatten and read
-    the first broadcast value, which is the per-expert constant for the
-    common alpha/r setting. `default` is only used as a last resort when
-    no numeric value can be recovered.
+    LoRASwitchLinear stores `.scale` as a per-expert mx.array where float()
+    and .item() both raise; falling back to 1.0 would silently override
+    alpha/r. `default` is only used when no numeric value can be recovered.
     """
     if scale is None:
         return float(default)
 
-    # 0-D Python scalar or mx.array with numeric coercion.
     try:
         return float(scale)
     except Exception:
@@ -2710,8 +2704,7 @@ def _coerce_mlx_lora_scale(scale, default=1.0):
         except Exception:
             pass
 
-    # Multi-element mx.array (LoRASwitchLinear / MoE LoRA): take the first
-    # broadcast value, which equals alpha/r for every expert.
+    # Per-expert mx.array: every entry is the same alpha/r constant.
     try:
         flat = scale.reshape((-1,))
         first = flat[0]
@@ -2723,11 +2716,10 @@ def _coerce_mlx_lora_scale(scale, default=1.0):
 
 
 def _infer_mlx_lora_rank(module):
-    # mlx-lm LoRA wrappers always expose lowercase lora_a / lora_b.
     lora_a = getattr(module, "lora_a", None)
     lora_b = getattr(module, "lora_b", None)
 
-    # mlx-lm sometimes wraps tensors in nn.Linear layers; unwrap to .weight.
+    # mlx-lm may wrap lora tensors in nn.Linear; unwrap to .weight.
     is_layer = False
     if lora_a is not None and not hasattr(lora_a, "shape") and hasattr(lora_a, "weight"):
         lora_a = lora_a.weight
@@ -2738,15 +2730,12 @@ def _infer_mlx_lora_rank(module):
 
     lora_a_shape = tuple(lora_a.shape) if lora_a is not None and hasattr(lora_a, "shape") else ()
     lora_b_shape = tuple(lora_b.shape) if lora_b is not None and hasattr(lora_b, "shape") else ()
-    # Require both halves; a half-built LoRA module is not a reliable
-    # rank source, so callers can move on to the next module.
+    # Half-built LoRA: not a reliable rank source.
     if not lora_a_shape or not lora_b_shape:
         return None
 
     # MoE/switch: lora_a (..., rank, in_dims); lora_b (..., out_dims, rank).
     if len(lora_a_shape) >= 3:
-        # Both halves must share the same expert / batch prefix; a bare 2-D
-        # lora_b means the pair cannot be a valid LoRASwitchLinear.
         if len(lora_b_shape) != len(lora_a_shape):
             return None
         rank = lora_a_shape[-2]
@@ -2756,19 +2745,16 @@ def _infer_mlx_lora_rank(module):
             return None
         return int(rank)
 
-    # Both halves of a 2D LoRA must be at least 2-D; a 1D lora_b is a
-    # half-built tensor we cannot trust for rank inference.
     if len(lora_a_shape) < 2 or len(lora_b_shape) < 2:
         return None
 
-    # Standard 2D LoRA:
-    # 1. mlx-lm layer convention: lora_a (rank, in), lora_b (out, rank)
+    # Layer convention: lora_a (rank, in), lora_b (out, rank).
     if is_layer:
         if lora_a_shape[0] == lora_b_shape[-1]:
             return int(lora_a_shape[0])
         return None
 
-    # 2. Raw array convention: lora_a (in, rank), lora_b (rank, out)
+    # Raw array convention: lora_a (in, rank), lora_b (rank, out).
     if lora_a_shape[-1] == lora_b_shape[0]:
         return int(lora_a_shape[-1])
 
@@ -2776,15 +2762,11 @@ def _infer_mlx_lora_rank(module):
 
 
 def _sync_mlx_lora_keys(adapter_config, lora_parameters):
-    """Keep `lora_parameters["keys"]` in lockstep with the authoritative
-    `unsloth_mlx_lora_module_paths`. mlx-lm.load_adapters() consults
-    `lora_parameters.keys` to decide which submodules get wrapped on reload,
-    so a stale or absent `keys` field is the difference between binding the
-    saved adapter and either scanning every layer or wrapping ghost paths.
-    When the authoritative path list is present (including an explicit empty
-    list, which is its own valid pin) we mirror it; otherwise we drop any
-    caller-supplied `keys` so mlx-lm falls back to its scan-everything default
-    instead of trusting an out-of-date list.
+    """Mirror `unsloth_mlx_lora_module_paths` into `lora_parameters["keys"]`.
+
+    mlx-lm.load_adapters() uses `lora_parameters.keys` to decide which
+    submodules to wrap; an empty list is a valid pin, and a missing path
+    list means we drop stale caller keys so mlx-lm scans everything.
     """
     if "unsloth_mlx_lora_module_paths" in adapter_config:
         lora_parameters["keys"] = list(
@@ -2857,13 +2839,11 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     # why: persist module paths + rank/scale/dropout so reload reproduces logits;
     # missing scale silently defaults to 1.0 even when training used alpha/r > 1.
     try:
-        # Reuse the loader-side normalizer so save and load accept exactly
-        # the same shapes (str / list / tuple / set / dict / pathlib.Path).
-        # Without this, dict-grouped or pathlib explicit paths got silently
-        # erased by save-side normalization, dropping aux LoRA topology
-        # before it ever reached adapter_config.json.
+        # Reuse loader-side normalizer so save/load accept the same shapes
+        # (str / list / tuple / set / dict / pathlib.Path) and dict-grouped
+        # or pathlib explicit paths aren't silently dropped.
         from .loader import _normalize_mlx_lora_module_paths
-        # distinguish "caller passed nothing" from "caller passed [] / None".
+        # Distinguish "caller passed nothing" from "caller passed [] / None".
         has_explicit_paths = "unsloth_mlx_lora_module_paths" in adapter_config
         raw_explicit_paths = (
             adapter_config.get("unsloth_mlx_lora_module_paths")
@@ -2874,30 +2854,25 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             adapter_config["unsloth_mlx_lora_module_paths"] = explicit_paths
         else:
             explicit_paths = None
-        # why: explicit empty list preserves caller topology but must not
-        # suppress global LoRA parameter inference; treat empty as "no filter".
+        # Empty explicit list pins topology but must not block inference;
+        # treat empty as "no filter".
         explicit_path_set = set(explicit_paths) if explicit_paths else None
 
         lora_paths = []
         lora_rank = None
         lora_scale = None
         lora_dropout = None
-        # When the caller pins an explicit path filter, track whether any
-        # selected live LoRA module existed at all. If the explicit set
-        # selected real modules but none of them produced trustworthy
-        # rank inference (e.g. malformed half-built LoRA wrapper), we
-        # must NOT later fall back to the caller's stale top-level
-        # rank/scale/dropout because that would persist placeholder
-        # metadata against the actual saved tensor shapes.
+        # Track whether the explicit filter selected any live LoRA at all,
+        # so we can refuse to fall back to stale caller metadata when those
+        # selected modules all failed rank inference.
         selected_lora_seen = False
         for name, module in model.named_modules():
             if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
                 continue
             lora_paths.append(name)
             inferred_rank = _infer_mlx_lora_rank(module)
-            # only infer rank/scale/dropout from modules the caller
-            # actually selected; otherwise an earlier unrelated LoRA
-            # would write the wrong language-tower params.
+            # Only infer rank/scale/dropout from caller-selected modules;
+            # an unrelated LoRA would otherwise write wrong tower params.
             if explicit_path_set is not None and name not in explicit_path_set:
                 continue
             selected_lora_seen = True
@@ -2905,13 +2880,9 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 continue
             if lora_rank is None:
                 lora_rank = inferred_rank
-                # _coerce_mlx_lora_scale handles 0-D scalars AND LoRASwitchLinear's
-                # per-expert mx.array. Falling back to 1.0 silently would change
-                # adapter behavior after reload when the trained adapter used a
-                # different alpha/r, and the outer try/except: pass would also
-                # silently abandon lora_paths, leaving vision/projector LoRA
-                # tensors unrecorded in adapter_config (so they vanish on reload
-                # via load_weights(strict=False)).
+                # _coerce_mlx_lora_scale handles LoRASwitchLinear's per-expert
+                # mx.array; silently falling back to 1.0 would change adapter
+                # behavior on reload when alpha/r differs.
                 lora_scale = _coerce_mlx_lora_scale(
                     getattr(module, "scale", 1.0),
                 )
@@ -2919,31 +2890,22 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     getattr(module, "dropout", None)
                 )
 
-        # only auto-fill when caller did not supply the key at all.
+        # Only auto-fill when caller did not supply the key at all.
         if lora_paths and not has_explicit_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
 
-        # Resolution rule: live LoRA module state describes the tensors
-        # being saved now, so when an inferable live rank exists it MUST
-        # override stale scalar metadata from caller-supplied configs.
-        # Only fall back to caller metadata when no trustworthy live rank
-        # could be inferred (e.g. caller wrote adapter_config manually
-        # before LoRA modules were attached, or the inference walk hit a
-        # custom wrapper). The earlier "honour caller" branch silently
-        # wrote rank=8 / scale=1.0 for a live rank-4 module, producing
-        # reload-time shape mismatches.
+        # Resolution rule: an inferable live rank MUST override caller
+        # scalar metadata; the live module describes the tensors being
+        # saved now. Only fall back to caller metadata when no trustworthy
+        # live rank exists (e.g. config written before modules attached).
         existing_lora_parameters = dict(adapter_config.get("lora_parameters") or {})
         has_caller_lora_metadata = any(
             key in existing_lora_parameters or key in adapter_config
             for key in ("rank", "scale", "dropout")
         )
-        # If the caller pinned explicit paths AND those paths selected
-        # real LoRA modules that all failed trustworthy rank inference,
-        # do NOT fall through to caller metadata as the truth. The
-        # caller's top-level rank/scale/dropout is stale by construction
-        # (the selected live modules disagree with it), so persisting
-        # those would reintroduce the rank=8/placeholder problem the
-        # earlier explicit-filter narrowing was meant to prevent.
+        # If explicit paths selected real LoRA modules that all failed
+        # rank inference, do NOT trust caller metadata: it's stale by
+        # construction (live modules disagree with it).
         allow_caller_metadata_fallback = not (
             explicit_path_set is not None
             and selected_lora_seen
@@ -2957,15 +2919,9 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 "scale": lora_scale,
                 "dropout": lora_dropout,
             })
-            # Constrain mlx-lm.load_adapters() to the saved topology by
-            # writing the path list under `lora_parameters["keys"]`. Without
-            # this, upstream interprets missing `keys` as "scan every Linear
-            # / Embedding / Switch layer" and creates extra zero-init LoRA
-            # wrappers outside the saved adapter set. The sync helper also
-            # writes `keys=[]` when the caller pinned an empty path list (a
-            # valid no-LoRA-binding instruction, distinct from "scan all"),
-            # and drops any stale caller-supplied `keys` when no authoritative
-            # path list is present.
+            # Mirror path list into `lora_parameters["keys"]` so
+            # mlx-lm.load_adapters wraps only the saved topology instead of
+            # scanning every Linear/Embedding/Switch.
             lora_parameters = _sync_mlx_lora_keys(adapter_config, lora_parameters)
             adapter_config["lora_parameters"] = lora_parameters
             adapter_config["rank"] = lora_rank
@@ -2973,8 +2929,9 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             adapter_config["dropout"] = lora_dropout
             adapter_config.setdefault("peft_type", "LORA")
             adapter_config.setdefault("fine_tune_type", "lora")
-            # mlx-lm load_adapters dereferences config.num_layers; fill it
-            # in for direct save_lora_adapters() callers without trainer config.
+            # mlx-lm load_adapters does attr-access on config.num_layers;
+            # write a value (-1 sentinel as fallback) so reload doesn't
+            # AttributeError for direct save_lora_adapters() callers.
             if "num_layers" not in adapter_config:
                 layers = _get_transformer_layers(model)
                 try:
@@ -2983,30 +2940,16 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     n_layers = -1
                 if n_layers <= 0:
                     n_layers = -1
-                # Always write the key so mlx-lm.load_adapters() can
-                # attribute-access `config.num_layers` (it builds a
-                # SimpleNamespace from adapter_config.json and raises
-                # AttributeError when the key is absent). -1 is the
-                # legacy "all layers" sentinel, consistent with the
-                # trainer's save_model() fallback for wrapped models.
                 adapter_config["num_layers"] = n_layers
         elif has_caller_lora_metadata and allow_caller_metadata_fallback:
-            # Keep the caller's metadata coherent: copy top-level
-            # rank/scale/dropout into lora_parameters (or vice versa) so
-            # both shapes that mlx-lm's load_adapters checks agree.
-            # Backfill rank/scale/dropout from the inferred module when
-            # the caller provided a partial set (e.g. only `scale`), so
-            # the LoRA parameters dict always ships complete (mlx-lm's
-            # load_adapters consults it for both halves and rejects
-            # missing fields). Runs whether or not the caller also
-            # pinned `unsloth_mlx_lora_module_paths`.
+            # Keep caller metadata coherent across top-level + lora_parameters
+            # shapes, and backfill from inferred values when caller supplied
+            # only a partial set so mlx-lm's load_adapters sees all fields.
             lora_parameters = existing_lora_parameters
             for key in ("rank", "scale", "dropout"):
                 if key not in lora_parameters and key in adapter_config:
                     lora_parameters[key] = adapter_config[key]
-            # Rank goes first because it gates the final write below;
-            # without backfilling rank a `{"scale": 9.0}` caller would
-            # otherwise produce a saved config with no rank at all.
+            # Rank goes first because it gates the final write below.
             inferred_fallbacks = (
                 ("rank", lora_rank, None),
                 ("scale", lora_scale, 1.0),
@@ -3016,16 +2959,12 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 if key in lora_parameters:
                     continue
                 if inferred_value is None and default_value is None:
-                    # No inferred value AND no safe default (rank);
-                    # leave it absent so the gate below skips the write.
+                    # No inferred + no safe default (rank): leave absent.
                     continue
                 lora_parameters[key] = (
                     inferred_value if inferred_value is not None else default_value
                 )
             if "rank" in lora_parameters:
-                # Same sync as the main branch: mirror the authoritative path
-                # list under `keys` (covering the empty-pin case) and drop
-                # stale caller keys when no path list survived.
                 lora_parameters = _sync_mlx_lora_keys(adapter_config, lora_parameters)
                 adapter_config["lora_parameters"] = lora_parameters
                 for key in ("rank", "scale", "dropout"):
@@ -3033,13 +2972,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                         adapter_config[key] = lora_parameters[key]
                 adapter_config.setdefault("peft_type", "LORA")
                 adapter_config.setdefault("fine_tune_type", "lora")
-                # mlx-lm.load_adapters() does `config.num_layers` (attr
-                # access on a SimpleNamespace built from adapter_config.json),
-                # so the key MUST be present or reload raises AttributeError.
-                # Mirror the main branch's `-1` sentinel fallback here so a
-                # direct `save_lora_adapters()` caller that supplied valid
-                # rank/scale/dropout but no num_layers still produces a
-                # loadable config.
+                # Same -1 num_layers sentinel as the main branch.
                 if "num_layers" not in adapter_config:
                     layers = _get_transformer_layers(model)
                     try:
@@ -3050,10 +2983,8 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                         n_layers = -1
                     adapter_config["num_layers"] = n_layers
     except (TypeError, ValueError, AttributeError) as _enrich_exc:
-        # Surface enrichment failures (e.g. caller passed garbage
-        # lora_parameters, mx.array scale that could not coerce, an
-        # unexpected None on a getattr chain) so the user knows
-        # adapter_config metadata may be incomplete on reload.
+        # Surface enrichment failures so user knows adapter_config metadata
+        # may be incomplete on reload.
         import warnings as _warnings
         _warnings.warn(
             f"Unsloth MLX: skipped LoRA metadata enrichment "
