@@ -92,6 +92,10 @@ MIN_PIXELS = 4 * 28 * 28
 MAX_PIXELS = 16384 * 28 * 28
 MAX_RATIO = 200
 
+# One-shot guard so the degenerate-aspect warning fires once per process,
+# not once per image / per batch.
+_WARNED_DEGENERATE_ASPECT = False
+
 VIDEO_MIN_PIXELS = 128 * 28 * 28
 VIDEO_MAX_PIXELS = 768 * 28 * 28
 VIDEO_TOTAL_PIXELS = int(float(os.environ.get('VIDEO_MAX_PIXELS', 128000 * 28 * 28 * 0.9)))
@@ -992,6 +996,25 @@ class UnslothVisionDataCollator:
                 new_h = max(1, (h * image_size + side // 2) // side)
                 if snap:
                     new_w, new_h = quantize_to_factor(new_w), quantize_to_factor(new_h)
+
+                # Heads-up: Qwen2-VL / Qwen2.5-VL preprocessors reject inputs
+                # with aspect_ratio > MAX_RATIO via smart_resize. Surface a
+                # single, actionable warning so users learn to filter their
+                # dataset before the downstream crash.
+                global _WARNED_DEGENERATE_ASPECT
+                if (not _WARNED_DEGENERATE_ASPECT
+                        and max(new_w, new_h) > MAX_RATIO * min(new_w, new_h)):
+                    _WARNED_DEGENERATE_ASPECT = True
+                    warnings.warn(
+                        f"Unsloth: image {w}x{h} resized to "
+                        f"({new_w}, {new_h}) has aspect ratio "
+                        f"{max(new_w, new_h) // min(new_w, new_h)}, exceeding "
+                        f"MAX_RATIO={MAX_RATIO}. Qwen2-VL / Qwen2.5-VL will "
+                        "reject this in smart_resize; filter degenerate-aspect "
+                        "images from your dataset before training those models.",
+                        UserWarning,
+                        stacklevel = 2,
+                    )
 
                 image[i] = img.resize((new_w, new_h), LANCZOS)
 
