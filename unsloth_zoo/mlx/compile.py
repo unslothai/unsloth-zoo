@@ -71,11 +71,8 @@ def set_qwen3_vision_norm_cast_output(enabled: bool) -> None:
 # Architectures explicitly verified for mlx compile support.
 # Training verification currently covers:
 # - qwen2_5_vl: real end-to-end compiled training via train.py
-# - qwen3_vl / qwen3_5 / qwen3_5_moe / gemma4 / paligemma / moondream3:
+# - gemma3 / qwen3_vl / qwen3_5 / qwen3_5_moe / gemma4 / paligemma / moondream3:
 #   compiled synthetic forward+backward
-# Gemma3 stays patched but unqualified for training compile: a fixed-fixture
-# Gemma3 VLM loss probe showed compiled loss differs from eager before any
-# optimizer update. Re-promote only after real loss parity is verified.
 # SmolVLM has processor/template support, but real mlx-vlm training still hits
 # MLX primitive-less-array failures after a compiled call. Keep it patched but
 # unqualified until a real dataset compile run passes.
@@ -83,6 +80,7 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "aya_vision",
     "deepseekocr",
     "deepseekocr_2",
+    "gemma3",
     "gemma3n",
     "gemma4",
     "glm_ocr",
