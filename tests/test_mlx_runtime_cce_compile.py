@@ -40,8 +40,7 @@ def _skip_torch_shim():
 
 
 def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
-    # hidden=0 but targets!=0 indicates an upstream shape mismatch we
-    # want to surface, not silently drop labels.
+    # hidden=0 with non-empty targets must raise, not silently drop labels.
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 
@@ -58,10 +57,8 @@ def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
 
 
 def test_runtime_cce_int64_wrap_to_ignore_index_poisons_gradients():
-    # A wide invalid label like 2**32 - 100 narrows to -100 (= ignore_index)
-    # inside int32. The forward loss is NaN, but the backward must NOT zero
-    # the gradient: it must propagate NaN from the poisoned lse so callers
-    # cannot silently keep training on the bad row.
+    # Wide labels (e.g. 2**32-100) narrow to -100 in int32; backward must
+    # propagate NaN from the poisoned lse instead of zeroing the gradient.
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 
@@ -92,9 +89,7 @@ def test_runtime_cce_int64_wrap_to_ignore_index_poisons_gradients():
     [2**32, -(2**32), 2**32 + 5, 2**32 - 100],
 )
 def test_runtime_cce_int64_invalid_labels_do_not_wrap_to_valid(bad_target):
-    # int64 labels outside [-2**31, 2**31) get narrowed to int32 by .astype.
-    # Validating before the narrow keeps wraparound values from masquerading
-    # as valid class ids or ignore_index.
+    # int64 labels outside int32 range must NaN, not wrap to valid ids.
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 
@@ -112,8 +107,7 @@ def test_runtime_cce_int64_invalid_labels_do_not_wrap_to_valid(bad_target):
 
 
 def test_runtime_cce_rejects_non_flat_targets():
-    # rank-2 (n, 1) targets would slip past the length check and crash inside
-    # the kernels; reject up front with a clear ValueError instead.
+    # Rank-2 / scalar targets must raise ValueError, not crash kernels.
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 
@@ -236,10 +230,8 @@ def test_runtime_cce_invalid_labels_poison_loss_and_gradients(bad_target):
 
     assert math.isnan(loss.item())
     assert math.isnan(grad_norm.item())
-    # explicit: invalid-label row poisons its OWN grad_hidden row with NaN
-    # while valid and ignore_index rows must stay finite. Without this,
-    # an NaN leak from _poison_invalid_targets into valid rows' lse would
-    # be hidden by grad_weight's NaN contamination of grad_norm.
+    # Per-row check: only the invalid row's grad_hidden goes NaN. Otherwise
+    # a leak into valid rows would be masked by grad_weight's NaN in grad_norm.
     grad_hidden_rows = mx.sum(mx.abs(grad_hidden).astype(mx.float32), axis=1)
     mx.eval(grad_hidden_rows)
     assert math.isfinite(grad_hidden_rows[0].item()), "valid row must have finite grad_hidden"
@@ -249,7 +241,7 @@ def test_runtime_cce_invalid_labels_poison_loss_and_gradients(bad_target):
 
 @pytest.mark.parametrize("bad_target", [-1, 32])
 def test_compiled_runtime_cce_invalid_labels_poison_loss(bad_target):
-    # cover both negative and >= vocab_size labels under mx.compile.
+    # Both negative and >= vocab_size labels under mx.compile.
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 
@@ -273,7 +265,7 @@ def test_compiled_runtime_cce_invalid_labels_poison_loss(bad_target):
 
 @pytest.mark.parametrize("bad_target", [-1, 32])
 def test_compiled_runtime_cce_invalid_labels_poison_gradients(bad_target):
-    # NaN must survive mx.custom_function aux-lse storage into the VJP under compile.
+    # NaN must survive aux-lse storage into the VJP under compile.
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 
