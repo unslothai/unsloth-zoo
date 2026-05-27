@@ -198,17 +198,18 @@ def patch_CsmDepthDecoderForCausalLM_forward():
             codebook_idxs = torch.clamp(codebook_indices - 1, min=0)
             offset = codebook_idxs * self.model.vocab_size
             inputs_embeds = self.model.embed_tokens(input_ids + offset)
-            restore_input_grad = inputs_embeds.requires_grad and inputs_embeds.is_leaf
-            if restore_input_grad:
-                inputs_embeds = inputs_embeds.detach()
+            if inputs_embeds.requires_grad and inputs_embeds.is_leaf:
+                # Use the cheap detach when backbone state supplies gradients;
+                # clone only when the GC sentinel itself must survive.
+                inputs_embeds = (
+                    inputs_embeds.detach()
+                    if backbone_last_hidden_state.requires_grad
+                    else inputs_embeds.clone()
+                )
             inputs_embeds[:, 0] = backbone_last_hidden_state.to(
                 device=inputs_embeds.device,
                 dtype=inputs_embeds.dtype,
             )
-            # If the replacement state is frozen, keep GC's input-grad
-            # sentinel alive for decoder-only adapter training.
-            if restore_input_grad and not inputs_embeds.requires_grad:
-                inputs_embeds.requires_grad_(True)
             input_ids = None
             backbone_last_hidden_state = None
 

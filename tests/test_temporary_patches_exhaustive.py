@@ -885,104 +885,35 @@ def test_csm_depth_decoder_for_causal_lm_forward_named_params():
     )
 
 
-def test_csm_depth_decoder_leaf_embedding_hook_backward():
-    """misc.py CSM patch must avoid upstream's leaf-view CopySlices crash.
-
-    Zoo's gradient-checkpointing hook can mark frozen embedding outputs as
-    leaf tensors requiring grad. Upstream CSM then assigns into
-    ``inputs_embeds[:, 0]`` and autograd raises before LoRA training starts.
-    """
-    torch = pytest.importorskip("torch")
+def _tiny_csm_depth_decoder(torch):
     csm = pytest.importorskip("transformers.models.csm.modeling_csm")
     config_mod = pytest.importorskip("transformers.models.csm.configuration_csm")
-
-    from unsloth_zoo.temporary_patches.misc import patch_CsmDepthDecoderForCausalLM_forward
-
-    patch_CsmDepthDecoderForCausalLM_forward()
-
     config = config_mod.CsmDepthDecoderConfig(
-        vocab_size=11,
-        num_codebooks=4,
-        backbone_hidden_size=8,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        max_position_embeddings=8,
-        head_dim=4,
-        attention_dropout=0.0,
-        use_cache=False,
+        vocab_size=11, num_codebooks=4, backbone_hidden_size=8,
+        hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1,
+        max_position_embeddings=8, head_dim=4, use_cache=False,
         pad_token_id=0,
     )
     config._attn_implementation = "eager"
     model = csm.CsmDepthDecoderForCausalLM(config).train()
     model.model.embed_tokens.weight.requires_grad_(False)
-
-    hook = model.model.embed_tokens.register_forward_hook(
-        lambda module, args, output: output.requires_grad_(True)
-    )
-    try:
-        input_ids = torch.tensor([[0, 2, 3, 4]], dtype=torch.long)
-        labels = torch.tensor([[5, 6, 7, 8]], dtype=torch.long)
-        backbone_last_hidden_state = torch.randn(1, 8, requires_grad=True)
-
-        out = model(
-            input_ids=input_ids,
-            backbone_last_hidden_state=backbone_last_hidden_state,
-            labels=labels,
-            return_dict=True,
-        )
-        out.loss.backward()
-
-        assert backbone_last_hidden_state.grad is not None
-        assert torch.isfinite(backbone_last_hidden_state.grad).all()
-        assert torch.count_nonzero(backbone_last_hidden_state.grad) > 0
-    finally:
-        hook.remove()
+    return model
 
 
-def test_csm_depth_decoder_keeps_gc_sentinel_with_frozen_backbone_state():
-    """Detached replacement states still need a grad-requiring model input.
-
-    This covers depth-decoder-only adapter training under reentrant gradient
-    checkpointing, where the hook-created sentinel is the only grad-requiring
-    input before the first checkpointed decoder block.
-    """
+@pytest.mark.parametrize("backbone_requires_grad", [True, False])
+def test_csm_depth_decoder_leaf_embedding_hook_backward(backbone_requires_grad):
+    """CSM patch handles GC hook leaf embeddings without losing grad input."""
     torch = pytest.importorskip("torch")
-    csm = pytest.importorskip("transformers.models.csm.modeling_csm")
-    config_mod = pytest.importorskip("transformers.models.csm.configuration_csm")
-
     from unsloth_zoo.temporary_patches.misc import patch_CsmDepthDecoderForCausalLM_forward
 
     patch_CsmDepthDecoderForCausalLM_forward()
-
-    config = config_mod.CsmDepthDecoderConfig(
-        vocab_size=11,
-        num_codebooks=4,
-        backbone_hidden_size=8,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        max_position_embeddings=8,
-        head_dim=4,
-        attention_dropout=0.0,
-        use_cache=False,
-        pad_token_id=0,
-    )
-    config._attn_implementation = "eager"
-    model = csm.CsmDepthDecoderForCausalLM(config).train()
-    model.model.embed_tokens.weight.requires_grad_(False)
-
+    model = _tiny_csm_depth_decoder(torch)
     seen = {}
     original_forward = model.model.forward
 
     def wrapped_model_forward(*args, **kwargs):
-        inputs_embeds = kwargs.get("inputs_embeds")
-        if inputs_embeds is not None:
-            seen["requires_grad"] = inputs_embeds.requires_grad
+        seen["inputs_embeds_requires_grad"] = kwargs["inputs_embeds"].requires_grad
         return original_forward(*args, **kwargs)
 
     model.model.forward = wrapped_model_forward
@@ -990,15 +921,19 @@ def test_csm_depth_decoder_keeps_gc_sentinel_with_frozen_backbone_state():
         lambda module, args, output: output.requires_grad_(True)
     )
     try:
+        backbone_state = torch.randn(1, 8, requires_grad=backbone_requires_grad)
         out = model(
             input_ids=torch.tensor([[0, 2, 3, 4]], dtype=torch.long),
-            backbone_last_hidden_state=torch.randn(1, 8),
+            backbone_last_hidden_state=backbone_state,
             labels=torch.tensor([[5, 6, 7, 8]], dtype=torch.long),
             return_dict=True,
         )
+        out.loss.backward()
 
-        assert out.loss.requires_grad
-        assert seen["requires_grad"] is True
+        assert seen["inputs_embeds_requires_grad"] is True
+        if backbone_requires_grad:
+            assert backbone_state.grad is not None
+            assert torch.count_nonzero(backbone_state.grad) > 0
     finally:
         hook.remove()
         model.model.forward = original_forward
@@ -2481,4 +2416,3 @@ def test_temporary_patches_directory_has_expected_files():
             f"DRIFT DETECTED: temporary_patches/ is missing files {missing}; "
             f"either they were renamed or dropped without updating the test"
         )
-
