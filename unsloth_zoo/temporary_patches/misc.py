@@ -420,7 +420,7 @@ def _tie_csm_audio_embeddings(model):
         audio_embeddings = model.backbone_model.embed_tokens.embed_audio_tokens
         depth_embeddings = model.depth_decoder.model.embed_tokens
         if audio_embeddings.weight.shape == depth_embeddings.weight.shape:
-            # Transformers 5.5 can miss this tie while loading older CSM checkpoints.
+            # Keep CSM's codebook tie alive when tie_word_embeddings=False.
             audio_embeddings.weight = depth_embeddings.weight
     except Exception:
         pass
@@ -428,33 +428,88 @@ def _tie_csm_audio_embeddings(model):
 pass
 
 
-def patch_CsmForConditionalGeneration_from_pretrained():
+def patch_CsmForConditionalGeneration_tie_weights():
     try:
         import transformers.models.csm.modeling_csm
     except Exception as e:
-        return raise_error("CsmForConditionalGeneration.from_pretrained", e)
+        return raise_error("CsmForConditionalGeneration.tie_weights", e)
 
     target_cls = transformers.models.csm.modeling_csm.CsmForConditionalGeneration
-    storage_name = _get_unique_storage_name(target_cls, "from_pretrained")
+    storage_name = _get_unique_storage_name(target_cls, "tie_weights")
     if hasattr(target_cls, storage_name):
-        original_from_pretrained = getattr(target_cls, storage_name)
+        original_tie_weights = getattr(target_cls, storage_name)
     else:
-        original_from_pretrained = target_cls.from_pretrained
-        setattr(target_cls, storage_name, original_from_pretrained)
+        original_tie_weights = target_cls.tie_weights
+        setattr(target_cls, storage_name, original_tie_weights)
     pass
 
-    @classmethod
-    def from_pretrained(cls, *args, **kwargs):
-        model = original_from_pretrained(*args, **kwargs)
-        return _tie_csm_audio_embeddings(model)
+    def tie_weights(self, *args, **kwargs):
+        output = original_tie_weights(self, *args, **kwargs)
+        _tie_csm_audio_embeddings(self)
+        return output
     pass
     try:
-        from_pretrained.__signature__ = inspect.signature(original_from_pretrained)
+        tie_weights.__signature__ = inspect.signature(original_tie_weights)
     except Exception:
         pass
-    target_cls.from_pretrained = from_pretrained
+    target_cls.tie_weights = tie_weights
 pass
-TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_from_pretrained)
+TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_tie_weights)
+
+
+def _label_csm_audio_eos_tokens(input_ids, labels, audio_eos_token_id):
+    if input_ids is None or labels is None or audio_eos_token_id is None:
+        return labels
+    try:
+        eos_mask = input_ids == audio_eos_token_id
+        previous_label_is_audio = torch.nn.functional.pad(labels[..., :-1] != -100, (1, 0), value=False)
+        labels[eos_mask & previous_label_is_audio] = audio_eos_token_id
+    except Exception:
+        pass
+    return labels
+pass
+
+
+def patch_CsmProcessor_apply_chat_template():
+    try:
+        import transformers.models.csm.processing_csm
+    except Exception as e:
+        return raise_error("CsmProcessor.apply_chat_template", e)
+
+    target_cls = transformers.models.csm.processing_csm.CsmProcessor
+    storage_name = _get_unique_storage_name(target_cls, "apply_chat_template")
+    if hasattr(target_cls, storage_name):
+        original_apply_chat_template = getattr(target_cls, storage_name)
+    else:
+        original_apply_chat_template = target_cls.apply_chat_template
+        setattr(target_cls, storage_name, original_apply_chat_template)
+    pass
+
+    def apply_chat_template(self, *args, **kwargs):
+        output = original_apply_chat_template(self, *args, **kwargs)
+        if hasattr(output, "__contains__") and "input_ids" in output and "labels" in output:
+            tokenizer = getattr(self, "tokenizer", None)
+            audio_eos_token_id = None
+            if tokenizer is not None:
+                try:
+                    audio_eos_token_id = tokenizer.convert_tokens_to_ids("<|audio_eos|>")
+                except Exception:
+                    audio_eos_token_id = None
+            pass
+            output["labels"] = _label_csm_audio_eos_tokens(
+                output.get("input_ids"),
+                output.get("labels"),
+                audio_eos_token_id,
+            )
+        return output
+    pass
+    try:
+        apply_chat_template.__signature__ = inspect.signature(original_apply_chat_template)
+    except Exception:
+        pass
+    target_cls.apply_chat_template = apply_chat_template
+pass
+TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
 def patch_transformers_masks():

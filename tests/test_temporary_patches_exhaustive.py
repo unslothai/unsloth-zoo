@@ -960,22 +960,16 @@ def test_csm_audio_embeddings_tie_helper():
     assert audio.weight.data_ptr() == depth.weight.data_ptr()
 
 
-def test_csm_num_items_counts_masked_audio_eos():
+def test_csm_audio_eos_label_helper_keeps_trainer_counts_aligned():
     torch = pytest.importorskip("torch")
-    from unsloth_zoo.loss_utils import _csm_token_count_mask
+    from unsloth_zoo.temporary_patches.misc import _label_csm_audio_eos_tokens
 
     labels = torch.tensor([[-100, 128002, -100, -100]])
     input_ids = torch.tensor([[128000, 128002, 128003, 0]])
-    attention_mask = torch.tensor([[1, 1, 1, 0]])
 
-    mask = _csm_token_count_mask(
-        labels,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        audio_eos_token_id=128003,
-    )
+    labels = _label_csm_audio_eos_tokens(input_ids, labels, 128003)
 
-    assert mask.tolist() == [[True, True, False]]
+    assert labels.tolist() == [[-100, 128002, 128003, -100]]
 
 
 def test_csm_for_conditional_generation_forward_named_params():
