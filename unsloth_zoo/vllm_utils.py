@@ -817,20 +817,31 @@ def patch_vllm_decompose_size_nodes():
     except Exception:
         return
 
-    def _replace_in_slice(s, node, dims):
-        # Picking a single dim from a multi-dim list is a heuristic with
-        # no sound mapping (`sym[0]` was arbitrary). Leave the slice
-        # untouched so `node.users` retains the reference and the safety
-        # net at the end of `_decompose_size_nodes` raises a clean error
-        # surfacing the unhandled shape.
-        return s
+    def _substitute_scalar(value, node, replacement):
+        # Recursive scalar substitute: replace every `node` reference
+        # inside `value` (which may be a slice, tuple, list, or plain
+        # fx.Node) with `replacement`. Used for the single-dim
+        # `tensor.size(dim)` case where `node` is a SymInt that callers
+        # plug into slices, tuples, kwargs etc.
+        if isinstance(value, fx.Node) and value is node:
+            return replacement
+        if isinstance(value, slice):
+            return slice(
+                _substitute_scalar(value.start, node, replacement),
+                _substitute_scalar(value.stop,  node, replacement),
+                _substitute_scalar(value.step,  node, replacement),
+            )
+        if isinstance(value, (tuple, list)):
+            return type(value)(_substitute_scalar(x, node, replacement) for x in value)
+        return value
 
     def _replace_in_args(args, node, dims, _depth=0):
-        # `node` appears in user.args / user.kwargs in one of two shapes
-        # we are confident about:
-        #   1. As a varargs spread: `fn(t.size(), other)` -- expand dims
-        #      inline at the TOP level. This matches the upstream call
-        #      sites of getitem-on-size.
+        # Whole-size `tensor.size()` case (returns a Size tuple).
+        # `node` is expected to appear in user.args / user.kwargs in
+        # one of two shapes we are confident about:
+        #   1. As a varargs spread: `fn(t.size(), other)` -- expand
+        #      dims inline at the TOP level. This matches the upstream
+        #      call sites of getitem-on-size.
         #   2. As a getitem consumer: `getitem(t.size(), i)` -- handled
         #      at the call site via `user.args[1]` indexing and never
         #      reaches this helper.
@@ -842,8 +853,6 @@ def patch_vllm_decompose_size_nodes():
         for a in args:
             if isinstance(a, fx.Node) and a is node and _depth == 0:
                 out.extend(dims)
-            elif isinstance(a, slice):
-                out.append(_replace_in_slice(a, node, dims))
             elif isinstance(a, (tuple, list)):
                 out.append(type(a)(_replace_in_args(list(a), node, dims, _depth + 1)))
             else:
@@ -857,6 +866,13 @@ def patch_vllm_decompose_size_nodes():
             ev = tensor_node.meta.get("example_value")
             if ev is None:
                 continue
+            # `tensor.size(dim)` returns a single SymInt; `tensor.size()`
+            # returns the full Size tuple. Behaviour at user sites is
+            # entirely different -- the single-dim form gets plugged into
+            # slices, tuples, kwargs and must substitute element-wise.
+            single_dim_idx = None
+            if len(node.args) >= 2 and isinstance(node.args[1], int):
+                single_dim_idx = node.args[1]
             dims = []
             with graph.graph.inserting_after(tensor_node):
                 for i in range(ev.dim()):
@@ -869,34 +885,49 @@ def patch_vllm_decompose_size_nodes():
                         dims.append(dn)
                     else:
                         dims.append(int(dv))
-            for user in list(node.users):
-                if (
-                    user.op == "call_function"
-                    and user.target is operator.getitem
-                    and len(user.args) == 2
-                    and user.args[0] is node
-                ):
-                    user.replace_all_uses_with(dims[user.args[1]])
-                    graph.graph.erase_node(user)
-                else:
-                    user.args = tuple(_replace_in_args(list(user.args), node, dims))
+            if single_dim_idx is not None:
+                # Single-dim mode: `node` represents a scalar. Replace
+                # every reference to it (including inside slices) with
+                # the corresponding `dims[single_dim_idx]` entry.
+                replacement = dims[single_dim_idx]
+                for user in list(node.users):
+                    user.args = tuple(
+                        _substitute_scalar(a, node, replacement) for a in user.args
+                    )
                     if user.kwargs:
-                        new_kwargs = {}
-                        for k, v in user.kwargs.items():
-                            if isinstance(v, (tuple, list)):
-                                new_kwargs[k] = type(v)(_replace_in_args(list(v), node, dims))
-                            elif isinstance(v, fx.Node) and v is node:
-                                # `kw=size_node` -- the kwarg expects the
-                                # full shape tuple (e.g. torch.reshape(...,
-                                # shape=x.size())), not a single dimension.
-                                # Picking dims[0] would shrink shape to a
-                                # scalar and produce invalid graph
-                                # semantics. Pass the decomposed dims as
-                                # a tuple, matching torch.Size semantics.
-                                new_kwargs[k] = tuple(dims)
-                            else:
-                                new_kwargs[k] = _replace_in_args([v], node, dims)[0]
-                        user.kwargs = new_kwargs
+                        user.kwargs = {
+                            k: _substitute_scalar(v, node, replacement)
+                            for k, v in user.kwargs.items()
+                        }
+            else:
+                for user in list(node.users):
+                    if (
+                        user.op == "call_function"
+                        and user.target is operator.getitem
+                        and len(user.args) == 2
+                        and user.args[0] is node
+                    ):
+                        user.replace_all_uses_with(dims[user.args[1]])
+                        graph.graph.erase_node(user)
+                    else:
+                        user.args = tuple(_replace_in_args(list(user.args), node, dims))
+                        if user.kwargs:
+                            new_kwargs = {}
+                            for k, v in user.kwargs.items():
+                                if isinstance(v, (tuple, list)):
+                                    new_kwargs[k] = type(v)(_replace_in_args(list(v), node, dims))
+                                elif isinstance(v, fx.Node) and v is node:
+                                    # `kw=size_node` -- the kwarg expects the
+                                    # full shape tuple (e.g. torch.reshape(...,
+                                    # shape=x.size())), not a single dimension.
+                                    # Picking dims[0] would shrink shape to a
+                                    # scalar and produce invalid graph
+                                    # semantics. Pass the decomposed dims as
+                                    # a tuple, matching torch.Size semantics.
+                                    new_kwargs[k] = tuple(dims)
+                                else:
+                                    new_kwargs[k] = _replace_in_args([v], node, dims)[0]
+                            user.kwargs = new_kwargs
             if node.users:
                 # The recursive rewrite did not replace every reference.
                 # Raise cleanly without calling `graph.graph.erase_node`
