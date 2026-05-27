@@ -960,6 +960,27 @@ def test_csm_audio_embeddings_tie_helper():
     assert audio.weight.data_ptr() == depth.weight.data_ptr()
 
 
+def test_csm_audio_embeddings_tie_helper_respects_config():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _tie_csm_audio_embeddings
+
+    audio = torch.nn.Embedding(4, 3)
+    depth = torch.nn.Embedding(4, 3)
+    model = SimpleNamespace(
+        config=SimpleNamespace(tie_codebooks_embeddings=False),
+        backbone_model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(embed_audio_tokens=audio),
+        ),
+        depth_decoder=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=depth),
+        ),
+    )
+
+    _tie_csm_audio_embeddings(model)
+    assert audio.weight.data_ptr() != depth.weight.data_ptr()
+
+
 def test_csm_audio_eos_label_helper_keeps_trainer_counts_aligned():
     torch = pytest.importorskip("torch")
     from unsloth_zoo.temporary_patches.misc import _label_csm_audio_eos_tokens
@@ -970,6 +991,46 @@ def test_csm_audio_eos_label_helper_keeps_trainer_counts_aligned():
     labels = _label_csm_audio_eos_tokens(input_ids, labels, 128003)
 
     assert labels.tolist() == [[-100, 128002, 128003, -100]]
+
+
+def test_csm_audio_eos_label_helper_supports_numpy():
+    np = pytest.importorskip("numpy")
+    from unsloth_zoo.temporary_patches.misc import _label_csm_audio_eos_tokens
+
+    labels = np.array([[-100, 128002, -100, -100]])
+    input_ids = np.array([[128000, 128002, 128003, 0]])
+
+    labels = _label_csm_audio_eos_tokens(input_ids, labels, 128003)
+
+    assert labels.tolist() == [[-100, 128002, 128003, -100]]
+
+
+def test_csm_processor_output_uses_configured_audio_eos_id():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _label_csm_processor_output
+
+    processor = SimpleNamespace(audio_eos_token_id=42)
+    output = {
+        "input_ids": torch.tensor([[128000, 128002, 42, 0]]),
+        "labels": torch.tensor([[-100, 128002, -100, -100]]),
+    }
+
+    output = _label_csm_processor_output(processor, output)
+
+    assert output["labels"].tolist() == [[-100, 128002, 42, -100]]
+
+
+def test_csm_processor_output_ignores_non_mappings():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _label_csm_processor_output
+
+    tensor_output = torch.tensor([[128000, 128002]])
+    text_output = "input_ids and labels are just rendered text"
+
+    assert _label_csm_processor_output(SimpleNamespace(), tensor_output) is tensor_output
+    assert _label_csm_processor_output(SimpleNamespace(), text_output) is text_output
 
 
 def test_csm_for_conditional_generation_forward_named_params():

@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import inspect
 import importlib
+from collections.abc import Mapping
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 from .common import TEMPORARY_PATCHES, torch_compile, _torch_compile
 from .utils import (
@@ -416,11 +417,13 @@ TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
 
 
 def _tie_csm_audio_embeddings(model):
+    if not getattr(getattr(model, "config", None), "tie_codebooks_embeddings", True):
+        return model
     try:
         audio_embeddings = model.backbone_model.embed_tokens.embed_audio_tokens
         depth_embeddings = model.depth_decoder.model.embed_tokens
         if audio_embeddings.weight.shape == depth_embeddings.weight.shape:
-            # Keep CSM's codebook tie alive when tie_word_embeddings=False.
+            # Keep CSM's configured codebook tie alive when tie_word_embeddings=False.
             audio_embeddings.weight = depth_embeddings.weight
     except Exception:
         pass
@@ -462,7 +465,15 @@ def _label_csm_audio_eos_tokens(input_ids, labels, audio_eos_token_id):
         return labels
     try:
         eos_mask = input_ids == audio_eos_token_id
-        previous_label_is_audio = torch.nn.functional.pad(labels[..., :-1] != -100, (1, 0), value=False)
+        previous_label_is_audio = labels[..., :-1] != -100
+        if torch.is_tensor(labels):
+            previous_label_is_audio = torch.nn.functional.pad(previous_label_is_audio, (1, 0), value=False)
+        else:
+            import numpy as np
+            previous_label_is_audio = np.concatenate(
+                [np.zeros_like(labels[..., :1], dtype=bool), previous_label_is_audio],
+                axis=-1,
+            )
         labels[eos_mask & previous_label_is_audio] = audio_eos_token_id
     except Exception:
         pass
@@ -470,44 +481,75 @@ def _label_csm_audio_eos_tokens(input_ids, labels, audio_eos_token_id):
 pass
 
 
+def _get_csm_processor_audio_eos_token_id(processor):
+    audio_eos_token_id = getattr(processor, "audio_eos_token_id", None)
+    if audio_eos_token_id is not None:
+        return audio_eos_token_id
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        return None
+
+    audio_eos_token_id = getattr(tokenizer, "audio_eos_token_id", None)
+    if audio_eos_token_id is not None:
+        return audio_eos_token_id
+
+    audio_eos_token = getattr(processor, "audio_eos_token", getattr(tokenizer, "audio_eos_token", "<|audio_eos|>"))
+    try:
+        return tokenizer.convert_tokens_to_ids(audio_eos_token)
+    except Exception:
+        return None
+pass
+
+
+def _label_csm_processor_output(processor, output):
+    if not isinstance(output, Mapping) or "input_ids" not in output or "labels" not in output:
+        return output
+    output["labels"] = _label_csm_audio_eos_tokens(
+        output.get("input_ids"),
+        output.get("labels"),
+        _get_csm_processor_audio_eos_token_id(processor),
+    )
+    return output
+pass
+
+
 def patch_CsmProcessor_apply_chat_template():
     try:
         import transformers.models.csm.processing_csm
     except Exception as e:
-        return raise_error("CsmProcessor.apply_chat_template", e)
+        return raise_error("CsmProcessor", e)
 
     target_cls = transformers.models.csm.processing_csm.CsmProcessor
-    storage_name = _get_unique_storage_name(target_cls, "apply_chat_template")
-    if hasattr(target_cls, storage_name):
-        original_apply_chat_template = getattr(target_cls, storage_name)
+    apply_storage_name = _get_unique_storage_name(target_cls, "apply_chat_template")
+    if hasattr(target_cls, apply_storage_name):
+        original_apply_chat_template = getattr(target_cls, apply_storage_name)
     else:
         original_apply_chat_template = target_cls.apply_chat_template
-        setattr(target_cls, storage_name, original_apply_chat_template)
+        setattr(target_cls, apply_storage_name, original_apply_chat_template)
+    pass
+    call_storage_name = _get_unique_storage_name(target_cls, "__call__")
+    if hasattr(target_cls, call_storage_name):
+        original_call = getattr(target_cls, call_storage_name)
+    else:
+        original_call = target_cls.__call__
+        setattr(target_cls, call_storage_name, original_call)
     pass
 
     def apply_chat_template(self, *args, **kwargs):
-        output = original_apply_chat_template(self, *args, **kwargs)
-        if hasattr(output, "__contains__") and "input_ids" in output and "labels" in output:
-            tokenizer = getattr(self, "tokenizer", None)
-            audio_eos_token_id = None
-            if tokenizer is not None:
-                try:
-                    audio_eos_token_id = tokenizer.convert_tokens_to_ids("<|audio_eos|>")
-                except Exception:
-                    audio_eos_token_id = None
-            pass
-            output["labels"] = _label_csm_audio_eos_tokens(
-                output.get("input_ids"),
-                output.get("labels"),
-                audio_eos_token_id,
-            )
-        return output
+        return _label_csm_processor_output(self, original_apply_chat_template(self, *args, **kwargs))
+    pass
+
+    def __call__(self, *args, **kwargs):
+        return _label_csm_processor_output(self, original_call(self, *args, **kwargs))
     pass
     try:
         apply_chat_template.__signature__ = inspect.signature(original_apply_chat_template)
+        __call__.__signature__ = inspect.signature(original_call)
     except Exception:
         pass
     target_cls.apply_chat_template = apply_chat_template
+    target_cls.__call__ = __call__
 pass
 TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
