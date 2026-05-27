@@ -224,3 +224,190 @@ def test_rl_replacements_registration_survived_grpo_refactor():
         f"{sorted(missing)}. Recheck the `RL_REPLACEMENTS[name] = fn` "
         f"lines below each definition in rl_replacements.py."
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: gpt-oss inference leaks a flex BlockMask into the eager
+# attention forward.
+#
+# Source: PR #690 (Fix gpt-oss inference BlockMask TypeError).
+# Latent since unsloth-zoo commit `ef819214` (2025-09-25, "Fix Flex")
+# which rewrote return_attention_mask -> wrap(f) that on the inference
+# branch unconditionally calls f(*args, **kwargs), AND switched
+# forward_function to use eager during inference. When
+# config._attn_implementation == "flex_attention" (set by training,
+# explicit user kwarg, or pre-#5701 resolver), the inference path
+# receives a BlockMask and inplace_eager_attention_forward crashes:
+#   TypeError: unsupported operand type(s) for +=:
+#       'Tensor' and 'BlockMask'
+#
+# AST-level guards. Two of them: one over wrap.return_attention_mask
+# (the path transformers' own GptOssModel.forward goes through), one
+# over patch_GptOssModel as a whole (the path Unsloth's patched forward
+# goes through). Catches silent deletion of the flex_attention literal.
+# ---------------------------------------------------------------------------
+
+
+def test_gpt_oss_wrap_has_flex_attention_inference_guard():
+    import ast
+    import inspect
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    src = inspect.getsource(_M.patch_GptOssModel)
+    tree = ast.parse(src)
+
+    wrap_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "wrap":
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.FunctionDef)
+                    and inner.name == "return_attention_mask"
+                ):
+                    wrap_fn = inner
+                    break
+        if wrap_fn is not None:
+            break
+
+    assert wrap_fn is not None, "wrap.return_attention_mask not found"
+
+    body_src = ast.unparse(wrap_fn)
+    assert (
+        '"flex_attention"' in body_src or "'flex_attention'" in body_src
+    ) and "_attn_implementation" in body_src, (
+        "wrap(f) for create_causal_mask must read config._attn_implementation "
+        "and short-circuit the flex_attention case on the inference branch. "
+        "Without this the eager forward receives a BlockMask and crashes "
+        "with TypeError: unsupported operand type(s) for +=: 'Tensor' "
+        "and 'BlockMask'. See PR #690."
+    )
+
+
+def test_gpt_oss_patched_model_forward_has_flex_attention_guard():
+    """The patched GptOssModel.forward body itself must hold the guard.
+
+    Locate the inner `forward` FunctionDef and assert its body carries
+    the _attn_implementation == 'flex_attention' literal. This is
+    independent of wrap's own guard, so removing the forward-level
+    swap while keeping wrap's literal cannot satisfy this test.
+    """
+    import ast
+    import inspect
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    src = inspect.getsource(_M.patch_GptOssModel)
+    tree = ast.parse(src)
+
+    forward_fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "forward"),
+        None,
+    )
+    assert forward_fn is not None, "patched GptOssModel.forward not found"
+    body = ast.unparse(forward_fn)
+
+    assert (
+        ('"flex_attention"' in body or "'flex_attention'" in body)
+        and "_attn_implementation" in body
+    ), (
+        "patched GptOssModel.forward must guard against "
+        "_attn_implementation == 'flex_attention' independently of "
+        "wrap's own guard. Without this, the forward's "
+        "causal_mask_mapping construction leaks a BlockMask to the "
+        "eager attention path. See PR #690."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression: eager attention shape mismatch when KV cache is longer than
+# the attention mask's kv dimension.
+#
+# Source: PR #691 (gpt-oss: align eager KV length to the attention mask).
+# transformers 5.x cache pre-allocation hands a full-attention layer more
+# positions than the causal mask covers (e.g. k=161 against a 128-wide
+# mask). Both eager attention forwards in patch_GptOssAttention then do
+#   attn_weights += attention_mask[:, :, :, : key_states.shape[-2]]
+# which fails with:
+#   RuntimeError: The size of tensor a (N) must match the size of
+#       tensor b (M) at non-singleton dimension 3
+#
+# The fix is the _align_kv_to_mask helper that trims KV (or the mask) to
+# the shorter length. Static check: helper exists AND is invoked from
+# BOTH eager forward variants so the inplace and non-inplace paths agree.
+# ---------------------------------------------------------------------------
+
+
+def test_gpt_oss_eager_attention_aligns_kv_to_mask():
+    """Both eager forwards must invoke the KV alignment helper.
+
+    Per-function source-slice check rather than a global callsite count,
+    so a future refactor that consolidates eager paths into a shared
+    closure still passes as long as the alignment runs on both routes.
+    """
+    import ast
+    import inspect
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    src = inspect.getsource(_M.patch_GptOssAttention)
+
+    assert "_align_kv_to_mask" in src, (
+        "patch_GptOssAttention must define _align_kv_to_mask (PR #691) "
+        "so eager attention can survive KV-vs-mask length mismatches "
+        "from pre-allocated caches on transformers 5.x + torch < 2.11."
+    )
+
+    tree = ast.parse(src)
+    forwards = {
+        node.name: ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("eager_attention_forward", "inplace_eager_attention_forward")
+    }
+    expected = {"eager_attention_forward", "inplace_eager_attention_forward"}
+    missing_defs = expected - set(forwards)
+    assert not missing_defs, (
+        f"patch_GptOssAttention must define {sorted(expected)}; "
+        f"missing: {sorted(missing_defs)}."
+    )
+
+    missing_calls = [
+        name for name, body in forwards.items()
+        if "_align_kv_to_mask(" not in body
+    ]
+    assert not missing_calls, (
+        f"Eager forward(s) missing _align_kv_to_mask call: {missing_calls}. "
+        "Without the alignment these paths crash with 'tensor a (N) vs "
+        "tensor b (M)' on transformers 5.x + torch < 2.11."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression: gpt-oss patched GptOssModel.forward hard-codes the
+# transformers 4.x mask kwargs ("input_embeds", "cache_position") and
+# blows up on transformers 5.x which renamed to "inputs_embeds" and
+# dropped "cache_position" entirely.
+#
+# Source: PR #690 fix included inspect-driven kwarg filtering so the
+# patch supports both 4.x and 5.x simultaneously. Static check that the
+# filtering helper is present.
+# ---------------------------------------------------------------------------
+
+
+def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
+    import inspect
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    src = inspect.getsource(_M.patch_GptOssModel)
+    # Either the inspect-driven helper (_build_mask_kwargs / _ccm_params)
+    # OR a guard string explicitly testing for inputs_embeds availability.
+    has_inspect_filter = (
+        "_build_mask_kwargs" in src
+        or "_ccm_params" in src
+        or "inspect.signature(create_causal_mask).parameters" in src
+    )
+    assert has_inspect_filter, (
+        "patch_GptOssModel must filter mask kwargs by the actual factory "
+        "signature so the patch works on both transformers 4.57.6 "
+        "(input_embeds + cache_position) and transformers 5.x "
+        "(inputs_embeds, no cache_position). See PR #690."
+    )
