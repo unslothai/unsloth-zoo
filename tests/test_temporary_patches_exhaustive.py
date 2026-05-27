@@ -939,16 +939,6 @@ def test_csm_depth_decoder_leaf_embedding_hook_backward(backbone_requires_grad):
         model.model.forward = original_forward
 
 
-def test_csm_audio_eos_label_mask_respects_processor_ignore():
-    torch = pytest.importorskip("torch")
-    from unsloth_zoo.temporary_patches.misc import _csm_audio_eos_label_mask
-
-    audio_eos_token_mask = torch.tensor([[False, True, True]])
-    labels = torch.tensor([[128002, -100, 128003]])
-
-    assert _csm_audio_eos_label_mask(audio_eos_token_mask, labels).tolist() == [[False, False, True]]
-
-
 def test_csm_audio_embeddings_tie_helper():
     torch = pytest.importorskip("torch")
     from types import SimpleNamespace
@@ -968,6 +958,24 @@ def test_csm_audio_embeddings_tie_helper():
     assert audio.weight.data_ptr() != depth.weight.data_ptr()
     _tie_csm_audio_embeddings(model)
     assert audio.weight.data_ptr() == depth.weight.data_ptr()
+
+
+def test_csm_num_items_counts_masked_audio_eos():
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo.loss_utils import _csm_token_count_mask
+
+    labels = torch.tensor([[-100, 128002, -100, -100]])
+    input_ids = torch.tensor([[128000, 128002, 128003, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 0]])
+
+    mask = _csm_token_count_mask(
+        labels,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        audio_eos_token_id=128003,
+    )
+
+    assert mask.tolist() == [[True, True, False]]
 
 
 def test_csm_for_conditional_generation_forward_named_params():

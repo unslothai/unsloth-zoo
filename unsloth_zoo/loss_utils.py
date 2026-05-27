@@ -76,6 +76,30 @@ __all__ = [
 
 from .fused_losses import unsloth_fused_ce_loss
 
+def _get_csm_audio_eos_token_id(model):
+    try:
+        if hasattr(model, "get_base_model"):
+            model = model.get_base_model()
+        for attr in ("base_model", "model", "model"):
+            model = getattr(model, attr, model)
+        config = getattr(model, "config", None)
+        if getattr(config, "model_type", None) == "csm":
+            return getattr(config, "audio_eos_token_id", None)
+    except Exception:
+        pass
+    return None
+pass
+
+def _csm_token_count_mask(labels, input_ids = None, attention_mask = None, audio_eos_token_id = None):
+    token_count = labels[..., 1:] != -100
+    if audio_eos_token_id is not None and input_ids is not None:
+        # Older CSM processors masked audio EOS labels; the merge patch trains them.
+        token_count |= input_ids[..., 1:] == audio_eos_token_id
+    if attention_mask is not None:
+        token_count &= attention_mask[..., 1:] != 0
+    return token_count
+pass
+
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # All Unsloth Zoo code licensed under LGPLv3
     try:
@@ -304,22 +328,28 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             break
     pass
 
+    csm_audio_eos_token_id = _get_csm_audio_eos_token_id(getattr(self, "model", None))
+
     # Get num_items_in_batch
     if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
         try:
             token_counts = []
             for x in batch_samples:
                 labels = x["labels"]
-                token_count = (labels[..., 1:] != -100)
+                input_ids = x.get("input_ids")
+                attention_mask = x.get("attention_mask")
+                token_count = _csm_token_count_mask(
+                    labels,
+                    input_ids = input_ids,
+                    attention_mask = attention_mask,
+                    audio_eos_token_id = csm_audio_eos_token_id,
+                )
                 if "input_ids" in x:
-                    input_ids = x["input_ids"]
                     mark_static (input_ids, 0)
                     mark_dynamic(input_ids, 1)
                 if "attention_mask" in x:
-                    attention_mask = x["attention_mask"]
                     mark_static (attention_mask, 0)
                     mark_dynamic(attention_mask, 1)
-                    token_count &= (attention_mask[..., 1:] != 0)
                 if "token_type_ids" in x:
                     token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)

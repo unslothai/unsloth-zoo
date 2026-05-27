@@ -415,11 +415,6 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
 
 
-def _csm_audio_eos_label_mask(audio_eos_token_mask, labels):
-    return audio_eos_token_mask & (labels != -100)
-pass
-
-
 def _tie_csm_audio_embeddings(model):
     try:
         audio_embeddings = model.backbone_model.embed_tokens.embed_audio_tokens
@@ -845,9 +840,7 @@ def patch_CsmForConditionalGeneration_merge():
             if labels is not None:
                 labels_expanded = labels.unsqueeze(-1).repeat(1, 1, self.config.num_codebooks)
                 labels_expanded[audio_token_mask] = batched_audio_token_ids[audio_codes_mask]
-                # Preserve processor masking: 4.52 masks audio EOS, while newer processors label it.
-                audio_eos_label_mask = _csm_audio_eos_label_mask(audio_eos_token_mask, labels)
-                labels_expanded[audio_eos_label_mask] = audio_eos_frame_ids
+                labels_expanded[audio_eos_token_mask] = audio_eos_frame_ids
                 # mask depth decoder
                 depth_decoder_ignore_frames_idxs = (labels == -101).nonzero(as_tuple=True)
                 labels_expanded[depth_decoder_ignore_frames_idxs[0], depth_decoder_ignore_frames_idxs[1], 1:] = -100
