@@ -282,6 +282,31 @@ def align_logprobs_with_mask(
 
 RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
 
+def align_completion_tool_mask(
+    tool_mask: torch.Tensor,
+    completion_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Aligns a raw completion-length tool/env mask with Unsloth's repacked loss mask.
+    """
+    if tool_mask is None:
+        return completion_mask
+    if tool_mask.shape[0] != completion_mask.shape[0]:
+        raise ValueError("tool_mask batch size must match completion_mask batch size.")
+
+    tool_mask = tool_mask.to(device=completion_mask.device)
+    if tool_mask.shape == completion_mask.shape:
+        aligned_tool_mask = tool_mask
+    else:
+        aligned_tool_mask = align_logprobs_with_mask(
+            tool_mask,
+            completion_mask,
+            pad_value=0,
+        )
+    return completion_mask * aligned_tool_mask.to(dtype=completion_mask.dtype)
+pass
+RL_REPLACEMENTS["align_completion_tool_mask"] = align_completion_tool_mask
+
 def autotune_batch_and_chunks(
     total_input_rows,
     seq_len,
@@ -726,6 +751,7 @@ def grpo_accumulated_loss(
     old_logps,
     ref_logps,
     n_chunks = -1,
+    tool_mask = None,
     **kwargs,
 ):
     # All Unsloth Zoo code licensed under AGPL3
@@ -834,10 +860,12 @@ def grpo_accumulated_loss(
             sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
         else:
             sampling_per_token_logps = None
+        completion_mask = align_completion_tool_mask(tool_mask, completion_mask)
         attention_mask =  input_ids != trainer.processing_class.pad_token_id
         attention_mask = attention_mask.to(attention_mask.dtype)
     else:
         completion_input_ids = input_ids[:, -logits_to_keep:]
+        completion_mask = align_completion_tool_mask(tool_mask, completion_mask)
 
     unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
 
