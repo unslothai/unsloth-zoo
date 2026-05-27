@@ -191,6 +191,27 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         else:
             codebook_indices = cache_position
 
+        if inputs_embeds is None and input_ids is not None and backbone_last_hidden_state is not None:
+            # Precompute inputs_embeds so self.model skips upstream's in-place
+            # first-token replacement. Zoo's GC hook can make frozen embeddings
+            # leaf tensors, so detach before CopySlices carries backbone grads.
+            codebook_idxs = torch.clamp(codebook_indices - 1, min=0)
+            offset = codebook_idxs * self.model.vocab_size
+            inputs_embeds = self.model.embed_tokens(input_ids + offset)
+            restore_input_grad = inputs_embeds.requires_grad and inputs_embeds.is_leaf
+            if restore_input_grad:
+                inputs_embeds = inputs_embeds.detach()
+            inputs_embeds[:, 0] = backbone_last_hidden_state.to(
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
+            )
+            # If the replacement state is frozen, keep GC's input-grad
+            # sentinel alive for decoder-only adapter training.
+            if restore_input_grad and not inputs_embeds.requires_grad:
+                inputs_embeds.requires_grad_(True)
+            input_ids = None
+            backbone_last_hidden_state = None
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids = input_ids,
