@@ -277,8 +277,25 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
         install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
 
     print(f"Unsloth: Installing packages: {package}")
-    if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
-        acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+    # Non-interactive contexts (CI, docker containers, headless notebook
+    # runners) close stdin so input() raises EOFError, which surfaces to
+    # the caller as "GGUF conversion failed: EOF when reading a line".
+    # Treat closed/non-TTY stdin as auto-accept so save_pretrained_gguf
+    # can install build deps on its own. UNSLOTH_AUTO_ACCEPT_INSTALL=1
+    # also forces auto-accept even when stdin is a TTY (for scripts that
+    # want to skip the prompt).
+    auto_accept = (
+        os.environ.get("UNSLOTH_AUTO_ACCEPT_INSTALL", "0") == "1"
+        or not (sys.stdin and sys.stdin.isatty())
+    )
+    if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT) and not auto_accept:
+        try:
+            acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        except EOFError:
+            # Stdin closed mid-call (eg. docker run -i without -t after a
+            # subprocess took stdin). Treat the same as auto-accept rather
+            # than abort the GGUF export.
+            acceptance = ""
         if "no" in str(acceptance).lower():
             raise RuntimeError(
                 f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
