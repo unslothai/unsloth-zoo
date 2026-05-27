@@ -284,18 +284,37 @@ def test_gpt_oss_wrap_has_flex_attention_inference_guard():
 
 
 def test_gpt_oss_patched_model_forward_has_flex_attention_guard():
+    """The patched GptOssModel.forward body itself must hold the guard.
+
+    Locate the inner `forward` FunctionDef and assert its body carries
+    the _attn_implementation == 'flex_attention' literal. This is
+    independent of wrap's own guard, so removing the forward-level
+    swap while keeping wrap's literal cannot satisfy this test.
+    """
+    import ast
     import inspect
     from unsloth_zoo.temporary_patches import gpt_oss as _M
 
     src = inspect.getsource(_M.patch_GptOssModel)
+    tree = ast.parse(src)
+
+    forward_fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "forward"),
+        None,
+    )
+    assert forward_fn is not None, "patched GptOssModel.forward not found"
+    body = ast.unparse(forward_fn)
+
     assert (
-        ('"flex_attention"' in src or "'flex_attention'" in src)
-        and "_attn_implementation" in src
+        ('"flex_attention"' in body or "'flex_attention'" in body)
+        and "_attn_implementation" in body
     ), (
-        "patch_GptOssModel must guard mask creation against "
-        "_attn_implementation == 'flex_attention' during inference, "
-        "otherwise the patched GptOssModel.forward leaks a BlockMask to "
-        "the eager forward. See PR #690."
+        "patched GptOssModel.forward must guard against "
+        "_attn_implementation == 'flex_attention' independently of "
+        "wrap's own guard. Without this, the forward's "
+        "causal_mask_mapping construction leaks a BlockMask to the "
+        "eager attention path. See PR #690."
     )
 
 
@@ -319,6 +338,13 @@ def test_gpt_oss_patched_model_forward_has_flex_attention_guard():
 
 
 def test_gpt_oss_eager_attention_aligns_kv_to_mask():
+    """Both eager forwards must invoke the KV alignment helper.
+
+    Per-function source-slice check rather than a global callsite count,
+    so a future refactor that consolidates eager paths into a shared
+    closure still passes as long as the alignment runs on both routes.
+    """
+    import ast
     import inspect
     from unsloth_zoo.temporary_patches import gpt_oss as _M
 
@@ -330,13 +356,28 @@ def test_gpt_oss_eager_attention_aligns_kv_to_mask():
         "from pre-allocated caches on transformers 5.x + torch < 2.11."
     )
 
-    callsite_count = src.count("_align_kv_to_mask(")
-    invocation_count = callsite_count - src.count("def _align_kv_to_mask(")
-    assert invocation_count >= 2, (
-        "_align_kv_to_mask must be called from both eager attention "
-        "forwards (inplace + non-inplace); found "
-        f"{invocation_count} invocations. Without the alignment one path "
-        "still crashes with 'tensor a (N) vs tensor b (M)' shape errors."
+    tree = ast.parse(src)
+    forwards = {
+        node.name: ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("eager_attention_forward", "inplace_eager_attention_forward")
+    }
+    expected = {"eager_attention_forward", "inplace_eager_attention_forward"}
+    missing_defs = expected - set(forwards)
+    assert not missing_defs, (
+        f"patch_GptOssAttention must define {sorted(expected)}; "
+        f"missing: {sorted(missing_defs)}."
+    )
+
+    missing_calls = [
+        name for name, body in forwards.items()
+        if "_align_kv_to_mask(" not in body
+    ]
+    assert not missing_calls, (
+        f"Eager forward(s) missing _align_kv_to_mask call: {missing_calls}. "
+        "Without the alignment these paths crash with 'tensor a (N) vs "
+        "tensor b (M)' on transformers 5.x + torch < 2.11."
     )
 
 
