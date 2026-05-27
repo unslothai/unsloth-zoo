@@ -3898,6 +3898,24 @@ def _vlm_gguf_tensor_candidates(tensor):
     return candidates
 
 
+def _has_vlm_gguf_tensor_candidate(tensor):
+    """Return whether a tensor shape can require HF-layout recovery."""
+    shape = getattr(tensor, "shape", ())
+    if len(shape) in (4, 5):
+        return True
+    if len(shape) == 1:
+        dtype = getattr(tensor, "dtype", None)
+        return dtype is not None and mx.issubdtype(dtype, mx.floating)
+    return False
+
+
+def _has_vlm_gguf_rewrite_candidate(name, tensor):
+    """Return whether a tensor can differ between mlx-vlm and GGUF layouts."""
+    if any(candidate_name != name for candidate_name in _vlm_gguf_name_candidates(name)):
+        return True
+    return _has_vlm_gguf_tensor_candidate(tensor)
+
+
 def _mlx_arrays_match(actual, expected):
     """Compare MLX-like arrays without assuming a concrete backend type."""
     shape = getattr(actual, "shape", None)
@@ -3931,6 +3949,9 @@ def _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
 
 def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
     """Invert mlx-vlm sanitizers to recover HF tensor names/layouts for GGUF."""
+    if not _has_vlm_gguf_rewrite_candidate(name, tensor):
+        return name, tensor, False
+
     for candidate_name in _vlm_gguf_name_candidates(name):
         for candidate_tensor in _vlm_gguf_tensor_candidates(tensor):
             for pipeline in _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
@@ -4099,7 +4120,7 @@ def _copy_source_sidecars(src_path, path):
     copied = 0
     src_path = Path(src_path)
     path = Path(path)
-    if not src_path.exists():
+    if not src_path.is_dir():
         return copied
     for source in src_path.iterdir():
         if not source.is_file():

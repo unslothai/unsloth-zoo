@@ -402,6 +402,32 @@ def test_vlm_rewrite_handles_same_name_layout_transforms(monkeypatch):
     )
 
 
+def test_vlm_rewrite_skips_untransformable_text_tensors():
+    import torch
+    import unsloth_zoo.mlx.utils as mutils
+
+    calls = 0
+
+    class CountingSanitizer:
+        @staticmethod
+        def sanitize(weights):
+            nonlocal calls
+            calls += 1
+            return weights
+
+    tensor = torch.zeros(2, 3)
+    new_name, new_tensor, changed = mutils._rewrite_mlx_vlm_tensor_for_gguf(
+        "language_model.model.layers.0.mlp.gate_proj.weight",
+        tensor,
+        [(CountingSanitizer, None)],
+    )
+
+    assert calls == 0
+    assert changed is False
+    assert new_name == "language_model.model.layers.0.mlp.gate_proj.weight"
+    assert new_tensor is tensor
+
+
 def test_mlx_arrays_match_checks_2d_tensor_values(monkeypatch):
     import torch
     import unsloth_zoo.mlx.utils as mutils
@@ -754,6 +780,18 @@ def test_copy_source_sidecars_preserves_image_processor_metadata(tmp_path):
         "pytorch_model.bin",
     ):
         assert not (dst / skipped).exists()
+
+
+def test_copy_source_sidecars_ignores_non_directory_source(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    src = tmp_path / "model.safetensors"
+    dst = tmp_path / "dst"
+    src.write_text("weights", encoding="utf-8")
+    dst.mkdir()
+
+    assert mutils._copy_source_sidecars(src, dst) == 0
+    assert list(dst.iterdir()) == []
 
 
 def test_save_pretrained_gguf_anchors_patcher_to_checked_llama_cpp_root(
