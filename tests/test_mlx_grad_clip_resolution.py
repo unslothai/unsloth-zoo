@@ -1,10 +1,9 @@
 # Unsloth Zoo - Utilities for Unsloth
-# Pin MLXTrainingConfig cheap clipping resolution:
-#   * max_grad_leaf_norm is the proportional per-leaf norm cap.
-#   * max_grad_value keeps historical elementwise clamp semantics.
-#   * None defaults to cheap proportional leaf-norm clipping at 1.0 unless
-#     max_grad_norm > 0 is passed.
-#   * explicit 0.0 disables that specific cheap clipping knob.
+# Pin MLXTrainingConfig grad-clip resolution across all three knobs:
+#   max_grad_leaf_norm  proportional per-leaf L2 cap (cheap, direction-preserving)
+#   max_grad_value      elementwise clamp (historical contract; explicit positives win)
+#   max_grad_norm       global L2 (HF parity; cross-tree reduction, pays memory)
+# Default (all None) -> ("leaf_norm", 1.0); explicit 0.0 disables that knob.
 
 from __future__ import annotations
 
