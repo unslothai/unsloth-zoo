@@ -395,7 +395,11 @@ def make_cce_loss_fn(model):
             )
         group_size = getattr(lm_layer, "group_size", 64)
         bits = getattr(lm_layer, "bits", 4)
-        print(f"Unsloth: CCE using quantized matmul (group_size={group_size}, bits={bits})")
+        quant_mode = getattr(lm_layer, "mode", "affine")
+        print(
+            "Unsloth: CCE using quantized matmul "
+            f"(group_size={group_size}, bits={bits}, mode={quant_mode})"
+        )
         _has_biases = hasattr(lm_layer, "biases")
 
         rt_cce = _get_runtime_cce(
@@ -404,6 +408,7 @@ def make_cce_loss_fn(model):
             quantized=True,
             group_size=group_size,
             bits=bits,
+            mode=quant_mode,
         )
 
         def loss_fn(model, batch, lengths, labels=None):
@@ -416,7 +421,9 @@ def make_cce_loss_fn(model):
             layer = _get_lm_weight_layer(model)
             w = layer.weight
             sc = layer.scales
-            bi = layer.biases if _has_biases else mx.zeros_like(layer.scales)
+            bi = layer.biases if _has_biases else None
+            if bi is None and quant_mode == "affine":
+                bi = mx.zeros_like(sc)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             if labels is None:
@@ -1700,6 +1707,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             )
         group_size = getattr(lm_layer, "group_size", 64)
         bits = getattr(lm_layer, "bits", 4)
+        quant_mode = getattr(lm_layer, "mode", "affine")
 
         rt_cce = _get_runtime_cce(
             ignore_index=-100,
@@ -1707,6 +1715,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             quantized=True,
             group_size=group_size,
             bits=bits,
+            mode=quant_mode,
         )
 
         def loss_fn(model, batch_dict):
@@ -1717,7 +1726,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             w = lm_head.weight
             sc = lm_head.scales
             bi = getattr(lm_head, "biases", None)
-            if bi is None:
+            if bi is None and quant_mode == "affine":
                 bi = mx.zeros_like(sc)
             # Quantized backward already returns zero weight/scales/biases
             # gradients (see runtime_cce.py VJP), so stop_gradient is

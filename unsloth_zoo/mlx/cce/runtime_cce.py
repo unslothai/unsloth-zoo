@@ -695,7 +695,7 @@ def make_runtime_cce_loss_fused_finalize(
                 v_end = min(v_start + resolved_chunk_size, vocab_size)
                 weight_chunk = weight_compute[v_start:v_end]
                 scales_chunk = scales[v_start:v_end]
-                biases_chunk = biases[v_start:v_end]
+                biases_chunk = None if biases is None else biases[v_start:v_end]
 
                 logits = _chunk_matmul(
                     hidden_compute,
@@ -757,7 +757,7 @@ def make_runtime_cce_loss_fused_finalize(
                 grad_hidden.astype(hidden.dtype),
                 mx.zeros_like(weight),
                 mx.zeros_like(scales),
-                mx.zeros_like(biases),
+                None if biases is None else mx.zeros_like(biases),
                 mx.zeros_like(targets),
             )
 

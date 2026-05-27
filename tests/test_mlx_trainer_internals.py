@@ -540,6 +540,17 @@ def test_qwen3_vl_training_compile_verified():
     assert "qwen3_vl_moe" in mc._VERIFIED_TRAINING_ARCHES
 
 
+def test_quantized_cce_uses_layer_mode_and_affine_bias_guard():
+    import inspect
+    import unsloth_zoo.mlx.utils as mlx_utils
+
+    source = inspect.getsource(mlx_utils.make_vlm_cce_loss_fn)
+    assert 'quant_mode = getattr(lm_layer, "mode", "affine")' in source
+    assert "mode=quant_mode" in source
+    assert 'if bi is None and quant_mode == "affine":' in source
+    assert "bi = mx.zeros_like(sc)" in source
+
+
 def test_gemma3_training_compile_verified():
     import unsloth_zoo.mlx.compile as mc
 
