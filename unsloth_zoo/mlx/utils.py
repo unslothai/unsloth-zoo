@@ -3441,6 +3441,19 @@ def _get_src_path(model):
     return getattr(model, "_src_path", None)
 
 
+def _save_mlx_config(config, config_path, *, is_vlm=False):
+    """Save MLX config using the backend-aware upstream helper."""
+    config = copy.deepcopy(config)
+    if is_vlm:
+        if "quantization" in config:
+            config["quantization_config"] = config["quantization"]
+        from mlx_vlm.utils import save_config as save_vlm_config
+        save_vlm_config(config, config_path)
+    else:
+        from mlx_lm.utils import save_config as save_lm_config
+        save_lm_config(config, config_path)
+
+
 def save_merged_model(model, tokenizer, path, dequantize=False):
     """Fuse LoRA weights and save the full merged model.
 
@@ -3457,7 +3470,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
             base quantization (smaller checkpoint, only meaningful when
             the base was quantized).
     """
-    from mlx_lm.utils import save_model, save_config, create_model_card
+    from mlx_lm.utils import save_model, create_model_card
     from mlx.utils import tree_unflatten
 
     path = Path(path)
@@ -3486,7 +3499,11 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     # Save config.json
     config = _get_model_config(model)
     if config:
-        save_config(config, config_path=path / "config.json")
+        _save_mlx_config(
+            config,
+            path / "config.json",
+            is_vlm=_is_vlm_model(model) or "vision_config" in config,
+        )
 
     # Save tokenizer
     tokenizer.save_pretrained(str(path))
