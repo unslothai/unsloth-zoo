@@ -256,12 +256,12 @@ def _is_lm_head_trainable(model):
     when the weight should be wrapped with mx.stop_gradient.
     """
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
-    # Module-anchored adapter detection so names like lora_router.weight aren't
-    # mistaken for adapter state.
+    # Module-anchored so unrelated trainables containing the substring
+    # "lora" are not treated as adapter state.
     adapter_keys = set(collect_mlx_lora_adapter_tensors(model))
-    # Skip reload-leaked base tensors inside a LoRA-wrapped lm_head (would defeat
-    # the CCE memory guard); reuse the save-time filter so intentional trainables
-    # like lm_head.bias still trigger the guard.
+    # Drop reload-leaked base tensors INSIDE a LoRA-wrapped lm_head (would
+    # defeat the CCE memory guard) while keeping intentional trainables
+    # like `lm_head.bias`. Shares the filter with save_trainable_adapters.
     _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
     lora_module_prefixes = tuple(f"{name}." for name in _lora_module_names if name)
     has_root_lora_module = any(name == "" for name in _lora_module_names)
@@ -272,8 +272,8 @@ def _is_lm_head_trainable(model):
             key, lora_module_prefixes, has_root_lora_module,
         ):
             continue
-        # Segment-match (not substring) so names like not_lm_head_router or
-        # embed_tokens_aux do not get classified as the real lm_head / embedding.
+        # Segment-match (not substring) so names like
+        # `decoder.not_lm_head_router.weight` are not classified as lm_head.
         segments = key.split(".")
         is_lm_head_param = "lm_head" in segments
         is_embed_tokens_weight = (
@@ -377,14 +377,18 @@ def make_cce_loss_fn(model):
             bi = layer.biases if _has_biases else mx.zeros_like(layer.scales)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            # Widen unsigned dtypes so mx.where can inject the signed -100
+            # (mx.where on uint crashes the torch-backed shim).
+            targets = _normalize_cce_label_dtype(targets)
             if labels is None:
                 mask = length_mask
             else:
                 mask = mx.logical_and(targets != -100, length_mask)
-            masked_targets = mx.where(mask, targets, -100)
+            ignore = mx.array(-100, dtype=targets.dtype)
+            masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -410,14 +414,17 @@ def make_cce_loss_fn(model):
                 w = mx.stop_gradient(w)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            # Same widen-to-int64 rationale as the quantized branch above.
+            targets = _normalize_cce_label_dtype(targets)
             if labels is None:
                 mask = length_mask
             else:
                 mask = mx.logical_and(targets != -100, length_mask)
-            masked_targets = mx.where(mask, targets, -100)
+            ignore = mx.array(-100, dtype=targets.dtype)
+            masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -452,14 +459,18 @@ def make_baseline_loss_fn():
             return ce, ntoks
         # labels-aware path: train_on_responses_only style masking.
         inputs = batch[:, :-1]
-        targets = labels[:, 1:]
+        # Widen unsigned dtypes so mx.where(..., -100, ...) and the
+        # `targets != -100` compare both see signed int64.
+        targets = _normalize_cce_label_dtype(labels[:, 1:])
         logits = model(inputs)
         steps = mx.arange(1, targets.shape[1] + 1)
         length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
         mask = mx.logical_and(targets != -100, length_mask).astype(mx.float32)
-        # Replace -100 with 0 before CE — MLX has no ignore_index;
+        # Replace -100 with 0 before CE, MLX has no ignore_index;
         # the mask already zeros out these positions in the loss.
-        safe_targets = mx.where(targets == -100, 0, targets)
+        safe_targets = mx.where(
+            targets == -100, mx.array(0, dtype=targets.dtype), targets,
+        )
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -523,6 +534,42 @@ def _get_image_token_ids(model):
     return ids  # plain Python list; avoids mx.eval in the hot path
 
 
+def _normalize_cce_label_dtype(labels):
+    """Widen unsigned label dtypes to int64 so masking can inject -100.
+
+    uint8/16/32 fit losslessly in int64. uint64 values in (2**63, 2**64)
+    wrap negative on cast and are routed to a positive out-of-vocab
+    sentinel (1<<62) so runtime CCE's validity check NaN-poisons those
+    rows instead of letting an overflowed uint64 like 2**64-100 collide
+    with ignore_index=-100. Signed/float dtypes pass through unchanged.
+    """
+    if labels is None:
+        return labels
+    dtype = getattr(labels, "dtype", None)
+    if dtype is None:
+        return labels
+    uint64_dtype = getattr(mx, "uint64", None)
+    if uint64_dtype is not None and dtype == uint64_dtype:
+        # Cast to signed int64 first; direct uint64 comparisons crash the
+        # torch-backed shim ("gt_cpu" / "where_cpu" not implemented).
+        # `labels_i64 < 0` then catches every uint64 >= 2**63 (including
+        # 2**64-100 which would otherwise collide with -100).
+        labels_i64 = labels.astype(mx.int64)
+        invalid_sentinel = mx.array((1 << 62), dtype=mx.int64)
+        return mx.where(labels_i64 < 0, invalid_sentinel, labels_i64)
+    unsigned_dtypes = tuple(
+        d for d in (
+            getattr(mx, "uint8", None),
+            getattr(mx, "uint16", None),
+            getattr(mx, "uint32", None),
+        )
+        if d is not None
+    )
+    if dtype in unsigned_dtypes:
+        return labels.astype(mx.int64)
+    return labels
+
+
 def _mask_image_tokens(targets, image_token_ids):
     """Set image token positions in targets to -100 (ignore_index).
 
@@ -535,11 +582,13 @@ def _mask_image_tokens(targets, image_token_ids):
     """
     if not image_token_ids:
         return targets
+    targets = _normalize_cce_label_dtype(targets)
     # Build a mask: True where target is any image token
     is_image = targets == image_token_ids[0]
     for tok_id in image_token_ids[1:]:
         is_image = is_image | (targets == tok_id)
-    return mx.where(is_image, -100, targets)
+    ignore = mx.array(-100, dtype=targets.dtype)
+    return mx.where(is_image, ignore, targets)
 
 
 def _mask_prompt_tokens(targets, assistant_token_id):
@@ -553,11 +602,13 @@ def _mask_prompt_tokens(targets, assistant_token_id):
     """
     if assistant_token_id <= 0:
         return targets
+    targets = _normalize_cce_label_dtype(targets)
     is_assistant = (targets == assistant_token_id)
     cumulative = mx.cumsum(is_assistant.astype(mx.int32), axis=1)
     has_assistant = mx.any(is_assistant, axis=1, keepdims=True)
     prompt_mask = mx.logical_and(has_assistant, cumulative == 0)
-    return mx.where(prompt_mask, -100, targets)
+    ignore = mx.array(-100, dtype=targets.dtype)
+    return mx.where(prompt_mask, ignore, targets)
 
 
 def _is_vlm_model(model) -> bool:
@@ -628,9 +679,13 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
 
         # Forward pass — let the model create its own causal mask.
         # Pass extra keys (e.g. image_grid_thw for Qwen) that some models need.
+        # Strip the private raw-input-ids carrier so the backbone never sees it.
         fwd_kwargs = {
             k: v for k, v in batch_dict.items()
-            if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+            if k not in (
+                "input_ids", "pixel_values", "attention_mask", "labels",
+                _RAW_INPUT_IDS_FOR_LABELS,
+            )
             and v is not None
         }
         fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
@@ -641,12 +696,16 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
         if labels is not None:
             # train_on_responses_only: labels encode instruction/padding masking.
             # Still mask image placeholder tokens.
-            targets = labels[:, 1:]
+            targets = _normalize_cce_label_dtype(labels[:, 1:])
             targets = _mask_image_tokens(targets, _image_token_ids)
             logits, targets = _align_logits_with_labels(logits, targets)
             mask = (targets != -100).astype(mx.float32)
         else:
-            targets = input_ids[:, 1:]
+            # Prefer the raw (pre-narrow) input_ids so wide invalid ids
+            # (e.g. np.uint32(2**32-100)) reach runtime CCE as out-of-vocab
+            # sentinels instead of wrapping to -100 via the int32 narrow.
+            target_source = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, input_ids)
+            targets = _normalize_cce_label_dtype(target_source[:, 1:])
 
             # Handle sequence length mismatch from vision token injection
             logits, targets = _align_logits_with_labels(logits, targets)
@@ -662,11 +721,17 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
             targets = _mask_image_tokens(targets, _image_token_ids)
             targets = _mask_prompt_tokens(targets, _assistant_token_id)
             # Update length_mask to exclude masked positions
-            mask = mx.where(targets == -100, 0, length_mask)
+            mask = mx.where(
+                targets == -100,
+                mx.array(0, dtype=length_mask.dtype),
+                length_mask,
+            )
 
-        # Replace -100 with 0 before CE — MLX has no ignore_index;
+        # Replace -100 with 0 before CE, MLX has no ignore_index;
         # the mask already zeros out these positions in the loss.
-        safe_targets = mx.where(targets == -100, 0, targets)
+        safe_targets = mx.where(
+            targets == -100, mx.array(0, dtype=targets.dtype), targets,
+        )
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -783,9 +848,13 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         fwd_attn_mask = attention_mask[:, :-1]
 
     # Collect extra keys (e.g. image_grid_thw for Qwen) that some models need.
+    # Strip the private raw-input-ids carrier so the embedder/backbone never sees it.
     extra_kwargs = {
         k: v for k, v in batch_dict.items()
-        if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+        if k not in (
+            "input_ids", "pixel_values", "attention_mask", "labels",
+            _RAW_INPUT_IDS_FOR_LABELS,
+        )
         and v is not None
     }
     extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
@@ -815,16 +884,21 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         masked_targets = _mask_image_tokens(targets, image_token_ids)
         ntoks = (masked_targets != -100).sum()
     else:
-        targets = input_ids[:, 1:]
+        # Prefer the raw (pre-narrow) input_ids so wide invalid ids
+        # (e.g. np.uint32(2**32-100)) reach runtime CCE as out-of-vocab
+        # sentinels instead of wrapping to -100 via the int32 narrow.
+        target_source = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, input_ids)
+        targets = _normalize_cce_label_dtype(target_source[:, 1:])
 
         if attention_mask is not None:
             length_mask = attention_mask[:, 1:][:, :targets.shape[1]]
         else:
             length_mask = mx.ones_like(targets, dtype=mx.float32)
 
-        masked_targets = mx.where(length_mask, targets, -100)
+        ignore = mx.array(-100, dtype=targets.dtype)
+        masked_targets = mx.where(length_mask, targets, ignore)
 
-        # Mask image placeholder tokens — they're fixed special tokens that
+        # Mask image placeholder tokens, they're fixed special tokens that
         # provide no useful gradient signal.
         masked_targets = _mask_image_tokens(masked_targets, image_token_ids)
 
@@ -904,6 +978,28 @@ def _normalize_int_tuple(values):
     return tuple(int(x) for x in values)
 
 
+def _normalize_numpy_cce_labels(labels):
+    """numpy-side analogue of `_normalize_cce_label_dtype` for VLM expand paths.
+
+    np.uint64 values above 2**63-1 would OverflowError when packed into the
+    int64 buffer used by `_expand_image_token_sequences` / `_expand_token_runs`;
+    route them to a positive 1<<62 sentinel (so an overflowed 2**64-100 cannot
+    silently masquerade as ignore_index=-100) and downcast other unsigned
+    dtypes to int64.
+    """
+    labels_np = np.asarray(labels)
+    if labels_np.dtype == np.uint64:
+        overflow_mask = labels_np > np.uint64((1 << 63) - 1)
+        return np.where(
+            overflow_mask,
+            np.int64(1 << 62),
+            labels_np.astype(np.int64),
+        )
+    if np.issubdtype(labels_np.dtype, np.unsignedinteger):
+        return labels_np.astype(np.int64)
+    return labels_np
+
+
 def _expand_image_token_sequences(
     input_ids,
     attention_mask,
@@ -917,7 +1013,7 @@ def _expand_image_token_sequences(
         if attention_mask is not None
         else np.ones_like(input_ids_np, dtype=np.int32)
     )
-    labels_np = np.asarray(labels) if labels is not None else None
+    labels_np = _normalize_numpy_cce_labels(labels) if labels is not None else None
 
     expanded_ids = []
     expanded_masks = []
@@ -947,8 +1043,10 @@ def _expand_image_token_sequences(
 
     padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
     padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
+    # int64 so wide invalid labels survive without OverflowError before the
+    # runtime CCE validity check; CCE owns dtype narrowing post-validate.
     padded_labels = (
-        np.full((len(expanded_labels), max_len), -100, dtype=np.int32)
+        np.full((len(expanded_labels), max_len), -100, dtype=np.int64)
         if expanded_labels is not None else None
     )
     for row_idx, (row_ids, row_mask) in enumerate(zip(expanded_ids, expanded_masks)):
@@ -975,7 +1073,7 @@ def _expand_token_runs(
         if attention_mask is not None
         else np.ones_like(input_ids_np, dtype=np.int32)
     )
-    labels_np = np.asarray(labels) if labels is not None else None
+    labels_np = _normalize_numpy_cce_labels(labels) if labels is not None else None
 
     expanded_ids = []
     expanded_masks = []
@@ -1019,8 +1117,9 @@ def _expand_token_runs(
 
     padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
     padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
+    # int64 so wide invalid labels survive expansion without OverflowError.
     padded_labels = (
-        np.full((len(expanded_labels), max_len), -100, dtype=np.int32)
+        np.full((len(expanded_labels), max_len), -100, dtype=np.int64)
         if expanded_labels is not None else None
     )
     for row_idx, (row_ids, row_mask) in enumerate(zip(expanded_ids, expanded_masks)):
@@ -1349,15 +1448,24 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
         input_ids = batch_dict.get("input_ids")
         if input_ids is not None:
             _labels = batch_dict.get("labels")
+            _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+            # Labels absent: expand the raw pre-narrow carrier so labels-free
+            # paths still see wide invalid ids for NaN-poisoning. Labels
+            # present: pop the now-stale carrier so a pre-expansion copy
+            # cannot break _apply_response_mask_to_vlm_batch with a shape mismatch.
+            _label_source = _labels if _labels is not None else _raw_labels
             _expanded = _expand_image_token_sequences(
                 input_ids=input_ids,
                 attention_mask=batch_dict.get("attention_mask"),
                 image_token_id=int(_config_get(config, "image_token_index")),
                 repeat_count=int(_config_get(config, "num_image_tokens")),
-                labels=_labels,
+                labels=_label_source,
             )
             if _labels is not None:
                 batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+            elif _raw_labels is not None:
+                batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
             else:
                 batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
@@ -1390,14 +1498,21 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                         image_idx += 1
                     replacements.append(tuple(batch_replacements))
                 _labels = batch_dict.get("labels")
+                _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+                # See multi_modality branch above for why we expand the raw
+                # carrier when labels are absent and pop it when labels exist.
+                _label_source = _labels if _labels is not None else _raw_labels
                 _expanded = _expand_token_runs(
                     input_ids=input_ids,
                     attention_mask=batch_dict.get("attention_mask"),
                     replacements_by_batch=tuple(replacements),
-                    labels=_labels,
+                    labels=_label_source,
                 )
                 if _labels is not None:
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+                elif _raw_labels is not None:
+                    batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
@@ -1462,14 +1577,21 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                 replacements.append(tuple(batch_replacements))
             if replacements:
                 _labels = batch_dict.get("labels")
+                _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+                # See multi_modality branch above for why we expand the raw
+                # carrier when labels are absent and pop it when labels exist.
+                _label_source = _labels if _labels is not None else _raw_labels
                 _expanded = _expand_token_runs(
                     input_ids=input_ids,
                     attention_mask=batch_dict.get("attention_mask"),
                     replacements_by_batch=tuple(replacements),
-                    labels=_labels,
+                    labels=_label_source,
                 )
                 if _labels is not None:
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+                elif _raw_labels is not None:
+                    batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
@@ -1565,7 +1687,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
             # gradients (see runtime_cce.py VJP), so stop_gradient is
             # redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -1586,7 +1708,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -2165,6 +2287,12 @@ def _format_vlm_images_for_processor(all_images):
     return all_images
 
 
+# Private key used to pass raw (pre-int32-narrowing) input_ids through
+# the VLM batch dict to labels-free / response-mask paths. Stripped from
+# model forward kwargs so the backbone never sees it.
+_RAW_INPUT_IDS_FOR_LABELS = "_unsloth_raw_input_ids_for_labels"
+
+
 def _to_mx_vlm_batch(inputs):
     batch = {}
     for key, value in inputs.items():
@@ -2184,11 +2312,22 @@ def _to_mx_vlm_batch(inputs):
             batch[key] = value
 
     if "input_ids" in batch:
+        # Preserve raw input_ids under a private key BEFORE the int32 narrow
+        # so labels-free / response-mask paths can derive labels from the
+        # original processor output (wide invalid ids like uint32(2**32-100)
+        # would otherwise wrap to -100 and be treated as ignore_index).
+        if "labels" not in batch:
+            batch[_RAW_INPUT_IDS_FOR_LABELS] = _normalize_cce_label_dtype(
+                batch["input_ids"]
+            )
         batch["input_ids"] = batch["input_ids"].astype(mx.int32)
     if "attention_mask" in batch:
         batch["attention_mask"] = batch["attention_mask"].astype(mx.int32)
+    # Do NOT narrow labels to int32: runtime CCE validates the original
+    # dtype before its own narrow. Unsigned dtypes still need widening to
+    # int64 so the masking helpers can mx.where the signed -100 sentinel.
     if "labels" in batch:
-        batch["labels"] = batch["labels"].astype(mx.int32)
+        batch["labels"] = _normalize_cce_label_dtype(batch["labels"])
 
     return batch
 
@@ -2242,9 +2381,22 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
     prompt_inputs = _processor_vlm_inputs(
         processor, prompt_texts, all_images, max_seq_length
     )
+
+    # Build labels BEFORE _to_mx_vlm_batch narrows to int32 so wide invalid
+    # ids (e.g. uint32 wrap) reach the runtime CCE validity check intact.
+    # A direct int64 cast of uint64 would wrap 2**64-100 onto -100; saturate
+    # those rows to a positive out-of-vocab sentinel instead.
+    _raw_input_ids = np.asarray(combined_inputs["input_ids"])
+    if _raw_input_ids.dtype == np.uint64:
+        labels_np = np.where(
+            _raw_input_ids > np.uint64((1 << 63) - 1),
+            np.int64(1 << 62),
+            _raw_input_ids.astype(np.int64),
+        ).copy()
+    else:
+        labels_np = _raw_input_ids.astype(np.int64, copy=True)
     batch = _to_mx_vlm_batch(combined_inputs)
 
-    labels_np = np.array(batch["input_ids"].tolist(), dtype=np.int32)
     prompt_batch = _to_mx_vlm_batch(prompt_inputs)
     prompt_mask = prompt_batch.get("attention_mask")
     prompt_ids = prompt_batch["input_ids"]
@@ -2256,8 +2408,12 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
         labels_np[row, :prompt_len] = -100
     labels = mx.array(labels_np)
     if "attention_mask" in batch:
-        labels = mx.where(batch["attention_mask"] == 0, mx.array(-100), labels)
-    batch["labels"] = labels.astype(mx.int32)
+        labels = mx.where(
+            batch["attention_mask"] == 0,
+            mx.array(-100, dtype=labels.dtype),
+            labels,
+        )
+    batch["labels"] = labels
     return batch
 
 
@@ -2323,17 +2479,25 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn):
     dataset_utils.train_on_responses_only, and stores the result as
     an mx.array in batch_dict["labels"].
     """
-    input_ids = batch_dict["input_ids"]
-    ids_list = input_ids.tolist()
+    # Prefer the raw (pre-int32-narrowing) input_ids so the masking closure
+    # sees original processor ids; wide invalid ids like uint32(2**32-100)
+    # would otherwise have already wrapped to -100 in batch_dict["input_ids"].
+    raw_input_ids = batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+    input_ids = raw_input_ids if raw_input_ids is not None else batch_dict["input_ids"]
+    ids_list = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
     result = mask_fn({"input_ids": ids_list})
     labels_list = result["labels"]
     if hasattr(labels_list, "tolist"):
         labels_list = labels_list.tolist()
+    # Route unsigned label dtypes through both normalizers so mx.where with
+    # -100 does not crash on uint* under the shim and wide invalid ids reach
+    # runtime CCE as sentinels instead of wrapping to -100.
+    labels_np = _normalize_numpy_cce_labels(labels_list)
+    labels_array = _normalize_cce_label_dtype(mx.array(labels_np))
     attention_mask = batch_dict.get("attention_mask")
     if attention_mask is not None:
-        labels_array = mx.where(attention_mask == 0, mx.array(-100), mx.array(labels_list))
-    else:
-        labels_array = mx.array(labels_list)
+        ignore = mx.array(-100, dtype=labels_array.dtype)
+        labels_array = mx.where(attention_mask == 0, ignore, labels_array)
     batch_dict["labels"] = labels_array
     return batch_dict
 
@@ -2565,8 +2729,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
 
 
 def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
-    # Local guard so a direct call cannot write adapter_config.json without
-    # an adapters.safetensors next to it (mlx-lm reload would choke).
+    # Refuse to write adapter_config.json without adapters.safetensors next
+    # to it; mlx-lm reload chokes on the missing weights file.
     if not tensors:
         raise ValueError(
             "Unsloth: _save_adapter_artifacts() requires non-empty "
@@ -2590,8 +2754,9 @@ def _extract_mlx_lora_parameters(model):
     for _, m in iter_mlx_lora_modules(model):
         a_tensor = m.lora_a
         a_shape = tuple(getattr(a_tensor, "shape", ()))
-        # Switch LoRA lora_a layout varies across mlx-lm versions; lora_b always
-        # ends with `rank`, so prefer it for switch (num_experts) modules.
+        # Switch LoRA layouts vary across mlx-lm versions; lora_b's last
+        # axis is always `rank`, so prefer it when num_experts is declared.
+        # Plain LoRALinear uses (in_dims, rank) where rank is shape[-1].
         b_tensor = getattr(m, "lora_b", None)
         b_shape = tuple(getattr(b_tensor, "shape", ())) if b_tensor is not None else ()
         if hasattr(m, "num_experts") and len(b_shape) >= 3:
@@ -2603,7 +2768,7 @@ def _extract_mlx_lora_parameters(model):
         scale = getattr(m, "scale", 1.0)
 
         drop = getattr(m, "dropout", None)
-        # mlx.nn.Dropout stores keep probability in _p_1; fall back to .p for shims.
+        # mlx.nn.Dropout stores keep-prob in _p_1; fall back to .p for shims.
         if drop is None:
             dropout = 0.0
         else:
@@ -2626,7 +2791,8 @@ def _extract_mlx_lora_parameters(model):
 def iter_mlx_lora_modules(model):
     """Yield (module_name, module) for each module that owns a complete LoRA pair.
 
-    Only lowercase lora_a / lora_b pairs (what mlx-lm reload rebuilds) are matched.
+    mlx-lm reload only recreates lowercase lora_a / lora_b wrappers, so we
+    skip uppercase or half-built modules that cannot be reloaded.
     """
     for module_name, module in model.named_modules():
         if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
@@ -2636,9 +2802,10 @@ def iter_mlx_lora_modules(model):
 def collect_mlx_lora_adapter_tensors(model):
     """Collect tensors for every module exposing a complete LoRA attr pair.
 
-    Module-anchored (not substring-anchored) so paths like ``router.lora_gate.weight``
-    are not exported, and so callers can still detect LoRA after a reload/freeze when
-    trainable_parameters() no longer lists adapter tensors.
+    Anchors on the modules themselves so substring-`lora_` paths (e.g.
+    ``router.lora_gate.weight``) are not exported, and so callers can
+    still detect LoRA after reload/freeze when trainable_parameters()
+    no longer lists adapter tensors.
     """
     parameters = dict(mlx.utils.tree_flatten(model.parameters()))
     adapter_keys = set()
@@ -2646,18 +2813,17 @@ def collect_mlx_lora_adapter_tensors(model):
         prefix = f"{module_name}." if module_name else ""
         adapter_keys.add(f"{prefix}lora_a")
         adapter_keys.add(f"{prefix}lora_b")
-        # Include DoRA magnitude `m` so reload keeps it. Gate on the DoRA class name
-        # so a future LoRA wrapper with an unrelated `m` attr is not mis-exported.
+        # Include DoRA magnitude `m`, gated on the DoRA class name so a
+        # future LoRA wrapper with an unrelated `m` attribute isn't exported.
         if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
             adapter_keys.add(f"{prefix}m")
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
 
-# Wrapped-base tensors that LoRALinear / DoRALinear / LoRAEmbedding expose under
-# the wrapper path. These are reload-leaked state we drop from adapter saves to
-# keep artifacts lean and to keep the CCE memory guard intact. `.bias` and
-# `.linear.bias` are intentionally NOT listed: upstream stores the legitimate
-# trainable bias there and it must survive when the user trains bias.
+# Wrapped base / quantization tensor suffixes (LoRALinear, DoRALinear,
+# LoRAEmbedding) that are reload-leaked state we must drop from adapter
+# saves. `.linear.bias` and `.bias` are intentionally NOT here: those are
+# legitimate trainable user state.
 _LORA_WRAPPED_BASE_SUFFIXES = (
     ".weight",
     ".scales",
@@ -2665,15 +2831,13 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
     ".linear.weight",
     ".linear.scales",
     ".linear.biases",
-    # LoRAEmbedding / DoRAEmbedding store the inner nn.Embedding at `.embedding`.
     ".embedding.weight",
     ".embedding.scales",
     ".embedding.biases",
 )
 
-# Same wrapped-base keys for the case where a LoRA wrapper is the model root
-# (no module prefix). `linear.bias` is intentionally absent for the same reason
-# as the suffix list above.
+# Same wrapped-base set for the rare root-level LoRA wrapper case where
+# the empty module prefix means we cannot match by suffix alone.
 _ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
     "weight", "scales", "biases",
     "linear.weight", "linear.scales", "linear.biases",
@@ -2684,14 +2848,12 @@ _ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
 def _is_base_tensor_inside_lora_module(
     key, lora_module_prefixes, has_root_lora_module=False,
 ):
-    """True when `key` is a wrapped base tensor of a LoRA module.
+    """True when `key` looks like the wrapped base tensor of a LoRA module.
 
-    Path-prefix check + suffix whitelist of base/quantization tensor names; used
-    by save paths to skip reload-leaked base state without dropping intentional
-    trainables (e.g. `.bias`) under the same prefix. `has_root_lora_module`
-    covers a root-level wrapper where bare `weight`/`scales`/`biases` are leaks
-    too (the empty-name prefix is excluded from `lora_module_prefixes` to avoid
-    swallowing every key in the model).
+    Prefix-match against LoRA module names + suffix whitelist of base /
+    quantization tensor names. `has_root_lora_module` separately covers
+    a root-level wrapper where the empty-name prefix is intentionally
+    omitted from `lora_module_prefixes` to avoid matching every key.
     """
     matches_prefix = lora_module_prefixes and any(
         key.startswith(p) for p in lora_module_prefixes
@@ -2706,11 +2868,9 @@ def _is_base_tensor_inside_lora_module(
 def save_trainable_adapters(model, path, adapter_config=None):
     """Save the current trainable parameter tree for training checkpoints.
 
-    Always includes LoRA adapter tensors (frozen or not) so the artifact stays
-    a valid reloadable adapter. Excludes wrapped base weights inside a LoRA
-    module (e.g. ``q_proj.weight`` under a LoRA-wrapped ``q_proj``) that can
-    silently become trainable after reload, which would reintroduce the
-    original Studio adapter-export bloat.
+    Includes all LoRA adapter tensors (frozen or not). Excludes wrapped
+    base weights INSIDE a LoRA module (reload-leaked state that would
+    reintroduce the original Studio adapter-export bloat).
     """
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
@@ -2722,8 +2882,6 @@ def save_trainable_adapters(model, path, adapter_config=None):
     for key, value in trainable.items():
         if key in adapter_tensors:
             continue
-        # Drop wrapped base tensors under LoRA prefixes; intentional trainables
-        # like `.bias` under the same prefix survive.
         if _is_base_tensor_inside_lora_module(
             key, lora_module_prefixes, has_root_lora_module,
         ):
@@ -2859,6 +3017,122 @@ def _get_mlx_config_quantization(model):
     return config.get("quantization") or config.get("quantization_config")
 
 
+def _get_mlx_dropout_probability(drop):
+    if drop is None:
+        return 0.0
+    # MLX nn.Dropout stores keep-prob as _p_1; shims may also set a stale .p,
+    # so _p_1 wins when numeric and we fall back to .p otherwise.
+    p1 = getattr(drop, "_p_1", None)
+    if p1 is not None:
+        try:
+            return float(1.0 - float(p1))
+        except (TypeError, ValueError):
+            pass
+    p = getattr(drop, "p", None)
+    if p is not None:
+        try:
+            return float(p)
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def _coerce_mlx_lora_scale(scale, default=1.0):
+    """Return a Python float from an mlx-lm LoRA wrapper's `.scale` attribute.
+
+    LoRASwitchLinear stores per-expert mx.array scales; raw float()/.item()
+    raise. Read the first broadcast value (= alpha/r for every expert) so
+    we don't silently lose the trained alpha/r by defaulting to 1.0.
+    """
+    if scale is None:
+        return float(default)
+
+    try:
+        return float(scale)
+    except Exception:
+        pass
+
+    if hasattr(scale, "item"):
+        try:
+            return float(scale.item())
+        except Exception:
+            pass
+
+    # LoRASwitchLinear per-expert mx.array: first broadcast value = alpha/r.
+    try:
+        flat = scale.reshape((-1,))
+        first = flat[0]
+        if hasattr(first, "item"):
+            return float(first.item())
+        return float(first)
+    except Exception:
+        return float(default)
+
+
+def _infer_mlx_lora_rank(module):
+    lora_a = getattr(module, "lora_a", None)
+    lora_b = getattr(module, "lora_b", None)
+
+    # mlx-lm sometimes wraps tensors in nn.Linear layers; unwrap to .weight.
+    is_layer = False
+    if lora_a is not None and not hasattr(lora_a, "shape") and hasattr(lora_a, "weight"):
+        lora_a = lora_a.weight
+        is_layer = True
+    if lora_b is not None and not hasattr(lora_b, "shape") and hasattr(lora_b, "weight"):
+        lora_b = lora_b.weight
+        is_layer = True
+
+    lora_a_shape = tuple(lora_a.shape) if lora_a is not None and hasattr(lora_a, "shape") else ()
+    lora_b_shape = tuple(lora_b.shape) if lora_b is not None and hasattr(lora_b, "shape") else ()
+    # Both halves required; a half-built module is not a reliable rank source.
+    if not lora_a_shape or not lora_b_shape:
+        return None
+
+    # MoE/switch: lora_a (..., rank, in_dims); lora_b (..., out_dims, rank).
+    if len(lora_a_shape) >= 3:
+        if len(lora_b_shape) != len(lora_a_shape):
+            return None
+        rank = lora_a_shape[-2]
+        if lora_b_shape[-1] != rank:
+            return None
+        if lora_a_shape[:-2] != lora_b_shape[:-2]:
+            return None
+        return int(rank)
+
+    if len(lora_a_shape) < 2 or len(lora_b_shape) < 2:
+        return None
+
+    # Standard 2D LoRA, two conventions:
+    # 1. mlx-lm layer: lora_a (rank, in), lora_b (out, rank)
+    if is_layer:
+        if lora_a_shape[0] == lora_b_shape[-1]:
+            return int(lora_a_shape[0])
+        return None
+
+    # 2. Raw array: lora_a (in, rank), lora_b (rank, out)
+    if lora_a_shape[-1] == lora_b_shape[0]:
+        return int(lora_a_shape[-1])
+
+    return None
+
+
+def _sync_mlx_lora_keys(adapter_config, lora_parameters):
+    """Mirror `unsloth_mlx_lora_module_paths` into `lora_parameters["keys"]`.
+
+    mlx-lm.load_adapters() reads `lora_parameters.keys` to pick which
+    submodules to wrap on reload. Mirror the authoritative path list when
+    present (an empty list is its own valid pin); otherwise drop a stale
+    caller-supplied `keys` so mlx-lm falls back to its scan default.
+    """
+    if "unsloth_mlx_lora_module_paths" in adapter_config:
+        lora_parameters["keys"] = list(
+            adapter_config.get("unsloth_mlx_lora_module_paths") or []
+        )
+    else:
+        lora_parameters.pop("keys", None)
+    return lora_parameters
+
+
 def _enrich_mlx_adapter_config(model, adapter_config):
     adapter_config = dict(adapter_config or {})
     hf_repo = getattr(model, "_hf_repo", None) or adapter_config.get("base_model_name_or_path")
@@ -2918,55 +3192,57 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
-    # Only stamp LoRA-flavoured fields when the live model actually has LoRA modules
-    # (or the caller already declared a lora/dora artifact). Stamping fine_tune_type
-    # ='lora' on a full fine-tune would make load_adapters() inject LoRA wrappers
-    # before binding the saved full-precision weights.
+    # Only stamp LoRA-flavoured fields when the live model carries LoRA
+    # modules (or the caller already declared a lora/dora artifact);
+    # otherwise mlx-lm.load_adapters() would inject LoRA wrappers before
+    # binding the saved full-precision weights and break reload.
     has_lora_modules = any(True for _ in iter_mlx_lora_modules(model))
-    # Cross-check caller-declared artifact against the live model so stale
-    # `fine_tune_type="lora"` from a re-used dict cannot survive a no-LoRA save.
     declared_lora_artifact = (
         has_lora_modules
         and adapter_config.get("fine_tune_type") in {"lora", "dora"}
     )
-    # Live LoRA + caller-passed fine_tune_type="full" is inconsistent (tensors
-    # would be lora_a/lora_b but config says full); override the caller.
+    # Override a stale caller fine_tune_type="full" when LoRA modules are
+    # live, else mlx-lm reload would skip LoRA wrapping and drop tensors.
     if has_lora_modules and adapter_config.get("fine_tune_type") == "full":
         adapter_config["fine_tune_type"] = "lora"
         declared_lora_artifact = True
-    # Detect DoRA so the adapter ships with fine_tune_type='dora'; load_adapters()
-    # only recreates DoRA wrappers when the config says 'dora', else `.m` is lost.
+    # Detect DoRA so we stamp 'dora' instead of 'lora'; otherwise mlx-lm's
+    # load_adapters() rebuilds plain LoRA and the saved q_proj.m magnitude
+    # tensor silently drops via strict=False.
     has_dora_modules = any(
         type(module).__name__.startswith("DoRA")
         for _, module in iter_mlx_lora_modules(model)
     )
     if has_lora_modules or declared_lora_artifact:
-        # Saved tensor shapes are authoritative: always derive rank/scale/dropout
-        # from the live LoRA modules so a stale caller `lora_parameters` cannot
-        # contradict adapters.safetensors. Only fall back to the caller's value
-        # when the model has no live LoRA modules (declared_lora_artifact path).
-        if has_lora_modules:
+        # Saved tensor shapes are authoritative: always re-derive
+        # rank/scale/dropout from live modules so a stale caller
+        # `lora_parameters` (e.g. rank=99) cannot survive. The path-
+        # filtered walker below owns the explicit-paths case so we do
+        # not borrow rank from an unselected module.
+        _has_explicit_paths_hint = "unsloth_mlx_lora_module_paths" in adapter_config
+        if has_lora_modules and not _has_explicit_paths_hint:
             rank, scale, dropout = _extract_mlx_lora_parameters(model)
             adapter_config["lora_parameters"] = {
                 "rank": rank,
                 "scale": scale,
                 "dropout": dropout,
             }
-        elif "lora_parameters" not in adapter_config:
+        elif "lora_parameters" not in adapter_config and not _has_explicit_paths_hint:
             rank, scale, dropout = _extract_mlx_lora_parameters(model)
             adapter_config["lora_parameters"] = {
                 "rank": rank,
                 "scale": scale,
                 "dropout": dropout,
             }
-        # mlx-vlm expects these at top level; mirror lora_parameters verbatim so
-        # a stale top-level `rank`/`scale`/`dropout` cannot contradict it.
-        lora_parameters = adapter_config["lora_parameters"]
-        for key in ("rank", "scale", "dropout"):
-            if key in lora_parameters:
-                adapter_config[key] = lora_parameters[key]
-        # Backfill num_layers so save_pretrained_merged also produces a loadable
-        # artifact (Trainer.save_model fills it in directly).
+        # Mirror lora_parameters to top-level for mlx-vlm; overwrite
+        # caller-supplied top-level rank/scale/dropout so stale values
+        # cannot shadow the canonical ones.
+        if "lora_parameters" in adapter_config:
+            lora_parameters = adapter_config["lora_parameters"]
+            for key in ("rank", "scale", "dropout"):
+                if key in lora_parameters:
+                    adapter_config[key] = lora_parameters[key]
+        # mlx-lm.load_adapters() reads num_layers off the config.
         if "num_layers" not in adapter_config:
             try:
                 layers = _get_transformer_layers(model)
@@ -2974,15 +3250,14 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     adapter_config["num_layers"] = len(layers)
             except Exception:
                 pass
-        # Derive fine_tune_type strictly from the live model so a stale "dora"
-        # from a previous run cannot survive into a plain-LoRA save (load_adapters
-        # would expect `.m` and drop every adapter via strict=False).
+        # Derive fine_tune_type from the live model so a stale caller value
+        # (e.g. 'dora' over plain LoRA) cannot survive; otherwise mlx-lm
+        # would expect a `m` tensor and drop every adapter via strict=False.
         adapter_config["fine_tune_type"] = "dora" if has_dora_modules else "lora"
         adapter_config["peft_type"] = "LORA"
     else:
-        # Full fine-tune: stamp 'full' explicitly so load_adapters() routes to the
-        # no-LoRA path (default fine_tune_type='lora' would break reload). Strip
-        # stale LoRA fields the caller may have copied over.
+        # Full fine-tune: stamp 'full' explicitly so reload routes to the
+        # no-LoRA path (mlx-lm defaults missing fine_tune_type to 'lora').
         adapter_config["fine_tune_type"] = "full"
         for _stale in (
             "peft_type", "lora_parameters", "rank", "scale", "dropout",
@@ -2990,14 +3265,155 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         ):
             adapter_config.pop(_stale, None)
 
-    # why: record LoRA module paths so reload recreates vision/projector LoRA
-    # layers (mlx-lm.load_adapters only knows the language tower).
+    # Persist module paths + rank/scale/dropout so reload reproduces logits.
+    # The walker below backfills lora_parameters via _infer_mlx_lora_rank
+    # and respects explicit caller path filters.
     try:
-        lora_paths = [name for name, _ in iter_mlx_lora_modules(model)]
-        if lora_paths:
+        # Reuse the loader-side normalizer so save/load accept the same
+        # shapes (str / list / tuple / set / dict / pathlib.Path).
+        from .loader import _normalize_mlx_lora_module_paths
+        # distinguish "caller passed nothing" from "caller passed [] / None".
+        has_explicit_paths = "unsloth_mlx_lora_module_paths" in adapter_config
+        raw_explicit_paths = (
+            adapter_config.get("unsloth_mlx_lora_module_paths")
+            if has_explicit_paths else None
+        )
+        if has_explicit_paths:
+            explicit_paths = _normalize_mlx_lora_module_paths(raw_explicit_paths)
+            adapter_config["unsloth_mlx_lora_module_paths"] = explicit_paths
+        else:
+            explicit_paths = None
+        # Empty explicit list pins caller topology but should NOT suppress
+        # global parameter inference; treat empty as "no filter".
+        explicit_path_set = set(explicit_paths) if explicit_paths else None
+
+        lora_paths = []
+        lora_rank = None
+        lora_scale = None
+        lora_dropout = None
+        # Track whether an explicit filter selected any real live module:
+        # if it did but rank inference failed, refusing the caller fallback
+        # below is what prevents persisting stale rank=8 placeholders.
+        selected_lora_seen = False
+        for name, module in iter_mlx_lora_modules(model):
+            lora_paths.append(name)
+            inferred_rank = _infer_mlx_lora_rank(module)
+            # Only infer from caller-selected modules so an unrelated LoRA
+            # cannot write the wrong language-tower params.
+            if explicit_path_set is not None and name not in explicit_path_set:
+                continue
+            selected_lora_seen = True
+            if inferred_rank is None:
+                continue
+            if lora_rank is None:
+                lora_rank = inferred_rank
+                lora_scale = _coerce_mlx_lora_scale(
+                    getattr(module, "scale", 1.0),
+                )
+                lora_dropout = _get_mlx_dropout_probability(
+                    getattr(module, "dropout", None)
+                )
+
+        # Auto-fill only when the caller did not supply the key.
+        if lora_paths and not has_explicit_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
-    except Exception:
-        pass
+
+        # Live LoRA module state describes the tensors being saved, so an
+        # inferable live rank ALWAYS overrides caller scalar metadata.
+        existing_lora_parameters = dict(adapter_config.get("lora_parameters") or {})
+        has_caller_lora_metadata = any(
+            key in existing_lora_parameters or key in adapter_config
+            for key in ("rank", "scale", "dropout")
+        )
+        # When the caller pinned explicit paths that selected real modules
+        # but rank inference failed everywhere, do NOT fall back to caller
+        # metadata; it is stale by construction.
+        allow_caller_metadata_fallback = not (
+            explicit_path_set is not None
+            and selected_lora_seen
+            and lora_rank is None
+        )
+
+        if lora_rank is not None:
+            lora_parameters = existing_lora_parameters
+            lora_parameters.update({
+                "rank": lora_rank,
+                "scale": lora_scale,
+                "dropout": lora_dropout,
+            })
+            # Mirror the authoritative path list under `keys` so mlx-lm.
+            # load_adapters() does not interpret a missing `keys` as "scan
+            # every Linear/Embedding/Switch layer".
+            lora_parameters = _sync_mlx_lora_keys(adapter_config, lora_parameters)
+            adapter_config["lora_parameters"] = lora_parameters
+            adapter_config["rank"] = lora_rank
+            adapter_config["scale"] = lora_scale
+            adapter_config["dropout"] = lora_dropout
+            adapter_config.setdefault("peft_type", "LORA")
+            adapter_config.setdefault("fine_tune_type", "lora")
+            # mlx-lm.load_adapters() attr-accesses `config.num_layers` on
+            # a SimpleNamespace, so the key MUST be present. -1 is the
+            # legacy "all layers" sentinel for the no-detect case.
+            if "num_layers" not in adapter_config:
+                layers = _get_transformer_layers(model)
+                try:
+                    n_layers = len(layers) if layers is not None else -1
+                except TypeError:
+                    n_layers = -1
+                if n_layers <= 0:
+                    n_layers = -1
+                adapter_config["num_layers"] = n_layers
+        elif has_caller_lora_metadata and allow_caller_metadata_fallback:
+            # Caller-supplied metadata path: copy top-level rank/scale/dropout
+            # into lora_parameters (or vice versa) and backfill missing keys
+            # from inferred values so mlx-lm.load_adapters sees a complete dict.
+            lora_parameters = existing_lora_parameters
+            for key in ("rank", "scale", "dropout"):
+                if key not in lora_parameters and key in adapter_config:
+                    lora_parameters[key] = adapter_config[key]
+            # Rank first because it gates the final write below.
+            inferred_fallbacks = (
+                ("rank", lora_rank, None),
+                ("scale", lora_scale, 1.0),
+                ("dropout", lora_dropout, 0.0),
+            )
+            for key, inferred_value, default_value in inferred_fallbacks:
+                if key in lora_parameters:
+                    continue
+                if inferred_value is None and default_value is None:
+                    # No inferred value AND no safe default (rank); leave absent.
+                    continue
+                lora_parameters[key] = (
+                    inferred_value if inferred_value is not None else default_value
+                )
+            if "rank" in lora_parameters:
+                lora_parameters = _sync_mlx_lora_keys(adapter_config, lora_parameters)
+                adapter_config["lora_parameters"] = lora_parameters
+                for key in ("rank", "scale", "dropout"):
+                    if key in lora_parameters:
+                        adapter_config[key] = lora_parameters[key]
+                adapter_config.setdefault("peft_type", "LORA")
+                adapter_config.setdefault("fine_tune_type", "lora")
+                # Same -1 sentinel as the main branch.
+                if "num_layers" not in adapter_config:
+                    layers = _get_transformer_layers(model)
+                    try:
+                        n_layers = len(layers) if layers is not None else -1
+                    except TypeError:
+                        n_layers = -1
+                    if n_layers <= 0:
+                        n_layers = -1
+                    adapter_config["num_layers"] = n_layers
+    except (TypeError, ValueError, AttributeError) as _enrich_exc:
+        # Surface enrichment failures so the user knows adapter_config
+        # metadata may be incomplete on reload.
+        import warnings as _warnings
+        _warnings.warn(
+            f"Unsloth MLX: skipped LoRA metadata enrichment "
+            f"({_enrich_exc!r}); reloaded adapters may use placeholder "
+            f"rank/scale until adapter_config is rewritten.",
+            stacklevel=2,
+        )
     return adapter_config
 
 
@@ -3099,17 +3515,13 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
 
 
 def _ensure_hub_repo_visibility(api, repo_id, private):
-    """create_repo + targeted update_repo_settings + post-failure verify.
+    """create_repo + update_repo_settings + verify on failure.
 
-    `create_repo(exist_ok=True)` is a no-op on visibility for existing repos, so
-    re-push with `private=True` needs an explicit update call. That call can fail
-    spuriously even on an already-private repo (e.g. token missing
-    `write:repo_settings`), so:
-
-      - private=None: skip entirely (Hub policy decides).
-      - private=False: soft-fail (stuck-private is a soft annoyance, not a leak).
-      - private=True: must end private; verify via repo_info on update failure
-        and only raise when confirmed non-private.
+    private=None  : skip the visibility update entirely (Hub policy).
+    private=False : soft-fail on update error (stuck-private is not a leak).
+    private=True  : verify via repo_info on update failure; only raise when
+                    the repo is confirmed non-private (covers tokens lacking
+                    write:repo_settings on a just-created private repo).
     """
     _create_repo_kwargs = {"repo_id": repo_id, "exist_ok": True}
     if private is not None:
@@ -3131,8 +3543,7 @@ def _ensure_hub_repo_visibility(api, repo_id, private):
             print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
             return
 
-        # private=True: verify before blocking; a freshly create_repo'd private
-        # repo can hit this path when update_repo_settings is unauthorized.
+        # private=True: verify before blocking the upload.
         try:
             info = api.repo_info(repo_id=repo_id, repo_type="model")
             if bool(getattr(info, "private", False)):
@@ -3150,8 +3561,9 @@ def _ensure_hub_repo_visibility(api, repo_id, private):
         ) from exc
 
 
-# Module-level so _caller_wants_commit_metadata can identify "caller forwarded
-# our default" vs "caller asked for their own commit string".
+# Module-level constants so _caller_wants_commit_metadata can distinguish
+# "caller explicitly wants this Unsloth default" from "caller wants their
+# own commit string"; same pattern as push_to_hub_merged.
 _LORA_DEFAULT_COMMIT_MESSAGE = "Trained with Unsloth"
 _LORA_DEFAULT_COMMIT_DESCRIPTION = "Upload LoRA adapters trained with Unsloth 2x faster"
 
@@ -3169,9 +3581,9 @@ def _push_lora_adapters_to_hub(
 ):
     """Upload an already-written LoRA adapter directory to the Hub.
 
-    Mirrors push_to_hub_merged's repo/commit/privacy/tag/upload semantics but
-    skips the merged save_model fallback so adapters.safetensors is not
-    overwritten with a full merged model.
+    Mirrors push_to_hub_merged's repo / commit / privacy / tag / upload
+    semantics, but skips the merged save_model fallback so it does not
+    overwrite adapters.safetensors with a full merged model.
     """
     from huggingface_hub import HfApi
 
@@ -3179,18 +3591,18 @@ def _push_lora_adapters_to_hub(
     if repo_id is None:
         repo_id = save_directory.name
 
-    # Capture caller intent BEFORE we backfill defaults; afterwards None and
-    # "My message" are indistinguishable. The Unsloth default strings are treated
-    # the same as None so an outer wrapper forwarding the default verbatim is
-    # not mistaken for a custom request (upload_large_folder cannot represent
-    # commit_message / commit_description / create_pr).
+    # Capture caller intent BEFORE backfilling defaults. Treat the Unsloth
+    # default strings the same as None so an outer wrapper that forwards
+    # the default verbatim is not mistaken for a custom request (the
+    # upload_large_folder fallback cannot preserve commit metadata).
     _caller_wants_commit_metadata = bool(
         create_pr
         or commit_message not in (None, _LORA_DEFAULT_COMMIT_MESSAGE)
         or commit_description not in (None, _LORA_DEFAULT_COMMIT_DESCRIPTION)
     )
 
-    # Match push_to_hub_merged's commit conventions for cross-backend parity.
+    # Match push_to_hub_merged's commit conventions so the history is
+    # recognizable across CUDA and MLX backends.
     if commit_message is None:
         commit_message = _LORA_DEFAULT_COMMIT_MESSAGE
     if "Unsloth" not in commit_message:
@@ -3201,16 +3613,14 @@ def _push_lora_adapters_to_hub(
         commit_description += " (Trained with Unsloth 2x faster)"
 
     api = HfApi(token=token)
-    # See _ensure_hub_repo_visibility for the private None/False/True policy.
     _ensure_hub_repo_visibility(api, repo_id, private)
 
     if tags:
         try:
             from huggingface_hub import ModelCard
             card_path = save_directory / "README.md"
-            # Seed a minimal card so ModelCard.load() doesn't raise FileNotFoundError
-            # and silently drop the requested tags. Merged saves usually have a card
-            # from create_model_card, but seed defensively here too.
+            # Seed a minimal card: fresh adapter dirs have no README, so
+            # ModelCard.load() would otherwise raise and tags would be lost.
             if not card_path.exists():
                 card_path.write_text(
                     "---\n"
@@ -3229,14 +3639,15 @@ def _push_lora_adapters_to_hub(
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
-    # Allow-list adapter-relevant files only, so stale merged-model artifacts or
-    # external GGUF exports left in save_directory cannot leak to the adapter repo.
+    # Allow-list adapter-relevant files only; prevents accidentally pushing
+    # stale merged-model artifacts or external GGUF exports under the LoRA
+    # adapter repo (data-leak guard for the public-by-default case).
     _lora_allow_patterns = [
         "adapters.safetensors",
         "adapter_config.json",
-        # `adapter_model.safetensors` is intentionally absent: MLX writes
-        # `adapters.safetensors`, so a matching file is stale (a separate
-        # PEFT/HF adapter save) and would corrupt the remote artifact.
+        # `adapter_model.safetensors` is intentionally excluded: MLX writes
+        # `adapters.safetensors`, so a matching PEFT file is stale by
+        # definition and would corrupt the remote artifact.
         "tokenizer.json",
         "tokenizer_config.json",
         "special_tokens_map.json",
@@ -3255,9 +3666,9 @@ def _push_lora_adapters_to_hub(
         ".gitattributes",
     ]
 
-    # LoRA dirs are small (~5 files), so prefer upload_folder (preserves
-    # commit_message/description/create_pr/revision); upload_large_folder is the
-    # fallback because it commits with the default "Upload N LFS files" on main.
+    # Prefer upload_folder for LoRA dirs (small, single commit honours
+    # commit_message / create_pr / revision); upload_large_folder is the
+    # last-resort fallback when upload_folder is unavailable.
     try:
         api.upload_folder(
             folder_path=str(save_directory),
@@ -3270,9 +3681,8 @@ def _push_lora_adapters_to_hub(
             allow_patterns=_lora_allow_patterns,
         )
     except (AttributeError, TypeError) as exc:
-        # Refuse to silently swap a custom commit_message/commit_description/
-        # create_pr for the upload_large_folder default; let the caller fix
-        # the environment or drop the kwarg.
+        # Refuse to fall back to upload_large_folder when the caller asked
+        # for commit metadata it cannot preserve.
         if _caller_wants_commit_metadata:
             raise RuntimeError(
                 "Unsloth: upload_folder() failed but commit metadata or "
@@ -3344,17 +3754,19 @@ def save_pretrained_merged(
                 "Unsloth: save_method='lora' but the model has no LoRA "
                 "layers — there's nothing to save. Use 'merged_16bit' instead."
             )
-        # Preserve intentionally trainable non-LoRA tensors (embeddings, lm_head,
-        # projector, vision, norm) outside LoRA modules; drop wrapped base
-        # tensors inside a LoRA module (else q_proj.weight under a wrapped q_proj
-        # would leak back through the public save path).
+        # Preserve intentionally trainable non-LoRA tensors OUTSIDE any
+        # LoRA module; exclude wrapped base weights INSIDE a LoRA module
+        # so reload-trainable q_proj.weight cannot leak through the save.
         trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
         adapter_keys = set(adapter_tensors)
         lora_module_prefixes = tuple(
             f"{name}." for name, _ in iter_mlx_lora_modules(model) if name
         )
-        # Route to save_trainable_adapters when there is any non-LoRA / non-base
-        # trainable (e.g. q_proj.bias) that save_lora_adapters would discard.
+        # Route to save_trainable_adapters when an external param or an
+        # intentionally trainable non-base param under a LoRA module (e.g.
+        # q_proj.bias) is present. _is_base_tensor_inside_lora_module
+        # treats wrapped `.weight`/`.scales`/`.biases` (+ `.linear.*`) as
+        # reload-leaks; everything else under a LoRA prefix is user state.
         has_root_lora_module = any(
             name == "" for name, _ in iter_mlx_lora_modules(model)
         )
@@ -3383,9 +3795,9 @@ def save_pretrained_merged(
 
     if push_to_hub:
         if method == "lora":
-            # Must NOT route through push_to_hub_merged: it falls back to
-            # save_merged_model() when model.safetensors.index.json is missing,
-            # which would re-save a full merged model over the adapter dir.
+            # LoRA artifacts must NOT route through push_to_hub_merged: it
+            # would fall back to save_merged_model() (no index.json) and
+            # overwrite adapters.safetensors with a full merged model.
             _push_lora_adapters_to_hub(
                 save_directory,
                 repo_id=repo_id,
@@ -3684,11 +4096,11 @@ def push_to_hub_merged(
     if repo_id is None:
         repo_id = save_directory.name
 
-    # Detect custom commit metadata BEFORE we normalize the strings.
-    # upload_large_folder supports `revision` natively but not commit_message /
-    # commit_description / create_pr; only those three trigger the upload_folder
-    # route. `commit_message=None` is treated as "use the default" (a wrapper
-    # forwarding default values must not be mistaken for an explicit request).
+    # Capture caller intent BEFORE backfilling defaults; upload_large_folder
+    # cannot preserve commit_message / commit_description / create_pr (only
+    # those three force the upload_folder route). Treat None and the
+    # Unsloth default strings the same so a wrapper forwarding the default
+    # is not mistaken for a custom request.
     _caller_wants_commit_metadata = bool(
         create_pr
         or commit_message not in (None, _PUSH_MERGED_DEFAULT_COMMIT_MESSAGE)
@@ -3707,17 +4119,14 @@ def push_to_hub_merged(
         commit_description += " (Trained with Unsloth 2x faster)"
 
     api = HfApi(token=token)
-    # See _ensure_hub_repo_visibility for the private None/False/True policy
-    # (must not unconditionally forward private=False or org-default-private
-    # repos would be created public on first push).
     _ensure_hub_repo_visibility(api, repo_id, private)
 
     if tags:
         try:
             from huggingface_hub import ModelCard
             card_path = save_directory / "README.md"
-            # Seed a minimal card so ModelCard.load() doesn't raise
-            # FileNotFoundError and silently drop the requested tags.
+            # Seed a minimal card: fresh dirs without one would crash
+            # ModelCard.load() and silently lose the requested tags.
             if not card_path.exists():
                 card_path.write_text(
                     "---\n"
@@ -3736,9 +4145,9 @@ def push_to_hub_merged(
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
-    # upload_large_folder resumes and chunks (good for multi-GB merges) but
-    # silently drops commit_message / commit_description / create_pr on
-    # huggingface_hub>=0.34, so honor them via upload_folder when set.
+    # upload_large_folder resumes / chunks (good for multi-GB merges) but
+    # drops commit_message / commit_description / create_pr; route through
+    # upload_folder when the caller asked for any of those.
     if _caller_wants_commit_metadata:
         try:
             api.upload_folder(
@@ -3751,9 +4160,8 @@ def push_to_hub_merged(
                 revision=revision,
             )
         except (AttributeError, TypeError) as exc:
-            # Same constraint as the LoRA helper: refuse to silently swap a
-            # custom commit_message/commit_description/create_pr for the
-            # upload_large_folder default.
+            # Refuse to fall back to upload_large_folder; it cannot preserve
+            # commit_message / commit_description / create_pr.
             if _caller_wants_commit_metadata:
                 raise RuntimeError(
                     "Unsloth: upload_folder() failed but commit metadata "
@@ -3818,9 +4226,8 @@ def push_to_hub_gguf(
 
     # Upload GGUF files
     api = HfApi(token=token)
-    # See _ensure_hub_repo_visibility for the private None/False/True policy.
-    # Multi-GB GGUF shards need the same fail-loud rule so a private=True
-    # request can never silently leak weights to a public repo.
+    # Same fail-loud private=True rule as the LoRA / merged paths so a
+    # private=True request never silently leaks GGUF shards public.
     _ensure_hub_repo_visibility(api, repo_id, private)
 
     gguf_files = list(save_directory.glob("*.gguf"))
