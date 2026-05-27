@@ -64,6 +64,7 @@ def test_vlm_config_save_uses_vlm_helper_and_preserves_quantization_config(
     mutils._save_mlx_config(config, tmp_path / "config.json", is_vlm=True)
 
     assert calls["path"] == tmp_path / "config.json"
+    assert calls["config"]["quantization"] == config["quantization"]
     assert calls["config"]["quantization_config"] == config["quantization"]
     assert "quantization_config" not in config
 
@@ -401,6 +402,22 @@ def test_vlm_rewrite_handles_same_name_layout_transforms(monkeypatch):
     )
 
 
+def test_mlx_arrays_match_checks_2d_tensor_values(monkeypatch):
+    import torch
+    import unsloth_zoo.mlx.utils as mutils
+
+    monkeypatch.setattr(mutils.mx, "all", torch.all)
+
+    assert mutils._mlx_arrays_match(
+        torch.zeros(2, 3),
+        torch.zeros(2, 3),
+    )
+    assert not mutils._mlx_arrays_match(
+        torch.zeros(2, 3),
+        torch.ones(2, 3),
+    )
+
+
 def test_vlm_sanitizer_replay_uses_real_model_instances():
     import unsloth_zoo.mlx.utils as mutils
 
@@ -484,6 +501,30 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
     assert tokenizer.chat_template == "{{ messages }}"
 
 
+def test_read_json_file_returns_empty_for_missing_or_malformed_files(tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+
+    assert loader._read_json_file(tmp_path / "missing.json") == {}
+
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{not-json", encoding="utf-8")
+
+    assert loader._read_json_file(malformed) == {}
+
+
+def test_read_json_file_does_not_swallow_unexpected_errors(monkeypatch, tmp_path):
+    import builtins
+    import unsloth_zoo.mlx.loader as loader
+
+    def fail_open(*args, **kwargs):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(builtins, "open", fail_open)
+
+    with pytest.raises(RuntimeError, match="unexpected"):
+        loader._read_json_file(tmp_path / "config.json")
+
+
 def test_get_model_config_extracts_dataclass_configs():
     import unsloth_zoo.mlx.utils as mutils
 
@@ -528,6 +569,74 @@ def test_get_model_config_prefers_copied_raw_config():
     assert raw_config["nested"]["values"] == [1]
 
 
+def test_has_tied_word_embeddings_ignores_malformed_thinker_config():
+    import unsloth_zoo.mlx.utils as mutils
+
+    assert not mutils._has_tied_word_embeddings({"thinker_config": "bad"})
+    assert mutils._has_tied_word_embeddings(
+        {"thinker_config": {"text_config": {"tie_word_embeddings": True}}}
+    )
+
+
+def test_has_vision_config_handles_nested_and_malformed_configs():
+    import unsloth_zoo.mlx.utils as mutils
+
+    assert not mutils._has_vision_config(None)
+    assert not mutils._has_vision_config({"thinker_config": "bad"})
+    assert mutils._has_vision_config({"vision_config": {}})
+    assert mutils._has_vision_config({"thinker_config": {"vision_config": {}}})
+
+
+def test_save_merged_model_detects_nested_vlm_config(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    calls = {}
+
+    class Model:
+        _config = {
+            "model_type": "glm_ocr",
+            "thinker_config": {"vision_config": {"hidden_size": 8}},
+        }
+
+        def eval(self):
+            pass
+
+        def named_modules(self):
+            return []
+
+    class Tokenizer:
+        def save_pretrained(self, path):
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+    fake_mlx_lm_utils = types.ModuleType("mlx_lm.utils")
+    fake_mlx_lm_utils.dequantize_model = lambda model: model
+    fake_mlx_lm_utils.save_model = lambda path, model, donate_model=False: Path(
+        path
+    ).mkdir(parents=True, exist_ok=True)
+    fake_mlx_lm_utils.create_model_card = lambda path, hf_repo: None
+    fake_mlx_lm_utils.save_config = lambda config, path: pytest.fail(
+        "text save_config should not run"
+    )
+    monkeypatch.setitem(sys.modules, "mlx_lm.utils", fake_mlx_lm_utils)
+
+    fake_mlx_utils = types.ModuleType("mlx.utils")
+    fake_mlx_utils.tree_unflatten = dict
+    monkeypatch.setitem(sys.modules, "mlx.utils", fake_mlx_utils)
+
+    monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: False)
+
+    def fake_save_mlx_config(config, config_path, *, is_vlm=False):
+        calls["is_vlm"] = is_vlm
+        calls["config"] = config
+
+    monkeypatch.setattr(mutils, "_save_mlx_config", fake_save_mlx_config)
+
+    mutils.save_merged_model(Model(), Tokenizer(), tmp_path)
+
+    assert calls["is_vlm"] is True
+    assert calls["config"]["thinker_config"]["vision_config"]["hidden_size"] == 8
+
+
 def test_prepare_vlm_gguf_export_directory_writes_nextn_config_without_tensors(
     monkeypatch,
     tmp_path,
@@ -564,6 +673,37 @@ def test_prepare_vlm_gguf_export_directory_writes_nextn_config_without_tensors(
     assert "num_nextn_predict_layers" not in updated["text_config"]
     assert "mtp_num_hidden_layers" not in updated["text_config"]
     assert "nextn_predict_layers" not in updated["text_config"]
+
+
+def test_prepare_vlm_gguf_export_directory_ignores_malformed_thinker_config(
+    monkeypatch,
+    tmp_path,
+):
+    import unsloth_zoo.mlx.utils as mutils
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "glm_ocr",
+                "thinker_config": "bad",
+                "text_config": {"num_hidden_layers": 16},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mutils,
+        "_get_transformer_layers",
+        lambda model: [object()] * 16,
+    )
+    monkeypatch.setattr(
+        mutils,
+        "_build_mlx_vlm_sanitize_pipelines",
+        lambda config, model=None: [],
+    )
+
+    assert mutils._prepare_vlm_gguf_export_directory(tmp_path, model=object()) == 0
 
 
 def test_copy_source_sidecars_preserves_image_processor_metadata(tmp_path):

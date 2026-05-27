@@ -365,7 +365,7 @@ def _read_json_file(path):
     try:
         with open(path, "r", encoding="utf-8") as file:
             return json.load(file)
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
 
 

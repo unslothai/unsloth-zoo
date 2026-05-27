@@ -34,10 +34,14 @@ import os
 import sys
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 
 from .cce import _get_runtime_cce
+
+
+_LLAMA_CPP_PATCHER_ENV_LOCK = threading.Lock()
 
 
 def _safe_token_denominator(ntoks):
@@ -3493,11 +3497,16 @@ def _has_tied_word_embeddings(config):
     """Return whether any text config declares tied input/output embeddings."""
     if not isinstance(config, dict):
         return False
+    thinker_config = config.get("thinker_config")
     candidates = [
         config,
         config.get("text_config"),
         config.get("language_config"),
-        (config.get("thinker_config") or {}).get("text_config"),
+        (
+            thinker_config.get("text_config")
+            if isinstance(thinker_config, dict)
+            else None
+        ),
     ]
     return any(
         isinstance(item, dict) and item.get("tie_word_embeddings") is True
@@ -3688,8 +3697,16 @@ def _materialize_tied_lm_head_in_saved_model(
 
 def _has_vision_config(config):
     """Return whether a raw or thinker-wrapped VLM config has vision settings."""
-    thinker_config = config.get("thinker_config") or {}
-    return "vision_config" in config or "vision_config" in thinker_config
+    if not isinstance(config, dict):
+        return False
+    thinker_config = config.get("thinker_config")
+    return (
+        "vision_config" in config
+        or (
+            isinstance(thinker_config, dict)
+            and "vision_config" in thinker_config
+        )
+    )
 
 
 class _MlxVlmSanitizeProxy:
@@ -3890,10 +3907,10 @@ def _mlx_arrays_match(actual, expected):
         return True
     if shape is None:
         return actual == expected
-    if len(shape) not in (1, 4, 5):
-        return True
     try:
-        return bool(mx.all(actual == expected).item())
+        result = mx.all(actual == expected)
+        item = getattr(result, "item", None)
+        return bool(item() if callable(item) else result)
     except Exception:
         return False
 
@@ -3952,10 +3969,15 @@ def _sync_gguf_nextn_layer_config(config, model):
     except Exception:
         return False
 
+    thinker_config = config.get("thinker_config")
     text_configs = [
         config.get("text_config"),
         config.get("language_config"),
-        (config.get("thinker_config") or {}).get("text_config"),
+        (
+            thinker_config.get("text_config")
+            if isinstance(thinker_config, dict)
+            else None
+        ),
     ]
     changed = False
     for text_config in text_configs:
@@ -4146,7 +4168,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     # Save config.json
     config = _get_model_config(model)
     if config:
-        is_vlm = _is_vlm_model(model) or "vision_config" in config
+        is_vlm = _is_vlm_model(model) or _has_vision_config(config)
         materialized = _materialize_tied_lm_head_in_saved_model(
             path,
             config,
@@ -4673,16 +4695,17 @@ def save_pretrained_gguf(
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
         supported_text_archs = None
         supported_vision_archs = None
-        old_scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
-        if old_scripts_dir is None:
-            os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = llama_cpp_folder
-        try:
-            result = _download_convert_hf_to_gguf()
-        finally:
+        with _LLAMA_CPP_PATCHER_ENV_LOCK:
+            old_scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
             if old_scripts_dir is None:
-                os.environ.pop("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", None)
-            else:
-                os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = old_scripts_dir
+                os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = llama_cpp_folder
+            try:
+                result = _download_convert_hf_to_gguf()
+            finally:
+                if old_scripts_dir is None:
+                    os.environ.pop("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", None)
+                else:
+                    os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = old_scripts_dir
         if isinstance(result, tuple) and len(result) >= 3:
             converter, supported_text_archs, supported_vision_archs = result[:3]
         elif isinstance(result, str):
