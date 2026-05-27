@@ -276,7 +276,7 @@ class MLXTrainer:
         """
         trainable = dict(tree_flatten(model.trainable_parameters()))
         if not trainable:
-            return  # why safe: nothing trainable means nothing to suspect-freeze; also avoids requiring model.parameters() on stub models.
+            return  # nothing trainable -> nothing to freeze; also tolerates stub models without .parameters()
         adapter_tensors = collect_mlx_lora_adapter_tensors(model)
         has_lora = any(name in trainable for name in adapter_tensors)
         if not has_lora:
@@ -779,14 +779,10 @@ class MLXTrainer:
             optimizer.update to promote params/m/v to fp32 too.
             """
             scale = mx.array(1.0, dtype=mx.float32) / safe_toks_f
-            # anchor on the parameter suffix so unrelated keys whose path
-            # merely contains "lora_b" (e.g. a routing layer literally named
-            # lora_b_router.weight) do not receive the LoRA+ multiplier.
+            # suffix-anchor: avoid matching unrelated keys like lora_b_router.weight
             if use_lora_plus and (name == "lora_b" or name.endswith(".lora_b")):
                 scale = scale * lora_plus_ratio
-            # Anchor on the path segment so unrelated names with these
-            # substrings (e.g. decoder.not_lm_head_router.weight or
-            # foo.embed_tokens_aux.weight) do not pick up the embedding LR.
+            # segment-match: avoid e.g. not_lm_head_router or embed_tokens_aux substrings
             if use_embedding_lr:
                 _segments = name.split(".")
                 _is_embed_or_lm_head = (
@@ -1407,8 +1403,7 @@ class MLXTrainer:
         from .utils import _extract_mlx_lora_parameters
         output_dir = output_dir or self.args.output_dir
 
-        # Detect LoRA from module structure so reloaded / frozen adapters
-        # still take the adapter-save path.
+        # Detect LoRA from module structure so reloaded / frozen adapters still hit this path.
         adapter_tensors = collect_mlx_lora_adapter_tensors(self.model)
         has_lora = bool(adapter_tensors)
 
@@ -1452,24 +1447,17 @@ class MLXTrainer:
                 ),
             }
 
-            # Preserve intentionally trained non-LoRA tensors (embeddings,
-            # lm_head, projector, vision, norm) when they live OUTSIDE any
-            # LoRA-wrapped module, while still dropping accidentally trainable
-            # base weights INSIDE a LoRA module (q_proj.weight under a
-            # LoRA-wrapped q_proj would re-leak the original Studio reload
-            # bug). When the only non-LoRA trainables sit under a LoRA
-            # module, the artifact stays lean and LoRA-only.
+            # Preserve intentionally trained non-LoRA tensors (embeddings, lm_head,
+            # projector, vision, norm) outside LoRA modules; drop reload-leaked base
+            # weights inside a wrapped module (the original Studio adapter-bloat bug).
             trainable = dict(tree_flatten(self.model.trainable_parameters()))
             adapter_keys = set(adapter_tensors)
             lora_module_prefixes = tuple(
                 f"{name}." for name, _ in iter_mlx_lora_modules(self.model)
                 if name
             )
-            # Route via the shared filter in utils so the routing here
-            # stays in lockstep with save_trainable_adapters/save_pretrained_merged.
-            # That filter drops wrapped base `.weight`/`.scales`/`.biases`
-            # under LoRA prefixes as reload-leaks but preserves
-            # intentional trainables like `.bias`.
+            # Route via the shared utils filter so trainer/save_trainable_adapters/
+            # save_pretrained_merged stay in lockstep.
             from .utils import _is_base_tensor_inside_lora_module
             has_root_lora_module = any(
                 name == "" for name, _ in iter_mlx_lora_modules(self.model)

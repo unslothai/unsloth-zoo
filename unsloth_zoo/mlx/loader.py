@@ -1074,24 +1074,15 @@ def _quant_config_from_resolved_map(resolved_map):
 
 
 def _apply_lora_at_paths(model, module_paths, adapter_cfg):
-    """Recreate LoRA / DoRA layers at saved module paths so vision/projector
-    LoRA survives reload (mlx-lm's load_adapters only rebuilds the language
-    tower).
+    """Recreate LoRA / DoRA layers at saved module paths so vision/projector LoRA
+    survives reload (mlx-lm's load_adapters only rebuilds the language tower).
 
-    Honours adapter_config['fine_tune_type']=='dora' by wrapping with DoRA
-    classes instead of plain LoRA; otherwise `q_proj.m` magnitude tensors
-    from DoRA exports would be silently dropped by the downstream
-    `model.load_weights(..., strict=False)` because the recreated wrapper
-    has no `.m` parameter.
+    Honours fine_tune_type=='dora' so DoRA `.m` magnitudes survive the downstream
+    strict=False reload (a plain LoRA wrapper has no `.m` parameter).
     """
     import mlx.nn as nn
-    # LoRALinear is the only mlx-lm LoRA class that has shipped on every
-    # mlx-lm version we support; LoRAEmbedding and LoRASwitchLinear were
-    # added later. Older installs that only expose LoRALinear must still
-    # be able to reload language-tower / projector LoRA adapters, so
-    # wrap the optional imports in try/except and treat the missing
-    # classes as "skip this module type" instead of crashing the whole
-    # reload path before any wrapper is attached.
+    # Only LoRALinear is guaranteed on every supported mlx-lm; LoRAEmbedding /
+    # LoRASwitchLinear are newer and treated as "skip this module type" if missing.
     from mlx_lm.tuner.lora import LoRALinear
     try:
         from mlx_lm.tuner.lora import LoRAEmbedding
@@ -1147,12 +1138,8 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
             elif LoRAEmbedding is not None:
                 wrapper_cls = LoRAEmbedding
             else:
-                # mlx-lm older than the LoRAEmbedding release cannot
-                # rebuild an embedding LoRA wrapper. Silently skipping
-                # would drop the saved embed_tokens.lora_a/lora_b tensors
-                # in the downstream strict=False reload, leaving the user
-                # with a partially-loaded adapter and no warning. Fail
-                # loudly, parallel to the DoRA-unavailable guard above.
+                # Fail loud: silently skipping would drop saved embed_tokens.lora_a/lora_b
+                # via the strict=False reload, parallel to the DoRA-unavailable guard above.
                 raise RuntimeError(
                     "Unsloth MLX: adapter_config_json contains an embedding "
                     f"LoRA path {name!r}, but this mlx-lm version does not "
@@ -1161,8 +1148,7 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
                     "are not silently dropped."
                 )
         elif switch_types and isinstance(module, switch_types):
-            # mlx-lm has no DoRA switch wrapper; fall back to plain LoRA
-            # for switch modules even when the rest of the model is DoRA.
+            # No DoRA switch wrapper exists; fall back to plain LoRA for switch modules.
             if LoRASwitchLinear is None:
                 continue
             wrapper_cls = LoRASwitchLinear
@@ -1176,18 +1162,9 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg):
         except TypeError:
             wrapped = wrapper_cls.from_base(module)
 
-        # Some VLM trees (e.g. Qwen2.5-VL's vision merger / projector
-        # `layers` list) install LoRA at a numeric path segment such as
-        # `vision_tower.merger.layers.0`, mirroring the navigation that
-        # `_lora_walk_module` uses at training time. A bare
-        # `setattr(parent, "0", wrapped)` is a silent no-op because
-        # `hasattr(parent, "0")` returns False; the following
-        # `load_weights(strict=False)` would then silently drop every
-        # saved tensor for that numeric leaf. Navigate the path
-        # segment-by-segment, preferring `parent[int(seg)]` for list /
-        # tuple containers and falling back to `getattr` for attribute
-        # access. Apply the same try-int / fallback-setattr pattern to
-        # the leaf so list-indexed wrappers install correctly.
+        # Navigate numeric path segments (e.g. Qwen2.5-VL merger.layers.0) via
+        # parent[int(seg)] with getattr fallback; bare setattr(parent, "0", ...)
+        # is a silent no-op and the strict=False reload would drop those tensors.
         parts = name.split(".")
         parent = model
         for seg in parts[:-1]:
@@ -2541,22 +2518,9 @@ class FastMLXModel:
                                 from mlx_lm.tuner.utils import load_adapters
                                 model = load_adapters(model, local_path)
                         except RuntimeError as _exc:
-                            # `_apply_lora_at_paths` raises a namespaced
-                            # `RuntimeError("Unsloth MLX: ...")` for two
-                            # capability gaps: (a) the adapter declares
-                            # `fine_tune_type='dora'` but `mlx_lm.tuner.dora`
-                            # is unavailable, or (b) the adapter pinned an
-                            # embedding LoRA path but `mlx_lm.tuner.lora.`
-                            # `LoRAEmbedding` is unavailable. Falling back
-                            # to `load_adapters()` in either case silently
-                            # drops the saved DoRA `.m` magnitudes or
-                            # `embed_tokens.lora_a` / `.lora_b` tensors via
-                            # the strict=False reload, defeating the
-                            # fail-loud guards inside `_apply_lora_at_paths`.
-                            # Re-raise any `"Unsloth MLX:"` namespaced
-                            # signal so the caller sees the capability gap
-                            # explicitly; mirrors the outer handler's
-                            # broader check below.
+                            # Re-raise the "Unsloth MLX:" capability-gap signal from
+                            # _apply_lora_at_paths (DoRA / LoRAEmbedding unavailable)
+                            # so it is not silently swallowed by the load_adapters fallback.
                             if "Unsloth MLX:" in str(_exc):
                                 raise
                             from mlx_lm.tuner.utils import load_adapters
@@ -2565,13 +2529,8 @@ class FastMLXModel:
                             from mlx_lm.tuner.utils import load_adapters
                             model = load_adapters(model, local_path)
                     else:
-                        # Mirror the saved-paths DoRA capability guard: if
-                        # the adapter declares fine_tune_type='dora' but
-                        # mlx_lm.tuner.dora is unavailable, falling through
-                        # to load_adapters() rebuilds plain LoRA wrappers
-                        # and silently drops the saved .m magnitude tensors
-                        # via the strict=False reload. Fail loudly here so
-                        # the user knows to install a DoRA-capable mlx-lm.
+                        # Mirror the saved-paths DoRA capability guard: load_adapters
+                        # would rebuild plain LoRA and silently drop saved .m magnitudes.
                         if adapter_cfg.get("fine_tune_type") == "dora":
                             try:
                                 import mlx_lm.tuner.dora  # noqa: F401
@@ -2624,14 +2583,9 @@ class FastMLXModel:
             except Exception as e:
                 if isinstance(e, ValueError) and "Unsloth:" in str(e):
                     raise
-                # Re-raise namespaced Unsloth MLX RuntimeErrors too so
-                # the inner-handler's intentional re-raise (e.g. the
-                # DoRA-unavailable signal from _apply_lora_at_paths)
-                # is not swallowed back into the silent standard-load
-                # fallback below. Without this the DoRA adapter would
-                # silently drop and the user would get a base-only
-                # model with no warning that fine_tune_type='dora'
-                # was unsupported.
+                # Also re-raise the namespaced "Unsloth MLX:" capability-gap signal
+                # so the inner-handler's intentional re-raise is not swallowed back
+                # into the silent standard-load fallback below.
                 if isinstance(e, RuntimeError) and "Unsloth MLX:" in str(e):
                     raise
                 print(f"Unsloth: LoRA adapter detection failed ({e}), falling back to standard load.")
