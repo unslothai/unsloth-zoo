@@ -415,6 +415,53 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
 
 
+def _csm_audio_eos_label_mask(audio_eos_token_mask, labels):
+    return audio_eos_token_mask & (labels != -100)
+pass
+
+
+def _tie_csm_audio_embeddings(model):
+    try:
+        audio_embeddings = model.backbone_model.embed_tokens.embed_audio_tokens
+        depth_embeddings = model.depth_decoder.model.embed_tokens
+        if audio_embeddings.weight.shape == depth_embeddings.weight.shape:
+            # Transformers 5.5 can miss this tie while loading older CSM checkpoints.
+            audio_embeddings.weight = depth_embeddings.weight
+    except Exception:
+        pass
+    return model
+pass
+
+
+def patch_CsmForConditionalGeneration_from_pretrained():
+    try:
+        import transformers.models.csm.modeling_csm
+    except Exception as e:
+        return raise_error("CsmForConditionalGeneration.from_pretrained", e)
+
+    target_cls = transformers.models.csm.modeling_csm.CsmForConditionalGeneration
+    storage_name = _get_unique_storage_name(target_cls, "from_pretrained")
+    if hasattr(target_cls, storage_name):
+        original_from_pretrained = getattr(target_cls, storage_name)
+    else:
+        original_from_pretrained = target_cls.from_pretrained
+        setattr(target_cls, storage_name, original_from_pretrained)
+    pass
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        model = original_from_pretrained(*args, **kwargs)
+        return _tie_csm_audio_embeddings(model)
+    pass
+    try:
+        from_pretrained.__signature__ = inspect.signature(original_from_pretrained)
+    except Exception:
+        pass
+    target_cls.from_pretrained = from_pretrained
+pass
+TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_from_pretrained)
+
+
 def patch_transformers_masks():
     if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
         return
@@ -798,8 +845,9 @@ def patch_CsmForConditionalGeneration_merge():
             if labels is not None:
                 labels_expanded = labels.unsqueeze(-1).repeat(1, 1, self.config.num_codebooks)
                 labels_expanded[audio_token_mask] = batched_audio_token_ids[audio_codes_mask]
-                # fix make sure to set eos_token_id as a valid label to predict
-                labels_expanded[audio_eos_token_mask] = audio_eos_frame_ids
+                # Preserve processor masking: 4.52 masks audio EOS, while newer processors label it.
+                audio_eos_label_mask = _csm_audio_eos_label_mask(audio_eos_token_mask, labels)
+                labels_expanded[audio_eos_label_mask] = audio_eos_frame_ids
                 # mask depth decoder
                 depth_decoder_ignore_frames_idxs = (labels == -101).nonzero(as_tuple=True)
                 labels_expanded[depth_decoder_ignore_frames_idxs[0], depth_decoder_ignore_frames_idxs[1], 1:] = -100

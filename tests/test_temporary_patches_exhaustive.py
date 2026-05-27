@@ -939,6 +939,37 @@ def test_csm_depth_decoder_leaf_embedding_hook_backward(backbone_requires_grad):
         model.model.forward = original_forward
 
 
+def test_csm_audio_eos_label_mask_respects_processor_ignore():
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo.temporary_patches.misc import _csm_audio_eos_label_mask
+
+    audio_eos_token_mask = torch.tensor([[False, True, True]])
+    labels = torch.tensor([[128002, -100, 128003]])
+
+    assert _csm_audio_eos_label_mask(audio_eos_token_mask, labels).tolist() == [[False, False, True]]
+
+
+def test_csm_audio_embeddings_tie_helper():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _tie_csm_audio_embeddings
+
+    audio = torch.nn.Embedding(4, 3)
+    depth = torch.nn.Embedding(4, 3)
+    model = SimpleNamespace(
+        backbone_model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(embed_audio_tokens=audio),
+        ),
+        depth_decoder=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=depth),
+        ),
+    )
+
+    assert audio.weight.data_ptr() != depth.weight.data_ptr()
+    _tie_csm_audio_embeddings(model)
+    assert audio.weight.data_ptr() == depth.weight.data_ptr()
+
+
 def test_csm_for_conditional_generation_forward_named_params():
     """misc.py:373 patches CsmForConditionalGeneration.forward (input_ids,
     input_values, ..., logits_to_keep). Resolves via ``_original_*``
