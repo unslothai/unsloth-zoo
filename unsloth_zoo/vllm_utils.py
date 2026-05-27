@@ -885,6 +885,15 @@ def patch_vllm_decompose_size_nodes():
                         for k, v in user.kwargs.items():
                             if isinstance(v, (tuple, list)):
                                 new_kwargs[k] = type(v)(_replace_in_args(list(v), node, dims))
+                            elif isinstance(v, fx.Node) and v is node:
+                                # `kw=size_node` -- the kwarg expects the
+                                # full shape tuple (e.g. torch.reshape(...,
+                                # shape=x.size())), not a single dimension.
+                                # Picking dims[0] would shrink shape to a
+                                # scalar and produce invalid graph
+                                # semantics. Pass the decomposed dims as
+                                # a tuple, matching torch.Size semantics.
+                                new_kwargs[k] = tuple(dims)
                             else:
                                 new_kwargs[k] = _replace_in_args([v], node, dims)[0]
                         user.kwargs = new_kwargs
