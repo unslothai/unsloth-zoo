@@ -1380,7 +1380,12 @@ class MLXTrainer:
 
     def save_model(self, output_dir=None):
         """Save LoRA adapters or full merged model (if no LoRA)."""
-        from .utils import save_merged_model
+        from .utils import (
+            _coerce_mlx_lora_scale,
+            _get_mlx_dropout_probability,
+            _infer_mlx_lora_rank,
+            save_merged_model,
+        )
         output_dir = output_dir or self.args.output_dir
 
         trainable = dict(tree_flatten(self.model.trainable_parameters()))
@@ -1390,36 +1395,40 @@ class MLXTrainer:
             hf_repo = getattr(self.model, "_hf_repo", None) or ""
 
 
-            _lora_rank, _lora_scale, _lora_dropout = 8, 1.0, 0.0
+            # Infer rank/scale/dropout from the first reloadable LoRA module;
+            # leave as None on failure so we never persist placeholders
+            # (rank=8, scale=1.0) that silently mis-scale on reload.
+            _lora_rank = _lora_scale = _lora_dropout = None
             for _, m in self.model.named_modules():
-                if hasattr(m, "lora_a"):
-                    _lora_rank = m.lora_a.shape[-1]
-                    _lora_scale = getattr(m, "scale", 1.0)
-
-                    _drop = getattr(m, "dropout", None)
-                    _lora_dropout = getattr(_drop, "p", 0.0) if _drop else 0.0
-                    break
+                if not (hasattr(m, "lora_a") and hasattr(m, "lora_b")):
+                    continue
+                inferred_rank = _infer_mlx_lora_rank(m)
+                if inferred_rank is None:
+                    continue
+                _lora_rank = inferred_rank
+                # _coerce_mlx_lora_scale preserves alpha/r for LoRASwitchLinear's
+                # per-expert mx.array where float()/.item() both raise.
+                _lora_scale = _coerce_mlx_lora_scale(getattr(m, "scale", 1.0))
+                _lora_dropout = _get_mlx_dropout_probability(
+                    getattr(m, "dropout", None)
+                )
+                break
 
 
             from .utils import _get_transformer_layers
             layers = _get_transformer_layers(self.model)
-            _num_layers = len(layers) if layers else -1
+            # mlx-lm load_adapters does attr-access on config.num_layers,
+            # so the key MUST be present. -1 is the legacy "all layers"
+            # sentinel; a positive count from _get_transformer_layers() wins.
+            try:
+                _num_layers = len(layers) if layers is not None else -1
+            except TypeError:
+                _num_layers = -1
+            if _num_layers <= 0:
+                _num_layers = -1
 
-            # Save in mlx-lm's expected format so load_adapters() works
-            self.model.save_lora_adapters(output_dir, adapter_config={
-                # mlx-lm format (load_adapters expects these)
-                "num_layers": _num_layers,
-                "lora_parameters": {
-                    "rank": _lora_rank,
-                    "scale": _lora_scale,
-                    "dropout": _lora_dropout,
-                },
+            _adapter_config = {
                 "fine_tune_type": "lora",
-                # mlx-vlm format (expects rank/scale at top level)
-                "rank": _lora_rank,
-                "scale": _lora_scale,
-                "dropout": _lora_dropout,
-                # Shared fields
                 "peft_type": "LORA",
                 "base_model_name_or_path": hf_repo,
                 "learning_rate": self.args.learning_rate,
@@ -1435,7 +1444,22 @@ class MLXTrainer:
                 "base_quantized_source": getattr(
                     self.model, "_unsloth_quantized_source", None,
                 ),
-            })
+            }
+            # Always present so mlx-lm load_adapters() can attr-access it.
+            _adapter_config["num_layers"] = _num_layers
+            if _lora_rank is not None:
+                _adapter_config["lora_parameters"] = {
+                    "rank": _lora_rank,
+                    "scale": _lora_scale,
+                    "dropout": _lora_dropout,
+                }
+                # mlx-vlm reads these top-level instead of lora_parameters.*.
+                _adapter_config["rank"] = _lora_rank
+                _adapter_config["scale"] = _lora_scale
+                _adapter_config["dropout"] = _lora_dropout
+
+            # Save in mlx-lm's expected format so load_adapters() works
+            self.model.save_lora_adapters(output_dir, adapter_config=_adapter_config)
             # why: VLM processors include the inner tokenizer; double-save
             # rewrites the same files. Skip when the processor will cover it.
             _processor = self.processor or getattr(self.model, "_processor", None)
