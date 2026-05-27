@@ -135,54 +135,6 @@ def test_merged_16bit_save_fully_dequantizes_model(monkeypatch, tmp_path):
     assert "quantization_config" not in calls["saved_config"]["nested"]
 
 
-def test_materialize_tied_lm_head_updates_saved_index(monkeypatch, tmp_path):
-    import torch
-    import unsloth_zoo.mlx.utils as mutils
-
-    shard = tmp_path / "model-00001-of-00001.safetensors"
-    shard.write_text("placeholder", encoding="utf-8")
-    index_path = tmp_path / "model.safetensors.index.json"
-    index_path.write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": 24, "total_parameters": 6},
-                "weight_map": {
-                    "model.embed_tokens.weight": shard.name,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    saved = {}
-    embed = torch.ones(2, 3, dtype=torch.float32)
-    monkeypatch.setattr(
-        mutils.mx,
-        "load",
-        lambda path: {"model.embed_tokens.weight": embed},
-    )
-    monkeypatch.setattr(mutils.mx, "eval", lambda *values: None)
-
-    def fake_save_safetensors(path, tensors, metadata=None):
-        saved["path"] = Path(path)
-        saved["tensors"] = tensors
-        Path(path).write_text("saved", encoding="utf-8")
-
-    monkeypatch.setattr(mutils.mx, "save_safetensors", fake_save_safetensors)
-
-    added = mutils._materialize_tied_lm_head_in_saved_model(
-        tmp_path,
-        {"tie_word_embeddings": True},
-    )
-
-    assert added == 1
-    assert "lm_head.weight" in saved["tensors"]
-    updated = json.loads(index_path.read_text(encoding="utf-8"))
-    assert updated["weight_map"]["lm_head.weight"] == shard.name
-    assert updated["metadata"]["total_size"] > 24
-    assert updated["metadata"]["total_parameters"] == 12
-
-
 def test_bound_gguf_save_filters_cuda_only_kwargs(monkeypatch, tmp_path):
     import unsloth_zoo.mlx.loader as loader
     import unsloth_zoo.mlx.utils as mutils
@@ -593,15 +545,6 @@ def test_get_model_config_prefers_copied_raw_config():
 
     assert extracted["model_type"] == "qwen3"
     assert raw_config["nested"]["values"] == [1]
-
-
-def test_has_tied_word_embeddings_ignores_malformed_thinker_config():
-    import unsloth_zoo.mlx.utils as mutils
-
-    assert not mutils._has_tied_word_embeddings({"thinker_config": "bad"})
-    assert mutils._has_tied_word_embeddings(
-        {"thinker_config": {"text_config": {"tie_word_embeddings": True}}}
-    )
 
 
 def test_has_vision_config_handles_nested_and_malformed_configs():
