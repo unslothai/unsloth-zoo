@@ -354,14 +354,18 @@ def make_cce_loss_fn(model):
             bi = layer.biases if _has_biases else mx.zeros_like(layer.scales)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            # Widen unsigned label dtypes so `mx.where(..., -100, ...)` can
+            # inject the signed sentinel (crashes on uint under the shim).
+            targets = _normalize_cce_label_dtype(targets)
             if labels is None:
                 mask = length_mask
             else:
                 mask = mx.logical_and(targets != -100, length_mask)
-            masked_targets = mx.where(mask, targets, -100)
+            ignore = mx.array(-100, dtype=targets.dtype)
+            masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE narrows after validating
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -387,14 +391,18 @@ def make_cce_loss_fn(model):
                 w = mx.stop_gradient(w)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            # See quantized branch: widen so the mx.where sentinel injection
+            # works and uint64 wrap labels survive to the CCE validity check.
+            targets = _normalize_cce_label_dtype(targets)
             if labels is None:
                 mask = length_mask
             else:
                 mask = mx.logical_and(targets != -100, length_mask)
-            masked_targets = mx.where(mask, targets, -100)
+            ignore = mx.array(-100, dtype=targets.dtype)
+            masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE narrows after validating
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -429,14 +437,18 @@ def make_baseline_loss_fn():
             return ce, ntoks
         # labels-aware path: train_on_responses_only style masking.
         inputs = batch[:, :-1]
-        targets = labels[:, 1:]
+        # Widen unsigned dtypes so the mask compare and the `mx.where(..., -100, ...)`
+        # sentinel injection both work under the torch-backed MLX shim.
+        targets = _normalize_cce_label_dtype(labels[:, 1:])
         logits = model(inputs)
         steps = mx.arange(1, targets.shape[1] + 1)
         length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
         mask = mx.logical_and(targets != -100, length_mask).astype(mx.float32)
-        # Replace -100 with 0 before CE — MLX has no ignore_index;
+        # Replace -100 with 0 before CE, MLX has no ignore_index;
         # the mask already zeros out these positions in the loss.
-        safe_targets = mx.where(targets == -100, 0, targets)
+        safe_targets = mx.where(
+            targets == -100, mx.array(0, dtype=targets.dtype), targets,
+        )
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -500,6 +512,40 @@ def _get_image_token_ids(model):
     return ids  # plain Python list; avoids mx.eval in the hot path
 
 
+def _normalize_cce_label_dtype(labels):
+    """Widen unsigned label dtypes to int64 so masking can inject -100.
+
+    uint8/16/32 cast losslessly. uint64 values >= 2**63 wrap negative on
+    cast and are routed to an out-of-vocab sentinel (1<<62) so wrap
+    artifacts (e.g. 2**64-100) NaN-poison instead of colliding with
+    ignore_index. Returns labels unchanged for signed/float dtypes.
+    """
+    if labels is None:
+        return labels
+    dtype = getattr(labels, "dtype", None)
+    if dtype is None:
+        return labels
+    uint64_dtype = getattr(mx, "uint64", None)
+    if uint64_dtype is not None and dtype == uint64_dtype:
+        # Cast first then detect overflow via `< 0` (raw uint64 compares
+        # crash the torch-backed shim). Route overflow to a sentinel so
+        # wrap artifacts like 2**64-100 do not collide with ignore_index.
+        labels_i64 = labels.astype(mx.int64)
+        invalid_sentinel = mx.array((1 << 62), dtype=mx.int64)
+        return mx.where(labels_i64 < 0, invalid_sentinel, labels_i64)
+    unsigned_dtypes = tuple(
+        d for d in (
+            getattr(mx, "uint8", None),
+            getattr(mx, "uint16", None),
+            getattr(mx, "uint32", None),
+        )
+        if d is not None
+    )
+    if dtype in unsigned_dtypes:
+        return labels.astype(mx.int64)
+    return labels
+
+
 def _mask_image_tokens(targets, image_token_ids):
     """Set image token positions in targets to -100 (ignore_index).
 
@@ -512,11 +558,13 @@ def _mask_image_tokens(targets, image_token_ids):
     """
     if not image_token_ids:
         return targets
+    targets = _normalize_cce_label_dtype(targets)
     # Build a mask: True where target is any image token
     is_image = targets == image_token_ids[0]
     for tok_id in image_token_ids[1:]:
         is_image = is_image | (targets == tok_id)
-    return mx.where(is_image, -100, targets)
+    ignore = mx.array(-100, dtype=targets.dtype)
+    return mx.where(is_image, ignore, targets)
 
 
 def _mask_prompt_tokens(targets, assistant_token_id):
@@ -530,11 +578,13 @@ def _mask_prompt_tokens(targets, assistant_token_id):
     """
     if assistant_token_id <= 0:
         return targets
+    targets = _normalize_cce_label_dtype(targets)
     is_assistant = (targets == assistant_token_id)
     cumulative = mx.cumsum(is_assistant.astype(mx.int32), axis=1)
     has_assistant = mx.any(is_assistant, axis=1, keepdims=True)
     prompt_mask = mx.logical_and(has_assistant, cumulative == 0)
-    return mx.where(prompt_mask, -100, targets)
+    ignore = mx.array(-100, dtype=targets.dtype)
+    return mx.where(prompt_mask, ignore, targets)
 
 
 def _is_vlm_model(model) -> bool:
@@ -605,9 +655,13 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
 
         # Forward pass — let the model create its own causal mask.
         # Pass extra keys (e.g. image_grid_thw for Qwen) that some models need.
+        # Strip the private raw-ids carrier so the backbone never sees it.
         fwd_kwargs = {
             k: v for k, v in batch_dict.items()
-            if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+            if k not in (
+                "input_ids", "pixel_values", "attention_mask", "labels",
+                _RAW_INPUT_IDS_FOR_LABELS,
+            )
             and v is not None
         }
         fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
@@ -618,12 +672,17 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
         if labels is not None:
             # train_on_responses_only: labels encode instruction/padding masking.
             # Still mask image placeholder tokens.
-            targets = labels[:, 1:]
+            targets = _normalize_cce_label_dtype(labels[:, 1:])
             targets = _mask_image_tokens(targets, _image_token_ids)
             logits, targets = _align_logits_with_labels(logits, targets)
             mask = (targets != -100).astype(mx.float32)
         else:
-            targets = input_ids[:, 1:]
+            # Use the raw pre-narrow ids preserved by `_to_mx_vlm_batch` so
+            # wide invalid ids reach runtime CCE as out-of-vocab sentinels
+            # rather than wrapping to -100. Falls back to narrowed input_ids
+            # when no raw copy was preserved.
+            target_source = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, input_ids)
+            targets = _normalize_cce_label_dtype(target_source[:, 1:])
 
             # Handle sequence length mismatch from vision token injection
             logits, targets = _align_logits_with_labels(logits, targets)
@@ -639,11 +698,17 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
             targets = _mask_image_tokens(targets, _image_token_ids)
             targets = _mask_prompt_tokens(targets, _assistant_token_id)
             # Update length_mask to exclude masked positions
-            mask = mx.where(targets == -100, 0, length_mask)
+            mask = mx.where(
+                targets == -100,
+                mx.array(0, dtype=length_mask.dtype),
+                length_mask,
+            )
 
-        # Replace -100 with 0 before CE — MLX has no ignore_index;
+        # Replace -100 with 0 before CE, MLX has no ignore_index;
         # the mask already zeros out these positions in the loss.
-        safe_targets = mx.where(targets == -100, 0, targets)
+        safe_targets = mx.where(
+            targets == -100, mx.array(0, dtype=targets.dtype), targets,
+        )
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -760,9 +825,13 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         fwd_attn_mask = attention_mask[:, :-1]
 
     # Collect extra keys (e.g. image_grid_thw for Qwen) that some models need.
+    # Strip the private raw-ids carrier so the embedder/backbone never sees it.
     extra_kwargs = {
         k: v for k, v in batch_dict.items()
-        if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+        if k not in (
+            "input_ids", "pixel_values", "attention_mask", "labels",
+            _RAW_INPUT_IDS_FOR_LABELS,
+        )
         and v is not None
     }
     extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
@@ -792,16 +861,22 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         masked_targets = _mask_image_tokens(targets, image_token_ids)
         ntoks = (masked_targets != -100).sum()
     else:
-        targets = input_ids[:, 1:]
+        # Use the raw pre-narrow ids preserved by `_to_mx_vlm_batch` so
+        # wide invalid ids reach runtime CCE as out-of-vocab sentinels
+        # rather than wrapping to -100. Falls back to narrowed input_ids
+        # when no raw copy was preserved.
+        target_source = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, input_ids)
+        targets = _normalize_cce_label_dtype(target_source[:, 1:])
 
         if attention_mask is not None:
             length_mask = attention_mask[:, 1:][:, :targets.shape[1]]
         else:
             length_mask = mx.ones_like(targets, dtype=mx.float32)
 
-        masked_targets = mx.where(length_mask, targets, -100)
+        ignore = mx.array(-100, dtype=targets.dtype)
+        masked_targets = mx.where(length_mask, targets, ignore)
 
-        # Mask image placeholder tokens — they're fixed special tokens that
+        # Mask image placeholder tokens, they're fixed special tokens that
         # provide no useful gradient signal.
         masked_targets = _mask_image_tokens(masked_targets, image_token_ids)
 
@@ -881,6 +956,26 @@ def _normalize_int_tuple(values):
     return tuple(int(x) for x in values)
 
 
+def _normalize_numpy_cce_labels(labels):
+    """numpy analogue of `_normalize_cce_label_dtype` for VLM expand paths.
+
+    Routes np.uint64 values above 2**63-1 to an out-of-vocab sentinel
+    (1<<62) so wrap artifacts (e.g. 2**64-100) do not collide with -100
+    and do not OverflowError on assignment into the int64 padded buffer.
+    """
+    labels_np = np.asarray(labels)
+    if labels_np.dtype == np.uint64:
+        overflow_mask = labels_np > np.uint64((1 << 63) - 1)
+        return np.where(
+            overflow_mask,
+            np.int64(1 << 62),
+            labels_np.astype(np.int64),
+        )
+    if np.issubdtype(labels_np.dtype, np.unsignedinteger):
+        return labels_np.astype(np.int64)
+    return labels_np
+
+
 def _expand_image_token_sequences(
     input_ids,
     attention_mask,
@@ -894,7 +989,7 @@ def _expand_image_token_sequences(
         if attention_mask is not None
         else np.ones_like(input_ids_np, dtype=np.int32)
     )
-    labels_np = np.asarray(labels) if labels is not None else None
+    labels_np = _normalize_numpy_cce_labels(labels) if labels is not None else None
 
     expanded_ids = []
     expanded_masks = []
@@ -924,8 +1019,10 @@ def _expand_image_token_sequences(
 
     padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
     padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
+    # int64 so wide invalid labels survive expansion without OverflowError;
+    # runtime CCE narrows post-validate.
     padded_labels = (
-        np.full((len(expanded_labels), max_len), -100, dtype=np.int32)
+        np.full((len(expanded_labels), max_len), -100, dtype=np.int64)
         if expanded_labels is not None else None
     )
     for row_idx, (row_ids, row_mask) in enumerate(zip(expanded_ids, expanded_masks)):
@@ -952,7 +1049,7 @@ def _expand_token_runs(
         if attention_mask is not None
         else np.ones_like(input_ids_np, dtype=np.int32)
     )
-    labels_np = np.asarray(labels) if labels is not None else None
+    labels_np = _normalize_numpy_cce_labels(labels) if labels is not None else None
 
     expanded_ids = []
     expanded_masks = []
@@ -996,8 +1093,9 @@ def _expand_token_runs(
 
     padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
     padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
+    # int64 so wide invalid labels survive expansion without OverflowError.
     padded_labels = (
-        np.full((len(expanded_labels), max_len), -100, dtype=np.int32)
+        np.full((len(expanded_labels), max_len), -100, dtype=np.int64)
         if expanded_labels is not None else None
     )
     for row_idx, (row_ids, row_mask) in enumerate(zip(expanded_ids, expanded_masks)):
@@ -1326,15 +1424,25 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
         input_ids = batch_dict.get("input_ids")
         if input_ids is not None:
             _labels = batch_dict.get("labels")
+            _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+            # When labels are absent, expand the raw carrier alongside
+            # input_ids so labels-free paths still see wide invalid ids at
+            # their original positions. When labels exist, the carrier is
+            # redundant and gets popped to avoid a stale pre-expansion copy
+            # tripping _apply_response_mask_to_vlm_batch later.
+            _label_source = _labels if _labels is not None else _raw_labels
             _expanded = _expand_image_token_sequences(
                 input_ids=input_ids,
                 attention_mask=batch_dict.get("attention_mask"),
                 image_token_id=int(_config_get(config, "image_token_index")),
                 repeat_count=int(_config_get(config, "num_image_tokens")),
-                labels=_labels,
+                labels=_label_source,
             )
             if _labels is not None:
                 batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+            elif _raw_labels is not None:
+                batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
             else:
                 batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
@@ -1367,14 +1475,21 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                         image_idx += 1
                     replacements.append(tuple(batch_replacements))
                 _labels = batch_dict.get("labels")
+                _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+                # See multi_modality branch above for why we expand the raw
+                # carrier when labels are absent and pop it when labels exist.
+                _label_source = _labels if _labels is not None else _raw_labels
                 _expanded = _expand_token_runs(
                     input_ids=input_ids,
                     attention_mask=batch_dict.get("attention_mask"),
                     replacements_by_batch=tuple(replacements),
-                    labels=_labels,
+                    labels=_label_source,
                 )
                 if _labels is not None:
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+                elif _raw_labels is not None:
+                    batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
@@ -1439,14 +1554,21 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                 replacements.append(tuple(batch_replacements))
             if replacements:
                 _labels = batch_dict.get("labels")
+                _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+                # See multi_modality branch above for why we expand the raw
+                # carrier when labels are absent and pop it when labels exist.
+                _label_source = _labels if _labels is not None else _raw_labels
                 _expanded = _expand_token_runs(
                     input_ids=input_ids,
                     attention_mask=batch_dict.get("attention_mask"),
                     replacements_by_batch=tuple(replacements),
-                    labels=_labels,
+                    labels=_label_source,
                 )
                 if _labels is not None:
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+                elif _raw_labels is not None:
+                    batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
@@ -1542,7 +1664,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
             # gradients (see runtime_cce.py VJP), so stop_gradient is
             # redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE narrows after validating
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -1563,7 +1685,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE narrows after validating
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -2142,6 +2264,11 @@ def _format_vlm_images_for_processor(all_images):
     return all_images
 
 
+# Private key carrying raw (pre-int32-narrow) input_ids through the VLM
+# batch dict for labels-free / response-mask paths. Stripped before forward.
+_RAW_INPUT_IDS_FOR_LABELS = "_unsloth_raw_input_ids_for_labels"
+
+
 def _to_mx_vlm_batch(inputs):
     batch = {}
     for key, value in inputs.items():
@@ -2161,11 +2288,21 @@ def _to_mx_vlm_batch(inputs):
             batch[key] = value
 
     if "input_ids" in batch:
+        # Preserve raw input_ids before the int32 narrow so labels-free /
+        # response-mask paths can derive labels from wide invalid ids that
+        # would otherwise wrap to -100 and look like ignore_index.
+        if "labels" not in batch:
+            batch[_RAW_INPUT_IDS_FOR_LABELS] = _normalize_cce_label_dtype(
+                batch["input_ids"]
+            )
         batch["input_ids"] = batch["input_ids"].astype(mx.int32)
     if "attention_mask" in batch:
         batch["attention_mask"] = batch["attention_mask"].astype(mx.int32)
+    # Do NOT narrow labels to int32: runtime CCE validates the wide dtype
+    # first so wrap artifacts NaN-poison instead of looking like -100.
+    # Unsigned dtypes still get widened to int64 so masking can inject -100.
     if "labels" in batch:
-        batch["labels"] = batch["labels"].astype(mx.int32)
+        batch["labels"] = _normalize_cce_label_dtype(batch["labels"])
 
     return batch
 
@@ -2219,9 +2356,22 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
     prompt_inputs = _processor_vlm_inputs(
         processor, prompt_texts, all_images, max_seq_length
     )
+
+    # Build labels from the raw processor output BEFORE _to_mx_vlm_batch
+    # narrows to int32, so wide invalid ids survive to the CCE validity
+    # check. For uint64, route values >= 2**63 to a sentinel because a
+    # direct int64 cast wraps 2**64-100 onto -100.
+    _raw_input_ids = np.asarray(combined_inputs["input_ids"])
+    if _raw_input_ids.dtype == np.uint64:
+        labels_np = np.where(
+            _raw_input_ids > np.uint64((1 << 63) - 1),
+            np.int64(1 << 62),
+            _raw_input_ids.astype(np.int64),
+        ).copy()
+    else:
+        labels_np = _raw_input_ids.astype(np.int64, copy=True)
     batch = _to_mx_vlm_batch(combined_inputs)
 
-    labels_np = np.array(batch["input_ids"].tolist(), dtype=np.int32)
     prompt_batch = _to_mx_vlm_batch(prompt_inputs)
     prompt_mask = prompt_batch.get("attention_mask")
     prompt_ids = prompt_batch["input_ids"]
@@ -2233,8 +2383,12 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
         labels_np[row, :prompt_len] = -100
     labels = mx.array(labels_np)
     if "attention_mask" in batch:
-        labels = mx.where(batch["attention_mask"] == 0, mx.array(-100), labels)
-    batch["labels"] = labels.astype(mx.int32)
+        labels = mx.where(
+            batch["attention_mask"] == 0,
+            mx.array(-100, dtype=labels.dtype),
+            labels,
+        )
+    batch["labels"] = labels
     return batch
 
 
@@ -2300,17 +2454,25 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn):
     dataset_utils.train_on_responses_only, and stores the result as
     an mx.array in batch_dict["labels"].
     """
-    input_ids = batch_dict["input_ids"]
-    ids_list = input_ids.tolist()
+    # Use the raw pre-narrow ids preserved by `_to_mx_vlm_batch` so the
+    # masking closure sees wide invalid ids before they wrap to -100 and
+    # masquerade as ignore_index.
+    raw_input_ids = batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+    input_ids = raw_input_ids if raw_input_ids is not None else batch_dict["input_ids"]
+    ids_list = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
     result = mask_fn({"input_ids": ids_list})
     labels_list = result["labels"]
     if hasattr(labels_list, "tolist"):
         labels_list = labels_list.tolist()
+    # Normalize unsigned dtypes through both numpy and mx so the downstream
+    # mx.where sentinel injection works and wide invalid ids survive to the
+    # CCE validity check.
+    labels_np = _normalize_numpy_cce_labels(labels_list)
+    labels_array = _normalize_cce_label_dtype(mx.array(labels_np))
     attention_mask = batch_dict.get("attention_mask")
     if attention_mask is not None:
-        labels_array = mx.where(attention_mask == 0, mx.array(-100), mx.array(labels_list))
-    else:
-        labels_array = mx.array(labels_list)
+        ignore = mx.array(-100, dtype=labels_array.dtype)
+        labels_array = mx.where(attention_mask == 0, ignore, labels_array)
     batch_dict["labels"] = labels_array
     return batch_dict
 
