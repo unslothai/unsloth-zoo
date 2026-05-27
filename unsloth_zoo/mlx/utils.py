@@ -3470,7 +3470,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
             base quantization (smaller checkpoint, only meaningful when
             the base was quantized).
     """
-    from mlx_lm.utils import save_model, create_model_card
+    from mlx_lm.utils import save_model, create_model_card, dequantize_model
     from mlx.utils import tree_unflatten
 
     path = Path(path)
@@ -3487,6 +3487,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
         model.update_modules(tree_unflatten(fused_linears))
 
     if dequantize:
+        model = dequantize_model(model)
         cfg = getattr(model, "_config", None)
         if isinstance(cfg, dict):
             model._config = _strip_mlx_quantization_metadata(cfg)
