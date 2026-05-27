@@ -2199,6 +2199,13 @@ def load_vllm(
             # UNSLOTH_VLLM_NO_FLASHINFER for the rest of unsloth_zoo.
             os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
             os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
+            # A user-forced VLLM_ATTENTION_BACKEND=FLASHINFER would keep
+            # vLLM pinned to FLASHINFER even after we poison the import,
+            # so vllm.LLM() still tries to load it and crashes. Drop the
+            # override here so vLLM's own `try: import flashinfer except
+            # ImportError` branch picks FLASH_ATTN instead.
+            if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
+                os.environ.pop("VLLM_ATTENTION_BACKEND", None)
             try:
                 # Drop any cached flashinfer module then mark it None so
                 # `import flashinfer` raises ImportError. None-in-sys.modules

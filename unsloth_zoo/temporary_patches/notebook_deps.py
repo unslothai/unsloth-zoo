@@ -163,6 +163,17 @@ def patch_requires_backends_autoinstall():
                 flag = f"_{b.replace('-', '_')}_available"
                 if hasattr(iu, flag):
                     setattr(iu, flag, True)
+                # transformers 5.x decorates is_<backend>_available with
+                # @lru_cache; without clearing it the cached False from the
+                # original _orig() call gets reused and the retry fails
+                # even though the install succeeded.
+                fn = getattr(iu, f"is_{b.replace('-', '_')}_available", None)
+                cache_clear = getattr(fn, "cache_clear", None)
+                if callable(cache_clear):
+                    try:
+                        cache_clear()
+                    except Exception:
+                        pass
             return _orig(obj, backends)
 
     requires_backends._unsloth_patched = True
