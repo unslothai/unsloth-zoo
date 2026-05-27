@@ -235,9 +235,14 @@ def _looks_like_jupyter_chain() -> bool:
     if (
         "JPY_PARENT_PID" in os.environ
         or "COLAB_RELEASE_TAG" in os.environ
-        or "VSCODE_PID" in os.environ  # VS Code python kernel
     ):
         return True
+    # VSCODE_PID is set by every VS Code subprocess (terminals, debug,
+    # Python LSP) -- not just notebook kernels -- so it can't be used as
+    # a notebook signal on its own. Real VS Code Jupyter kernels import
+    # ipykernel before unsloth_zoo, so the sys.modules probe below still
+    # catches them; a plain VS Code terminal no longer triggers the
+    # eager traitlets install.
     for m in ("IPython", "ipykernel", "google.colab"):
         if m in sys.modules:
             return True
