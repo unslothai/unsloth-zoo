@@ -1524,3 +1524,27 @@ def patch_qwen2vl_image_processor_pixel_attrs():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
+
+
+def patch_deepseek_v2_moe_alias():
+    """Alias DeepseekV2MoE -> DeepseekV2Moe in transformers' modeling_deepseek_v2.
+
+    Transformers 5.x renamed `DeepseekV2MoE` to `DeepseekV2Moe`, but several
+    HF trust_remote_code modeling files (notably deepseek-ai/deepseek-ocr's
+    `modeling_deepseekocr.py`) still import the old name and crash with
+    `ImportError: cannot import name 'DeepseekV2MoE' ... Did you mean:
+    'DeepseekV2Moe'?` before the model can be loaded. Restoring the old
+    spelling as an alias unblocks those notebooks without touching upstream.
+    """
+    try:
+        from transformers.models.deepseek_v2 import modeling_deepseek_v2 as ddv2
+    except Exception:
+        return  # transformers without deepseek_v2 -- nothing to patch.
+    if hasattr(ddv2, "DeepseekV2MoE"):
+        return
+    new_class = getattr(ddv2, "DeepseekV2Moe", None)
+    if new_class is None:
+        return
+    ddv2.DeepseekV2MoE = new_class
+pass
+TEMPORARY_PATCHES.append(patch_deepseek_v2_moe_alias)
