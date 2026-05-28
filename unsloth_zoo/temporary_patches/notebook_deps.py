@@ -187,6 +187,12 @@ def patch_check_imports_autoinstall():
     ``dynamic_module_utils.check_imports`` (ImportError "This modeling file
     requires the following packages..."). That call site never reaches
     ``requires_backends``, so wrap it too.
+
+    Also wraps ``get_class_in_module`` so that ``ModuleNotFoundError``
+    raised from ``module_spec.loader.exec_module`` -- the case where a
+    *submodule* of the modeling file (e.g. ``deepencoder.py``) imports a
+    package that the top-level ``check_imports`` scanner missed -- gets
+    auto-installed too.
     """
     try:
         from transformers import dynamic_module_utils as dmu
@@ -221,6 +227,54 @@ def patch_check_imports_autoinstall():
 
     check_imports._unsloth_patched = True
     dmu.check_imports = check_imports
+
+    # Wrap get_class_in_module to retry on ModuleNotFoundError raised
+    # during ``module_spec.loader.exec_module``. This catches missing deps
+    # that `check_imports` (top-level file scanner) misses because they're
+    # imported by a sibling submodule next to the main modeling file
+    # (e.g. Deepseek-OCR's `deepencoder.py` imports easydict).
+    gcim = getattr(dmu, "get_class_in_module", None)
+    if gcim is None or getattr(gcim, "_unsloth_patched", False):
+        return
+    _orig_gcim = gcim
+
+    def get_class_in_module(*args, **kwargs):
+        try:
+            return _orig_gcim(*args, **kwargs)
+        except ModuleNotFoundError as e:
+            if not _AUTO_INSTALL or _NO_NETWORK:
+                raise
+            pkg = (getattr(e, "name", None) or "").strip()
+            # Only auto-install known-safe packages from the allow-list.
+            if not pkg or pkg not in _ALLOW_LIST:
+                raise
+            if not _try_install_and_import(pkg):
+                raise
+            # Retry once. If the submodule needs a SECOND missing dep we
+            # iterate up to 6 times (well above any real-world chain).
+            for _retry in range(6):
+                try:
+                    return _orig_gcim(*args, **kwargs)
+                except ModuleNotFoundError as e2:
+                    pkg2 = (getattr(e2, "name", None) or "").strip()
+                    if not pkg2 or pkg2 not in _ALLOW_LIST:
+                        raise
+                    if not _try_install_and_import(pkg2):
+                        raise
+            # Give up after 6 retries; surface the latest error.
+            return _orig_gcim(*args, **kwargs)
+
+    get_class_in_module._unsloth_patched = True
+    dmu.get_class_in_module = get_class_in_module
+    # ``get_class_from_dynamic_module`` resolved the reference at import
+    # time, so rebind the call site too.
+    if hasattr(dmu, "get_class_from_dynamic_module"):
+        try:
+            src_globals = getattr(dmu.get_class_from_dynamic_module, "__globals__", None)
+            if isinstance(src_globals, dict) and "get_class_in_module" in src_globals:
+                src_globals["get_class_in_module"] = get_class_in_module
+        except Exception:
+            pass
 
 
 def _looks_like_jupyter_chain() -> bool:
