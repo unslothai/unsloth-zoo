@@ -75,10 +75,81 @@ def patch_synthetic_data_kit_subprocess():
         PipeCapture.__init__ = _pc_init
         PipeCapture._unsloth_echo_stderr = True
 
+    # Wrap subprocess.Popen inside the synthetic module's globals so the
+    # CUDA-clear / env-sanitise fires RIGHT BEFORE the actual fork+exec of
+    # `vllm serve`, after `patch_vllm()` has re-touched CUDA. Clearing
+    # CUDA at __init__ entry was insufficient because patch_vllm() runs
+    # AFTER the wrapper.
+    mod_globals = getattr(orig_init, "__globals__", None)
+    if isinstance(mod_globals, dict) and not getattr(_syn, "_unsloth_popen_patched", False):
+        import subprocess
+        _orig_popen = mod_globals.get("subprocess") or subprocess
+
+        class _CudaClearingPopen(subprocess.Popen):
+            def __init__(self, *a, **kw):
+                # Drop the parent's CUDA context so the child vLLM
+                # subprocess can boot with a clean NVML / Triton state.
+                try:
+                    import torch
+                    if hasattr(torch, "cuda") and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        try:
+                            torch.cuda.synchronize()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                for _ in range(3):
+                    gc.collect()
+                # vLLM EngineCore subprocess often hits
+                # `cudaErrorDevicesUnavailable` when a parent holds an
+                # initialised CUDA context inherited via fork+exec. Force
+                # the child to a clean spawn-style boot by clearing the
+                # vars that would otherwise carry NVML state forward.
+                # CUDA_VISIBLE_DEVICES MUST be preserved.
+                env = kw.get("env")
+                if env is None:
+                    env = dict(os.environ)
+                else:
+                    env = dict(env)
+                for var in (
+                    "LD_PRELOAD",
+                    "VLLM_LOGGING_LEVEL",
+                    "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC",
+                ):
+                    env.pop(var, None)
+                # Force vLLM to use spawn for its EngineCore worker so
+                # the child gets a fresh interpreter not a forked clone.
+                env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+                # If the parent already imported torchao etc. and held a
+                # CUDA context, a stale lazy-init flag can survive
+                # fork+exec. start_new_session=True isolates the
+                # subprocess's PGID so a CUDA-busy SIGINT in the child
+                # can't bubble back into the parent.
+                kw["env"] = env
+                kw.setdefault("start_new_session", True)
+                super().__init__(*a, **kw)
+
+        # Surgical replacement: only swap `subprocess.Popen` as visible
+        # from the synthetic module. Other importers of `subprocess`
+        # see the unmodified original.
+        class _SubprocessShim:
+            __slots__ = ("_real",)
+            def __init__(self, real):
+                object.__setattr__(self, "_real", real)
+            def __getattr__(self, name):
+                if name == "Popen":
+                    return _CudaClearingPopen
+                return getattr(object.__getattribute__(self, "_real"), name)
+
+        mod_globals["subprocess"] = _SubprocessShim(_orig_popen)
+        _syn._unsloth_popen_patched = True
+
     @functools.wraps(orig_init)
     def __init__(self, *args, **kwargs):
-        # Drop CUDA context held by the parent before forking the vLLM
-        # subprocess so the child gets a clean NVML/Triton state.
+        # Drop CUDA context held by the parent before patch_vllm()
+        # re-touches CUDA inside the original __init__. Defensive
+        # double-clear; the Popen wrapper above is the primary fix.
         try:
             import torch
             if hasattr(torch, "cuda") and torch.cuda.is_available():
@@ -91,8 +162,6 @@ def patch_synthetic_data_kit_subprocess():
             pass
         for _ in range(3):
             gc.collect()
-        # Sanitise inherited env that frequently breaks the child vLLM.
-        # CUDA_VISIBLE_DEVICES MUST be preserved.
         for var in ("LD_PRELOAD", "VLLM_LOGGING_LEVEL"):
             os.environ.pop(var, None)
         return orig_init(self, *args, **kwargs)
