@@ -121,6 +121,23 @@ def patch_synthetic_data_kit_subprocess():
                 # Force vLLM to use spawn for its EngineCore worker so
                 # the child gets a fresh interpreter not a forked clone.
                 env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+                # Mirror the parent's FlashInfer-disable decision into the
+                # child's env. The parent's `load_vllm` poisons
+                # ``sys.modules["flashinfer"] = None`` to force vLLM onto
+                # FLASH_ATTN, but that poison does NOT cross the
+                # fork+exec boundary. Without an explicit env hint, the
+                # child re-imports flashinfer, JIT-compiles via nvcc, and
+                # crashes when nvcc is missing (runtime images do not
+                # ship it). Propagate the parent's signal AND set the
+                # vLLM-level env var so the child's vllm.platforms.cuda
+                # picks FLASH_ATTN directly.
+                if env.get("UNSLOTH_VLLM_NO_FLASHINFER") == "1":
+                    env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+                    # Pop a user-set FLASHINFER pin so the child's vllm
+                    # falls through to FLASH_ATTN. If the user pinned a
+                    # different backend, leave it alone.
+                    if env.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
+                        env.pop("VLLM_ATTENTION_BACKEND", None)
                 # If the parent already imported torchao etc. and held a
                 # CUDA context, a stale lazy-init flag can survive
                 # fork+exec. start_new_session=True isolates the
