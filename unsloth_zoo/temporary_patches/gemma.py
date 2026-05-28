@@ -882,3 +882,104 @@ def patch_Gemma3Attention_generic():
     patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention_generic)
+
+
+def patch_Gemma3ForConditionalGeneration_logits_to_keep():
+    """Normalise tensor ``logits_to_keep`` and guard 4-D logits for Gemma3-VL.
+
+    Failure mode (`torch.multinomial: prob_dist must be 1 or 2 dim` at
+    ``transformers/generation/utils.py:_sample``) chain on transformers 5.x:
+
+    1. ``transformers/generation/utils.py`` auto-injects
+       ``model_kwargs["logits_to_keep"] = 1`` because
+       ``Gemma3ForConditionalGeneration.forward`` advertises that param.
+    2. ``prepare_inputs_for_generation`` for Gemma3-VL forwards it through
+       unchanged; for the prefill iteration combined with the
+       ``cache_implementation = "static"`` promotion that
+       ``unsloth_base_fast_generate`` performs for any model with a
+       ``vision_config``, ``logits_to_keep`` arrives as a
+       Tensor of indices, not a Python ``int``.
+    3. The unsloth-zoo compiled cache (``unsloth_compiled_module_gemma3``)
+       emits ``slice_indices = slice(-logits_to_keep, None) if
+       isinstance(logits_to_keep, int) else logits_to_keep`` and then
+       ``hidden_states[:, slice_indices, :]``. With a >=1-D index tensor
+       this fancy-indexes the middle axis and (when transformers chunks the
+       prefill into a 2-D index tensor) yields ``[B, K, S, V]`` logits.
+    4. ``_sample``'s ``outputs.logits[:, -1, :]`` then leaves a 3-D probs
+       tensor, which ``torch.multinomial`` rejects.
+
+    Fix: wrap ``Gemma3ForConditionalGeneration.forward`` to (a) coerce
+    ``logits_to_keep`` to ``int`` (0-D / 1-element Tensor) or a flat 1-D
+    index tensor BEFORE the compiled body sees it, so the compiler's
+    ``slice(-int, None)`` fast path is restored; and (b) on the generate
+    hot path (``labels is None``) defensively flatten any residual
+    ``dim() > 3`` ``outputs.logits`` to ``[B, S, V]``. Training paths emit
+    ``logits = EMPTY_LOGITS`` (1-D ``torch.empty(0)``) which we leave
+    untouched.
+
+    Compatibility:
+    - transformers 4.57.6 (always ``int``): coerce is identity, flatten
+      never fires. No-op.
+    - transformers 5.x (5.0 -> 5.9.0+ confirmed in unsloth-blackwell:test).
+    - TRL 0.22.2 / 0.27.1 / 1.x: all route through ``model.generate``.
+    - peft 0.13-0.19: forward delegation hits our wrapped ``cls.forward``.
+    - vLLM 0.11.2+: never enters ``_sample``; patch is unused.
+    - CUDA / ROCm / XPU / MPS / CPU / MLX: pure tensor ops, no kernels.
+    - ``UNSLOTH_COMPILE_DISABLE=1`` / ``UNSLOTH_COMPILE_OVERWRITE=0``:
+      we wrap the bound method, the closure-captured ``_orig_forward`` is
+      still what the unsloth-zoo compiler reads, so cache hits and SFT
+      training paths are byte-identical.
+
+    Idempotent via ``_unsloth_logits_to_keep_patched`` sentinel on the
+    wrapped forward; no-op if Gemma3 isn't present.
+    """
+    try:
+        import transformers.models.gemma3.modeling_gemma3 as _mg3
+    except Exception:
+        return
+    cls = getattr(_mg3, "Gemma3ForConditionalGeneration", None)
+    if cls is None:
+        return
+    orig_forward = getattr(cls, "forward", None)
+    if orig_forward is None or getattr(orig_forward, "_unsloth_logits_to_keep_patched", False):
+        return
+
+    def _coerce_logits_to_keep(lk):
+        if lk is None or isinstance(lk, int):
+            return lk
+        if isinstance(lk, torch.Tensor):
+            try:
+                if lk.numel() == 1:
+                    return int(lk.item())
+                if lk.dim() > 1:
+                    return lk.reshape(-1)
+            except Exception:
+                pass
+        return lk
+
+    import functools
+
+    @functools.wraps(orig_forward)
+    def forward(self, *args, **kwargs):
+        if "logits_to_keep" in kwargs:
+            kwargs["logits_to_keep"] = _coerce_logits_to_keep(kwargs["logits_to_keep"])
+        out = orig_forward(self, *args, **kwargs)
+        # Defensive 4-D -> 3-D flatten on the generate hot path only.
+        if kwargs.get("labels", None) is None:
+            lg = getattr(out, "logits", None)
+            if isinstance(lg, torch.Tensor) and lg.dim() > 3 and lg.numel() > 0:
+                new_shape = (-1, lg.shape[-2], lg.shape[-1])
+                try:
+                    flat = lg.reshape(new_shape)
+                except RuntimeError:
+                    flat = lg.contiguous().reshape(new_shape)
+                try:
+                    out.logits = flat
+                except Exception:
+                    pass
+        return out
+
+    forward._unsloth_logits_to_keep_patched = True
+    cls.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_logits_to_keep)
