@@ -122,9 +122,13 @@ pass
 
 
 import functools
-torch_distributed_is_initialized = torch.distributed.is_initialized
-torch_distributed_is_torchelastic_launched = torch.distributed.is_torchelastic_launched
-torch_distributed_get_rank = torch.distributed.get_rank
+# ROCm on Windows ships a stubbed torch.distributed that is missing these
+# attributes entirely (https://github.com/ROCm/TheRock/issues/3284).
+# Use getattr with no-op / safe-default lambdas so importing this module
+# never crashes on that platform.
+torch_distributed_is_initialized = getattr(torch.distributed, "is_initialized", lambda: False)
+torch_distributed_is_torchelastic_launched = getattr(torch.distributed, "is_torchelastic_launched", lambda: False)
+torch_distributed_get_rank = getattr(torch.distributed, "get_rank", lambda: 0)
 
 def is_main_process():
     if torch_distributed_is_initialized():
