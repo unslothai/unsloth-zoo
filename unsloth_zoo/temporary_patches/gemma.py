@@ -190,22 +190,51 @@ def patch_Gemma3Processor():
         return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", True)
 
         text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
-        # Fix double BOS tokens
+        # Fix double BOS tokens while preserving batch rectangularity.
+        # Tokenizers that already padded the batch return equal-length
+        # sequences; the previous `x[1:] if x[:2] == double_bos` pattern
+        # shortened only the rows whose first two tokens were BOS and
+        # left the rest, producing a jagged batch (315 vs 314 observed on
+        # Gemma3-(4B)-Vision-GRPO) that crashed BatchFeature.convert_to_tensors.
+        # If any row needed trimming, repad every trimmed row to the new
+        # max length so input_ids, attention_mask, and the downstream
+        # token_type_ids all stay rectangular.
         double_bos_token_id = [self.tokenizer.bos_token_id]*2
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
         input_ids = text_inputs["input_ids"]
-        text_inputs["input_ids"] = [x[1:] if x[:2] == double_bos_token_id else x for x in input_ids]
+        attention_mask = text_inputs.get("attention_mask", None)
+        trim_flags = [x[:2] == double_bos_token_id for x in input_ids]
+        if any(trim_flags):
+            new_input_ids = [
+                (x[1:] if flag else x) for x, flag in zip(input_ids, trim_flags)
+            ]
+            if attention_mask is not None:
+                new_attention_mask = [
+                    (m[1:] if flag else m) for m, flag in zip(attention_mask, trim_flags)
+                ]
+            else:
+                new_attention_mask = None
+            new_max_len = max(len(x) for x in new_input_ids)
+            padding_side = getattr(self.tokenizer, "padding_side", "right")
+            def _pad_row(row, pad_value):
+                deficit = new_max_len - len(row)
+                if deficit <= 0:
+                    return row
+                pad = [pad_value] * deficit
+                return (row + pad) if padding_side == "right" else (pad + row)
+            text_inputs["input_ids"] = [_pad_row(x, pad_token_id) for x in new_input_ids]
+            if new_attention_mask is not None:
+                text_inputs["attention_mask"] = [_pad_row(m, 0) for m in new_attention_mask]
+        # else: no double-BOS rows -> leave text_inputs untouched.
 
         # Add token type ids manually, as tokenizer can't do arbitrary position token types
-        # [TODO] FAILS for batched tokens since text_inputs["input_ids"] is a list of lists, so np.array creates an object!
         if return_mm_token_type_ids:
             input_ids = text_inputs["input_ids"]
             image_token_id = self.image_token_id
             mm_token_type_ids = [[1 if y == image_token_id else 0 for y in x] for x in input_ids]
-            # array_ids = np.array(text_inputs["input_ids"])
-            # mm_token_type_ids = np.zeros_like(text_inputs["input_ids"])
-            # mm_token_type_ids[array_ids == self.image_token_id] = 1
-            # text_inputs = {k: v.tolist() for k, v in text_inputs.items()}  # in case user requested list inputs
-            text_inputs["token_type_ids"] = mm_token_type_ids#.tolist()
+            text_inputs["token_type_ids"] = mm_token_type_ids
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
     pass
 

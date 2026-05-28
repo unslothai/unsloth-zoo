@@ -16,6 +16,12 @@
 
 __version__ = "2026.5.4"
 
+# Stub numpy._core.tests._natype FIRST -- before anything that might pull in
+# scipy.linalg / transformers.generation / trust_remote_code modelling files.
+# See unsloth_zoo/numpy_compat.py for the full rationale (slim numpy wheels
+# missing the tests/ subpackage that numpy.testing requires).
+from . import numpy_compat  # noqa: F401
+
 import os
 import warnings
 import re

@@ -68,15 +68,60 @@ def patch_bitsandbytes_linear4bit_forward():
     pass
 
     def forward(self, x: torch.Tensor):
-        # In transformers 5.0+, weights may not be in packed format yet during init
-        if self.weight.shape[-1] == 1:
-            fix_4bit_weight_quant_state_from_module(self)
+        # In transformers 5.0+, weights may not be in packed format yet during init.
+        # Recover the missing `quant_state` for both packed layouts that appear
+        # in transformers 4.x and 5.x with bitsandbytes >= 0.43:
+        #   * `[N, 1]` -- legacy column-packed (handled by bnb upstream's
+        #     `fix_4bit_weight_quant_state_from_module`, which asserts
+        #     `shape[1] == 1`).
+        #   * `[1, N]` -- flat-row-packed used by some Gemma3n /
+        #     conditional-generation layers (e.g. `per_layer_model_projection`).
+        #     bnb's recovery function asserts column-packed, so briefly reshape
+        #     the weight metadata to `[N, 1]` to satisfy the assertion, call
+        #     the recovery, and restore the original shape. Reshape is
+        #     metadata-only on the contiguous nibble buffer; storage bytes are
+        #     untouched and `quant_state.shape` carries the original
+        #     `[out_features, in_features]` for the matmul.
+        w = self.weight
+        if (
+            getattr(w, "quant_state", None) is None
+            and w.dim() == 2
+            and (w.shape[-1] == 1 or w.shape[0] == 1)
+        ):
+            original_shape = tuple(w.shape)
+            try:
+                if w.shape[-1] != 1:
+                    # `[1, N]` -> transient `[N, 1]` so bnb's assert passes.
+                    w.data = w.data.reshape(-1, 1)
+                fix_4bit_weight_quant_state_from_module(self)
+            except AssertionError:
+                # Module also lacks a stashed `module.quant_state`; fall
+                # through to the eager error below with a clearer message.
+                pass
+            finally:
+                if tuple(w.shape) != original_shape:
+                    w.data = w.data.reshape(*original_shape)
 
         # Some layers may not be quantized (no quant_state) - fall back to regular matmul
         quant_state = getattr(self.weight, "quant_state", None)
         if quant_state is None:
             bias = None if self.bias is None else self.bias
             weight = self.weight
+            # Hard-detect "still packed but unrecoverable": shape doesn't
+            # match (out_features, in_features). Emit a specific error
+            # instead of a confusing `mat1 x mat2` mismatch.
+            of = getattr(self, "out_features", None)
+            if_ = getattr(self, "in_features", None)
+            if of is not None and if_ is not None and tuple(weight.shape) != (of, if_):
+                raise RuntimeError(
+                    f"Unsloth: Linear4bit weight is in packed layout {tuple(weight.shape)} "
+                    f"but has no `quant_state` to dequantize. Expected dense "
+                    f"shape ({of}, {if_}). This usually means the model loader "
+                    f"did not register a `quant_state` for this layer. "
+                    f"Workarounds: (1) load with `load_in_4bit=False`, or "
+                    f"(2) add the layer prefix to `llm_int8_skip_modules` so "
+                    f"it is materialised as dense fp16/bf16."
+                )
             if weight.dtype != x.dtype:
                 weight = weight.to(x.dtype)
             if bias is not None and bias.dtype != x.dtype:
