@@ -1683,3 +1683,136 @@ def patch_deepseek_v2_config_default_ints():
     Config.from_dict = from_dict
 pass
 TEMPORARY_PATCHES.append(patch_deepseek_v2_config_default_ints)
+
+
+def patch_deepseek_ocr_prepare_inputs_for_generation():
+    """Post-load patch for ``DeepseekOCRForCausalLM.prepare_inputs_for_generation``.
+
+    The trust_remote_code ``modeling_deepseekocr.py`` shipped with
+    ``deepseek-ai/DeepSeek-OCR`` predates the transformers Cache API
+    change: when ``past_key_values`` is a ``Cache`` instance,
+    ``past_length`` is taken from ``cache.seen_tokens`` which is a
+    ``torch.Tensor`` in transformers 5.x but used to be a Python int.
+    The next line then calls::
+
+        cache_position = torch.arange(
+            past_length, past_length + position_ids.shape[-1], device=...
+        )
+
+    and torch 2.10+ rejects Tensor positional args to ``torch.arange``:
+    ``TypeError: arange() received an invalid combination of arguments``.
+
+    Fix: wrap ``transformers.dynamic_module_utils.get_class_in_module`` so
+    that after the dynamic module loads, we look for the
+    ``DeepseekOCRForCausalLM`` (or the parent ``DeepseekV2ForCausalLM``)
+    on the module and replace its ``prepare_inputs_for_generation`` with
+    a thin wrapper that coerces tensor scalars to ``int`` before the
+    arange call. The wrapper is identical in behaviour for the
+    int-past_length case and the legacy 2D ``past_key_values`` tuple
+    case, so existing code paths are preserved.
+
+    Idempotent; sentinel both on the inner method and on the
+    ``get_class_in_module`` wrapper so re-runs don't stack.
+    """
+    try:
+        from transformers import dynamic_module_utils as dmu
+    except Exception:
+        return
+    gcim = getattr(dmu, "get_class_in_module", None)
+    if gcim is None or getattr(gcim, "_unsloth_arange_patched", False):
+        return
+    _orig = gcim
+
+    def _patch_cls(cls):
+        if cls is None or not isinstance(cls, type):
+            return
+        name = getattr(cls, "__name__", "")
+        if "Deepseek" not in name and "DeepSeek" not in name:
+            return
+        method = getattr(cls, "prepare_inputs_for_generation", None)
+        if method is None or getattr(method, "_unsloth_arange_patched", False):
+            return
+        import functools, torch as _torch
+
+        @functools.wraps(method)
+        def prepare_inputs_for_generation(self, *args, **kwargs):
+            # Replicate the original method but coerce a Tensor-shaped
+            # `past_length` to a Python int before torch.arange runs.
+            # Simplest: monkey-patch torch.arange transiently in the
+            # bound method's globals so we don't have to maintain a
+            # forked copy of the upstream method body.
+            mod_globals = getattr(method, "__globals__", None)
+            _orig_arange = _torch.arange
+
+            def _safe_arange(*aa, **kk):
+                aa2 = tuple(
+                    int(x.item()) if isinstance(x, _torch.Tensor) and x.numel() == 1 else x
+                    for x in aa
+                )
+                return _orig_arange(*aa2, **kk)
+
+            if mod_globals is not None and mod_globals.get("torch") is _torch:
+                mod_globals["torch"] = _ShimTorch(_torch, _safe_arange)
+                try:
+                    return method(self, *args, **kwargs)
+                finally:
+                    mod_globals["torch"] = _torch
+            else:
+                # Fallback: temporarily monkey-patch torch.arange itself.
+                _torch.arange = _safe_arange
+                try:
+                    return method(self, *args, **kwargs)
+                finally:
+                    _torch.arange = _orig_arange
+
+        prepare_inputs_for_generation._unsloth_arange_patched = True
+        cls.prepare_inputs_for_generation = prepare_inputs_for_generation
+
+    class _ShimTorch:
+        """Forward every attribute to ``torch`` except ``arange``."""
+        __slots__ = ("_torch", "_arange")
+        def __init__(self, t, arange):
+            object.__setattr__(self, "_torch", t)
+            object.__setattr__(self, "_arange", arange)
+        def __getattr__(self, name):
+            if name == "arange":
+                return object.__getattribute__(self, "_arange")
+            return getattr(object.__getattribute__(self, "_torch"), name)
+
+    import sys as _sys
+
+    def get_class_in_module(*args, **kwargs):
+        cls = _orig(*args, **kwargs)
+        try:
+            _patch_cls(cls)
+            # Also walk the SAME module the class lives in: trust_remote_code
+            # only returns the one class actually requested (AutoConfig vs
+            # AutoModel), but the module file declares siblings we also
+            # need to patch (DeepseekV2 / DeepseekV3 / DeepseekOCR
+            # ForCausalLM all live in the same dynamic module pair).
+            mod_name = getattr(cls, "__module__", None)
+            mod = _sys.modules.get(mod_name) if mod_name else None
+            if mod is not None:
+                for attr in dir(mod):
+                    sibling = getattr(mod, attr, None)
+                    if isinstance(sibling, type) and sibling is not cls:
+                        _patch_cls(sibling)
+        except Exception:
+            pass
+        return cls
+
+    get_class_in_module._unsloth_arange_patched = True
+    # Preserve any sentinels from the prior notebook_deps wrap.
+    for attr in ("_unsloth_patched",):
+        if getattr(_orig, attr, False):
+            setattr(get_class_in_module, attr, True)
+    dmu.get_class_in_module = get_class_in_module
+    if hasattr(dmu, "get_class_from_dynamic_module"):
+        try:
+            src_globals = getattr(dmu.get_class_from_dynamic_module, "__globals__", None)
+            if isinstance(src_globals, dict) and "get_class_in_module" in src_globals:
+                src_globals["get_class_in_module"] = get_class_in_module
+        except Exception:
+            pass
+pass
+TEMPORARY_PATCHES.append(patch_deepseek_ocr_prepare_inputs_for_generation)
