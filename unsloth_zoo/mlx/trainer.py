@@ -2207,12 +2207,34 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             labels = labels.tolist()
         return (encoded, labels[0])
 
+    # Filter out samples where all labels are -100 (no valid training signal).
+    # This can happen when truncation cuts off the response_part entirely,
+    # e.g. long reasoning/analysis channels in GPT-OSS that exceed max_seq_length.
+    # Such samples cause NaN loss since cross_entropy(mean) computes 0/0.
+    def _has_valid_labels(labels):
+        """Return whether a response-masked row still has trainable labels."""
+        return any(label != -100 for label in labels)
+
     max_workers = min(4, os.cpu_count() or 1)
     all_items = []
+    n_before_filter = 0
+    n_removed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         for result in executor.map(_process_text, all_texts):
             if result is not None:
-                all_items.append(result)
+                n_before_filter += 1
+                if _has_valid_labels(result[1]):
+                    all_items.append(result)
+                else:
+                    n_removed += 1
+
+    if n_removed > 0:
+        print(
+            f"Unsloth: Removed {n_removed} out of {n_before_filter} samples "
+            f"from train_dataset where all labels were -100 "
+            f"(no response found after truncation). "
+            f"This prevents NaN loss during training."
+        )
 
     if not all_items:
         raise ValueError(
