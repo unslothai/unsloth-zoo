@@ -2037,6 +2037,13 @@ def load_vllm(
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
     standby_util_override = os.getenv("UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE", "0") != "0"
+    # FP8 + CUDA graph capture trips `cudaErrorNotPermitted` during
+    # `torch.cuda.graph.capture_end()` on Blackwell (observed on B200 with
+    # Qwen3_8B_FP8_GRPO and Llama_FP8_GRPO). Allow the env var
+    # `UNSLOTH_VLLM_ENFORCE_EAGER=1` to skip CUDA graph capture so the
+    # affected models can train, at the cost of slower inference.
+    if not enforce_eager and os.getenv("UNSLOTH_VLLM_ENFORCE_EAGER", "0") == "1":
+        enforce_eager = True
 
     free_memory, total_memory = get_mem_info()
     # If T4 ie 15GB, we use 0.85 since it'll rarely OOM. Other GPUs 0.9
