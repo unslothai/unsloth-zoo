@@ -1548,3 +1548,138 @@ def patch_deepseek_v2_moe_alias():
     ddv2.DeepseekV2MoE = new_class
 pass
 TEMPORARY_PATCHES.append(patch_deepseek_v2_moe_alias)
+
+
+def patch_transformers_legacy_import_utils():
+    """Restore ``is_torch_fx_available`` on ``transformers.utils.import_utils``.
+
+    Transformers 5.x dropped this helper. ``deepseek-ai/DeepSeek-OCR``'s
+    trust_remote_code modeling file imports it at module load time and
+    crashes with ``ImportError: cannot import name 'is_torch_fx_available'``
+    before any config can be parsed. The helper used to be a thin
+    ``importlib.util.find_spec("torch.fx") is not None`` check. Re-add it
+    with the same semantics so legacy modeling files import cleanly.
+
+    No-op when ``transformers`` is absent or when ``is_torch_fx_available``
+    already exists (older transformers).
+    """
+    try:
+        from transformers.utils import import_utils as iu
+    except Exception:
+        return
+    if hasattr(iu, "is_torch_fx_available"):
+        return
+
+    import importlib.util as _ilu
+
+    def is_torch_fx_available():
+        return _ilu.find_spec("torch.fx") is not None
+
+    iu.is_torch_fx_available = is_torch_fx_available
+    # transformers re-exports a bunch of helpers via the parent ``utils``
+    # package; mirror the symbol there too if it's already missing so
+    # ``from transformers.utils import is_torch_fx_available`` works.
+    try:
+        from transformers import utils as tu
+        if not hasattr(tu, "is_torch_fx_available"):
+            tu.is_torch_fx_available = is_torch_fx_available
+    except Exception:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_transformers_legacy_import_utils)
+
+
+def patch_llama_attention_back_compat_aliases():
+    """Alias legacy ``Llama{Flash,Sdpa}Attention[2]`` symbols on
+    ``transformers.models.llama.modeling_llama``.
+
+    Transformers 5.x collapsed the per-backend attention subclasses into a
+    single ``LlamaAttention`` that selects flash/sdpa/eager via
+    ``config._attn_implementation``. Several HF trust_remote_code modeling
+    files (notably ``deepseek-ai/DeepSeek-OCR``'s ``modeling_deepseekv2.py``,
+    which lists ``LlamaFlashAttention2`` in a top-level ``from ... import``
+    plus an ``ATTENTION_CLASSES`` dict but only ever uses MLA in practice)
+    pre-date that refactor and crash with ``ImportError: cannot import name
+    'LlamaFlashAttention2'`` before the model can load.
+
+    Re-export the unified class under the old names so legacy import lines
+    succeed. The behaviour is identical: at construction time
+    ``LlamaAttention`` dispatches to the configured backend internally, so
+    callers that referenced the old subclasses still pick up the right
+    kernel path. Pre-5.0 transformers releases that still ship the
+    subclasses (4.57.6 etc.) keep their originals unchanged via the
+    ``hasattr`` guard.
+
+    Idempotent. No-op when ``transformers`` is absent (MLX-only path) or
+    when ``LlamaAttention`` itself is missing.
+    """
+    try:
+        from transformers.models.llama import modeling_llama as mllama
+    except Exception:
+        return
+    base = getattr(mllama, "LlamaAttention", None)
+    if base is None:
+        return
+    for legacy_name in (
+        "LlamaFlashAttention2",
+        "LlamaSdpaAttention",
+        "LlamaFlexAttention",
+    ):
+        if not hasattr(mllama, legacy_name):
+            setattr(mllama, legacy_name, base)
+pass
+TEMPORARY_PATCHES.append(patch_llama_attention_back_compat_aliases)
+
+
+def patch_deepseek_v2_config_default_ints():
+    """Coerce ``None`` values for required-int fields on Deepseek-V2 configs.
+
+    The official ``deepseek-ai/DeepSeek-OCR`` config.json has
+    ``kv_lora_rank: null`` and ``q_lora_rank: null`` because the OCR
+    head doesn't use MLA, but transformers 5.x ``StrictDataclass`` (and
+    legacy ``PretrainedConfig`` users that read these as ints later)
+    reject ``None`` for fields annotated ``int``. Walk the dict that
+    ``DeepseekV2Config.from_dict`` consumes and replace ``None`` with the
+    init default for known-required-int fields.
+
+    No-op on transformers builds without ``deepseek_v2`` or when the
+    fields are already non-None. Idempotent via the ``_unsloth_patched``
+    sentinel on the wrapped ``from_dict``.
+    """
+    try:
+        from transformers.models.deepseek_v2 import configuration_deepseek_v2 as cdv2
+    except Exception:
+        return
+    Config = getattr(cdv2, "DeepseekV2Config", None)
+    if Config is None:
+        return
+    orig_from_dict = getattr(Config, "from_dict", None)
+    if orig_from_dict is None or getattr(orig_from_dict, "_unsloth_patched", False):
+        return
+
+    import inspect
+    int_defaults = {}
+    try:
+        sig = inspect.signature(Config.__init__)
+        for name, p in sig.parameters.items():
+            if isinstance(p.default, int) and not isinstance(p.default, bool):
+                int_defaults[name] = p.default
+    except (TypeError, ValueError):
+        return
+
+    if not int_defaults:
+        return
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        if isinstance(config_dict, dict):
+            config_dict = dict(config_dict)
+            for key, default in int_defaults.items():
+                if key in config_dict and config_dict[key] is None:
+                    config_dict[key] = default
+        return orig_from_dict.__func__(cls, config_dict, **kwargs)
+
+    from_dict._unsloth_patched = True
+    Config.from_dict = from_dict
+pass
+TEMPORARY_PATCHES.append(patch_deepseek_v2_config_default_ints)
