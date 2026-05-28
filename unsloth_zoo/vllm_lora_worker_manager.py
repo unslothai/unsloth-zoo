@@ -222,6 +222,18 @@ class WorkerLoRAManager(AbstractWorkerManager):
             if mapping is not None:
                 self._adapter_manager.set_adapter_mapping(mapping)
 
+    def get_dummy_lora_warmup_rank(self, default_rank: int) -> int:
+        # vLLM v1 (lora_model_runner_mixin.maybe_setup_dummy_loras) calls
+        # this during cudagraph warmup; delegate to the adapter manager,
+        # fall back to default_rank if the underlying implementation
+        # predates this helper.
+        manager_fn = getattr(
+            self._adapter_manager, "get_dummy_lora_warmup_rank", None
+        )
+        if manager_fn is not None:
+            return manager_fn(default_rank)
+        return default_rank
+
     def supports_tower_connector_lora(self) -> bool:
         manager = getattr(self, '_adapter_manager', None)
         if manager is None:
