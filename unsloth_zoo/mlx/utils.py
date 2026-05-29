@@ -2070,6 +2070,22 @@ def normalize_vlm_processor_chat_template(
     )
 
 
+def encode_mlx_text(tokenizer, text):
+    """Tokenize text while mirroring Unsloth's double-BOS guard."""
+    add_special_tokens = True
+    bos_token = getattr(tokenizer, "bos_token", None)
+    chat_template = getattr(tokenizer, "chat_template", "") or ""
+    if bos_token is not None and (
+        text.startswith(bos_token) or bos_token in chat_template
+    ):
+        add_special_tokens = False
+
+    try:
+        return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+    except TypeError:
+        return tokenizer.encode(text)
+
+
 def _raise_mlx_chat_template_error(target, *, is_vlm=False):
     if is_vlm:
         _raise_vlm_chat_template_error(target)
@@ -3100,7 +3116,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
             self._eos_id = eos_id
 
         def process(self, item):
-            encoded = self.tokenizer.encode(item[self.text_key])
+            encoded = encode_mlx_text(self.tokenizer, item[self.text_key])
             if (
                 self._eos_id is not None
                 and (not encoded or encoded[-1] != self._eos_id)

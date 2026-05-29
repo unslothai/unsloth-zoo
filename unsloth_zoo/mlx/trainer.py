@@ -64,6 +64,7 @@ from .utils import (
     iterate_vlm_training_batches,
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
+    encode_mlx_text,
     _get_vlm_ignore_token_ids,
     collect_mlx_texts,
     save_lora_adapters,
@@ -2246,7 +2247,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     # 2. Tokenize + mask in parallel (HF fast tokenizers are thread-safe).
     def _process_text(text):
-        encoded = tokenizer.encode(text)
+        encoded = encode_mlx_text(tokenizer, text)
         # Mirror `_prepare_dataset`'s EOS contract; mismatch desyncs labeled vs unlabeled.
         if append_eos and eos_id is not None and (not encoded or encoded[-1] != eos_id):
             encoded.append(eos_id)
