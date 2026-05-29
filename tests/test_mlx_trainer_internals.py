@@ -302,6 +302,35 @@ def test_mlx_text_loss_masks_exclude_position_at_sequence_length():
     assert "steps < lengths[:, 1:]" in source
 
 
+def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
+    import unsloth_zoo.dataset_utils as dataset_utils
+    from unsloth_zoo.mlx.trainer import train_on_responses_only
+
+    class CallableTokenizer:
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [1, 2, 3]}
+
+    received = {}
+
+    def fake_hf(trainer, *, instruction_part=None, response_part=None,
+                force_match=True, tokenizer=None, return_function=False,
+                num_proc=None, last_response_only=False):
+        received["last_response_only"] = last_response_only
+        return lambda batch: batch
+
+    monkeypatch.setattr(dataset_utils, "train_on_responses_only", fake_hf)
+    train_on_responses_only(
+        None,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        tokenizer=CallableTokenizer(),
+        return_function=True,
+        last_response_only=True,
+    )
+
+    assert received["last_response_only"] is True
+
+
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils

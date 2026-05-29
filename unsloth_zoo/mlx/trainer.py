@@ -88,6 +88,59 @@ from .compile import (
 )
 
 
+def _is_hf_tokenizer(tokenizer):
+    """Check whether a wrapper has already resolved to an HF tokenizer."""
+    try:
+        from transformers import PreTrainedTokenizerBase
+    except Exception:
+        return False
+    return isinstance(tokenizer, PreTrainedTokenizerBase)
+
+
+def _resolve_response_mask_tokenizer(tokenizer):
+    """Return a callable HF tokenizer for the CUDA response-mask helper."""
+    for _ in range(3):
+        if _is_hf_tokenizer(tokenizer):
+            return tokenizer
+
+        processor_tokenizer = getattr(tokenizer, "tokenizer", None)
+        if processor_tokenizer is not None and processor_tokenizer is not tokenizer:
+            tokenizer = processor_tokenizer
+            continue
+
+        # mlx-lm TokenizerWrapper stores the HF tokenizer under _tokenizer.
+        # HF fast tokenizers also expose _tokenizer, but that is the low-level
+        # Rust tokenizer and is not callable like PreTrainedTokenizerBase.
+        if hasattr(tokenizer, "_tokenizer"):
+            wrapped = getattr(tokenizer, "_tokenizer", None)
+            if (
+                wrapped is not None
+                and wrapped is not tokenizer
+                and (
+                    not hasattr(tokenizer, "convert_tokens_to_ids")
+                    or callable(wrapped)
+                )
+            ):
+                tokenizer = wrapped
+                continue
+
+        break
+
+    if not (
+        callable(tokenizer)
+        or (
+            hasattr(tokenizer, "encode")
+            and hasattr(tokenizer, "convert_tokens_to_ids")
+        )
+    ):
+        raise TypeError(
+            "Unsloth MLX: train_on_responses_only requires a callable "
+            "Hugging Face tokenizer or a processor/tokenizer wrapper that "
+            "contains one."
+        )
+    return tokenizer
+
+
 def _normalize_mlx_optimizer_name(name):
     opt_name = str(name or "adamw").strip().lower()
     if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
@@ -2413,6 +2466,7 @@ def train_on_responses_only(
     tokenizer=None,
     return_function=False,
     num_proc=None,
+    last_response_only=False,
 ):
     """Mask instruction tokens from loss — train only on assistant responses.
 
@@ -2428,6 +2482,8 @@ def train_on_responses_only(
         tokenizer: Optional override; defaults to trainer.tokenizer.
         return_function: If True, return the masking closure only.
         num_proc: Accepted for HF API compat, unused on MLX.
+        last_response_only: If True, only the final assistant response is
+            unmasked, matching the CUDA helper.
 
     Returns:
         The trainer (for chaining), or the closure if return_function=True.
@@ -2446,16 +2502,7 @@ def train_on_responses_only(
             "kwarg or via trainer.tokenizer."
         )
 
-    # Unwrap to a callable HF tokenizer (mlx-lm TokenizerWrapper._tokenizer,
-    # or VLM processor.tokenizer). The HF masking impl calls tokenizer(...),
-    # and mlx-lm's TokenizerWrapper proxies attributes but is not callable,
-    # so require both. HF fast tokenizers already speak the API and their
-    # _tokenizer is the Rust backend, so leave those as-is.
-    if not (callable(_tokenizer) and hasattr(_tokenizer, "convert_tokens_to_ids")):
-        if hasattr(_tokenizer, "_tokenizer"):
-            _tokenizer = _tokenizer._tokenizer
-        elif hasattr(_tokenizer, "tokenizer"):
-            _tokenizer = _tokenizer.tokenizer
+    _tokenizer = _resolve_response_mask_tokenizer(_tokenizer)
 
     # Get masking closure from the HF/CUDA implementation
     mask_fn = _hf_train_on_responses_only(
@@ -2465,6 +2512,7 @@ def train_on_responses_only(
         force_match=force_match,
         tokenizer=_tokenizer,
         return_function=True,
+        last_response_only=last_response_only,
     )
 
     if return_function:

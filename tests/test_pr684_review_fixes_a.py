@@ -310,7 +310,7 @@ def _run_train_on_responses_only(monkeypatch, args):
 
     def fake_hf(trainer, *, instruction_part=None, response_part=None,
                 force_match=True, tokenizer=None, return_function=False,
-                num_proc=None):
+                num_proc=None, last_response_only=False):
         return _identity_mask_fn
 
     monkeypatch.setattr(dataset_utils, "train_on_responses_only", fake_hf)
@@ -575,7 +575,7 @@ def test_thread5_noncallable_proxy_wrapper_unwraps_for_masking(monkeypatch):
 
     def fake_hf(trainer, *, instruction_part=None, response_part=None,
                 force_match=True, tokenizer=None, return_function=False,
-                num_proc=None):
+                num_proc=None, last_response_only=False):
         received["tokenizer"] = tokenizer
         return lambda batch: batch
 
