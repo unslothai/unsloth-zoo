@@ -36,6 +36,7 @@ import requests
 import json
 from tqdm.auto import tqdm as ProgressBar
 from functools import lru_cache
+import getpass
 import inspect
 import contextlib
 import importlib.util
@@ -264,11 +265,11 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
     # Choose package manager based on system type
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
+        install_cmd = f"{'sudo -S ' if sudo else ''}{pkg_manager} install {package} -y"
     elif system_type == "arch":
-        install_cmd = f"{'sudo ' if sudo else ''}pacman -S --noconfirm {package}"
+        install_cmd = f"{'sudo -S ' if sudo else ''}pacman -S --noconfirm {package}"
     else:  # Default to debian/apt-get
-        install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+        install_cmd = f"{'sudo -S ' if sudo else ''}apt-get install {package} -y"
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
@@ -278,6 +279,9 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
                 f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
                 "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
             )
+    if sudo:
+        password = getpass.getpass(f"Enter password for user {getpass.getuser()}: ")
+        install_cmd = f"echo {password} | {install_cmd}"
     with subprocess.Popen(install_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
@@ -313,7 +317,7 @@ def do_we_need_sudo(system_type="debian"):
     # Choose update command based on system type
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        update_cmd = f"{pkg_manager} check-update"
+        update_cmd = f"{pkg_manager} update -y"
     elif system_type == "arch":
         update_cmd = "pacman -Sy"
     else:
@@ -323,7 +327,7 @@ def do_we_need_sudo(system_type="debian"):
     with subprocess.Popen(update_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line or "requires superuser" in line:
                 sp.terminate()
                 sudo = True
                 break
