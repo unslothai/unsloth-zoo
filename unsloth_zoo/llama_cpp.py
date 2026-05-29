@@ -282,7 +282,7 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
 
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line or "requires superuser" in line:
                 sp.terminate()
                 raise RuntimeError(f"[FAIL] Unsloth: Permission denied when installing package {package}\n"\
                                    "This operation requires elevated sudo/root permissions. Please manually install missing packages and retry again"
