@@ -331,6 +331,44 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
     assert received["last_response_only"] is True
 
 
+def test_evaluate_dict_eval_datasets_records_split_metrics():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    class Model:
+        def __init__(self):
+            self.modes = []
+
+        def eval(self):
+            self.modes.append("eval")
+
+        def train(self):
+            self.modes.append("train")
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = Model()
+    trainer.stop_requested = False
+
+    def loss_fn(_model, name):
+        if name == "small":
+            return mx.array(1.0), mx.array(2)
+        return mx.array(3.0), mx.array(6)
+
+    loss, ppl = trainer._evaluate(
+        {"small": [("small",)], "large": [("large",)]},
+        loss_fn,
+        is_vlm=False,
+    )
+
+    assert loss == pytest.approx(2.5)
+    assert ppl == pytest.approx(__import__("math").exp(2.5))
+    assert trainer._last_eval_metrics["eval_small_loss"] == pytest.approx(1.0)
+    assert trainer._last_eval_metrics["eval_large_loss"] == pytest.approx(3.0)
+    assert trainer._last_eval_metrics["eval_loss"] == pytest.approx(2.5)
+    assert trainer.model.modes == ["eval", "train"]
+
+
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils

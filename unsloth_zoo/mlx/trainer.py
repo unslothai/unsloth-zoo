@@ -883,9 +883,8 @@ class MLXTrainer:
                 unsupported.append((name, tuple(getattr(value, "shape", ()))))
         return unsupported
 
-    def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
-        """Run evaluation loop; returns (avg_loss, perplexity)."""
-        self.model.eval()
+    def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False):
+        """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
 
@@ -901,9 +900,47 @@ class MLXTrainer:
             ntokens += ntoks
             mx.eval(all_losses, ntokens)
 
+        return all_losses, ntokens
+
+    def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
+        """Run evaluation loop.
+
+        Returns:
+            (avg_loss, perplexity) tuple.
+        """
+        self.model.eval()
+        metrics = {}
+        if isinstance(eval_batches, dict):
+            all_losses = mx.array(0.0)
+            ntokens = mx.array(0)
+            for split_name, split_batches in eval_batches.items():
+                split_losses, split_tokens = self._evaluate_batch_totals(
+                    split_batches, loss_fn, is_vlm=is_vlm,
+                )
+                all_losses += split_losses
+                ntokens += split_tokens
+                mx.eval(all_losses, ntokens)
+                split_loss = (
+                    (split_losses / split_tokens).item()
+                    if split_tokens.item() > 0 else 0.0
+                )
+                split_ppl = math.exp(min(split_loss, 100))
+                split_prefix = f"eval_{split_name}"
+                metrics[f"{split_prefix}_loss"] = split_loss
+                metrics[f"{split_prefix}_perplexity"] = split_ppl
+                if self.stop_requested:
+                    break
+        else:
+            all_losses, ntokens = self._evaluate_batch_totals(
+                eval_batches, loss_fn, is_vlm=is_vlm,
+            )
+
         self.model.train()
         avg_loss = (all_losses / ntokens).item() if ntokens.item() > 0 else 0.0
         perplexity = math.exp(min(avg_loss, 100))
+        metrics["eval_loss"] = avg_loss
+        metrics["eval_perplexity"] = perplexity
+        self._last_eval_metrics = metrics
         return avg_loss, perplexity
 
     @staticmethod
@@ -1547,41 +1584,55 @@ class MLXTrainer:
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
             if _labeled_eval is not None:
                 eval_batches = _labeled_eval
-            elif is_vlm:
-                processor = self._resolve_vlm_processor()
-                config = getattr(self.model, "_config", {})
-                _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
-                eval_batches = create_vlm_batches(
-                    dataset=self.eval_dataset,
-                    processor=processor,
-                    config=config,
-                    batch_size=args.per_device_train_batch_size,
-                    max_seq_length=args.max_seq_length,
-                    seed=args.seed,
-                    response_mask_fn=_vlm_mask_fn,
-                    formatting_func=self.formatting_func,
-                )
             else:
-                eval_batches = create_batches(
-                    dataset=self.eval_dataset,
-                    tokenizer=self.tokenizer,
-                    batch_size=args.per_device_train_batch_size,
-                    max_seq_length=args.max_seq_length,
-                    seed=args.seed,
-                    dataset_text_field=args.dataset_text_field,
-                    formatting_func=self.formatting_func,
-                    chat_template=getattr(args, "chat_template", None),
-                    model_name=getattr(self.model, "_hf_repo", None),
-                    model_type=(
-                        getattr(self.model, "_config", {}).get("model_type")
-                        if isinstance(getattr(self.model, "_config", {}), dict)
-                        else None
-                    ),
-                    append_eos=bool(getattr(args, "append_eos", True)),
-                )
+                def _create_eval_batches(eval_dataset):
+                    """Materialize eval batches for one dataset split."""
+                    if is_vlm:
+                        processor = self._resolve_vlm_processor()
+                        config = getattr(self.model, "_config", {})
+                        _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
+                        return create_vlm_batches(
+                            dataset=eval_dataset,
+                            processor=processor,
+                            config=config,
+                            batch_size=args.per_device_train_batch_size,
+                            max_seq_length=args.max_seq_length,
+                            seed=args.seed,
+                            response_mask_fn=_vlm_mask_fn,
+                            formatting_func=self.formatting_func,
+                        )
+                    return create_batches(
+                        dataset=eval_dataset,
+                        tokenizer=self.tokenizer,
+                        batch_size=args.per_device_train_batch_size,
+                        max_seq_length=args.max_seq_length,
+                        seed=args.seed,
+                        dataset_text_field=args.dataset_text_field,
+                        formatting_func=self.formatting_func,
+                        chat_template=getattr(args, "chat_template", None),
+                        model_name=getattr(self.model, "_hf_repo", None),
+                        model_type=(
+                            getattr(self.model, "_config", {}).get("model_type")
+                            if isinstance(getattr(self.model, "_config", {}), dict)
+                            else None
+                        ),
+                        append_eos=bool(getattr(args, "append_eos", True)),
+                    )
+
+                if isinstance(self.eval_dataset, dict):
+                    eval_batches = {
+                        key: _create_eval_batches(value)
+                        for key, value in self.eval_dataset.items()
+                    }
+                else:
+                    eval_batches = _create_eval_batches(self.eval_dataset)
             if eval_batches:
+                eval_batch_count = (
+                    sum(len(value) for value in eval_batches.values())
+                    if isinstance(eval_batches, dict) else len(eval_batches)
+                )
                 print(f"Unsloth: Eval enabled every {args.eval_steps} steps "
-                      f"({len(eval_batches)} eval batches).")
+                      f"({eval_batch_count} eval batches).")
 
         features = []
         if is_vlm:
@@ -2577,26 +2628,36 @@ def train_on_responses_only(
 
         # Process eval dataset too
         if trainer.eval_dataset is not None:
-            eval_batches = _create_labeled_batches(
-                dataset=trainer.eval_dataset,
-                tokenizer=_tokenizer,
-                mask_fn=mask_fn,
-                batch_size=args.per_device_train_batch_size,
-                max_seq_length=args.max_seq_length,
-                formatting_func=trainer.formatting_func,
-                dataset_text_field=args.dataset_text_field,
-                seed=args.seed,
-                chat_template=getattr(args, "chat_template", None),
-                model_name=getattr(trainer.model, "_hf_repo", None),
-                model_type=(
-                    getattr(trainer.model, "_config", {}).get("model_type")
-                    if isinstance(getattr(trainer.model, "_config", {}), dict)
-                    else None
-                ),
-                append_eos=bool(getattr(args, "append_eos", True)),
-                dataset_order=getattr(args, "dataset_order", "default"),
-                preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
-            )
+            def _create_labeled_eval_batches(eval_dataset):
+                """Build response-masked eval batches for one dataset split."""
+                return _create_labeled_batches(
+                    dataset=eval_dataset,
+                    tokenizer=_tokenizer,
+                    mask_fn=mask_fn,
+                    batch_size=args.per_device_train_batch_size,
+                    max_seq_length=args.max_seq_length,
+                    formatting_func=trainer.formatting_func,
+                    dataset_text_field=args.dataset_text_field,
+                    seed=args.seed,
+                    chat_template=getattr(args, "chat_template", None),
+                    model_name=getattr(trainer.model, "_hf_repo", None),
+                    model_type=(
+                        getattr(trainer.model, "_config", {}).get("model_type")
+                        if isinstance(getattr(trainer.model, "_config", {}), dict)
+                        else None
+                    ),
+                    append_eos=bool(getattr(args, "append_eos", True)),
+                    dataset_order=getattr(args, "dataset_order", "default"),
+                    preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
+                )
+
+            if isinstance(trainer.eval_dataset, dict):
+                eval_batches = {
+                    key: _create_labeled_eval_batches(value)
+                    for key, value in trainer.eval_dataset.items()
+                }
+            else:
+                eval_batches = _create_labeled_eval_batches(trainer.eval_dataset)
             trainer._eval_batches_labeled = eval_batches
 
         print(f"Unsloth: train_on_responses_only enabled "
