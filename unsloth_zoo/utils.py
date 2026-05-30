@@ -122,13 +122,19 @@ pass
 
 
 import functools
-# ROCm on Windows ships a stubbed torch.distributed that is missing these
-# attributes entirely (https://github.com/ROCm/TheRock/issues/3284).
-# Use getattr with no-op / safe-default lambdas so importing this module
-# never crashes on that platform.
-torch_distributed_is_initialized = getattr(dist, "is_initialized", lambda *args, **kwargs: False)
-torch_distributed_is_torchelastic_launched = getattr(dist, "is_torchelastic_launched", lambda *args, **kwargs: False)
-torch_distributed_get_rank = getattr(dist, "get_rank", lambda *args, **kwargs: 0)
+# ROCm on Windows ships a stubbed torch.distributed missing these attributes
+# entirely (https://github.com/ROCm/TheRock/issues/3284). Bind the real
+# functions directly when present; only the stub hits the AttributeError path.
+# Avoids per-name getattr and the throwaway lambdas it builds on every other
+# platform.
+try:
+    torch_distributed_is_initialized = dist.is_initialized
+    torch_distributed_is_torchelastic_launched = dist.is_torchelastic_launched
+    torch_distributed_get_rank = dist.get_rank
+except AttributeError:
+    torch_distributed_is_initialized = lambda *args, **kwargs: False
+    torch_distributed_is_torchelastic_launched = lambda *args, **kwargs: False
+    torch_distributed_get_rank = lambda *args, **kwargs: 0
 
 def is_main_process():
     if torch_distributed_is_initialized():
