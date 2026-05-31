@@ -74,10 +74,11 @@ def _module_compute_dtype(module, *attr_names):
 def _narrow_to_boundary(x_fp32, dtype):
     """Cast a float32 tensor to ``dtype`` for a Linear boundary.
 
-    For float16 we preserve the original overflow-safety clamp + downcast so the
-    fp16 path stays numerically identical to the unfixed forced patches. For
-    float32 this is a no-op (no narrowing happens). bfloat16 is clamped to its
-    own (very wide) range, which never actually clips, then downcast.
+    For float16 we clamp to the fp16 range then downcast, matching what the
+    RMSNorm patch already did. For in-range activations this equals the original
+    bare ``.to(float16)`` at the MLP/attention boundaries; for activations above
+    the fp16 max it clamps instead of overflowing to inf (strictly safer). For
+    float32 this is a no-op. bfloat16 clamps to its own (very wide) range first.
     """
     if dtype == torch.float32:
         return x_fp32
@@ -435,8 +436,9 @@ def patch_Gemma3MLP():
         activated_fp32 = self.act_fn(gate_proj_fp32) # Activation in fp32
         intermediate_fp32 = activated_fp32 * up_proj_fp32 # Product in fp32
 
-        # Narrow to the down_proj weight dtype before the down_proj matmul:
-        # fp16 weights -> fp16 (clamped, bit-identical to before); fp32 -> stays fp32.
+        # Narrow to the down_proj weight dtype: fp16 weights -> fp16 (now clamped to
+        # fp16 range like RMSNorm, vs the old bare cast; equal for in-range values,
+        # safer otherwise); fp32 weights (full finetuning) -> stays fp32.
         boundary_dtype = _module_compute_dtype(self, "down_proj", "gate_proj", "up_proj")
         intermediate = _narrow_to_boundary(intermediate_fp32, boundary_dtype)
         down_proj_out = self.down_proj(intermediate)
@@ -648,9 +650,10 @@ def patch_Gemma3Attention():
         # Using -1 for the last dimension is robust and aligns with your original example.
         attn_output_fp32 = attn_output_fp32.reshape(bsz, q_len, -1) # REVISED FIX
 
-        # Narrow to the o_proj weight dtype: fp16 weights -> fp16 (clamped,
-        # bit-identical to before); fp32 weights (full finetuning) -> stays fp32
-        # so o_proj is float32 x float32 instead of crashing on Half != float.
+        # Narrow to the o_proj weight dtype: fp16 weights -> fp16 (now clamped to
+        # fp16 range like RMSNorm, vs the old bare cast; equal for in-range values,
+        # safer otherwise); fp32 weights (full finetuning) -> stays fp32 so o_proj
+        # is float32 x float32 instead of crashing on Half != float.
         boundary_dtype = _module_compute_dtype(self, "o_proj", "q_proj", "k_proj", "v_proj")
         attn_output_narrowed = _narrow_to_boundary(attn_output_fp32, boundary_dtype)
 
