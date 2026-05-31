@@ -1559,6 +1559,49 @@ def check_max_shard_size(max_shard_size = "50GB"):
 pass
 
 
+# Deps the converter imports. Only installed in install_llama_cpp(), which is
+# skipped when llama.cpp already exists, so a stale `gguf` can fail with exit 1.
+_CONVERTER_PYTHON_DEPS = ("gguf", "protobuf", "sentencepiece", "mistral_common")
+
+# Markers that mean the converter env is broken, not the model. Only these
+# trigger auto-repair; genuine model errors are surfaced as-is.
+_CONVERTER_DEP_ERROR_MARKERS = (
+    "ModuleNotFoundError",
+    "No module named",
+    "ImportError",
+    "cannot import name",
+    "DLL load failed",      # common Windows broken-package symptom
+    "undefined symbol",
+)
+
+
+def _looks_like_converter_dep_error(text):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not text: return False
+    return any(marker in text for marker in _CONVERTER_DEP_ERROR_MARKERS)
+
+
+def _reinstall_converter_deps(python_exe, print_output = False):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Force-reinstall the converter deps into its own interpreter to self-heal.
+    if print_output:
+        print(
+            f"Unsloth: The GGUF converter environment looks broken (stale/missing "
+            f"package). Reinstalling {', '.join(_CONVERTER_PYTHON_DEPS)} and retrying..."
+        )
+    def _run(cmd):
+        return subprocess.run(cmd, encoding="utf-8", errors="replace",
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    install = [python_exe, "-m", "pip", "install", "--upgrade", "--force-reinstall",
+               *_CONVERTER_PYTHON_DEPS]
+    result = _run(install)
+    # Some envs (eg uv-created venvs) ship without pip; bootstrap it once.
+    if result.returncode != 0 and "no module named pip" in (result.stdout or "").lower():
+        _run([python_exe, "-m", "ensurepip", "--upgrade"])
+        result = _run(install)
+    return result
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -1691,18 +1734,55 @@ def convert_to_gguf(
                 command.extend([str(key), str(value)])
         command.append(str(input_folder))
 
-        try:
-            if print_output:
-                result = subprocess.run(command, shell=False, check=True, text=True,
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                print(result.stdout)
-            else:
-                subprocess.run(command, shell=False, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            if print_output and hasattr(e, 'stdout') and e.stdout:
-                print(e.stdout)
-            cmd = " ".join(str(x) for x in command)
-            raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}")
+        # Run the converter; self-heal and retry once if the env (not the model)
+        # is broken. No cost on the happy path.
+        attempted_repair = False
+        repair_note = ""
+        while True:
+            try:
+                # encoding/errors pinned so non-UTF8 output never crashes decoding.
+                if print_output:
+                    result = subprocess.run(command, shell=False, check=True,
+                                          encoding="utf-8", errors="replace",
+                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    print(result.stdout)
+                else:
+                    # Capture so a failure surfaces the real traceback.
+                    subprocess.run(command, shell=False, check=True,
+                                   encoding="utf-8", errors="replace",
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                break
+            except subprocess.CalledProcessError as e:
+                captured = ""
+                for stream in (getattr(e, "stderr", None), getattr(e, "stdout", None)):
+                    if stream:
+                        captured += stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
+
+                # Self-heal: reinstall the converter deps (command[0] = its
+                # interpreter) and retry once instead of failing.
+                if not attempted_repair and _looks_like_converter_dep_error(captured):
+                    attempted_repair = True
+                    try:
+                        repair = _reinstall_converter_deps(command[0], print_output = print_output)
+                        if repair.returncode == 0:
+                            continue
+                        repair_note = f"\n--- dependency reinstall failed ---\n{(repair.stdout or '').strip()}"
+                    except Exception as repair_error:
+                        repair_note = f"\n--- dependency reinstall failed ---\n{repair_error}"
+
+                if print_output and getattr(e, 'stdout', None):
+                    print(e.stdout)
+                cmd = " ".join(str(x) for x in command)
+                # Surface the converter output, else the failure is just "exit
+                # status 1" with the real traceback discarded.
+                details = ""
+                for label, stream in (("stderr", getattr(e, "stderr", None)),
+                                      ("stdout", getattr(e, "stdout", None))):
+                    if not stream: continue
+                    text = stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
+                    text = text.strip()
+                    if text: details += f"\n--- converter {label} ---\n{text}"
+                raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}")
 
         # Simple validation using native Python - check for main file or sharded files
         if os.path.exists(output_file):
@@ -1833,16 +1913,27 @@ def quantize_gguf(
 
     try:
         if print_output:
-            result = subprocess.run(command, shell=True, check=True, text=True,
+            result = subprocess.run(command, shell=True, check=True,
+                                  encoding="utf-8", errors="replace",
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             print(result.stdout)
         else:
-            subprocess.run(command, shell=True, check=True, capture_output=True)
+            # Capture so llama-quantize's output can be surfaced on failure.
+            subprocess.run(command, shell=True, check=True,
+                           encoding="utf-8", errors="replace",
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     except subprocess.CalledProcessError as e:
         if print_output and hasattr(e, 'stdout') and e.stdout:
             print(e.stdout)
-        raise RuntimeError(f"Failed to quantize {input_gguf} to {_display_quant_type}: {e}")
+        details = ""
+        for label, stream in (("stderr", getattr(e, "stderr", None)),
+                              ("stdout", getattr(e, "stdout", None))):
+            if not stream: continue
+            text = stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
+            text = text.strip()
+            if text: details += f"\n--- llama-quantize {label} ---\n{text}"
+        raise RuntimeError(f"Failed to quantize {input_gguf} to {_display_quant_type}: {e}{details}")
 
     # Verify output exists and get size using pathlib
     output_path = Path(output_gguf)
