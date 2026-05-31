@@ -1589,11 +1589,17 @@ def _reinstall_converter_deps(python_exe, print_output = False):
             f"Unsloth: The GGUF converter environment looks broken (stale/missing "
             f"package). Reinstalling {', '.join(_CONVERTER_PYTHON_DEPS)} and retrying..."
         )
-    command = [
-        python_exe, "-m", "pip", "install", "--upgrade", "--force-reinstall",
-        *_CONVERTER_PYTHON_DEPS,
-    ]
-    return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    def _run(cmd):
+        return subprocess.run(cmd, encoding="utf-8", errors="replace",
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    install = [python_exe, "-m", "pip", "install", "--upgrade", "--force-reinstall",
+               *_CONVERTER_PYTHON_DEPS]
+    result = _run(install)
+    # Some envs (eg uv-created venvs) ship without pip; bootstrap it once.
+    if result.returncode != 0 and "no module named pip" in (result.stdout or "").lower():
+        _run([python_exe, "-m", "ensurepip", "--upgrade"])
+        result = _run(install)
+    return result
 
 
 def convert_to_gguf(
@@ -1734,13 +1740,16 @@ def convert_to_gguf(
         repair_note = ""
         while True:
             try:
+                # encoding/errors pinned so non-UTF8 output never crashes decoding.
                 if print_output:
-                    result = subprocess.run(command, shell=False, check=True, text=True,
+                    result = subprocess.run(command, shell=False, check=True,
+                                          encoding="utf-8", errors="replace",
                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                     print(result.stdout)
                 else:
-                    # Capture as text so a failure surfaces the real traceback.
-                    subprocess.run(command, shell=False, check=True, text=True,
+                    # Capture so a failure surfaces the real traceback.
+                    subprocess.run(command, shell=False, check=True,
+                                   encoding="utf-8", errors="replace",
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 break
             except subprocess.CalledProcessError as e:
@@ -1753,10 +1762,13 @@ def convert_to_gguf(
                 # interpreter) and retry once instead of failing.
                 if not attempted_repair and _looks_like_converter_dep_error(captured):
                     attempted_repair = True
-                    repair = _reinstall_converter_deps(command[0], print_output = print_output)
-                    if repair.returncode == 0:
-                        continue
-                    repair_note = f"\n--- dependency reinstall failed ---\n{(repair.stdout or '').strip()}"
+                    try:
+                        repair = _reinstall_converter_deps(command[0], print_output = print_output)
+                        if repair.returncode == 0:
+                            continue
+                        repair_note = f"\n--- dependency reinstall failed ---\n{(repair.stdout or '').strip()}"
+                    except Exception as repair_error:
+                        repair_note = f"\n--- dependency reinstall failed ---\n{repair_error}"
 
                 if print_output and getattr(e, 'stdout', None):
                     print(e.stdout)
@@ -1901,12 +1913,14 @@ def quantize_gguf(
 
     try:
         if print_output:
-            result = subprocess.run(command, shell=True, check=True, text=True,
+            result = subprocess.run(command, shell=True, check=True,
+                                  encoding="utf-8", errors="replace",
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             print(result.stdout)
         else:
-            # Capture as text so llama-quantize's output can be surfaced on failure.
-            subprocess.run(command, shell=True, check=True, text=True,
+            # Capture so llama-quantize's output can be surfaced on failure.
+            subprocess.run(command, shell=True, check=True,
+                           encoding="utf-8", errors="replace",
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     except subprocess.CalledProcessError as e:
