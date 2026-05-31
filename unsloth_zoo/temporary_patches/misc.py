@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import inspect
 import importlib
+from collections.abc import Mapping
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 from .common import TEMPORARY_PATCHES, torch_compile, _torch_compile
 from .utils import (
@@ -183,6 +184,36 @@ def patch_CsmDepthDecoderForCausalLM_forward():
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         kwargs = process_output_options(self, locals(), kwargs)
 
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            seq_len = inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
+            device = inputs_embeds.device if inputs_embeds is not None else input_ids.device
+            codebook_indices = torch.arange(seq_len, device=device) + past_seen_tokens
+        else:
+            codebook_indices = cache_position
+
+        if inputs_embeds is None and input_ids is not None and backbone_last_hidden_state is not None:
+            # Precompute inputs_embeds so self.model skips upstream's in-place
+            # first-token replacement. Zoo's GC hook can make frozen embeddings
+            # leaf tensors, so detach before CopySlices carries backbone grads.
+            codebook_idxs = torch.clamp(codebook_indices - 1, min=0)
+            offset = codebook_idxs * self.model.vocab_size
+            inputs_embeds = self.model.embed_tokens(input_ids + offset)
+            if inputs_embeds.requires_grad and inputs_embeds.is_leaf:
+                # Use the cheap detach when backbone state supplies gradients;
+                # clone only when the GC sentinel itself must survive.
+                inputs_embeds = (
+                    inputs_embeds.detach()
+                    if backbone_last_hidden_state.requires_grad
+                    else inputs_embeds.clone()
+                )
+            inputs_embeds[:, 0] = backbone_last_hidden_state.to(
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
+            )
+            input_ids = None
+            backbone_last_hidden_state = None
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids = input_ids,
@@ -211,7 +242,7 @@ def patch_CsmDepthDecoderForCausalLM_forward():
             slice_indices = logits_to_keep
 
         logits = self.codebooks_head(
-            hidden_states[:, slice_indices, :], cache_position[slice_indices] if cache_position is not None else None
+            hidden_states[:, slice_indices, :], codebook_indices[slice_indices]
         )
         logits = logits.contiguous()
 
@@ -232,10 +263,15 @@ def patch_CsmDepthDecoderForCausalLM_forward():
     pass
 
     # Wrap with (self, *args, **kwargs) so check_args_kwargs accepts any
-    # removed params (output_attentions, output_hidden_states, cache_position)
+    # removed params (output_attentions, output_hidden_states, cache_position).
+    # Copy the original class signature onto the wrapper so
+    # transformers._validate_model_kwargs (used by generate) still sees
+    # the real named parameters like backbone_last_hidden_state.
+    _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
+    forward.__signature__ = _original_forward_signature
     patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
@@ -367,12 +403,155 @@ def patch_CsmForConditionalGeneration_forward():
         })
     pass
 
+    # Preserve the original signature on the wrapper so inspect.signature
+    # (used by transformers._validate_model_kwargs among others) still sees
+    # the real named parameters.
+    _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
+    forward.__signature__ = _original_forward_signature
     patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
+
+
+def _tie_csm_audio_embeddings(model):
+    if not getattr(getattr(model, "config", None), "tie_codebooks_embeddings", True):
+        return model
+    try:
+        audio_embeddings = model.backbone_model.embed_tokens.embed_audio_tokens
+        depth_embeddings = model.depth_decoder.model.embed_tokens
+        if audio_embeddings.weight.shape == depth_embeddings.weight.shape:
+            # Keep CSM's configured codebook tie alive when tie_word_embeddings=False.
+            audio_embeddings.weight = depth_embeddings.weight
+    except Exception:
+        pass
+    return model
+pass
+
+
+def patch_CsmForConditionalGeneration_tie_weights():
+    try:
+        import transformers.models.csm.modeling_csm
+    except Exception as e:
+        return raise_error("CsmForConditionalGeneration.tie_weights", e)
+
+    target_cls = transformers.models.csm.modeling_csm.CsmForConditionalGeneration
+    storage_name = _get_unique_storage_name(target_cls, "tie_weights")
+    if hasattr(target_cls, storage_name):
+        original_tie_weights = getattr(target_cls, storage_name)
+    else:
+        original_tie_weights = target_cls.tie_weights
+        setattr(target_cls, storage_name, original_tie_weights)
+    pass
+
+    def tie_weights(self, *args, **kwargs):
+        output = original_tie_weights(self, *args, **kwargs)
+        _tie_csm_audio_embeddings(self)
+        return output
+    pass
+    try:
+        tie_weights.__signature__ = inspect.signature(original_tie_weights)
+    except Exception:
+        pass
+    target_cls.tie_weights = tie_weights
+pass
+TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_tie_weights)
+
+
+def _label_csm_audio_eos_tokens(input_ids, labels, audio_eos_token_id):
+    if input_ids is None or labels is None or audio_eos_token_id is None:
+        return labels
+    try:
+        eos_mask = input_ids == audio_eos_token_id
+        previous_label_is_audio = labels[..., :-1] != -100
+        if torch.is_tensor(labels):
+            previous_label_is_audio = torch.nn.functional.pad(previous_label_is_audio, (1, 0), value=False)
+        else:
+            import numpy as np
+            previous_label_is_audio = np.concatenate(
+                [np.zeros_like(labels[..., :1], dtype=bool), previous_label_is_audio],
+                axis=-1,
+            )
+        labels[eos_mask & previous_label_is_audio] = audio_eos_token_id
+    except Exception:
+        pass
+    return labels
+pass
+
+
+def _get_csm_processor_audio_eos_token_id(processor):
+    audio_eos_token_id = getattr(processor, "audio_eos_token_id", None)
+    if audio_eos_token_id is not None:
+        return audio_eos_token_id
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        return None
+
+    audio_eos_token_id = getattr(tokenizer, "audio_eos_token_id", None)
+    if audio_eos_token_id is not None:
+        return audio_eos_token_id
+
+    audio_eos_token = getattr(processor, "audio_eos_token", getattr(tokenizer, "audio_eos_token", "<|audio_eos|>"))
+    try:
+        return tokenizer.convert_tokens_to_ids(audio_eos_token)
+    except Exception:
+        return None
+pass
+
+
+def _label_csm_processor_output(processor, output):
+    if not isinstance(output, Mapping) or "input_ids" not in output or "labels" not in output:
+        return output
+    output["labels"] = _label_csm_audio_eos_tokens(
+        output.get("input_ids"),
+        output.get("labels"),
+        _get_csm_processor_audio_eos_token_id(processor),
+    )
+    return output
+pass
+
+
+def patch_CsmProcessor_apply_chat_template():
+    try:
+        import transformers.models.csm.processing_csm
+    except Exception as e:
+        return raise_error("CsmProcessor", e)
+
+    target_cls = transformers.models.csm.processing_csm.CsmProcessor
+    apply_storage_name = _get_unique_storage_name(target_cls, "apply_chat_template")
+    if hasattr(target_cls, apply_storage_name):
+        original_apply_chat_template = getattr(target_cls, apply_storage_name)
+    else:
+        original_apply_chat_template = target_cls.apply_chat_template
+        setattr(target_cls, apply_storage_name, original_apply_chat_template)
+    pass
+    call_storage_name = _get_unique_storage_name(target_cls, "__call__")
+    if hasattr(target_cls, call_storage_name):
+        original_call = getattr(target_cls, call_storage_name)
+    else:
+        original_call = target_cls.__call__
+        setattr(target_cls, call_storage_name, original_call)
+    pass
+
+    def apply_chat_template(self, *args, **kwargs):
+        return _label_csm_processor_output(self, original_apply_chat_template(self, *args, **kwargs))
+    pass
+
+    def __call__(self, *args, **kwargs):
+        return _label_csm_processor_output(self, original_call(self, *args, **kwargs))
+    pass
+    try:
+        apply_chat_template.__signature__ = inspect.signature(original_apply_chat_template)
+        __call__.__signature__ = inspect.signature(original_call)
+    except Exception:
+        pass
+    target_cls.apply_chat_template = apply_chat_template
+    target_cls.__call__ = __call__
+pass
+TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
 def patch_transformers_masks():
@@ -758,7 +937,6 @@ def patch_CsmForConditionalGeneration_merge():
             if labels is not None:
                 labels_expanded = labels.unsqueeze(-1).repeat(1, 1, self.config.num_codebooks)
                 labels_expanded[audio_token_mask] = batched_audio_token_ids[audio_codes_mask]
-                # fix make sure to set eos_token_id as a valid label to predict
                 labels_expanded[audio_eos_token_mask] = audio_eos_frame_ids
                 # mask depth decoder
                 depth_decoder_ignore_frames_idxs = (labels == -101).nonzero(as_tuple=True)

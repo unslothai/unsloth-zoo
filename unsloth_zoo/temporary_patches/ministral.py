@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import torch
+import inspect
 from typing import Optional, Callable
 from .common import TEMPORARY_PATCHES
 from .utils import (
@@ -90,13 +91,19 @@ def patch_MinistralAttention():
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-    # Wrap so check_args_kwargs accepts removed params (e.g. cache_position in v5)
+    # Wrap so check_args_kwargs accepts removed params (e.g. cache_position in v5).
+    # Preserve the original signature on the wrapper so inspect.signature
+    # (used by transformers._validate_model_kwargs among others) still sees
+    # the real named parameters.
+    target_cls = transformers.models.ministral.modeling_ministral.MinistralAttention
+    _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
+    forward.__signature__ = _original_forward_signature
 
     patch_function(
-        transformers.models.ministral.modeling_ministral.MinistralAttention,
+        target_cls,
         "forward",
         forward,
         match_level="relaxed",

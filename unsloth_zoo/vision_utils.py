@@ -92,6 +92,9 @@ MIN_PIXELS = 4 * 28 * 28
 MAX_PIXELS = 16384 * 28 * 28
 MAX_RATIO = 200
 
+# Fire degenerate-aspect warning once per process.
+_WARNED_DEGENERATE_ASPECT = False
+
 VIDEO_MIN_PIXELS = 128 * 28 * 28
 VIDEO_MAX_PIXELS = 768 * 28 * 28
 VIDEO_TOTAL_PIXELS = int(float(os.environ.get('VIDEO_MAX_PIXELS', 128000 * 28 * 28 * 0.9)))
@@ -972,18 +975,39 @@ class UnslothVisionDataCollator:
             return image or []
         # Resize images
         image_size = self.image_size
+        # Hoist loop invariants.
+        is_tuple = type(image_size) is tuple
+        snap = self.snap_to_patch_size
+        if snap:
+            factor = self.patch_size * 2
 
         for i, img in enumerate(image):
-            if type(image_size) is tuple:
+            if is_tuple:
                 image[i] = img.resize(image_size, LANCZOS)
-            elif self.size_func(img) > image_size and hasattr(img, "resize"):
+                continue
+            # Cache size_func(img) once.
+            side = self.size_func(img)
+            if side > image_size and hasattr(img, "resize"):
                 w, h = img.size
-                # integer math rounding
-                new_w = (w * image_size + self.size_func(img) // 2) // self.size_func(img)
-                new_h = (h * image_size + self.size_func(img) // 2) // self.size_func(img)
-                if self.snap_to_patch_size:
-                    factor = self.patch_size * 2
+                # max(1, _) avoids zero-side crash on degenerate aspect ratios.
+                new_w = max(1, (w * image_size + side // 2) // side)
+                new_h = max(1, (h * image_size + side // 2) // side)
+                if snap:
                     new_w, new_h = quantize_to_factor(new_w), quantize_to_factor(new_h)
+
+                # Qwen2-VL smart_resize rejects aspect > MAX_RATIO; warn once.
+                global _WARNED_DEGENERATE_ASPECT
+                if (not _WARNED_DEGENERATE_ASPECT
+                        and max(new_w, new_h) > MAX_RATIO * min(new_w, new_h)):
+                    _WARNED_DEGENERATE_ASPECT = True
+                    warnings.warn(
+                        f"Unsloth: {w}x{h} -> ({new_w}, {new_h}) aspect "
+                        f"{max(new_w, new_h) // min(new_w, new_h)} > "
+                        f"MAX_RATIO={MAX_RATIO}. Qwen2-VL/2.5-VL will reject; "
+                        "filter degenerate-aspect images from your dataset.",
+                        UserWarning,
+                        stacklevel = 2,
+                    )
 
                 image[i] = img.resize((new_w, new_h), LANCZOS)
 

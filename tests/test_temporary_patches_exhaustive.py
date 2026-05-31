@@ -885,6 +885,154 @@ def test_csm_depth_decoder_for_causal_lm_forward_named_params():
     )
 
 
+def _tiny_csm_depth_decoder(torch):
+    csm = pytest.importorskip("transformers.models.csm.modeling_csm")
+    config_mod = pytest.importorskip("transformers.models.csm.configuration_csm")
+    config = config_mod.CsmDepthDecoderConfig(
+        vocab_size=11, num_codebooks=4, backbone_hidden_size=8,
+        hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1,
+        max_position_embeddings=8, head_dim=4, use_cache=False,
+        pad_token_id=0,
+    )
+    config._attn_implementation = "eager"
+    model = csm.CsmDepthDecoderForCausalLM(config).train()
+    model.model.embed_tokens.weight.requires_grad_(False)
+    return model
+
+
+@pytest.mark.parametrize("backbone_requires_grad", [True, False])
+def test_csm_depth_decoder_leaf_embedding_hook_backward(backbone_requires_grad):
+    """CSM patch handles GC hook leaf embeddings without losing grad input."""
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo.temporary_patches.misc import patch_CsmDepthDecoderForCausalLM_forward
+
+    patch_CsmDepthDecoderForCausalLM_forward()
+    model = _tiny_csm_depth_decoder(torch)
+    seen = {}
+    original_forward = model.model.forward
+
+    def wrapped_model_forward(*args, **kwargs):
+        seen["inputs_embeds_requires_grad"] = kwargs["inputs_embeds"].requires_grad
+        return original_forward(*args, **kwargs)
+
+    model.model.forward = wrapped_model_forward
+    hook = model.model.embed_tokens.register_forward_hook(
+        lambda module, args, output: output.requires_grad_(True)
+    )
+    try:
+        backbone_state = torch.randn(1, 8, requires_grad=backbone_requires_grad)
+        out = model(
+            input_ids=torch.tensor([[0, 2, 3, 4]], dtype=torch.long),
+            backbone_last_hidden_state=backbone_state,
+            labels=torch.tensor([[5, 6, 7, 8]], dtype=torch.long),
+            return_dict=True,
+        )
+        out.loss.backward()
+
+        assert seen["inputs_embeds_requires_grad"] is True
+        if backbone_requires_grad:
+            assert backbone_state.grad is not None
+            assert torch.count_nonzero(backbone_state.grad) > 0
+    finally:
+        hook.remove()
+        model.model.forward = original_forward
+
+
+def test_csm_audio_embeddings_tie_helper():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _tie_csm_audio_embeddings
+
+    audio = torch.nn.Embedding(4, 3)
+    depth = torch.nn.Embedding(4, 3)
+    model = SimpleNamespace(
+        backbone_model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(embed_audio_tokens=audio),
+        ),
+        depth_decoder=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=depth),
+        ),
+    )
+
+    assert audio.weight.data_ptr() != depth.weight.data_ptr()
+    _tie_csm_audio_embeddings(model)
+    assert audio.weight.data_ptr() == depth.weight.data_ptr()
+
+
+def test_csm_audio_embeddings_tie_helper_respects_config():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _tie_csm_audio_embeddings
+
+    audio = torch.nn.Embedding(4, 3)
+    depth = torch.nn.Embedding(4, 3)
+    model = SimpleNamespace(
+        config=SimpleNamespace(tie_codebooks_embeddings=False),
+        backbone_model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(embed_audio_tokens=audio),
+        ),
+        depth_decoder=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=depth),
+        ),
+    )
+
+    _tie_csm_audio_embeddings(model)
+    assert audio.weight.data_ptr() != depth.weight.data_ptr()
+
+
+def test_csm_audio_eos_label_helper_keeps_trainer_counts_aligned():
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo.temporary_patches.misc import _label_csm_audio_eos_tokens
+
+    labels = torch.tensor([[-100, 128002, -100, -100]])
+    input_ids = torch.tensor([[128000, 128002, 128003, 0]])
+
+    labels = _label_csm_audio_eos_tokens(input_ids, labels, 128003)
+
+    assert labels.tolist() == [[-100, 128002, 128003, -100]]
+
+
+def test_csm_audio_eos_label_helper_supports_numpy():
+    np = pytest.importorskip("numpy")
+    from unsloth_zoo.temporary_patches.misc import _label_csm_audio_eos_tokens
+
+    labels = np.array([[-100, 128002, -100, -100]])
+    input_ids = np.array([[128000, 128002, 128003, 0]])
+
+    labels = _label_csm_audio_eos_tokens(input_ids, labels, 128003)
+
+    assert labels.tolist() == [[-100, 128002, 128003, -100]]
+
+
+def test_csm_processor_output_uses_configured_audio_eos_id():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _label_csm_processor_output
+
+    processor = SimpleNamespace(audio_eos_token_id=42)
+    output = {
+        "input_ids": torch.tensor([[128000, 128002, 42, 0]]),
+        "labels": torch.tensor([[-100, 128002, -100, -100]]),
+    }
+
+    output = _label_csm_processor_output(processor, output)
+
+    assert output["labels"].tolist() == [[-100, 128002, 42, -100]]
+
+
+def test_csm_processor_output_ignores_non_mappings():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _label_csm_processor_output
+
+    tensor_output = torch.tensor([[128000, 128002]])
+    text_output = "input_ids and labels are just rendered text"
+
+    assert _label_csm_processor_output(SimpleNamespace(), tensor_output) is tensor_output
+    assert _label_csm_processor_output(SimpleNamespace(), text_output) is text_output
+
+
 def test_csm_for_conditional_generation_forward_named_params():
     """misc.py:373 patches CsmForConditionalGeneration.forward (input_ids,
     input_values, ..., logits_to_keep). Resolves via ``_original_*``
@@ -2362,5 +2510,3 @@ def test_temporary_patches_directory_has_expected_files():
             f"DRIFT DETECTED: temporary_patches/ is missing files {missing}; "
             f"either they were renamed or dropped without updating the test"
         )
-
-
