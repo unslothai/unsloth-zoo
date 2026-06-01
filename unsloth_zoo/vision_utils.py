@@ -697,6 +697,25 @@ class UnslothVisionDataCollator:
             else:
                 self.patch_size = IMAGE_FACTOR // 2
 
+        # Some configs (e.g. InternVL3) specify patch_size as a (height, width)
+        # tuple/list, but UnslothVisionDataCollator uses it as a scalar size
+        # factor (`self.patch_size * 2`) for image resizing. Coerce to a single
+        # int: take the unique value for square patches, else fall back to the
+        # max so resized images remain divisible in both dimensions.
+        if isinstance(self.patch_size, (tuple, list)):
+            if len(self.patch_size) == 0:
+                self.patch_size = IMAGE_FACTOR // 2
+            elif all(p == self.patch_size[0] for p in self.patch_size):
+                self.patch_size = int(self.patch_size[0])
+            else:
+                logger.warning(
+                    f"Unsloth: non-square vision patch_size {tuple(self.patch_size)} "
+                    f"detected; using max for image size factor."
+                )
+                self.patch_size = int(max(self.patch_size))
+        else:
+            self.patch_size = int(self.patch_size)
+
         # Auto resize images to save VRAM!
         if resize == "min":
             try:
