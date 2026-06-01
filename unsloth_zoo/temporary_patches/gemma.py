@@ -449,6 +449,45 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
 
+def patch_Gemma3MultiModalProjector():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector
+    except Exception as e:
+        return raise_error("Gemma3MultiModalProjector.forward", e)
+
+    def forward(self, vision_outputs: torch.Tensor):
+        batch_size, _, seq_length = vision_outputs.shape
+
+        reshaped_vision_outputs = vision_outputs.transpose(1, 2)
+        reshaped_vision_outputs = reshaped_vision_outputs.reshape(
+            batch_size, seq_length, self.patches_per_image, self.patches_per_image
+        )
+        reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
+
+        pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
+        pooled_vision_outputs = pooled_vision_outputs.flatten(2)
+        pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2)
+
+        # mm_soft_emb_norm is a Gemma3RMSNorm, so under FORCE_FLOAT32 it can emit a float32
+        # activation (when its weight is upcast for stability) while mm_input_projection_weight
+        # stays a low-precision dtype -> "mat1 and mat2 must have the same dtype: float != Half"
+        # in the matmul below. Narrow the normed output to the projection weight's boundary
+        # dtype, exactly like the MLP/attention Linear boundaries: fp16 weights -> fp16 (with
+        # the overflow clamp, bit-identical to stock), fp32 weights (full finetuning) -> fp32.
+        normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
+        boundary_dtype = _module_compute_dtype(self, "mm_input_projection_weight")
+        normed_vision_outputs = _narrow_to_boundary(normed_vision_outputs.to(torch.float32), boundary_dtype)
+
+        projected_vision_outputs = torch.matmul(normed_vision_outputs, self.mm_input_projection_weight)
+        return projected_vision_outputs.type_as(vision_outputs)
+    pass
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector, "forward", forward, fullgraph = False)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3MultiModalProjector)
+
+
 def patch_Gemma3Attention():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
