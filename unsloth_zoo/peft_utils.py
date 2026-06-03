@@ -43,6 +43,9 @@ SKIP_QUANTIZATION_MODULES = [
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
+    "vision_embedder",          # multimodal embedders kept in full precision
+    "embed_vision",
+    "embed_audio",
     "score",                    # *ForSequenceClassification head
     "classifier",               # *ForTokenClassification, *ForImageClassification, BERT-family head
     "qa_outputs",               # *ForQuestionAnswering head
@@ -215,13 +218,19 @@ def requires_grad_for_gradient_checkpointing(model):
         if type_output is torch.Tensor:
             output.requires_grad_(True)
         else:
-            try: # For dataclass from HF, try on loss or logits 
+            try: # For dataclass from HF, try on loss or logits
                 if hasattr(output, "loss") and output.loss is not None:
                     output.loss.requires_grad_(True)
-                elif hasattr(output, "logits") and output.logits is not None: #with RL like GRPO there are no loss as you don't provide labels 
+                elif hasattr(output, "logits") and output.logits is not None: #with RL like GRPO there are no loss as you don't provide labels
                     output.logits.requires_grad_(True)
+                elif hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+                    # Encoder / decoder-style embedding backbones (e.g. Qwen3-Embedding) return a
+                    # BaseModelOutputWithPast with only last_hidden_state (no loss/logits) when called
+                    # for sentence embeddings. Make it require grad so gradient checkpointing works.
+                    # See https://github.com/unslothai/unsloth/issues/5360
+                    output.last_hidden_state.requires_grad_(True)
                 else:
-                    raise ValueError("Neither loss nor logits are available for grad post hook.")
+                    raise ValueError("Neither loss, logits, nor last_hidden_state are available for grad post hook.")
             except Exception as e:
                 raise RuntimeError(f"Unsloth: Failed to make output require gradients: {e}")
     pass
