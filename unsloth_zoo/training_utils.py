@@ -223,6 +223,26 @@ def prepare_model_for_training(
                 if hasattr(module, "gradient_checkpointing"):
                     module.gradient_checkpointing = False
 
+    # KV cache is unused under gradient checkpointing; disable it on every config.
+    if use_gradient_checkpointing in (True, "unsloth") and getattr(model, "config", None) is not None:
+        try:
+            from transformers import PretrainedConfig
+        except Exception:
+            PretrainedConfig = None
+        _seen = set()
+        _stack = [model.config]
+        while _stack:
+            _cfg = _stack.pop()
+            if _cfg is None or id(_cfg) in _seen:
+                continue
+            _seen.add(id(_cfg))
+            if getattr(_cfg, "use_cache", None):
+                _cfg.use_cache = False
+            if PretrainedConfig is not None:
+                for _sub in vars(_cfg).values():
+                    if isinstance(_sub, PretrainedConfig):
+                        _stack.append(_sub)
+
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:
         if hasattr(model, "enable_input_require_grads"):
