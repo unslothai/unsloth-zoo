@@ -1275,7 +1275,6 @@ def create_standalone_class(
         "use_kernelized_func",
         "auto_docstring",
         "merge_with_config_defaults",
-        "capture_outputs",
         # add more here if needed
     }
 
@@ -1476,7 +1475,7 @@ def create_standalone_class(
     _PAREN_GROUP = r"(?P<grp>\((?:[^()'\"]|'[^'\\]*(?:\\.[^'\\]*)*'|\"[^\"\\]*(?:\\.[^\"\\]*)*\"|(?P>grp))*\))"
     for _dec in (
         "auto_docstring", "use_kernelized_func", "check_model_inputs",
-        "merge_with_config_defaults", "capture_outputs",
+        "merge_with_config_defaults",
     ):
         source = regex.sub(rf"@{_dec}\s*(?:{_PAREN_GROUP})?", "", source)
 
@@ -3280,6 +3279,56 @@ FIX_GC_LAYER_CALLER_MODULES = [
 ]
 
 
+def patch_output_capture_targets(modeling_file, replacement_classes=None):
+    """Return captured target names and retarget them after class replacement."""
+    try:
+        from transformers.utils.output_capturing import OutputRecorder
+    except ImportError:
+        return set()
+
+    replacement_classes = replacement_classes or {}
+    target_names = set()
+
+    def patch_capture_spec(spec):
+        if isinstance(spec, (list, tuple)):
+            patched = [patch_capture_spec(x) for x in spec]
+            return tuple(patched) if isinstance(spec, tuple) else patched
+        if isinstance(spec, OutputRecorder) and spec.target_class is not None:
+            target_names.add(spec.target_class.__name__)
+            replacement_class = replacement_classes.get(spec.target_class.__name__)
+            if replacement_class is not None:
+                spec.target_class = replacement_class
+        elif isinstance(spec, type):
+            target_names.add(spec.__name__)
+            return replacement_classes.get(spec.__name__, spec)
+        return spec
+
+    for item_name in dir(modeling_file):
+        try:
+            item = getattr(modeling_file, item_name)
+            capture_flags = getattr(item, "_can_record_outputs", None)
+        except Exception:
+            continue
+        if not isinstance(capture_flags, dict):
+            continue
+        for flag_name, capture_spec in capture_flags.items():
+            capture_flags[flag_name] = patch_capture_spec(capture_spec)
+    return target_names
+
+
+def calls_output_capture_target(init, source, target_names):
+    """Detect direct calls to submodules targeted by Transformers output hooks."""
+    for target_name in target_names:
+        assigned_names = re.findall(
+            rf"self\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)*{re.escape(target_name)}\(",
+            init,
+        )
+        for assigned_name in assigned_names:
+            if f"self.{assigned_name}(" in source:
+                return True
+    return False
+
+
 def unsloth_compile_transformers(
     model_type: str = "llama",
     sdpa_dynamic_mask: bool = True,
@@ -3769,8 +3818,10 @@ def unsloth_compile_transformers(
     # Remove modules which have attention mechanisms
     # since torch.compile will compile too many kernels
     bad_torch_modules = set()
+    no_fullgraph_modules = set()
     # actively disable certain modules
     disable_modules = set()
+    output_capture_target_names = patch_output_capture_targets(modeling_file)
     for module, fullgraph in torch_modules.items():
         try:
             source = eval(f"{model_location}.{module}")
@@ -3824,6 +3875,17 @@ def unsloth_compile_transformers(
                 f"Unsloth: Will not compile {module} since data-dependent routing is done."
             )
             bad_torch_modules.add(module)
+        pass
+
+        if (
+            fullgraph
+            and len(output_capture_target_names) > 0
+            and calls_output_capture_target(init, source, output_capture_target_names)
+        ):
+            print(
+                f"Unsloth: Will compile {module} without fullgraph since output capture hooks run inside it."
+            )
+            no_fullgraph_modules.add(module)
         pass
 
         # Remove decoder layers
@@ -3914,7 +3976,7 @@ def unsloth_compile_transformers(
                     module,
                     model_location,
                     functions,
-                    fullgraph=fullgraph,
+                    fullgraph=False if module in no_fullgraph_modules else fullgraph,
                     disable=disable,
                 )
                 print(f"Unsloth: Compiled module {module}.")
@@ -4575,6 +4637,7 @@ def unsloth_compile_transformers(
         return
 
     # Import and replace with new module
+    replacement_classes = {}
     for module in all_standalone_classes.keys():
         try:
             exec(
@@ -4582,9 +4645,12 @@ def unsloth_compile_transformers(
                 globals(),
                 locals(),
             )
+            replacement_classes[module] = getattr(combined_module, module)
         except:
             pass
     pass
+
+    patch_output_capture_targets(modeling_file, replacement_classes)
 
     # Finally edit dictionary items inside the target file
     replaced_classes = all_standalone_classes.keys()
