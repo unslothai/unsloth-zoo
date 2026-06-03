@@ -43,6 +43,9 @@ SKIP_QUANTIZATION_MODULES = [
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
+    "vision_embedder",          # multimodal embedders kept in full precision
+    "embed_vision",
+    "embed_audio",
     "score",                    # *ForSequenceClassification head
     "classifier",               # *ForTokenClassification, *ForImageClassification, BERT-family head
     "qa_outputs",               # *ForQuestionAnswering head
