@@ -53,6 +53,10 @@ IMAGE_TOKENS = [
     "<|IMG_PATCH|>",      # Cohere
 ]
 
+AUDIO_TOKENS = [
+    "<|audio|>",  # Gemma 4
+]
+
 import torch
 from PIL import Image
 import base64
@@ -570,6 +574,21 @@ def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> L
     return vision_infos
 
 
+def extract_audio_info(conversations: Union[List[Dict], List[List[Dict]]]) -> List:
+    audio_inputs = []
+    if len(conversations) == 0:
+        return audio_inputs
+    if isinstance(conversations[0], dict):
+        conversations = [conversations]
+    for conversation in conversations:
+        for message in conversation:
+            if isinstance(message["content"], list):
+                for ele in message["content"]:
+                    if ele.get("type") == "audio" and "audio" in ele:
+                        audio_inputs.append(ele["audio"])
+    return audio_inputs
+
+
 def process_vision_info(
     conversations: Union[List[Dict], List[List[Dict]]],
     size_factor: int = IMAGE_FACTOR,
@@ -602,14 +621,16 @@ def process_vision_info(
 
 
 def get_padding_tokens_ids(tokenizer):
-    global IMAGE_TOKENS
+    global IMAGE_TOKENS, AUDIO_TOKENS
 
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
-    image_tokens = IMAGE_TOKENS
+    placeholder_tokens = IMAGE_TOKENS + AUDIO_TOKENS
     if hasattr(tokenizer, "image_token"):
-        image_tokens = IMAGE_TOKENS + [tokenizer.image_token]
+        placeholder_tokens = placeholder_tokens + [tokenizer.image_token]
+    if hasattr(tokenizer, "audio_token"):
+        placeholder_tokens = placeholder_tokens + [tokenizer.audio_token]
 
-    padding_token_ids = tokenizer.convert_tokens_to_ids(image_tokens)
+    padding_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
     if hasattr(tokenizer, "pad_token_id"):
         padding_token_ids.append(tokenizer.pad_token_id)
 
@@ -799,6 +820,7 @@ class UnslothVisionDataCollator:
         texts  = []
         images = []
         videos = []
+        audios = []
         video_kwargs = {'fps': []}
         for example in examples:
             messages = self._select_messages_or_raw(example)
@@ -831,6 +853,9 @@ class UnslothVisionDataCollator:
                     video_kwarg = {"fps": []}
                 video_kwargs['fps'].extend(video_kwarg['fps'])
 
+            audio = self._extract_audio_for_example(example, messages)
+            audios.extend(audio)
+
         # Tokenize the texts and process the images
         proc_kwargs = dict(
             text=texts,
@@ -847,6 +872,8 @@ class UnslothVisionDataCollator:
             video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
             for k, v in video_kwargs.items():
                 proc_kwargs[k] = v
+        if audios:
+            proc_kwargs["audio"] = audios
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
         batch = self.processor(**proc_kwargs)
@@ -931,6 +958,11 @@ class UnslothVisionDataCollator:
             if image is None: image = []
             if video is None: video = []
         return image, video, video_kwarg
+
+    def _extract_audio_for_example(self, example, messages):
+        if "audio" in example:
+            return list(example["audio"])
+        return extract_audio_info(messages)
 
     def _extract_images_for_pc(self, example, p_msgs, c_msgs):
         # PC: prefer embedded across prompt+completion; else top-level first image; else []
