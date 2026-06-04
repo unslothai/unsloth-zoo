@@ -180,6 +180,7 @@ def _check_torch_grouped_mm_supported():
 
 _TRITON_ALLOCATOR_INITIALIZED = False
 _PERSISTENT_BUFFER = None
+_original_peft_get_peft_model = None
 
 
 def _init_triton_allocator():
@@ -239,7 +240,7 @@ def _check_grouped_gemm_available():
     return _GROUPED_GEMM_AVAILABLE
 
 
-from functools import lru_cache
+from functools import lru_cache, wraps
 
 
 @lru_cache(maxsize=1)
@@ -389,6 +390,7 @@ def _get_moe_lora_io_dims(wrapper, experts_module=None):
     source = experts_module if experts_module is not None else base
     if source is None:
         return None, None
+    _set_gpt_oss_grouped_mm_format_on_experts(source)
 
     shape = _get_param_shape_from_module(source, parameter_name)
     if shape is not None and len(shape) >= 3:
@@ -760,6 +762,104 @@ def preprocess_weight(
 # ============================================================================
 
 
+def _normalize_model_type(value) -> str:
+    if value is None:
+        return ""
+    return str(value).lower().replace("-", "_")
+
+
+def _is_gpt_oss_model(model) -> bool:
+    config = getattr(model, "config", None)
+    model_type = _normalize_model_type(getattr(config, "model_type", None))
+    if model_type == "gpt_oss":
+        return True
+
+    for attr in ("_name_or_path", "name_or_path"):
+        if "gpt_oss" in _normalize_model_type(getattr(config, attr, None)):
+            return True
+
+    return False
+
+
+def _set_gpt_oss_grouped_mm_format_on_experts(module) -> bool:
+    if module is None:
+        return False
+    if module.__class__.__name__ != "GptOssExperts":
+        return False
+    if bool(getattr(module, "_unsloth_grouped_mm_format", False)):
+        return False
+    module._unsloth_grouped_mm_format = True
+    return True
+
+
+def patch_gpt_oss_grouped_mm_format(model) -> int:
+    """
+    Mark GPT-OSS experts as storing weights in grouped_mm format.
+
+    Stock transformers GPT-OSS experts use (E, in_dim, out_dim) tensors but do
+    not carry Unsloth's `_unsloth_grouped_mm_format` instance flag. Set it on
+    live expert modules so the shared MoE LoRA extractor chooses GPT-OSS
+    ordering instead of the Qwen-style fallback.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if model is None or not _is_gpt_oss_model(model):
+        return 0
+
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return 0
+
+    updated = 0
+    for module in modules():
+        if _set_gpt_oss_grouped_mm_format_on_experts(module):
+            updated += 1
+    return updated
+
+
+def _patch_peft_get_peft_model_for_moe():
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    global _original_peft_get_peft_model
+    if _original_peft_get_peft_model is not None:
+        return
+
+    try:
+        import peft
+    except Exception:
+        return
+
+    original_get_peft_model = getattr(peft, "get_peft_model", None)
+    if original_get_peft_model is None:
+        return
+    if getattr(original_get_peft_model, "_unsloth_moe_patched", False):
+        return
+
+    _original_peft_get_peft_model = original_get_peft_model
+
+    @wraps(original_get_peft_model)
+    def patched_get_peft_model(model, *args, **kwargs):
+        peft_model = original_get_peft_model(model, *args, **kwargs)
+        try:
+            patch_gpt_oss_grouped_mm_format(model)
+            if peft_model is not model:
+                patch_gpt_oss_grouped_mm_format(peft_model)
+        except Exception:
+            pass
+        return peft_model
+
+    patched_get_peft_model._unsloth_moe_patched = True
+    peft.get_peft_model = patched_get_peft_model
+
+    for module_name in ("peft.mapping_func", "peft.mapping"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        if getattr(module, "get_peft_model", None) is original_get_peft_model:
+            module.get_peft_model = patched_get_peft_model
+
+
 def _is_moe_experts_module(module) -> bool:
     """
     Check if module is an MoE experts layer (generic, not model-specific).
@@ -904,6 +1004,7 @@ def patch_param_wrapper_for_moe():
 
         # Patch with our version
         ParamWrapper.forward = _patched_param_wrapper_forward
+        _patch_peft_get_peft_model_for_moe()
 
         return True
     except ImportError:
