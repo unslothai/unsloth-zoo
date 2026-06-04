@@ -411,15 +411,32 @@ def test_lm_head_extraction_collapsed_to_single_path():
     assert 'elif hasattr(vllm_internals, "lm_head")' not in lm_block
 
 
-def test_gemma4_k_eq_v_set_hoists_constant_check():
-    # Pre-fix: model_type == "gemma4" and attention_k_eq_v were evaluated on
-    # every iteration of the set comprehension. Current fix also routes the
-    # model-type check through the shared _is_gemma4_config helper so that
-    # text-only Gemma4 (model_type == "gemma4_text") is matched too.
+def test_gemma4_kv_shared_set_uses_shared_config_helper():
+    # Keep Gemma4 config matching routed through the shared helper so text-only
+    # Gemma4 configs (model_type == "gemma4_text") are matched too.
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils._get_vllm_state_dict)
-    assert 'if _is_gemma4_config(config) and getattr(text_config, "attention_k_eq_v"' in src
-    assert "gemma4_k_eq_v_layers = set()" in src
+    assert "if _is_gemma4_config(config):" in src
+    assert "gemma4_kv_shared_layers = set()" in src
+
+
+def test_gemma4_layer_types_none_is_guarded():
+    # Gemma4 configs may carry layer_types=None. Direct enumerate(None) crashed
+    # BnB k_eq_v quant-state patching.
+    from unsloth_zoo import empty_model
+    empty_src = inspect.getsource(empty_model.patch_gemma4_vllm_k_eq_v_support)
+    assert 'getattr(text_config, "layer_types", None) or ()' in empty_src
+
+
+def test_gemma4_k_eq_v_does_not_skip_v_proj_extraction():
+    # Dense Gemma4 split layouts can expose real v_proj weights even when
+    # attention_k_eq_v is true. Do not leave converted HF placeholders behind.
+    from unsloth_zoo import vllm_utils
+    src = inspect.getsource(vllm_utils._get_vllm_state_dict)
+    v_proj_idx = src.index('get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)')
+    guard_window = src[max(0, v_proj_idx - 200):v_proj_idx]
+    assert "gemma4_k_eq_v_layers" not in guard_window
+    assert "gemma4_kv_shared_layers" in guard_window
 
 
 def test_merger_linear_fc_moved_to_non_layered():

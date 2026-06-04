@@ -437,7 +437,7 @@ def patch_gemma4_vllm_k_eq_v_support():
 
         param_names = set(name for name, _ in model.named_parameters())
         pairs = []
-        for layer_idx, layer_type in enumerate(getattr(text_config, "layer_types", ())):
+        for layer_idx, layer_type in enumerate(getattr(text_config, "layer_types", None) or ()):
             if layer_type != "full_attention":
                 continue
 

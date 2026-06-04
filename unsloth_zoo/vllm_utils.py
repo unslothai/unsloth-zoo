@@ -1089,14 +1089,6 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             quant_state_dict[prefix + ".bias"] = bias_tensor
     pass
 
-    if _is_gemma4_config(config) and getattr(text_config, "attention_k_eq_v", False):
-        gemma4_k_eq_v_layers = {
-            kk
-            for kk, layer_type in enumerate(getattr(text_config, "layer_types", ()))
-            if layer_type == "full_attention"
-        }
-    else:
-        gemma4_k_eq_v_layers = set()
     if _is_gemma4_config(config):
         num_kv_shared_layers = getattr(text_config, "num_kv_shared_layers", 0) or 0
         num_hidden_layers = getattr(text_config, "num_hidden_layers", 0) or 0
@@ -1155,7 +1147,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
                 if kk not in gemma4_kv_shared_layers:
                     get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
-                if kk not in gemma4_k_eq_v_layers and kk not in gemma4_kv_shared_layers:
+                if kk not in gemma4_kv_shared_layers:
                     get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
             get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
         elif hasattr(layer, "cross_attn"):
