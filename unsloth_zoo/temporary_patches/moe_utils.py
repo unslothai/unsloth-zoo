@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import os
 import shutil
 import sys
+import importlib
 import importlib.util
 from typing import Optional, Tuple
 from torch.autograd import Function
@@ -768,15 +769,37 @@ def _normalize_model_type(value) -> str:
     return str(value).lower().replace("-", "_")
 
 
-def _is_gpt_oss_model(model) -> bool:
-    config = getattr(model, "config", None)
-    model_type = _normalize_model_type(getattr(config, "model_type", None))
-    if model_type == "gpt_oss":
-        return True
+def _iter_model_configs(model):
+    seen = set()
+    queue = [model]
+    while queue and len(seen) < 8:
+        current = queue.pop(0)
+        if current is None:
+            continue
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
 
-    for attr in ("_name_or_path", "name_or_path"):
-        if "gpt_oss" in _normalize_model_type(getattr(config, attr, None)):
+        config = getattr(current, "config", None)
+        if config is not None:
+            yield config
+
+        for attr in ("base_model", "model"):
+            nested = getattr(current, attr, None)
+            if nested is not None and nested is not current:
+                queue.append(nested)
+
+
+def _is_gpt_oss_model(model) -> bool:
+    for config in _iter_model_configs(model):
+        model_type = _normalize_model_type(getattr(config, "model_type", None))
+        if model_type == "gpt_oss":
             return True
+
+        for attr in ("_name_or_path", "name_or_path"):
+            if "gpt_oss" in _normalize_model_type(getattr(config, attr, None)):
+                return True
 
     return False
 

@@ -69,6 +69,14 @@ class _Wrapper:
         return self.base_layer
 
 
+class _PeftLikeWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.base_model = nn.Module()
+        self.base_model.model = model
+        self.config = _Config("lora")
+
+
 def _unwrap_base_layer(module):
     while hasattr(module, "base_layer"):
         module = module.base_layer
@@ -163,6 +171,15 @@ def test_gpt_oss_experts_name_is_gated_by_model_type():
 
     assert patch_gpt_oss_grouped_mm_format(model) == 0
     assert not hasattr(experts, "_unsloth_grouped_mm_format")
+
+
+def test_gpt_oss_detection_unwraps_peft_like_model():
+    experts = GptOssExperts()
+    model = _Model("gpt_oss", experts)
+    wrapped_model = _PeftLikeWrapper(model)
+
+    assert patch_gpt_oss_grouped_mm_format(wrapped_model) == 1
+    assert experts._unsloth_grouped_mm_format is True
 
 
 def test_existing_gpt_oss_grouped_mm_flag_is_preserved():
