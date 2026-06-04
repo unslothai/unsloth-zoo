@@ -98,7 +98,36 @@ def patch_glm4_moe():
     patch_function(Glm4MoeLiteMoE,      "forward", moe_block_forward)
 
     if UNSLOTH_ENABLE_LOGGING:
-        logger.info("Unsloth: Patched GLM4 MoE for Split LoRA support.")
+        logger.info("Unsloth: Patched GLM4 MoE Lite for Split LoRA support.")
 
-# Register the patch
+
+def patch_glm4_moe_standard():
+    """Patches standard (non-lite) GLM4 MoE for Split LoRA using grouped GEMM."""
+    patch_param_wrapper_for_moe()
+
+    try:
+        from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeNaiveMoe
+    except ImportError:
+        return
+
+    def _glm4_std_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+        return extract_moe_lora_weights_for_grouped_mm(
+            wrapper,
+            weight_A,
+            weight_B,
+            scaling,
+            num_experts,
+            model_name="GLM4 MoE",
+            enable_logging=UNSLOTH_ENABLE_LOGGING,
+            logger_obj=logger,
+        )
+
+    Glm4MoeNaiveMoe._unsloth_lora_extractor_fn = staticmethod(_glm4_std_lora_extractor)
+    patch_function(Glm4MoeNaiveMoe, "forward", get_forward_moe_backend())
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: Patched GLM4 MoE (standard) for Split LoRA support.")
+
+# Register the patches
 TEMPORARY_PATCHES.append(patch_glm4_moe)
+TEMPORARY_PATCHES.append(patch_glm4_moe_standard)
