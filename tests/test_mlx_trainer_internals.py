@@ -533,6 +533,41 @@ def test_qwen3_vl_vision_rotary_uses_transformers_fp32_math():
     assert "k = _qwen3_vision_rotary_fp32(k, rotary_pos_emb)" in source
 
 
+def test_qwen3_vl_vision_block_mlp_fp32_guard_for_fp16():
+    """Pin the fp16 MLP overflow guard in patched_qwen3_vision_block_call.
+
+    On M1/M2 Macs (no native bf16), MLX defaults to float16 for the vision
+    tower. The vision block's MLP linear_fc1 (up-projection) produces output
+    magnitudes that exceed fp16's 65504 ceiling for some inputs; downcasting
+    to fp16 saturates to inf and cascades to NaN in the backward.
+
+    Fix: when activation dtype is fp16, upcast the MLP input to fp32 so the
+    entire MLP (fc1, GELU, fc2) runs in fp32. The output is cast back to
+    source dtype at the residual add. bf16/fp32 keep the original path.
+    """
+    import inspect
+    import unsloth_zoo.mlx.compile as mc
+
+    source = inspect.getsource(mc._install_qwen3_family_compile_patches)
+
+    # Guard is present
+    assert "linear_fc1 (up-projection) overflows fp16" in source, (
+        "Missing comment documenting the fp16 overflow rationale"
+    )
+    # Dtype-conditional branch keys on residual_dtype (the activation dtype)
+    assert "if residual_dtype == mx.float16:" in source, (
+        "MLP fp32 guard must be gated on residual_dtype == mx.float16"
+    )
+    # fp16 path: upcast input to fp32 before calling self.mlp
+    assert "self.mlp(mlp_norm_out.astype(mx.float32))" in source, (
+        "fp16 branch must upcast mlp input to fp32"
+    )
+    # non-fp16 path: original (cheaper) cast-only flow preserved
+    assert "self.mlp(mlp_norm_out)" in source, (
+        "bf16/fp32 path must keep the original self.mlp(...) call"
+    )
+
+
 def test_qwen3_vl_training_compile_verified():
     import unsloth_zoo.mlx.compile as mc
 
