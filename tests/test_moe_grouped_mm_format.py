@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
+import pytest
 
 from unsloth_zoo.temporary_patches.moe_utils import (
     _get_moe_lora_io_dims,
+    patch_param_wrapper_for_moe,
     patch_gpt_oss_grouped_mm_format,
 )
 
@@ -23,9 +25,31 @@ class Qwen3MoeExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(4, 16, 12))
 
 
+class Qwen3VLMoeTextExperts(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.num_experts = 4
+        self.gate_up_proj = nn.Parameter(torch.empty(4, 16, 24))
+        self.down_proj = nn.Parameter(torch.empty(4, 12, 16))
+
+
+class Mxfp4GptOssExperts(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.num_experts = 4
+        self.gate_up_proj = nn.Parameter(torch.empty(4, 24, 16))
+        self.down_proj = nn.Parameter(torch.empty(4, 16, 12))
+
+
 class _Config:
     def __init__(self, model_type):
         self.model_type = model_type
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def to_dict(self):
+        return {"model_type": self.model_type}
 
 
 class _Model(nn.Module):
@@ -45,6 +69,12 @@ class _Wrapper:
         return self.base_layer
 
 
+def _unwrap_base_layer(module):
+    while hasattr(module, "base_layer"):
+        module = module.base_layer
+    return module
+
+
 def test_stock_gpt_oss_experts_get_grouped_mm_flag_and_dims():
     experts = GptOssExperts()
     model = _Model("gpt_oss", experts)
@@ -57,6 +87,39 @@ def test_stock_gpt_oss_experts_get_grouped_mm_flag_and_dims():
     assert _get_moe_lora_io_dims(_Wrapper("down_proj", experts)) == (12, 16)
 
 
+def test_peft_get_peft_model_marks_nested_gpt_oss_experts_and_dims():
+    peft = pytest.importorskip("peft")
+    LoraConfig = peft.LoraConfig
+
+    try:
+        config = LoraConfig(
+            r=2,
+            lora_alpha=4,
+            target_parameters=["experts.gate_up_proj", "experts.down_proj"],
+            bias="none",
+        )
+    except TypeError:
+        pytest.skip("Installed PEFT does not support target_parameters")
+
+    model = _Model("gpt_oss", GptOssExperts())
+    patch_param_wrapper_for_moe()
+
+    peft_model = peft.get_peft_model(model, config)
+    experts = _unwrap_base_layer(model.experts)
+
+    assert experts._unsloth_grouped_mm_format is True
+
+    wrappers = {
+        module.parameter_name: module
+        for module in peft_model.modules()
+        if module.__class__.__name__ == "ParamWrapper"
+        and getattr(module, "parameter_name", None) in ("gate_up_proj", "down_proj")
+    }
+    assert set(wrappers) == {"gate_up_proj", "down_proj"}
+    assert _get_moe_lora_io_dims(wrappers["gate_up_proj"]) == (16, 24)
+    assert _get_moe_lora_io_dims(wrappers["down_proj"]) == (12, 16)
+
+
 def test_qwen3_moe_experts_do_not_get_gpt_oss_grouped_mm_flag():
     experts = Qwen3MoeExperts()
     model = _Model("qwen3_moe", experts)
@@ -67,6 +130,31 @@ def test_qwen3_moe_experts_do_not_get_gpt_oss_grouped_mm_flag():
     assert _get_moe_lora_io_dims(_Wrapper("gate_up_proj", experts)) == (16, 24)
     assert _get_moe_lora_io_dims(_Wrapper("down_proj", experts)) == (12, 16)
     assert not hasattr(experts, "_unsloth_grouped_mm_format")
+
+
+def test_qwen3_vl_grouped_mm_layout_still_requires_explicit_flag():
+    experts = Qwen3VLMoeTextExperts()
+    model = _Model("qwen3_vl_moe", experts)
+
+    assert patch_gpt_oss_grouped_mm_format(model) == 0
+    assert not hasattr(experts, "_unsloth_grouped_mm_format")
+
+    assert _get_moe_lora_io_dims(_Wrapper("gate_up_proj", experts)) == (24, 16)
+
+    experts._unsloth_grouped_mm_format = True
+    assert _get_moe_lora_io_dims(_Wrapper("gate_up_proj", experts)) == (16, 24)
+    assert _get_moe_lora_io_dims(_Wrapper("down_proj", experts)) == (12, 16)
+
+
+def test_mxfp4_gpt_oss_experts_name_is_not_treated_as_bf16_gpt_oss():
+    experts = Mxfp4GptOssExperts()
+    model = _Model("gpt_oss", experts)
+
+    assert patch_gpt_oss_grouped_mm_format(model) == 0
+    assert not hasattr(experts, "_unsloth_grouped_mm_format")
+
+    assert _get_moe_lora_io_dims(_Wrapper("gate_up_proj", experts)) == (16, 24)
+    assert _get_moe_lora_io_dims(_Wrapper("down_proj", experts)) == (12, 16)
 
 
 def test_gpt_oss_experts_name_is_gated_by_model_type():
