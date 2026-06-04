@@ -67,6 +67,12 @@ def has_429_exact_full_read(log_dir: str | Path) -> str:
             continue
     return "1"
 
+# Redirect the HF cache off a read-only default (locked-down machines) so
+# snapshot_download() can write. Runs before any huggingface_hub import.
+from .hf_cache import redirect_hf_cache_if_readonly
+redirect_hf_cache_if_readonly()
+del redirect_hf_cache_if_readonly
+
 hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")).expanduser()
 xet_cache = Path(os.environ.get("HF_XET_CACHE", hf_home / "xet")).expanduser()
 os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", has_429_exact_full_read(xet_cache / "logs"))
