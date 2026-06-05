@@ -1494,7 +1494,6 @@ def patch_peft_dispatch_bnb_4bit():
 pass
 TEMPORARY_PATCHES.append(patch_peft_dispatch_bnb_4bit)
 
-
 def patch_trl_push_to_hub_token():
     """Ensure to_dict() always includes push_to_hub_token for TRL compat.
 
