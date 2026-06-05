@@ -1195,7 +1195,7 @@ class UnslothVisionDataCollator:
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
     def _collate_prompt_completion(self, examples):
-        prompt_texts, completion_texts, images, videos = [], [], [], []
+        prompt_texts, completion_texts, images, videos, audios = [], [], [], [], []
         video_kwargs = {'fps': []}
 
         for ex in examples:
@@ -1242,6 +1242,9 @@ class UnslothVisionDataCollator:
                     vids_kwarg = {"fps": []}
                 video_kwargs['fps'].extend(vids_kwarg['fps'])
 
+            audio = self._extract_audio_for_example(ex, p if is_p_msgs else [])
+            audios.extend(audio)
+
         prompt_kwargs = dict(
             padding=True,
             padding_side="left",
@@ -1261,6 +1264,8 @@ class UnslothVisionDataCollator:
             video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
             for k, v in video_kwargs.items():
                 prompt_kwargs[k] = v
+        if audios:
+            prompt_kwargs["audio"] = audios
 
         proc_prompts = self.processor(text=prompt_texts, **prompt_kwargs)
         # Encode completions (RIGHT pad) text-only
