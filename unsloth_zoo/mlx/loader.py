@@ -437,17 +437,35 @@ class _TrainingKVStore:
         return keys, values
 
 
+def _gemma4_has_native_shared_kv(backbone):
+    """Return whether mlx-vlm already threads Gemma4 shared K/V for training."""
+    layers = getattr(backbone, "layers", None) or []
+    previous_kvs = getattr(backbone, "previous_kvs", None)
+    if (
+        isinstance(previous_kvs, (list, tuple))
+        and layers
+        and len(previous_kvs) == len(layers)
+    ):
+        return True
+
+    try:
+        call_params = inspect.signature(backbone.__class__.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+    return "shared_kv_sink" in call_params
+
+
 def _fix_gemma4_kv_sharing(model):
-    """Fix Gemma4 KV-shared layers producing wrong K/V during training.
+    """Fix legacy Gemma4 KV-shared layers producing wrong K/V during training.
 
     Gemma4 E2B/E4B have num_kv_shared_layers shared attention layers that
     borrow K/V from earlier "store" layers via the KV cache. When cache=None
     (training), shared layers fall through to computing their own K/V from
     the wrong hidden state — silently producing incorrect attention.
 
-    Fix: monkey-patch the text backbone's __call__ to create _TrainingKVStore
-    objects when cache=None, so store layers populate them and shared layers
-    read correct K/V.
+    mlx-vlm 0.5.0+ threads shared_kv natively; only older backbones need the
+    cache shim.
     """
     lm = getattr(model, "language_model", None)
     if lm is None:
@@ -460,6 +478,9 @@ def _fix_gemma4_kv_sharing(model):
     num_layers = getattr(backbone, "num_hidden_layers", None)
     if first_shared is None or num_layers is None or first_shared >= num_layers:
         return  # No shared layers
+
+    if _gemma4_has_native_shared_kv(backbone):
+        return  # Native mlx-vlm shared_kv support
 
     cls = backbone.__class__
     if getattr(cls, "_kv_sharing_patched", False):
