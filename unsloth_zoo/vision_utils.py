@@ -582,9 +582,10 @@ def extract_audio_info(conversations: Union[List[Dict], List[List[Dict]]]) -> Li
         conversations = [conversations]
     for conversation in conversations:
         for message in conversation:
-            if isinstance(message["content"], list):
-                for ele in message["content"]:
-                    if ele.get("type") == "audio" and "audio" in ele:
+            content = message.get("content")
+            if isinstance(content, list):
+                for ele in content:
+                    if isinstance(ele, dict) and ele.get("type") == "audio" and "audio" in ele:
                         audio_inputs.append(ele["audio"])
     return audio_inputs
 
@@ -961,7 +962,17 @@ class UnslothVisionDataCollator:
 
     def _extract_audio_for_example(self, example, messages):
         if "audio" in example:
-            return list(example["audio"])
+            audio_val = example["audio"]
+            if audio_val is None:
+                return []
+            # HuggingFace Audio feature: {"array": np.ndarray, "sampling_rate": int, ...}
+            if isinstance(audio_val, dict):
+                return [audio_val["array"]] if "array" in audio_val else []
+            # Already a list/tuple of clips
+            if isinstance(audio_val, (list, tuple)):
+                return list(audio_val)
+            # Raw ndarray or other single-clip value
+            return [audio_val]
         return extract_audio_info(messages)
 
     def _extract_images_for_pc(self, example, p_msgs, c_msgs):
