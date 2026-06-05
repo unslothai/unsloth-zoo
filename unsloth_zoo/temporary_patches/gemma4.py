@@ -608,6 +608,63 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4AudioAttention)
 
 
+# ============================================================================
+# Gemma4 PEFT reload patch - make PeftModel.from_pretrained handle adapters
+# saved against Gemma4ClippableLinear.inner .linear modules.
+# ============================================================================
+
+def patch_Gemma4ClippableLinear_peft_reload():
+    try:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ClippableLinear
+        from peft.tuners.lora.model import LoraModel
+    except ImportError:
+        return
+    except Exception as e:
+        return raise_error("Gemma4ClippableLinear PEFT reload", e)
+
+    original_create_and_replace = LoraModel._create_and_replace
+    if getattr(original_create_and_replace, "_unsloth_gemma4_clippable_linear_patched", False):
+        return
+
+    def create_and_replace(
+        self,
+        peft_config,
+        adapter_name,
+        target,
+        target_name,
+        parent,
+        current_key=None,
+        **kwargs,
+    ):
+        if isinstance(target, Gemma4ClippableLinear):
+            return original_create_and_replace(
+                self,
+                peft_config,
+                adapter_name,
+                target.linear,
+                "linear",
+                target,
+                current_key=current_key,
+                **kwargs,
+            )
+        return original_create_and_replace(
+            self,
+            peft_config,
+            adapter_name,
+            target,
+            target_name,
+            parent,
+            current_key=current_key,
+            **kwargs,
+        )
+
+    create_and_replace._unsloth_gemma4_clippable_linear_patched = True
+    create_and_replace._unsloth_original_create_and_replace = original_create_and_replace
+    LoraModel._create_and_replace = create_and_replace
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4ClippableLinear_peft_reload)
+
+
 # Gemma-4 float16 MLP overflow fix.
 #
 # `down_proj(act_fn(gate_proj(x)) * up_proj(x))` overflows fp16 at layers.0
