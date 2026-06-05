@@ -858,14 +858,21 @@ class UnslothVisionDataCollator:
             audios.extend(audio)
 
         # Tokenize the texts and process the images
+        # When audio is present, omit max_length/truncation from the top-level processor
+        # call — passing them at top-level causes _merge_kwargs to broadcast them into
+        # audio_kwargs, which makes the audio feature extractor truncate the waveform to
+        # max_length *samples* (e.g. 512 samples = 32ms) instead of leaving it intact.
+        # We truncate input_ids manually after the call instead.
         proc_kwargs = dict(
             text=texts,
             padding=True,
-            truncation=self.truncation,
-            max_length=self.max_seq_length,
             return_tensors="pt",
             add_special_tokens=False,
         )
+        if not audios:
+            # Safe to pass truncation kwargs top-level when no audio is involved
+            proc_kwargs["truncation"] = self.truncation
+            proc_kwargs["max_length"] = self.max_seq_length
         if images:
             proc_kwargs["images"] = images
         if videos:
@@ -878,6 +885,14 @@ class UnslothVisionDataCollator:
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
         batch = self.processor(**proc_kwargs)
+
+        # Truncate manually when audio is present (couldn't pass max_length to processor)
+        if audios and self.truncation and self.max_seq_length:
+            seq_len = batch["input_ids"].shape[1]
+            if seq_len > self.max_seq_length:
+                for key in list(batch.keys()):
+                    if isinstance(batch[key], torch.Tensor) and batch[key].shape[-1] == seq_len:
+                        batch[key] = batch[key][..., :self.max_seq_length]
 
         # Cannot remove due to bidirectional attention from Gemma 3!
         # batch.pop("token_type_ids", None)
@@ -1245,15 +1260,15 @@ class UnslothVisionDataCollator:
             audio = self._extract_audio_for_example(ex, p if is_p_msgs else [])
             audios.extend(audio)
 
-        prompt_kwargs = dict(
-            padding=True,
-            padding_side="left",
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
         completion_kwargs = dict(
             padding=True,
             padding_side="right",
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        prompt_kwargs = dict(
+            padding=True,
+            padding_side="left",
             return_tensors="pt",
             add_special_tokens=False,
         )
