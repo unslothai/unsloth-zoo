@@ -20,7 +20,6 @@ __all__ = [
     "UNSLOTH_ENABLE_LOGGING",
     "UNSLOTH_COMPILE_DISABLE",
     "get_torch_compile_options",
-    "is_transformers_v5_moe_quantization_available",
     "logger",
     "torch_compile",
     "_torch_compile",
@@ -47,30 +46,6 @@ def determine_compile_threads():
     cpu_count = os.cpu_count()
     return min(32, max(4, cpu_count))
 pass
-
-@functools.lru_cache(1)
-def is_transformers_v5_moe_quantization_available():
-    """
-    True when Transformers exposes the v5 MoE weight-loading/dispatcher APIs
-    that PR #659 patches. Transformers v4 does not use bare nn.Parameter MoE
-    experts for these paths, so the v5-only patches should not be registered.
-    """
-    try:
-        from transformers.core_model_loading import WeightConverter
-        from transformers.integrations import moe as transformers_moe
-        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
-    except (ImportError, AttributeError):
-        return False
-
-    return (
-        WeightConverter is not None
-        and getattr(Bnb4BitHfQuantizer, "param_needs_quantization", None) is not None
-        and getattr(transformers_moe, "ALL_EXPERTS_FUNCTIONS", None) is not None
-        and (
-            getattr(transformers_moe, "grouped_mm_experts_forward", None) is not None
-            or getattr(transformers_moe, "batched_mm_experts_forward", None) is not None
-        )
-    )
 
 def get_torch_compile_options(
     epilogue_fusion = True,

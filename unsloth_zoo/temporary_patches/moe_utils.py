@@ -28,14 +28,6 @@ UNSLOTH_COMPILE_LOCATION = os.environ.get(
     "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
 )
 
-try:
-    import bitsandbytes as bnb
-    from bitsandbytes.nn import Params4bit
-    HAS_BNB = True
-except ImportError:
-    HAS_BNB = False
-    Params4bit = None
-
 
 def _get_compile_location() -> str:
     return os.path.abspath(
@@ -136,35 +128,8 @@ def _grouped_mm_with_backward_fix(
     Grouped matmul with working backward pass.
 
     Uses native torch._grouped_mm with contiguous inputs for correct gradients.
-    Some low-rank LoRA weights are contiguous but still have row strides below
-    the kernel alignment requirement, so keep a narrow fallback for those cases.
     """
-    inputs = inputs.contiguous()
-    weight = weight.contiguous()
-    try:
-        return torch._grouped_mm(inputs, weight, offs=offsets)
-    except RuntimeError as exc:
-        message = str(exc)
-        if "strides should be multiple of 16 bytes" not in message:
-            raise
-        return _manual_grouped_mm(inputs, weight, offsets)
-
-
-def _manual_grouped_mm(
-    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
-    """
-    Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps.
-    """
-    outputs = []
-    start = 0
-    for expert_idx, end in enumerate(offsets.detach().cpu().tolist()):
-        if start < end:
-            outputs.append(torch.matmul(inputs[start:end], weight[expert_idx]))
-        start = end
-    if outputs:
-        return torch.cat(outputs, dim=0)
-    return inputs.new_empty((0, weight.shape[-1]))
+    return torch._grouped_mm(inputs, weight, offs=offsets)
 
 
 # Global flag to check if grouped GEMM is available
@@ -305,23 +270,6 @@ def select_moe_backend():
     return "native_torch"
 
 
-def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_fn, *args):
-    """Temporarily install dequantized weights on the experts module for one
-    forward call, then restore the originals. Uses object.__setattr__ to bypass
-    nn.Module's Parameter (de)registration, which would re-register hooks and
-    is unnecessary for read-only temporary tensors. Used by both the FP8 and
-    bnb4bit MoE dispatchers."""
-    original_gate_up = experts_module.gate_up_proj
-    original_down = experts_module.down_proj
-    object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
-    object.__setattr__(experts_module, "down_proj", down_proj)
-    try:
-        return forward_fn(experts_module, *args)
-    finally:
-        object.__setattr__(experts_module, "gate_up_proj", original_gate_up)
-        object.__setattr__(experts_module, "down_proj", original_down)
-
-
 def forward_moe_backend(
     self,
     hidden_states: torch.Tensor,
@@ -333,37 +281,6 @@ def forward_moe_backend(
     Centralizes backend selection to keep model-specific patches minimal.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
-
-    # Use absolute imports — this function is also copied into
-    # `unsloth_compiled_cache/moe_utils.py` where relative imports of sibling
-    # helper modules don't resolve (only the dispatcher is copied, helpers stay
-    # in unsloth_zoo.temporary_patches).
-    # Narrow `except ImportError` to ONLY the import statement; runtime errors
-    # inside the bnb4bit/fp8 path must propagate so we don't silently fall
-    # through to a backend that will crash on unsupported dtypes.
-    _moe_uses_bnb4bit_expert_weights = forward_moe_backend_bnb4bit = None
-    try:
-        from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
-            _moe_uses_bnb4bit_expert_weights,
-            forward_moe_backend_bnb4bit,
-        )
-    except ImportError:
-        pass
-    if _moe_uses_bnb4bit_expert_weights is not None and _moe_uses_bnb4bit_expert_weights(self):
-        result = forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
-        if result is not None:
-            return result
-
-    _moe_uses_fp8_expert_weights = forward_moe_backend_fp8 = None
-    try:
-        from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
-            _moe_uses_fp8_expert_weights,
-            forward_moe_backend_fp8,
-        )
-    except ImportError:
-        pass
-    if _moe_uses_fp8_expert_weights is not None and _moe_uses_fp8_expert_weights(self):
-        return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
 
     backend = select_moe_backend()
     if backend == "grouped_mm":
@@ -692,17 +609,6 @@ def _get_base_weight(param):
     while hasattr(param, "base_layer"):
         param = param.base_layer
 
-    if HAS_BNB and isinstance(param, Params4bit):
-        if getattr(param, "quant_state", None) is None:
-            raise RuntimeError(
-                "unsloth: _get_base_weight saw a Params4bit with quant_state=None. "
-                "This usually means the model was used in forward before loading "
-                "completed quantization (meta placeholder still in place), or the "
-                "MoE quantizer patch did not fire for this expert. "
-                f"data.shape={tuple(param.data.shape)}, device={param.device}."
-            )
-        return bnb.functional.dequantize_4bit(param.data, param.quant_state)
-
     if hasattr(param, "get_param"):
         return param.get_param()
 
@@ -872,8 +778,6 @@ def _is_moe_experts_module(module) -> bool:
     if hasattr(module, "gate_up_proj"):
         param = module.gate_up_proj
         # 4-bit parameters are packed into 2D tensors (n_params, 1) or similar.
-        if HAS_BNB and isinstance(param, Params4bit) and param.ndim == 2:
-            return True
         # Standard MoE weights are 3D (num_experts, in, out).
         if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim in (2, 3):
             return True

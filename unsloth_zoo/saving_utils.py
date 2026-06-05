@@ -1007,122 +1007,8 @@ def _resolve_num_experts_from_lora_stats(lora_stats, fallback):
     return fallback
 
 
-# MoE-quant save-side dispatch. Each quant kind (FP8 today, room for bnb4bit
-# later) registers a handler in `unsloth_zoo.temporary_patches.moe_utils_fp8.
-# _MOE_QUANT_HANDLERS`; we consult that list via `apply_moe_quant_load`
-# instead of inlining quant-specific dequant/requant math here.
-try:
-    from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
-        apply_moe_quant_load as _apply_moe_quant_load,
-        _MOE_QUANT_UNSAFE,
-    )
-except ImportError:
-    _apply_moe_quant_load = None
-    _MOE_QUANT_UNSAFE = object()
-
-
-def _merge_moe_expert_quant_aware(
-    role: str,
-    key: str,
-    file,
-    header_metadata,
-    lora_stats,
-    expert_idx: int,
-    num_experts: int,
-    output_dtype,
-    mm,
-    length_of_header,
-    processed_mxfp4_keys,
-    merge_fn,
-) -> bool:
-    """Read one expert weight (dequantising any quant kind via the registry),
-    apply `merge_fn`, requantise (if the handler returned a requant closure),
-    write data + any companion scale tensors back to `mm`. Returns True on a
-    successful merge+write, False on skip (key missing or sentinel)."""
-    if key not in header_metadata:
-        return False
-
-    if _apply_moe_quant_load is None:
-        W = file.get_tensor(key)
-        requant_fn = None
-    else:
-        loaded = _apply_moe_quant_load(file, header_metadata, key)
-        if loaded[0] is _MOE_QUANT_UNSAFE:
-            _record_moe_merge_fallback(
-                role, expert_idx,
-                f"{role} base at {key} has no usable quant companion scale; "
-                "skipping LoRA merge to avoid scale-loss corruption",
-                lora_stats, None,
-            )
-            return False
-        W, requant_fn = loaded
-
-    merged = merge_fn(W, lora_stats, expert_idx, num_experts, output_dtype or W.dtype)
-
-    if requant_fn is None:
-        write_dtype = W.dtype
-    else:
-        merged, write_dtype, extra_writes = requant_fn(merged)
-        for extra_key, extra_tensor, extra_dtype in extra_writes:
-            _write_tensor_direct_torch(
-                mm, header_metadata, length_of_header,
-                extra_key, extra_tensor, extra_dtype,
-            )
-            processed_mxfp4_keys.add(extra_key)
-
-    _write_tensor_direct_torch(mm, header_metadata, length_of_header, key, merged, write_dtype)
-    processed_mxfp4_keys.add(key)
-    return True
-
-
-def _peft_paramwrapper_swaps_in_out():
-    """True if installed PEFT version's ParamWrapper.update_layer performs the
-    `(experts, in, out) -> (experts, out, in)` swap for 3D non-transposed MoE
-    params. Introduced in PEFT 0.19; absent in 0.18 and earlier.
-
-    Prefers `peft.__version__` (cheap, stable) and falls back to checking
-    whether `ParamWrapper` exposes `_did_swap_in_out_features` as a class
-    attribute (defined at __init__ time in 0.19, absent in 0.18). Last-resort
-    fallback to inspect.getsource if neither is available (e.g. a packaged
-    PEFT without a version string).
-    """
-    try:
-        from peft import __version__ as _peft_version
-        major, minor = _peft_version.split(".")[:2]
-        return (int(major), int(minor)) >= (0, 19)
-    except Exception:
-        pass
-    try:
-        from peft.tuners.lora.layer import ParamWrapper
-        # PEFT 0.19's update_layer references `_did_swap_in_out_features`; the
-        # attribute is set on instances, not the class, so a hasattr check on
-        # the class doesn't suffice — fall back to source inspection.
-        import inspect
-        return "_did_swap_in_out_features" in inspect.getsource(ParamWrapper.update_layer)
-    except Exception:
-        return True  # assume modern PEFT
-
-
-_PEFT_AMBIGUOUS_LAYOUT_DEFAULT = "standard" if _peft_paramwrapper_swaps_in_out() else "swapped"
-
-
-def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim, lora_module=None):
-    """Shape-classify as 'swapped' / 'standard' / 'unknown'; returns (layout, r).
-
-    When 2*I == H for the fused gate_up_proj (common when intermediate is
-    half the hidden dim), both 'standard' and 'swapped' shape checks pass.
-    For that ambiguous case the right default depends on whether PEFT swapped
-    in/out features when creating the ParamWrapper:
-
-    - PEFT 0.19+ swaps for 3D non-transposed MoE → `lora_A.dim_A == in_dim`,
-      which corresponds to the "standard" branch of the merge math.
-    - PEFT 0.18 and earlier do NOT swap → `lora_A.dim_A == out_dim`, which
-      corresponds to the "swapped" branch.
-
-    `_PEFT_AMBIGUOUS_LAYOUT_DEFAULT` is computed once at import time from the
-    installed PEFT version. A caller can still override per-call by passing a
-    `lora_module` with `_did_swap_in_out_features` set explicitly.
-    """
+def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim):
+    """Shape-classify as 'swapped' / 'standard' / 'unknown'; returns (layout, r)."""
     total_rank_A, dim_A = lora_A.shape
     dim_B, total_rank_B = lora_B.shape
     if total_rank_A != total_rank_B or num_experts is None or num_experts <= 0:
@@ -1130,21 +1016,10 @@ def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim, lora_m
     if total_rank_A % num_experts != 0:
         return "unknown", 0
     r = total_rank_A // num_experts
-    standard_match = (dim_A == in_dim and dim_B == out_dim)
-    swapped_match  = (dim_A == out_dim and dim_B == in_dim)
-    if standard_match and swapped_match:
-        # Ambiguous shape (typically 2*I == H). Prefer an explicit per-wrapper
-        # signal when available, otherwise fall back to the PEFT-version-aware
-        # default. `_did_swap_in_out_features = True` means PEFT swapped in/out
-        # at training time, which corresponds to "standard" storage from the
-        # merge code's perspective.
-        if lora_module is not None and hasattr(lora_module, "_did_swap_in_out_features"):
-            return ("standard" if lora_module._did_swap_in_out_features else "swapped"), r
-        return _PEFT_AMBIGUOUS_LAYOUT_DEFAULT, r
-    if standard_match:
-        return "standard", r
-    if swapped_match:
+    if dim_A == out_dim and dim_B == in_dim:
         return "swapped", r
+    if dim_A == in_dim and dim_B == out_dim:
+        return "standard", r
     return "unknown", r
 
 
@@ -1156,25 +1031,12 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
     try:
         num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
         if num_experts is None or num_experts <= 0:
-            rank = getattr(lora_stats, "rank", 0) or 0
-            if rank <= 0:
-                # No usable num_experts AND no rank metadata. Falling back to
-                # `total_rank // 1` would produce a degenerate r=1 slicing
-                # whose shape check happens to pass but emits a wrong delta —
-                # silently. Refuse to merge.
-                _record_moe_merge_fallback(
-                    role, expert_idx,
-                    "num_experts and lora_stats.rank both missing — cannot derive per-expert slicing",
-                    lora_stats, tuple(W.shape),
-                )
-                return W
-            num_experts = lora_stats.lora_A.shape[0] // rank
+            num_experts = lora_stats.lora_A.shape[0] // max(1, getattr(lora_stats, "rank", 0) or 1)
 
         I, H = W.shape
         layout, r = _detect_moe_lora_layout(
             lora_stats.lora_A, lora_stats.lora_B,
             num_experts = num_experts, out_dim = 2 * I, in_dim = H,
-            lora_module = getattr(lora_stats, "module", None),
         )
         if layout == "unknown" or r <= 0:
             _record_moe_merge_fallback(
@@ -1189,15 +1051,6 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
             _record_moe_merge_fallback(role, expert_idx, "expert_idx out of range", lora_stats, (I, H))
             return W
 
-        # unsloth's MoE forward (temporary_patches/moe_utils.py
-        # `_canonical_lora_weights_for_grouped_mm`) views lora_B as
-        # (out, num_experts, r) — contiguous-r columns per expert. This
-        # MUST match here so the merged checkpoint reproduces the unsloth
-        # training-time forward. (PEFT's own `get_delta_weight` uses
-        # stride-E reshape `(out, r, E)`, but unsloth bypasses PEFT's
-        # forward via `patch_param_wrapper_for_moe`, so the stored
-        # tensors only need to be interpreted with the same convention as
-        # unsloth's forward.)
         a_slice = lora_stats.lora_A[start:end, :]
         b_slice = lora_stats.lora_B[:, start:end]
         device  = _active_merge_device()
@@ -1244,21 +1097,12 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
     try:
         num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
         if num_experts is None or num_experts <= 0:
-            rank = getattr(lora_stats, "rank", 0) or 0
-            if rank <= 0:
-                _record_moe_merge_fallback(
-                    "down", expert_idx,
-                    "num_experts and lora_stats.rank both missing — cannot derive per-expert slicing",
-                    lora_stats, tuple(down_W.shape),
-                )
-                return down_W
-            num_experts = lora_stats.lora_A.shape[0] // rank
+            num_experts = lora_stats.lora_A.shape[0] // max(1, getattr(lora_stats, "rank", 0) or 1)
 
         H, I = down_W.shape
         layout, r = _detect_moe_lora_layout(
             lora_stats.lora_A, lora_stats.lora_B,
             num_experts = num_experts, out_dim = H, in_dim = I,
-            lora_module = getattr(lora_stats, "module", None),
         )
         if layout == "unknown" or r <= 0:
             _record_moe_merge_fallback(
@@ -1273,7 +1117,6 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
             _record_moe_merge_fallback("down", expert_idx, "expert_idx out of range", lora_stats, (H, I))
             return down_W
 
-        # See _merge_moe_gate_or_up_expert for the slicing convention rationale.
         a_slice = lora_stats.lora_A[start:end, :]
         b_slice = lora_stats.lora_B[:, start:end]
         device  = _active_merge_device()
@@ -1524,26 +1367,37 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
             if is_gate:
                 gate_key = f"{prefix}.{expert_idx}.gate_proj.weight"
                 up_key   = f"{prefix}.{expert_idx}.up_proj.weight"
-                if _merge_moe_expert_quant_aware(
-                    "gate", gate_key, file, header_metadata, lora_stats,
-                    expert_idx, num_experts, output_dtype, mm, length_of_header,
-                    processed_mxfp4_keys, _merge_moe_gate_expert,
-                ):
+
+                # Check for gate_proj
+                if gate_key in header_metadata:
+                    gate_W = file.get_tensor(gate_key)
+                    merged_gate = _merge_moe_gate_expert(
+                        gate_W, lora_stats, expert_idx, num_experts, output_dtype or gate_W.dtype
+                    )
+                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, gate_key, merged_gate, gate_W.dtype)
+                    processed_mxfp4_keys.add(gate_key)
                     module_updated = True
-                if _merge_moe_expert_quant_aware(
-                    "up", up_key, file, header_metadata, lora_stats,
-                    expert_idx, num_experts, output_dtype, mm, length_of_header,
-                    processed_mxfp4_keys, _merge_moe_up_expert,
-                ):
+
+                # Check for up_proj
+                if up_key in header_metadata:
+                    up_W = file.get_tensor(up_key)
+                    merged_up = _merge_moe_up_expert(
+                        up_W, lora_stats, expert_idx, num_experts, output_dtype or up_W.dtype
+                    )
+                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, up_key, merged_up, up_W.dtype)
+                    processed_mxfp4_keys.add(up_key)
                     module_updated = True
             else:
                 down_key = f"{prefix}.{expert_idx}.down_proj.weight"
-                if _merge_moe_expert_quant_aware(
-                    "down", down_key, file, header_metadata, lora_stats,
-                    expert_idx, num_experts, output_dtype, mm, length_of_header,
-                    processed_mxfp4_keys, _merge_moe_down_proj_expert,
-                ):
-                    module_updated = True
+                if down_key not in header_metadata:
+                    continue
+                down_W = file.get_tensor(down_key)
+                merged_down = _merge_moe_down_proj_expert(
+                    down_W, lora_stats, expert_idx, num_experts, output_dtype or down_W.dtype
+                )
+                _write_tensor_direct_torch(mm, header_metadata, length_of_header, down_key, merged_down, down_W.dtype)
+                processed_mxfp4_keys.add(down_key)
+                module_updated = True
         if module_updated and not already_counted:
             count += 1
             counted_lora_modules.add(lora_key)
@@ -1558,13 +1412,8 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
       - Standard (Gemma4):    (E, 2*I, H) with lora_A (E*R, H), lora_B (2*I, E*R)
     is_transposed: if provided, overrides dimension-based heuristic (needed when dims are equal).
     """
-    _MOE_MERGE_STATE["attempted"] += 1
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
-            _record_moe_merge_fallback(
-                "fused_gate_up", -1, "lora_A or lora_B is None",
-                lora_stats, tuple(gate_up_W.shape),
-            )
             return gate_up_W
 
         num_experts, dim1, dim2 = gate_up_W.shape
@@ -1572,20 +1421,10 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
         dim_B, total_rank_B = lora_stats.lora_B.shape
 
         if total_rank_B != total_rank:
-            _record_moe_merge_fallback(
-                "fused_gate_up", -1,
-                f"total_rank mismatch (A.shape[0]={total_rank}, B.shape[1]={total_rank_B})",
-                lora_stats, tuple(gate_up_W.shape),
-            )
             return gate_up_W
 
         rank = total_rank // num_experts
         if total_rank % num_experts != 0:
-            _record_moe_merge_fallback(
-                "fused_gate_up", -1,
-                f"total_rank {total_rank} not divisible by num_experts {num_experts}",
-                lora_stats, tuple(gate_up_W.shape),
-            )
             return gate_up_W
 
         if is_transposed is not None:
@@ -1595,11 +1434,6 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
         elif dim_A == dim2 and dim_B == dim1:
             use_transpose = False
         else:
-            _record_moe_merge_fallback(
-                "fused_gate_up", -1,
-                f"layout ambiguous (W.shape={tuple(gate_up_W.shape)}, A.shape={tuple(lora_stats.lora_A.shape)}, B.shape={tuple(lora_stats.lora_B.shape)})",
-                lora_stats, tuple(gate_up_W.shape),
-            )
             return gate_up_W
 
         device = _active_merge_device()
@@ -1607,10 +1441,6 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
 
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
-            # unsloth's MoE forward views lora_B contiguous-r per expert
-            # (see temporary_patches/moe_utils.py
-            # `_canonical_lora_weights_for_grouped_mm`); the merge must
-            # match so the saved checkpoint reproduces training-time forward.
             a_slice = lora_stats.lora_A[start:end, :]
             b_slice = lora_stats.lora_B[:, start:end]
             delta = b_slice.to(
@@ -1621,13 +1451,8 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
                 delta.T if use_transpose else delta, alpha=lora_stats.alpha
             )
 
-        _MOE_MERGE_STATE["applied"] += 1
         return gate_up_merged.to(output_dtype)
-    except Exception as exc:
-        _record_moe_merge_fallback(
-            "fused_gate_up", -1, repr(exc),
-            lora_stats, tuple(gate_up_W.shape),
-        )
+    except Exception:
         return gate_up_W
 
 
@@ -1639,13 +1464,8 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
       - Standard (Gemma4):    (E, H, I) with lora_A (E*R, H), lora_B (I, E*R)
     is_transposed: if provided, overrides dimension-based heuristic (needed when H==I).
     """
-    _MOE_MERGE_STATE["attempted"] += 1
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
-            _record_moe_merge_fallback(
-                "fused_down", -1, "lora_A or lora_B is None",
-                lora_stats, tuple(down_W.shape),
-            )
             return down_W
 
         num_experts, dim1, dim2 = down_W.shape
@@ -1653,20 +1473,10 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
         dim_B, total_rank_B = lora_stats.lora_B.shape
 
         if total_rank_B != total_rank:
-            _record_moe_merge_fallback(
-                "fused_down", -1,
-                f"total_rank mismatch (A.shape[0]={total_rank}, B.shape[1]={total_rank_B})",
-                lora_stats, tuple(down_W.shape),
-            )
             return down_W
 
         rank = total_rank // num_experts
         if total_rank % num_experts != 0:
-            _record_moe_merge_fallback(
-                "fused_down", -1,
-                f"total_rank {total_rank} not divisible by num_experts {num_experts}",
-                lora_stats, tuple(down_W.shape),
-            )
             return down_W
 
         if is_transposed is not None:
@@ -1676,11 +1486,6 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
         elif dim_A == dim2 and dim_B == dim1:
             use_transpose = False
         else:
-            _record_moe_merge_fallback(
-                "fused_down", -1,
-                f"layout ambiguous (W.shape={tuple(down_W.shape)}, A.shape={tuple(lora_stats.lora_A.shape)}, B.shape={tuple(lora_stats.lora_B.shape)})",
-                lora_stats, tuple(down_W.shape),
-            )
             return down_W
 
         device = _active_merge_device()
@@ -1688,7 +1493,6 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
 
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
-            # See _merge_moe_fused_gate_up_expert for the slicing rationale.
             a_slice = lora_stats.lora_A[start:end, :]
             b_slice = lora_stats.lora_B[:, start:end]
             delta = b_slice.to(
@@ -1699,13 +1503,8 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
                 delta.T if use_transpose else delta, alpha=lora_stats.alpha
             )
 
-        _MOE_MERGE_STATE["applied"] += 1
         return down_merged.to(output_dtype)
-    except Exception as exc:
-        _record_moe_merge_fallback(
-            "fused_down", -1, repr(exc),
-            lora_stats, tuple(down_W.shape),
-        )
+    except Exception:
         return down_W
 
 

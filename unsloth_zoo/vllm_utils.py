@@ -53,7 +53,6 @@ import inspect
 from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
 from .empty_model import *
-from .empty_model import _is_gemma4_config
 from .hf_utils import (
     dtype_from_config,
     add_dtype_kwargs,
@@ -825,8 +824,6 @@ def vllm_dynamic_quant_supported(
     if "quantization_config" not in config: return True
 
     llm_int8_skip_modules = config.quantization_config.get("llm_int8_skip_modules", {})
-    if _is_gemma4_config(config) and _get_gemma4_bnb_skip_module_aliases(config.quantization_config) is not None:
-        return True
 
     # Only allow layer modules ie model.layers.1.mlp or model.layers.1.self_attn
 
@@ -846,29 +843,6 @@ def vllm_dynamic_quant_supported(
         # Could not find parent
         if find_regex.search(module) is None: return False
     return True
-pass
-
-def _get_gemma4_bnb_skip_module_aliases(quantization_config):
-    if not isinstance(quantization_config, dict):
-        return None
-    skip_modules = quantization_config.get("llm_int8_skip_modules", None)
-    if skip_modules is None:
-        return None
-
-    aliases = set(skip_modules)
-    for module in skip_modules:
-        if module.startswith("model.language_model."):
-            text_module = module[len("model.language_model."):]
-            aliases.add("model." + text_module)
-            aliases.add("language_model.model." + text_module)
-        elif module.startswith("language_model.model."):
-            aliases.add("model." + module[len("language_model.model."):])
-    if len(aliases) == len(skip_modules):
-        return None
-
-    quantization_config = quantization_config.copy()
-    quantization_config["llm_int8_skip_modules"] = sorted(aliases)
-    return quantization_config
 pass
 
 
@@ -1089,26 +1063,13 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             quant_state_dict[prefix + ".bias"] = bias_tensor
     pass
 
-    if _is_gemma4_config(config):
-        num_kv_shared_layers = getattr(text_config, "num_kv_shared_layers", 0) or 0
-        num_hidden_layers = getattr(text_config, "num_hidden_layers", 0) or 0
-        gemma4_kv_shared_layers = set(range(
-            max(num_hidden_layers - num_kv_shared_layers, 0),
-            num_hidden_layers,
-        ))
-    else:
-        gemma4_kv_shared_layers = set()
-
     # Embedding
     if hasattr(vllm_internals, "model"): # Standard Language models
         vllm_text_model = vllm_internals.model
         vllm_text_model_prefix = "model"
     elif hasattr(vllm_internals, "language_model"):
         # For Llama 3.2, Gemma 3 and Qwen 2.5 VL, they have text model in model.language_model.model
-        if not is_vision_model and not hasattr(config, "text_config"):
-            vllm_text_model_prefix = "model"
-        else:
-            vllm_text_model_prefix = "model.language_model"
+        vllm_text_model_prefix = "model.language_model"
         vllm_text_model = vllm_internals.language_model.model
     else:
         raise RuntimeError(f'Unsloth: Cannot find vllm_internal_model!')
@@ -1145,11 +1106,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 get_state_dict(f"{prefix}.qkv_proj", 0, state_dict, qkv_proj, slice_weights=False)
             else:
                 get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
-                if kk not in gemma4_kv_shared_layers:
-                    get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
-                if kk not in gemma4_kv_shared_layers:
-                    get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
-            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+                get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
+                get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
         elif hasattr(layer, "cross_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
             qkv_proj = layer.cross_attn.qkv_proj
@@ -1161,49 +1119,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
             get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
             get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
-            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
-        elif hasattr(layer, "linear_attn"):
-            # Qwen3.5 Gated Delta Net (GDN) linear attention layers
-            extract_gdn_layers(
-                layer.linear_attn,
-                f"{vllm_text_model_prefix}.layers.{kk}.linear_attn",
-                state_dict, quant_state_dict, get_state_dict,
-            )
-        pass
 
-        if hasattr(layer, "per_layer_input_gate"):
-            get_state_dict(
-                f"{vllm_text_model_prefix}.layers.{kk}.per_layer_input_gate",
-                0, state_dict, layer.per_layer_input_gate,
-            )
-        if hasattr(layer, "per_layer_projection"):
-            get_state_dict(
-                f"{vllm_text_model_prefix}.layers.{kk}.per_layer_projection",
-                0, state_dict, layer.per_layer_projection,
-            )
-
-        # Use layernorms from the layer configuration
-        layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
-
-        for layernorm_name in layernorm_names:
-            if kk in gemma4_kv_shared_layers and ".self_attn.k_norm" in layernorm_name:
-                continue
-            vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
-            try:
-                layernorm = eval(vllm_name).state_dict()["weight"]
-                layernorm_name = f"{layernorm_name}.weight"
-                state_dict[layernorm_name] = layernorm
-                quant_state_dict[layernorm_name] = state_dict[layernorm_name]
-            except Exception as e:
-                skipped_layernorms.append(layernorm_name.split(".")[-1])
-        pass
-
-        if hasattr(layer, "layer_scalar"):
-            state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
-            quant_state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
-
-        if not hasattr(layer, "mlp"):
-            continue
+        get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
         proj = layer.mlp.gate_up_proj
         use_fused_gate_up = _is_fused_module("gate_up_proj")
@@ -1218,6 +1135,20 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
         proj = layer.mlp.down_proj
         get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
+
+        # Use layernorms from the layer configuration
+        layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
+
+        for layernorm_name in layernorm_names:
+            vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
+            try:
+                layernorm = eval(vllm_name).state_dict()["weight"]
+                layernorm_name = f"{layernorm_name}.weight"
+                state_dict[layernorm_name] = layernorm
+                quant_state_dict[layernorm_name] = state_dict[layernorm_name]
+            except Exception as e:
+                skipped_layernorms.append(layernorm_name.split(".")[-1])
+        pass
     pass
 
     if len(skipped_layernorms) != 0:
@@ -1234,26 +1165,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     state_dict[norm_prefix] = vllm_text_model.norm.weight.data
     quant_state_dict[norm_prefix] = state_dict[norm_prefix]
 
-    # Gemma4 top-level per-layer-input modules
-    for extra_name in ("embed_tokens_per_layer", "per_layer_model_projection", "per_layer_projection_norm"):
-        component = getattr(vllm_text_model, extra_name, None)
-        if component is None:
-            continue
-        prefix = f"{vllm_text_model_prefix}.{extra_name}"
-        if hasattr(component, "weight"):
-            get_state_dict(prefix, 0, state_dict, component, slice_weights=False)
-        else:
-            for param_name, param in component.named_parameters():
-                key = f"{prefix}.{param_name}"
-                state_dict[key] = param.data
-                quant_state_dict[key] = param.data
-
     # LM Head - Use get_state_dict for consistency
     if not getattr(text_config, "tie_word_embeddings", False):
-        lm_layer = next((mod for name, mod in vllm_internals.named_modules() if name == "lm_head" or name.endswith(".lm_head")), None)
-        if lm_layer is None:
-            raise RuntimeError("Unsloth: could not find lm_head in vLLM internals")
-        get_state_dict("lm_head", 0, state_dict, lm_layer, slice_weights=False)
+        lm_layer = [mod for name,mod in vllm_internals.named_modules() if "lm_head" in name]
+        # Use get_state_dict for consistent extraction and automatic truncation
+        get_state_dict("lm_head", 0, state_dict, lm_layer[0], slice_weights=False)
     else:
         # Fallback to embed_tokens for tied embeddings
         embed_key = f"{vllm_text_model_prefix}.embed_tokens.weight"
@@ -1270,16 +1186,8 @@ pass
 @torch.inference_mode
 def assert_same_state_dict(old_state_dict, new_state_dict):
     # All Unsloth Zoo code licensed under LGPLv3
-    # args: hf, vllm
-
-    def _normalize_state_dict_tensor(value):
-        if isinstance(value, torch.nn.Parameter):
-            value = value.detach()
-        if not isinstance(value, torch.Tensor):
-            return None
-        if value.is_sparse:
-            value = value.to_dense()
-        return value.contiguous()
+    # Check if state_dict are equivalent
+    # hf, vllm
 
     difference = new_state_dict.keys() ^ old_state_dict.keys()
     difference -= set(("model.lm_head.weight","model.language_model.lm_head.weight", "lm_head.weight"))
@@ -1294,18 +1202,13 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
 
     for key in old_state_dict:
         try:
-            old_val = _normalize_state_dict_tensor(old_state_dict[key])
-            new_val = _normalize_state_dict_tensor(new_state_dict[key])
-            if old_val is None or new_val is None:
-                continue
-            loose_tol = old_val.dtype != new_val.dtype or (new_val.element_size() < 2)
-            if loose_tol:
+            old_val = old_state_dict[key]
+            new_val = new_state_dict[key]
+            if old_val.dtype != new_val.dtype or (new_val.element_size() < 2):
                 # upcast both to float32 just for comparison. For FP8, vLLM stores weight scale in FP32 while HF preferes 16bit
                 old_val = old_val.to(torch.float32)
                 new_val = new_val.to(torch.float32)
-                torch.testing.assert_close(old_val, new_val, check_stride = False, atol = 1e-4, rtol = 1e-3)
-            else:
-                torch.testing.assert_close(old_val, new_val, check_stride = False)
+            torch.testing.assert_close(old_val, new_val, check_stride = False, atol = 1e-4, rtol = 1e-3)
         except Exception as error:
             if key == "lm_head.weight":
                 # Try tied embeddings fallback
@@ -1314,13 +1217,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
 
                 if key1 is not None and key2 is not None:
                     try:
-                        torch.testing.assert_close(
-                            _normalize_state_dict_tensor(old_state_dict[key1]),
-                            _normalize_state_dict_tensor(new_state_dict[key2]),
-                            check_stride = False,
-                            atol = 1e-4,
-                            rtol = 1e-3,
-                        )
+                        torch.testing.assert_close(old_state_dict[key1].contiguous(), new_state_dict[key2].contiguous(), check_stride = True)
                     except Exception:
                         failures[key] = error
                 else:
@@ -1338,14 +1235,7 @@ pass
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules to create HF compatible model
-    def _unwrap_tensor(value):
-        return getattr(value, "data", value)
-
     set_dtype_in_config(config, dtype)
-    for subconfig_name in ("text_config", "vision_config", "audio_config"):
-        subconfig = getattr(config, subconfig_name, None)
-        if subconfig is not None:
-            set_dtype_in_config(subconfig, dtype)
     new_model, original_meta_model, layer_count, layer_names = create_empty_model(config, dtype, is_vision_model)
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
     quantization_config = getattr(config, "quantization_config", {})
@@ -1441,14 +1331,16 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 weight = quant_state_dict[f"{layer_name}.weight"]
 
             if f"{layer_name}.bias" in quant_state_dict:
+                # Has bias!
                 has_bias = True
-                bias = _unwrap_tensor(quant_state_dict[f"{layer_name}.bias"])
+                bias = quant_state_dict[f"{layer_name}.bias"]
                 bias = torch.nn.Parameter(bias, requires_grad = False)
             else:
                 has_bias = False
                 bias = None
             pass
 
+            # check if either of layer_name.weight_scale or layer_name.weight_scale_inv exists and set that attribute to fp8_weight_scale
             fp8_weight_scale = None
             if f"{layer_name}.weight_scale" in quant_state_dict:
                 fp8_weight_scale = quant_state_dict[f"{layer_name}.weight_scale"]
@@ -1460,15 +1352,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
             if layer_name in quant_state_dict:
                 # for attributes of type nn.Parameter, there's no .weight
-                layer_name_br = re.sub(r"\.([\d]+)(?=\.|$)", lambda x: f"[{x.group(1)}]", layer_name)
-                raw_value = _unwrap_tensor(weight)
-                parent_path, _, attr_name = layer_name_br.rpartition(".")
-                parent = eval(f"new_model.{parent_path}") if parent_path else new_model
-                if attr_name in getattr(parent, "_buffers", {}):
-                    parent._buffers[attr_name] = raw_value
-                else:
-                    layer = torch.nn.Parameter(raw_value, requires_grad = False)
-                    exec(f"new_model.{layer_name_br} = layer")
+                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
+                layer = torch.nn.Parameter(weight, requires_grad = False)
+                exec(f"new_model.{layer_name_br} = layer")
                 continue
             elif fp8_weight_scale is not None:
                 if fp8_weight_scale.ndim == 1:
@@ -1476,7 +1362,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
-                    layer.weight = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
+                    layer.weight = torch.nn.Parameter(weight, requires_grad = False)
                     layer.bias = bias
                     layer.input_scale_ub = kwargs['input_scale_ub']
                     layer.weight_scale = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
@@ -1492,11 +1378,12 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer = FP8Linear(**fp8_kwargs)
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
-                    layer.weight = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
+                    layer.weight = torch.nn.Parameter(weight, requires_grad = False)
                     layer.bias = bias
                     layer.weight_scale_inv = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
                     layer.quant_method = "fp8"
             elif f"{layer_name}.weight.quant_state" in quant_state_dict:
+                # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
                 layer = Linear4bit(0, 0, device = get_target_device(), bias = has_bias, compute_dtype = compute_dtype, **kwargs)
                 layer.in_features  = quant_state.shape[1]
@@ -1509,37 +1396,22 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.to = partial(_override_to, layer)
                 layer.weight.to = partial(_override_to, layer.weight)
 
-            elif layer_name.endswith(".conv1d") and "linear_attn" in layer_name:
-                # Qwen3.5 GDN depthwise Conv1d: rebuild with real channels/kernel/groups.
-                from torch.nn import Conv1d
-                conv_weight = _unwrap_tensor(weight)
-                channels = conv_weight.shape[0]
-                kernel_size = conv_weight.shape[-1]
-                layer = Conv1d(
-                    in_channels = channels,
-                    out_channels = channels,
-                    kernel_size = kernel_size,
-                    groups = channels,
-                    padding = kernel_size - 1,
-                    bias = has_bias,
-                    device = get_target_device(),
-                )
-                layer.weight = torch.nn.Parameter(conv_weight, requires_grad = False)
-                layer.bias = bias
             elif not any(x in layer_name for x in layernorm_names):
                 layer = Linear(0, 0, device = get_target_device(), bias = has_bias)
                 layer.in_features  = weight.shape[1]
                 layer.out_features = weight.shape[0]
                 # from vllm 0.11.1, the .weight is of dtype ModelWeightParameter, so try to extract the 'data' part
                 # https://github.com/vllm-project/vllm/commit/de94289a98d7ec52a5ef02719e01a1db8b505170#diff-7d6145ac4ba084231a441c2056c7fca23c3bae33e6542f4f602a6c9d4d2da64dL199-R208
-                layer.weight = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
+                layer.weight = torch.nn.Parameter(getattr(weight, 'data', weight), requires_grad = False)
                 layer.bias = bias
             else:
                 # LayerNorms (including vision norms)
-                weight_param = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad=False)
+                weight_param = torch.nn.Parameter(weight, requires_grad=False)
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
+                # Set weight
                 exec(f"new_model.{layer_name_br}.weight = None")
                 exec(f"new_model.{layer_name_br}.weight = weight_param")
+                # Set bias if it exists
                 if bias is not None:
                     exec(f"new_model.{layer_name_br}.bias = None")
                     exec(f"new_model.{layer_name_br}.bias = bias")
@@ -1553,14 +1425,49 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     pass
 
     set_additional_modules(new_model, quant_state_dict, config)
-    new_model = finalize_huggingface_model(
-        new_model,
-        original_meta_model,
-        config,
-        dtype,
-        quantization_config = quantization_config,
-        bnb_config = bnb_config,
-    )
+
+    if original_meta_model is not None:
+        copy_attributes(original_meta_model, new_model)
+
+    # # Set config on model and modules using clean approach
+    # new_model.config = config
+    # for module in new_model.modules():
+    #     if hasattr(module, "config"):
+    #         module.config = config
+    # for param in new_model.parameters():
+    #     if hasattr(param, "config"):
+    #         param.config = config
+
+    text_config = getattr(config, "text_config", config) #try using text config for VLMs
+    vision_config = getattr(config, "vision_config", None)
+    # Fix up rotary_emb by re-initing them
+    for module in new_model.modules():
+        if hasattr(module, "rotary_emb"):
+            module.rotary_emb = module.rotary_emb.__class__(
+                config = text_config,
+                device = get_target_device(),
+            )
+        if hasattr(module, "rotary_pos_emb"):
+            # Qwen 2.5 VL has a rotary_pos_emb in vision submodel
+            # https://github.com/huggingface/transformers/blob/a871f6f58d49f3a05ae9dae519caa8aa9d919a07/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py#L337
+            assert vision_config is not None, "Unsloth: vision_config is required for models with vision rotary_pos_emb"
+            head_dim = vision_config.hidden_size // vision_config.num_heads
+            module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(get_target_device())
+        if hasattr(module, "rotary_emb_local"):
+            # gemma3 has a rotary_emb_local
+            # https://github.com/huggingface/transformers/blob/008c0ba8e2a1226a6ef5a61c4915a0a8a340c157/src/transformers/models/gemma3/modeling_gemma3.py#L469-L471
+            # Gemma3 uses different defaults for local and global RoPE. Copy the config for modification.
+            local_rope_config = deepcopy(text_config)
+            local_rope_config.rope_theta = text_config.rope_local_base_freq
+            local_rope_config.rope_scaling = {"rope_type": "default"}
+            # gemma3 has a rotary_emb_local
+            module.rotary_emb_local = module.rotary_emb_local.__class__(
+                config = local_rope_config,
+                device = get_target_device(),
+            )
+            del local_rope_config
+        pass
+    pass
 
     # Must override or else Bitsandbytes will error
     new_model.to = partial(_override_to, new_model)
@@ -1944,12 +1851,6 @@ def load_vllm(
     use_bitsandbytes = use_bitsandbytes or \
         model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
 
-    if _is_gemma4_config(config):
-        if enable_lora:
-            patch_gemma4_vllm_lora_support()
-        if use_bitsandbytes:
-            patch_gemma4_vllm_k_eq_v_support()
-
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
     if is_fp8 and DEVICE_TYPE == "cuda":
@@ -2329,14 +2230,6 @@ def load_vllm(
         # To reduce memory usage, we limit the number of images/videos per prompt
         # TODO: Make it configurable by user
         engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
-    if _is_gemma4_config(config) and use_bitsandbytes:
-        gemma4_bnb_quantization_config = _get_gemma4_bnb_skip_module_aliases(
-            getattr(config, "quantization_config", None)
-        )
-        if gemma4_bnb_quantization_config is not None:
-            engine_args["hf_overrides"] = {
-                "quantization_config": gemma4_bnb_quantization_config,
-            }
 
     # [[CRITICAL for RL on policy]]
     # Check for Cascade Attention which fails on A100 / L40 for vLLM < 0.11.0 versions
@@ -2934,38 +2827,6 @@ def _test_same_model(model, new_model, input_ids):
     return
 pass
 
-def _get_dense_causal_lm_state_dict(model):
-    state_dict = model.state_dict()
-    if not any(key.startswith("model.language_model.") for key in state_dict):
-        return state_dict, False
-
-    normalized = {}
-    prefix = "model.language_model."
-    for key, value in state_dict.items():
-        if key.startswith(prefix):
-            normalized["model." + key[len(prefix):]] = value
-        elif key.startswith("lm_head."):
-            normalized[key] = value
-    return normalized, True
-pass
-
-def _test_whole_model_forward(model, new_model, input_ids):
-    kwargs = dict(
-        input_ids = input_ids,
-        labels = input_ids,
-        output_hidden_states = True,
-        use_cache = False,
-    )
-    old_outputs = model(**kwargs)
-    new_outputs = new_model(**kwargs)
-    torch.testing.assert_close(old_outputs.logits, new_outputs.logits)
-    if getattr(old_outputs, "loss", None) is not None and getattr(new_outputs, "loss", None) is not None:
-        torch.testing.assert_close(old_outputs.loss, new_outputs.loss)
-    if getattr(old_outputs, "hidden_states", None) is not None and getattr(new_outputs, "hidden_states", None) is not None:
-        for old_hidden, new_hidden in zip(old_outputs.hidden_states, new_outputs.hidden_states):
-            torch.testing.assert_close(old_hidden, new_hidden, rtol = 1e-3, atol = 1e-4)
-pass
-
 @torch.inference_mode()
 def test_model_conversion(original_model, new_model):
     """
@@ -3005,27 +2866,10 @@ def _test_is_same_vlm(model, new_model, processor, test_backward=False):
         messages, tokenize=False, add_generation_prompt=True
     )
 
-    if processor.__class__.__name__ in ("Gemma3Processor", "Gemma4Processor"):
-        try:
-            from transformers.image_utils import load_image
-            image = load_image(messages[0]["content"][0]["image"])
-        except Exception:
-            from PIL import Image
-            image = Image.new("RGB", (224, 224), color = (128, 128, 128))
-        inputs = processor(
-            text = [text],
-            images = [image],
-            return_tensors = "pt",
-        )
-    else:
-        inputs = processor.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=True,
-            return_dict=True, return_tensors="pt",
-        )
-    inputs = inputs.to(model.device)
-    for _k, _v in list(inputs.items()):
-        if torch.is_tensor(_v) and torch.is_floating_point(_v):
-            inputs[_k] = _v.to(dtype = model.dtype)
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+        return_dict=True, return_tensors="pt"
+    ).to(model.device, dtype=model.dtype)
 
     with torch.no_grad():
         original_outputs = model(**inputs)
@@ -3145,7 +2989,6 @@ def _test_get_vllm_state_dict(
     load_in_4bit = False,
     skip_generation = False,
     is_vision_model = False,
-    compilation_config = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if model is allowed to be used in vLLM
@@ -3184,9 +3027,7 @@ def _test_get_vllm_state_dict(
     # patch_bitsandbytes_compute_dtype(dtype)
     model_type = getattr(config, "model_type", "causal_lm")
 
-    enable_lora = model_type not in ("mllama", "gemma4")
-    if compilation_config is None and model_type == "gemma4":
-        compilation_config = 0
+    enable_lora = model_type != "mllama"
 
     if not is_vision_model:
         model_class = AutoModelForCausalLM
@@ -3213,12 +3054,6 @@ def _test_get_vllm_state_dict(
         param.requires_grad_(False)
     model, _ = patch_model_and_tokenizer(model, None)
     model.eval()
-    if not is_vision_model and _is_gemma4_config(model.config):
-        extraction_config = getattr(model.config, "text_config", model.config)
-    else:
-        extraction_config = model.config if not is_vision_model else config
-    extraction_config.model_name = model_name
-    dense_state_dict, text_normalized_state_dict = _get_dense_causal_lm_state_dict(model)
 
     # Patch vLLM to disable multiprocessing for state dict extraction
     patch_vllm()
@@ -3234,25 +3069,19 @@ def _test_get_vllm_state_dict(
         use_bitsandbytes       = load_in_4bit,
         is_vision_model        = is_vision_model,
         enable_lora            = enable_lora,
-        compilation_config     = compilation_config,
     )
 
     state_dict, quant_state_dict = get_vllm_state_dict(
         llm,
         return_state_dict = True,
-        config = extraction_config,
+        config = config,
         is_vision_model = is_vision_model,
     )
 
-    assert_same_state_dict(dense_state_dict, state_dict)
+    assert_same_state_dict(model.state_dict(), state_dict)
 
-    new_model = convert_vllm_to_huggingface(quant_state_dict, extraction_config, dtype, is_vision_model = is_vision_model)
-    if text_normalized_state_dict:
-        assert_same_state_dict(dense_state_dict, new_model.state_dict())
-    else:
-        test_model_conversion(model, new_model)
-    new_model, _ = patch_model_and_tokenizer(new_model, None)
-    new_model.eval()
+    new_model = convert_vllm_to_huggingface(quant_state_dict, config, dtype, is_vision_model = is_vision_model)
+    test_model_conversion(model, new_model)
 
     # Run the model as well
     if not is_vision_model:
@@ -3299,17 +3128,7 @@ def _test_get_vllm_state_dict(
         # Check all hidden states manually
         input_ids = tokenizer(inputs[0], add_special_tokens = False, return_tensors = "pt")
         input_ids = input_ids["input_ids"].to("cuda", non_blocking = True)
-        model_layers = getattr(getattr(model, "model", None), "layers", ())
-        supports_layerwise_test = (
-            not text_normalized_state_dict
-            and len(model_layers) != 0
-            and all(hasattr(layer, "self_attn") for layer in model_layers)
-            and hasattr(getattr(model, "model", None), "rotary_emb")
-        )
-        if supports_layerwise_test:
-            _test_same_model(model, new_model, input_ids)
-        else:
-            _test_whole_model_forward(model, new_model, input_ids)
+        _test_same_model(model, new_model, input_ids)
     else:
         # VLMs dont have a standardised forward pass mechanism. So we just test whole model forward pass and not layer wise
         # TODO: Maybe add layer wise checks
