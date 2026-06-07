@@ -22,9 +22,10 @@ except ImportError:
 # vLLM imports are guarded so this module stays importable without vLLM
 # (only the LoRA worker functionality, which needs real vLLM, uses them).
 try:
-    from vllm.config import LoRAConfig
+    from vllm.config import LoRAConfig, VllmConfig
 except ImportError:
     class LoRAConfig: pass
+    class VllmConfig: pass
 try:
     from vllm.logger import init_logger
 except ImportError:
@@ -338,7 +339,6 @@ def old_init(
     # Lazily initialized by create_lora_manager.
     self._adapter_manager: LoRAModelManager
 
-from vllm.config import VllmConfig
 def new_init(
     self,
     vllm_config: VllmConfig,
