@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import types
 import pytest
+pytest.importorskip("vllm.config")
 import torch
 
 
