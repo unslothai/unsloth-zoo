@@ -19,8 +19,7 @@ except ImportError:
         def __init__(self, device):
             self.device = device
 
-# vLLM imports are guarded so this module stays importable without vLLM
-# (only the LoRA worker functionality, which needs real vLLM, uses them).
+# Guard vLLM imports so this module imports without vLLM (real LoRA work needs it).
 try:
     from vllm.config import LoRAConfig, VllmConfig
 except ImportError:
