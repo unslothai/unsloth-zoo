@@ -352,7 +352,6 @@ def patch_gemma4_vllm_lora_support():
         from vllm.v1.worker import lora_model_runner_mixin
     except ImportError:
         lora_model_runner_mixin = None
-    from unsloth_zoo import vllm_lora_worker_manager
 
     gemma4_lora_classes = []
     classes_to_patch = []
@@ -370,6 +369,8 @@ def patch_gemma4_vllm_lora_support():
         pass
     if not classes_to_patch:
         return
+    # Import after the early return: pulls in hard vllm internals.
+    from unsloth_zoo import vllm_lora_worker_manager
     gemma4_lora_classes = set(gemma4_lora_classes)
 
     for cls in classes_to_patch:
