@@ -19,19 +19,45 @@ except ImportError:
         def __init__(self, device):
             self.device = device
 
-from vllm.config import LoRAConfig
-from vllm.logger import init_logger
+# vLLM imports are guarded so this module stays importable without vLLM
+# (only the LoRA worker functionality, which needs real vLLM, uses them).
+try:
+    from vllm.config import LoRAConfig
+except ImportError:
+    class LoRAConfig: pass
+try:
+    from vllm.logger import init_logger
+except ImportError:
+    import logging
+    def init_logger(name): return logging.getLogger(name)
 try:
     from vllm.lora.models import (LoRAModel, LoRAModelManager,
                                 LRUCacheLoRAModelManager, create_lora_manager)
 except ImportError:
     # Newer vLLM version moved/split lora methods
     # https://github.com/vllm-project/vllm/pull/30253
-    from vllm.lora.lora_model import LoRAModel
-    from vllm.lora.model_manager import LoRAModelManager, LRUCacheLoRAModelManager, create_lora_manager
-from vllm.lora.peft_helper import PEFTHelper
-from vllm.lora.request import LoRARequest
-from vllm.lora.utils import get_adapter_absolute_path
+    try:
+        from vllm.lora.lora_model import LoRAModel
+        from vllm.lora.model_manager import LoRAModelManager, LRUCacheLoRAModelManager, create_lora_manager
+    except ImportError:
+        class LoRAModel: pass
+        class LoRAModelManager: pass
+        class LRUCacheLoRAModelManager: pass
+        def create_lora_manager(*args, **kwargs):
+            raise RuntimeError("vLLM is required for LoRA worker manager")
+try:
+    from vllm.lora.peft_helper import PEFTHelper
+except ImportError:
+    class PEFTHelper: pass
+try:
+    from vllm.lora.request import LoRARequest
+except ImportError:
+    class LoRARequest: pass
+try:
+    from vllm.lora.utils import get_adapter_absolute_path
+except ImportError:
+    def get_adapter_absolute_path(*args, **kwargs):
+        raise RuntimeError("vLLM is required for LoRA worker manager")
 
 logger = init_logger(__name__)
 
