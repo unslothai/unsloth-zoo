@@ -40,6 +40,57 @@ import inspect
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
 
 
+def _module_compute_dtype(module, *attr_names):
+    """Derive the low-precision *boundary* dtype for a forced-float32 Gemma3 patch
+    from the module's own (trainable) weights instead of hard-coding float16.
+
+    The FORCE_FLOAT32 patches run heavy reductions (RMSNorm variance, SwiGLU,
+    attention) in float32 for fp16 overflow-safety, then narrow back to a
+    low-precision dtype at each Linear/projection boundary. That boundary dtype
+    must match the dtype of the weights actually multiplying the activations:
+
+      * LoRA (FORCE_FLOAT32): base proj weights stay float16  -> boundary float16
+        (identical to the original hard-coded behaviour, incl. the fp16 clamp).
+      * Full finetuning      : trainable weights upcast to float32 -> boundary
+        float32, so a float32 activation meets a float32 weight (no Half != float).
+      * bfloat16 weights     : boundary bfloat16 (clamp is a no-op at bf16 range).
+
+    We look at the first attribute that is a tensor / has a floating ``.dtype``.
+    If none is found (should not happen for these modules) we fall back to
+    float16 so behaviour is unchanged from before this patch.
+    """
+    for name in attr_names:
+        obj = getattr(module, name, None)
+        if obj is None:
+            continue
+        # nn.Linear (q_proj, gate_proj, ...) -> .weight ; or a raw Parameter (RMSNorm.weight)
+        weight = getattr(obj, "weight", obj)
+        dtype = getattr(weight, "dtype", None)
+        if dtype is not None and dtype.is_floating_point:
+            return dtype
+    return torch.float16
+
+
+def _narrow_to_boundary(x_fp32, dtype):
+    """Cast a float32 tensor to ``dtype`` for a Linear boundary.
+
+    For float16 we clamp to the fp16 range then downcast, matching what the
+    RMSNorm patch already did. For in-range activations this equals the original
+    bare ``.to(float16)`` at the MLP/attention boundaries; for activations above
+    the fp16 max it clamps instead of overflowing to inf (strictly safer). For
+    float32 this is a no-op. bfloat16 clamps to its own (very wide) range first.
+    """
+    if dtype == torch.float32:
+        return x_fp32
+    if dtype == torch.float16:
+        fp16_max = torch.finfo(torch.float16).max
+        fp16_min = torch.finfo(torch.float16).min
+        return torch.clamp(x_fp32, min = fp16_min, max = fp16_max).to(torch.float16)
+    # bfloat16 (or any other low-precision float): clamp to its own range then cast.
+    finfo = torch.finfo(dtype)
+    return torch.clamp(x_fp32, min = finfo.min, max = finfo.max).to(dtype)
+
+
 def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states, sliding_window=None):
     if attention_mask is None or attention_mask.dim() != 2:
         return attention_mask
@@ -351,16 +402,16 @@ def patch_Gemma3RMSNorm():
         variance = x_fp32.pow(2).mean(-1, keepdim=True)
         hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + self.eps)
 
-        # self.weight is bf16 (from vision.py loading if UNSLOTH_FORCE_FLOAT32="1")
-        # So, cast self.weight to fp32 for the (1.0 + weight) operation
+        # self.weight is fp16 for LoRA (FORCE_FLOAT32) and fp32 once full finetuning
+        # upcasts the trainable params. Cast it to fp32 for the (1.0 + weight) math.
         output_fp32 = hidden_states_fp32 * (1.0 + self.weight.to(torch.float32))
 
-        # Clamp to fp16 range before casting back to fp16
-        fp16_max = torch.finfo(torch.float16).max
-        fp16_min = torch.finfo(torch.float16).min
-        clamped_output_fp32 = torch.clamp(output_fp32, min=fp16_min, max=fp16_max)
-
-        return clamped_output_fp32.to(torch.float16) # Output fp16
+        # Narrow to the boundary dtype of the downstream Linear, derived from this
+        # norm's own (trainable) weight: fp16 weights -> fp16 output with the
+        # original overflow clamp (bit-identical to before); fp32 weights ->
+        # fp32 output so the next projection matmul is float32 x float32.
+        boundary_dtype = _module_compute_dtype(self, "weight")
+        return _narrow_to_boundary(output_fp32, boundary_dtype)
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
 pass
@@ -375,7 +426,7 @@ def patch_Gemma3MLP():
     except Exception as e:
         return raise_error("Gemma3MLP.forward", e)
 
-    def forward(self, x): # x is fp16 from RMSNorm
+    def forward(self, x): # x matches proj weight dtype (fp16 LoRA / fp32 full-FT)
         gate_proj_out = self.gate_proj(x)
         up_proj_out = self.up_proj(x)
 
@@ -385,14 +436,56 @@ def patch_Gemma3MLP():
         activated_fp32 = self.act_fn(gate_proj_fp32) # Activation in fp32
         intermediate_fp32 = activated_fp32 * up_proj_fp32 # Product in fp32
 
-        # Downcast and down_proj
-        intermediate_fp16 = intermediate_fp32.to(torch.float16)
-        down_proj_out = self.down_proj(intermediate_fp16)
+        # Narrow to the down_proj weight dtype: fp16 weights -> fp16 (now clamped to
+        # fp16 range like RMSNorm, vs the old bare cast; equal for in-range values,
+        # safer otherwise); fp32 weights (full finetuning) -> stays fp32.
+        boundary_dtype = _module_compute_dtype(self, "down_proj", "gate_proj", "up_proj")
+        intermediate = _narrow_to_boundary(intermediate_fp32, boundary_dtype)
+        down_proj_out = self.down_proj(intermediate)
         return down_proj_out
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
+
+
+def patch_Gemma3MultiModalProjector():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector
+    except Exception as e:
+        return raise_error("Gemma3MultiModalProjector.forward", e)
+
+    def forward(self, vision_outputs: torch.Tensor):
+        batch_size, _, seq_length = vision_outputs.shape
+
+        reshaped_vision_outputs = vision_outputs.transpose(1, 2)
+        reshaped_vision_outputs = reshaped_vision_outputs.reshape(
+            batch_size, seq_length, self.patches_per_image, self.patches_per_image
+        )
+        reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
+
+        pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
+        pooled_vision_outputs = pooled_vision_outputs.flatten(2)
+        pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2)
+
+        # mm_soft_emb_norm is a Gemma3RMSNorm, so under FORCE_FLOAT32 it can emit a float32
+        # activation (when its weight is upcast for stability) while mm_input_projection_weight
+        # stays a low-precision dtype -> "mat1 and mat2 must have the same dtype: float != Half"
+        # in the matmul below. Narrow the normed output to the projection weight's boundary
+        # dtype, exactly like the MLP/attention Linear boundaries: fp16 weights -> fp16 (with
+        # the overflow clamp, bit-identical to stock), fp32 weights (full finetuning) -> fp32.
+        normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
+        boundary_dtype = _module_compute_dtype(self, "mm_input_projection_weight")
+        normed_vision_outputs = _narrow_to_boundary(normed_vision_outputs.to(torch.float32), boundary_dtype)
+
+        projected_vision_outputs = torch.matmul(normed_vision_outputs, self.mm_input_projection_weight)
+        return projected_vision_outputs.type_as(vision_outputs)
+    pass
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector, "forward", forward, fullgraph = False)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3MultiModalProjector)
 
 
 def patch_Gemma3Attention():
@@ -596,10 +689,15 @@ def patch_Gemma3Attention():
         # Using -1 for the last dimension is robust and aligns with your original example.
         attn_output_fp32 = attn_output_fp32.reshape(bsz, q_len, -1) # REVISED FIX
 
-        attn_output_fp16 = attn_output_fp32.to(torch.float16)
+        # Narrow to the o_proj weight dtype: fp16 weights -> fp16 (now clamped to
+        # fp16 range like RMSNorm, vs the old bare cast; equal for in-range values,
+        # safer otherwise); fp32 weights (full finetuning) -> stays fp32 so o_proj
+        # is float32 x float32 instead of crashing on Half != float.
+        boundary_dtype = _module_compute_dtype(self, "o_proj", "q_proj", "k_proj", "v_proj")
+        attn_output_narrowed = _narrow_to_boundary(attn_output_fp32, boundary_dtype)
 
-        # 8. Output Projection (o_proj) in fp16
-        attn_output_projected = self.o_proj(attn_output_fp16) # fp16 output
+        # 8. Output Projection (o_proj)
+        attn_output_projected = self.o_proj(attn_output_narrowed)
 
         return attn_output_projected, attn_weights # 3-tuple return
     pass
