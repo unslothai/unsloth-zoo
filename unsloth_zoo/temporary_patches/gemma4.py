@@ -111,6 +111,13 @@ class _Gemma4KVSharedSafeProxy:
     def __getattr__(self, name):
         # Only invoked when normal attribute lookup fails (i.e. not a slot
         # and not a method of this proxy class).
+        # Return AttributeError for num_kv_shared_layers so hasattr() returns False
+        # This fixes the cache constructor bug: layer_types[:-0] == []
+        if name == "num_kv_shared_layers":
+            raise AttributeError(
+                "num_kv_shared_layers is 0 (no KV sharing) -- hidden from "
+                "the cache constructor to avoid layer_types[:-0] == [] bug"
+            )
         return getattr(object.__getattribute__(self, "_real"), name)
 
     def get_text_config(self, decoder=None, encoder=None):
@@ -736,13 +743,14 @@ def patch_Gemma4MultimodalEmbedder_forward():
 
     def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         old_dtype = inputs_embeds.dtype
-        # Compute norm in float32
+        # Compute norm in float32 (in-place to avoid extra allocation)
         emb_norm = _Gemma4MultimodalEmbedder_RMSNorm_forward(self.embedding_pre_projection_norm, inputs_embeds)
-        # Project in float32 to preserve spatial precision
-        # Ensure both input and weight are float32 for matmul
-        weight_fp32 = self.embedding_projection.weight.to(torch.float32)
-        emb_norm_fp32 = emb_norm.to(torch.float32)
-        emb_norm_proj = torch.nn.functional.linear(emb_norm_fp32, weight_fp32)
+        # Project in float32 to preserve spatial precision - use linear with fp32 weight
+        # Avoid redundant downcast-upcast: compute directly in fp32 and return in original dtype
+        emb_norm_proj = torch.nn.functional.linear(
+            emb_norm.to(torch.float32),
+            self.embedding_projection.weight.to(torch.float32)
+        )
         return emb_norm_proj.to(old_dtype)
     try:
         patch_function(
@@ -776,7 +784,8 @@ def patch_Gemma4VisionPatchEmbedder_position_embeddings():
         one_hot = one_hot.permute(0, 2, 1, 3).to(dtype=torch.float32)
         position_embeddings = one_hot @ self.position_embedding_table.to(torch.float32)
         position_embeddings = position_embeddings.sum(dim=1)
-        position_embeddings = torch.where(padding_positions.unsqueeze(-1), torch.tensor(0.0, dtype=position_embeddings.dtype), position_embeddings)
+        # Use Python float 0.0 instead of torch.tensor to avoid device mismatch
+        position_embeddings = torch.where(padding_positions.unsqueeze(-1), 0.0, position_embeddings)
         return position_embeddings.to(self.position_embedding_table.dtype)
 
     try:
