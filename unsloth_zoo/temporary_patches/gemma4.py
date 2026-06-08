@@ -105,6 +105,10 @@ class _Gemma4KVSharedSafeProxy:
 
     __slots__ = ("_real",)
 
+    # __dict__/vars() still expose num_kv_shared_layers (no instance dict -> forwards
+    # to _real); keep it that way -- to_dict() deepcopies __dict__, so sealing it
+    # would drop the field from serialization. #6089
+
     def __init__(self, real):
         object.__setattr__(self, "_real", real)
 
@@ -127,14 +131,17 @@ class _Gemma4KVSharedSafeProxy:
     # PreTrainedConfig.__iter__ yields attribute names from self.__dict__.
     # Validators such as validate_token_ids rely on this iteration.
     def __iter__(self):
-        return iter(object.__getattribute__(self, "_real"))
+        # Hide num_kv_shared_layers, like __getattr__/__contains__/__getitem__:
+        # validate_token_ids does `for n in cfg: getattr(cfg, n)`, so yielding it
+        # would re-raise the AttributeError from __getattr__. See unslothai/unsloth#6089.
+        for name in object.__getattribute__(self, "_real"):
+            if name == "num_kv_shared_layers":
+                continue
+            yield name
 
     def __len__(self):
-        real = object.__getattribute__(self, "_real")
-        try:
-            return len(real)
-        except TypeError:
-            return len(getattr(real, "__dict__", {}))
+        # Consistent with __iter__ (hidden attr excluded).
+        return sum(1 for _ in self)
 
     def __contains__(self, item):
         if item == "num_kv_shared_layers":
