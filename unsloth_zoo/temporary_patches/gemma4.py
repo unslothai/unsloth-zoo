@@ -16,7 +16,7 @@
 
 import torch
 import os
-from .common import TEMPORARY_PATCHES
+from .common import TEMPORARY_PATCHES, torch_compile
 from .utils import raise_error, patch_function
 
 
@@ -111,6 +111,8 @@ class _Gemma4KVSharedSafeProxy:
     def __getattr__(self, name):
         # Only invoked when normal attribute lookup fails (i.e. not a slot
         # and not a method of this proxy class).
+        # Return AttributeError for num_kv_shared_layers so hasattr() returns False
+        # This fixes the cache constructor bug: layer_types[:-0] == []
         if name == "num_kv_shared_layers":
             raise AttributeError(
                 "num_kv_shared_layers is 0 (no KV sharing) -- hidden from "
@@ -716,3 +718,81 @@ def patch_Gemma4TextMLP():
         return raise_error("Gemma4TextMLP.forward", e)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextMLP)
+
+
+# ============================================================================
+# Gemma4MultimodalEmbedder patch - force float32 for projection stability
+# The projection (embedding_projection) loses spatial precision in bf16/fp16.
+# Mirror of patch_Gemma3nMultimodalEmbedder_forward.
+# ============================================================================
+
+@torch_compile
+def _Gemma4MultimodalEmbedder_RMSNorm_forward(self, x: torch.Tensor) -> torch.Tensor:
+    output = self._norm(x.float())
+    if getattr(self, "with_scale", True) and hasattr(self, "weight"):
+        output = output * self.weight.float()
+    return output.type_as(x)
+
+def patch_Gemma4MultimodalEmbedder_forward():
+    """Force float32 computation for Gemma4MultimodalEmbedder to preserve spatial precision."""
+    try:
+        import transformers.models.gemma4.modeling_gemma4 as mod
+        Gemma4MultimodalEmbedder = mod.Gemma4MultimodalEmbedder
+    except (ImportError, AttributeError) as e:
+        return raise_error("Gemma4MultimodalEmbedder.forward", e)
+
+    def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        old_dtype = inputs_embeds.dtype
+        # Compute norm in float32 (in-place to avoid extra allocation)
+        emb_norm = _Gemma4MultimodalEmbedder_RMSNorm_forward(self.embedding_pre_projection_norm, inputs_embeds)
+        # Project in float32 to preserve spatial precision - use linear with fp32 weight
+        # Avoid redundant downcast-upcast: compute directly in fp32 and return in original dtype
+        emb_norm_proj = torch.nn.functional.linear(
+            emb_norm.to(torch.float32),
+            self.embedding_projection.weight.to(torch.float32)
+        )
+        return emb_norm_proj.to(old_dtype)
+    try:
+        patch_function(
+            Gemma4MultimodalEmbedder, "forward", forward, fullgraph=True,
+        )
+    except Exception as e:
+        return raise_error("Gemma4MultimodalEmbedder.forward", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4MultimodalEmbedder_forward)
+
+
+# ============================================================================
+# Gemma4VisionPatchEmbedder patch - force float32 for position embeddings
+# The position embedding computation (one_hot @ table) loses precision in bf16/fp16,
+# causing y-coordinate collapse in spatial localization tasks.
+# ============================================================================
+
+def patch_Gemma4VisionPatchEmbedder_position_embeddings():
+    """Force float32 computation for Gemma4VisionPatchEmbedder position embeddings."""
+    try:
+        import transformers.models.gemma4.modeling_gemma4 as mod
+        Gemma4VisionPatchEmbedder = mod.Gemma4VisionPatchEmbedder
+    except (ImportError, AttributeError) as e:
+        return raise_error("Gemma4VisionPatchEmbedder._position_embeddings", e)
+
+    def _position_embeddings(self, pixel_position_ids: torch.Tensor, padding_positions: torch.Tensor) -> torch.Tensor:
+        """Prepare patch positions map for matmul with position embedding table."""
+        # Compute in float32 for numerical stability of position embeddings
+        clamped_positions = pixel_position_ids.clamp(min=0)
+        one_hot = torch.nn.functional.one_hot(clamped_positions, num_classes=self.position_embedding_size)
+        one_hot = one_hot.permute(0, 2, 1, 3).to(dtype=torch.float32)
+        position_embeddings = one_hot @ self.position_embedding_table.to(torch.float32)
+        position_embeddings = position_embeddings.sum(dim=1)
+        # Use Python float 0.0 instead of torch.tensor to avoid device mismatch
+        position_embeddings = torch.where(padding_positions.unsqueeze(-1), 0.0, position_embeddings)
+        return position_embeddings.to(self.position_embedding_table.dtype)
+
+    try:
+        patch_function(
+            Gemma4VisionPatchEmbedder, "_position_embeddings", _position_embeddings, fullgraph=True,
+        )
+    except Exception as e:
+        return raise_error("Gemma4VisionPatchEmbedder._position_embeddings", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4VisionPatchEmbedder_position_embeddings)
