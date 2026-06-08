@@ -111,29 +111,7 @@ class _Gemma4KVSharedSafeProxy:
     def __getattr__(self, name):
         # Only invoked when normal attribute lookup fails (i.e. not a slot
         # and not a method of this proxy class).
-        # Return the real value for num_kv_shared_layers so validation works,
-        # but hasattr will still see it (the cache fix relies on hasattr).
-        # The cache constructor uses hasattr() which calls getattr() and catches AttributeError.
-        # We can't make both work perfectly, so we return the value for validation.
         return getattr(object.__getattribute__(self, "_real"), name)
-
-    def __getattribute__(self, name):
-        # Override hasattr behavior: make hasattr(proxy, "num_kv_shared_layers") return False
-        # by raising AttributeError only when called from hasattr context.
-        # We detect this by checking if the caller is hasattr (which calls getattr).
-        if name == "num_kv_shared_layers":
-            import inspect
-            frame = inspect.currentframe()
-            try:
-                # Check if caller is hasattr (which uses getattr internally)
-                # hasattr calls getattr and catches AttributeError
-                # We can't easily distinguish, so we'll check the call stack
-                caller_frame = frame.f_back
-                if caller_frame and caller_frame.f_code.co_name == "hasattr":
-                    raise AttributeError("num_kv_shared_layers hidden from cache constructor")
-            finally:
-                del frame
-        return object.__getattribute__(self, name)
 
     def get_text_config(self, decoder=None, encoder=None):
         # If upstream recursively calls get_text_config on the proxy, return
