@@ -643,7 +643,12 @@ def patch_Gemma4ClippableLinear_peft_reload():
         current_key=None,
         **kwargs,
     ):
-        if isinstance(target, Gemma4ClippableLinear):
+        # Match by identity OR name+structure: the compiler emits a duplicate
+        # Gemma4ClippableLinear, so a compiled model's modules aren't isinstance of the
+        # transformers class (breaks a 2nd adapter, e.g. GRPO "ref"). #6089
+        if isinstance(target, Gemma4ClippableLinear) or (
+            type(target).__name__ == "Gemma4ClippableLinear" and hasattr(target, "linear")
+        ):
             return original_create_and_replace(
                 self,
                 peft_config,
