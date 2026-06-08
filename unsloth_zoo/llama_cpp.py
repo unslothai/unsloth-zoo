@@ -1392,76 +1392,53 @@ _download_convert_hf_to_gguf.cache_parameters = _download_convert_hf_to_gguf_cac
 
 
 def _patch_tensor_mapping_for_qwen35(llama_cpp_dir: str):
-    """Patch tensor_mapping.py to add explicit Qwen3.5 patterns for SSM tensors.
-    This ensures Qwen3.5 hybrid models (with linear_attn layers) have their
-    SSM tensors properly mapped during GGUF conversion."""
+    """Add Qwen3.5 SSM tensor patterns to tensor_mapping.py for GGUF export."""
     tensor_mapping_path = os.path.join(llama_cpp_dir, "gguf-py", "gguf", "tensor_mapping.py")
     if not os.path.exists(tensor_mapping_path):
-        logger.debug(f"tensor_mapping.py not found at {tensor_mapping_path}, skipping patch")
         return
 
-    try:
-        with open(tensor_mapping_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+    with open(tensor_mapping_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
 
-        # Check if Qwen3.5 patterns are already present
-        content_str = "".join(lines)
-        if "qwen3.5" in content_str.lower() and "linear_attn.conv1d" in content_str:
-            logger.debug("Qwen3.5 patterns already present in tensor_mapping.py")
-            return
+    content_str = "".join(lines)
+    if "qwen3.5" in content_str.lower() and "linear_attn.conv1d" in content_str:
+        return
 
-        # Define the Qwen3.5 patterns to add for each SSM tensor
-        # These match the HF tensor names: model.layers.{bid}.linear_attn.{tensor_name}
-        qwen35_patterns = {
-            "SSM_CONV1D": '            "model.layers.{bid}.linear_attn.conv1d",   # qwen3.5',
-            "SSM_DT": '            "model.layers.{bid}.linear_attn.dt_proj",   # qwen3.5',
-            "SSM_A": '            "model.layers.{bid}.linear_attn.A_log",   # qwen3.5',
-            "SSM_NORM": '            "model.layers.{bid}.linear_attn.norm",   # qwen3.5',
-            "SSM_OUT": '            "model.layers.{bid}.linear_attn.out_proj",   # qwen3.5',
-            "SSM_BETA": '            "model.layers.{bid}.linear_attn.in_proj_b",   # qwen3.5',
-            "SSM_ALPHA": '            "model.layers.{bid}.linear_attn.in_proj_a",   # qwen3.5',
-        }
+    qwen35_patterns = {
+        "SSM_CONV1D": '            "model.layers.{bid}.linear_attn.conv1d",   # qwen3.5',
+        "SSM_DT": '            "model.layers.{bid}.linear_attn.dt_proj",   # qwen3.5',
+        "SSM_A": '            "model.layers.{bid}.linear_attn.A_log",   # qwen3.5',
+        "SSM_NORM": '            "model.layers.{bid}.linear_attn.norm",   # qwen3.5',
+        "SSM_OUT": '            "model.layers.{bid}.linear_attn.out_proj",   # qwen3.5',
+        "SSM_BETA": '            "model.layers.{bid}.linear_attn.in_proj_b",   # qwen3.5',
+        "SSM_ALPHA": '            "model.layers.{bid}.linear_attn.in_proj_a",   # qwen3.5',
+    }
 
-        # Track which tensor block we're in
-        current_tensor = None
-        patched = False
-        new_lines = []
+    current_tensor = None
+    new_lines = []
 
-        for i, line in enumerate(lines):
-            # Detect which tensor block we're entering
-            if "MODEL_TENSOR." in line and ": (" in line:
-                # Extract tensor name, e.g., "SSM_CONV1D"
-                for tensor_name in qwen35_patterns.keys():
-                    if f"MODEL_TENSOR.{tensor_name}" in line:
-                        current_tensor = tensor_name
-                        break
+    for line in lines:
+        if "MODEL_TENSOR." in line and ": (" in line:
+            for tensor_name in qwen35_patterns.keys():
+                if f"MODEL_TENSOR.{tensor_name}" in line:
+                    current_tensor = tensor_name
+                    break
 
-            # Check if this line has the qwen3next pattern for the current tensor
-            if current_tensor and current_tensor in qwen35_patterns:
-                if "# qwen3next" in line:
-                    # Add the Qwen3.5 pattern after this line
-                    new_lines.append(line)
-                    new_lines.append(qwen35_patterns[current_tensor] + "\n")
-                    patched = True
-                    logger.info(f"Added Qwen3.5 pattern for {current_tensor}")
-                    current_tensor = None  # Reset after adding
-                    continue
-
-            # Reset current_tensor when we exit the tuple (line with just "),")
-            if current_tensor and line.strip() == "),":
+        if current_tensor and current_tensor in qwen35_patterns:
+            if "# qwen3next" in line:
+                new_lines.append(line)
+                new_lines.append(qwen35_patterns[current_tensor] + "\n")
                 current_tensor = None
+                continue
 
-            new_lines.append(line)
+        if current_tensor and line.strip() == "),":
+            current_tensor = None
 
-        if patched:
-            with open(tensor_mapping_path, "w", encoding="utf-8") as f:
-                f.writelines(new_lines)
-            logger.info("Successfully patched tensor_mapping.py for Qwen3.5 SSM tensors")
-        else:
-            logger.debug("No Qwen3.5 patterns added (tensor blocks not found or already patched)")
+        new_lines.append(line)
 
-    except Exception as e:
-        logger.warning(f"Failed to patch tensor_mapping.py for Qwen3.5: {e}")
+    if new_lines != lines:
+        with open(tensor_mapping_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
 
 
 def _split_str_to_n_bytes(split_str: str) -> int:

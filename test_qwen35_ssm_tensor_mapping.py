@@ -1,47 +1,33 @@
 import os
 import tempfile
-import shutil
 import sys
-import logging
 
-# Read and exec the function from the source file to avoid package import issues
-def _get_patch_function():
-    with open('/home/datta0/repos/unsloth-zoo/worktrees/issue-6071-qwen35-ssm-fix/unsloth_zoo/llama_cpp.py', 'r') as f:
+SOURCE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'unsloth_zoo', 'llama_cpp.py')
+
+
+def _load_patch_function():
+    with open(SOURCE_FILE, 'r') as f:
         content = f.read()
-    
-    # Extract the function definition
+
     start = content.find('def _patch_tensor_mapping_for_qwen35')
     if start == -1:
         raise RuntimeError("Function not found")
-    
-    # Find the end of the function (next function def or end of file)
+
     end = content.find('\ndef ', start + 1)
     if end == -1:
         end = len(content)
-    
+
     func_code = content[start:end]
-    
-    # Create a namespace with required imports
-    logger = logging.getLogger('test')
-    logger.setLevel(logging.DEBUG)
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    logger.addHandler(handler)
-    
-    namespace = {
-        'os': os,
-        'logging': logging,
-        'logger': logger,
-    }
+
+    namespace = {'os': os}
     exec(func_code, namespace)
     return namespace['_patch_tensor_mapping_for_qwen35']
 
-_patch_tensor_mapping_for_qwen35 = _get_patch_function()
+
+_patch_tensor_mapping_for_qwen35 = _load_patch_function()
 
 
 def test_patch_tensor_mapping_for_qwen35():
-    """Test that _patch_tensor_mapping_for_qwen35 correctly adds Qwen3.5 patterns to tensor_mapping.py"""
-
     with tempfile.TemporaryDirectory() as tmpdir:
         gguf_dir = os.path.join(tmpdir, 'gguf-py', 'gguf')
         os.makedirs(gguf_dir)
@@ -87,8 +73,8 @@ MODEL_TENSOR.SSM_ALPHA: (
         with open(mapping_path, 'r') as f:
             result = f.read()
 
-        assert 'qwen3.5' in result.lower(), 'Qwen3.5 pattern not found'
-        assert result.lower().count('qwen3.5') >= 5, f'Expected at least 5 qwen3.5 patterns, got {result.lower().count("qwen3.5")}'
+        assert 'qwen3.5' in result.lower()
+        assert result.lower().count('qwen3.5') >= 5
 
         expected_patterns = [
             'linear_attn.conv1d',
@@ -98,14 +84,10 @@ MODEL_TENSOR.SSM_ALPHA: (
             'linear_attn.out_proj',
         ]
         for pattern in expected_patterns:
-            assert pattern in result, f'Pattern {pattern} not found in patched file'
-
-        print('test_patch_tensor_mapping_for_qwen35 PASSED')
+            assert pattern in result
 
 
 def test_patch_tensor_mapping_idempotent():
-    """Test that running the patch twice doesn't duplicate patterns"""
-
     with tempfile.TemporaryDirectory() as tmpdir:
         gguf_dir = os.path.join(tmpdir, 'gguf-py', 'gguf')
         os.makedirs(gguf_dir)
@@ -126,14 +108,10 @@ def test_patch_tensor_mapping_idempotent():
             result = f.read()
 
         count = result.lower().count('qwen3.5')
-        assert count == 1, f'Expected 1 qwen3.5 pattern after idempotent run, got {count}'
-
-        print('test_patch_tensor_mapping_idempotent PASSED')
+        assert count == 1
 
 
 def test_patch_tensor_mapping_skips_when_already_patched():
-    """Test that patch is skipped when Qwen3.5 patterns already present"""
-
     with tempfile.TemporaryDirectory() as tmpdir:
         gguf_dir = os.path.join(tmpdir, 'gguf-py', 'gguf')
         os.makedirs(gguf_dir)
@@ -154,22 +132,9 @@ def test_patch_tensor_mapping_skips_when_already_patched():
             result = f.read()
 
         count = result.lower().count('qwen3.5')
-        assert count == 1, f'Expected 1 qwen3.5 pattern, got {count}'
-
-        print('test_patch_tensor_mapping_skips_when_already_patched PASSED')
+        assert count == 1
 
 
 def test_patch_tensor_mapping_graceful_missing_file():
-    """Test that function handles missing tensor_mapping.py gracefully"""
-
     with tempfile.TemporaryDirectory() as tmpdir:
         _patch_tensor_mapping_for_qwen35(tmpdir)
-        print('test_patch_tensor_mapping_graceful_missing_file PASSED')
-
-
-if __name__ == '__main__':
-    test_patch_tensor_mapping_for_qwen35()
-    test_patch_tensor_mapping_idempotent()
-    test_patch_tensor_mapping_skips_when_already_patched()
-    test_patch_tensor_mapping_graceful_missing_file()
-    print('\nAll tests PASSED!')
