@@ -11,13 +11,10 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
 
-"""Drift detectors for the ``unsloth/import_fixes.py`` workarounds.
-
-Every test maps 1:1 to a ``fix_*`` / ``patch_*`` in ``import_fixes.py``.
-DRIFT-DETECTED framing: assert the healthy shape; surface an active
-pathology as ``pytest.fail("DRIFT DETECTED: ...")``; ``importorskip``
-genuinely optional libs. Each test cites the source-of-truth file:line.
-"""
+"""Drift detectors for the ``unsloth/import_fixes.py`` workarounds. Each test
+maps 1:1 to a ``fix_*`` / ``patch_*``: assert the healthy shape, surface an
+active pathology as pytest.fail("DRIFT DETECTED: ..."), importorskip optional
+libs. Each cites the source file:line."""
 
 from __future__ import annotations
 
@@ -32,8 +29,8 @@ from importlib.metadata import version as importlib_version
 import pytest
 
 
-# Mirrors Version() in import_fixes.py (51-68): strips dev/post/local
-# suffixes so packaging.Version handles "0.0.33.post2" / "0.15.1+cu130".
+# Mirrors Version() in import_fixes.py (51-68): strips dev/post/local suffixes
+# so packaging.Version handles "0.0.33.post2" / "0.15.1+cu130".
 from packaging.version import Version as _PkgVersion
 
 
@@ -55,9 +52,8 @@ def _safe_version(raw):
 
 
 def test_protobuf_message_factory_get_prototype_or_get_message_class_present():
-    """``fix_message_factory_issue`` (import_fixes.py 264-308). On a healthy
-    install ``MessageFactory.GetPrototype`` OR module-level
-    ``GetMessageClass`` must be reachable."""
+    """fix_message_factory_issue (import_fixes.py 264-308): healthy install has
+    ``MessageFactory.GetPrototype`` OR module-level ``GetMessageClass``."""
     mf = pytest.importorskip("google.protobuf.message_factory")
     has_mf_class = hasattr(mf, "MessageFactory")
     has_get_prototype = has_mf_class and hasattr(
@@ -84,9 +80,9 @@ def test_protobuf_message_factory_get_prototype_or_get_message_class_present():
 
 
 def test_datasets_version_not_in_broken_recursion_range():
-    """``patch_datasets`` (import_fixes.py 574-586). datasets 4.4.0-4.5.0
-    inclusive triggers ``_thread.RLock_recursion_count`` errors deep in the
-    Arrow loader; assert the installed version is outside it."""
+    """patch_datasets (import_fixes.py 574-586): datasets 4.4.0-4.5.0 triggers
+    ``_thread.RLock_recursion_count`` errors in the Arrow loader; assert the
+    installed version is outside that range."""
     pytest.importorskip("datasets")
     ds_v = _safe_version(importlib_version("datasets"))
     lo = _PkgVersion("4.4.0")
@@ -104,10 +100,10 @@ def test_datasets_version_not_in_broken_recursion_range():
 
 
 def test_trl_is_x_available_returns_bool_not_tuple():
-    """``fix_trl_vllm_ascend`` (import_fixes.py 493-516). transformers
-    >=4.48's ``_is_package_available`` returns ``(bool, version)``; TRL
-    caches that tuple as truthy, firing unconditional ``import vllm``.
-    Healthy state: every ``is_*_available()`` returns a real bool."""
+    """fix_trl_vllm_ascend (import_fixes.py 493-516): transformers >=4.48's
+    ``_is_package_available`` returns ``(bool, version)``; TRL caches that
+    tuple as truthy and fires unconditional ``import vllm``. Healthy: every
+    ``is_*_available()`` returns a real bool."""
     pytest.importorskip("trl")
     try:
         import trl.import_utils as tiu
@@ -154,9 +150,9 @@ def test_trl_is_x_available_returns_bool_not_tuple():
 
 
 def test_trl_cached_available_flags_are_not_tuples():
-    """``fix_trl_vllm_ascend`` (import_fixes.py 493-516). Same pathology
-    as above but checks the module-level cached ``_*_available`` attrs --
-    this is where the tuple drift actually lives."""
+    """fix_trl_vllm_ascend (import_fixes.py 493-516): same pathology, checked
+    on the module-level cached ``_*_available`` attrs where the tuple drift
+    actually lives."""
     pytest.importorskip("trl")
     try:
         import trl.import_utils as tiu
@@ -183,16 +179,12 @@ def test_trl_cached_available_flags_are_not_tuples():
 
 
 def test_pretrained_model_enable_input_require_grads_uses_old_pattern():
-    """``patch_enable_input_require_grads`` (import_fixes.py 609-670).
-    transformers PR #41993 rewrote ``enable_input_require_grads`` to
-    iterate ``for module in self.modules()`` and call
-    ``module.get_input_embeddings()``, which raises NotImplementedError
-    on vision sub-modules (GLM V4.6's ``self.visual``). Healthy state:
-    either the upstream rewrite isn't present (pre-HF#41993), OR the
-    patch installed a NotImplementedError-tolerant replacement. The
-    bare ``for module in self.modules()`` check alone cannot tell the
-    two apart because unsloth's replacement deliberately also uses
-    that loop, just wrapped in ``try / except NotImplementedError``."""
+    """patch_enable_input_require_grads (import_fixes.py 609-670): HF PR #41993
+    rewrote ``enable_input_require_grads`` to iterate ``self.modules()`` and
+    call ``get_input_embeddings()``, which raises NotImplementedError on vision
+    submodules (GLM V4.6's ``self.visual``). Healthy: either the rewrite is
+    absent (pre-#41993) OR the tolerant replacement (the same loop wrapped in
+    ``try/except NotImplementedError``) is installed."""
     pytest.importorskip("transformers")
     from transformers import PreTrainedModel
 
@@ -216,10 +208,9 @@ def test_pretrained_model_enable_input_require_grads_uses_old_pattern():
 
 
 def test_transformers_torchcodec_available_flag_is_present():
-    """``disable_torchcodec_if_broken`` (import_fixes.py 1291-1317). Needs
-    either the pre-5.x module-level ``_torchcodec_available`` flag, or
-    the 5.x ``is_torchcodec_available`` public function; one of the two
-    is the patch site the fix monkey-patches when FFmpeg is missing."""
+    """disable_torchcodec_if_broken (import_fixes.py 1291-1317): needs the
+    pre-5.x ``_torchcodec_available`` flag OR the 5.x
+    ``is_torchcodec_available`` function -- the patch site for missing FFmpeg."""
     tf_iu = pytest.importorskip("transformers.utils.import_utils")
     has_flag = hasattr(tf_iu, "_torchcodec_available")
     has_func = callable(getattr(tf_iu, "is_torchcodec_available", None))
@@ -233,10 +224,9 @@ def test_transformers_torchcodec_available_flag_is_present():
 
 
 def test_transformers_is_causal_conv1d_available_symbol_present():
-    """``_disable_transformers_causal_conv1d`` (import_fixes.py 1881-1895).
-    Needs at least one of ``is_causal_conv1d_available`` /
-    ``_causal_conv1d_available`` / ``_is_causal_conv1d_available`` to
-    mask a broken-binary causal_conv1d install."""
+    """_disable_transformers_causal_conv1d (import_fixes.py 1881-1895): needs
+    one of is_causal_conv1d_available / _causal_conv1d_available /
+    _is_causal_conv1d_available to mask a broken causal_conv1d binary."""
     tf_iu = pytest.importorskip("transformers.utils.import_utils")
     candidates = [
         "is_causal_conv1d_available",
@@ -258,10 +248,9 @@ def test_transformers_is_causal_conv1d_available_symbol_present():
 
 
 def test_transformers_and_accelerate_is_wandb_available_callable():
-    """``disable_broken_wandb`` (import_fixes.py 1320-1372). Patches
+    """disable_broken_wandb (import_fixes.py 1320-1372): patches
     ``is_wandb_available`` on transformers.integrations.integration_utils,
-    accelerate.utils.imports, AND accelerate.utils (a protobuf mismatch
-    can make ``import wandb`` raise). All three locations must exist."""
+    accelerate.utils.imports, AND accelerate.utils. All three must exist."""
     pytest.importorskip("transformers")
     pytest.importorskip("accelerate")
     from transformers.integrations import integration_utils as tf_integration
@@ -290,12 +279,11 @@ def test_transformers_and_accelerate_is_wandb_available_callable():
 
 
 def test_peft_transformers_weight_conversion_importable_and_signature():
-    """``patch_peft_weight_converter_compatibility`` (import_fixes.py
-    1375-1454). Wraps ``build_peft_weight_mapping`` to retrofit
-    ``distributed_operation`` / ``quantization_operation`` kwargs;
-    must import cleanly AND keep
-    ``(weight_conversions, adapter_name, peft_config=None)``. An
-    unimportable module IS drift -- the fix's bare except silently no-ops."""
+    """patch_peft_weight_converter_compatibility (import_fixes.py 1375-1454):
+    wraps ``build_peft_weight_mapping`` to retrofit distributed/quantization
+    operation kwargs; must import cleanly AND keep ``(weight_conversions,
+    adapter_name, peft_config=None)``. An unimportable module IS drift (the
+    fix's bare except silently no-ops)."""
     pytest.importorskip("peft")
     try:
         from peft.utils import transformers_weight_conversion as twc
@@ -325,18 +313,17 @@ def test_peft_transformers_weight_conversion_importable_and_signature():
 
 
 def test_triton_compiled_kernel_has_num_ctas_and_cluster_dims():
-    """``fix_triton_compiled_kernel_missing_attrs`` (import_fixes.py
-    923-968). triton 3.6.0+ dropped ``num_ctas`` / ``cluster_dims`` on
-    CompiledKernel but torch 2.9.x Inductor still eagerly evaluates them
-    -- without the fix torch.compile paths blow up before reaching the
-    new launch contract."""
+    """fix_triton_compiled_kernel_missing_attrs (import_fixes.py 923-968):
+    triton 3.6.0+ dropped ``num_ctas`` / ``cluster_dims`` on CompiledKernel
+    but torch 2.9.x Inductor still eagerly evaluates them, so torch.compile
+    blows up without the fix."""
     pytest.importorskip("torch")
     triton_mod = pytest.importorskip("triton")  # noqa: F841
     tc = pytest.importorskip("triton.compiler.compiler")
 
     ck_cls = tc.CompiledKernel
-    # Healthy if either: pre-3.6 class attr present, or unsloth wrapped
-    # ``__init__`` to install num_ctas + cluster_dims per instance.
+    # Healthy if the pre-3.6 class attr is present, or unsloth wrapped
+    # __init__ to install num_ctas + cluster_dims per instance.
     if hasattr(ck_cls, "num_ctas"):
         return
     init = getattr(ck_cls, "__init__", None)
@@ -389,9 +376,8 @@ def _is_custom_torch_build(raw_version_str):
 
 
 def test_installed_torch_torchvision_pair_is_compatible():
-    """``torchvision_compatibility_check`` (import_fixes.py 708-798).
-    Mirrors the upstream compat table; custom or prerelease builds get
-    downgraded to a warning, so this test skips for those."""
+    """torchvision_compatibility_check (import_fixes.py 708-798): mirrors the
+    upstream compat table; skips custom/prerelease builds (warning-only there)."""
     pytest.importorskip("torch")
     pytest.importorskip("torchvision")
 
@@ -438,10 +424,9 @@ def test_installed_torch_torchvision_pair_is_compatible():
 
 
 def test_vllm_guided_decoding_params_or_structured_outputs_present():
-    """``fix_vllm_guided_decoding_params`` (import_fixes.py 446-490).
-    vLLM PR #22772 renamed ``GuidedDecodingParams`` ->
-    ``StructuredOutputsParams``; trl still imports the old name so the
-    fix re-aliases. At least one must exist at module load."""
+    """fix_vllm_guided_decoding_params (import_fixes.py 446-490): vLLM PR #22772
+    renamed ``GuidedDecodingParams`` -> ``StructuredOutputsParams``; trl still
+    imports the old name so the fix re-aliases. At least one must exist."""
     pytest.importorskip("vllm")
     try:
         sp = importlib.import_module("vllm.sampling_params")
@@ -465,9 +450,8 @@ def test_vllm_guided_decoding_params_or_structured_outputs_present():
 
 
 def test_vllm_aimv2_ovis_config_is_past_fix_version():
-    """``fix_vllm_aimv2_issue`` (import_fixes.py 404-443). vLLM < 0.10.1
-    has an Ovis config that unconditionally
-    ``AutoConfig.register("aimv2", AIMv2Config)`` and trips
+    """fix_vllm_aimv2_issue (import_fixes.py 404-443): vLLM < 0.10.1's Ovis
+    config unconditionally ``AutoConfig.register("aimv2", ...)`` and trips
     ``ValueError: 'aimv2' is already used by a Transformers config``."""
     pytest.importorskip("vllm")
     vllm_v = _safe_version(importlib_version("vllm"))
@@ -486,10 +470,9 @@ def test_vllm_aimv2_ovis_config_is_past_fix_version():
 
 
 def test_huggingface_hub_is_offline_mode_or_hf_hub_offline_present():
-    """``fix_huggingface_hub`` (import_fixes.py 913-920). huggingface_hub
-    removed the top-level ``is_offline_mode()`` helper; unsloth
-    re-injects it from ``huggingface_hub.constants.HF_HUB_OFFLINE``. At
-    least one of the two must still exist."""
+    """fix_huggingface_hub (import_fixes.py 913-920): huggingface_hub removed
+    top-level ``is_offline_mode()``; unsloth re-injects it from
+    ``huggingface_hub.constants.HF_HUB_OFFLINE``. At least one must exist."""
     hub = pytest.importorskip("huggingface_hub")
     has_top_level = False
     try:
@@ -518,9 +501,9 @@ def test_huggingface_hub_is_offline_mode_or_hf_hub_offline_present():
 
 
 def test_torch_nn_init_trunc_normal_exists():
-    """``patch_trunc_normal_precision_issue`` (import_fixes.py 971-1050).
-    The fp16/bf16 stability wrapper monkey-patches
-    ``torch.nn.init.trunc_normal_``; a rename silently fails the install."""
+    """patch_trunc_normal_precision_issue (import_fixes.py 971-1050): the
+    fp16/bf16 stability wrapper monkey-patches ``torch.nn.init.trunc_normal_``;
+    a rename silently fails the install."""
     pytest.importorskip("torch")
     import torch.nn.init as init_mod
 
@@ -536,9 +519,8 @@ def test_torch_nn_init_trunc_normal_exists():
 
 
 def test_xformers_is_post_num_splits_key_fix_or_not_installed():
-    """``fix_xformers_performance_issue`` (import_fixes.py 312-341).
-    xformers < 0.0.29 has the ``num_splits_key=-1`` perf bug that
-    unsloth rewrites at install time."""
+    """fix_xformers_performance_issue (import_fixes.py 312-341): xformers <
+    0.0.29 has the ``num_splits_key=-1`` perf bug unsloth rewrites at install."""
     if importlib.util.find_spec("xformers") is None:
         pytest.skip("xformers not installed -- nothing to drift-check.")
     x_v = _safe_version(importlib_version("xformers"))
@@ -557,9 +539,9 @@ def test_xformers_is_post_num_splits_key_fix_or_not_installed():
 
 
 def test_transformers_pretrained_model_has_get_input_embeddings():
-    """``patch_enable_input_require_grads`` (import_fixes.py 609-670).
-    The replacement function calls ``module.get_input_embeddings()`` on
-    every submodule; a rename breaks the replacement."""
+    """patch_enable_input_require_grads (import_fixes.py 609-670): the
+    replacement calls ``module.get_input_embeddings()`` on every submodule;
+    a rename breaks it."""
     pytest.importorskip("transformers")
     from transformers import PreTrainedModel
 
@@ -575,9 +557,9 @@ def test_transformers_pretrained_model_has_get_input_embeddings():
 
 
 def test_accelerate_utils_imports_module_present():
-    """``disable_broken_wandb`` + ``fix_trl_vllm_ascend`` (import_fixes.py
-    493-516, 1320-1372). Both reach into ``accelerate.utils.imports``;
-    a restructuring silently no-ops the monkey-patches."""
+    """disable_broken_wandb + fix_trl_vllm_ascend (import_fixes.py 493-516,
+    1320-1372): both reach into ``accelerate.utils.imports``; a restructuring
+    silently no-ops the monkey-patches."""
     pytest.importorskip("accelerate")
     mod = pytest.importorskip("accelerate.utils.imports")
     # is_wandb_available is the representative symbol disable_broken_wandb targets.

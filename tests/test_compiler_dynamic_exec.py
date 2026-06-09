@@ -11,20 +11,17 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
 
-"""End-to-end drift detectors for ``unsloth_zoo/compiler.py``'s DYNAMIC
-CODE CREATION pipeline.
+"""End-to-end drift detectors for ``unsloth_zoo/compiler.py``'s dynamic
+code-creation pipeline.
 
-Companion to ``test_upstream_source_patterns.py`` (which pins the
-upstream patterns BEFORE the rewrite). This file drives each rewriter
-end-to-end against real upstream transformers source and asserts the
-rewritten output ``ast.parse``s, ``compile`` + ``exec``s, and (for
-named-symbol rewrites) the symbol is gone after rewrite.
+Companion to ``test_upstream_source_patterns.py``. Drives each rewriter
+against real transformers source and asserts the output ``ast.parse``s,
+``compile`` + ``exec``s, and (for named-symbol rewrites) the symbol is gone.
+Also drives ``unsloth_compile_transformers(model_type=X)`` per known model
+type and AST-parses the emitted cache.
 
-Also drives ``unsloth_compile_transformers(model_type=X)`` end-to-end
-across every known model type and AST-parses the emitted cache file.
-
-CPU-only; drift -> ``pytest.fail("DRIFT DETECTED: ...")``. Model types
-absent from the installed transformers are skipped (environment).
+CPU-only; drift -> ``pytest.fail("DRIFT DETECTED: ...")``. Model types absent
+from the installed transformers are skipped.
 """
 
 from __future__ import annotations
@@ -38,8 +35,7 @@ import textwrap
 import pytest
 
 
-# Disable torch.compile side effects so we only exercise the SOURCE
-# rewrite + ast.parse pipeline (no GPU / no torch.compile cost).
+# Disable torch.compile so we only exercise the source rewrite + ast.parse.
 os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
 
 
@@ -47,9 +43,8 @@ transformers = pytest.importorskip("transformers")
 compiler = pytest.importorskip("unsloth_zoo.compiler")
 
 
-# Model types the zoo compiler drives end-to-end; sourced from
-# unsloth_compile_transformers(model_type=...) call sites in unsloth +
-# unsloth_zoo and from test_apply_fused_lm_head's enumerated families.
+# Model types the zoo compiler drives end-to-end (from
+# unsloth_compile_transformers call sites and test_apply_fused_lm_head).
 KNOWN_MODEL_TYPES = [
     "llama",
     "llama4",
@@ -123,9 +118,8 @@ def _assert_parseable(rewritten: str, entry_point: str, *, dedent: bool = False)
 
 
 def _assert_execs(rewritten: str, entry_point: str, *, dedent: bool = False):
-    """compile + exec rewritten in a sandbox; NameError -> DRIFT.
-    ImportError / other runtime errors at top-level are out of scope
-    (env, not drift); only NameError indicates a dangling identifier."""
+    """compile + exec in a sandbox; only NameError (a dangling identifier)
+    is DRIFT. ImportError / other runtime errors are env, not drift."""
     source = textwrap.dedent(rewritten) if dedent else rewritten
     sandbox = {"__name__": "test_compiler_dynamic_exec_sandbox"}
     try:
@@ -150,9 +144,8 @@ def _assert_execs(rewritten: str, entry_point: str, *, dedent: bool = False):
 
 
 # Per-rewriter tests against real transformers source. gemma3 is the
-# canonical driver: moderately-sized and exercises almost every
-# rewriter path (RMSNorm, sliding-window attn, RoPE, MoE-shaped
-# routing, multi-modal projector, ForConditionalGeneration head).
+# canonical driver: it exercises almost every rewriter path (RMSNorm,
+# sliding-window attn, RoPE, MoE routing, projector, ForConditionalGeneration).
 
 
 @pytest.fixture(scope="module")
@@ -405,8 +398,7 @@ def test_patch_gradient_accumulation_for_conditional_gen(gemma3_mod):
     )
 
 
-# Rewriter passthrough robustness on shapes the rewriter is NOT meant
-# to touch (guards against accidental corruption of unrelated source).
+# Passthrough robustness on shapes the rewriter must not touch.
 
 
 PASSTHROUGH_SOURCE = (
@@ -459,7 +451,7 @@ def test_two_arg_rewriter_passthrough_on_plain_python(name_args):
     _assert_parseable(out, f"{name}(plain-python)")
 
 
-# Targeted symbol-removal asserts (the rewrite must LAND, not silently no-op).
+# Targeted symbol-removal asserts: the rewrite must land, not silently no-op.
 
 
 def test_higher_precision_softmax_inserts_float32_cast():
@@ -521,11 +513,10 @@ def test_replace_with_grouped_query_attention_inserts_enable_gqa():
     )
 
 
-# End-to-end: unsloth_compile_transformers(model_type=X). Master entry
-# point chaining every rewriter; emits combined module to
-# unsloth_compiled_cache/. Drive for every known model type, AST-parse
-# the cache file. Cache name: unsloth_compiled_module_<type>.py (see
-# ``unsloth_zoo/compiler.py:66-67`` COMBINED_UNSLOTH_NAME).
+# End-to-end: unsloth_compile_transformers(model_type=X) chains every
+# rewriter and emits unsloth_compiled_module_<type>.py to
+# unsloth_compiled_cache/ (see ``unsloth_zoo/compiler.py:66-67``
+# COMBINED_UNSLOTH_NAME). Drive per known model type, AST-parse the cache.
 
 
 def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
@@ -562,9 +553,8 @@ def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
 def test_unsloth_compile_transformers_emits_parseable_cache(
     model_type, monkeypatch,
 ):
-    """End-to-end pipeline drive per model_type + AST-parse the emitted
-    combined cache. Master pipeline exec()'s rewritten transformers
-    source; any rewriter producing invalid Python surfaces here."""
+    """Drive the pipeline per model_type + AST-parse the combined cache; any
+    rewriter producing invalid Python surfaces here."""
     cache_path = _compile_and_get_cache(model_type, monkeypatch)
 
     if not os.path.isfile(cache_path):
@@ -597,10 +587,9 @@ def test_unsloth_compile_transformers_emits_parseable_cache(
 
 
 def test_smoke_unsloth_compile_transformers_gemma3(monkeypatch):
-    """Spec smoke: ``unsloth_compile_transformers("gemma3", ...)`` returns
-    valid Python on the installed transformers. Real zoo signature (see
-    ``unsloth_zoo/compiler.py:3116-3143``) doesn't accept
-    trust_remote_code/fast_inference; pass what it does accept."""
+    """Smoke: ``unsloth_compile_transformers("gemma3", ...)`` returns valid
+    Python. The real signature (``unsloth_zoo/compiler.py:3116-3143``)
+    rejects trust_remote_code/fast_inference; pass only what it accepts."""
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
     monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "1")
     _load_modeling("gemma3")
@@ -646,9 +635,8 @@ def test_smoke_unsloth_compile_transformers_unknown_model_type(monkeypatch):
     )
 
 
-# AST validity of CONSTANT source blocks pasted inside compiler.py.
-# These are exec()'d verbatim by ``create_new_function`` (see
-# ``unsloth_zoo/compiler.py:801-1126``).
+# AST validity of constant source blocks in compiler.py, exec()'d verbatim
+# by ``create_new_function`` (see ``unsloth_zoo/compiler.py:801-1126``).
 
 
 @pytest.mark.parametrize(
@@ -663,9 +651,8 @@ def test_smoke_unsloth_compile_transformers_unknown_model_type(monkeypatch):
     ],
 )
 def test_compiler_constant_source_blocks_parse(const_name):
-    """Each constant is a Python source block embedded in
-    ``unsloth_zoo/compiler.py`` and exec()'d as-is. Must be valid Python
-    (after documented placeholder substitution where applicable)."""
+    """Each constant is a source block exec()'d as-is by compiler.py; must be
+    valid Python (after placeholder substitution where applicable)."""
     block = getattr(compiler, const_name, None)
     if block is None:
         pytest.skip(f"{const_name} not present (renamed?)")

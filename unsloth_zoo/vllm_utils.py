@@ -136,9 +136,8 @@ if importlib.util.find_spec("vllm") is not None:
 
     # Allow unsloth dynamic quants to work
     def is_layer_skipped_bnb(prefix: str, llm_int8_skip_modules):
-        # Split the prefix into its dot-separated components
         components = prefix.split('.')
-        # Check if any of the skip modules exactly matches any component
+        # Any skip module exactly matching a component
         vllm_check = any(
             module_name in components
             for module_name in llm_int8_skip_modules
@@ -151,9 +150,8 @@ if importlib.util.find_spec("vllm") is not None:
         return vllm_check or unsloth_check
     pass
 
-    # Since https://github.com/vllm-project/vllm/blob/4959915089f1bcf011f082136464e48b76c7e3d9/vllm/model_executor/model_loader/bitsandbytes_loader.py
-    # vLLM dequantizes the Double quant scalars on the fly
-    # We disable this
+    # vLLM dequantizes Double quant scalars on the fly; disable it.
+    # https://github.com/vllm-project/vllm/blob/4959915089f1bcf011f082136464e48b76c7e3d9/vllm/model_executor/model_loader/bitsandbytes_loader.py
     def dequantize_dq(quant_states):
         return quant_states
     def _dequantize_dq(self, quant_states):
@@ -180,14 +178,13 @@ if importlib.util.find_spec("vllm") is not None:
         vllm.model_executor.layers.quantization.bitsandbytes,
         "apply_bnb_4bit"
     ):
-        # Fix force using torch.bfloat16 all the time and make it dynamic
+        # Make the compute dtype dynamic instead of forcing torch.bfloat16
         def _apply_4bit_weight(
             self,
             layer: torch.nn.Module,
             x: torch.Tensor,
             bias: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
-            # only load the bitsandbytes module when needed
             from bitsandbytes import matmul_4bit
 
             original_type = x.dtype
@@ -242,7 +239,6 @@ if importlib.util.find_spec("vllm") is not None:
             x: torch.Tensor,
             bias: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
-            # only load the bitsandbytes module when needed
             original_type = x.dtype
             original_shape = x.shape
             reshape_after_matmul = False
@@ -286,7 +282,7 @@ if importlib.util.find_spec("vllm") is not None:
         try:
             from vllm.config import logger as vllm_config_logger
         except:
-            # vLLM refactored a lot of configs. Most of them are backwards compatible for imports. This seems to not be.
+            # vLLM config refactor: this import isn't backwards compatible.
             from vllm.config.model import logger as vllm_config_logger
         vllm_config_logger.addFilter(HideLoggingMessage("not supported"))
         vllm_config_logger.addFilter(HideLoggingMessage("is not tested"))
@@ -309,8 +305,7 @@ if importlib.util.find_spec("vllm") is not None:
 
     def patch_vllm_compute_dtype(dtype = torch.float16):
         # All Unsloth Zoo code licensed under LGPLv3
-        # vLLM defaults to using the model config file's compute_dtype
-        # We shall fix it dynamically!
+        # vLLM uses the config file's compute_dtype; override it dynamically.
         old_config = vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
 
         dtype = str(dtype)
@@ -340,7 +335,7 @@ if importlib.util.find_spec("vllm") is not None:
         except:
             pass
         try:
-            # New vLLM is now a class!
+            # New vLLM: TokenizerGroup is a class
             import vllm.transformers_utils.tokenizer_group
             vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer = _return_self_tokenizer
             vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer_async = _return_self_tokenizer
@@ -376,8 +371,7 @@ if importlib.util.find_spec("vllm") is not None:
 
     def set_inductor_config(config, runtime_shape):
         if isinstance(runtime_shape, int):
-            # for a specific batchsize, tuning triton kernel parameters
-            # can be beneficial
+            # Per-batchsize triton kernel tuning can help
             config["max_autotune"] = False # Very slow so disable
             config["coordinate_descent_tuning"] = True
     pass
@@ -424,13 +418,10 @@ if importlib.util.find_spec("bitsandbytes") is not None:
     # Force offsets to be in float32 and not bfloat16 / float16
     @classmethod
     def from_dict(cls, qs_dict: Dict[str, Any], device: torch.device) -> "QuantState":
-        """
-        unpacks components of state_dict into QuantState
-        where necessary, convert into strings, torch.dtype, ints, etc.
+        """Unpack state_dict components into a QuantState (strings, dtypes, ints).
 
-        qs_dict: based on state_dict, with only relevant keys, striped of prefixes.
-
-        item with key `quant_state.bitsandbytes__[nf4/fp4]` may contain minor and non-tensor quant state items.
+        qs_dict: state_dict relevant keys, prefixes stripped. The
+        `quant_state.bitsandbytes__[nf4/fp4]` item may hold minor non-tensor items.
         """
 
         # unpacking tensor with non-tensor components
@@ -535,8 +526,7 @@ def patch_vllm_enable_sleep_mode():
     logger.info(f"Unsloth: Enabling vLLM standby mode")
 
     def __init__(self):
-        # This is a replica of the original CuMemAllocator.__init__()
-        # with no changes except modification to error message for better readability
+        # Replica of CuMemAllocator.__init__() with a clearer error message only.
         for check in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF",):
             conf = os.environ.get(check, "")
             assert "expandable_segments:True" not in conf, \
@@ -548,10 +538,8 @@ def patch_vllm_enable_sleep_mode():
         self.current_tag: str = CuMemAllocator.default_tag
         self.allocator_and_pools: dict[str, Any] = {}
         if hasattr(self, '_python_malloc_callback'):
-            # vllm changed something recently wrt cumem init
-            # new versions have function _python_malloc/free and set it to self.python_malloc/free
-            # old versions just have the function self.python_malloc/free so they need no such assignment
-            # this check is to make sure it works for both new versions and old alike
+            # Newer vLLM exposes _python_malloc/free and assigns them to
+            # python_malloc/free; old versions don't. Handle both.
             # https://github.com/vllm-project/vllm/commit/9dc30b7068ae07ceca89663e9f8403d00217256d
             self.python_malloc_callback = self._python_malloc_callback
         if hasattr(self, '_python_free_callback'):
@@ -561,17 +549,9 @@ def patch_vllm_enable_sleep_mode():
             self,
             offload_tags: Optional[Union[Tuple[str, ...],
                                             str]] = None) -> None:
-        """
-        Put the allocator in sleep mode.
-        All data in the memory allocation with the specified tag will be
-        offloaded to CPU memory, and others will be discarded.
-
-        :param offload_tags: The tags of the memory allocation that will be
-            offloaded. The rest of the memory allocation will be discarded.
-        """
+        """Sleep mode: offload allocations with offload_tags to CPU, discard the rest."""
         if offload_tags is None:
-            # by default, allocated tensors are offloaded
-            # when the allocator sleeps
+            # by default, allocated tensors are offloaded on sleep
             offload_tags = (CuMemAllocator.default_tag, )
         elif isinstance(offload_tags, str):
             offload_tags = (offload_tags, )
@@ -591,7 +571,7 @@ def patch_vllm_enable_sleep_mode():
             total_offloads += 1
             handle = data.handle
             if data.tag == 'weights':
-                # In unsloth's case we have weights managed by unsloth. So we neither offload/delete them nor onload/create them here.
+                # Weights are unsloth-managed; don't offload/delete them here.
                 continue
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
@@ -616,19 +596,11 @@ def patch_vllm_enable_sleep_mode():
     pass
 
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
-        """
-        Wake up the allocator from sleep mode.
-        All data that is previously offloaded will be loaded back to GPU
-        memory, and the rest of the data will have empty memory.
-
-        :param tags: The tags of the memory allocation that will be loaded
-            back to GPU memory. If None, all memory allocation will be loaded
-            back to GPU memory.
-        """
+        """Wake from sleep mode: reload offloaded data to GPU (tags, or all if None)."""
         delete_memory()
         for ptr, data in self.pointer_to_data.items():
             if data.tag == "weights":
-                # In unsloth's case we have weights managed by unsloth. So we neither offload/delete them nor onload/create them here.
+                # Weights are unsloth-managed; don't onload/create them here.
                 continue
             if tags is None or data.tag in tags:
                 handle = data.handle
@@ -651,9 +623,7 @@ def patch_vllm_enable_sleep_mode():
     pass
 
     def print_memory_summary(self):
-        """
-        Print the total memory usage for weights and KVCache allocations.
-        """
+        """Log total memory used by weights and KVCache allocations."""
         weights_total = 0
         kv_cache_total = 0
         kv_cache_count = 0
@@ -674,7 +644,6 @@ def patch_vllm_enable_sleep_mode():
 
     def get_patched_generate(original_generate):
         def check_sleep_mode(self):
-            # LLM object has llm_engine as an attribute
             engine = getattr(self, "llm_engine", self)
             return hasattr(engine, "vllm_config") and hasattr(engine.vllm_config, "model_config") and getattr(engine.vllm_config.model_config, "enable_sleep_mode", False)
 
@@ -699,11 +668,7 @@ pass
 
 
 def patch_vllm_graph_capture():
-    """
-    Temporarily disable ``gc.collect`` to speed up CUDA graph capture.
-    This is a workaround to avoid the overhead of garbage collection
-    during the graph capture with torch.compile.
-    """
+    """Temporarily disable gc.collect to speed up CUDA graph capture with torch.compile."""
     from contextlib import contextmanager
     import gc
     import time
@@ -779,8 +744,7 @@ pass
 
 
 def patch_vllm(debug = True):
-    # Temporary patch to disable multiprocessing for vLLM
-    # Allows accessing model_executor
+    # Disable vLLM multiprocessing so we can access model_executor.
     logger.info(f'Unsloth: Patching vLLM')
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     if debug or os.getenv("UNSLOTH_ENABLE_LOGGING", "0") == "1":
@@ -818,9 +782,8 @@ def vllm_dynamic_quant_supported(
 ) -> bool:
     # All Unsloth Zoo code licensed under LGPLv3
 
-    # Check if vLLM supports some Unsloth dynamic quants
-    # Sometimes we quantize modules within a layer, but not an entire layer
-    # If so, then we cannot use dynamic quants for now
+    # Dynamic quants are unsupported when only some modules within a layer are
+    # quantized (not the whole layer).
     if not model_name.lower().endswith("unsloth-bnb-4bit"): return True
     if "quantization_config" not in config: return True
 
@@ -828,12 +791,10 @@ def vllm_dynamic_quant_supported(
     if _is_gemma4_config(config) and _get_gemma4_bnb_skip_module_aliases(config.quantization_config) is not None:
         return True
 
-    # Only allow layer modules ie model.layers.1.mlp or model.layers.1.self_attn
-
-    # Exclude model.layers.27.mlp.gate_proj
+    # Allow only layer modules (model.layers.1.mlp / .self_attn), not deeper
+    # ones like model.layers.27.mlp.gate_proj.
     parent_llm_int8_skip_modules = []
     for module in llm_int8_skip_modules:
-        # $ means end of string
         if re.search(r"[\d]\.[^\.]{1,}$", module) or "." not in module:
             parent_llm_int8_skip_modules.append(module)
     pass
@@ -879,14 +840,10 @@ def get_vllm_state_dict(
     is_vision_model = False,
     load_in_fp8 = False,
 ):
-    # If the vllm state dict was quantized using torchao, we will run into
-    # the following error when calling ops like aten.t() in inference mode.
-    # This is a bug in PyTorch that affects all tensor subclasses.
-    #
-    #     Cannot set version_counter for inference tensor
-    #
-    # For now, we work around this issue by using torch.no_grad in this case.
-    # See https://github.com/pytorch/pytorch/issues/164872 for more details
+    # torchao-quantized state dicts hit "Cannot set version_counter for
+    # inference tensor" on ops like aten.t() in inference_mode (PyTorch bug for
+    # tensor subclasses); use no_grad instead.
+    # https://github.com/pytorch/pytorch/issues/164872
     if get_quant_type(config) == "torchao" or load_in_fp8:
         ctx_manager = torch.no_grad()
     else:
@@ -898,18 +855,16 @@ def get_vllm_state_dict(
 def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
-    # vllm_state_dict = {}
     try:
         llm_engine = getattr(llm, "llm_engine", getattr(llm, "engine", llm))
-        # Handle V1 vs V0 engines
         if hasattr(llm_engine, "engine_core"):
-            # V1 engine - access through engine_core (multiprocessing is disabled by patch_vllm)
+            # V1 engine via engine_core (multiprocessing disabled by patch_vllm)
             vllm_internals = llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner.model
         else:
             # V0 engine - direct access
             vllm_internals = llm_engine.model_executor.driver_worker.model_runner.model
     except:
-        # Using a new VLLM version must use collective_rpc
+        # Newer vLLM must use collective_rpc
         try:
             vllm_state_dict = {}
             gpu_ids = llm.collective_rpc("report_device_id", args = tuple())
@@ -925,10 +880,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     assert(config is not None)
 
-    # Determine model type from config BEFORE reassigning config
+    # Read model_type before reassigning config below
     model_type = getattr(config, "model_type", "causal_lm")
 
-    # Keep the original config for model_type but use text_config for vocab_size etc
+    # text_config holds vocab_size etc; keep original config for model_type
     text_config = getattr(config, "text_config", config)
 
     vocab_size = text_config.vocab_size
@@ -941,9 +896,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
 
     try:
-        # vLLM recently removed the transpose of weight scale for Hopper GPUs.
+        # vLLM removed the Hopper weight-scale transpose; check whether the
+        # weight-process function still transposes before we do.
         # https://github.com/vllm-project/vllm/pull/28431
-        # So now we check if the weight process function does a transpose of weight scale before doing so
         # https://github.com/vllm-project/vllm/commit/f9a4087182ffcd9404779fcda876f820b3b26d5f#diff-cce58c0ceb6a9b15a01f117d734b93736acc25ed89921c2eacc58ea05bd34d0eL1155-L1157
         from vllm.model_executor.layers.quantization.utils.fp8_utils import maybe_post_process_fp8_weight_block
         from inspect import getsource
@@ -955,7 +910,6 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     is_deep_gemm_supported = False
     cutlass_block_fp8_supported = False
     if needs_transpose_check:
-        # Only try to import and check if we need to
         try:
             from vllm.utils.deep_gemm import is_deep_gemm_supported as vllm_is_deep_gemm_supported
             is_deep_gemm_supported = vllm_is_deep_gemm_supported()
@@ -972,14 +926,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         proj = getattr(proj, "base_layer", proj)
         qweight = proj.weight
 
-        # Determine slicing offsets
+        # Slicing offsets
         output_sizes = getattr(proj, "output_sizes", None)
         if output_sizes is not None:
             dim_offsets = np.cumsum([0] + output_sizes)
         else:
             dim_offsets = [0, qweight.shape[0]]
 
-        ## Handle FP8 weights. For now only BlockQuantized
+        ## FP8 weights (BlockQuantized only for now)
         if qweight.dtype == torch.float8_e4m3fn:
             if hasattr(proj, 'weight_scale'):
                 weight_scale = proj.weight_scale
@@ -993,34 +947,29 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             scale_suffix = '.weight_scale'
             if weight_scale.ndim == 2:
                 if weight_scale.shape[1] > 1:
-                    # Block quantized has 2D weight scale
-                    # for qwen 3 for eg, 4096 query and 1024 each for k and v. Weight block size say is [128, 128]
-                    # so the shape of qkv is [6144, 4096] and scale.T is [48, 32]. Now 48 should be split into [0, 32, 40, 48]
-                    # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
+                    # Block quantized: 2D weight scale. vLLM stores it transposed
+                    # vs what HF expects (e.g. qwen3 qkv [6144,4096], scale.T [48,32]).
                     scale_suffix = '.weight_scale_inv'
                     block_size = proj.weight_block_size[0]
                     is_compressed_linear = "CompressedTensors" in str(type(getattr(proj, 'quant_method', None)))
                     if is_compressed_linear:
-                        # Compressed linear doesn't seem to transpose the weight scale inv
-                        # Also preferes the name weight_scale (without _inv suffix)
-                        # We detect it based on the quant_method we see in proj's attributes
+                        # Compressed linear keeps weight_scale (no _inv) untransposed.
                         scale_suffix = '.weight_scale'
                     elif needs_transpose_check:
                         should_use_deepgemm = is_deep_gemm_supported and getattr(proj, "orig_dtype", torch.bfloat16) == torch.bfloat16 and qweight.shape[0] % 128 == 0 and qweight.shape[1] % 128 == 0
                         if sm_cap==90 and cutlass_block_fp8_supported and not should_use_deepgemm:
-                            # For H100 (at least), the scale seems to be a transpose of what HF expects, while on L4 it is right shape.
-                            # This is done by vLLM based on a few checks that we replicated above.
+                            # On H100 the scale is transposed vs HF (L4 isn't); mirror vLLM's checks.
                             # https://github.com/vllm-project/vllm/blob/294c805f1df9ddf62c2290989710da9d48ab4973/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1172-L1179
                             weight_scale = weight_scale.T
                             logger.info(f"Unsloth: Transposed weight scale for {prefix} for weight shape {qweight.shape} and scale shape {weight_scale.shape}")
                     pass
                     a, b = qweight.shape
                     p, q = weight_scale.shape
-                    # This is just a sanity check to ensure that we don't end up with wrongly sliced weight of shape [0, x] :)
+                    # Sanity check against wrongly sliced [0, x] weights
                     assert a // p == proj.weight_block_size[0] and b // q == proj.weight_block_size[1], f"Unsloth: vLLM weight for {prefix} has unexpected weight shape {qweight.shape} and scale {weight_scale.shape} and block size {proj.weight_block_size}"
                 else:
-                    # This is dynamic quantization (aka per row or per column). The scale is of shape [n,1]
-                    # The weight here is of shape [4096, 6144]. We need to transpose and then slice
+                    # Dynamic (per row/column) quant: scale [n,1], weight [4096,6144];
+                    # transpose then slice.
                     qweight = qweight.T
                     block_size = 1
 
@@ -1060,8 +1009,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             else:
                 weight = qweight
 
-        # Apply vocab_size truncation for embedding and lm_head layers
-        # for mllama, prefer using org_vocab_size which is text_config.vocab_size + 8
+        # Truncate embedding / lm_head to vocab_size; mllama prefers
+        # org_vocab_size (= text_config.vocab_size + 8).
         # https://github.com/huggingface/transformers/blob/1cea763ba422b83778a8db0374ea90f43b09992b/src/transformers/models/mllama/modeling_mllama.py#L1147
         shrink_size = getattr(proj,"org_vocab_size", vocab_size)
         if shrink_size and ("embed_tokens" in prefix or "lm_head" in prefix):
@@ -1104,7 +1053,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         vllm_text_model = vllm_internals.model
         vllm_text_model_prefix = "model"
     elif hasattr(vllm_internals, "language_model"):
-        # For Llama 3.2, Gemma 3 and Qwen 2.5 VL, they have text model in model.language_model.model
+        # Llama 3.2 / Gemma 3 / Qwen 2.5 VL keep the text model in model.language_model.model
         if not is_vision_model and not hasattr(config, "text_config"):
             vllm_text_model_prefix = "model"
         else:
@@ -1114,10 +1063,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         raise RuntimeError(f'Unsloth: Cannot find vllm_internal_model!')
 
     embed_tokens = vllm_text_model.embed_tokens
-    # Use get_state_dict for consistent extraction and automatic truncation
     get_state_dict(f"{vllm_text_model_prefix}.embed_tokens", 0, state_dict, embed_tokens, slice_weights=False)
 
-    # Get layer configuration for this model type
     layer_config = get_model_layer_config()
 
     packed_modules_mapping = getattr(vllm_internals, "packed_modules_mapping", None)
@@ -1139,9 +1086,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
             use_fused_qkv = _is_fused_module("qkv_proj")
             if use_fused_qkv:
-                # For some model types like phi3 vllm will expect fused qkv (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
-                # so we should not split them here otherwise there will be a size mismatch when activating the adapter
-                # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
+                # phi3 family keeps qkv fused; splitting causes a size mismatch
+                # when activating the adapter.
+                # https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
                 get_state_dict(f"{prefix}.qkv_proj", 0, state_dict, qkv_proj, slice_weights=False)
             else:
                 get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
@@ -1208,9 +1155,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         proj = layer.mlp.gate_up_proj
         use_fused_gate_up = _is_fused_module("gate_up_proj")
         if use_fused_gate_up:
-            # For some model types like phi3 vllm will expect fused gate_up_proj (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
-            # so we should not split them here otherwise there will be a size mismatch when activating the adapter
-            # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
+            # phi3 family keeps gate_up_proj fused; splitting breaks the adapter.
+            # https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
             get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_up_proj", 0, state_dict, proj, slice_weights=False)
         else:
             get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
@@ -1225,11 +1171,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     pass
 
     if is_vision_model:
-        # Handle vision-specific layers using dedicated functions
         extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
-    # Norm
-    # For Gemma3 and similar multimodal models, norm should be under model.norm
-    # For standard models, also under model.norm
+    # Norm (under model.norm for both standard and multimodal models)
     norm_prefix = f"{vllm_text_model_prefix}.norm.weight"
     state_dict[norm_prefix] = vllm_text_model.norm.weight.data
     quant_state_dict[norm_prefix] = state_dict[norm_prefix]
@@ -1248,7 +1191,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 state_dict[key] = param.data
                 quant_state_dict[key] = param.data
 
-    # LM Head - Use get_state_dict for consistency
+    # LM Head
     if not getattr(text_config, "tie_word_embeddings", False):
         lm_layer = next((mod for name, mod in vllm_internals.named_modules() if name == "lm_head" or name.endswith(".lm_head")), None)
         if lm_layer is None:
@@ -1300,7 +1243,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
                 continue
             loose_tol = old_val.dtype != new_val.dtype or (new_val.element_size() < 2)
             if loose_tol:
-                # upcast both to float32 just for comparison. For FP8, vLLM stores weight scale in FP32 while HF preferes 16bit
+                # Compare in fp32: vLLM stores FP8 weight scale in fp32, HF in 16bit
                 old_val = old_val.to(torch.float32)
                 new_val = new_val.to(torch.float32)
                 torch.testing.assert_close(old_val, new_val, check_stride = False, atol = 1e-4, rtol = 1e-3)
@@ -1337,7 +1280,7 @@ pass
 @torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Unmerges vLLM modules to create HF compatible model
+    # Unmerges vLLM modules into an HF-compatible model
     def _unwrap_tensor(value):
         return getattr(value, "data", value)
 
@@ -1424,12 +1367,12 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             layer_name = layer_name.format(kk = kk)
 
             if 'language_model.model' in layer_name:
-                # vLLM uses vllm_internals.language_model.model.layers while HF uses model.language_model.layers
+                # vLLM uses language_model.model.layers; HF uses language_model.layers
                 layer_name = layer_name.replace('language_model.model', 'language_model')
 
             is_weight = True
             if layer_name in quant_state_dict:
-                # for attirbutes of type nn.Parameter, there's no .weight
+                # nn.Parameter attributes have no .weight
                 weight = quant_state_dict[layer_name]
                 is_weight = False
             else:
@@ -1459,7 +1402,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             if fp8_weight_scale is not None: assert fp8_weight_scale.ndim in [1,2], f"we only support row quantized (ndim=1) and block quantized(ndim=2) fp8 but found {fp8_weight_scale.ndim}"
 
             if layer_name in quant_state_dict:
-                # for attributes of type nn.Parameter, there's no .weight
+                # nn.Parameter attributes have no .weight
                 layer_name_br = re.sub(r"\.([\d]+)(?=\.|$)", lambda x: f"[{x.group(1)}]", layer_name)
                 raw_value = _unwrap_tensor(weight)
                 parent_path, _, attr_name = layer_name_br.rpartition(".")
@@ -1472,7 +1415,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 continue
             elif fp8_weight_scale is not None:
                 if fp8_weight_scale.ndim == 1:
-                    # This is FP8 quantized but not block quant. Either dynamic or static
+                    # FP8 dynamic/static (not block) quant
                     layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
@@ -1483,8 +1426,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.weight.input_scale_ub = kwargs['input_scale_ub']
                     layer.quant_method = "fbgemm_fp8"
                 elif fp8_weight_scale.ndim == 2:
-                    # This denotes that the model if FP8 dynamic quantized.
-                    # transformers 5.0+ renamed bias -> has_bias and removed device
+                    # FP8 dynamic quantized. transformers 5.0+ renamed
+                    # bias -> has_bias and removed device.
                     if Version("transformers") < Version("5.0.0"):
                         fp8_kwargs = dict(in_features=0, out_features=0, bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'], device=get_target_device())
                     else:
@@ -1530,7 +1473,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer = Linear(0, 0, device = get_target_device(), bias = has_bias)
                 layer.in_features  = weight.shape[1]
                 layer.out_features = weight.shape[0]
-                # from vllm 0.11.1, the .weight is of dtype ModelWeightParameter, so try to extract the 'data' part
+                # vLLM 0.11.1+ wraps .weight as ModelWeightParameter; unwrap to data.
                 # https://github.com/vllm-project/vllm/commit/de94289a98d7ec52a5ef02719e01a1db8b505170#diff-7d6145ac4ba084231a441c2056c7fca23c3bae33e6542f4f602a6c9d4d2da64dL199-R208
                 layer.weight = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
                 layer.bias = bias
@@ -1546,7 +1489,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 continue
             pass
 
-            # Convert model.layers.0.self_attn.q_proj to model.layers[0].self_attn.q_proj
+            # model.layers.0.* -> model.layers[0].*
             layer_name = re.sub(r"\.([\d]{1,})", lambda x: f"[{x.group(1)}]", layer_name)
             exec(f"new_model.{layer_name} = layer")
         pass
@@ -1731,13 +1674,9 @@ pass
 
 
 def vllm_supports_flashinfer(config) -> bool:
-    """
-    Approximately checks if a vLLM model supports FLASHINFER by checking
-    vLLM's ModelRegistry, then inspecting if an `if self.attn_backend not in { ... }`
-    guard excludes FLASHINFER.
-
-    For eg Qwen3-VL does not work with flashinfer.
-    """
+    """Approximate check for vLLM FLASHINFER support: looks up the model in
+    ModelRegistry, then inspects for an `attn_backend not in {...}` guard that
+    excludes FLASHINFER (e.g. Qwen3-VL does not work with flashinfer)."""
     try:
         from vllm.model_executor.models.registry import ModelRegistry
     except Exception as e:
@@ -1791,16 +1730,14 @@ def vllm_supports_flashinfer(config) -> bool:
         if not matches:
             return False
 
-        # For each guard, see if FLASHINFER appears in the allowed set.
+        # If any guard's allowed set includes FLASHINFER, don't disallow.
         for m in matches:
             body = m.group("body")
             if "FLASHINFER" in body:
-                # Some allowed-set includes FLASHINFER → don't disallow.
                 return False
 
-        # We found at least one guard, but none of its allowed sets mention FLASHINFER.
-        # That's exactly the Qwen3-VL pattern:
-        # { FLASH_ATTN, TORCH_SDPA, ROCM_AITER_FA }
+        # Guards exist but none allow FLASHINFER -- the Qwen3-VL pattern
+        # { FLASH_ATTN, TORCH_SDPA, ROCM_AITER_FA }.
         return True
 
     return not _module_disallows_flashinfer(module)
@@ -1808,10 +1745,7 @@ pass
 
 
 def _get_torchao_fp8_config(fp8_mode: str):
-    """
-    Return a `torchao.quantization.Float8DynamicActivationFloat8WeightConfig`
-    to be used for `load_in_fp8=True`.
-    """
+    """Float8DynamicActivationFloat8WeightConfig for load_in_fp8=True."""
     from torchao.quantization import (
         Float8DynamicActivationFloat8WeightConfig,
         PerBlock,
@@ -1900,7 +1834,7 @@ def load_vllm(
         elif ten_percent >= 1.4: standby_target_gpu_util = 0.8
         elif ten_percent >= 1.0: standby_target_gpu_util = 0.775
         else: standby_target_gpu_util = 0.75
-        # Reduce memory usage for newer vLLM versions since it OOMs
+        # vLLM >= 0.11.0 uses more VRAM and OOMs; reduce further.
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Decreasing VRAM further since vLLM version >= 0.11.0 uses more")
         standby_target_gpu_util *= 0.95
@@ -1934,7 +1868,7 @@ def load_vllm(
     else:
         mem_config = config
 
-    # Determine the maximum LoRA rank since vLLM restricts the rank to some values
+    # vLLM only allows certain LoRA ranks; round up to a supported one.
     new_max_lora_rank = determine_max_lora_rank(max_lora_rank)
     if new_max_lora_rank != max_lora_rank:
         print(f"Unsloth: Changing the maximum lora rank to {new_max_lora_rank} from {max_lora_rank} for vLLM.")
@@ -1955,9 +1889,8 @@ def load_vllm(
     if is_fp8 and DEVICE_TYPE == "cuda":
         major_version, minor_version = torch.cuda.get_device_capability()
         if major_version == 10:
-            # It is noticed that Deepgemm is generally slower than triton for vLLM
+            # DeepGEMM is generally slower than triton for vLLM here.
             # https://x.com/TheZachMueller/status/2024619480580510117?s=20
-            # This might get implemented in vLLM later but till then we have this toggle
             os.environ['VLLM_USE_DEEP_GEMM'] = '0'
 
     assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
@@ -1994,8 +1927,7 @@ def load_vllm(
         assert max_seq_length >= 8192, "Unsloth: MLLama requires max_seq_length >= 8192 for fast inference"
 
     else:
-        # Check max_num_batched_tokens for max_seq_length
-        # Must be >= max_num_batched_tokens
+        # max_num_batched_tokens must be >= max_seq_length
         if max_num_batched_tokens <= 0:
             max_seq_length = 256
             max_num_batched_tokens = 256
@@ -2033,13 +1965,12 @@ def load_vllm(
     # Fix up vLLM compute_dtype for bitsandbytes
     BitsAndBytesConfig = patch_vllm_compute_dtype(dtype)
 
-    # Use Flashinfer if possible (doesn't seem to be faster for BnB)
-    # Also seems to process 2x less sequences in 1 go so less throughput?
-    # Maybe FP8 Flashinfer is much better
+    # Use Flashinfer if possible (not faster for BnB, and seems lower throughput;
+    # FP8 Flashinfer may be better).
     # See https://docs.vllm.ai/en/latest/serving/env_vars.html
     if importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
-        # Pre-flight check: FlashInfer JIT-compiles CUDA kernels, requiring nvcc and ninja.
-        # If either is missing, skip FlashInfer so vLLM falls back to FLASH_ATTN + native sampler.
+        # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
+        # is missing, skip it so vLLM falls back to FLASH_ATTN + native sampler.
         _has_nvcc = (
             shutil.which("nvcc") is not None
             or os.path.isfile(os.path.join(os.environ.get("CUDA_HOME", ""), "bin", "nvcc"))
@@ -2067,7 +1998,7 @@ def load_vllm(
             if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
                 del os.environ["VLLM_ATTENTION_BACKEND"]
         else:
-            # Check if FLASHINFER is supported - for eg Qwen3-VL and Qwen2-VL do not work
+            # FLASHINFER unsupported by some models (e.g. Qwen3-VL, Qwen2-VL)
             if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
                 del os.environ["VLLM_ATTENTION_BACKEND"]
             elif not vllm_supports_flashinfer(config):
@@ -2120,11 +2051,8 @@ def load_vllm(
 
     from vllm import LLM, LLMEngine, AsyncLLMEngine, EngineArgs, AsyncEngineArgs
 
-    # Default vLLM max_num_seqs is 256
-    # This is how many sequences can be processed in parallel
-    # We do 64 on smaller GPUs
-    # batch_size = 16, num_generations = 4 for eg.
-    # We expand max_batched_tokens to 4096 on small GPUs and 8192 on large ones.
+    # max_num_seqs = sequences processed in parallel (vLLM default 256; we use
+    # 64 on smaller GPUs). max_batched_tokens scales 4096 -> 8192 small -> large.
     """
     Benchmarks for max_batched_tokens, max_num_seqs
     Around after max_num_seqs>=64, we see linear increase in memory usage.
@@ -2158,17 +2086,15 @@ def load_vllm(
     elif memory_left_for_kv_cache_gb >  80: max_num_batched_tokens, approx_max_num_seqs = 8192, 256 # + 16
 
     if is_vision_model:
-        # In vLLM profiling, each sequence contributes to an image. Which is generally in the order of thousand tokens.
-        # We don't want to go beyond 16 sequences for vision models.
-        # TODO: In vLLM V1, iirc, the profiling sets a cap on the max seqs based on the budget. Check it out.
+        # Each sequence carries an image (~thousands of tokens) in vLLM
+        # profiling; cap seqs low for vision models.
+        # TODO: vLLM V1 profiling may cap max seqs by budget; check.
         print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
-        # [TODO] Check this
         approx_max_num_seqs = 1
-        # Single image would contribute to 6404 tokens in Llama 3.2 for eg. So have some more for text
-        # For qwen 2.5 VL, this single image/video contributes to 16Ki tokens
+        # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
         max_num_batched_tokens = max(8192, max_seq_length)
 
-    # float8 KV cache can fit more sequences in 1 go so more throughput
+    # float8 KV cache fits more sequences -> more throughput
     if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
 
     # vLLM default max_num_batched_tokens is 2048
@@ -2183,7 +2109,7 @@ def load_vllm(
         elif memory_left_for_kv_cache_gb <= 80: chunked_prefill_tokens = 8192 # + 4096
         else: chunked_prefill_tokens = 8192 # + 0
 
-        # vLLM errors out from max_seq_length (2048) being bigger than chunked_prefill_tokens (1024)
+        # vLLM errors if max_seq_length exceeds chunked_prefill_tokens
         chunked_prefill_tokens = max_seq_length
 
     # Scale num_seqs by conservativeness
@@ -2326,8 +2252,7 @@ def load_vllm(
         enable_sleep_mode      = unsloth_vllm_standby,
     )
     if is_vision_model:
-        # To reduce memory usage, we limit the number of images/videos per prompt
-        # TODO: Make it configurable by user
+        # Limit images/videos per prompt to save memory. TODO: make configurable.
         engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
     if _is_gemma4_config(config) and use_bitsandbytes:
         gemma4_bnb_quantization_config = _get_gemma4_bnb_skip_module_aliases(
@@ -2367,9 +2292,8 @@ def load_vllm(
                 logger.info(f"Unsloth: Setting vLLM block_size=32 for head_dim={_head_dim} to avoid FlashInfer bug on Blackwell.")
     pass
 
-    # On-the-fly quantization is added in https://github.com/vllm-project/vllm/pull/23014
-    # This is only available in vllm >= 0.12.0. Older versions will do offline quantization
-    # by creating an FP8 checkpoint and loading it back in
+    # On-the-fly quantization (vLLM >= 0.12.0); older versions quantize offline.
+    # https://github.com/vllm-project/vllm/pull/23014
     if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
         from torchao.core.config import config_to_dict
         torchao_config = _get_torchao_fp8_config(fp8_mode)
@@ -2482,7 +2406,7 @@ pass
 
 def create_batches(requests, num_sequences = 64):
     # All Unsloth Zoo code licensed under LGPLv3
-    # llm.generate must be batched!
+    # llm.generate must be batched
     n_splits = int(math.ceil(len(requests) / num_sequences))
     offsets = np.arange(0, len(requests), num_sequences)
     if offsets[-1] != len(requests):
@@ -2738,7 +2662,7 @@ pass
 
 def generate_batches(llm, inputs, n_batches = None, lora_request = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Cannot just use llm.generate or will OOM - split into batches
+    # Split into batches; a single llm.generate would OOM
     if n_batches is None:
         if "UNSLOTH_VLLM_BATCHES" in os.environ:
             n_batches = int(os.environ["UNSLOTH_VLLM_BATCHES"])
@@ -2916,14 +2840,12 @@ def _test_same_model(model, new_model, input_ids):
     B = new_model.model.norm(B)
     torch.testing.assert_close(A, B)
 
-    # LM Head testing with proper error handling
+    # LM Head testing
     try:
-        # Check if both models have lm_head
         if hasattr(model, 'lm_head') and hasattr(new_model, 'lm_head'):
             if model.lm_head.weight is not None and new_model.lm_head.weight is not None:
                 torch.testing.assert_close(model.lm_head.weight, new_model.lm_head.weight)
 
-        # Continue with lm_head forward pass if possible
         if hasattr(model, 'lm_head') and hasattr(new_model, 'lm_head'):
             A = model.lm_head(A)
             B = new_model.lm_head(B)
@@ -2968,17 +2890,13 @@ pass
 
 @torch.inference_mode()
 def test_model_conversion(original_model, new_model):
-    """
-    Simplified model testing using clean comparison utilities.
-    Replaces the complex _test_same_model function.
-    """
+    """Simplified model conversion test (replaces _test_same_model)."""
     print("=== MODEL CONVERSION TEST ===")
 
-    # Compare model attributes. Wouldn't throw error if some attributes are missing
+    # Compare attributes; missing ones don't raise.
     compare_attributes(original_model, new_model)
 
     try:
-        # compare state dicts
         assert_same_state_dict(original_model.state_dict(), new_model.state_dict())
         print("✅ State dict comparison passed!")
     except Exception as e:
@@ -3040,7 +2958,6 @@ def _test_is_same_vlm(model, new_model, processor, test_backward=False):
     print('Losses match !')
 
     if test_backward:
-        # Initialize per-model statistics dictionaries
         original_model_stats = {
             'pre': defaultdict(list),
             'post': defaultdict(list),
@@ -3053,24 +2970,19 @@ def _test_is_same_vlm(model, new_model, processor, test_backward=False):
             'backward': defaultdict(list)
         }
 
-        # Register hooks for both models
         register_hooks(model, original_model_stats)
         register_hooks(new_model, new_model_stats)
 
-        # Prepare inputs
         from copy import deepcopy
         inputs['labels'] = deepcopy(inputs['input_ids'])
         inputs['input_ids'].requires_grad = True
 
-        # Forward passes
         original_outputs = model(**inputs)
         new_outputs = new_model(**inputs)
 
-        # Check loss matches
         torch.testing.assert_close(original_outputs.loss, new_outputs.loss)
         print('Losses match!')
 
-        # Backward passes
         original_outputs.loss.backward()
         new_outputs.loss.backward()
 
@@ -3115,9 +3027,7 @@ pass
 
 
 def get_vllm_supported_vlm(_VAR_NAME = "VLLM_SUPPORTED_VLM"):
-    """
-    Parse VLLM_SUPPORTED_VLM from unsloth/models/vision.py as a literal.
-    """
+    """Parse VLLM_SUPPORTED_VLM from unsloth/models/vision.py as a literal."""
     src = _read_unsloth_vision_source()
     tree = ast.parse(src)
 
@@ -3220,7 +3130,7 @@ def _test_get_vllm_state_dict(
     extraction_config.model_name = model_name
     dense_state_dict, text_normalized_state_dict = _get_dense_causal_lm_state_dict(model)
 
-    # Patch vLLM to disable multiprocessing for state dict extraction
+    # Disable vLLM multiprocessing for state dict extraction
     patch_vllm()
 
     llm = load_vllm(
@@ -3287,7 +3197,7 @@ def _test_get_vllm_state_dict(
         )
 
         if not skip_generation:
-            # Cannot just use llm.generate or OOM - split into batches
+            # Split into batches to avoid OOM
             batches = create_batches(inputs, llm.approx_max_num_seqs)
             completion_ids = []
             for batch in batches:
@@ -3311,8 +3221,8 @@ def _test_get_vllm_state_dict(
         else:
             _test_whole_model_forward(model, new_model, input_ids)
     else:
-        # VLMs dont have a standardised forward pass mechanism. So we just test whole model forward pass and not layer wise
-        # TODO: Maybe add layer wise checks
+        # VLMs lack a standard forward path; test whole-model forward only.
+        # TODO: maybe add layer-wise checks.
         from transformers import AutoProcessor
         processor = AutoProcessor.from_pretrained(model_name)
         _test_is_same_vlm(model, new_model, processor, False)

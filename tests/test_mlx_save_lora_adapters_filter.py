@@ -16,16 +16,12 @@
 
 """Regression coverage for save_lora_adapters / save_trainable_adapters.
 
-- save_lora_adapters keeps only module-anchored lora_a / lora_b tensors,
-  even when base weights are listed as trainable, and raises if no
-  LoRA modules are present.
-- save_trainable_adapters preserves every trainable tensor for in-loop
-  checkpoints.
-- The module-anchored filter does not leak paths that merely contain
-  "lora_" (e.g. router.lora_gate.weight).
+- save_lora_adapters keeps only module-anchored lora_a/lora_b, even when base
+  weights are trainable, and raises if no LoRA modules are present.
+- save_trainable_adapters preserves every trainable tensor for in-loop checkpoints.
+- The filter does not leak paths that merely contain "lora_" (e.g. router.lora_gate.weight).
 
-Runs on Linux + Windows via the mlx_simulation shim, on macOS against
-real MLX.
+Runs on Linux/Windows via the mlx_simulation shim, on macOS against real MLX.
 """
 
 from __future__ import annotations

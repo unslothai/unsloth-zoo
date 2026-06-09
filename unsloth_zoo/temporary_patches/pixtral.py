@@ -84,10 +84,9 @@ def patch_PixtralAttention():
         attn_output = self.o_proj(attn_output)
         return attn_output, None
 
-    # Wrap so check_args_kwargs accepts removed params (e.g. output_attentions in v5).
-    # Preserve the original signature on the wrapper so inspect.signature
-    # (used by transformers._validate_model_kwargs among others) still sees
-    # the real named parameters.
+    # Wrap so check_args_kwargs accepts removed params (e.g. output_attentions in
+    # v5), but keep the original __signature__ so inspect.signature (used by
+    # transformers._validate_model_kwargs) still sees the real named parameters.
     target_cls = transformers.models.pixtral.modeling_pixtral.PixtralAttention
     _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward

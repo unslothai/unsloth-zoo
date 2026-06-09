@@ -66,24 +66,21 @@ pass
 class TiledMLP(torch.autograd.Function):
     @staticmethod
     def handle_output(output, extra_lists):
-        """Extract main output and append extras to their lists"""
+        """Extract main output, append extras to their lists."""
         if isinstance(output, tuple):
-            # Initialize lists on first tuple
             if not extra_lists:
                 for _ in output[1:]:
                     extra_lists.append([])
-            # Append extras
             for i, extra in enumerate(output[1:]):
                 extra_lists[i].append(extra)
-            return output[0]  # Return main output
-        return output  # Single tensor
+            return output[0]
+        return output
 
     @staticmethod
     def structure_output(main_output, extra_lists):
-        """Reconstruct original structure"""
+        """Reconstruct original structure: cat extras along seq dim."""
         if not extra_lists:
             return main_output
-        # Cat extras along seq dim and return tuple
         extras = [torch.cat(extra_list, dim=-2) for extra_list in extra_lists]
         return (main_output, *extras)
 
@@ -119,10 +116,8 @@ class TiledMLP(torch.autograd.Function):
             preserve_rng_state = True
         ctx.preserve_rng_state = bool(preserve_rng_state)
 
-        # Save tensors needed in backward
         ctx.save_for_backward(x)
 
-        # RNG state capture if requested
         if ctx.preserve_rng_state:
             ctx.fwd_cpu_state = torch.get_rng_state()
             ctx.had_device_in_fwd = False

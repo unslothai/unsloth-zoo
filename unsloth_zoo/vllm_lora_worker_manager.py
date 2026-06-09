@@ -148,8 +148,6 @@ class WorkerLoRAManager(AbstractWorkerManager):
             else:
                 lora_request.lora_config["vllm_max_position_embeddings"] = self.max_position_embeddings
                 peft_helper = PEFTHelper.from_dict(lora_request.config)
-            # Validates the LoRA configuration against requirements before
-            # loading weights, throwing an exception if validation fails.
             peft_helper.validate_legal(self.lora_config)
 
             # For some models like Qwen2VL, we need to use hf_to_vllm_mapper
@@ -159,7 +157,6 @@ class WorkerLoRAManager(AbstractWorkerManager):
                     and model.hf_to_vllm_mapper is not None):
                 hf_to_vllm_mapper = model.hf_to_vllm_mapper
 
-            # Prepare common arguments
             lora_extra_vocab_size = getattr(self.lora_config, "lora_extra_vocab_size", 0)
             kwargs = {
                 "lora_model_id": lora_request.lora_int_id,

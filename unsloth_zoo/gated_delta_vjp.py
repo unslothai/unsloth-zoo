@@ -17,9 +17,9 @@
 """
 Memory-efficient custom VJP for GatedDeltaNet (Qwen3.5).
 
-Replaces the T-step Python loop in gated_delta_ops with a single
-mx.custom_function that recomputes states during backward instead
-of storing all T intermediate states in the autograd graph.
+Replaces the T-step Python loop in gated_delta_ops with an mx.custom_function
+that recomputes states during backward instead of keeping all T intermediate
+states in the autograd graph.
 
 Usage:
     from gated_delta_vjp import patch_gated_delta
@@ -65,9 +65,8 @@ def gated_delta_ops_efficient(
 ) -> Tuple[mx.array, mx.array]:
     """Memory-efficient GDN forward+backward via custom VJP.
 
-    Instead of a Python for-loop that creates T graph nodes (each holding
-    state references), this wraps the entire recurrence in mx.custom_function.
-    The backward recomputes states on-the-fly during BPTT.
+    Wraps the recurrence in mx.custom_function so backward recomputes states
+    on the fly during BPTT instead of keeping T graph nodes alive.
     """
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
@@ -78,9 +77,8 @@ def gated_delta_ops_efficient(
         q = mx.repeat(q, repeat_factor, -2)
         k = mx.repeat(k, repeat_factor, -2)
 
-    # Chunk the sequence into segments for checkpointed BPTT.
-    # Each chunk's forward is recomputed during backward.
-    # Memory: O(num_chunks * state_size) instead of O(T * state_size)
+    # Chunk for checkpointed BPTT: each chunk's forward is recomputed during
+    # backward. Memory: O(num_chunks * state_size) instead of O(T * state_size).
     CHUNK_SIZE = max(1, min(64, T))
     num_chunks = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
 
@@ -107,11 +105,10 @@ def gated_delta_ops_efficient(
         chunk_T = q_c.shape[1]
         _has_mask = mask_chunk is not None and mask_chunk.shape[-1] >= chunk_T
 
-        # Recompute the chunk's RETURNED states (post-mask). At step t the
-        # returned state is `where(mask, state_new, state_prev)` — so for
-        # masked steps `states[t+1] == states[t]`. We don't use these for
-        # the y-path backward (that needs state_new, recomputed below); we
-        # only need them as the entry point `state_prev` for each step.
+        # Recompute the chunk's RETURNED states (post-mask: where(mask,
+        # state_new, state_prev), so masked steps give states[t+1]==states[t]).
+        # Used only as each step's entry `state_prev`; the y-path backward needs
+        # state_new, recomputed below.
         states = [state_in]
         s = state_in
         for t in range(chunk_T):
@@ -122,10 +119,9 @@ def gated_delta_ops_efficient(
             )
             states.append(s)
 
-        # BPTT: backward through time. `d_state` holds the cotangent w.r.t.
-        # the RETURNED state at the current step's output (= input to step
-        # t+1). At chunk boundary it's d_state_out; subsequent iterations
-        # propagate it through the recurrence + mask.
+        # BPTT: `d_state` is the cotangent w.r.t. the RETURNED state at the
+        # current step (= input to step t+1). Starts at d_state_out, then
+        # propagates through the recurrence + mask.
         d_q = mx.zeros_like(q_c)
         d_k = mx.zeros_like(k_c)
         d_v = mx.zeros_like(v_c)
@@ -145,9 +141,8 @@ def gated_delta_ops_efficient(
             # Cotangent flowing into step t's output (state_returned).
             d_state_returned = d_state
 
-            # Recompute state_new (pre-mask). y always depends on state_new
-            # regardless of mask; using states[t+1] would be wrong when
-            # mask=False because states[t+1] equals state_prev there.
+            # Recompute state_new (pre-mask): y always depends on it, but
+            # states[t+1] equals state_prev when mask=False, so it can't be used.
             if g_t.ndim == 2:
                 decay = g_t[..., None, None]
             else:
@@ -157,10 +152,9 @@ def gated_delta_ops_efficient(
             delta = (v_t - kv_mem) * beta_t[..., None]
             state_new = state_decayed + k_t[..., None, :] * delta[..., None]
 
-            # Forward had: state_returned = where(mask, state_new, state_prev).
-            # Backward splits d_state_returned into:
-            #   d_state_new path (recurrence backward): only when mask=True
-            #   d_state_prev passthrough:               only when mask=False
+            # Forward: state_returned = where(mask, state_new, state_prev).
+            # Split d_state_returned: to d_state_new when mask=True, passthrough
+            # to d_state_prev when mask=False.
             if _has_mask:
                 m = mask_chunk[:, t]
                 m_exp = mx.expand_dims(m, axis=(1, 2, 3))
@@ -256,13 +250,10 @@ def patch_gated_delta():
         q, k, v, a, b, A_log, dt_bias,
         state=None, mask=None, use_kernel=True,
     ):
-        # Heuristic: training calls enter with state=None (start of sequence,
-        # no cache); inference with KV cache passes the cached state in.
-        # Route training through gated_delta_ops_efficient so the
-        # memory-efficient custom VJP actually runs — gated_delta_kernel
-        # has no custom VJP, so going through it forces mlx to keep all T
-        # intermediate states alive in the autograd graph and defeats the
-        # whole point of this module.
+        # Heuristic: training calls enter with state=None (no cache); inference
+        # passes the cached state in. Route training through the efficient ops
+        # so the custom VJP runs — gated_delta_kernel has none, so it would keep
+        # all T intermediate states alive and defeat this module.
         is_training_call = state is None
         beta = mx.sigmoid(b)
         g = gated_delta.compute_g(A_log, a, dt_bias)
@@ -271,13 +262,11 @@ def patch_gated_delta():
             Hv, Dv = v.shape[-2:]
             state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-        # Training (or any call without an incoming state cache): always
-        # use the efficient ops path so backward is memory-efficient.
+        # No incoming state cache: use the memory-efficient ops path.
         if is_training_call:
             return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
 
-        # Inference with cached state: prefer the kernel for speed when
-        # available; fall back to efficient ops otherwise.
+        # Cached state: prefer the kernel for speed, else efficient ops.
         if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
             return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
         return gated_delta.gated_delta_kernel(q, k, v, g, beta, state, mask)

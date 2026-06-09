@@ -41,7 +41,7 @@ def patch_compiling_bitsandbytes():
         if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
             print("Unsloth: Bitsandbytes >= 0.46.0 supports torch.compile - enabling.")
     else:
-        # Disable dynamo on Linear4bit, Linear8bit and other future modules
+        # Disable dynamo on Linear4bit, Linear8bit etc
         if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
             print("Unsloth: Bitsandbytes < 0.46.0 does not support torch.compile - disabling.")
         for x in ["bitsandbytes.nn.modules", "peft.tuners.lora.bnb",]:
@@ -123,8 +123,8 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     pass
 
     os.environ["UNSLOTH_PATCHED"] = "1"
-    # See https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html
-    # Caches kernel generations for faster restarts
+    # Cache kernel generations for faster restarts. See
+    # https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html
     # https://dev-discuss.pytorch.org/t/impact-of-multithreading-and-local-caching-on-torch-compile/2498/3
     os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
     os.environ["TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE"] = "1"
@@ -218,8 +218,7 @@ def get_model(model):
         elif hasattr(x, "model"):
             x = x.model
         elif hasattr(x, "base_model") and x.base_model !=x:
-            # for VLMs x.base_model = x causing this to be stuck in endless loop
-            # the check x.base_model != x is to prevent this
+            # x.base_model != x guards against VLMs where base_model is self (infinite loop)
             x = x.base_model
         elif hasattr(x, "language_model"):
             x = x.language_model
@@ -303,8 +302,7 @@ def patch_model_and_tokenizer(
         elif config_dtype ==  "float16": set_dtype_in_config(m.config, torch.float16)
     pass
 
-    # Also patch all dtypes - BnB seems to not allocate the correct type?
-    # BnB default dtype seems to be float16!
+    # Patch all dtypes: BnB defaults to float16 and may not allocate correctly
     try:
         from bitsandbytes.nn  import Linear4bit as Bnb_Linear4bit
     except:
@@ -315,7 +313,7 @@ def patch_model_and_tokenizer(
         raise ImportError("Unsloth: Please install peft via `pip install peft`")
     pass
 
-    # Get most likely the correct data-type of the model
+    # Determine the model's correct data type
     if correct_dtype is None:
         try:
             correct_dtype = _get_dtype(dtype_from_config(model.config))
@@ -389,18 +387,16 @@ def patch_model_and_tokenizer(
         except: pass
     pass
 
-    # since we are now setting actual dtypes in config
-    # and there is a transition from torch.dtype to dtype
-    # support for auto dtype conversion is not stable
-    # patch to dict makes sure that any torch.dtype is converted to
-    # string when trying to save the config or serialize it
+    # We now set actual dtypes in config; the torch.dtype -> dtype transition's
+    # auto conversion is unstable, so patch_to_dict() stringifies any torch.dtype
+    # when saving / serializing the config.
     patch_to_dict()
 
     # Check all params and patch!
     for name, module in model.named_modules():
         if isinstance(module, (Bnb_Linear4bit, Peft_Linear4bit)):
             weight = module.weight
-            # Check if quant_state exists for vision models like unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit, unsloth/granite-vision-3.2-2b
+            # Some vision models (e.g. Llama-3.2-11B-Vision, granite-vision) lack quant_state
             if not hasattr(weight, 'quant_state'):
                 print(f"Skipping {name}: no quant_state found")
                 continue
@@ -413,8 +409,8 @@ def patch_model_and_tokenizer(
                 setted_dtype = correct_dtype
 
             if type(quant_state) is list:
-                # BnB seems to have float16 as default!
-                module.weight.quant_state[2] = setted_dtype # Cast to correct dtype
+                # BnB defaults to float16; cast to correct dtype
+                module.weight.quant_state[2] = setted_dtype
             else:
                 # https://github.com/TimDettmers/bitsandbytes/pull/763/files
                 quant_state.dtype = setted_dtype
@@ -591,28 +587,21 @@ def check_conversion_mappings(model, current_key_name_str, skip_modules):
     if model_root_cls is None:
         return False
     if hasattr(model_root_cls, "_checkpoint_conversion_mapping") and len(model_root_cls._checkpoint_conversion_mapping) > 0:
-        # if this is true, then it means that we must be on transformers >=4.52.0 because conversion_mappings was added in 4.52.0
-        # we cant know if the skip module naming convention is new or old
-        # but if we are supposed to skip this current_key_name_str, and it didn't pass
-        # (current_key_name_str in quantization_config.llm_int8_skip_modules)
-        # then new transformers + new module hierarchy means it should not be skipped, ie no BC check needed
-        # and new transformers + old module hierarchy means we still need to check to skip
-        # old transformers + old module hierarchy means no BC needed
-        # old transformers + new module hierarchy is problematic since we don't have the conversion_mappings to reverse
-        # follow the logic from save_pretrained in transformers.modeling_utils
+        # Non-empty conversion_mappings => transformers >=4.52.0. We can't tell
+        # if the skip-module naming is new or old, so reverse-map the key (per
+        # save_pretrained in transformers.modeling_utils) and re-check, which
+        # covers the old-module-hierarchy case that still needs the BC skip.
         reverse_conversion_mappings = {v: k for k, v in model_root_cls._checkpoint_conversion_mapping.items()}
         new_current_key_names_str = current_key_name_str
         for pattern, replacement in reverse_conversion_mappings.items():
             try:
-                replacement = replacement.lstrip("^")  # strip off un-needed chars and patterns
+                replacement = replacement.lstrip("^")  # strip unneeded chars/patterns
                 replacement = re.sub(r"\(.*?\)", "", replacement)
                 key, n_replace = re.subn(pattern, replacement, current_key_name_str)
-                # Early exit of the loop
                 if n_replace > 0:
                     new_current_key_names_str = key
                     break
             except Exception as e:
-                # skip this pattern but log
                 do_logging = os.environ.get('UNSLOTH_ENABLE_LOGGING', '0') == '1'
                 if do_logging:
                     print(f"Unsloth: Replace bnb issue: {str(e)}")
@@ -622,18 +611,18 @@ def check_conversion_mappings(model, current_key_name_str, skip_modules):
 
 
 def _mark_parent(child, parent_type):
-    """Attach the parent’s class so the child can inspect it later."""
+    """Attach the parent's class so the child can inspect it later."""
     child._root_cls = parent_type
 
 
 def _unmark_parent(child):
-    """Remove the temporary attribute if it is present."""
+    """Remove the temporary _root_cls attribute if present."""
     if hasattr(child, "_root_cls"):
         delattr(child, "_root_cls")
 
 
 def parsed_statement(code: str) -> ast.stmt:
-    """Return the statement parsed from a one-liner."""
+    """Parse a one-liner into a single statement node."""
     return ast.parse(code).body[0]
 
 
@@ -646,19 +635,8 @@ class WrapRecursiveCall(ast.NodeTransformer):
     unmark_statement = parsed_statement('_unmark_parent(module)')
 
     def visit_Assign(self, node: ast.Assign):
-        """
-        Replace
-            _, has_been_replaced = _replace_with_bnb_linear(...)
-        with
-            try:
-                _mark_parent(module,
-                             model._root_cls
-                             if hasattr(model, "_root_cls")
-                             else type(model))
-                _, has_been_replaced = _replace_with_bnb_linear(...)
-            finally:
-                _unmark_parent(module)
-        """
+        """Wrap each `_replace_with_bnb_linear(...)` call in try/finally that
+        marks the parent class before the call and unmarks it after."""
         if (
             isinstance(node.value, ast.Call)
             and getattr(node.value.func, "id", None) == self.function_name
@@ -689,8 +667,8 @@ if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") a
     if "current_key_name_str" not in source:
         raise RuntimeError("Unsloth: Patch for dynamic quantization failed since current_key_name_str does not exist.")
 
-    # First patch recursive calls to mark the parent class
-    # we need it to access the parent class to check for conversion_mappings
+    # Patch recursive calls to mark the parent class, so we can access it
+    # when checking for conversion_mappings
     try:
         mark_parent_error = False
         new_source = source.replace(
@@ -721,7 +699,7 @@ if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") a
         mark_parent_error = True
 
     if mark_parent_error:
-        # we sitll have the original source without the mark_parent and unmark_parent patches
+        # Fall back to original source without the mark/unmark patches
         source = source.replace(
             "name in quantization_config.llm_int8_skip_modules\n",
             "((name in quantization_config.llm_int8_skip_modules) or (current_key_name_str in quantization_config.llm_int8_skip_modules))\n",
@@ -752,13 +730,11 @@ if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") a
     transformers.integrations.bitsandbytes._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
 pass
 
-# Patch for transformers 5.x: should_convert_module uses re.match (prefix-anchored)
-# and endswith, but does not do substring component matching. This means entries like
-# "vision_tower" in llm_int8_skip_modules fail to match module names like
-# "model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj".
-# On 4.x, Unsloth patches _replace_with_bnb_linear with check_conversion_mappings
-# (substring matching). On 5.x, _replace_with_bnb_linear doesn't exist, so we
-# patch should_convert_module instead.
+# Patch for transformers 5.x: should_convert_module uses re.match + endswith
+# but no substring component matching, so entries like "vision_tower" in
+# llm_int8_skip_modules miss names like "model.vision_tower.vision_model...".
+# 4.x patches _replace_with_bnb_linear (substring matching); on 5.x that no
+# longer exists, so patch should_convert_module instead.
 import transformers.quantizers.quantizers_utils as _quantizers_utils
 if not hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") and \
     hasattr(_quantizers_utils, "should_convert_module") and \
