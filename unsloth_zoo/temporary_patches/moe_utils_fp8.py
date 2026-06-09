@@ -147,7 +147,6 @@ def _dequantize_expert_slice(
     if s.numel() == 1:
         return w * s.view(1, 1).to(target_dtype)
 
-    # Reshape 1D to column vector for per-row handling
     if s.ndim == 1:
         s = s.view(-1, 1)
 
@@ -176,8 +175,7 @@ def _dequantize_expert_slice(
 
         if block_size is not None and len(block_size) == 2:
             bm, bn = block_size
-            # Check if scale is transposed
-            if _ceil_div(M, bm) != p or _ceil_div(N, bn) != q:
+            if _ceil_div(M, bm) != p or _ceil_div(N, bn) != q:  # scale transposed?
                 if _ceil_div(M, bm) == q and _ceil_div(N, bn) == p:
                     s = s.T.contiguous()
                     p, q = s.shape
@@ -195,7 +193,7 @@ def _dequantize_expert_slice(
 
 
 def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state, target_dtype: torch.dtype,) -> Optional[torch.Tensor]:
-    """Vectorized dequantization: handles all experts in one batched op."""
+    """Dequantize all experts in one batched op."""
     if weight.ndim != 3 or weight.dtype != torch.float8_e4m3fn:
         return None
     if quant_state is None or not isinstance(quant_state, torch.Tensor):
@@ -219,8 +217,7 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
         else:
             bm = _ceil_div(M, p)
             bn = _ceil_div(N, q)
-        # Expand block scales to full weight dims in one vectorized op
-        # (E, p, q) -> (E, p*bm, q*bn) -> trim to (E, M, N)
+        # Expand block scales (E, p, q) -> (E, p*bm, q*bn), trim to (E, M, N)
         s_expanded = (
             s.to(target_dtype)
             .repeat_interleave(bm, dim=1)[:, :M, :]
@@ -342,8 +339,7 @@ def _make_grouped_mm_rhs_column_major(weight: torch.Tensor) -> torch.Tensor:
 
 
 def _try_attach_block_size(tensor, block_size):
-    """Defensively attach block_size as an attribute, ignoring failures
-    (e.g. read-only Tensor subclasses)."""
+    """Attach block_size, ignoring failures (e.g. read-only Tensor subclasses)."""
     try:
         setattr(tensor, "block_size", block_size)
     except Exception:
@@ -353,8 +349,7 @@ def _try_attach_block_size(tensor, block_size):
 def _get_moe_weight_and_quant_info(experts_module, param_name: str):
     """Resolve the underlying expert weight tensor and (if present) its FP8
     block-quant scale tensor, walking through PEFT ParamWrapper if needed."""
-    # Use the FP8-aware unwrap so we get the raw FP8 tensor, NOT a
-    # bf16-merged ParamWrapper.get_param() value.
+    # FP8-aware unwrap returns the raw FP8 tensor, not a bf16-merged ParamWrapper value.
     weight = _unwrap_param_attr(experts_module, param_name)
     if weight is None:
         weight = getattr(experts_module, param_name, None)
@@ -594,11 +589,10 @@ def _unwrap_param_attr(module, name):
     obj = getattr(module, name, None)
     if obj is None:
         return None
-    # Already a tensor / Parameter.
     if isinstance(obj, torch.Tensor):
         return obj
-    # PEFT ParamWrapper exposes get_param() — call it BEFORE walking base_layer
-    # because base_layer points back to the experts module, not the tensor.
+    # Call get_param() BEFORE walking base_layer: base_layer points back to the
+    # experts module, not the tensor.
     while hasattr(obj, "get_param") and callable(obj.get_param):
         try:
             inner = obj.get_param()
@@ -609,8 +603,8 @@ def _unwrap_param_attr(module, name):
         if inner is obj:
             break
         obj = inner
-    # Last-ditch: if obj has a base_layer chain ending in something with the
-    # named attribute, recurse through it. (Handles nested ParamWrappers.)
+    # Walk a base_layer chain ending in something with the named attribute
+    # (handles nested ParamWrappers).
     seen = set()
     while hasattr(obj, "base_layer") and id(obj) not in seen:
         seen.add(id(obj))
@@ -747,7 +741,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
 
     backend = select_moe_backend()
 
-    # 1. Try _scaled_grouped_mm (fast FP8 path on Hopper/Blackwell)
+    # 1. _scaled_grouped_mm (fast FP8 path on Hopper/Blackwell)
     if backend == "grouped_mm" and _check_torch_scaled_grouped_mm_supported():
         scaled_grouped_mm_output = _forward_scaled_grouped_mm_fp8(
             self,
@@ -762,7 +756,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
             )
             return scaled_grouped_mm_output
 
-    # 2. Dequant FP8 weights to bf16/fp16 and run through normal MoE forward
+    # 2. Dequant FP8 weights to bf16/fp16, run through normal MoE forward
     target_dtype = _get_fp8_dequant_target_dtype(hidden_states)
     gate_up_base, gate_up_quant, gate_up_qkind = _get_moe_weight_and_quant_info(self, "gate_up_proj")
     down_base, down_quant, down_qkind = _get_moe_weight_and_quant_info(self, "down_proj")

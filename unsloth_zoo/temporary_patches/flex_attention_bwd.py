@@ -15,26 +15,18 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-Patch for flex_attention backward kernel shared memory OOM on constrained GPUs.
+Patch flex_attention backward shared-memory OOM on constrained GPUs.
 
 On GPUs with limited shared memory per SM (RTX 3090/4090/5090, RTX PRO 6000,
-etc. -- typically ~100KB), the flex_attention backward kernel configs can exceed
-shared memory limits for large head_dims (e.g., 256 in Gemma3). For example,
-the default config (BLOCK=64, num_stages=2) requires ~141KB, but the hardware
-only has ~101KB.
+~100KB), the backward configs can exceed the limit for large head_dims (e.g.
+256 in Gemma3): the default BLOCK=64, num_stages=2 needs ~141KB vs ~101KB.
 
-This patch intercepts the backward config selection and adds safe fallback
-configs estimated to fit within the GPU's actual shared memory limit. The
-shared memory estimation uses:
+We intercept backward config selection and add safe fallbacks estimated via
     shmem ~ num_stages * max_block * head_dim * dtype_size * 2 + OVERHEAD
-where OVERHEAD is ~10KB from Triton runtime. This formula was validated
-against real crashes (estimated 141,312 vs actual 140,800 bytes).
+(OVERHEAD ~10KB from Triton; validated 141,312 estimated vs 140,800 actual).
+Fallbacks are only added when a config is estimated to exceed the limit.
 
-If the default configs already fit in shared memory, they are returned
-unchanged. Safe fallbacks are only added when a config is estimated to exceed
-the limit.
-
-This is a no-op on torch versions that do not have FlexBwDConfig (< 2.10).
+No-op on torch < 2.10 (no FlexBwDConfig).
 """
 
 import torch
@@ -47,10 +39,10 @@ _SHMEM_OVERHEAD = 10240  # 10KB, slightly conservative
 
 
 def _estimate_shmem(block_size, num_stages, head_dim, dtype):
-    """Estimate shared memory for a flex_attention backward config.
+    """Estimate shared memory for a backward config.
 
-    The backward kernel pipelines two tensor loads (qT + dO or kT + vT)
-    with num_stages copies each in shared memory.
+    The kernel pipelines two tensor loads (qT+dO or kT+vT), num_stages copies
+    each in shared memory.
     """
     dtype_size = 2 if dtype in (torch.bfloat16, torch.float16) else 4
     return num_stages * block_size * head_dim * dtype_size * 2 + _SHMEM_OVERHEAD
@@ -103,18 +95,16 @@ def patch_flex_attention_bwd_configs():
 
         def make_patched(orig):
             def patched_get_flex_attn_bwd_configs(self, head_dim, dtype):
-                # Query shared memory limit from the current device so this
-                # works correctly in heterogeneous multi-GPU setups.
+                # Per-device limit so heterogeneous multi-GPU setups work.
                 device = torch.cuda.current_device()
                 shmem_limit = torch.cuda.get_device_properties(device).shared_memory_per_multiprocessor
 
-                # Get original configs first
                 try:
                     configs = list(orig(self, head_dim, dtype))
                 except Exception:
                     configs = []
 
-                # Check if any original config exceeds shared memory
+                # Patch only if some original config exceeds shared memory.
                 needs_patch = False
                 for c in configs:
                     max_block = max(c.block_m1, c.block_n1, c.block_m2, c.block_n2)

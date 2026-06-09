@@ -33,9 +33,8 @@ __all__ = [
 @torch.inference_mode
 def mean_of_trained_tokens(model, eps = 1e-16):
     """
-    Llama-3 for eg has untrained vectors in the base model.
-    These include <|eot_id|>, <|start_header_id|>, <|end_header_id|>
-    We reset them to the mean of the rest of the tokens
+    Llama-3 etc have untrained vectors (<|eot_id|>, <|start_header_id|>, ...)
+    in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     embedding_matrix = model.get_input_embeddings ().weight.clone()
@@ -77,8 +76,8 @@ def add_new_tokens(
     interpolation = 0.5,
 ):
     """
-    Smartly resizes the tokenizer and adds new tokens to the model.
-    We also disregard untrained tokens by removing them from the mean calculation.
+    Resize the tokenizer and add new tokens to the model, excluding untrained
+    tokens from the mean calculation.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     assert(isinstance(new_tokens, (list, tuple)))
@@ -203,9 +202,8 @@ pass
 @torch.inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
-    Llama-3 for eg has untrained vectors in the base model.
-    These include <|eot_id|>, <|start_header_id|>, <|end_header_id|>
-    We reset them to the mean of the rest of the tokens
+    Llama-3 etc have untrained vectors (<|eot_id|>, <|start_header_id|>, ...)
+    in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     embedding_matrix = model.get_input_embeddings ().weight
@@ -473,10 +471,9 @@ POSSIBLE_RESERVED_TOKENS = (
     "<unused",                   # PaliGemma
 )
 
-# Vision-specific tokens that should not be used as pad_token for text-only models.
-# Qwen3 text models share the same vocab as Qwen3-VL and include these tokens,
-# but using them as pad_token is semantically wrong and confusing.
-# See https://github.com/unslothai/unsloth/issues/4104
+# Vision tokens that must not be a pad_token for text-only models. Qwen3 text
+# models share Qwen3-VL's vocab and include these, but using them as pad_token
+# is wrong. See https://github.com/unslothai/unsloth/issues/4104
 VISION_RESERVED_TOKENS = frozenset((
     "<|vision_pad|>",
     "<|image_pad|>",
@@ -486,10 +483,9 @@ VISION_RESERVED_TOKENS = frozenset((
 @torch.inference_mode
 def patch_tokenizer(model, tokenizer):
     """
-        Phi3's pad_token isn't set. We set it to <|placeholder...
-        Llama-3 is <|reserved...
-        Llama-2 is <unk>
-        Check if pad_token is not the same as eos_token otherwise the loss will ignore it!!
+        Set a sensible pad_token when missing (Phi3 -> <|placeholder...,
+        Llama-3 -> <|reserved..., Llama-2 -> <unk>) and ensure it differs from
+        eos_token so the loss does not ignore it.
         Fixes https://github.com/unslothai/unsloth/issues/5
     """
     # All Unsloth Zoo code licensed under LGPLv3
@@ -503,8 +499,7 @@ def patch_tokenizer(model, tokenizer):
 
     original_tokenizer = tokenizer
 
-    # Patch processor's __call__ for vision models to auto-apply chat template
-    # when conversation format is passed instead of a string
+    # Auto-apply chat template when a conversation is passed instead of a string
     if hasattr(tokenizer, "image_processor") and hasattr(tokenizer, "apply_chat_template"):
         patch_processor_call(tokenizer)
 
@@ -515,10 +510,8 @@ def patch_tokenizer(model, tokenizer):
             return model, original_tokenizer
         tokenizer = inner
 
-    # Detect if model is a vision model. Text-only models should not
-    # use vision-specific tokens (e.g. <|vision_pad|>) as pad_token,
-    # even if those tokens exist in the vocab.
-    # See https://github.com/unslothai/unsloth/issues/4104
+    # Text-only models must not use vision tokens (e.g. <|vision_pad|>) as
+    # pad_token. See https://github.com/unslothai/unsloth/issues/4104
     is_vision_model = hasattr(original_tokenizer, "image_processor")
     if not is_vision_model and model is not None and hasattr(model, "config"):
         model_type = getattr(model.config, "model_type", "") or ""
@@ -527,10 +520,9 @@ def patch_tokenizer(model, tokenizer):
 
     bad_pad_token = False
     if hasattr(tokenizer, "pad_token") and tokenizer.pad_token is not None:
-        # Check if pad_token is not the same as eos_token otherwise the loss will ignore it!!
+        # pad_token == eos_token makes the loss ignore it
         bad_pad_token = tokenizer.eos_token == tokenizer.pad_token
-        # Also fix text-only models that already have a vision token as pad_token
-        # (e.g. Qwen3 models with <|vision_pad|> baked into tokenizer_config.json)
+        # Also fix text-only models with a vision token baked in as pad_token
         if not bad_pad_token and not is_vision_model:
             bad_pad_token = tokenizer.pad_token in VISION_RESERVED_TOKENS
     elif hasattr(tokenizer, "pad_token") and tokenizer.pad_token is None:
@@ -648,17 +640,12 @@ pass
 
 
 def _is_conversation_format(text):
-    """
-    Check if text looks like a conversation format (list of dicts with 'role' keys).
-    This handles the case where users pass conversation format directly to processor.__call__
-    instead of first applying apply_chat_template.
-    """
+    """Return True if text is conversation format (list of dicts with 'role')."""
     # All Unsloth Zoo code licensed under LGPLv3
     if not isinstance(text, list):
         return False
     if len(text) == 0:
         return False
-    # Check first element - if it's a dict with 'role' key, it's conversation format
     first = text[0]
     if isinstance(first, dict) and "role" in first:
         return True
@@ -668,32 +655,22 @@ pass
 
 def patch_processor_call(processor):
     """
-    Patch processor's __call__ to auto-detect conversation format and apply chat template.
-
-    This fixes the issue where users call:
-        tokenizer(image, prompt, ...)
-    where prompt is a list of dicts (conversation format) instead of a string.
-
-    The Qwen3VL (and other VLM) processors expect text to be a string, not conversation format.
-    Without this patch, users get:
-        AttributeError: 'dict' object has no attribute 'replace'
+    Patch processor's __call__ to auto-apply the chat template when text is in
+    conversation format. VLM processors (e.g. Qwen3VL) expect a string; passing
+    a list of dicts otherwise raises
+    `AttributeError: 'dict' object has no attribute 'replace'`.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     if not hasattr(processor, "apply_chat_template"):
         return processor
 
-    # Only patch if not already patched
     if hasattr(processor, "_unsloth_patched_call"):
         return processor
 
-    # Store the original __call__ from the class
     original_call = processor.__class__.__call__
 
-    # Create a wrapper that handles conversation format
     def patched_call(self, images=None, text=None, videos=None, **kwargs):
-        # Auto-apply chat template if text looks like conversation format
         if text is not None and _is_conversation_format(text):
-            # Text is conversation format - apply chat template first
             add_generation_prompt = kwargs.pop("add_generation_prompt", True)
             text = self.apply_chat_template(
                 text,
@@ -702,11 +679,8 @@ def patch_processor_call(processor):
             )
         return original_call(self, images=images, text=text, videos=videos, **kwargs)
 
-    # Patch at the class level to ensure it's used.
-    # Create a dynamic subclass just for this instance.
-    # Use the original class name so save_pretrained writes the correct
-    # processor_class into config files (fixes GitHub issue #4085).
-    # Double-patching is already prevented by _unsloth_patched_call check above.
+    # Patch via a dynamic subclass reusing the original class name so
+    # save_pretrained writes the correct processor_class (fixes issue #4085).
     original_class = processor.__class__
     patched_class = type(
         original_class.__name__,

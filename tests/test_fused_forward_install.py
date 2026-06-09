@@ -8,18 +8,9 @@
 
 """Tests for the fused lm_head + cross_entropy auto-installer.
 
-Covers:
-  - AST rewriter recognises the canonical HF triplet shape (keyword form,
-    positional vocab_size, `.float()` wrapper, no-`loss = None` initialiser).
-  - AST rewriter declines on non-matching forwards (no triplet, missing
-    if-labels block, missing loss_function call).
-  - install_for_class:
-      * no-op when UNSLOTH_FUSED_FORWARD is off
-      * patches a synthetic *ForCausalLM whose forward matches the triplet
-      * leaves a hand-crafted bespoke forward in _UNMATCHED
-      * is idempotent
-  - Numerical equivalence of the rewritten forward vs the original at
-    small shapes (mean MSE under 1e-4 on bf16 -> fp32).
+Covers the AST rewriter (matches the canonical HF triplet, declines non-matching
+forwards), install_for_class (env opt-out, patching, _UNMATCHED, idempotency),
+and numerical equivalence of the rewritten forward vs the original.
 """
 
 from __future__ import annotations
@@ -104,13 +95,11 @@ def test_ast_rewriter_matches_keyword_form():
     assert cap.logits_name == "logits"
     assert "unsloth_fused_lm_head_loss" in new_src
     assert "EMPTY_LOGITS" in new_src
-    # self.loss_function appears exactly once: on the UNSLOTH_RETURN_LOGITS
-    # opt-in path, where we materialise logits via the original RHS and
-    # route the loss through it to avoid a second lm_head matmul.
+    # self.loss_function only on the UNSLOTH_RETURN_LOGITS opt-in path, routing
+    # the loss through materialised logits to avoid a second lm_head matmul.
     assert new_src.count("self.loss_function") == 1
-    # Labels branch carries the UNSLOTH_RETURN_LOGITS opt-in; the hidden-
-    # states branch is intentionally absent (handled by the compiled
-    # forward in unsloth_zoo/compiler.py).
+    # Labels branch carries the RETURN_LOGITS opt-in; RETURN_HIDDEN_STATES is
+    # absent (handled by the compiled forward in unsloth_zoo/compiler.py).
     assert "UNSLOTH_RETURN_LOGITS" in new_src
     assert "UNSLOTH_RETURN_HIDDEN_STATES" not in new_src
 
@@ -264,10 +253,8 @@ _SYNTH_COUNTER = 0
 def _make_synthetic_class(forward_src: str, name: str = "SyntheticForCausalLM"):
     """Build a class whose forward source is recoverable via inspect.getsource.
 
-    `inspect.getsource` relies on `linecache`. Exec'd functions without a
-    real file backing return OSError, which is what the installer falls
-    back on. To exercise the rewriter we register a unique synthetic file
-    name with `linecache` and compile through it.
+    getsource relies on linecache, so register a unique synthetic file name and
+    compile through it (exec'd funcs without a file backing raise OSError).
     """
     import linecache
     global _SYNTH_COUNTER
@@ -436,8 +423,7 @@ def test_rewritten_forward_loss_matches_reference(fresh_install, enable_env):
     instance.lm_head = torch.nn.Linear(H, V, bias=False).cuda().to(torch.bfloat16)
 
     def _reference_loss(logits, labels, vocab_size, **kw):
-        # unsloth_fused_ce_loss shifts labels by one (causal LM convention).
-        # Mirror that here so the two losses are apples-to-apples.
+        # Mirror unsloth_fused_ce_loss's causal one-token label shift.
         shifted = labels.clone()
         shifted[..., :-1] = labels[..., 1:]
         shifted[..., -1] = -100

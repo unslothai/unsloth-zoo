@@ -68,10 +68,8 @@ import requests
 from packaging import version
 from typing import Union, Tuple, List, Dict, Sequence
 from itertools import takewhile
-# torchvision is an optional dependency: the video reader path uses it but
-# the rest of vision_utils (image preprocessing, HF picker integration)
-# works without it. Guard the top-level import so a CPU-only zoo install
-# without torchvision can still import this module.
+# torchvision is optional (only the video reader path needs it); guard the
+# import so a CPU-only zoo install without it can still import this module.
 try:
     import torchvision
     from torchvision import io, transforms
@@ -122,14 +120,9 @@ def floor_by_factor(number: int, factor: int) -> int:
 def smart_resize(
     height: int, width: int, factor: int = IMAGE_FACTOR, min_pixels: int = MIN_PIXELS, max_pixels: int = MAX_PIXELS
 ) -> tuple[int, int]:
-    """
-    Rescales the image so that the following conditions are met:
-
-    1. Both dimensions (height and width) are divisible by 'factor'.
-
-    2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
-
-    3. The aspect ratio of the image is maintained as closely as possible.
+    """Rescale so both dims are divisible by 'factor', total pixels stay in
+    ['min_pixels', 'max_pixels'], and aspect ratio is preserved as closely
+    as possible.
     """
     if height <= 0 or width <= 0:
         raise ValueError(
@@ -220,23 +213,11 @@ def smart_nframes(
     total_frames: int,
     video_fps: Union[int, float],
 ) -> int:
-    """calculate the number of frames for video used for model inputs.
+    """Number of frames to extract for model inputs.
 
-    Args:
-        ele (dict): a dict contains the configuration of video.
-            support either `fps` or `nframes`:
-                - nframes: the number of frames to extract for model inputs.
-                - fps: the fps to extract frames for model inputs.
-                    - min_frames: the minimum number of frames of the video, only used when fps is provided.
-                    - max_frames: the maximum number of frames of the video, only used when fps is provided.
-        total_frames (int): the original total number of frames of the video.
-        video_fps (int | float): the original fps of the video.
-
-    Raises:
-        ValueError: nframes should in interval [FRAME_FACTOR, total_frames].
-
-    Returns:
-        int: the number of frames for video used for model inputs.
+    `ele` supports either `fps` (with optional `min_frames`/`max_frames`) or
+    `nframes`. Raises ValueError if the result is outside
+    [FRAME_FACTOR, total_frames].
     """
     assert not ("fps" in ele and "nframes" in ele), "Only accept either `fps` or `nframes`"
     if "nframes" in ele:
@@ -259,16 +240,10 @@ def smart_nframes(
 def _read_video_torchvision(
     ele: dict,
 ) -> tuple[torch.Tensor, float]:
-    """read video using torchvision.io.read_video
+    """Read video via torchvision.io.read_video.
 
-    Args:
-        ele (dict): a dict contains the configuration of video.
-        support keys:
-            - video: the path of video. support "file://", "http://", "https://" and local path.
-            - video_start: the start time of video.
-            - video_end: the end time of video.
-    Returns:
-        torch.Tensor: the video tensor with shape (T, C, H, W).
+    `ele` keys: video (path/file/http/https), video_start, video_end.
+    Returns a (T, C, H, W) tensor and the sample fps.
     """
     video_path = ele["video"]
     if version.parse(torchvision.__version__) < version.parse("0.19.0"):
@@ -310,19 +285,9 @@ def calculate_video_frame_range(
     total_frames: int,
     video_fps: float,
 ) -> tuple[int, int, int]:
-    """
-    Calculate the start and end frame indices based on the given time range.
-
-    Args:
-        ele (dict): A dictionary containing optional 'video_start' and 'video_end' keys (in seconds).
-        total_frames (int): Total number of frames in the video.
-        video_fps (float): Frames per second of the video.
-
-    Returns:
-        tuple: A tuple containing (start_frame, end_frame, frame_count).
-
-    Raises:
-        ValueError: If input parameters are invalid or the time range is inconsistent.
+    """Compute (start_frame, end_frame, frame_count) from `ele`'s optional
+    'video_start'/'video_end' (seconds). Raises ValueError on invalid params
+    or an inconsistent time range.
     """
     # Validate essential parameters
     if video_fps <= 0:
@@ -367,16 +332,10 @@ def calculate_video_frame_range(
 def _read_video_decord(
     ele: dict,
 ) -> tuple[torch.Tensor, float]:
-    """read video using decord.VideoReader
+    """Read video via decord.VideoReader.
 
-    Args:
-        ele (dict): a dict contains the configuration of video.
-        support keys:
-            - video: the path of video. support "file://", "http://", "https://" and local path.
-            - video_start: the start time of video.
-            - video_end: the end time of video.
-    Returns:
-        torch.Tensor: the video tensor with shape (T, C, H, W).
+    `ele` keys: video (path/file/http/https), video_start, video_end.
+    Returns a (T, C, H, W) tensor and the sample fps.
     """
     import decord
     video_path = ele["video"]
@@ -413,16 +372,10 @@ def is_torchcodec_available() -> bool:
 def _read_video_torchcodec(
     ele: dict,
 ) -> tuple[torch.Tensor, float]:
-    """read video using torchcodec.decoders.VideoDecoder
+    """Read video via torchcodec.decoders.VideoDecoder.
 
-    Args:
-        ele (dict): a dict contains the configuration of video.
-        support keys:
-            - video: the path of video. support "file://", "http://", "https://" and local path.
-            - video_start: the start time of video.
-            - video_end: the end time of video.
-    Returns:
-        torch.Tensor: the video tensor with shape (T, C, H, W).
+    `ele` keys: video (path/file/http/https), video_start, video_end.
+    Returns a (T, C, H, W) tensor and the sample fps.
     """
     from torchcodec.decoders import VideoDecoder
     TORCHCODEC_NUM_THREADS = int(os.environ.get('TORCHCODEC_NUM_THREADS', 8))
