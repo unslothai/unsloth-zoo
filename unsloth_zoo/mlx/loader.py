@@ -479,19 +479,47 @@ def _fix_qwen35_attention_cache(model):
 
     original_attn_call = attn_cls.__call__
 
-    def patched_attn_call(self, x, mask=None, cache=None, position_ids=None):
+    def patched_attn_call(self, x, mask=None, cache=None, position_ids=None, **kwargs):
         # Compute position_ids when training (cache=None, position_ids=None).
-        if cache is None and position_ids is None:
+        # Extra kwargs (position_embeddings, target_verify, ...) added by
+        # newer mlx-vlm releases must pass through untouched.
+        if (
+            cache is None
+            and position_ids is None
+            and kwargs.get("position_embeddings") is None
+        ):
             import mlx.core as mx
             L = x.shape[1]
             position_ids = mx.arange(L)
             position_ids = mx.expand_dims(position_ids, axis=0)
             position_ids = mx.tile(position_ids, (3, 1, 1))
-        return original_attn_call(self, x, mask=mask, cache=cache, position_ids=position_ids)
+        return original_attn_call(self, x, mask=mask, cache=cache, position_ids=position_ids, **kwargs)
 
     attn_cls.__call__ = patched_attn_call
     attn_cls._unsloth_cache_patched = True
     print("Unsloth: Fixed Qwen3.5 attention for training (cache=None).")
+
+
+def _disable_fused_mrope(model):
+    """Route MRoPE through the differentiable cos/sin fallback for training.
+
+    mlx-vlm's MRoPERotaryEmbedding.apply_rotary uses a fused Metal kernel
+    whenever Metal is available, with no gradient support — training dies
+    with [Primitive::vjp] Not implemented for CustomKernel. Flipping
+    fused_apply off makes apply_rotary take its pure-MLX fallback, which
+    differentiates fine.
+    """
+    count = 0
+    try:
+        modules = model.modules()
+    except Exception:
+        return
+    for module in modules:
+        if getattr(module, "fused_apply", False):
+            module.fused_apply = False
+            count += 1
+    if count:
+        print(f"Unsloth: Disabled fused MRoPE kernel on {count} modules for training (no VJP).")
 
 
 def _safe_getsource(obj) -> str:

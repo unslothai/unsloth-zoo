@@ -274,3 +274,50 @@ def patch_gated_delta():
     gated_delta.gated_delta_update = patched_gated_delta_update
     gated_delta._unsloth_gated_delta_patched = True
     print("Unsloth: Patched GatedDeltaNet with memory-efficient custom VJP.")
+
+
+def patch_gated_delta_vlm():
+    """Monkey-patch mlx_vlm's qwen3_5 gated_delta module the same way.
+
+    mlx_vlm.models.qwen3_5 ships its own gated_delta_update wrapper that
+    calls mlx_lm's gated_delta_kernel directly (imported by name), so
+    patch_gated_delta() never intercepts it. The kernel has no VJP, which
+    crashes training with [Primitive::vjp] Not implemented for CustomKernel.
+    language.py also from-imports gated_delta_update, so patch both
+    namespaces.
+    """
+    try:
+        from mlx_lm.models import gated_delta
+        from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
+        from mlx_vlm.models.qwen3_5 import language as vlm_language
+    except ImportError:
+        return
+
+    if getattr(vlm_gated_delta, "_unsloth_gated_delta_patched", False):
+        return
+
+    original_update = vlm_gated_delta.gated_delta_update
+
+    def patched_gated_delta_update(
+        q, k, v, a, b, A_log, dt_bias,
+        state=None, mask=None, use_kernel=True,
+    ):
+        # Same heuristic as patch_gated_delta: state=None means a training
+        # call (no KV cache), which must avoid the non-differentiable
+        # custom kernel and route through the memory-efficient VJP.
+        if state is not None:
+            return original_update(
+                q, k, v, a, b, A_log, dt_bias,
+                state=state, mask=mask, use_kernel=use_kernel,
+            )
+        beta = mx.sigmoid(b)
+        g = gated_delta.compute_g(A_log, a, dt_bias)
+        B, _, Hk, Dk = q.shape
+        Hv, Dv = v.shape[-2:]
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
+
+    vlm_gated_delta.gated_delta_update = patched_gated_delta_update
+    vlm_language.gated_delta_update = patched_gated_delta_update
+    vlm_gated_delta._unsloth_gated_delta_patched = True
+    print("Unsloth: Patched mlx-vlm GatedDeltaNet with memory-efficient custom VJP.")

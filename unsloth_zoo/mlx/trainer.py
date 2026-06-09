@@ -604,10 +604,12 @@ class MLXTrainer:
         config = getattr(model, "_config", {})
         model_type = config.get("model_type", "") if isinstance(config, dict) else ""
         if "qwen3_5" in model_type:
-            from .loader import _fix_qwen35_attention_cache
+            from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
             _fix_qwen35_attention_cache(model)
-            from ..gated_delta_vjp import patch_gated_delta
+            _disable_fused_mrope(model)
+            from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
             patch_gated_delta()
+            patch_gated_delta_vlm()
 
         try:
             return self._train_inner()
