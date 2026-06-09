@@ -102,10 +102,23 @@ try:
         return q_idx >= kv_idx
 
     def generate_causal_mask_with_padding(padding_start_idx = None):
-        """Causal mask for Flex Attention with left-padding support.
-
-        Both q and kv below padding_start_idx[batch_idx] are masked out, so
-        padded tokens attend to nothing and are attended by nothing.
+        """
+        Causal mask for Flex Attention with left padding support.
+        Normal causal mask:
+            k0 k1 k2 k3 k4
+        q0   X
+        q1   X  X
+        q2   X  X  X
+        q3   X  X  X  X
+        q4   X  X  X  X  X
+        If we add 2 tokens as padded tokens, we get:
+            #0 #1 k2 k3 k4
+        #0
+        #1
+        q2         X
+        q3         X  X
+        q4         X  X  X
+        Assume padding_start_idx == [2]
         """
         assert padding_start_idx is not None and type(padding_start_idx) is torch.Tensor
         assert padding_start_idx.dim() == 1
@@ -119,7 +132,18 @@ try:
         return causal_mask
 
     def generate_decoding_causal_mask_with_padding(padding_start_idx = None):
-        """Decoding-only causal mask: drop the q_padded check since decoding attends to 1 q."""
+        """
+        For decoding purposes only. We remove q_padded since decoding attends to 1 q
+        Assume padded tokens = 5
+            #0 #1 #2 #3 #4 k5 k6
+        #0   #
+        #1   #  #
+        #2   #  #  #
+        #3   #  #  #  #
+        #4   #  #  #  #  #
+        q5   #  #  #  #  #  X
+        q6   #  #  #  #  #  X  X
+        """
         assert padding_start_idx is not None and type(padding_start_idx) is torch.Tensor
         assert padding_start_idx.dim() == 1
         assert padding_start_idx.shape[0] >= 1
@@ -171,8 +195,13 @@ try:
         return sliding_window
 
     def generate_decoding_sliding_window_mask_with_padding(window_size: int, padding_start_idx = None):
-        """SWA decoding: padding_start_idx can exceed KV size (e.g. 3406 with SW=128),
-        masking everything; since padded tokens are always 0 we just return generic SWA."""
+        """
+        We cannot use padding_start_idx[batch_idx] for SWA decoding since
+        assume padding_start_idx=[3406, 4000, 0] and SW=128 then it'll always
+        be masked since the KV size=128.
+
+        Since we set padded tokens = 0 always, we simply return the generic SWA.
+        """
         return generate_sliding_window_mask(window_size)
 
     # For inference see https://pytorch.org/blog/flexattention-for-inference
