@@ -1122,12 +1122,13 @@ def test_convert_regex_handles_trailing_digit_parameter_paths():
 
 def test_convert_vllm_to_huggingface_uses_robust_bracket_regex():
     # The Parameter-assignment path must use the anchor-or-end regex so keys
-    # ending in `.DIGIT` get bracketed.
+    # ending in `.DIGIT` get bracketed. Anchor on the bracketing code (first
+    # occurrence is this branch), not a comment, so the check survives reworded
+    # comments.
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils.convert_vllm_to_huggingface)
     assert r'r"\.([\d]+)(?=\.|$)"' in src
-    param_branch_anchor = "# for attributes of type nn.Parameter, there's no .weight"
-    idx = src.index(param_branch_anchor)
+    idx = src.index("layer_name_br = re.sub(")
     nearby = src[idx:idx + 400]
     assert r'r"\.([\d]+)(?=\.|$)"' in nearby
     assert r'r"\.([\d]{1,})\."' not in nearby
