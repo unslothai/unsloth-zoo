@@ -64,6 +64,10 @@ class _Gemma4KVSharedSafeProxy:
 
     __slots__ = ("_real",)
 
+    # __dict__/vars() still expose num_kv_shared_layers (no instance dict -> forwards
+    # to _real); keep it that way -- to_dict() deepcopies __dict__, so sealing it
+    # would drop the field from serialization. #6089
+
     def __init__(self, real):
         object.__setattr__(self, "_real", real)
 
@@ -82,14 +86,17 @@ class _Gemma4KVSharedSafeProxy:
 
     # ---- dict-like dunder forwarding (used by config validators) ----
     def __iter__(self):
-        return iter(object.__getattribute__(self, "_real"))
+        # Hide num_kv_shared_layers, like __getattr__/__contains__/__getitem__:
+        # validate_token_ids does `for n in cfg: getattr(cfg, n)`, so yielding it
+        # would re-raise the AttributeError from __getattr__. See unslothai/unsloth#6089.
+        for name in object.__getattribute__(self, "_real"):
+            if name == "num_kv_shared_layers":
+                continue
+            yield name
 
     def __len__(self):
-        real = object.__getattribute__(self, "_real")
-        try:
-            return len(real)
-        except TypeError:
-            return len(getattr(real, "__dict__", {}))
+        # Consistent with __iter__ (hidden attr excluded).
+        return sum(1 for _ in self)
 
     def __contains__(self, item):
         if item == "num_kv_shared_layers":
@@ -513,7 +520,12 @@ def patch_Gemma4ClippableLinear_peft_reload():
         current_key=None,
         **kwargs,
     ):
-        if isinstance(target, Gemma4ClippableLinear):
+        # Match by identity OR name+structure: the compiler emits a duplicate
+        # Gemma4ClippableLinear, so a compiled model's modules aren't isinstance of the
+        # transformers class (breaks a 2nd adapter, e.g. GRPO "ref"). #6089
+        if isinstance(target, Gemma4ClippableLinear) or (
+            type(target).__name__ == "Gemma4ClippableLinear" and hasattr(target, "linear")
+        ):
             return original_create_and_replace(
                 self,
                 peft_config,
