@@ -68,6 +68,24 @@ class _ConfigCarrier(nn.Module):
         self.linear = nn.Linear(4, 4)
 
 
+def _none_use_cache_supported() -> bool:
+    """transformers v5 configs are strict huggingface_hub dataclasses whose
+    use_cache field is typed bool, so None ("defer to the model default") is
+    unrepresentable there and the legacy preserve-None contract only applies
+    to stacks that accept it."""
+    try:
+        LlamaConfig(use_cache = None)
+    except Exception:
+        return False
+    return True
+
+
+requires_none_use_cache = pytest.mark.skipif(
+    not _none_use_cache_supported(),
+    reason = "strict transformers configs type use_cache as bool; None is unrepresentable",
+)
+
+
 @pytest.mark.parametrize("mode", [True, "unsloth"])
 def test_top_level_use_cache_disabled(mode):
     model = _tiny_llama(use_cache = True)
@@ -82,7 +100,10 @@ def test_no_gradient_checkpointing_leaves_use_cache():
     assert model.config.use_cache is True
 
 
-@pytest.mark.parametrize("initial", [None, False])
+@pytest.mark.parametrize(
+    "initial",
+    [pytest.param(None, marks = requires_none_use_cache), False],
+)
 def test_falsy_use_cache_preserved(initial):
     # None means "defer to the model default": it must NOT be coerced to False.
     model = _tiny_llama(use_cache = initial)
@@ -151,6 +172,7 @@ def test_restore_without_prepare_is_noop():
     assert model.config.use_cache is True
 
 
+@requires_none_use_cache
 def test_restore_preserves_falsy_values():
     # Configs whose use_cache was None/False are never recorded, so a
     # restore after prepare must not invent True values for them.
