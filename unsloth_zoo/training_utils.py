@@ -37,15 +37,14 @@ __all__ = [
     "fix_zero_training_loss",
     "unsloth_train",
     "prepare_model_for_training",
+    "disable_use_cache",
+    "restore_use_cache",
 ]
 
 
 @torch.inference_mode
 def fix_zero_training_loss(model, tokenizer, train_dataset):
-    """
-    Sometimes the labels get masked by all -100s, causing the loss
-    to be 0. We check for this!
-    """
+    """Warn/raise when labels are all -100 (masked), which zeroes the loss."""
     # All Unsloth Zoo code licensed under LGPLv3
     if isinstance(train_dataset, datasets.IterableDataset):
         # Skip the check since the code below assumes
@@ -92,6 +91,58 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
 pass
 
 
+def _iter_configs(config):
+    """Yield config and every nested transformers config (composite models
+    like VLMs nest text_config / vision_config as attributes)."""
+    try:
+        from transformers import PreTrainedConfig
+    except ImportError:
+        from transformers import PretrainedConfig as PreTrainedConfig
+    seen = set()
+    stack = [config]
+    while stack:
+        cfg = stack.pop()
+        if cfg is None or id(cfg) in seen:
+            continue
+        seen.add(id(cfg))
+        yield cfg
+        for sub in vars(cfg).values():
+            if isinstance(sub, PreTrainedConfig):
+                stack.append(sub)
+
+
+def disable_use_cache(model):
+    """Set use_cache = False on every config of the model. KV cache is unused
+    under gradient checkpointing. Original values are remembered on the model
+    the first time so restore_use_cache can undo this for inference."""
+    config = getattr(model, "config", None)
+    if config is None:
+        return
+    originals = getattr(model, "_unsloth_use_cache_originals", None)
+    record = originals is None
+    if record:
+        originals = []
+    for cfg in _iter_configs(config):
+        if getattr(cfg, "use_cache", None):
+            if record:
+                originals.append((cfg, cfg.use_cache))
+            cfg.use_cache = False
+    if record and originals:
+        try:
+            model._unsloth_use_cache_originals = originals
+        except Exception:
+            pass
+
+
+def restore_use_cache(model):
+    """Undo disable_use_cache by restoring the recorded use_cache values,
+    e.g. when switching the model to inference. No-op if nothing was
+    disabled. The record is kept so disable_use_cache can re-disable
+    without re-recording when training resumes."""
+    for cfg, value in getattr(model, "_unsloth_use_cache_originals", None) or ():
+        cfg.use_cache = value
+
+
 @torch.no_grad
 def prepare_model_for_training(
     model                      : Any,
@@ -119,9 +170,8 @@ def prepare_model_for_training(
         # We need to upcast to float32
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
-        # For full finetuning, update config dtype to match actual weight dtype.
-        # The KV cache uses model.config.torch_dtype, but weights are upcast to float32.
-        # Without this, generation fails with dtype mismatch in index_copy_().
+        # Full finetuning upcasts weights to float32; sync config dtype so the
+        # KV cache matches and generation avoids a dtype mismatch in index_copy_().
         if full_finetuning:
             model._unsloth_original_dtype = dtype
             model.config.torch_dtype = torch.float32
@@ -195,8 +245,7 @@ def prepare_model_for_training(
                 exec(f"model.{name}.to({str(torch.float32)})")
     pass
 
-    # Gradient checkpointing
-    # If the user requested vanilla GC (True/False), ensure any prior Unsloth patch is undone.
+    # Vanilla GC (True/False) requires undoing any prior Unsloth patch.
     if use_gradient_checkpointing != "unsloth":
         unpatch_unsloth_gradient_checkpointing()
         unpatch_unsloth_smart_gradient_checkpointing()
@@ -222,6 +271,10 @@ def prepare_model_for_training(
             for module in model.modules():
                 if hasattr(module, "gradient_checkpointing"):
                     module.gradient_checkpointing = False
+
+    # KV cache is unused under gradient checkpointing; disable it on every config.
+    if use_gradient_checkpointing in (True, "unsloth"):
+        disable_use_cache(model)
 
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:
@@ -290,7 +343,6 @@ pass
 
 
 def set_training(model):
-    # Start training
     model.training = True
     while hasattr(model, "model"):
         model = model.model
@@ -300,7 +352,6 @@ pass
 
 
 def unset_training(model):
-    # End training
     model.training = False
     while hasattr(model, "model"):
         model = model.model
@@ -317,10 +368,8 @@ pass
 
 def unsloth_train(trainer):
     """
-    Unsloth Trainer
-    1. Fixes gradient accumulation
-    2. Scaled down version of HF's trainer
-    3. Much less feature complete
+    Minimal trainer: a scaled-down HF Trainer that fixes gradient accumulation.
+    Much less feature complete.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     assert(hasattr(trainer, "args"))

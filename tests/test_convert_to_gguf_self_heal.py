@@ -1,9 +1,9 @@
 """Tests for convert_to_gguf's self-heal on a broken converter environment.
 
-A stale or missing converter package (usually `gguf`) makes the converter
-subprocess exit 1. convert_to_gguf should reinstall the deps into the
-converter's own interpreter and retry once, surface the real traceback if the
-failure persists, and never reinstall on a genuine model error.
+When a stale/missing converter package (usually `gguf`) makes the subprocess
+exit 1, convert_to_gguf should reinstall deps into the converter's interpreter
+and retry once, surface the real traceback if it persists, and never reinstall
+on a genuine model error.
 """
 
 from __future__ import annotations

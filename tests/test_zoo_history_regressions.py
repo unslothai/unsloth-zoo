@@ -6,13 +6,9 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Pin-down regression suite for past zoo bugs.
-
-Every test here corresponds to a SHIPPED fix on `main`. The goal is
-to catch the SAME bug class if it re-appears, not to retest the
-fix path itself. Each test has a `WHY` block citing the commit /
-PR that introduced the regression.
-"""
+"""Regression pins for past zoo bugs. Each test maps to a SHIPPED fix on
+`main` and catches the bug class if it re-appears (not the fix path itself);
+each cites the commit/PR that introduced the regression."""
 
 from __future__ import annotations
 
@@ -22,18 +18,11 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Regression: temporary_patches/utils.py `__all__` missing comma between
-# entries silently concatenates the two strings ("raise_errorUnpack")
-# and the supposedly-public names become un-import-able under
-# `from temporary_patches.utils import *`.
-#
-# Source: `2e36f32 fix(temporary_patches/utils): add missing comma in
-# __all__ between 'raise_error' and 'Unpack' (#617)`
-#
-# This is a Python footgun -- there's no syntactic error, the
-# interpreter just concatenates adjacent string literals. The bug
-# stayed live until someone star-imported and noticed `Unpack` was
-# missing.
+# Regression: a missing comma in temporary_patches/utils.py `__all__` silently
+# concatenates adjacent string literals ("raise_errorUnpack"), making the
+# public names un-importable under `from ... import *`. No syntax error fires.
+# Source: 2e36f32 fix(temporary_patches/utils): add missing comma in __all__
+# between 'raise_error' and 'Unpack' (#617)
 # ---------------------------------------------------------------------------
 
 
@@ -55,27 +44,22 @@ def test_temporary_patches_utils_all_entries_are_valid_attributes():
 
 
 def test_temporary_patches_utils_no_concatenated_all_entries():
-    """No `__all__` entry should look like two separate names jammed
-    together (e.g. `raise_errorUnpack`). Heuristic: detect a name
-    that has BOTH (a) snake_case tokens (lowercase + underscore) AND
-    (b) a PascalCase / camelCase transition (lowercase letter
-    followed by uppercase letter). Pure `ALL_CAPS_CONSTANT` names
-    like `KWARGS_TYPE` have underscores but no lowercase->uppercase
-    transition, so they don't match.
+    """No `__all__` entry should look like two jammed names (e.g.
+    `raise_errorUnpack`). Heuristic: a name with BOTH a snake_case underscore
+    AND a lowercase->uppercase transition. Pure ALL_CAPS like `KWARGS_TYPE`
+    has no such transition, so it doesn't match.
     """
     from unsloth_zoo.temporary_patches import utils
     import re
 
-    # Matches a lowercase letter followed by an uppercase letter --
-    # the signature of a snake_case + CamelCase concatenation.
+    # lowercase->uppercase = a snake_case + CamelCase concatenation.
     camel_boundary = re.compile(r"[a-z][A-Z]")
     suspicious = []
     for name in utils.__all__:
         if name.startswith("_"):
             continue
         if "_" not in name:
-            # Pure CamelCase or pure lowercase -- not the bug class.
-            continue
+            continue  # pure CamelCase or lowercase -- not the bug class.
         if camel_boundary.search(name):
             suspicious.append(name)
     assert not suspicious, (
@@ -100,17 +84,12 @@ def test_temporary_patches_utils_known_public_names_present():
 
 
 # ---------------------------------------------------------------------------
-# Regression: `compiler.higher_precision_softmax` was not idempotent --
-# running it twice on the same source appended a duplicate
-# `.to(x.dtype).to(x.dtype)` because the lookahead that detects an
-# already-rewritten softmax was missing.
-#
-# Source: `f98dbbc fix(compiler): make higher_precision_softmax
-# idempotent (#631)`
-#
-# The compiler runs on user source mid-training; if it's invoked
-# twice (e.g. through a checkpoint reload that re-patches), the
-# emitted source must not drift. This test pins the contract.
+# Regression: `compiler.higher_precision_softmax` wasn't idempotent -- running
+# it twice appended a duplicate `.to(x.dtype).to(x.dtype)` (the
+# already-rewritten lookahead was missing). The compiler runs on user source
+# mid-training and may re-run (e.g. checkpoint reload), so emitted source must
+# not drift.
+# Source: f98dbbc fix(compiler): make higher_precision_softmax idempotent (#631)
 # ---------------------------------------------------------------------------
 
 
@@ -156,15 +135,10 @@ def test_higher_precision_softmax_does_not_double_cast():
 
 
 # ---------------------------------------------------------------------------
-# Regression: backend device helpers must guard against partial torch
-# builds (e.g. `torch.xpu` exists but `torch.xpu.synchronize` raises).
-# Two commits address this:
-#   `e08c1df Guard XPU synchronize call against partial torch.xpu builds`
-#   `35dc451 Guard XPU empty_cache call against partial torch.xpu builds`
-#
-# Test: calling device_synchronize / device_empty_cache must not raise
-# even if the resolved backend module is partial. Uses the same
-# stub harness as tests/conftest.py.
+# Regression: backend device helpers must guard against partial torch builds
+# (e.g. `torch.xpu` exists but `torch.xpu.synchronize` raises). Calling
+# device_synchronize / device_empty_cache must not raise on a partial backend.
+# Source: e08c1df (Guard XPU synchronize), 35dc451 (Guard XPU empty_cache).
 # ---------------------------------------------------------------------------
 
 
@@ -172,18 +146,14 @@ def test_device_synchronize_tolerates_partial_backend():
     """`device_synchronize()` must not raise on a minimal stub backend."""
     from unsloth_zoo.device_type import device_synchronize
 
-    # Just call it. On the GPU-free harness this resolves to the
-    # stub `lambda *a, **k: None`. The point is to assert the
-    # exported name exists and is callable -- the partial-backend
-    # guards live inside its implementation.
+    # On the GPU-free harness this resolves to a stub; the partial-backend
+    # guards live inside the implementation.
     device_synchronize()
 
 
 def test_device_type_module_has_expected_helpers():
-    """Pin the public API surface that downstream zoo / unsloth /
-    Studio code calls. A rename or removal here breaks consumers
-    silently (`AttributeError` at training time).
-    """
+    """Pin the public API downstream zoo/unsloth/Studio code calls; a rename
+    or removal here breaks consumers silently (AttributeError at train time)."""
     import unsloth_zoo.device_type as dt
 
     expected = [
@@ -198,14 +168,9 @@ def test_device_type_module_has_expected_helpers():
 
 # ---------------------------------------------------------------------------
 # Regression: RL_REPLACEMENTS dict integrity vs the GRPO refactor wave
-# (commits 466334c, 9829ade, 035f...). The dict is rebuilt as each
-# function is defined; a missing `RL_REPLACEMENTS[name] = fn`
-# assignment after a refactor is silent -- nothing fails at import.
-#
-# This test pins the registration count + the well-known public-API
-# keys. Duplicates the assertion in test_rl_replacements_cpu.py
-# deliberately: that file proves the IO contract of each function;
-# THIS file proves the registration survives a refactor.
+# (commits 466334c, 9829ade, 035f...). The dict is rebuilt per definition; a
+# missing `RL_REPLACEMENTS[name] = fn` after a refactor fails silently. Pins
+# the public-API keys (test_rl_replacements_cpu.py covers the IO contract).
 # ---------------------------------------------------------------------------
 
 
@@ -227,24 +192,13 @@ def test_rl_replacements_registration_survived_grpo_refactor():
 
 
 # ---------------------------------------------------------------------------
-# Regression: gpt-oss inference leaks a flex BlockMask into the eager
-# attention forward.
-#
-# Source: PR #690 (Fix gpt-oss inference BlockMask TypeError).
-# Latent since unsloth-zoo commit `ef819214` (2025-09-25, "Fix Flex")
-# which rewrote return_attention_mask -> wrap(f) that on the inference
-# branch unconditionally calls f(*args, **kwargs), AND switched
-# forward_function to use eager during inference. When
-# config._attn_implementation == "flex_attention" (set by training,
-# explicit user kwarg, or pre-#5701 resolver), the inference path
-# receives a BlockMask and inplace_eager_attention_forward crashes:
-#   TypeError: unsupported operand type(s) for +=:
-#       'Tensor' and 'BlockMask'
-#
-# AST-level guards. Two of them: one over wrap.return_attention_mask
-# (the path transformers' own GptOssModel.forward goes through), one
-# over patch_GptOssModel as a whole (the path Unsloth's patched forward
-# goes through). Catches silent deletion of the flex_attention literal.
+# Regression: gpt-oss inference leaks a flex BlockMask into the eager attention
+# forward. When config._attn_implementation == "flex_attention" the inference
+# path receives a BlockMask and inplace_eager_attention_forward crashes with
+#   TypeError: unsupported operand type(s) for +=: 'Tensor' and 'BlockMask'
+# Two AST guards (one over wrap.return_attention_mask, one over
+# patch_GptOssModel) catch silent deletion of the flex_attention literal.
+# Source: PR #690; latent since commit ef819214 ("Fix Flex").
 # ---------------------------------------------------------------------------
 
 
@@ -284,13 +238,9 @@ def test_gpt_oss_wrap_has_flex_attention_inference_guard():
 
 
 def test_gpt_oss_patched_model_forward_has_flex_attention_guard():
-    """The patched GptOssModel.forward body itself must hold the guard.
-
-    Locate the inner `forward` FunctionDef and assert its body carries
-    the _attn_implementation == 'flex_attention' literal. This is
-    independent of wrap's own guard, so removing the forward-level
-    swap while keeping wrap's literal cannot satisfy this test.
-    """
+    """The patched GptOssModel.forward body must carry the
+    _attn_implementation == 'flex_attention' guard, independent of wrap's own
+    guard (so removing the forward-level swap can't satisfy this test)."""
     import ast
     import inspect
     from unsloth_zoo.temporary_patches import gpt_oss as _M
@@ -319,30 +269,20 @@ def test_gpt_oss_patched_model_forward_has_flex_attention_guard():
 
 
 # ---------------------------------------------------------------------------
-# Regression: eager attention shape mismatch when KV cache is longer than
-# the attention mask's kv dimension.
-#
-# Source: PR #691 (gpt-oss: align eager KV length to the attention mask).
-# transformers 5.x cache pre-allocation hands a full-attention layer more
-# positions than the causal mask covers (e.g. k=161 against a 128-wide
-# mask). Both eager attention forwards in patch_GptOssAttention then do
-#   attn_weights += attention_mask[:, :, :, : key_states.shape[-2]]
-# which fails with:
-#   RuntimeError: The size of tensor a (N) must match the size of
-#       tensor b (M) at non-singleton dimension 3
-#
-# The fix is the _align_kv_to_mask helper that trims KV (or the mask) to
-# the shorter length. Static check: helper exists AND is invoked from
-# BOTH eager forward variants so the inplace and non-inplace paths agree.
+# Regression: eager attention shape mismatch when the KV cache is longer than
+# the attention mask's kv dim. transformers 5.x cache pre-allocation hands a
+# full-attention layer more positions than the causal mask covers (e.g. k=161
+# vs a 128-wide mask), so `attn_weights += attention_mask[...]` raises
+# RuntimeError on dim 3. The _align_kv_to_mask helper trims to the shorter
+# length; static check: it exists AND runs in BOTH eager forwards.
+# Source: PR #691.
 # ---------------------------------------------------------------------------
 
 
 def test_gpt_oss_eager_attention_aligns_kv_to_mask():
-    """Both eager forwards must invoke the KV alignment helper.
-
-    Per-function source-slice check rather than a global callsite count,
-    so a future refactor that consolidates eager paths into a shared
-    closure still passes as long as the alignment runs on both routes.
+    """Both eager forwards must invoke the KV alignment helper. Per-function
+    source-slice check (not a global callsite count) so consolidation into a
+    shared closure still passes if alignment runs on both routes.
     """
     import ast
     import inspect
@@ -382,14 +322,10 @@ def test_gpt_oss_eager_attention_aligns_kv_to_mask():
 
 
 # ---------------------------------------------------------------------------
-# Regression: gpt-oss patched GptOssModel.forward hard-codes the
-# transformers 4.x mask kwargs ("input_embeds", "cache_position") and
-# blows up on transformers 5.x which renamed to "inputs_embeds" and
-# dropped "cache_position" entirely.
-#
-# Source: PR #690 fix included inspect-driven kwarg filtering so the
-# patch supports both 4.x and 5.x simultaneously. Static check that the
-# filtering helper is present.
+# Regression: patched GptOssModel.forward hard-coded the 4.x mask kwargs
+# ("input_embeds", "cache_position") and blew up on 5.x (renamed to
+# "inputs_embeds", dropped "cache_position"). PR #690 added inspect-driven
+# kwarg filtering to support both; static check that the helper is present.
 # ---------------------------------------------------------------------------
 
 
@@ -398,8 +334,7 @@ def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
     from unsloth_zoo.temporary_patches import gpt_oss as _M
 
     src = inspect.getsource(_M.patch_GptOssModel)
-    # Either the inspect-driven helper (_build_mask_kwargs / _ccm_params)
-    # OR a guard string explicitly testing for inputs_embeds availability.
+    # The inspect-driven helper, or a guard testing inputs_embeds availability.
     has_inspect_filter = (
         "_build_mask_kwargs" in src
         or "_ccm_params" in src
@@ -410,4 +345,131 @@ def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
         "signature so the patch works on both transformers 4.57.6 "
         "(input_embeds + cache_position) and transformers 5.x "
         "(inputs_embeds, no cache_position). See PR #690."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression: patch_compiling_bitsandbytes used exec(f"import {x}",
+# globals(), locals()) + eval(x) inside a function. Under PEP 667
+# (Python 3.13+) the locals() snapshot does not persist, so eval raised
+# NameError: name 'peft' is not defined on every model load with
+# bitsandbytes < 0.46.0. Fixed by switching to importlib.import_module +
+# getattr. Source: #710 (issue #311).
+# These tests stub bitsandbytes/peft in sys.modules so they are hermetic:
+# no GPU, no real bitsandbytes install needed.
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_bnb_and_peft(monkeypatch, bnb_version, with_peft_leaf=True):
+    import sys
+    import types
+
+    # The function under test sets UNSLOTH_PATCHED=1; setenv registers the key
+    # with monkeypatch so the pre-test state (even absence) is restored.
+    import os
+    monkeypatch.setenv("UNSLOTH_PATCHED", os.environ.get("UNSLOTH_PATCHED", "0"))
+
+    def _fake_layer_class():
+        class _Layer:
+            def forward(self):
+                return "ok"
+        return _Layer
+
+    bnb = types.ModuleType("bitsandbytes")
+    bnb.__version__ = bnb_version
+    bnb_nn = types.ModuleType("bitsandbytes.nn")
+    bnb_modules = types.ModuleType("bitsandbytes.nn.modules")
+    bnb_modules.Linear4bit = _fake_layer_class()
+    bnb.nn = bnb_nn
+    bnb_nn.modules = bnb_modules
+
+    for name, mod in [
+        ("bitsandbytes", bnb),
+        ("bitsandbytes.nn", bnb_nn),
+        ("bitsandbytes.nn.modules", bnb_modules),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    peft_leaf = None
+    if with_peft_leaf:
+        peft = types.ModuleType("peft")
+        peft_tuners = types.ModuleType("peft.tuners")
+        peft_lora = types.ModuleType("peft.tuners.lora")
+        peft_leaf = types.ModuleType("peft.tuners.lora.bnb")
+        peft_leaf.Linear4bit = _fake_layer_class()
+        for name, mod in [
+            ("peft", peft),
+            ("peft.tuners", peft_tuners),
+            ("peft.tuners.lora", peft_lora),
+            ("peft.tuners.lora.bnb", peft_leaf),
+        ]:
+            monkeypatch.setitem(sys.modules, name, mod)
+    else:
+        # A peft package whose submodules cannot be imported: no __path__.
+        peft = types.ModuleType("peft")
+        monkeypatch.setitem(sys.modules, "peft", peft)
+        for name in ["peft.tuners", "peft.tuners.lora", "peft.tuners.lora.bnb"]:
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    return bnb_modules, peft_leaf
+
+
+def test_patch_compiling_bitsandbytes_old_bnb_wraps_without_nameerror(monkeypatch):
+    """The #311 bug class: with bitsandbytes < 0.46.0 the patch must run to
+    completion (no NameError from exec/eval namespace loss on Python 3.13+)
+    and dynamo-disable every forward on both target modules."""
+    from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
+
+    bnb_modules, peft_leaf = _install_fake_bnb_and_peft(monkeypatch, "0.45.5")
+    patch_compiling_bitsandbytes()
+
+    assert hasattr(bnb_modules.Linear4bit.forward, "__wrapped__"), (
+        "bitsandbytes.nn.modules forwards were not dynamo-disabled on the "
+        "< 0.46.0 branch. If this raises NameError instead, the exec/eval "
+        "import pattern regressed (PEP 667, fixed in #710)."
+    )
+    assert hasattr(peft_leaf.Linear4bit.forward, "__wrapped__"), (
+        "peft.tuners.lora.bnb forwards were not dynamo-disabled on the "
+        "< 0.46.0 branch (the exact failure mode of issue #311)."
+    )
+
+
+def test_patch_compiling_bitsandbytes_idempotent(monkeypatch):
+    """A second call must not re-wrap already wrapped forwards."""
+    from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
+
+    bnb_modules, _ = _install_fake_bnb_and_peft(monkeypatch, "0.45.5")
+    patch_compiling_bitsandbytes()
+    first = bnb_modules.Linear4bit.forward
+    patch_compiling_bitsandbytes()
+    second = bnb_modules.Linear4bit.forward
+
+    assert first is second, "forward was re-wrapped on a second call"
+    assert not hasattr(first.__wrapped__, "__wrapped__"), "double wrap detected"
+
+
+def test_patch_compiling_bitsandbytes_new_bnb_is_noop(monkeypatch):
+    """bitsandbytes >= 0.46.0 supports torch.compile: nothing gets wrapped,
+    checked at the exact 0.46.0 boundary."""
+    from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
+
+    bnb_modules, peft_leaf = _install_fake_bnb_and_peft(monkeypatch, "0.46.0")
+    patch_compiling_bitsandbytes()
+
+    assert not hasattr(bnb_modules.Linear4bit.forward, "__wrapped__")
+    assert not hasattr(peft_leaf.Linear4bit.forward, "__wrapped__")
+
+
+def test_patch_compiling_bitsandbytes_missing_peft_helpful_error(monkeypatch):
+    """A missing peft leaf must raise the actionable install message with the
+    original ImportError chained, not a bare NameError/ImportError."""
+    import pytest
+    from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
+
+    _install_fake_bnb_and_peft(monkeypatch, "0.45.5", with_peft_leaf=False)
+    with pytest.raises(ImportError, match="pip install peft") as excinfo:
+        patch_compiling_bitsandbytes()
+    assert excinfo.value.__cause__ is not None, (
+        "the original ImportError must be chained (raise ... from e) so an "
+        "installed-but-broken peft stays debuggable"
     )
