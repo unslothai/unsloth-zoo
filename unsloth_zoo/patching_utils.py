@@ -48,16 +48,18 @@ def patch_compiling_bitsandbytes():
         for x in ["bitsandbytes.nn.modules", "peft.tuners.lora.bnb",]:
             try:
                 module = importlib.import_module(x)
-            except ImportError:
-                # peft is required for LoRA training; give a helpful message
+            except ImportError as e:
+                # peft is required for LoRA training
                 if x.startswith("peft"):
                     raise ImportError(
                         "Unsloth: Please install peft via `pip install peft`"
-                    )
+                    ) from e
+                if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+                    print(f"Unsloth: Skipping {x} - import failed: {e}")
                 continue
             for fx in dir(module):
                 try: layer = getattr(module, fx)
-                except: continue
+                except Exception: continue
                 if not hasattr(layer, "forward"): continue
                 if hasattr(layer.forward, "__wrapped__"): continue
                 layer.forward = torch._disable_dynamo(layer.forward)
