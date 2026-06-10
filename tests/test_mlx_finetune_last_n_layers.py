@@ -16,17 +16,12 @@
 
 """Tests for `finetune_last_n_layers` in FastMLXModel.get_peft_model.
 
-mlx-lm CLI's CONFIG_DEFAULTS sets num_layers=16 (lora.py:56), meaning
-LoRA is applied to the last 16 transformer blocks only. unsloth-zoo's
-get_peft_model historically applied LoRA to ALL transformer layers,
-matching HF PEFT/CUDA semantics. The two paths could produce different
-trained models on the same fixture (different basin) because (a) the
-extra layers contribute extra LoRA modules whose lora_a init consumes
-mx.random state, shifting init for the later layers, and (b) the
-trainable-parameter set differs.
-
-`finetune_last_n_layers` lets users opt into mlx-lm CLI semantics
-without changing the existing default (which remains None = all layers).
+mlx-lm CLI defaults to num_layers=16 (lora.py:56): LoRA on the last 16 blocks
+only. unsloth-zoo historically applied LoRA to ALL layers (HF PEFT/CUDA
+parity). The paths can diverge because extra layers add LoRA modules whose
+lora_a init consumes mx.random state (shifting later-layer init) and change the
+trainable set. `finetune_last_n_layers` opts into mlx-lm semantics; the default
+stays None (all layers).
 """
 
 from __future__ import annotations
@@ -51,13 +46,11 @@ def test_get_peft_model_has_finetune_last_n_layers_param():
 
 
 def test_get_peft_model_passes_finetune_last_n_layers_through():
-    """When finetune_last_n_layers is set, linear_to_lora_layers is
-    called with that num_layers value.
+    """linear_to_lora_layers receives the right num_layers value.
 
-    Patches mlx_lm.tuner.utils.linear_to_lora_layers to record the
-    num_layers it sees. The test runs against a tiny synthetic text
-    model (no real layers needed -- the value of num_layers passed is
-    what we assert, not the side effects on a real architecture).
+    Patches mlx_lm.tuner.utils.linear_to_lora_layers to record num_layers and
+    runs against a synthetic text model (we assert the passed value, not real
+    side effects).
     """
     import sys
     import unsloth_zoo.mlx.loader as loader_mod

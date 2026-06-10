@@ -43,8 +43,7 @@ import pytest
 
 
 def _resolve(dotted: str) -> object:
-    """``importlib.import_module`` + ``getattr`` chain. Any failure is
-    surfaced as AssertionError tagged DRIFT DETECTED."""
+    """import_module + getattr chain; failures raise AssertionError tagged DRIFT DETECTED."""
     parts = dotted.split(".")
     obj: object = None
     consumed: list[str] = []

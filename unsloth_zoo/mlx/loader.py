@@ -14,12 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-Lightweight FastLanguageModel for Apple Silicon / MLX.
+"""Lightweight FastLanguageModel for Apple Silicon / MLX.
 
-No GPU dependencies — uses mlx-lm for model loading and LoRA.
-Supports both text-only models (mlx-lm) and VLMs (mlx-vlm).
-This avoids importing unsloth.models (which pulls in CUDA kernels).
+No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
+(which pulls in CUDA kernels).
 """
 
 import json
@@ -63,11 +61,10 @@ _LOAD_WEIGHTS_PATCH_LOCK = threading.RLock()
 
 @contextmanager
 def _temporary_hf_token_env(token):
-    """Expose an explicit HF token to libraries that only read auth from env.
+    """Expose an explicit HF token via env for the duration of the call.
 
-    mlx-lm / mlx-vlm do not consistently thread a ``token=`` argument through
-    every internal download path. Keep explicit token loads local to this call
-    without mutating persistent Hugging Face login state.
+    mlx-lm / mlx-vlm don't thread ``token=`` through every download path; this
+    keeps the token local without mutating persistent HF login state.
     """
     if not token or not isinstance(token, str):
         yield
@@ -89,9 +86,8 @@ def _temporary_hf_token_env(token):
 
 
 def _is_force_float32_arch(model_type: str) -> bool:
-    """Case-insensitive lookup of ``model_type`` in
-    ``unsloth_zoo.FORCE_FLOAT32``. Strips ``-``/``_`` and treats a
-    trailing comma on a list entry as an exact-match marker."""
+    """Case-insensitive ``model_type`` lookup in ``unsloth_zoo.FORCE_FLOAT32``
+    (strips ``-``/``_``; trailing comma marks an exact-match entry)."""
     if not model_type:
         return False
     from ..model_lists import FORCE_FLOAT32
@@ -108,12 +104,11 @@ def _is_force_float32_arch(model_type: str) -> bool:
 
 
 def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
-    """Cast floating-point params to target_dtype (preserves quantized ints)
-    while honoring the model's optional path-based ``cast_predicate``.
+    """Cast float params to target_dtype (quantized ints preserved), honoring
+    the model's optional path-based ``cast_predicate``.
 
-    Warns on bfloat16 -> float16 for architectures in
-    ``unsloth_zoo.FORCE_FLOAT32`` (Gemma3 family, gpt_oss, Qwen3.5) where
-    fp16's narrower range silently NaN/Infs at training time.
+    Warns on bf16 -> fp16 for ``unsloth_zoo.FORCE_FLOAT32`` archs (Gemma3,
+    gpt_oss, Qwen3.5) where fp16's narrower range NaN/Infs in training.
     """
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
@@ -157,18 +152,12 @@ def _seed_mlx_random_state(random_state):
 
 
 def _collect_all_linear_target_names(model):
-    """Return suffix names of every Linear / QuantizedLinear leaf in `model`.
+    """Leaf-suffix names of every Linear / QuantizedLinear in `model`.
 
-    Mirrors PEFT's ``target_modules="all-linear"``: discover every
-    ``nn.Linear`` (and quantized variant) in the live module tree, and
-    return the leaf-suffix name of each. Numeric tokens (list indices like
-    ``experts.0``) are skipped — we want the semantic name (e.g. ``w1``,
-    ``router``, ``q_proj``, ``qkv_proj``, ``lm_head``).
-
-    The result is the set of names against which mlx-lm's
-    ``linear_to_lora_layers`` matches, so applying LoRA to this set covers
-    every Linear in the model — including fused-QKV archs, MoE
-    routers/experts, multimodal projector, and untied LM heads.
+    Mirrors PEFT's ``target_modules="all-linear"``: walk the live tree and
+    return each leaf's semantic name (``w1``, ``q_proj``, ``lm_head``, ...),
+    skipping numeric list indices. mlx-lm's ``linear_to_lora_layers`` matches
+    on these, so LoRA covers fused-QKV, MoE, projector, and untied heads.
     """
     import mlx.nn as nn
     linear_types = (nn.Linear, nn.QuantizedLinear)
@@ -182,19 +171,15 @@ def _collect_all_linear_target_names(model):
                     names.add(token)
                     break
     except Exception:
-        # Defensive: never let target-module discovery raise during LoRA
-        # setup. Caller will fall back to the canonical 7-name default.
+        # Never let discovery raise during LoRA setup; caller falls back to
+        # the canonical 7-name default.
         return []
     return sorted(names)
 
 
 def _is_vlm(config: dict) -> bool:
-    """Detect whether a model config describes a VLM.
-
-    Checks:
-    1. "vision_config" key in config → True
-    2. model_type is in mlx_vlm's supported model set (discovered dynamically)
-    """
+    """Detect whether a config describes a VLM (via "vision_config" or a
+    model_type in mlx_vlm's supported set)."""
     if "vision_config" in config:
         return True
 
@@ -261,15 +246,14 @@ def _load_mlx_lm_with_strict_fallback(
     mlx_load_kwargs,
     hf_token=None,
 ):
-    """Load text models through mlx-lm, retrying strict=False for known safe mismatches.
+    """Load text models via mlx-lm, retrying strict=False for known safe
+    mismatches (extra checkpoint tensors mlx-lm doesn't instantiate).
 
-    Some upstream checkpoints contain extra tensors that the current mlx-lm
-    implementation intentionally does not instantiate. mlx-lm's public load()
-    does not expose strict=False, so use the internal loader only for registered
-    mismatch signatures.
+    mlx-lm's public load() doesn't expose strict=False, so we use the internal
+    loader only for registered mismatch signatures.
     """
-    # why: mlx-lm 0.22.0 load() rejects return_config / revision; bypass it
-    # so signature drift between mlx-lm releases doesn't break loading.
+    # why: mlx-lm 0.22.0 load() rejects return_config / revision; bypass it so
+    # signature drift between releases doesn't break loading.
     from mlx_lm.utils import _download, load_model, load_tokenizer
 
     tokenizer_config = mlx_load_kwargs.get("tokenizer_config") or {}
@@ -319,10 +303,9 @@ def _load_mlx_vlm_with_extra_weight_filter(
 ):
     """Load VLMs, filtering known extra checkpoint tensors on retry.
 
-    Some upstream VLM checkpoints include tensors for modules that the current
-    mlx-vlm class does not instantiate. mlx-vlm does not expose strict=False
-    through load(), so retry with a temporary load_weights shim only for
-    registered mismatch signatures and exact allow-listed keys.
+    Some VLM checkpoints carry tensors mlx-vlm doesn't instantiate; since
+    load() lacks strict=False, retry with a temporary load_weights shim for
+    registered mismatch signatures and exact allow-listed keys only.
     """
     try:
         with _temporary_hf_token_env(hf_token):
@@ -361,11 +344,8 @@ def _load_mlx_vlm_with_extra_weight_filter(
 
 
 def _build_vlm_model_types():
-    """Build the set of model_type strings that mlx_vlm supports.
-
-    Uses dynamic discovery via pkgutil + MODEL_REMAPPING keys/values.
-    Returns frozenset; cached at module level by _is_vlm().
-    """
+    """Frozenset of model_type strings mlx_vlm supports (discovered via
+    pkgutil + MODEL_REMAPPING); cached at module level by _is_vlm()."""
     types_set = set()
     try:
         import mlx_vlm.models as vlm_models_pkg
@@ -378,7 +358,6 @@ def _build_vlm_model_types():
 
     try:
         from mlx_vlm.utils import MODEL_REMAPPING
-        # Add both source and target keys
         for src, tgt in MODEL_REMAPPING.items():
             types_set.add(src)
             types_set.add(tgt)
@@ -389,10 +368,10 @@ def _build_vlm_model_types():
 
 
 def _fix_missing_no_grad(model):
-    """Ensure every nn.Module submodule has _no_grad / _training.
+    """Ensure every submodule has _no_grad / _training.
 
-    Works around upstream model definitions that use __new__ without __init__
-    (e.g. gemma4 AudioRelativePositionEmbedding).
+    Works around upstream modules using __new__ without __init__ (e.g. gemma4
+    AudioRelativePositionEmbedding).
     """
     import mlx.nn as nn
     for _, mod in model.named_modules():
@@ -404,18 +383,13 @@ def _fix_missing_no_grad(model):
 
 
 class _TrainingKVStore:
-    """Lightweight KV store for Gemma4 KV-sharing during training.
+    """Minimal KV store for Gemma4 KV-sharing during training.
 
-    Gemma4 E2B/E4B have shared attention layers that borrow K/V from earlier
-    "store" layers via the KV cache. During training (cache=None), the shared
-    layers silently fall through to computing their own K/V from wrong hidden
-    states. This class provides a minimal interface so store layers can write
-    K/V and shared layers can read them, without autoregressive offset tracking.
-
-    Implements the subset of KVCache that Attention.__call__ needs:
-    - offset (always 0 for training — no prior tokens)
-    - state property (returns stored K/V)
-    - update_and_fetch (stores K/V from store layer)
+    Gemma4 E2B/E4B shared layers borrow K/V from earlier "store" layers via
+    the cache; with cache=None they'd recompute K/V from the wrong hidden
+    states. This lets store layers write and shared layers read, with no
+    autoregressive offset tracking. Implements just the KVCache surface
+    Attention.__call__ needs: offset (0), state, update_and_fetch.
     """
     __slots__ = ("keys", "values")
 
@@ -440,14 +414,9 @@ class _TrainingKVStore:
 def _fix_gemma4_kv_sharing(model):
     """Fix Gemma4 KV-shared layers producing wrong K/V during training.
 
-    Gemma4 E2B/E4B have num_kv_shared_layers shared attention layers that
-    borrow K/V from earlier "store" layers via the KV cache. When cache=None
-    (training), shared layers fall through to computing their own K/V from
-    the wrong hidden state — silently producing incorrect attention.
-
-    Fix: monkey-patch the text backbone's __call__ to create _TrainingKVStore
-    objects when cache=None, so store layers populate them and shared layers
-    read correct K/V.
+    With cache=None (training) the shared layers recompute K/V from the wrong
+    hidden state. Fix: patch the text backbone's __call__ to create
+    _TrainingKVStore objects when cache=None so shared layers read correct K/V.
     """
     lm = getattr(model, "language_model", None)
     if lm is None:
@@ -492,10 +461,9 @@ def _fix_gemma4_kv_sharing(model):
 def _fix_qwen35_attention_cache(model):
     """Fix Qwen3.5 attention crash when cache=None during training.
 
-    mlx-vlm's Qwen3.5 attention does `cache.offset + 1` without checking
-    if cache is None. During training cache is always None. Patch the
-    attention __call__ to handle cache=None by computing position_ids
-    from scratch.
+    mlx-vlm's Qwen3.5 attention does `cache.offset + 1` without a None check,
+    but training always passes cache=None. Patch __call__ to compute
+    position_ids from scratch in that case.
     """
     try:
         import importlib
@@ -512,7 +480,7 @@ def _fix_qwen35_attention_cache(model):
     original_attn_call = attn_cls.__call__
 
     def patched_attn_call(self, x, mask=None, cache=None, position_ids=None, **kwargs):
-        # When training (cache=None) and position_ids=None, compute them
+        # Compute position_ids when training (cache=None, position_ids=None).
         if cache is None and position_ids is None:
             import mlx.core as mx
             L = x.shape[1]
@@ -534,11 +502,8 @@ def _safe_getsource(obj) -> str:
 
 
 def _has_multimodal_strip_sanitize(model_or_cls) -> bool:
-    """Return whether a loader-side sanitize path strips multimodal towers.
-
-    We use this as a generic signal for "text-only load of a multimodal wrapper"
-    instead of hardcoding every Gemma-like family by name.
-    """
+    """Whether a sanitize path strips multimodal towers, a generic signal for
+    "text-only load of a multimodal wrapper" (vs hardcoding families)."""
 
     cls = model_or_cls if inspect.isclass(model_or_cls) else type(model_or_cls)
     sanitize = getattr(cls, "sanitize", None)
@@ -561,14 +526,12 @@ def _get_mlx_lm_model_class(model_type: str):
 
 
 def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
-    """Return whether a multimodal wrapper should stay on the VLM load path.
+    """Whether a multimodal wrapper should stay on the VLM load path.
 
-    We still want a plain tokenizer API for text-only training, but some repos
-    are fundamentally multimodal wrappers whose `mlx_lm` text path works only
-    by stripping modality towers in `sanitize()`. That is a strong signal that
-    the text loader is reconstructing a different object graph than the actual
-    checkpoint. When that happens, keeping the runtime on the VLM model path is
-    more robust than trying to maintain one sanitizer workaround per family.
+    Some repos are multimodal wrappers whose mlx_lm text path works only by
+    stripping modality towers in `sanitize()`, meaning it reconstructs a
+    different object graph than the checkpoint. Keeping the VLM path is more
+    robust than a per-family sanitizer workaround.
     """
 
     if not _is_vlm(config):
@@ -584,13 +547,9 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
 def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
     """Patch nested-weight sanitize assumptions for text-only multimodal loads.
 
-    Some `mlx_lm` multimodal wrappers sanitize text-only checkpoints by first
-    unflattening weights and then blindly indexing `weights["model"]`. That is
-    brittle across upstream packing changes: some checkpoints expose the text
-    wrapper under `"model"`, others expose the same multimodal towers at the
-    top level. We patch the sanitize method by behavior, not by one exact
-    architecture, so any future loader with the same nested-vs-top-level
-    assumption is handled the same way.
+    Some mlx_lm wrappers unflatten then blindly index `weights["model"]`, which
+    breaks when towers sit at the top level instead. Patch by behavior, not by
+    one architecture, so any loader with the same assumption is handled.
     """
 
     if not model_type or model_type in _SAFE_TEXT_SANITIZE_PATCHED:
@@ -636,17 +595,13 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
 
 
 def _fp16_needs_bf16_modules(model):
-    """Return modules that should stay bf16 under fp16 training.
+    """Modules that should stay bf16 under fp16 training.
 
-    Some Pixtral/Mistral3-family VLMs emit vision hidden states above fp16's
-    finite range on real OCR-style images. The projector output remains small,
-    but the selected vision features can exceed 65,504 before projection, so
-    a plain `model.set_dtype(mx.float16)` overflows inside get_input_embeddings.
-
-    Text-only loads of multimodal wrapper models can also be numerically shaky
-    in fp16. We detect those by behavior: if the wrapper sanitize path strips
-    multimodal towers before handing off to a text backbone, we keep that
-    backbone in bf16 under an fp16 training request.
+    Some Pixtral/Mistral3 VLMs emit vision features above fp16's range (>65,504)
+    before projection, so `model.set_dtype(mx.float16)` overflows in
+    get_input_embeddings. Text-only loads of multimodal wrappers are also shaky
+    in fp16; detect them by the strip-tower sanitize path and keep the text
+    backbone bf16.
     """
     model_module = type(model).__module__
     vision_tower = getattr(model, "vision_tower", None)
@@ -682,8 +637,8 @@ def _fp16_needs_bf16_modules(model):
 def _resolve_full_finetune_dtype(target_dtype, float32_mixed_precision, mx):
     if target_dtype == mx.bfloat16:
         if type(float32_mixed_precision) is not bool:
-            # Match the Torch post-patch default: bf16 full finetuning stays
-            # bf16 unless float32_mixed_precision=True is explicitly requested.
+            # Match Torch: bf16 full finetuning stays bf16 unless
+            # float32_mixed_precision=True is explicit.
             float32_mixed_precision = False
         if float32_mixed_precision is False:
             return mx.bfloat16, False
@@ -1074,11 +1029,10 @@ def _quant_config_from_resolved_map(resolved_map):
 
 
 def _normalize_mlx_lora_module_paths(module_paths):
-    """Normalize stored module paths into a list of non-empty strings.
+    """Normalize stored module paths to a list of non-empty strings.
 
-    Accepts str, list/tuple/set, dict ({"language": [...], "vision": [...]}),
-    and pathlib.Path; iterating a bare string would walk characters and
-    never wrap a real LoRA layer.
+    Accepts str, list/tuple/set, dict, and pathlib.Path; a bare string is
+    wrapped (not iterated char-by-char).
     """
     if module_paths is None:
         return []
@@ -1107,11 +1061,10 @@ def _normalize_mlx_lora_module_paths(module_paths):
 
 
 def _infer_rank_from_saved_adapter(adapter_weights_file, module_path):
-    """Read the rank dimension off the saved LoRA tensor for `module_path`.
+    """Read the rank from the saved LoRA tensor for `module_path`.
 
-    Compatibility shim for legacy direct-save adapters that wrote
-    `unsloth_mlx_lora_module_paths` without persisting rank/scale/dropout.
-    Returns None when the file/path is absent or imports fail.
+    Compat shim for legacy adapters that saved module paths without
+    rank/scale/dropout. Returns None if the file/path is absent or imports fail.
     """
     if not adapter_weights_file or not os.path.exists(adapter_weights_file):
         return None
@@ -1124,11 +1077,10 @@ def _infer_rank_from_saved_adapter(adapter_weights_file, module_path):
         ".lora_A.weight", ".lora_A",
         ".lora_embedding_a.weight", ".lora_embedding_a",
     )
-    # Suffixes whose 2-D shape is (rank, in_dims): mlx-lm's layer-backed
-    # `lora_a.weight` and PEFT-style uppercase `lora_A` / `lora_A.weight`.
-    # Raw lowercase `lora_a` keeps the older (in_dims, rank) shape so falls
-    # through to the default shape[-1] branch. `.lora_embedding_a*` is NOT
-    # in this set: LoRAEmbedding saves A as (num_embeddings, rank).
+    # Suffixes whose 2-D shape is (rank, in_dims): mlx-lm's `lora_a.weight` and
+    # PEFT-style `lora_A` / `lora_A.weight`. Raw lowercase `lora_a` keeps the
+    # older (in_dims, rank) shape (default shape[-1] branch). `.lora_embedding_a*`
+    # is excluded: LoRAEmbedding saves A as (num_embeddings, rank).
     _rank_first_2d_suffixes = frozenset({
         ".lora_a.weight",
         ".lora_A",
@@ -1145,7 +1097,7 @@ def _infer_rank_from_saved_adapter(adapter_weights_file, module_path):
                 shape = tuple(tensor.shape)
                 if not shape:
                     return None
-                # MoE/switch: (experts, rank, in_dims) → rank is shape[-2].
+                # MoE/switch (experts, rank, in_dims): rank is shape[-2].
                 if len(shape) >= 3:
                     return int(shape[-2])
                 if suffix in _rank_first_2d_suffixes:
@@ -1157,13 +1109,12 @@ def _infer_rank_from_saved_adapter(adapter_weights_file, module_path):
 
 
 def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=None):
-    """Recreate LoRA/DoRA layers at saved module paths so vision/projector
-    and MoE/embedding LoRA survives reload (mlx-lm's load_adapters only
-    rebuilds the language tower's Linear layers).
+    """Recreate LoRA/DoRA at saved module paths so vision/projector and
+    MoE/embedding LoRA survive reload (mlx-lm's load_adapters rebuilds only the
+    language tower).
 
-    Returns the number of new wrappers attached. `adapter_weights_file` is
-    a last-resort rank source for legacy adapters that wrote
-    `unsloth_mlx_lora_module_paths` without rank/scale/dropout.
+    Returns the number of wrappers attached. `adapter_weights_file` is a
+    last-resort rank source for legacy adapters lacking rank/scale/dropout.
     """
     import mlx.nn as nn
     from mlx_lm.tuner.lora import LoRALinear
@@ -1195,9 +1146,8 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
         if t is not None
     )
 
-    # DoRA path: refuse silent downgrade to plain LoRA when the saved
-    # model had DoRA modules; the per-module loop raises a specific
-    # ImportError if it hits one that needs the missing class.
+    # DoRA path: refuse silent downgrade to plain LoRA; the per-module loop
+    # raises ImportError if it needs a missing DoRA class.
     fine_tune_type = str(adapter_cfg.get("fine_tune_type", "lora")).lower()
     use_dora = fine_tune_type == "dora"
     DoRALinear_cls = DoRAEmbedding_cls = None
@@ -1211,9 +1161,8 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
         except Exception:
             DoRAEmbedding_cls = None
 
-    # Defer rank validation until the first module actually needs wrapping;
-    # a legacy adapter with no rank but paths already wrapped by mlx-lm.
-    # load_adapters should not crash here.
+    # Defer rank validation until a module needs wrapping, so a legacy adapter
+    # with no rank (but already wrapped by load_adapters) doesn't crash here.
     _metadata = {"rank": None, "scale": None, "dropout": None}
 
     def _ensure_metadata(module_path=None):
@@ -1222,8 +1171,8 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
         lora_params = adapter_cfg.get("lora_parameters") or {}
         raw_rank = lora_params.get("rank", adapter_cfg.get("rank"))
         if raw_rank is None and module_path is not None:
-            # Legacy direct-save fallback: recover rank from the saved
-            # tensor shape; scale/dropout stay at their 1.0 / 0.0 defaults.
+            # Legacy fallback: recover rank from the saved tensor shape;
+            # scale/dropout stay at 1.0 / 0.0.
             raw_rank = _infer_rank_from_saved_adapter(
                 adapter_weights_file, module_path,
             )
@@ -1235,12 +1184,9 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
                 "wrappers with placeholder rank=8. Re-save the adapter "
                 "with rank/scale/dropout populated."
             )
-        # Wrap the int/float conversions in a namespaced ValueError so
-        # malformed metadata (e.g. `"rank": "not-an-int"` in a hand-
-        # authored or stale config) raises the same "Unsloth MLX:" prefix
-        # the outer adapter detection catch preserves. Without this the
-        # plain `invalid literal for int()` ValueError can be swallowed
-        # by the fallback into a silent standard-load.
+        # Re-raise conversion errors with the "Unsloth MLX:" prefix the outer
+        # catch preserves; otherwise a plain `int()` ValueError on malformed
+        # metadata gets swallowed into a silent standard-load.
         try:
             _metadata["rank"] = int(raw_rank)
             _metadata["scale"] = float(
@@ -1260,9 +1206,8 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
     by_name = dict(model.named_modules())
     linear_types = (nn.Linear, nn.QuantizedLinear)
     attached = 0
-    # Track per-path skip reasons for the final warning so the user knows
-    # which paths could not be re-wrapped (the saved-vs-live key diff is
-    # the actual gate that raises).
+    # Track per-path skip reasons for the final warning (the saved-vs-live key
+    # diff is the gate that actually raises).
     _skipped_paths = []
     for name in module_paths:
         module = by_name.get(name)
@@ -1275,8 +1220,8 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
         lora_cls = None
         if isinstance(module, linear_types):
             if use_dora:
-                # Fail loud: silent downgrade to plain LoRA would drop the
-                # saved q_proj.m magnitude tensor on strict=False.
+                # Fail loud: a plain-LoRA downgrade drops the saved DoRA `.m`
+                # tensor on strict=False.
                 if DoRALinear_cls is None:
                     raise ImportError(
                         "Unsloth MLX: adapter_config.json says "
@@ -1288,8 +1233,8 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
             else:
                 lora_cls = LoRALinear
         elif switch_types and isinstance(module, switch_types):
-            # No DoRA on switch layers in mlx-lm; fail loud rather than
-            # silently dropping saved switch LoRA tensors.
+            # mlx-lm has no DoRA on switch layers; fail loud, don't drop saved
+            # switch LoRA tensors.
             if LoRASwitchLinear is None:
                 raise ImportError(
                     "Unsloth MLX: adapter_config.json contains a saved "
@@ -1310,8 +1255,8 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
                     )
                 lora_cls = DoRAEmbedding_cls
             else:
-                # Fail loud for the embedding path too: silent lora_cls=None
-                # would drop saved embedding LoRA tensors on strict=False.
+                # Fail loud for embeddings too: lora_cls=None would drop saved
+                # embedding LoRA tensors on strict=False.
                 if LoRAEmbedding is None:
                     raise ImportError(
                         "Unsloth MLX: adapter_config.json contains a saved "
@@ -1331,9 +1276,8 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
             lora_cls, module,
             _metadata["rank"], _metadata["scale"], _metadata["dropout"],
         )
-        # Walk numeric path segments (e.g. `vision_tower.merger.layers.0`)
-        # via `parent[int(seg)]` first then getattr; same try-int /
-        # setattr pattern on the leaf so list-indexed wrappers install.
+        # Resolve numeric path segments (e.g. `...layers.0`) via parent[int(seg)]
+        # then getattr; same pattern on the leaf so list-indexed wrappers install.
         parts = name.split(".")
         parent = model
         parent_reachable = True
@@ -1405,13 +1349,10 @@ _ADAPTER_LORA_KEY_SUFFIXES = (
 def _warn_missing_adapter_keys(model, adapter_weights_file):
     """Diff saved adapter LoRA keys against live params and warn.
 
-    Compares both presence AND shape so a wrong-rank live wrapper at a
-    matching key (e.g. mlx-lm wrapped the language tower at default
-    rank=8 over saved rank-4) is reported as missing. Called on both the
-    success and fallback branches; never blocks the following
-    load_weights() (exceptions are swallowed into a skip warning).
-    Returns the sorted missing-key list so the fallback can raise instead
-    of returning a partial adapter; `[]` means clean OR skipped.
+    Compares presence AND shape so a wrong-rank live wrapper (e.g. default
+    rank=8 over saved rank-4) counts as missing. Never blocks the following
+    load_weights() (exceptions become a skip warning). Returns the sorted
+    missing-key list so the fallback can raise; `[]` means clean or skipped.
     """
     if not adapter_weights_file or not os.path.exists(adapter_weights_file):
         return []
@@ -1431,10 +1372,8 @@ def _warn_missing_adapter_keys(model, adapter_weights_file):
                 continue
             shape = getattr(v, "shape", None)
             _bound_shapes[k] = tuple(shape) if shape is not None else None
-        # Compare presence AND shape so a wrong-rank live wrapper (e.g.
-        # default rank=8 over saved rank-4) is reported missing; a pure
-        # key-set diff would call it "fully bound" and strict=False would
-        # drop the saved tensors.
+        # Presence AND shape: a pure key-set diff would call a wrong-rank
+        # wrapper "fully bound" and strict=False would drop the saved tensors.
         _missing = sorted(
             k for k, saved_shape in _saved_shapes.items()
             if k not in _bound_shapes or _bound_shapes[k] != saved_shape
@@ -1494,10 +1433,9 @@ _FROM_BASE_SIGNATURE_NEEDLES = (
     "got multiple values",
     "no argument named",
     "takes no keyword",
-    # Manual-rejection phrasings from custom shims. Intentionally narrow:
-    # _is_from_base_kwarg_typeerror only treats these as signature
-    # mismatches when the error ALSO names one of our kwargs, so
-    # "rank 4 not supported" cannot silently downgrade rank.
+    # Manual-rejection phrasings; only treated as signature mismatches when the
+    # error also names one of our kwargs, so "rank 4 not supported" can't
+    # downgrade rank.
     "not accepted",
     "not supported",
 )
@@ -1507,8 +1445,8 @@ def _is_from_base_kwarg_typeerror(exc, kwarg=None, kwargs=None):
     """True when `exc` is a `from_base()` signature mismatch (older mlx-lm
     rejecting r/scale/dropout), not an internal wrapper TypeError.
 
-    Falling back through fewer-arg signatures on an unrelated TypeError
-    would silently downgrade rank to r=8 and mis-bind a wrong-rank wrapper.
+    Falling back on an unrelated TypeError would downgrade rank to r=8 and
+    mis-bind a wrong-rank wrapper.
     """
     import re
 
@@ -1530,8 +1468,8 @@ def _is_from_base_kwarg_typeerror(exc, kwarg=None, kwargs=None):
     if not any(needle in msg for needle in _FROM_BASE_SIGNATURE_NEEDLES):
         return False
 
-    # Require the kwarg as a standalone word so short kwargs like "r" do
-    # not match "rank" / "wrapper" / "are" in unrelated semantic errors.
+    # Require the kwarg as a whole word so "r" doesn't match "rank"/"are" in
+    # unrelated errors.
     return any(
         re.search(rf"(?<![\w]){re.escape(k)}(?![\w])", msg)
         for k in kwargs_lower
@@ -1539,11 +1477,8 @@ def _is_from_base_kwarg_typeerror(exc, kwarg=None, kwargs=None):
 
 
 def _no_rank_fallback_or_fail(from_base, module, rank):
-    """Call `from_base(module)` only when rank is the upstream default (8).
-
-    Any other rank must NOT silently downgrade; strict=False would then
-    drop the saved different-rank tensors.
-    """
+    """Call `from_base(module)` only when rank is the upstream default (8); any
+    other rank must not downgrade or strict=False drops the saved tensors."""
     if int(rank) != 8:
         raise ValueError(
             f"Unsloth MLX: this mlx-lm wrapper's from_base() does not "
@@ -1557,8 +1492,8 @@ def _no_rank_fallback_or_fail(from_base, module, rank):
 def _lora_from_base_compat(lora_cls, module, rank, scale, dropout):
     """Call lora_cls.from_base with older-signature fallback.
 
-    Only retries on signature-mismatch TypeErrors; internal wrapper
-    TypeErrors propagate so we never silently downgrade rank to r=8.
+    Retries only on signature-mismatch TypeErrors; internal wrapper TypeErrors
+    propagate so rank is never downgraded to r=8.
     """
     try:
         return lora_cls.from_base(module, r=rank, scale=scale, dropout=dropout)
@@ -1575,13 +1510,12 @@ def _lora_from_base_compat(lora_cls, module, rank, scale, dropout):
 
 
 def _patch_mlx_lora_from_base_compat():
-    """Monkey-patch mlx_lm LoRA/DoRA `from_base()` to accept scale/dropout
-    kwargs on older mlx-lm wheels.
+    """Monkey-patch mlx_lm LoRA/DoRA `from_base()` to accept scale/dropout on
+    older wheels.
 
-    The canonical mlx-lm walk (linear_to_lora_layers / load_adapters) calls
-    `from_base(..., scale=..., dropout=...)` directly with no fallback, so
-    without this an older wheel produces an asymmetric partial-LoRA model.
-    Idempotent: each class gets `_unsloth_from_base_compat = True`.
+    The canonical walk calls `from_base(..., scale=..., dropout=...)` with no
+    fallback, so an older wheel would yield a partial-LoRA model. Idempotent
+    via `_unsloth_from_base_compat`.
     """
     patch_targets = (
         ("mlx_lm.tuner.lora", ("LoRALinear", "LoRASwitchLinear", "LoRAEmbedding")),
@@ -1598,8 +1532,8 @@ def _patch_mlx_lora_from_base_compat():
             if lora_cls is None or getattr(lora_cls, "_unsloth_from_base_compat", False):
                 continue
 
-            # Stubs without from_base: skip rather than patch the wrong
-            # attribute; the upstream walk will surface AttributeError.
+            # Stubs without from_base: skip; the upstream walk surfaces the
+            # AttributeError.
             original_from_base = getattr(lora_cls, "from_base", None)
             if original_from_base is None:
                 continue
@@ -1612,11 +1546,10 @@ def _patch_mlx_lora_from_base_compat():
                 scale=20.0,
                 _orig=original_from_base,
             ):
-                # Pass-through on new mlx-lm; fall back through older
-                # signatures the same way _lora_from_base_compat does.
-                # Positional order MUST match upstream
-                # `LoRALinear.from_base(linear, r=8, dropout=0.0, scale=20.0)`
-                # so positional callers don't get scale/dropout swapped.
+                # Pass-through on new mlx-lm; else fall back like
+                # _lora_from_base_compat. Positional order MUST match upstream
+                # `from_base(linear, r=8, dropout=0.0, scale=20.0)` so callers
+                # don't swap scale/dropout.
                 try:
                     return _orig(module, r=r, dropout=dropout, scale=scale)
                 except TypeError as exc:
@@ -1630,8 +1563,7 @@ def _patch_mlx_lora_from_base_compat():
                         wrapped = _no_rank_fallback_or_fail(_orig, module, r)
                     return _apply_lora_metadata_to_wrapper(wrapped, scale, dropout)
 
-            # Best-effort patch; simulation stubs with __slots__ raise on
-            # assignment, which is the right surface for those builds.
+            # Best-effort; simulation stubs with __slots__ raise on assignment.
             try:
                 lora_cls.from_base = classmethod(_compat_from_base)
                 lora_cls._unsloth_from_base_compat = True
@@ -2099,12 +2031,11 @@ def _anchor_conversation_media_to_first_user_turn(
     num_audios,
     kwargs,
 ):
-    """Rebuild text-only chat while keeping conversation-level media on turn 1.
+    """Rebuild text-only chat, keeping conversation-level media on turn 1.
 
-    mlx-vlm's prompt helper used to attach `num_images` / `num_audios` to the
-    last user turn for list prompts. That shifts the image token between turns
-    during multi-turn chat, which breaks prompt-cache reuse for models like
-    Qwen3.5 that pre-compute multimodal rope positions from the full prompt.
+    mlx-vlm attached `num_images`/`num_audios` to the last user turn, shifting
+    the image token between turns and breaking prompt-cache reuse for models
+    like Qwen3.5 that precompute multimodal rope positions from the full prompt.
     """
     target_idx = _first_media_user_message_index(messages)
     if target_idx < 0:
@@ -2215,9 +2146,8 @@ def _build_role_prompt_fallback(processor, messages, *, add_generation_prompt):
 
 
 _EMPTY_VLM_CHAT_TEMPLATE_FALLBACKS = {
-    # Upstream Qwen2-VL MLX template expects a flat content list instead of
-    # standard role-wrapped chat messages, so normal chat rendering can return
-    # an empty string. Fall back to a simple role-prefixed prompt instead.
+    # Qwen2-VL's MLX template expects a flat content list, so role-wrapped chat
+    # can render empty; fall back to a role-prefixed prompt.
     "qwen2_vl": _build_role_prompt_fallback,
 }
 
@@ -2243,15 +2173,12 @@ def _prepare_vlm_template_messages(
     num_audios,
     kwargs,
 ):
-    """Normalize prompt input and apply the smallest rewrite needed for VLM chat.
+    """Normalize prompt input and apply the smallest VLM-chat rewrite.
 
-    There are two cases where we bypass mlx-vlm's higher-level helper and render
-    messages ourselves:
-    1. The prompt already uses structured multimodal content and must survive
-       intact instead of being flattened back to plain text.
-    2. The caller passes conversation-level `num_images` / `num_audios`. In
-       that case we anchor those media tokens to the first user turn so prompt
-       cache reuse does not silently change rope positions between turns.
+    Bypass mlx-vlm's helper and render ourselves when (1) the prompt already
+    has structured multimodal content (must survive intact) or (2) the caller
+    passes conversation-level `num_images`/`num_audios` (anchor media to the
+    first user turn so cache reuse doesn't shift rope positions).
     """
     prompt_items = prompt if isinstance(prompt, list) else [prompt]
     normalized_messages = _normalize_prompt_messages(prompt_utils_module, prompt_items)
@@ -2424,9 +2351,8 @@ def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
 def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, **kwargs):
     from .utils import push_to_hub_merged
     tokenizer = tokenizer or self._tokenizer
-    # If save_directory wasn't given, fall back to repo_id (relative dir
-    # named after the repo). Callers that already saved locally should
-    # pass save_directory= to avoid a redundant re-save.
+    # Default save_directory to repo_id; callers that already saved locally
+    # should pass save_directory= to avoid a re-save.
     save_directory = save_directory or repo_id
     push_to_hub_merged(self, tokenizer, save_directory, repo_id=repo_id, **kwargs)
 
@@ -2701,13 +2627,11 @@ class FastMLXModel:
                 bf16 is emulated and ~40-70%% slower in prefill — fp16 is
                 recommended on those chips.
             load_in_4bit: Accepted for API compat with CUDA unsloth.
-            full_finetuning: When True, force-disable runtime quantization
-                (``load_in_4bit`` etc.) so the full-precision weights are
-                trainable. By default MLX mirrors Unsloth Torch full
-                finetuning and upcasts trainable floating weights to float32;
-                pass ``float32_mixed_precision=False`` to keep native bf16
-                weights on bf16-capable Apple Silicon. ``get_peft_model``
-                becomes a no-op for models loaded this way.
+            full_finetuning: When True, disable runtime quantization so
+                full-precision weights are trainable. MLX mirrors Unsloth Torch
+                and upcasts trainable float weights to float32; pass
+                ``float32_mixed_precision=False`` to keep native bf16 on
+                bf16-capable chips. ``get_peft_model`` becomes a no-op.
             token: HuggingFace token for gated models.
             text_only: Loading mode:
                 None  — auto-detect from config (default)
@@ -2822,14 +2746,13 @@ class FastMLXModel:
             force_requantize=force_requantize,
         )
 
-        # Seed mlx random state so any randomness during model construction
-        # (e.g. layer init for runtime-quantized models) is reproducible.
+        # Seed mlx random state so construction-time randomness (e.g. runtime
+        # quant layer init) is reproducible.
         _seed_mlx_random_state(random_state)
 
-        # Split download from config-read so a missing config.json
-        # does not clear local_path. LoRA-adapter directories carry
-        # adapter_config.json but no config.json; the adapter branch
-        # below needs local_path either way.
+        # Separate download from config-read so a missing config.json doesn't
+        # clear local_path: LoRA-adapter dirs have adapter_config.json but no
+        # config.json, and the adapter branch needs local_path.
         local_path = None
         try:
             with _temporary_hf_token_env(token):
@@ -2847,13 +2770,9 @@ class FastMLXModel:
                 except (json.JSONDecodeError, KeyError):
                     config_data = {}
 
-        # Reject full_finetuning against a pre-quantized repo. The weights on
-        # disk are int4/int8 packed; full FT would need them in a trainable
-        # float dtype, and our CCE backward returns mx.zeros for the quantized
-        # weight gradient (since dequant→grad→requant is not implemented).
-        # Without this check the user would silently train only the
-        # non-quantized params (LayerNorms, biases) while the bulk of the
-        # model's quantized linears never updated.
+        # Reject full_finetuning on a pre-quantized repo: int4/int8 weights
+        # aren't trainable (our CCE backward zeros the quantized weight grad),
+        # so full FT would silently update only LayerNorms/biases.
         if full_finetuning and _get_existing_mlx_quantization(config_data):
             raise ValueError(
                 f"Unsloth: full_finetuning=True was requested against "
@@ -2962,10 +2881,9 @@ class FastMLXModel:
                                     "Use the saved base quantization policy or retrain "
                                     "the adapter for the requested base quantization."
                                 )
-                    # Always reload the base via FastMLXModel.from_pretrained
-                    # (works for both text and VLM); the previous mlx_lm.load
-                    # fallback for non-quant-metadata adapters silently broke
-                    # VLM adapters because mlx-lm's load is text-only.
+                    # Reload the base via FastMLXModel.from_pretrained (text +
+                    # VLM); the old mlx_lm.load fallback broke VLM adapters
+                    # (mlx-lm load is text-only).
                     model, tokenizer = FastMLXModel.from_pretrained(
                         base_model_id,
                         max_seq_length=max_seq_length,
@@ -2991,29 +2909,26 @@ class FastMLXModel:
                         ),
                     )
                     _validate_mlx_adapter_base(model, adapter_cfg)
-                    # why: load_adapters only rebuilds language-tower LoRA;
-                    # vision/projector LoRA must be re-attached at the saved
-                    # paths first so load_weights binds the trained tensors.
+                    # why: load_adapters rebuilds only language-tower LoRA;
+                    # vision/projector LoRA must be re-attached so load_weights
+                    # binds the trained tensors.
                     _saved_lora_paths = _normalize_mlx_lora_module_paths(
                         adapter_cfg.get("unsloth_mlx_lora_module_paths"),
                     )
-                    # Call load_adapters FIRST (canonical walk rebuilds the
-                    # language tower); _apply_lora_at_paths runs AFTER and
-                    # skips already-wrapped paths, leaving only auxiliary
-                    # (vision / projector / MoE / embedding) to attach. The
-                    # old order produced nested LoRALinear(LoRALinear).
+                    # load_adapters FIRST (rebuilds the language tower);
+                    # _apply_lora_at_paths runs after and skips wrapped paths,
+                    # attaching only auxiliary (vision/projector/MoE/embedding).
+                    # The old order nested LoRALinear(LoRALinear).
                     from mlx_lm.tuner.utils import load_adapters
-                    # Compatibility patch so older mlx-lm's load_adapters
-                    # accepts scale=/dropout= without forcing a manual-wrap fallback.
+                    # Let older mlx-lm load_adapters accept scale=/dropout=.
                     _patch_mlx_lora_from_base_compat()
                     adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
                     _load_adapters_ok = False
                     _load_adapters_exc = None
-                    # Staging-only R29 DoRA pre-validate: catch missing
-                    # mlx_lm.tuner.dora BEFORE load_adapters silently rebuilds
-                    # plain LoRA and drops saved DoRA `.m` tensors via
-                    # strict=False. Distinct from _apply_lora_at_paths's
-                    # post-check, which fires per-module after wrapping.
+                    # Pre-validate DoRA: catch missing mlx_lm.tuner.dora before
+                    # load_adapters rebuilds plain LoRA and drops saved DoRA
+                    # `.m` via strict=False (distinct from the per-module
+                    # post-check in _apply_lora_at_paths).
                     if adapter_cfg.get("fine_tune_type") == "dora":
                         try:
                             import mlx_lm.tuner.dora  # noqa: F401
@@ -3029,25 +2944,23 @@ class FastMLXModel:
                         model = load_adapters(model, local_path)
                         _load_adapters_ok = True
                     except Exception as _exc:
-                        # Fall through to the manual-wrap + strict=False
-                        # fallback below (needed for adapter sets lacking
-                        # mlx-lm metadata, e.g. missing num_layers).
+                        # Fall through to the manual-wrap + strict=False fallback
+                        # (for adapters lacking mlx-lm metadata, e.g. num_layers).
                         _load_adapters_exc = _exc
 
                     _aux_attached = 0
                     if _saved_lora_paths:
-                        # Attach auxiliary paths (vision / projector / MoE)
-                        # that linear_to_lora_layers does not walk; the
-                        # skip-if-wrapped guard makes language-tower paths
-                        # no-ops here.
+                        # Attach auxiliary paths (vision/projector/MoE) that
+                        # linear_to_lora_layers skips; language-tower paths are
+                        # no-ops via the skip-if-wrapped guard.
                         try:
                             _aux_attached = _apply_lora_at_paths(
                                 model, _saved_lora_paths, adapter_cfg,
                                 adapter_weights_file=adapter_weights_file,
                             ) or 0
                         except (ValueError, ImportError):
-                            # Caller-actionable contracts (missing rank
-                            # metadata / DoRA class); never downgrade.
+                            # Caller-actionable (missing rank / DoRA class); never
+                            # downgrade.
                             raise
                         except Exception as _exc:
                             warnings.warn(
@@ -3060,18 +2973,16 @@ class FastMLXModel:
                     # Bind aux tensors via a follow-up load_weights and run
                     # the shared key diff so silent drops surface here too.
                     if _load_adapters_ok and os.path.exists(adapter_weights_file):
-                        # Always diff (even when _aux_attached == 0): a
-                        # caller-declared aux path the live tree no longer
-                        # satisfies would otherwise sit in adapters.safetensors
-                        # with no live module to bind into.
+                        # Always diff (even _aux_attached == 0): a declared aux
+                        # path the live tree no longer satisfies has no module
+                        # to bind into.
                         _missing_after_success = _warn_missing_adapter_keys(
                             model, adapter_weights_file,
                         )
                         if _aux_attached > 0:
                             model.load_weights(adapter_weights_file, strict=False)
-                        # Refuse to return a partial adapter on ANY shape
-                        # mismatch (e.g. stale rank=8 over rank-4) so the
-                        # success branch stays in lockstep with the fallback.
+                        # Refuse a partial adapter on any shape mismatch (e.g.
+                        # stale rank=8 over rank-4), matching the fallback.
                         if _missing_after_success:
                             _preview = ", ".join(_missing_after_success[:5])
                             if len(_missing_after_success) > 5:
@@ -3088,9 +2999,8 @@ class FastMLXModel:
                             )
 
                     if not _load_adapters_ok:
-                        # No wrappers → strict=False would silently drop
-                        # every saved tensor and return a base model;
-                        # re-raise the original load_adapters error.
+                        # No wrappers: strict=False would drop every saved
+                        # tensor and return a base model; re-raise instead.
                         if _aux_attached == 0:
                             if _load_adapters_exc is not None:
                                 raise _load_adapters_exc
@@ -3100,14 +3010,13 @@ class FastMLXModel:
                                 "saved tensors against."
                             )
                         if os.path.exists(adapter_weights_file):
-                            # Diff saved-vs-live before strict=False; the
-                            # shared helper covers DoRA `.m` + lora_{a,b}.
+                            # Diff saved-vs-live before strict=False (covers DoRA
+                            # `.m` + lora_{a,b}).
                             _missing_saved_keys = _warn_missing_adapter_keys(
                                 model, adapter_weights_file,
                             )
-                            # Refuse an aux-only partial adapter (the language
-                            # tower would silently mis-train); re-raise the
-                            # original load_adapters error chained.
+                            # Refuse an aux-only partial adapter (language tower
+                            # would mis-train); chain the original error.
                             if _missing_saved_keys:
                                 _preview = ", ".join(_missing_saved_keys[:5])
                                 if len(_missing_saved_keys) > 5:
@@ -3128,8 +3037,7 @@ class FastMLXModel:
                                 raise _partial_err
                             model.load_weights(adapter_weights_file, strict=False)
                         else:
-                            # No safetensors fallback; surface the
-                            # original load_adapters failure.
+                            # No safetensors; surface the original failure.
                             if _load_adapters_exc is not None:
                                 raise _load_adapters_exc
                             raise RuntimeError(
@@ -3174,9 +3082,9 @@ class FastMLXModel:
                     _patch_mlx_saving(model, tokenizer)
                     return model, tokenizer
             except Exception as e:
-                # Preserve Unsloth-tagged ValueError/ImportError/RuntimeError
-                # so adapter-config-level failures aren't swallowed into
-                # a silent base-model fallback.
+                # Preserve Unsloth-tagged Value/Import/RuntimeError so
+                # adapter-config failures aren't swallowed into a base-model
+                # fallback.
                 _msg = str(e)
                 _is_unsloth = (
                     "Unsloth:" in _msg or "Unsloth MLX:" in _msg
@@ -3185,12 +3093,11 @@ class FastMLXModel:
                     e, (ValueError, ImportError, RuntimeError)
                 ):
                     raise
-                # Also preserve the namespaced Unsloth MLX RuntimeError
-                # signal from _apply_lora_at_paths.
+                # Preserve the Unsloth MLX RuntimeError from _apply_lora_at_paths.
                 if isinstance(e, RuntimeError) and "Unsloth MLX:" in str(e):
                     raise
-                # If adapter_config declared a LoRA/DoRA artifact, refuse
-                # the silent base-model fallback for any other exception.
+                # If a LoRA/DoRA artifact was declared, refuse the base-model
+                # fallback for any other exception.
                 _is_lora_adapter = False
                 if isinstance(adapter_cfg, dict):
                     _peft_type = str(adapter_cfg.get("peft_type", "")).upper()
@@ -3209,7 +3116,7 @@ class FastMLXModel:
 
         model_type = config_data.get("model_type", "")
 
-        # Step 2: Route based on text_only
+        # Route based on text_only.
         is_vlm = False
         force_vlm_text_path = bool(
             text_only is True and _prefer_vlm_loader_for_text(config_data, model_type)
@@ -3283,8 +3190,7 @@ class FastMLXModel:
                 mx.eval(model.parameters())
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
-                # Lazy-load when we need to convert dtype so weights are
-                # only materialized once in the target dtype.
+                # Lazy-load when converting dtype so weights materialize once.
                 vlm_kwargs = dict(extra_kwargs)
                 vlm_kwargs["revision"] = revision
                 if target_dtype is not None:
@@ -3466,12 +3372,9 @@ class FastMLXModel:
     ):
         """Apply LoRA via mlx-lm on Apple Silicon.
 
-        For VLMs, applies LoRA to the language model and optionally to the
-        vision tower (train_vision=True) and projector (train_projector=True).
-
-        When the model was loaded with ``full_finetuning=True``, this is a
-        no-op: the full-precision parameters stay trainable and the model
-        is returned as-is.
+        For VLMs, applies LoRA to the language model and optionally the vision
+        tower (train_vision=True) and projector (train_projector=True). No-op
+        when the model was loaded with ``full_finetuning=True``.
         """
         loftq_config = kwargs.pop("loftq_config", None)
         if loftq_config is not None:
@@ -3511,18 +3414,14 @@ class FastMLXModel:
             train_vision = bool(finetune_vision_layers)
 
 
-        # PEFT/CUDA semantics: target_modules="all-linear" means literally
-        # every nn.Linear in the model — fused QKV (qkv_proj), MoE routers
-        # and experts, vision tower linears, multimodal projector, untied
-        # lm_head, etc. Walk the model tree and collect those names instead
-        # of silently collapsing to the canonical 7-name list (which would
-        # leave fused-attention archs and MoEs with no LoRA on most of
-        # their linears).
+        # "all-linear" means every nn.Linear (fused QKV, MoE routers/experts,
+        # vision linears, projector, untied lm_head). Walk the tree for those
+        # names rather than collapsing to the canonical 7, which would leave
+        # fused-attention archs and MoEs mostly un-LoRA'd.
         if target_modules == ["all-linear"] or target_modules == "all-linear":
             target_modules = _collect_all_linear_target_names(model)
             if not target_modules:
-                # No Linear modules discovered (shouldn't happen on a real
-                # model). Fall back to the canonical default.
+                # No Linear modules found; fall back to the canonical default.
                 target_modules = [
                     "q_proj", "k_proj", "v_proj", "o_proj",
                     "gate_proj", "up_proj", "down_proj",
@@ -3534,10 +3433,8 @@ class FastMLXModel:
                 "gate_proj", "up_proj", "down_proj",
             ]
 
-        # Filter target_modules by finetune_attention_modules / finetune_mlp_modules.
-        # Applies whether target_modules came from the user as an explicit list,
-        # was built from defaults, or was normalized from "all-linear" — so
-        # toggling these flags always has effect.
+        # Filter by finetune_attention_modules / finetune_mlp_modules,
+        # whatever the source of target_modules, so these flags always apply.
         if isinstance(target_modules, list) and len(target_modules) > 0:
             _ATTN = {
                 "q_proj", "k_proj", "v_proj", "o_proj",
@@ -3567,12 +3464,12 @@ class FastMLXModel:
         is_vlm = getattr(model, "_is_vlm_model", False)
 
         if is_vlm:
-            # VLM path: freeze everything, then apply LoRA selectively
+            # Freeze everything, then apply LoRA selectively.
             _fix_missing_no_grad(model)
             _fix_gemma4_kv_sharing(model)
             model.freeze()
 
-            # Apply LoRA to the language model (filtered by target_modules)
+            # LoRA the language model (filtered by target_modules).
             language_lora_count = 0
             if finetune_language_layers and (
                 target_modules is None or (isinstance(target_modules, list) and len(target_modules) > 0)
@@ -3585,14 +3482,13 @@ class FastMLXModel:
                     num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = _resolve_lora_keys(lm, target_modules)
                 if language_lora_keys is None or len(language_lora_keys) > 0:
-                    # Compatibility patch (older mlx-lm rejects
-                    # scale=/dropout= on from_base); applied before
-                    # _seed_mlx_random_state since monkey-patching
-                    # Python classes does not advance mx.random.
+                    # Compat patch (older mlx-lm rejects scale=/dropout= on
+                    # from_base); before the seed since monkey-patching doesn't
+                    # advance mx.random.
                     _patch_mlx_lora_from_base_compat()
-                    # Match mlx_lm/tuner/lora.py (def train) -- seed
-                    # mx.random immediately before LoRA init; lazy MLX
-                    # state advances otherwise leak into lora_a sampling.
+                    # Seed mx.random immediately before LoRA init (like
+                    # mlx_lm/tuner/lora.py train); otherwise lazy state
+                    # advances leak into lora_a sampling.
                     _seed_mlx_random_state(random_state)
                     linear_to_lora_layers(
                         lm,
@@ -3602,7 +3498,7 @@ class FastMLXModel:
                     )
                     language_lora_count = len(language_lora_keys) if language_lora_keys is not None else num_layers
 
-            # Optionally apply LoRA to vision tower
+            # Optionally LoRA the vision tower.
             vision_lora_count = 0
             if train_vision:
                 vision_lora_count = _lora_walk_module(
@@ -3612,10 +3508,9 @@ class FastMLXModel:
                     attr_names=("vision_tower", "vision_model", "vision_encoder"),
                 )
 
-            # Optionally train the multimodal projector / connector. Prefer
-            # projector LoRA over unfreezing raw weights because many MLX VLM
-            # checkpoints expose projector layers as QuantizedLinear, and MLX
-            # does not backprop into quantized weights directly.
+            # Optionally LoRA the projector/connector. LoRA beats unfreezing
+            # raw weights since many projectors are QuantizedLinear and MLX
+            # can't backprop into quantized weights.
             projector_lora_count = 0
             if train_projector:
                 projector_lora_count = _lora_walk_module(
@@ -3654,12 +3549,11 @@ class FastMLXModel:
                     )
                 _raise_no_lora_targets(target_modules)
 
-            # Unfreeze all LoRA params across the entire tree
+            # Unfreeze all LoRA params across the tree.
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
         else:
-            # Text-only path — filter by target_modules
-            # Fix missing _no_grad on modules that use __new__ without __init__
-            # (e.g. Gemma4 AudioRelativePositionEmbedding loaded via VLM path)
+            # Text-only path. _fix_missing_no_grad handles modules using
+            # __new__ without __init__ (e.g. Gemma4 AudioRelativePosition...).
             _fix_missing_no_grad(model)
 
             if not finetune_language_layers:
@@ -3677,13 +3571,13 @@ class FastMLXModel:
                 language_lora_keys = _resolve_lora_keys(model, target_modules)
                 if language_lora_keys is not None and len(language_lora_keys) == 0:
                     _raise_no_lora_targets(target_modules)
-                # Compatibility patch (older mlx-lm rejects scale=/dropout=
-                # on from_base); applied before _seed_mlx_random_state
-                # since monkey-patching does not advance mx.random.
+                # Compat patch (older mlx-lm rejects scale=/dropout= on
+                # from_base); before the seed since monkey-patching doesn't
+                # advance mx.random.
                 _patch_mlx_lora_from_base_compat()
-                # Match mlx_lm/tuner/lora.py (def train) -- seed
-                # mx.random immediately before LoRA init; lazy MLX
-                # state advances otherwise leak into lora_a sampling.
+                # Seed mx.random immediately before LoRA init (like
+                # mlx_lm/tuner/lora.py train); otherwise lazy state advances
+                # leak into lora_a sampling.
                 _seed_mlx_random_state(random_state)
                 linear_to_lora_layers(
                     model,
@@ -3697,8 +3591,7 @@ class FastMLXModel:
 
         _apply_mlx_lora_initialization(model, init_lora_weights)
 
-        # Apply gradient checkpointing if requested
-        # "mlx" (default) or True → apply; False or "none" → skip
+        # Gradient checkpointing: "mlx"/True -> apply; False/"none" -> skip.
         if isinstance(use_gradient_checkpointing, str):
             _apply_gc = use_gradient_checkpointing.lower() not in ("false", "none", "")
         else:

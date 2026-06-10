@@ -53,23 +53,21 @@ class _FakeFile:
 
 
 class _FakeMM:
-    """Stand-in for the mmap-backed safetensors output. Collects writes so
-    we can assert on them."""
+    """Stand-in for the mmap-backed safetensors output; collects writes to assert on."""
 
     def __init__(self):
         self.writes = []  # list of (key, tensor, dtype) tuples
 
 
 def _identity_merge(W, lora_stats, expert_idx, num_experts, output_dtype):
-    """Stand-in 'merge' that returns the input unchanged. Lets us pin the
-    quant-aware wrapper without depending on the real LoRA math."""
+    """Stand-in 'merge' returning input unchanged; pins the wrapper without real LoRA math."""
     return W.to(output_dtype)
 
 
 @pytest.fixture(autouse=True)
 def _stub_write_tensor_direct_torch(monkeypatch):
-    """`_write_tensor_direct_torch` does real safetensors header arithmetic on
-    a torch storage; for these tests we just capture (key, tensor, dtype)."""
+    """`_write_tensor_direct_torch` does real safetensors header arithmetic;
+    here we just capture (key, tensor, dtype)."""
     from unsloth_zoo import saving_utils
 
     def _capture(mm, header_metadata, length_of_header, key, tensor, dtype):

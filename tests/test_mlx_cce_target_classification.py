@@ -7,12 +7,11 @@
 # (at your option) any later version.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# MLX CCE target-classification coverage that runs on non-Apple-Silicon
-# hosts via the simulation shim. The companion file
-# tests/test_mlx_runtime_cce_compile.py gates on real Metal and skips
-# under the shim, leaving the pure-Python validation, in-vocab
-# ignore_index precedence, and logit_softcap fallback paths without
-# Linux CI coverage. This file fills those gaps.
+# MLX CCE target-classification coverage on non-Apple-Silicon hosts via the
+# simulation shim. tests/test_mlx_runtime_cce_compile.py gates on real Metal
+# and skips under the shim, leaving the pure-Python validation, in-vocab
+# ignore_index precedence, and logit_softcap fallback paths uncovered on Linux
+# CI. This file fills those gaps.
 
 from __future__ import annotations
 

@@ -45,38 +45,24 @@ pass
 
 
 def _longest_common_sublist(lists):
-    """
-    Finds the longest common sublist among multiple lists.
-
-    Parameters:
-    lists (List[List[int]]): A list of lists.
-
-    Returns:
-    List[int]: The longest common sublist. If multiple sublists have the same maximum length,
-               one of them is returned. If there's no common sublist, an empty list is returned.
-    """
+    """Longest common sublist among multiple lists (ties broken arbitrarily,
+    empty list if none)."""
     if not lists: return []
 
-    # Find the minimum length among all lists
     min_len = min(len(lst) for lst in lists)
     if min_len == 0: return []
 
     def has_common_sublist(length):
-        """
-        Checks if there's a common sublist of the given length across all lists.
-
-        Returns:
-        (bool, List): Tuple of whether such a sublist exists and the sublist itself.
-        """
+        """Return (exists, sublist) for a common sublist of `length`."""
         common = set()
         first = lists[0]
-        # Generate all possible sublists of the given length from the first list
+        # All sublists of `length` from the first list
         for i in range(len(first) - length + 1):
             sub = tuple(first[i:i + length])
             common.add(sub)
         pass
 
-        # Iterate over the remaining lists and retain only the common sublists
+        # Keep only sublists also present in every remaining list
         for lst in lists[1:]:
             current = set()
             for i in range(len(lst) - length + 1):
@@ -87,11 +73,10 @@ def _longest_common_sublist(lists):
             if not common:
                 return False, []
         pass
-        
-        # If common is not empty, return one of the common sublists
         return True, list(common.pop())
     pass
 
+    # Binary search on length
     left, right = 1, min_len
     result = []
 
@@ -99,10 +84,10 @@ def _longest_common_sublist(lists):
         mid = left + (right - left) // 2
         exists, sublist = has_common_sublist(mid)
         if exists:
-            result = sublist  # Update result with the latest found sublist
-            left = mid + 1    # Try to find a longer sublist
+            result = sublist
+            left = mid + 1
         else:
-            right = mid - 1   # Try with a shorter length
+            right = mid - 1
     pass
 
     return result
@@ -110,12 +95,10 @@ pass
 
 
 def _find_common_token_ids(component, tokenizer, force_match = False):
-    """
-    \n### User:\n\n
-    \n\n### User:\n\n
-    etc
-    we need to find the middle most repeatted part.
-    Tokenizers can tokenize newlines or spaces as 1 token!
+    """Find the middle-most repeated token sequence for a chat component.
+
+    Tokenizers may fold surrounding newlines/spaces into one token, so we probe
+    variants (e.g. "\\n### User:\\n\\n") to find the stable common core.
     """
     right_text = ""
     if   component.endswith (" "): right_text = " "
@@ -150,30 +133,26 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
     # substring = [int(x) for x in substring if x.isdigit()]
     substring = _longest_common_sublist([x + [0] for x in all_input_ids])
 
-    # If substring is simply [0], this might be just the original single token
+    # substring == [0] may just be the original single token.
     # Fixes https://github.com/unslothai/unsloth/issues/1290
-    # Mistral [INST] [/INST] singular tokens breaks since we output [0] but we need [3] [4]
+    # Mistral [INST] [/INST] singular tokens break since we output [0] but need [3] [4].
     if substring == [0] and len(all_input_ids[0]) == 1:
         single_token = all_input_ids[0][0]
-        # Confirm single token in every single possible match
         if all(single_token in x for x in all_input_ids):
             substring = [single_token]
     pass
 
-    # Also if substring is original input_ids + [0], then leave it as the original one
-    # This happens when no newlines / spaces are used in chat template
-    # Eg Phi-4 does not use newlines or spaces
+    # If substring is original input_ids + [0], keep the original. Happens when
+    # the chat template uses no newlines/spaces (e.g. Phi-4).
     if (len(set(str(x) for x in all_input_ids)) == 1) and \
         (len(all_input_ids[0]) + 1 == len(substring)) and \
         (all_input_ids[0] == substring[:-1]):
 
-        # Use original un-changed substring
         substring = all_input_ids[0]
     pass
-    
-    # Also get rest of tokenized string
+
+    # Recover optional left/right tokens around the matched core
     original = tokenizer(component, add_special_tokens = False).input_ids
-    # Get optional left and right
     for j in range(len(original)):
         if original[j : j + len(substring)] == substring: break
     optional_left  = original[:j]
@@ -192,14 +171,11 @@ def train_on_responses_only(
     num_proc          = None,
     last_response_only = False, # Train only on the last assistant turn
 ):
-    """
-    Trains only on responses and not on the instruction by masking out
-    the labels with -100 for the instruction part.
+    """Train only on responses by masking instruction labels to -100.
 
-    If last_response_only=True, only the final assistant turn has its
-    labels unmasked; all earlier assistant turns remain masked at -100
-    (they are never written, so they keep the initialized -100 values
-    and are not copied from old_labels either).
+    With last_response_only=True, only the final assistant turn is unmasked;
+    earlier assistant turns stay at -100 (never written, never copied from
+    old_labels).
     """
     # All Unsloth Zoo code licensed under LGPLv3
     if tokenizer is None and trainer is not None:
@@ -270,13 +246,12 @@ def train_on_responses_only(
                 if (input_ids[j] == A_first) and \
                     (input_ids[j : (k := j + len_A_must)] == A_must):
 
-                    # Now backtrack to get previous optional tokens
+                    # Extend over optional tokens, backward then forward
                     for optional_left in A_left_reversed:
                         if j < 1: break
                         if optional_left == input_ids[j-1]: j -= 1
                         else: break
                     pass
-                    # And forwards look as well
                     for optional_right in A_right_forward:
                         if k >= n_minus_1: break
                         if optional_right == input_ids[k+1]: k += 1
@@ -286,21 +261,18 @@ def train_on_responses_only(
                     assistant_k = k
 
                     j = assistant_k
-                    # Given <assistant>, now find next user
+                    # Find the next <user> (or the final item if assistant is last)
                     while j < n:
-                        # Find <user>
-                        # Also accept last final item if assistant is the last turn
                         if (j == n_minus_1) or \
                             ((input_ids[j] == Q_first) and \
                              (input_ids[j : (k := j + len_Q_must)] == Q_must)):
 
-                            # Now backtrack to get previous optional tokens
+                            # Extend over optional tokens, backward then forward
                             for optional_left in Q_left_reversed:
                                 if j < 1: break
                                 if optional_left == input_ids[j-1]: j -= 1
                                 else: break
                             pass
-                            # And forwards look as well
                             for optional_right in Q_right_forward:
                                 if k >= n_minus_1: break
                                 if optional_right == input_ids[k+1]: k += 1
@@ -326,16 +298,14 @@ def train_on_responses_only(
                 j += 1
             pass
 
-            # Apply labels: only the last assistant turn when last_response_only=True.
-            # Note: spans[-1:] safely returns [] when spans is empty (no assistant turn
-            # was found), so a sample with no assistant turn stays fully masked at -100.
+            # Apply labels (last assistant turn only when last_response_only).
+            # spans[-1:] is [] when no assistant turn was found, so such samples
+            # stay fully masked at -100.
             apply_spans = spans[-1:] if last_response_only else spans
             for assistant_k, user_j in apply_spans:
                 if not use_old_labels:
-                    # Now copy input_ids to labels
                     labels[assistant_k : user_j] = input_ids [assistant_k : user_j]
                 else:
-                    # Copy over from old labels!
                     labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
 
             all_labels.append(labels)
@@ -352,26 +322,23 @@ def train_on_responses_only(
         else:
             import psutil
             num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
-            # Check memory left so we can reduce multiprocessing to converse memory
+            # Cap by available memory to avoid OOM (1 proc per GB; 1 if <=2GB)
             memory_gb_left = psutil.virtual_memory().available / (1024**3)
             if memory_gb_left <= 2:
-                num_proc = 1 # Too risky, so set to 1
+                num_proc = 1
             else:
-                # Set it to int(memory_gb_left) so 16Gb = 16
                 num_proc = min(num_proc, int(memory_gb_left))
 
-    # In transformers 5.0+, VLM models skip dataset preparation in SFTTrainer.__init__
-    # (skip_prepare_dataset=True when _is_vlm=True). This means the dataset may not be
-    # tokenized yet. We need to tokenize it before applying _train_on_responses_only.
+    # transformers 5.0+ VLMs skip dataset prep in SFTTrainer.__init__
+    # (skip_prepare_dataset=True when _is_vlm), so tokenize before masking.
     def _maybe_tokenize_dataset(dataset):
         if dataset is None:
             return dataset
         sample = next(iter(dataset))
         if "input_ids" in sample:
             return dataset  # Already tokenized
-        # Need to tokenize - get the processing class from trainer
         _tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
-        # Get the actual tokenizer (not processor) for tokenization
+        # Use the actual tokenizer, not the processor
         if hasattr(_tokenizer, "tokenizer"):
             _tok = _tokenizer.tokenizer
         else:
@@ -390,10 +357,9 @@ def train_on_responses_only(
             return dataset.map(_tokenize_fn, **_map_kwargs)
     pass
 
-    # Filter out samples where all labels are -100 (no valid training signal).
-    # This can happen when truncation cuts off the response_part entirely,
-    # e.g. long reasoning/analysis channels in GPT-OSS that exceed max_seq_length.
-    # Such samples cause NaN loss since cross_entropy(mean) computes 0/0.
+    # Drop samples with all labels -100 (no training signal). Happens when
+    # truncation cuts off the response_part (e.g. long GPT-OSS reasoning
+    # channels), which would give NaN loss from cross_entropy(mean)'s 0/0.
     def _has_valid_labels(example):
         labels = example.get("labels")
         if labels is None: return True
@@ -479,22 +445,15 @@ def standardize_data_formats(
     batch_size            = 1000,
     num_proc              = None,
 ):
-    """
-    Standardizes ShareGPT and other formats to user/assistant Hugging Face format.
-    
-    Get aliases for the system, user and assistant roles.
-    These shall map to "system", "user" and "assistant" respectively.
-    
-    aliases_for_system    = ["system",],
-    aliases_for_user      = ["user", "human", "input",],
-    aliases_for_assistant = ["gpt", "assistant", "output",],
+    """Standardize ShareGPT and similar formats to user/assistant HF format.
+
+    The alias lists map source role names onto "system"/"user"/"assistant".
     """
     import collections
     import itertools
 
-    # Check if vision tokenizer is used - if yes, we must use the format:
-    # Text : {"role" : role, "content" : "Happy"}
-    # VLMs : {"role" : role, "content" : [{"type" : "text", "text" : "Happy"}]}
+    # VLMs need list-valued content ([{"type": "text", "text": ...}]); text
+    # models use a plain string.
     is_vlm = False
     if tokenizer is not None:
         if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
@@ -620,8 +579,7 @@ def sft_prepare_dataset(
     tokenizer = processing_class
     if is_vlm: tokenizer = processing_class.tokenizer
 
-    # Dynamic detection: check if model's module defines a function
-    # that requires token_type_ids when is_training=True
+    # Detect whether the model's module needs token_type_ids when training
     import sys as _sys
     _needs_token_type_ids = False
     # Split to avoid compiler substring match on masking_utils names
@@ -668,20 +626,17 @@ def sft_prepare_dataset(
     if _needs_token_type_ids:
         used_column_names.append("token_type_ids")
 
-    # Check if already tokenized so skip
+    # Skip tokenization if already tokenized; just set the data collator
     from transformers import DataCollatorForSeq2Seq, DataCollatorForLanguageModeling
     if "labels" in column_names:
         # Most likely forgot data collator!
         if is_vlm and not hasattr(tokenizer, "pad"):
-            # Check if processing_class has a .pad, if not, use tokenizer.tokenizer
             raise RuntimeError(f"Unsloth: {processing_class.__class__} does not have .pad!")
         self.data_collator = DataCollatorForSeq2Seq(tokenizer)
         used_column_names.append("labels")
         do_tokenize = False
     elif "input_ids" in column_names:
-        # Skip dataset prep, and set data collator
         if is_vlm and not hasattr(tokenizer, "pad"):
-            # Check if processing_class has a .pad, if not, use tokenizer.tokenizer
             raise RuntimeError(f"Unsloth: {processing_class.__class__} does not have .pad!")
         self.data_collator = DataCollatorForLanguageModeling(tokenizer, mlm = False)
         do_tokenize = False
@@ -698,7 +653,6 @@ def sft_prepare_dataset(
     pass
 
     if do_tokenize:
-        # Check double BOS tokens
         if do_formatting_func:
             test_text = formatting_func(next(iter(dataset)))
             if not isinstance(test_text, list):
@@ -726,14 +680,13 @@ def sft_prepare_dataset(
         else:
             test_text = next(iter(dataset))[dataset_text_field][0]
 
-        # Get chat template
         chat_template = getattr(processing_class, 'chat_template', '')
         if chat_template == '' and is_vlm:
             chat_template = getattr(tokenizer, 'chat_template', '')
         if chat_template is None:
             chat_template = ''
 
-        # Get bos_token
+        # Detect double BOS so we can drop the duplicate
         add_special_tokens = True
         bos_token_1 = getattr(processing_class, 'bos_token', None)
         bos_token_2 = getattr(tokenizer, 'bos_token', None)
@@ -745,7 +698,6 @@ def sft_prepare_dataset(
                 print("Unsloth: We found double BOS tokens - we shall remove one automatically.")
         pass
 
-        # Create tokenize function
         def _tokenize(example):
             return tokenizer(
                 example[dataset_text_field] if not do_formatting_func else formatting_func(example),
@@ -775,7 +727,6 @@ def sft_prepare_dataset(
             map_kwargs["batch_size"] = dataset._ex_iterable.batch_size
 
         if do_prompt_completion:
-            # Tokenize prompt/completion datasets for completion_only_loss
             _eos_token = getattr(tokenizer, 'eos_token', None)
 
             def _tokenize_pc(example):
@@ -833,14 +784,14 @@ def sft_prepare_dataset(
                 _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
                 dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
 
-        # If VLM, switch data collator since .pad is needed!
+        # VLMs need .pad; switch the data collator
         if is_vlm and not hasattr(processing_class, "pad") and not do_prompt_completion:
             data_collator = DataCollatorForLanguageModeling(tokenizer, mlm = False)
             self.data_collator = data_collator
         pass
     pass
     if packing:
-        # Try using new packing which works in TRL
+        # Use TRL's pack_dataset if available
         try:
             pack_dataset
         except:

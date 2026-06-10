@@ -8,29 +8,15 @@
 
 """Import-smoke regression suite for `unsloth_zoo.temporary_patches`.
 
-The temporary-patches subsystem is the model-specific monkey-patch
-layer that lands ahead of upstream HF/TRL changes. It has 22
-submodules (one per model family) and an `__init__.py` that
-star-imports every one of them. A broken decorator or top-level
-syntax error in ANY submodule cascades into the whole package
-failing to import, which is exactly what zoo's downstream users
-hit at training time -- a confusing `ImportError: cannot import
-name 'PatchUnsloth_GPT_OSS_Triton'` rather than the actual file
-that broke.
-
-This suite pins that contract:
-
+The subsystem star-imports every model-family submodule from __init__.py, so
+a broken decorator or syntax error in any one cascades into a confusing
+package-wide ImportError at training time. This suite pins:
   - Every submodule imports cleanly.
-  - The `__init__.py` star-import chain succeeds (so
-    `from unsloth_zoo.temporary_patches import *` doesn't blow up).
-  - `temporary_patches.common.torch_compile_options` is a dict
-    (rl_replacements.py imports it at module top, so a contract
-    break here breaks RL training too).
+  - The __init__.py star-import chain succeeds.
+  - `common.torch_compile_options` is a dict (rl_replacements.py imports it
+    at module top, so a break here breaks RL training too).
 
-Runs under the GPU-free harness in `tests/conftest.py` which
-pre-loads `unsloth_zoo.device_type` under a mocked
-`torch.cuda.is_available()`. No GPU required; no actual model
-forward pass.
+Runs under the GPU-free harness in tests/conftest.py; no GPU required.
 """
 
 from __future__ import annotations
@@ -41,10 +27,8 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Per-submodule import smoke. One parametrize per file under
-# unsloth_zoo/temporary_patches/. New files added there should land on
-# this list -- the suite is intentionally explicit (not a glob) so a
-# silent drop or rename surfaces as a missing test, not a green CI.
+# Per-submodule import smoke. Explicit (not a glob) so a silent drop or rename
+# surfaces as a missing test; new files must be added to this list.
 # ---------------------------------------------------------------------------
 
 
@@ -82,20 +66,14 @@ def test_temporary_patches_submodule_imports(module_path):
 
 
 def test_temporary_patches_star_import_chain():
-    """`unsloth_zoo.temporary_patches.__init__` star-imports every
-    submodule above. If ANY submodule blows up at import time, the
-    star-import chain fails wholesale and downstream `from
-    unsloth_zoo.temporary_patches import *` users get a wall of red.
-    """
+    """The __init__ star-imports every submodule; if any blows up at import,
+    downstream `from unsloth_zoo.temporary_patches import *` fails wholesale."""
     importlib.import_module("unsloth_zoo.temporary_patches")
 
 
 def test_torch_compile_options_is_dict():
-    """`temporary_patches.common.torch_compile_options` is imported
-    by `unsloth_zoo.rl_replacements` at module top level. If the
-    contract changes from dict to None / callable / removed, every
-    @torch.compile decorator in rl_replacements.py breaks at import.
-    """
+    """`common.torch_compile_options` is imported by rl_replacements at module
+    top; a non-dict contract breaks every @torch.compile decorator there."""
     from unsloth_zoo.temporary_patches import common
     assert hasattr(common, "torch_compile_options"), (
         "common.torch_compile_options removed -- rl_replacements.py "
@@ -111,11 +89,8 @@ def test_torch_compile_options_is_dict():
 
 
 def test_temporary_patches_submodule_list_is_complete():
-    """The hand-maintained TEMPORARY_PATCHES_SUBMODULES list above
-    must stay in sync with the actual files on disk. A new
-    submodule added to the directory without being added here would
-    silently bypass the per-submodule import smoke above.
-    """
+    """TEMPORARY_PATCHES_SUBMODULES must stay in sync with files on disk; a new
+    submodule not added here would silently bypass the import smoke above."""
     import unsloth_zoo.temporary_patches as tp
     import pathlib
 

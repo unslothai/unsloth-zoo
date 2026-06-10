@@ -37,9 +37,8 @@ def test_fixture_files_exist():
 def test_fixture_bytes_are_deterministic(tmp_path):
     """Re-running `_build.py` must produce byte-identical archives.
 
-    The build helper sets every member's mtime/uid/gid/mode and emits
-    members in sorted order. We rebuild into a temp dir and compare
-    SHA-256 against the committed bytes.
+    The build helper pins each member's mtime/uid/gid/mode and sorts members;
+    we rebuild into a temp dir and compare SHA-256 against the committed bytes.
     """
     # Snapshot committed hashes.
     expected: dict[str, str] = {}
@@ -204,16 +203,12 @@ def test_may12_ioc_caught_by_scan_archive():
 
 
 def test_scan_packages_pip_download_failure_propagates(tmp_path):
-    """A pip download failure must NOT be silently swallowed into a
-    `0 findings, exit 0` report. Item (4) of the silent-failure
-    hardening: an obviously unresolvable spec is fed to the scanner
-    as a subprocess; the orchestrator must exit 2 (scan incomplete)
-    and the stderr must carry the SCAN INCOMPLETE banner.
+    """A pip download failure must not be swallowed into a `0 findings,
+    exit 0` report: an unresolvable spec must make the orchestrator exit 2
+    (scan incomplete) with the SCAN INCOMPLETE banner on stderr.
 
-    The spec name is deliberately long + random-looking so it cannot
-    accidentally resolve on any real package index. We do not rely on
-    network reachability: even an offline runner will get a clean
-    "could not resolve" failure from pip.
+    The spec name is deliberately long + random so it can't resolve on any
+    real index; even an offline runner gets a clean "could not resolve".
     """
     script = REPO_ROOT / "scripts" / "scan_packages.py"
     assert script.is_file(), script
