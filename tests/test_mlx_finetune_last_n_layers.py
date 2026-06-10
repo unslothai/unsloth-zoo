@@ -65,6 +65,10 @@ def test_get_peft_model_passes_finetune_last_n_layers_through():
         _is_vlm_model = False
         def freeze(self): pass
         def unfreeze(self, **kwargs): pass
+        # The trainable-parameter summary at the end of get_peft_model walks
+        # these; empty trees keep the count at 0 without touching the asserts.
+        def parameters(self): return {}
+        def trainable_parameters(self): return {}
 
     # Capture num_layers values seen by linear_to_lora_layers.
     captured = {"calls": []}
