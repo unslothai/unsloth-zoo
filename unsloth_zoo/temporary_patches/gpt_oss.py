@@ -2485,6 +2485,8 @@ def patch_GptOssModel():
 pass
 TEMPORARY_PATCHES.append(patch_GptOssModel)
 
+encoding = None
+
 try:
     from openai_harmony import (
         Author,
@@ -2498,10 +2500,25 @@ try:
         load_harmony_encoding,
         ReasoningEffort
     )
-
-    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 except:
     pass
+
+
+def _get_gpt_oss_harmony_encoding():
+    global encoding
+    try:
+        HarmonyEncodingName
+        load_harmony_encoding
+    except:
+        raise ImportError("Please install openai_harmony via `pip install openai_harmony`")
+
+    if encoding is None:
+        try:
+            encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        except Exception as e:
+            raise RuntimeError(f"Unsloth: failed to load the gpt-oss harmony encoding: {e}") from e
+    return encoding
+pass
 
 
 def encode_conversations_with_harmony(
@@ -2516,6 +2533,8 @@ def encode_conversations_with_harmony(
         SystemContent
     except:
         raise ImportError("Please install openai_harmony via `pip install openai_harmony`")
+
+    harmony_encoding = _get_gpt_oss_harmony_encoding()
 
     assert reasoning_effort in ("low", "medium", "high")
 
@@ -2581,10 +2600,10 @@ def encode_conversations_with_harmony(
     # Create Harmony conversations
     convos = Conversation.from_messages(convos)
     if add_generation_prompt:
-        harmony_input_ids = encoding.render_conversation_for_completion(convos, Role.ASSISTANT)
+        harmony_input_ids = harmony_encoding.render_conversation_for_completion(convos, Role.ASSISTANT)
     else:
-        harmony_input_ids = encoding.render_conversation(convos)
-    harmony_decoded_text = encoding.decode(harmony_input_ids)
+        harmony_input_ids = harmony_encoding.render_conversation(convos)
+    harmony_decoded_text = harmony_encoding.decode(harmony_input_ids)
     return harmony_decoded_text, harmony_input_ids
 pass
 
