@@ -3545,11 +3545,13 @@ def _add_mlx_vlm_sanitize_step(steps, module):
 
 def _get_mlx_vlm_model_sanitize_pipelines(model):
     """Build sanitizer pipelines from a loaded mlx-vlm model and submodules."""
-    if model is None or getattr(model, "sanitize", None) is None:
+    if model is None:
         return []
 
-    model_step = [(model, None)]
-    pipelines = [model_step]
+    # Submodule-only sanitizers (wrapper without its own sanitize) still
+    # need replay pipelines, so the wrapper step is optional.
+    model_step = [(model, None)] if getattr(model, "sanitize", None) is not None else []
+    pipelines = [model_step] if model_step else []
 
     extra_steps = []
     for attr in ("thinker", "vision_tower", "vision_model", "vision_encoder", "visual"):
@@ -4720,9 +4722,9 @@ def push_to_hub_gguf(
     save_directory,
     repo_id,
     quantization_method="fast_quantized",
-    first_conversion=None,
     token=None,
     private=None,
+    first_conversion=None,
 ):
     """Export to GGUF and push to HuggingFace Hub.
 
@@ -4732,10 +4734,11 @@ def push_to_hub_gguf(
         save_directory: Local path for GGUF output.
         repo_id: HuggingFace repo ID.
         quantization_method: GGUF quantization type.
-        first_conversion: Optional intermediate GGUF dtype passed through to
-            save_pretrained_gguf.
         token: HuggingFace token.
         private: Whether repo should be private.
+        first_conversion: Optional intermediate GGUF dtype passed through to
+            save_pretrained_gguf. Placed after the pre-existing arguments so
+            positional callers keep their meaning.
     """
     from huggingface_hub import HfApi
 

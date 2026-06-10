@@ -1347,3 +1347,135 @@ def test_repair_with_backslash_path_string_returns_processor_unchanged():
         processor, "C:\\models\\fake", "fake_type"
     )
     assert repaired is processor
+
+
+# --- Group 15: review follow-ups ---
+
+
+def test_push_to_hub_gguf_positional_token_stays_token(monkeypatch, tmp_path):
+    """Pre-existing positional callers must keep binding token as token."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    calls = {}
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            calls["token"] = token
+
+        def create_repo(self, repo_id, exist_ok=True, private=None):
+            calls["repo_id"] = repo_id
+
+        def update_repo_settings(self, **kwargs):
+            pass
+
+        def upload_file(self, path_or_fileobj, path_in_repo, repo_id):
+            calls.setdefault("uploads", []).append(path_in_repo)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = FakeHfApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    def fake_save_pretrained_gguf(
+        model,
+        tokenizer,
+        save_directory,
+        quantization_method="fast_quantized",
+        first_conversion=None,
+    ):
+        calls["first_conversion"] = first_conversion
+        Path(save_directory).mkdir(parents=True, exist_ok=True)
+        (Path(save_directory) / "model.F16.gguf").write_bytes(b"GGUF")
+
+    monkeypatch.setattr(mutils, "save_pretrained_gguf", fake_save_pretrained_gguf)
+
+    mutils.push_to_hub_gguf(
+        types.SimpleNamespace(),
+        object(),
+        tmp_path / "out",
+        "org/repo",
+        "not_quantized",
+        "hf_secret_token",
+    )
+    assert calls["token"] == "hf_secret_token"
+    assert calls["first_conversion"] is None
+    assert calls["uploads"] == ["model.F16.gguf"]
+
+
+def test_resolve_processor_class_follows_model_remapping(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    class RemappedProcessor:
+        pass
+
+    fake_vlm_utils = types.ModuleType("mlx_vlm.utils")
+    fake_vlm_utils.MODEL_REMAPPING = {"alias_type": "real_type"}
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", fake_vlm_utils)
+    fake_processing = types.ModuleType("mlx_vlm.models.real_type.processing")
+    fake_processing.RemappedProcessor = RemappedProcessor
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm.models.real_type.processing", fake_processing
+    )
+    # The alias package does not exist in real mlx-vlm; the permissive shim
+    # would auto-create it, so block those imports to mirror production.
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.alias_type.processing", None)
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm.models.alias_type.processing_alias_type", None
+    )
+
+    resolved = loader._resolve_mlx_vlm_processor_class(
+        "alias-type", "RemappedProcessor"
+    )
+    assert resolved is RemappedProcessor
+
+
+def test_sanitize_pipelines_built_from_submodule_only_sanitizers():
+    import unsloth_zoo.mlx.utils as mutils
+
+    class VisionTower:
+        def sanitize(self, weights):
+            return weights
+
+    tower = VisionTower()
+    wrapper = types.SimpleNamespace(vision_tower=tower)
+    pipelines = mutils._get_mlx_vlm_model_sanitize_pipelines(wrapper)
+    assert pipelines == [[(tower, None)]]
+
+
+def test_sanitize_pipelines_keep_wrapper_first_when_present():
+    import unsloth_zoo.mlx.utils as mutils
+
+    class Sanitizing:
+        def sanitize(self, weights):
+            return weights
+
+    wrapper = Sanitizing()
+    tower = Sanitizing()
+    wrapper.vision_tower = tower
+    pipelines = mutils._get_mlx_vlm_model_sanitize_pipelines(wrapper)
+    assert pipelines == [
+        [(wrapper, None)],
+        [(wrapper, None), (tower, None)],
+    ]
+
+
+def test_image_processor_rebuild_uses_mlx_vlm_module_class(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+
+    class EdgeImageProcessor:
+        def __init__(self, size=None):
+            self.size = size
+
+    fake_processing = types.ModuleType("mlx_vlm.models.edge_type.processing")
+    fake_processing.EdgeImageProcessor = EdgeImageProcessor
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm.models.edge_type.processing", fake_processing
+    )
+
+    built = loader._build_vlm_image_processor_from_config(
+        tmp_path,
+        {},
+        {"image_processor_type": "EdgeImageProcessor", "size": 224},
+        "edge_type",
+    )
+    assert isinstance(built, EdgeImageProcessor)
+    assert built.size == 224

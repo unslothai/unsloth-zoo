@@ -377,9 +377,22 @@ def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
         return None
 
     module_model_type = (model_type or "").replace("-", "_")
-    module_candidates = (
-        f"mlx_vlm.models.{module_model_type}.processing",
-        f"mlx_vlm.models.{module_model_type}.processing_{module_model_type}",
+    module_types = [module_model_type]
+    # Aliased model types live under their MODEL_REMAPPING target package.
+    try:
+        from mlx_vlm.utils import MODEL_REMAPPING
+        remapped = MODEL_REMAPPING.get(module_model_type)
+        if remapped and remapped not in module_types:
+            module_types.append(str(remapped).replace("-", "_"))
+    except Exception:
+        pass
+    module_candidates = tuple(
+        name
+        for module_type in module_types
+        for name in (
+            f"mlx_vlm.models.{module_type}.processing",
+            f"mlx_vlm.models.{module_type}.processing_{module_type}",
+        )
     )
     for module_name in module_candidates:
         try:
@@ -397,7 +410,9 @@ def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
         return None
 
 
-def _build_vlm_image_processor_from_config(model_path, processor_config, preprocessor_config):
+def _build_vlm_image_processor_from_config(
+    model_path, processor_config, preprocessor_config, model_type=None,
+):
     """Recreate the image processor from saved processor sidecar configs."""
     image_config = processor_config.get("image_processor")
     if not isinstance(image_config, dict):
@@ -417,6 +432,15 @@ def _build_vlm_image_processor_from_config(model_path, processor_config, preproc
         try:
             import transformers
             image_processor_class = getattr(transformers, image_processor_type, None)
+            if image_processor_class is not None:
+                return image_processor_class(**image_kwargs)
+        except Exception:
+            pass
+        # mlx-vlm models can ship their own image processor classes.
+        try:
+            image_processor_class = _resolve_mlx_vlm_processor_class(
+                model_type, image_processor_type,
+            )
             if image_processor_class is not None:
                 return image_processor_class(**image_kwargs)
         except Exception:
@@ -466,7 +490,7 @@ def _repair_degraded_vlm_processor(
         return processor
 
     image_processor = _build_vlm_image_processor_from_config(
-        model_path, processor_config, preprocessor_config,
+        model_path, processor_config, preprocessor_config, model_type,
     )
     if image_processor is None:
         return processor

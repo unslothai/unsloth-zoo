@@ -443,7 +443,9 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
     monkeypatch.setattr(
         loader,
         "_build_vlm_image_processor_from_config",
-        lambda model_path, processor_config, preprocessor_config: image_processor,
+        lambda model_path, processor_config, preprocessor_config, model_type=None: (
+            image_processor
+        ),
     )
 
     (tmp_path / "processor_config.json").write_text(
