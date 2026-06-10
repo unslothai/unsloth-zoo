@@ -191,15 +191,42 @@ def test_legacy_hub_cache_env_blocked_redirects(hf_cache, tmp_path, monkeypatch)
     assert os.environ["HF_HUB_CACHE"] == str(fallback / "hub")
 
 
-def test_env_vars_in_paths_expanded(hf_cache, tmp_path, monkeypatch):
+def test_env_vars_in_hub_path_expanded(hf_cache, tmp_path, monkeypatch):
     root = tmp_path / "root"
     monkeypatch.setenv("MY_CACHE_ROOT", str(root))
     monkeypatch.setenv("HF_HUB_CACHE", "$MY_CACHE_ROOT/hub")
-    monkeypatch.setenv("HF_XET_CACHE", "$MY_CACHE_ROOT/xet")
+    monkeypatch.setenv("HF_XET_CACHE", str(root / "xet"))
+    monkeypatch.chdir(tmp_path)
     assert hf_cache.redirect_hf_cache_if_readonly() is None
     # Probed the expanded path, not a literal "$MY_CACHE_ROOT" directory.
     assert (root / "hub").is_dir()
-    assert not Path("$MY_CACHE_ROOT").exists()
+    assert not (tmp_path / "$MY_CACHE_ROOT").exists()
+
+
+def test_xet_env_value_probed_literally(hf_cache, tmp_path, monkeypatch):
+    # Hub does NOT expandvars/expanduser HF_XET_CACHE, so the probe must
+    # target the same literal path Hub will use.
+    root = tmp_path / "root"
+    monkeypatch.setenv("MY_CACHE_ROOT", str(root))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hfhome"))
+    monkeypatch.setenv("HF_XET_CACHE", "$MY_CACHE_ROOT/xet")
+    monkeypatch.chdir(tmp_path)
+    assert hf_cache.redirect_hf_cache_if_readonly() is None
+    assert (tmp_path / "$MY_CACHE_ROOT" / "xet").is_dir()
+    assert not (root / "xet").exists()
+
+
+def test_explicit_symlinked_hub_cache_honored(hf_cache, tmp_path, monkeypatch):
+    # Users symlink caches to large volumes; Hub writes through the link, so
+    # a writable symlinked cache must not be redirected away.
+    target = tmp_path / "real_hub"
+    target.mkdir()
+    link = tmp_path / "hub_link"
+    link.symlink_to(target, target_is_directory = True)
+    monkeypatch.setenv("HF_HUB_CACHE", str(link))
+    monkeypatch.setenv("HF_XET_CACHE", str(tmp_path / "xet"))
+    assert hf_cache.redirect_hf_cache_if_readonly() is None
+    assert os.environ["HF_HUB_CACHE"] == str(link)
 
 
 def test_explicit_hub_cache_survives_home_failure(hf_cache, tmp_path, monkeypatch):

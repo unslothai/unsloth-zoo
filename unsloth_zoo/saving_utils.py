@@ -2722,19 +2722,13 @@ pass
 
 def _get_hf_cache_dir() -> Optional[Path]:
     """Determines the Hugging Face Hub cache directory."""
-    potential_paths = []
-    if "HF_HUB_CACHE" in os.environ:
-        potential_paths.append(Path(os.environ["HF_HUB_CACHE"]))
-    if "HF_HOME" in os.environ:
-        potential_paths.append(Path(os.environ["HF_HOME"]) / "hub")
-    try:
-        potential_paths.append(Path.home() / ".cache" / "huggingface" / "hub")
-    except Exception:
-        # Home can be unresolvable on locked-down machines; the env-derived
-        # candidates above still apply.
-        pass
+    # Resolve through hf_cache._active_caches so cache reuse sees the same
+    # location Hub uses (XDG_CACHE_HOME, legacy HUGGINGFACE_HUB_CACHE,
+    # expanded env values, unresolvable-home handling).
+    from .hf_cache import _active_caches
+    _, cache_dir, _ = _active_caches()
 
-    for cache_dir in potential_paths:
+    if cache_dir is not None:
         try:
             if cache_dir.is_dir():
                 # Need R/W/X for HF's lock files and internal operations
@@ -2743,17 +2737,14 @@ def _get_hf_cache_dir() -> Optional[Path]:
                     return cache_dir.resolve()
                 else:
                     print(f"Warning: Found cache directory {cache_dir}, but lack R/W/X permissions. Cannot use cache.")
-                    # First prioritized path lacks permissions; stop here
                     return None
             elif cache_dir.exists():
                  # Exists but not a directory: bail
                  print(f"Warning: Path {cache_dir} exists but is not a directory. Cannot use cache.")
                  return None
-
         except Exception as e:
             # symlink loops, permission errors, etc.
-            print(f"Warning: Error accessing potential cache path {cache_dir}: {e}. Checking next option.")
-            continue
+            print(f"Warning: Error accessing potential cache path {cache_dir}: {e}.")
 
     print("No existing and accessible Hugging Face cache directory found.")
     return None

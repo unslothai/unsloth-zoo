@@ -40,10 +40,9 @@ def _expand_env_path(value: str) -> Path:
 
 def _is_writable(path: Path) -> bool:
     # Create the dir and a throwaway file; any failure means not writable.
-    # Reject symlinks so a planted link cannot route cache writes elsewhere.
+    # Symlinks are allowed here: users legitimately symlink caches to large
+    # volumes. Fallback paths are hardened separately in _is_safe_private_dir.
     try:
-        if path.is_symlink():
-            return False
         path.mkdir(parents = True, exist_ok = True)
         with tempfile.NamedTemporaryFile(dir = path):
             pass
@@ -124,7 +123,9 @@ def _active_caches() -> tuple[Path | None, Path | None, Path | None]:
         hub_cache = None
     try:
         if xet_cache_env:
-            xet_cache = _expand_env_path(xet_cache_env)
+            # Hub reads HF_XET_CACHE literally (no expanduser/expandvars),
+            # unlike HF_HOME and HF_HUB_CACHE; probe the same literal path.
+            xet_cache = Path(xet_cache_env)
         else:
             xet_cache = hf_home / "xet" if hf_home is not None else None
     except Exception:
