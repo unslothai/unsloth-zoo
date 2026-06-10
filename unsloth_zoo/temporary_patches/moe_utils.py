@@ -811,6 +811,18 @@ def _set_gpt_oss_grouped_mm_format_on_experts(module) -> bool:
         return False
     if bool(getattr(module, "_unsloth_grouped_mm_format", False)):
         return False
+    # Require the gpt-oss (E, in, out) weight signature: gate_up's out dim is
+    # twice down's in dim. Same-named classes with other layouts stay unflagged.
+    gate_shape = _get_param_shape_from_module(module, "gate_up_proj")
+    down_shape = _get_param_shape_from_module(module, "down_proj")
+    if gate_shape is None or down_shape is None:
+        return False
+    if len(gate_shape) < 3 or len(down_shape) < 3:
+        return False
+    if gate_shape[0] != down_shape[0]:
+        return False
+    if gate_shape[-2] != down_shape[-1] or gate_shape[-1] != 2 * down_shape[-2]:
+        return False
     module._unsloth_grouped_mm_format = True
     return True
 
@@ -1628,6 +1640,9 @@ def forward_native_moe_loop(
     # unsafe when intermediate_dim == hidden_dim (square dims).
     grouped_mm_format = bool(getattr(self, "_unsloth_grouped_mm_format", False))
 
+    # GPT-OSS uses interleaved gate/up, clamped swiglu, and per-expert biases.
+    is_gpt_oss = "GptOssExperts" in self.__class__.__name__
+
     # Only loop over experts that actually have tokens routed to them
     for expert_idx_t in expert_hit:
         expert_idx = expert_idx_t.item()
@@ -1650,12 +1665,28 @@ def forward_native_moe_loop(
                 lora_delta = current_state @ first_weight[expert_idx]
                 lora_delta = lora_delta @ second_weight[expert_idx]
                 gate_up = gate_up + lora_delta * scaling
-            gate, up = gate_up.chunk(2, dim=-1)
+            if is_gpt_oss:
+                gate_up_bias = getattr(self, "gate_up_proj_bias", None)
+                if gate_up_bias is not None:
+                    gate_up = gate_up + gate_up_bias[expert_idx].to(gate_up.dtype)
+                gate = gate_up[..., ::2]
+                up = gate_up[..., 1::2]
+            else:
+                gate, up = gate_up.chunk(2, dim=-1)
         else:
             gate = F.linear(current_state, self.w1[expert_idx])
             up = F.linear(current_state, self.w3[expert_idx])
 
-        current_hidden_states = self.act_fn(gate) * up
+        if is_gpt_oss:
+            limit = getattr(self, "limit", 7.0)
+            alpha = getattr(self, "alpha", 1.702)
+            gate = gate.clamp(min=None, max=limit)
+            up = up.clamp(min=-limit, max=limit)
+            current_hidden_states = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
+        elif hasattr(self, "act_fn") and callable(self.act_fn):
+            current_hidden_states = self.act_fn(gate) * up
+        else:
+            current_hidden_states = F.silu(gate) * up
 
         # Compute down projection for this expert only
         if hasattr(self, "down_proj"):
@@ -1671,6 +1702,10 @@ def forward_native_moe_loop(
                 lora_delta = current_hidden_states @ first_weight[expert_idx]
                 lora_delta = lora_delta @ second_weight[expert_idx]
                 down = down + lora_delta * scaling
+            if is_gpt_oss:
+                down_bias = getattr(self, "down_proj_bias", None)
+                if down_bias is not None:
+                    down = down + down_bias[expert_idx].to(down.dtype)
             current_hidden_states = down
         else:
             current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])

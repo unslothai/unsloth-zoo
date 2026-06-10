@@ -199,3 +199,17 @@ def test_model_without_experts_does_not_raise_or_set_flags():
     assert patch_gpt_oss_grouped_mm_format(model) == 0
     assert not hasattr(model, "_unsloth_grouped_mm_format")
     assert not hasattr(model.dense, "_unsloth_grouped_mm_format")
+
+
+def test_lazy_path_does_not_flag_qwen_layout_named_gpt_oss():
+    class GptOssExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_experts = 4
+            self.gate_up_proj = nn.Parameter(torch.empty(4, 24, 16))
+            self.down_proj = nn.Parameter(torch.empty(4, 16, 12))
+
+    experts = GptOssExperts()
+    assert _get_moe_lora_io_dims(_Wrapper("gate_up_proj", experts)) == (16, 24)
+    assert _get_moe_lora_io_dims(_Wrapper("down_proj", experts)) == (12, 16)
+    assert not hasattr(experts, "_unsloth_grouped_mm_format")
