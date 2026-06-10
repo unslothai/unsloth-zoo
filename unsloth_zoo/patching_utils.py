@@ -49,13 +49,23 @@ def patch_compiling_bitsandbytes():
             try:
                 module = importlib.import_module(x)
             except ImportError as e:
+                # Genuinely absent package = the missing module is the target
+                # or one of its parents. Anything else (e.g. a broken
+                # transitive dependency inside an installed package) must
+                # surface its real error, not an install hint.
+                missing = getattr(e, "name", "") or ""
+                target_missing = isinstance(e, ModuleNotFoundError) and missing and (
+                    x == missing or x.startswith(missing + ".")
+                )
+                if not target_missing:
+                    raise
                 # peft is required for LoRA training
                 if x.startswith("peft"):
                     raise ImportError(
                         "Unsloth: Please install peft via `pip install peft`"
                     ) from e
                 if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
-                    print(f"Unsloth: Skipping {x} - import failed: {e}")
+                    print(f"Unsloth: Skipping {x} - module not found: {e}")
                 continue
             for fx in dir(module):
                 try: layer = getattr(module, fx)
