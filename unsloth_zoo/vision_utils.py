@@ -58,6 +58,7 @@ AUDIO_TOKENS = [
 ]
 
 import torch
+import numpy as np
 from PIL import Image
 import base64
 from io import BytesIO
@@ -984,7 +985,8 @@ class UnslothVisionDataCollator:
             if len(audio_val) == 0:
                 clips = []
             # A flat list of samples is one clip, not a list of clips
-            elif not isinstance(audio_val[0], (dict, list, tuple)) and getattr(audio_val[0], "ndim", 0) == 0:
+            # (strings are path/url clips, so they stay in the list-of-clips branch)
+            elif not isinstance(audio_val[0], (dict, list, tuple, str)) and getattr(audio_val[0], "ndim", 0) == 0:
                 clips = [audio_val]
             else:
                 clips = []
@@ -1008,6 +1010,14 @@ class UnslothVisionDataCollator:
         for clip in clips:
             if torch.is_tensor(clip):
                 clip = clip.detach().cpu().numpy()
+            elif isinstance(clip, (list, tuple)):
+                # Catches stereo-as-nested-lists in the mono guard below
+                try:
+                    clip = np.asarray(clip)
+                except Exception as e:
+                    raise ValueError(
+                        f"Unsloth: could not interpret an audio clip list as a waveform: {e}"
+                    ) from e
             if getattr(clip, "ndim", 1) > 1:
                 # torchaudio.load returns [channels, frames]; accept mono (1, N)
                 if clip.shape[0] == 1:

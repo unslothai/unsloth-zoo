@@ -140,9 +140,38 @@ def test_top_level_dict_rate_mismatch_raises():
 
 def test_top_level_flat_list_is_one_clip():
     collator = make_collator()
-    flat = [0.0] * 16
-    out = collator._extract_audio_for_example({"audio": flat}, [])
-    assert len(out) == 1 and out[0] is flat
+    out = collator._extract_audio_for_example({"audio": [0.0] * 16}, [])
+    assert len(out) == 1 and isinstance(out[0], np.ndarray)
+    assert out[0].shape == (16,)
+
+
+def test_top_level_list_of_path_strings_are_clips():
+    collator = make_collator()
+    out = collator._extract_audio_for_example({"audio": ["/tmp/a.wav", "/tmp/b.wav"]}, [])
+    assert out == ["/tmp/a.wav", "/tmp/b.wav"]
+
+
+def test_top_level_list_of_flat_list_clips():
+    collator = make_collator()
+    out = collator._extract_audio_for_example({"audio": [[0.0] * 16, [1.0] * 8]}, [])
+    assert len(out) == 2
+    assert out[0].shape == (16,) and out[1].shape == (8,)
+
+
+def test_inline_nested_list_stereo_raises():
+    # stereo serialized as nested Python lists must hit the mono guard too
+    collator = make_collator()
+    stereo = [[0.0] * 16, [1.0] * 16]
+    with pytest.raises(ValueError, match="mono"):
+        collator._extract_audio_for_example(
+            {}, msgs({"type": "audio", "audio": stereo}))
+
+
+def test_inline_nested_list_mono_squeezed():
+    collator = make_collator()
+    out = collator._extract_audio_for_example(
+        {}, msgs({"type": "audio", "audio": [[0.0] * 16]}))
+    assert len(out) == 1 and out[0].shape == (16,)
 
 
 def test_top_level_list_of_clips():
