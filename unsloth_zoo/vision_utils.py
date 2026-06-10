@@ -1011,6 +1011,11 @@ class UnslothVisionDataCollator:
             if torch.is_tensor(clip):
                 clip = clip.detach().cpu().numpy()
             elif isinstance(clip, (list, tuple)):
+                if len(clip) > 0 and isinstance(clip[0], str):
+                    raise ValueError(
+                        "Unsloth: an audio clip cannot be a list of strings. Pass each "
+                        "path or url as its own clip or content part."
+                    )
                 # Catches stereo-as-nested-lists in the mono guard below
                 try:
                     clip = np.asarray(clip)

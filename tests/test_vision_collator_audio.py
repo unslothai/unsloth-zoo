@@ -174,6 +174,14 @@ def test_inline_nested_list_mono_squeezed():
     assert len(out) == 1 and out[0].shape == (16,)
 
 
+def test_inline_list_of_strings_clip_raises():
+    # one content part is one clip; a list of paths inside it is user error
+    collator = make_collator()
+    with pytest.raises(ValueError, match="list of strings"):
+        collator._extract_audio_for_example(
+            {}, msgs({"type": "audio", "audio": ["/tmp/a.wav", "/tmp/b.wav"]}))
+
+
 def test_top_level_list_of_clips():
     collator = make_collator()
     out = collator._extract_audio_for_example(
