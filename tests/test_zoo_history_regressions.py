@@ -364,6 +364,11 @@ def _install_fake_bnb_and_peft(monkeypatch, bnb_version, with_peft_leaf=True):
     import sys
     import types
 
+    # The function under test sets UNSLOTH_PATCHED=1; setenv registers the key
+    # with monkeypatch so the pre-test state (even absence) is restored.
+    import os
+    monkeypatch.setenv("UNSLOTH_PATCHED", os.environ.get("UNSLOTH_PATCHED", "0"))
+
     def _fake_layer_class():
         class _Layer:
             def forward(self):
