@@ -281,8 +281,12 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
             )
     if sudo:
         password = getpass.getpass(f"Enter password for user {getpass.getuser()}: ")
-        install_cmd = f"echo {password} | {install_cmd}"
-    with subprocess.Popen(install_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+    with subprocess.Popen(install_cmd, shell = True, stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+        if sudo and sp.stdin:
+            sp.stdin.write(f"{password}\n".encode())
+            sp.stdin.flush()
+            sp.stdin.close()
+
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
 
