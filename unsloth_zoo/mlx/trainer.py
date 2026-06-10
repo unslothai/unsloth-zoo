@@ -608,6 +608,14 @@ class MLXTrainer:
             _fix_qwen35_attention_cache(model)
             from ..gated_delta_vjp import patch_gated_delta
             patch_gated_delta()
+        # Qwen3-VL-specific fixes: the language tower's MRoPERotaryEmbedding
+        # uses the same non-differentiable fused Metal kernel that breaks
+        # training with [Primitive::vjp] Not implemented for CustomKernel.
+        # Flip fused_apply off so apply_rotary takes the differentiable
+        # fallback path.
+        if "qwen3_vl" in model_type:
+            from .loader import _disable_fused_mrope
+            _disable_fused_mrope(model)
 
         try:
             return self._train_inner()
