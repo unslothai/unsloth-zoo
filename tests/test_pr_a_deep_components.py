@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-PR-A deeper component exercises: trainer, compile discovery,
-cce backward, and quantization helpers — beyond just imports.
-
-If a test fails, the failing component identifies the next gap.
+"""PR-A deeper component exercises beyond imports: trainer, compile discovery,
+cce backward, and quantization helpers. A failing test names the next gap.
 """
 
 from __future__ import annotations

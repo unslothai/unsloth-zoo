@@ -6,21 +6,14 @@
 # the Free Software Foundation, either version 3 of the License, or (at
 # your option) any later version.
 
-"""Exhaustive upstream-signature pinning for the (class, method) pairs
-that ``unsloth_zoo/temporary_patches/<file>.py`` rebinds (tail not
-covered by the sibling test_upstream_signatures /
-test_upstream_pinned_symbols_transformers / test_zoo_source_upstream_refs
-/ test_upstream_source_patterns files).
+"""Exhaustive upstream-signature pinning for (class, method) pairs that
+``unsloth_zoo/temporary_patches/<file>.py`` rebinds (tail not covered by the
+sibling test_upstream_* files).
 
-Each (model_class, method) pair below maps 1:1 to a
-``patch_function(...)`` call or attribute reassignment in zoo. Upstream
-rename / drop -> zoo's patch silently no-ops via ``raise_error()``; this
-file makes that drift loud.
-
-CPU-only; ``pytest.importorskip`` for optional libs (timm, bitsandbytes).
-Drift -> ``pytest.fail("DRIFT DETECTED: zoo temporary_patches/<file>.py
-expects <class>.<method>(<params>) but installed transformers has
-<signature>")``.
+Each pair maps 1:1 to a ``patch_function(...)`` call or attribute reassignment
+in zoo; an upstream rename/drop makes that patch silently no-op via
+``raise_error()``, and this file makes the drift loud. CPU-only;
+``pytest.importorskip`` for optional libs.
 """
 
 from __future__ import annotations
@@ -43,13 +36,9 @@ _TX_IS_5X = Version(_TX_VERSION) >= Version("5.0.0")
 
 
 def _skip_if_transformers_5x(reason: str) -> None:
-    """transformers 5.x moved many ForCausalLM.forward named params
-    (notably ``cache_position``) into ``**kwargs: Unpack[TransformersKwargs]``
-    and renamed others (``rope_theta`` -> ``rope_parameters`` on GptOssConfig).
-    The runtime patches gracefully no-op via try/except + relaxed
-    patch_function, so the drift detector serves no purpose on 5.x and
-    just blocks CI. Skip with the upstream-removal reason; keep the
-    detector active on 4.57.6 where real drift can still surface."""
+    """Skip on 5.x: it folded many forward params into ``**kwargs`` and the
+    runtime patches no-op gracefully, so the detector only blocks CI here.
+    Stays active on 4.57.6 where real drift can still surface."""
     if _TX_IS_5X:
         pytest.skip(
             f"transformers {_TX_VERSION}: {reason} (zoo patch silently "
@@ -106,13 +95,11 @@ def _original_attr_name(cls, attr: str) -> str:
 
 
 def _resolve_upstream_method(cls, method_name: str):
-    """Return UPSTREAM (unpatched) method body for cls.method_name.
+    """Return the UPSTREAM (unpatched) method body for cls.method_name.
 
-    apply_import_fixes() and temporary_patches runner monkey-patch at
-    import time, so naive ``cls.method_name`` returns zoo's
-    ``(self, *args, **kwargs)`` wrapper. Resolution order:
-      1. ``_original_<module>_<class>_<method>`` stash from patch_function.
-      2. Live attribute (caller checks _maybe_skip_if_patched if needed).
+    Zoo monkey-patches at import time, so naive ``cls.method_name`` is zoo's
+    wrapper. Prefer the ``_original_<module>_<class>_<method>`` stash, else the
+    live attribute (caller may guard via _maybe_skip_if_patched).
     """
     if not hasattr(cls, method_name):
         return None
@@ -171,12 +158,8 @@ def _assert_params_superset(
     got = _param_names(func)
     missing = [name for name in required if name not in got]
     if missing and _has_var_keyword(func):
-        # Newer transformers wrap many upstream forwards as
-        # ``(self, *args, **kwargs)`` (attention-impl dispatch, generic
-        # decorators, etc.). The zoo patch's call site stays valid because
-        # kwargs flow through verbatim; static param-name verification is
-        # not meaningful for a wrapped signature. Skip rather than emit
-        # spurious DRIFT.
+        # Newer transformers wrap forwards as ``(self, *args, **kwargs)``; kwargs
+        # flow through verbatim so static param checks aren't meaningful. Skip.
         pytest.skip(
             f"{label} is wrapped as `(self, *args, **kwargs)` on "
             f"transformers {_TX_VERSION}; static param-name verification "
@@ -721,14 +704,9 @@ def test_mxfp4_gpt_oss_experts_class_present_and_init_signature():
 
 
 def test_gpt_oss_config_class_construction_signature():
-    """gpt_oss.py:2813 replaces GptOssConfig with Old_GptOssConfig; pin
-    kwarg names (num_hidden_layers, num_local_experts, vocab_size, ...).
-
-    transformers 5.x renamed ``rope_theta`` -> ``rope_parameters``. The
-    zoo patch site (`patch_gpt_oss_config`) gates on
-    ``inspect.getsource(GptOssConfig) == Old_GptOssConfig`` and skips the
-    replacement when the 5.x version's source no longer matches, so the
-    pin is dormant on 5.x. Keep it strict on 4.57.6.
+    """gpt_oss.py:2813 replaces GptOssConfig with Old_GptOssConfig; pin kwarg
+    names. Dormant on 5.x (rope_theta -> rope_parameters; patch gates on a
+    source-match and skips), strict on 4.57.6.
     """
     _skip_if_transformers_5x(
         "GptOssConfig.__init__ renamed rope_theta -> rope_parameters"
@@ -883,6 +861,154 @@ def test_csm_depth_decoder_for_causal_lm_forward_named_params():
         zoo_file="misc.py",
         label="CsmDepthDecoderForCausalLM.forward",
     )
+
+
+def _tiny_csm_depth_decoder(torch):
+    csm = pytest.importorskip("transformers.models.csm.modeling_csm")
+    config_mod = pytest.importorskip("transformers.models.csm.configuration_csm")
+    config = config_mod.CsmDepthDecoderConfig(
+        vocab_size=11, num_codebooks=4, backbone_hidden_size=8,
+        hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1,
+        max_position_embeddings=8, head_dim=4, use_cache=False,
+        pad_token_id=0,
+    )
+    config._attn_implementation = "eager"
+    model = csm.CsmDepthDecoderForCausalLM(config).train()
+    model.model.embed_tokens.weight.requires_grad_(False)
+    return model
+
+
+@pytest.mark.parametrize("backbone_requires_grad", [True, False])
+def test_csm_depth_decoder_leaf_embedding_hook_backward(backbone_requires_grad):
+    """CSM patch handles GC hook leaf embeddings without losing grad input."""
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo.temporary_patches.misc import patch_CsmDepthDecoderForCausalLM_forward
+
+    patch_CsmDepthDecoderForCausalLM_forward()
+    model = _tiny_csm_depth_decoder(torch)
+    seen = {}
+    original_forward = model.model.forward
+
+    def wrapped_model_forward(*args, **kwargs):
+        seen["inputs_embeds_requires_grad"] = kwargs["inputs_embeds"].requires_grad
+        return original_forward(*args, **kwargs)
+
+    model.model.forward = wrapped_model_forward
+    hook = model.model.embed_tokens.register_forward_hook(
+        lambda module, args, output: output.requires_grad_(True)
+    )
+    try:
+        backbone_state = torch.randn(1, 8, requires_grad=backbone_requires_grad)
+        out = model(
+            input_ids=torch.tensor([[0, 2, 3, 4]], dtype=torch.long),
+            backbone_last_hidden_state=backbone_state,
+            labels=torch.tensor([[5, 6, 7, 8]], dtype=torch.long),
+            return_dict=True,
+        )
+        out.loss.backward()
+
+        assert seen["inputs_embeds_requires_grad"] is True
+        if backbone_requires_grad:
+            assert backbone_state.grad is not None
+            assert torch.count_nonzero(backbone_state.grad) > 0
+    finally:
+        hook.remove()
+        model.model.forward = original_forward
+
+
+def test_csm_audio_embeddings_tie_helper():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _tie_csm_audio_embeddings
+
+    audio = torch.nn.Embedding(4, 3)
+    depth = torch.nn.Embedding(4, 3)
+    model = SimpleNamespace(
+        backbone_model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(embed_audio_tokens=audio),
+        ),
+        depth_decoder=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=depth),
+        ),
+    )
+
+    assert audio.weight.data_ptr() != depth.weight.data_ptr()
+    _tie_csm_audio_embeddings(model)
+    assert audio.weight.data_ptr() == depth.weight.data_ptr()
+
+
+def test_csm_audio_embeddings_tie_helper_respects_config():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _tie_csm_audio_embeddings
+
+    audio = torch.nn.Embedding(4, 3)
+    depth = torch.nn.Embedding(4, 3)
+    model = SimpleNamespace(
+        config=SimpleNamespace(tie_codebooks_embeddings=False),
+        backbone_model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(embed_audio_tokens=audio),
+        ),
+        depth_decoder=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=depth),
+        ),
+    )
+
+    _tie_csm_audio_embeddings(model)
+    assert audio.weight.data_ptr() != depth.weight.data_ptr()
+
+
+def test_csm_audio_eos_label_helper_keeps_trainer_counts_aligned():
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo.temporary_patches.misc import _label_csm_audio_eos_tokens
+
+    labels = torch.tensor([[-100, 128002, -100, -100]])
+    input_ids = torch.tensor([[128000, 128002, 128003, 0]])
+
+    labels = _label_csm_audio_eos_tokens(input_ids, labels, 128003)
+
+    assert labels.tolist() == [[-100, 128002, 128003, -100]]
+
+
+def test_csm_audio_eos_label_helper_supports_numpy():
+    np = pytest.importorskip("numpy")
+    from unsloth_zoo.temporary_patches.misc import _label_csm_audio_eos_tokens
+
+    labels = np.array([[-100, 128002, -100, -100]])
+    input_ids = np.array([[128000, 128002, 128003, 0]])
+
+    labels = _label_csm_audio_eos_tokens(input_ids, labels, 128003)
+
+    assert labels.tolist() == [[-100, 128002, 128003, -100]]
+
+
+def test_csm_processor_output_uses_configured_audio_eos_id():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _label_csm_processor_output
+
+    processor = SimpleNamespace(audio_eos_token_id=42)
+    output = {
+        "input_ids": torch.tensor([[128000, 128002, 42, 0]]),
+        "labels": torch.tensor([[-100, 128002, -100, -100]]),
+    }
+
+    output = _label_csm_processor_output(processor, output)
+
+    assert output["labels"].tolist() == [[-100, 128002, 42, -100]]
+
+
+def test_csm_processor_output_ignores_non_mappings():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.misc import _label_csm_processor_output
+
+    tensor_output = torch.tensor([[128000, 128002]])
+    text_output = "input_ids and labels are just rendered text"
+
+    assert _label_csm_processor_output(SimpleNamespace(), tensor_output) is tensor_output
+    assert _label_csm_processor_output(SimpleNamespace(), text_output) is text_output
 
 
 def test_csm_for_conditional_generation_forward_named_params():
@@ -1700,15 +1826,9 @@ def test_misc_all_attention_functions_modeling_utils_top_level():
 
 
 def test_misc_modernbert_model_update_attention_mask_present():
-    """misc.py:662 patches
-    ``ModernBertModel._update_attention_mask`` (SDPA-stride fix).
-
-    transformers 5.x removed ``_update_attention_mask`` from
-    ModernBertModel (mask construction moved into the central
-    masking-utils path). zoo's patch site is fully guarded
-    (`misc.py:644-678`: import try/except + `getattr(..., None)` on
-    both the class and the method), so the SDPA-stride fix silently
-    no-ops on 5.x. Skip the drift here, keep it strict on 4.57.6.
+    """misc.py:662 patches ``ModernBertModel._update_attention_mask`` (SDPA-stride
+    fix). Removed on 5.x (mask moved into masking-utils); zoo's patch is fully
+    guarded so it no-ops there. Skip on 5.x, strict on 4.57.6.
     """
     _skip_if_transformers_5x(
         "ModernBertModel._update_attention_mask removed (mask construction "
@@ -2219,12 +2339,9 @@ def test_static_cache_class_present():
 def test_hybrid_cache_class_present():
     """gemma.py:260 isinstance(past_key_values, HybridCache).
 
-    Drift on 4.57.6: HybridCache must exist (zoo's gemma mask path
-    dispatches isinstance against it). Drift on 5.x: HybridCache was
-    removed; zoo's utils.py falls back to ``HybridCache = typing.Any``
-    and ``HAS_HYBRID_CACHE = False``, and gemma.py:260 gates the
-    isinstance on the flag so the runtime no-ops cleanly without
-    raising ``TypeError: isinstance() arg 2 must be a type``.
+    4.57.6: HybridCache must exist. 5.x: it was removed; zoo's utils.py falls
+    back to ``HybridCache = typing.Any`` / ``HAS_HYBRID_CACHE = False`` and
+    gemma.py:260 gates the isinstance on the flag, so it no-ops cleanly.
     """
     cu = importlib.import_module("transformers.cache_utils")
     from unsloth_zoo.temporary_patches.utils import HAS_HYBRID_CACHE
@@ -2362,5 +2479,3 @@ def test_temporary_patches_directory_has_expected_files():
             f"DRIFT DETECTED: temporary_patches/ is missing files {missing}; "
             f"either they were renamed or dropped without updating the test"
         )
-
-

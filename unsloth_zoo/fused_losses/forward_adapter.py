@@ -16,10 +16,10 @@
 
 """HF-call-convention adapter for unsloth_fused_ce_loss.
 
-The fused kernel takes hidden_states + lm_head.weight directly, skipping
-both the lm_head matmul and the fp32 logits materialisation that the HF
-template performs before `self.loss_function(...)`. `EMPTY_LOGITS` is the
-0-element sentinel slotted into the `logits=` return field.
+The fused kernel takes hidden_states + lm_head.weight directly, skipping the
+lm_head matmul and fp32 logits materialisation the HF template does before
+`self.loss_function(...)`. `EMPTY_LOGITS` is the 0-element sentinel for the
+`logits=` return field.
 """
 
 from __future__ import annotations
@@ -45,18 +45,17 @@ def unsloth_fused_lm_head_loss(
     **kwargs,
 ):
     """Replacement for the canonical `self.loss_function(logits=..., labels=...,
-    vocab_size=..., **kwargs)` call site. Routes through the chunked fused
-    cross-entropy kernel without materialising fp32 logits.
+    vocab_size=..., **kwargs)` call site, routing through the chunked fused CE
+    kernel without materialising fp32 logits.
 
     Args:
-        hidden_states: the tensor that was about to be fed into `self.lm_head`.
-        lm_head: the lm_head module (Linear). Weight + bias pulled off it.
+        hidden_states: tensor that was about to be fed into `self.lm_head`.
+        lm_head: the lm_head Linear module; weight + bias pulled off it.
         labels: integer label tensor.
-        vocab_size: ignored. Kernel reads it from `lm_head.weight.shape[0]`.
-        **kwargs: forwarded to the kernel. Accepts `num_items_in_batch`
-            (renamed to `n_items`), `logit_scale_multiply`, `logit_scale_divide`,
-            `logit_softcapping`, plus any other extras the original
-            `self.loss_function` would have ignored.
+        vocab_size: ignored; kernel reads it from `lm_head.weight.shape[0]`.
+        **kwargs: forwarded to the kernel. `num_items_in_batch` is renamed to
+            `n_items`; also accepts `logit_scale_multiply`, `logit_scale_divide`,
+            `logit_softcapping`, plus extras the original loss_function ignored.
     """
     n_items = kwargs.pop("num_items_in_batch", None)
     if n_items is None:
@@ -65,9 +64,8 @@ def unsloth_fused_lm_head_loss(
         kwargs.pop("n_items", None)
     # vocab_size is read from lm_head_weight.shape[0]; drop the keyword.
     kwargs.pop("vocab_size", None)
-    # If caller already shifted (e.g. trl padding_free with packing passes
-    # shift_labels=<tensor>), route the pre-shifted target into the fused
-    # kernel with shift_labels=False so we still get chunked logits.
+    # Caller may pass a pre-shifted target (e.g. trl padding_free + packing
+    # gives shift_labels=<tensor>); route it through with shift_labels=False.
     shift_labels_kw = kwargs.pop("shift_labels", None)
     pre_shifted_tensor = (
         shift_labels_kw is not None and not isinstance(shift_labels_kw, bool)

@@ -2,15 +2,12 @@
 # Pin `make_baseline_loss_fn` source so the labels=None fast path stays
 # byte-for-byte equivalent to mlx_lm.tuner.trainer.default_loss.
 #
-# Why pin source rather than run a numerical comparison: the test
-# harness uses a torch-based MLX shim that doesn't faithfully reproduce
-# MLX's autodiff graph or its rounding; an apples-to-apples numerical
-# parity check requires a real MLX runtime (Apple Silicon), so it's
-# done in the Round BP probe matrix on
-# danielhanchen/unsloth-staging-2. Locally we guard against future
-# refactors silently re-introducing the divergent code patterns
-# (fp32-cast mask, mx.where(safe_targets), _safe_token_denominator)
-# that mlx_lm.tuner.trainer.default_loss does NOT do.
+# Source is pinned rather than numerically compared because the torch-based
+# MLX shim doesn't reproduce MLX's autodiff graph / rounding (real numerical
+# parity needs Apple Silicon, done in the Round BP probe matrix on
+# danielhanchen/unsloth-staging-2). Locally we guard against refactors
+# re-introducing the divergent patterns (fp32-cast mask, mx.where(safe_targets),
+# _safe_token_denominator) that default_loss does NOT do.
 
 from __future__ import annotations
 
@@ -38,8 +35,7 @@ def _labels_none_block():
     )
     assert m, "make_baseline_loss_fn must keep a `labels is None` fast path"
     raw = textwrap.dedent(m.group(1))
-    # Strip whole-line comments so test assertions on code don't trip on
-    # explanatory prose like "no safe_targets mx.where" in docstrings.
+    # Strip whole-line comments so assertions on code ignore explanatory prose.
     code_lines = []
     for line in raw.splitlines():
         stripped = line.strip()

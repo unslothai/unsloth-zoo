@@ -49,10 +49,10 @@ __all__ = [
 ]
 
 # Initial buffer sizes for gradient checkpointing
-INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # Initial size per CPU buffer
-INITIAL_GPU_BUFFER_SIZE = 2 * 256 * 2048   # Initial size per GPU buffer
-INITIAL_CPU_BUFFER_COUNT = 200             # Initial number of CPU buffers
-DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # 512MB minimum free CUDA memory to enable double buffering
+INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # per CPU buffer
+INITIAL_GPU_BUFFER_SIZE = 2 * 256 * 2048   # per GPU buffer
+INITIAL_CPU_BUFFER_COUNT = 200             # number of CPU buffers
+DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable double buffering
 
 torch_version = torch.__version__
 if Version(torch_version) < Version("2.4.0"):
@@ -82,7 +82,7 @@ def _calculate_n_gradient_checkpoints(
     size = n_layers // n_checkpoints
     sizes = np.full(n_checkpoints, size, dtype = int)
     leftovers = n_layers % n_checkpoints
-    # We append leftovers from the right
+    # Append leftovers from the right
     for k in range(leftovers):
         sizes[n_checkpoints-1-k] += 1
     boundaries = np.hstack((0, np.cumsum(sizes)))
@@ -279,14 +279,9 @@ from torch.utils.checkpoint import (
 )
 # Added [device_type] in Torch 2.5!
 def set_device_states(devices, states, *, device_type=None) -> None:
-    """Sets random number generator states for the specified devices.
+    """Set RNG states for the given devices.
 
-    Args:
-        devices: Device ids to set states for.
-        states: States to set.
-        device_type: ``device_type`` of the devices to set states for. Default
-            is the device returned by a call to ``DefaultDeviceType.get_device_type()``,
-            which is ``cuda`` if not changed by calling ``DefaultDeviceType::set_device_type()``.
+    device_type defaults to ``DefaultDeviceType.get_device_type()`` (cuda).
     """
     if device_type is None:
         device_type = DefaultDeviceType.get_device_type()
@@ -360,7 +355,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         CPU_BUFFERS.append(x)
     pass
 
-    # Allocate buffers to how many GPUs
+    # Allocate one buffer per GPU
     n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
     NEXT_BUFFER_SLOT = [0] * n_gpus
     try:
@@ -374,9 +369,9 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         else:
             try:
                 GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-                USE_DOUBLE_BUFFER = False # set false first, enabled after first pass if CUDA free memory > DOUBLE_BUFFER_HEADROOM
-                # Per-buffer events to prevent race conditions in double buffering.
-                # Each event tracks when compute on that buffer finishes
+                USE_DOUBLE_BUFFER = False # enabled after first pass if CUDA free memory > DOUBLE_BUFFER_HEADROOM
+                # Per-buffer events prevent double-buffering races; each tracks
+                # when compute on that buffer finishes
                 if DEVICE_TYPE in ("cuda", "hip"):
                     event_ctor = torch.cuda.Event
                 elif DEVICE_TYPE == "xpu":
@@ -412,7 +407,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     MINIMUM_SIZE = 2 * 1024 * 1024 // n_bytes
     USE_UNSLOTH_GC = True
 
-    # Disable offloading on the last layer - uses more VRAM and is slower
+    # Don't offload the last layer - uses more VRAM and is slower
     # See https://github.com/pytorch/torchtune/pull/1443
     LAST_GC_INDEX = 0
     FIRST_PASS = True
@@ -425,21 +420,17 @@ class UnslothCheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
         # All Unsloth Zoo code licensed under LGPLv3
-        # check_backward_validity(args)
-        # Check if no requires_grad in inputs
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
-        # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
+        # Handle autocast enabled for cpu AND gpu.
         ctx.device_type = _infer_device_type(*args)
         ctx.device_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs(
             ctx.device_type
         )
         if preserve_rng_state:
             ctx.fwd_cpu_state = torch.get_rng_state()
-            # Don't eagerly initialize the cuda context by accident.
-            # (If the user intends that the context is initialized later, within their
-            # run_function, we SHOULD actually stash the cuda state here.  Unfortunately,
-            # we have no way to anticipate this will happen before we run the function.)
+            # Don't eagerly initialize the cuda context by accident: we can't
+            # anticipate run_function initializing it later, so don't stash here.
             ctx.had_device_in_fwd = False
             device_module = _get_device_module(ctx.device_type)
             if getattr(device_module, "_initialized", False):
@@ -461,9 +452,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     global FIRST_PASS
                     global LAST_GC_INDEX
                     if FIRST_PASS:
-                        # Save last layer index so next run we do not offload activations
-                        # Saves VRAM and saves some time
-                        # See https://github.com/pytorch/torchtune/pull/1443
+                        # Save last layer index so next run skips offloading it
+                        # (saves VRAM and time). See
+                        # https://github.com/pytorch/torchtune/pull/1443
                         LAST_GC_INDEX += 1
                     pass
                     global CURRENT_GC_INDEX
@@ -527,7 +518,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                             except RuntimeError as e:
                                 if "out of memory" not in str(e).lower():
                                     raise
-                                # clear Buffer B and try to resize Single Buffer
+                                # Clear buffer B and resize the single buffer
                                 if GPU_BUFFERS_B is not None:
                                     USE_DOUBLE_BUFFER = False
                                     for j in range(len(GPU_BUFFERS_B)):
@@ -537,7 +528,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     GPU_BUFFER.resize_(new_size)
                                 else:
                                     raise
-                        # resize buffer B as needed if double buffering is enabled, disable and free Buffer B if OOM
+                        # Resize buffer B when double buffering; disable + free B on OOM
                         if USE_DOUBLE_BUFFER:
                             GPU_BUFFER_B = GPU_BUFFERS_B[device_index]
                             if new_size > GPU_BUFFER_B.numel():
@@ -546,9 +537,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                 except RuntimeError as e:
                                     if "out of memory" not in str(e).lower():
                                         raise
-                                    # OOM - disable double buffering
                                     USE_DOUBLE_BUFFER = False
-                                    # Reclaim buffer B
                                     for j in range(len(GPU_BUFFERS_B)):
                                         GPU_BUFFERS_B[j].resize_(0)
                                     GPU_BUFFERS_B = None
@@ -620,7 +609,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             global GPU_BUFFERS_B
             global BUFFER_EVENTS_A
             global BUFFER_EVENTS_B
-            # Select which buffer to use based on per-device buffer_slot
+            # Select buffer from per-device buffer_slot
             if USE_DOUBLE_BUFFER and buffer_slot == 1:
                 buffer = GPU_BUFFERS_B[device_index][:new_size].view(shape)
             else:
@@ -630,11 +619,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:
-                # Wait for the last compute on THIS SPECIFIC buffer to finish
+                # Wait for the last compute on THIS buffer to finish
                 event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
                 EXTRA_STREAM.wait_event(event_buffer[device_index])
             else:
-                # Single buffer mode: Must wait for MAIN_STREAM to finish
+                # Single buffer mode: wait for MAIN_STREAM
                 EXTRA_STREAM.wait_stream(MAIN_STREAM)
 
             with torch_gpu_stream(EXTRA_STREAM):
@@ -657,9 +646,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         global CURRENT_GC_INDEX
         CURRENT_GC_INDEX = 0
 
-        # Stash the surrounding rng state, and mimic the state that was
-        # present at this time during forward.  Restore the surrounding state
-        # when we're done.
+        # Stash the surrounding rng state, mimic the forward state, then
+        # restore the surrounding state when done.
         rng_devices = []
         if ctx.preserve_rng_state and ctx.had_device_in_fwd:
             rng_devices = ctx.fwd_devices
@@ -721,7 +709,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             torch.autograd.backward(outputs_with_grad, args_with_grad)
         pass
 
-        # Record event after compute finishes so the copy stream knows
+        # Record event after compute so the copy stream can wait on it
         if CPU_INDEX is not None and USE_DOUBLE_BUFFER:
             event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
             event_buffer[device_index].record(MAIN_STREAM)
@@ -757,116 +745,27 @@ def unsloth_checkpoint(
     debug: bool = False,
     **kwargs
 ):
-    r"""Checkpoint a model or part of the model.
+    r"""Activation checkpoint a model or part of the model.
 
-    Activation checkpointing is a technique that trades compute for memory.
-    Instead of keeping tensors needed for backward alive until they are used in
-    gradient computation during backward, forward computation in checkpointed
-    regions omits saving tensors for backward and recomputes them during the
-    backward pass. Activation checkpointing can be applied to any part of a
-    model.
+    Trades compute for memory: forward in checkpointed regions omits saving
+    tensors for backward and recomputes them during the backward pass.
 
-    There are currently two checkpointing implementations available, determined
-    by the :attr:`use_reentrant` parameter. It is recommended that you use
-    ``use_reentrant=False``. Please refer the note below for a discussion of
-    their differences.
+    This is Unsloth's drop-in for ``torch.utils.checkpoint.checkpoint``; it
+    forces ``use_reentrant=True`` to route through UnslothCheckpointFunction
+    (smart CPU offloading). The ``context_fn`` / ``determinism_check`` /
+    ``debug`` args are only valid with ``use_reentrant=False`` and raise here.
 
     .. warning::
 
-        If the :attr:`function` invocation during the backward pass differs
-        from the forward pass, e.g., due to a global variable, the checkpointed
-        version may not be equivalent, potentially causing an
-        error being raised or leading to silently incorrect gradients.
-
-    .. warning::
-
-        The ``use_reentrant`` parameter should be passed explicitly. In version
-        2.4 we will raise an exception if ``use_reentrant`` is not passed.
-        If you are using the ``use_reentrant=True`` variant, please refer to the
-        note below for important considerations and potential limitations.
-
-    .. note::
-
-        The reentrant variant of checkpoint (``use_reentrant=True``) and
-        the non-reentrant variant of checkpoint (``use_reentrant=False``)
-        differ in the following ways:
-
-        * Non-reentrant checkpoint stops recomputation as soon as all needed
-          intermediate activations have been recomputed. This feature is enabled
-          by default, but can be disabled with :func:`set_checkpoint_early_stop`.
-          Reentrant checkpoint always recomputes :attr:`function` in its
-          entirety during the backward pass.
-
-        * The reentrant variant does not record the autograd graph during the
-          forward pass, as it runs with the forward pass under
-          :func:`torch.no_grad`. The non-reentrant version does record the
-          autograd graph, allowing one to perform backward on the graph within
-          checkpointed regions.
-
-        * The reentrant checkpoint only supports the
-          :func:`torch.autograd.backward` API for the backward pass without its
-          `inputs` argument, while the non-reentrant version supports all ways
-          of performing the backward pass.
-
-        * At least one input and output must have ``requires_grad=True`` for the
-          reentrant variant. If this condition is unmet, the checkpointed part
-          of the model will not have gradients. The non-reentrant version does
-          not have this requirement.
-
-        * The reentrant version does not consider tensors in nested structures
-          (e.g., custom objects, lists, dicts, etc) as participating in
-          autograd, while the non-reentrant version does.
-
-        * The reentrant checkpoint does not support checkpointed regions with
-          detached tensors from the computational graph, whereas the
-          non-reentrant version does. For the reentrant variant, if the
-          checkpointed segment contains tensors detached using ``detach()`` or
-          with :func:`torch.no_grad`, the backward pass will raise an error.
-          This is because ``checkpoint`` makes all the outputs require gradients
-          and this causes issues when a tensor is defined to have no gradient in
-          the model. To avoid this, detach the tensors outside of the
-          ``checkpoint`` function.
+        If :attr:`function` behaves differently in backward vs forward (e.g.
+        via a global), recomputation may error or yield wrong gradients.
 
     Args:
-        function: describes what to run in the forward pass of the model or
-            part of the model. It should also know how to handle the inputs
-            passed as the tuple. For example, in LSTM, if user passes
-            ``(activation, hidden)``, :attr:`function` should correctly use the
-            first input as ``activation`` and the second input as ``hidden``
-        preserve_rng_state(bool, optional):  Omit stashing and restoring
-            the RNG state during each checkpoint. Note that under torch.compile,
-            this flag doesn't take effect and we always preserve RNG state.
-            Default: ``True``
-        use_reentrant(bool):
-            specify whether to use the activation checkpoint variant that
-            requires reentrant autograd. This parameter should be passed
-            explicitly. In version 2.5 we will raise an exception if
-            ``use_reentrant`` is not passed. If ``use_reentrant=False``,
-            ``checkpoint`` will use an implementation that does not require
-            reentrant autograd. This allows ``checkpoint`` to support additional
-            functionality, such as working as expected with
-            ``torch.autograd.grad`` and support for keyword arguments input into
-            the checkpointed function.
-        context_fn(Callable, optional): A callable returning a tuple of two
-            context managers. The function and its recomputation will be run
-            under the first and second context managers respectively.
-            This argument is only supported if ``use_reentrant=False``.
-        determinism_check(str, optional): A string specifying the determinism
-            check to perform. By default it is set to ``"default"`` which
-            compares the shapes, dtypes, and devices of the recomputed tensors
-            against those the saved tensors. To turn off this check, specify
-            ``"none"``. Currently these are the only two supported values.
-            Please open an issue if you would like to see more determinism
-            checks. This argument is only supported if ``use_reentrant=False``,
-            if ``use_reentrant=True``, the determinism check is always disabled.
-        debug(bool, optional): If ``True``, error messages will also include
-            a trace of the operators ran during the original forward computation
-            as well as the recomputation. This argument is only supported if
-            ``use_reentrant=False``.
-        args: tuple containing inputs to the :attr:`function`
+        function: forward pass to run; must handle the passed input tuple.
+        args: inputs to :attr:`function`.
 
     Returns:
-        Output of running :attr:`function` on :attr:`*args`
+        Output of running :attr:`function` on :attr:`*args`.
     """
     # Force use_reentrant=True so UnslothCheckpointFunction (smart CPU offloading)
     # is always used. This is safe because unsloth_checkpoint is only active when
@@ -914,12 +813,11 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None):
         torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
         torch.utils.checkpoint.checkpoint = unsloth_checkpoint
 
-    # Always patch transformers.modeling_utils.checkpoint so that
-    # gradient_checkpointing_enable() wraps unsloth_checkpoint, not the original.
-    # Without this, transformers 5.2's use_reentrant=False default bypasses
-    # UnslothCheckpointFunction entirely.
-    # Must be outside the conditional above since torch.utils.checkpoint.checkpoint
-    # may already be patched while transformers.modeling_utils.checkpoint is not.
+    # Always patch transformers.modeling_utils.checkpoint so
+    # gradient_checkpointing_enable() wraps unsloth_checkpoint; otherwise
+    # transformers 5.2's use_reentrant=False default bypasses
+    # UnslothCheckpointFunction. Outside the conditional above since
+    # torch.utils.checkpoint may already be patched while this one is not.
     import transformers.modeling_utils
     transformers.modeling_utils.checkpoint = unsloth_checkpoint
 pass
@@ -962,12 +860,11 @@ def unpatch_unsloth_smart_gradient_checkpointing():
 
         torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
 
-    # Restore transformers.modeling_utils.checkpoint independently.
-    # Must be outside the conditional above because unpatch_unsloth_gradient_checkpointing()
-    # may run first (e.g. training_utils.py:201), deleting _old_checkpoint and restoring
-    # torch.utils.checkpoint.checkpoint, which makes the condition above False.
-    # Use _old_checkpoint if still available, otherwise torch.utils.checkpoint.checkpoint
-    # (which has already been restored to the original at that point).
+    # Restore transformers.modeling_utils.checkpoint independently: an earlier
+    # unpatch_unsloth_gradient_checkpointing() (e.g. training_utils.py:201) may
+    # have deleted _old_checkpoint and restored torch.utils.checkpoint,
+    # making the condition above False. Prefer _old_checkpoint, else the
+    # already-restored torch.utils.checkpoint.checkpoint.
     import transformers.modeling_utils
     if getattr(transformers.modeling_utils, "checkpoint", None) is unsloth_checkpoint:
         transformers.modeling_utils.checkpoint = getattr(
@@ -981,18 +878,11 @@ def reset_unsloth_gradient_checkpointing_buffers():
     """
     All Unsloth Zoo code licensed under LGPLv3
 
-    Resets CPU_BUFFERS and GPU_BUFFERS to their initial sizes after training.
+    Reset CPU_BUFFERS and GPU_BUFFERS to their initial sizes after training.
 
-    This function should be called after trainer.train() completes to free up
-    memory that was allocated during training while keeping the buffers ready
-    for another potential training run. Unlike unpatch_unsloth_smart_gradient_checkpointing,
-    this does NOT destroy the buffers or unpatch the checkpointing - it just resets
-    them to their initial state.
-
-    Usage:
-        trainer.train()
-        reset_unsloth_gradient_checkpointing_buffers()  # Free memory, stay ready
-        # Can run trainer.train() again without re-initializing
+    Call after trainer.train() to free training-allocated memory while keeping
+    buffers ready for another run. Unlike unpatch_unsloth_smart_gradient_checkpointing,
+    this neither destroys the buffers nor unpatches checkpointing.
     """
     global CPU_BUFFERS
     global GPU_BUFFERS
@@ -1008,20 +898,17 @@ def reset_unsloth_gradient_checkpointing_buffers():
     global BUFFER_EVENTS_A
     global BUFFER_EVENTS_B
 
-    # Check if buffers exist
     if CPU_BUFFERS is None or GPU_BUFFERS is None:
         return
     if len(CPU_BUFFERS) == 0:
         return
 
-    # Reset CPU buffers to initial size and remove excess buffers
+    # Reset CPU buffers to initial size; free any added during training
     for i in range(len(CPU_BUFFERS)):
         if i < INITIAL_CPU_BUFFER_COUNT:
-            # Resize existing buffers back to initial size
             if CPU_BUFFERS[i] is not None and hasattr(CPU_BUFFERS[i], "resize_"):
                 CPU_BUFFERS[i].resize_(INITIAL_CPU_BUFFER_SIZE)
         else:
-            # Free excess buffers that were added during training
             if CPU_BUFFERS[i] is not None and hasattr(CPU_BUFFERS[i], "resize_"):
                 CPU_BUFFERS[i].resize_(0)
             CPU_BUFFERS[i] = None
@@ -1038,13 +925,13 @@ def reset_unsloth_gradient_checkpointing_buffers():
             GPU_BUFFERS[i].resize_(INITIAL_GPU_BUFFER_SIZE)
     pass
 
-    # Reset state variables for fresh training run
+    # Reset state for a fresh training run
     CPU_INDEX = 0
     BACKWARD_PASS = True
     LAST_GC_INDEX = 0
     FIRST_PASS = True
     CURRENT_GC_INDEX = 0
-    USE_UNSLOTH_GC = True  # Re-enable the "Will smartly offload" message
+    USE_UNSLOTH_GC = True  # re-enable the "Will smartly offload" message
     if NEXT_BUFFER_SLOT is not None:
         for i in range(len(NEXT_BUFFER_SLOT)):
             NEXT_BUFFER_SLOT[i] = 0
@@ -1079,7 +966,6 @@ def reset_unsloth_gradient_checkpointing_buffers():
         except RuntimeError:
             pass
 
-    # Clean up freed memory
     torch.cuda.empty_cache()
     gc.collect()
 pass
