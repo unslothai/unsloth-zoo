@@ -346,3 +346,125 @@ def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
         "(input_embeds + cache_position) and transformers 5.x "
         "(inputs_embeds, no cache_position). See PR #690."
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: patch_compiling_bitsandbytes used exec(f"import {x}",
+# globals(), locals()) + eval(x) inside a function. Under PEP 667
+# (Python 3.13+) the locals() snapshot does not persist, so eval raised
+# NameError: name 'peft' is not defined on every model load with
+# bitsandbytes < 0.46.0. Fixed by switching to importlib.import_module +
+# getattr. Source: #710 (issue #311).
+# These tests stub bitsandbytes/peft in sys.modules so they are hermetic:
+# no GPU, no real bitsandbytes install needed.
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_bnb_and_peft(monkeypatch, bnb_version, with_peft_leaf=True):
+    import sys
+    import types
+
+    def _fake_layer_class():
+        class _Layer:
+            def forward(self):
+                return "ok"
+        return _Layer
+
+    bnb = types.ModuleType("bitsandbytes")
+    bnb.__version__ = bnb_version
+    bnb_nn = types.ModuleType("bitsandbytes.nn")
+    bnb_modules = types.ModuleType("bitsandbytes.nn.modules")
+    bnb_modules.Linear4bit = _fake_layer_class()
+    bnb.nn = bnb_nn
+    bnb_nn.modules = bnb_modules
+
+    for name, mod in [
+        ("bitsandbytes", bnb),
+        ("bitsandbytes.nn", bnb_nn),
+        ("bitsandbytes.nn.modules", bnb_modules),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    peft_leaf = None
+    if with_peft_leaf:
+        peft = types.ModuleType("peft")
+        peft_tuners = types.ModuleType("peft.tuners")
+        peft_lora = types.ModuleType("peft.tuners.lora")
+        peft_leaf = types.ModuleType("peft.tuners.lora.bnb")
+        peft_leaf.Linear4bit = _fake_layer_class()
+        for name, mod in [
+            ("peft", peft),
+            ("peft.tuners", peft_tuners),
+            ("peft.tuners.lora", peft_lora),
+            ("peft.tuners.lora.bnb", peft_leaf),
+        ]:
+            monkeypatch.setitem(sys.modules, name, mod)
+    else:
+        # A peft package whose submodules cannot be imported: no __path__.
+        peft = types.ModuleType("peft")
+        monkeypatch.setitem(sys.modules, "peft", peft)
+        for name in ["peft.tuners", "peft.tuners.lora", "peft.tuners.lora.bnb"]:
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    return bnb_modules, peft_leaf
+
+
+def test_patch_compiling_bitsandbytes_old_bnb_wraps_without_nameerror(monkeypatch):
+    """The #311 bug class: with bitsandbytes < 0.46.0 the patch must run to
+    completion (no NameError from exec/eval namespace loss on Python 3.13+)
+    and dynamo-disable every forward on both target modules."""
+    from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
+
+    bnb_modules, peft_leaf = _install_fake_bnb_and_peft(monkeypatch, "0.45.5")
+    patch_compiling_bitsandbytes()
+
+    assert hasattr(bnb_modules.Linear4bit.forward, "__wrapped__"), (
+        "bitsandbytes.nn.modules forwards were not dynamo-disabled on the "
+        "< 0.46.0 branch. If this raises NameError instead, the exec/eval "
+        "import pattern regressed (PEP 667, fixed in #710)."
+    )
+    assert hasattr(peft_leaf.Linear4bit.forward, "__wrapped__"), (
+        "peft.tuners.lora.bnb forwards were not dynamo-disabled on the "
+        "< 0.46.0 branch (the exact failure mode of issue #311)."
+    )
+
+
+def test_patch_compiling_bitsandbytes_idempotent(monkeypatch):
+    """A second call must not re-wrap already wrapped forwards."""
+    from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
+
+    bnb_modules, _ = _install_fake_bnb_and_peft(monkeypatch, "0.45.5")
+    patch_compiling_bitsandbytes()
+    first = bnb_modules.Linear4bit.forward
+    patch_compiling_bitsandbytes()
+    second = bnb_modules.Linear4bit.forward
+
+    assert first is second, "forward was re-wrapped on a second call"
+    assert not hasattr(first.__wrapped__, "__wrapped__"), "double wrap detected"
+
+
+def test_patch_compiling_bitsandbytes_new_bnb_is_noop(monkeypatch):
+    """bitsandbytes >= 0.46.0 supports torch.compile: nothing gets wrapped,
+    checked at the exact 0.46.0 boundary."""
+    from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
+
+    bnb_modules, peft_leaf = _install_fake_bnb_and_peft(monkeypatch, "0.46.0")
+    patch_compiling_bitsandbytes()
+
+    assert not hasattr(bnb_modules.Linear4bit.forward, "__wrapped__")
+    assert not hasattr(peft_leaf.Linear4bit.forward, "__wrapped__")
+
+
+def test_patch_compiling_bitsandbytes_missing_peft_helpful_error(monkeypatch):
+    """A missing peft leaf must raise the actionable install message with the
+    original ImportError chained, not a bare NameError/ImportError."""
+    import pytest
+    from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
+
+    _install_fake_bnb_and_peft(monkeypatch, "0.45.5", with_peft_leaf=False)
+    with pytest.raises(ImportError, match="pip install peft") as excinfo:
+        patch_compiling_bitsandbytes()
+    assert excinfo.value.__cause__ is not None, (
+        "the original ImportError must be chained (raise ... from e) so an "
+        "installed-but-broken peft stays debuggable"
+    )
