@@ -541,6 +541,19 @@ def _check_audio_sampling_rate(sampling_rate, target_sampling_rate):
         )
 
 
+def _fix_audio_feature_extractor_padding_side(processor):
+    # Audio feature extractors must keep their stock right padding: their
+    # frame-validity masks assume trailing padding, so a left-padded waveform
+    # gains an extra valid mel frame on some clip lengths. On Gemma 4 with
+    # transformers < 5.10 that desyncs audio features from audio placeholder
+    # tokens and crashes the forward pass. The model loader passes
+    # padding_side = "left" (a text setting) to AutoProcessor.from_pretrained,
+    # which forwards it to every sub-component including the feature extractor.
+    feature_extractor = getattr(processor, "feature_extractor", None)
+    if getattr(feature_extractor, "padding_side", None) == "left":
+        feature_extractor.padding_side = "right"
+
+
 def _resolve_audio_dict(audio, sampling_rate=None):
     # HuggingFace Audio feature dict -> waveform array, else a path / url string
     # (covers Audio(decode=False) payloads like {"bytes": None, "path": ...})
@@ -695,6 +708,7 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+        _fix_audio_feature_extractor_padding_side(processor)
         self.formatting_func = formatting_func
         self.completion_only_loss = completion_only_loss
         self.pad_to_multiple_of = pad_to_multiple_of

@@ -37,6 +37,7 @@ import torch
 
 from unsloth_zoo.vision_utils import (
     UnslothVisionDataCollator,
+    _fix_audio_feature_extractor_padding_side,
     extract_audio_info,
 )
 
@@ -241,6 +242,39 @@ def test_inline_audio_decode_false_dict_resolved():
     part = {"type": "audio", "audio": {"bytes": None, "path": "/tmp/a.wav"}}
     out = extract_audio_info(msgs(part), sampling_rate=16000)
     assert out == ["/tmp/a.wav"]
+
+
+# ---------------------------------------------------------------------------
+# _fix_audio_feature_extractor_padding_side
+# ---------------------------------------------------------------------------
+
+def test_left_padded_feature_extractor_reset_to_right():
+    # The model loader leaks padding_side="left" into the audio feature
+    # extractor; left-padded waveforms desync mel frame masks from audio
+    # placeholder counts (crashes Gemma 4 on transformers < 5.10).
+    proc = _FakeProcessor()
+    proc.feature_extractor.padding_side = "left"
+    _fix_audio_feature_extractor_padding_side(proc)
+    assert proc.feature_extractor.padding_side == "right"
+
+
+def test_right_padded_feature_extractor_untouched():
+    proc = _FakeProcessor()
+    proc.feature_extractor.padding_side = "right"
+    _fix_audio_feature_extractor_padding_side(proc)
+    assert proc.feature_extractor.padding_side == "right"
+
+
+def test_processor_without_feature_extractor_noop():
+    class _TextOnly:
+        pass
+    _fix_audio_feature_extractor_padding_side(_TextOnly())
+
+
+def test_feature_extractor_without_padding_side_noop():
+    proc = _FakeProcessor()
+    _fix_audio_feature_extractor_padding_side(proc)
+    assert not hasattr(proc.feature_extractor, "padding_side")
 
 
 # ---------------------------------------------------------------------------
