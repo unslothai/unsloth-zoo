@@ -321,7 +321,7 @@ def do_we_need_sudo(system_type="debian"):
     # Choose update command based on system type
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        update_cmd = f"{pkg_manager} update -y"
+        update_cmd = f"{pkg_manager} install package --setopt=tsflags=test"
     elif system_type == "arch":
         update_cmd = "pacman -Sy"
     else:
