@@ -38,7 +38,11 @@ try:
 except ImportError:
     from transformers import PretrainedConfig as PreTrainedConfig
 
-from unsloth_zoo.training_utils import prepare_model_for_training
+from unsloth_zoo.training_utils import (
+    disable_use_cache,
+    prepare_model_for_training,
+    restore_use_cache,
+)
 
 
 def _tiny_llama(**config_overrides):
@@ -118,3 +122,58 @@ def test_self_referencing_config_terminates():
         model, use_gradient_checkpointing = True, use_reentrant = False,
     )
     assert config.use_cache is False
+
+
+def test_restore_use_cache_after_training_prep():
+    model = _tiny_llama(use_cache = True)
+    prepare_model_for_training(model, use_gradient_checkpointing = True)
+    assert model.config.use_cache is False
+    restore_use_cache(model)
+    assert model.config.use_cache is True
+
+
+def test_restore_nested_composite_config():
+    Gemma3Config = pytest.importorskip("transformers").Gemma3Config
+    config = Gemma3Config()
+    config.text_config.use_cache = True
+    model = _ConfigCarrier(config)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing = True, use_reentrant = False,
+    )
+    assert config.text_config.use_cache is False
+    restore_use_cache(model)
+    assert config.text_config.use_cache is True
+
+
+def test_restore_without_prepare_is_noop():
+    model = _tiny_llama(use_cache = True)
+    restore_use_cache(model)
+    assert model.config.use_cache is True
+
+
+def test_restore_preserves_falsy_values():
+    # Configs whose use_cache was None/False are never recorded, so a
+    # restore after prepare must not invent True values for them.
+    model = _tiny_llama(use_cache = None)
+    prepare_model_for_training(model, use_gradient_checkpointing = True)
+    restore_use_cache(model)
+    assert model.config.use_cache is None
+
+
+def test_disable_restore_cycle_keeps_originals():
+    # for_inference -> for_training -> for_inference round trips.
+    model = _tiny_llama(use_cache = True)
+    prepare_model_for_training(model, use_gradient_checkpointing = True)
+    restore_use_cache(model)
+    disable_use_cache(model)
+    assert model.config.use_cache is False
+    restore_use_cache(model)
+    assert model.config.use_cache is True
+
+
+def test_double_prepare_keeps_first_originals():
+    model = _tiny_llama(use_cache = True)
+    prepare_model_for_training(model, use_gradient_checkpointing = True)
+    prepare_model_for_training(model, use_gradient_checkpointing = True)
+    restore_use_cache(model)
+    assert model.config.use_cache is True
