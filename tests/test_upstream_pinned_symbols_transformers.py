@@ -94,10 +94,9 @@ def _first_match(repo: str, ref: str, paths: list[str]) -> tuple[str, str] | Non
     return None
 
 
-# Gemma3 attention surface, zoo PR #635 / #488 / #571.
-# unsloth_zoo/temporary_patches/gemma.py imports Gemma3Attention,
-# Gemma3RMSNorm, Gemma3MLP, Gemma3TextScaledWordEmbedding plus
-# apply_rotary_pos_emb / ALL_ATTENTION_FUNCTIONS / eager_attention_forward.
+# Gemma3 attention surface, zoo PR #635 / #488 / #571. gemma.py imports
+# Gemma3Attention/RMSNorm/MLP/TextScaledWordEmbedding plus apply_rotary_pos_emb
+# / ALL_ATTENTION_FUNCTIONS / eager_attention_forward.
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
@@ -175,9 +174,9 @@ def test_ministral_attention_module_present(tag: str):
 
 
 # gpt_oss MoE patch surface, zoo PR #525 / #472 / #471 / #470 / #467.
-# gpt_oss.py reads transformers.models.gpt_oss.modeling_gpt_oss.{
-# GptOssExperts, GptOssTopKRouter, GptOssAttention, GptOssModel,
-# GptOssPreTrainedModel} and reassigns .GptOssExperts.forward.
+# gpt_oss.py reads modeling_gpt_oss.{GptOssExperts, GptOssTopKRouter,
+# GptOssAttention, GptOssModel, GptOssPreTrainedModel} and reassigns
+# .GptOssExperts.forward.
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
@@ -224,8 +223,8 @@ def test_qwen3_moe_required_classes(tag: str):
     )
     if src is None:
         pytest.skip(f"{tag}: modeling_qwen3_moe.py not present")
-    # Qwen3MoeSparseMoeBlock: stable across the entire support window
-    # (zoo qwen3_moe.py:215 + L337-L340 read it).
+    # Qwen3MoeSparseMoeBlock: stable across the support window
+    # (qwen3_moe.py:215 + L337-L340 read it).
     assert _has_def(src, "Qwen3MoeSparseMoeBlock", "class"), (
         f"{tag}: class Qwen3MoeSparseMoeBlock missing; "
         f"unsloth_zoo/temporary_patches/qwen3_moe.py forward / LoRA "

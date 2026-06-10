@@ -11,18 +11,9 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
 
-"""Exhaustive drift detectors for the ``unsloth_zoo`` / ``unsloth``
-source-string and regex rewriters (round 3 of coverage).
-
-Pins sites in compiler.py, temporary_patches/*.py, patching_utils.py,
-saving_utils.py, rl_replacements.py, training_utils.py, unsloth/trainer.py,
-unsloth/models/rl.py that aren't already pinned by
-test_upstream_source_patterns.py.
-
-Each test cites its rewriter file:line. Missing pinned string / regex ->
-``pytest.fail("DRIFT DETECTED: zoo/unsloth source-rewriter at <file:line>
-expects '<pattern>' in <upstream module>, found 0 matches")``. CPU-only.
-"""
+"""Drift detectors for zoo/unsloth source-string and regex rewriters not
+covered by test_upstream_source_patterns.py. Each test cites its rewriter
+file:line and fails with a DRIFT DETECTED message. CPU-only."""
 
 from __future__ import annotations
 
@@ -42,8 +33,7 @@ except Exception:
 
 
 def _skip_if_transformers_5x(reason: str) -> None:
-    """Skip when transformers 5.x removed the anchor the rewriter
-    probe pins. Keep the detector strict on 4.57.6."""
+    """Skip on transformers 5.x; keep the detector strict on 4.57.6."""
     if _TX_IS_5X:
         pytest.skip(
             f"transformers {_TX_VERSION}: {reason} (zoo rewriter silently "
@@ -55,7 +45,7 @@ def _skip_if_transformers_5x(reason: str) -> None:
 
 def _drift(zoo_site: str, pattern: str, upstream_path: str,
            extra: str = "") -> None:
-    """``pytest.fail`` with the standardized DRIFT message."""
+    """pytest.fail with the standardized DRIFT message."""
     msg = (
         f"DRIFT DETECTED: zoo/unsloth source-rewriter at {zoo_site} expects "
         f"{pattern!r} in {upstream_path}, found 0 matches."
@@ -99,9 +89,8 @@ def _probe_modules(candidates, predicate):
 
 
 def test_compiler_higher_precision_softmax_idempotency_lookahead():
-    """``unsloth_zoo/compiler.py:391-405`` higher_precision_softmax negative
-    lookahead skips already-rewritten softmax. Pins the upstream
-    ``softmax(..., dim=N)`` keyword form so the finder isn't dormant."""
+    """compiler.py:391-405 higher_precision_softmax: pin the upstream
+    ``softmax(..., dim=N)`` form so the float32 upcast finder isn't dormant."""
     pytest.importorskip("transformers")
     pattern = re.compile(
         r"(?:nn\.functional\.softmax|F\.softmax)"
@@ -127,9 +116,8 @@ def test_compiler_higher_precision_softmax_idempotency_lookahead():
 
 
 def test_compiler_fix_rotary_embedding_cos_to_dtype_pattern():
-    """``unsloth_zoo/compiler.py:510-517`` fix_rotary_embedding_dtype
-    replaces ``cos.to(dtype=x.dtype)`` / ``sin.to(dtype=x.dtype)``;
-    UNSLOTH_FORCE_CUSTOM_DTYPE-gated. Pin: some rotary cast site exists."""
+    """compiler.py:510-517 fix_rotary_embedding_dtype (UNSLOTH_FORCE_CUSTOM_DTYPE
+    -gated): pin that some rotary cos/sin cast site exists."""
     pytest.importorskip("transformers")
     candidates = [
         "transformers.models.llama.modeling_llama",
@@ -162,8 +150,8 @@ def test_compiler_fix_rotary_embedding_cos_to_dtype_pattern():
 
 
 def test_compiler_higher_precision_layernorms_norm_class_marker():
-    """``unsloth_zoo/compiler.py:560-597`` higher_precision_layernorms
-    locates ``class <X>Norm(nn.Module):`` blocks; without one,
+    """compiler.py:560-597 higher_precision_layernorms locates
+    ``class <X>Norm(nn.Module):`` blocks; without one,
     UNSLOTH_HIGH_PRECISION_LAYERNORM is never auto-toggled."""
     pytest.importorskip("transformers")
     pattern = re.compile(
@@ -214,9 +202,9 @@ def test_compiler_embedding_oob_clamp_input_ids_pattern():
 
 
 def test_compiler_apply_mask_attention_mask_kwargs_pinned_pattern():
-    """``unsloth_zoo/compiler.py:2128-2140`` apply_mask_attention_mask_out
-    needs ``attention_mask=attention_mask,`` AND ``labels=labels,`` together
-    in a ForConditionalGeneration forward."""
+    """compiler.py:2128-2140 apply_mask_attention_mask_out needs
+    ``attention_mask=attention_mask,`` AND ``labels=labels,`` together in
+    a ForConditionalGeneration forward."""
     pytest.importorskip("transformers")
     candidates = [
         "transformers.models.llava.modeling_llava",
@@ -358,10 +346,9 @@ def test_compiler_strip_kw_for_loop_pattern_targetable():
 
 
 def test_compiler_dtype_mismatch_finfo_attention_mask_pinned():
-    """``unsloth_zoo/compiler.py:2381-2391`` patch_finfo_attention_mask_dtype_mismatch
-    pins pre-4.50 ``<X> = <X>/torch.finfo(<X>.dtype).min`` followed by
-    ``<X> = (1.0 - <X>).int()``. Forward-looking: only DRIFT when the
-    underlying primitives are also gone."""
+    """compiler.py:2381-2391 patch_finfo_attention_mask_dtype_mismatch pins
+    pre-4.50 ``<X> = <X>/torch.finfo(<X>.dtype).min`` then
+    ``<X> = (1.0 - <X>).int()``; DRIFT only when the primitives are also gone."""
     pytest.importorskip("transformers")
     candidates = [
         "transformers.modeling_attn_mask_utils",
@@ -390,8 +377,8 @@ def test_compiler_dtype_mismatch_finfo_attention_mask_pinned():
 
 
 def test_compiler_lora_forward_result_clone_pinned_string():
-    """``unsloth_zoo/compiler.py:2539`` replaces ``result = result.clone()``
-    in peft's LoRA forward (defeats in-place ops)."""
+    """compiler.py:2539 replaces ``result = result.clone()`` in peft's LoRA
+    forward (defeats in-place ops)."""
     pytest.importorskip("peft")
     try:
         from peft.tuners.lora.layer import Linear as LoraLinear
@@ -450,11 +437,8 @@ def test_compiler_lora_def_forward_rename_pinned_string():
 
 
 def test_compiler_lora_x_cast_dtype_pinned_strings():
-    """``unsloth_zoo/compiler.py:2578-2581,2596`` pins three peft LoRA
-    targets: ``x = x.to(lora_A.weight.dtype)`` / ``x =
-    self._cast_input_dtype(x, lora_A.weight.dtype)`` /
-    ``self._check_forward_args(x, *args, **kwargs)``. DRIFT only when
-    ALL THREE are gone."""
+    """compiler.py:2578-2581,2596 pins three peft LoRA targets (x dtype cast,
+    _cast_input_dtype, _check_forward_args); DRIFT only when ALL THREE are gone."""
     pytest.importorskip("peft")
     try:
         from peft.tuners.lora.layer import Linear as LoraLinear
@@ -480,9 +464,8 @@ def test_compiler_lora_x_cast_dtype_pinned_strings():
 
 
 def test_compiler_variant_kwarg_keys_pinned_token():
-    """``unsloth_zoo/compiler.py:2649-2655`` peft >= 0.18.0
-    ``VARIANT_KWARG_KEYS`` at the layer module level; the FIND must
-    succeed for the fallback to fire."""
+    """compiler.py:2649-2655 peft >= 0.18.0 ``VARIANT_KWARG_KEYS`` at the layer
+    module level; the FIND must succeed for the fallback to fire."""
     pytest.importorskip("peft")
     try:
         import peft.tuners.lora.layer as ly
@@ -498,9 +481,9 @@ def test_compiler_variant_kwarg_keys_pinned_token():
 
 
 def test_compiler_patch_residual_stream_residual_plus_hidden_states_pattern():
-    """``unsloth_zoo/compiler.py:2698-2705`` second patch_residual_stream
-    regex matches ``<h> = residual + (<h> * <expr>|<expr> * <h>)``
-    (addcmul / fused-add target on VLM cross-attention encoders)."""
+    """compiler.py:2698-2705 second patch_residual_stream regex matches
+    ``<h> = residual + (<h> * <expr>|<expr> * <h>)`` (addcmul / fused-add
+    target on VLM cross-attention encoders)."""
     pytest.importorskip("transformers")
     pattern = re.compile(
         r"(hidden_state(?:s)?) = residual \+ "
@@ -781,10 +764,9 @@ def test_compiler_conv_forward_def_first_param_pattern():
 
 
 def test_patching_utils_compiled_autograd_end_capture_return_compiled_fn_pinned():
-    """``unsloth_zoo/patching_utils.py:544-547`` wraps
-    ``AutogradCompilerInstance.end_capture``'s ``return compiled_fn(...)``
-    in ``with disable():`` (PR #135795 double-compile fix). Signature
-    drift silently no-ops the rewriter."""
+    """patching_utils.py:544-547 wraps AutogradCompilerInstance.end_capture's
+    ``return compiled_fn(...)`` in ``with disable():`` (PR #135795
+    double-compile fix). Signature drift silently no-ops the rewriter."""
     pytest.importorskip("torch")
     try:
         import torch._dynamo.compiled_autograd as ca
@@ -817,18 +799,15 @@ def test_patching_utils_compiled_autograd_end_capture_return_compiled_fn_pinned(
         return
     needle = "return compiled_fn(inputs, sizes, scalars, hooks)"
     pattern = re.compile(r"\n([ ]{1,})return compiled_fn")
-    # Contract: pass if exact str+regex present (rewriter works), or
-    # `with disable()` / `with _disable()` already in src (torch 2.7+
-    # native fix). torch 2.7+ end_capture signature drifted (added
-    # packed_inputs, nested with-block); rewriter no-ops cleanly.
+    # Pass if exact str+regex present (rewriter works), or `with disable()`
+    # / `with _disable()` already in src (torch 2.7+ native fix).
     if needle in src and pattern.search(src) is not None:
         return
     if "with disable()" in src or "with _disable()" in src:
         return
     if "compiled_fn(" in src:
-        # BENIGN on torch 2.7+: upstream fixed PR #135795 natively with
-        # ``with _disable()``; zoo's patch_compiled_autograd recognises
-        # both forms and no-ops cleanly.
+        # BENIGN on torch 2.7+: upstream fixed PR #135795 natively; zoo
+        # recognises both forms and no-ops cleanly.
         pytest.skip(
             "BENIGN: torch 2.7+ fixed PR #135795-style double-compile "
             "upstream natively (now wraps compiled_fn in `with _disable()`); "
@@ -868,9 +847,8 @@ def test_patching_utils_compiled_autograd_end_capture_rename_target():
 
 
 def test_patching_utils_autograd_engine_call_method_compiled_autograd_enabled_pinned():
-    """``unsloth_zoo/patching_utils.py:564-573`` replaces
-    ``compiled_autograd_enabled`` -> ``in_compiled_autograd_region`` in
-    ``AutogradEngineVariable.call_method``."""
+    """patching_utils.py:564-573 replaces ``compiled_autograd_enabled`` ->
+    ``in_compiled_autograd_region`` in AutogradEngineVariable.call_method."""
     pytest.importorskip("torch")
     try:
         import torch._dynamo.variables.misc as misc
@@ -909,11 +887,10 @@ def test_patching_utils_autograd_engine_call_method_rename_target():
 
 
 def test_patching_utils_replace_with_bnb_linear_skip_modules_pinned():
-    """``unsloth_zoo/patching_utils.py:695-699`` replaces
-    ``name in quantization_config.llm_int8_skip_modules\\n`` on
-    ``bnb._replace_with_bnb_linear`` (dynamic-4bit conversion).
-    Resolves UPSTREAM source via inspect.getsourcefile because zoo has
-    already rebound the function by test time."""
+    """patching_utils.py:695-699 replaces ``name in
+    quantization_config.llm_int8_skip_modules\\n`` on
+    ``bnb._replace_with_bnb_linear`` (dynamic-4bit conversion). Resolves
+    UPSTREAM source via inspect.getsourcefile (zoo has already rebound it)."""
     pytest.importorskip("transformers")
     try:
         import transformers.integrations.bitsandbytes as bnb
@@ -926,9 +903,8 @@ def test_patching_utils_replace_with_bnb_linear_skip_modules_pinned():
         )
         return
 
-    # Resolve upstream source directly from the module file (zoo rebinds
-    # bnb._replace_with_bnb_linear so inspect.getsource off the live
-    # function returns the patched body, never upstream).
+    # Read upstream source from the module file: zoo rebinds the live
+    # function, so inspect.getsource off it returns the patched body.
     live = bnb._replace_with_bnb_linear
     is_zoo_patched = (
         getattr(live, "__name__", "") == "_unsloth_replace_with_bnb_linear"
@@ -1041,7 +1017,7 @@ def test_patching_utils_current_key_name_str_marker():
 
 
 def test_patching_utils_replace_with_bnb_linear_ast_wrap_target():
-    """``unsloth_zoo/patching_utils.py:701-704`` AST-wraps recursive
+    """patching_utils.py:701-704 AST-wraps recursive
     ``= _replace_with_bnb_linear(...)`` calls in try/finally with
     parent-class marking."""
     pytest.importorskip("transformers")
@@ -1056,8 +1032,7 @@ def test_patching_utils_replace_with_bnb_linear_ast_wrap_target():
         src = inspect.getsource(bnb._replace_with_bnb_linear)
     except (OSError, TypeError):
         pytest.skip("Source unavailable")
-    # The recursive call is the AST anchor. Match patterns like:
-    # ``_, has_been_replaced = _replace_with_bnb_linear(...)``
+    # The recursive call is the AST anchor.
     pattern = re.compile(r"=\s*_replace_with_bnb_linear\s*\(")
     if pattern.search(src) is None:
         _drift(
@@ -1074,9 +1049,9 @@ def test_patching_utils_replace_with_bnb_linear_ast_wrap_target():
 
 
 def test_saving_utils_save_pretrained_state_dict_split_pinned_string():
-    """``unsloth_zoo/saving_utils.py:2675-2677`` hard-fails (RuntimeError)
-    when ``state_dict_split = split_torch_state_dict_into_shards`` is
-    missing from PreTrainedModel.save_pretrained."""
+    """saving_utils.py:2675-2677 hard-fails (RuntimeError) when
+    ``state_dict_split = split_torch_state_dict_into_shards`` is missing
+    from PreTrainedModel.save_pretrained."""
     pytest.importorskip("transformers")
     import transformers.modeling_utils as mu
     try:
@@ -1095,17 +1070,10 @@ def test_saving_utils_save_pretrained_state_dict_split_pinned_string():
 
 
 def test_saving_utils_save_pretrained_state_dict_contiguous_pinned_string():
-    """``unsloth_zoo/saving_utils.py:2680-2686`` requires
-    ``state_dict[tensor].contiguous()`` in upstream + replace to
-    ``merge_lora_weights(...)``; RuntimeError otherwise.
-
-    transformers 5.x rewrote PreTrainedModel.save_pretrained (sharding /
-    state-dict iteration moved). zoo's saving_utils.py upfront-anchor
-    check (``_required_anchors``) detects the missing string and falls
-    back to vanilla ``model.save_pretrained`` with a warning. The
-    detector becomes a positive-assertion on 5.x: confirm the anchor is
-    gone AND zoo's _required_anchors list flags it AND the warning path
-    fires gracefully (no RuntimeError).
+    """saving_utils.py:2680-2686 requires ``state_dict[tensor].contiguous()``
+    + replace to ``merge_lora_weights(...)``; RuntimeError otherwise. On 5.x
+    the anchor moved: assert it's gone AND zoo's _required_anchors flags it so
+    the graceful vanilla-save fallback fires instead of RuntimeError.
     """
     pytest.importorskip("transformers")
     import transformers.modeling_utils as mu
@@ -1120,8 +1088,7 @@ def test_saving_utils_save_pretrained_state_dict_contiguous_pinned_string():
             "on 5.x but is present; refresh the zoo prod-fix anchor "
             "list at saving_utils.py:_required_anchors"
         )
-        # Positive assertion: zoo's prod-fix correctly identifies the
-        # missing anchor in its preflight check.
+        # Assert zoo's preflight check includes the now-missing anchor.
         import unsloth_zoo.saving_utils as zsu
         zsu_src = inspect.getsource(zsu.merge_and_dequantize_lora)
         assert needle in zsu_src, (
@@ -1143,8 +1110,8 @@ def test_saving_utils_save_pretrained_state_dict_contiguous_pinned_string():
 
 
 def test_saving_utils_save_pretrained_def_marker():
-    """``unsloth_zoo/saving_utils.py:2688-2694`` renames
-    ``save_pretrained`` -> ``save_pretrained_dequantized``."""
+    """saving_utils.py:2688-2694 renames ``save_pretrained`` ->
+    ``save_pretrained_dequantized``."""
     pytest.importorskip("transformers")
     import transformers.modeling_utils as mu
     try:
@@ -1160,9 +1127,8 @@ def test_saving_utils_save_pretrained_def_marker():
 
 
 def test_saving_utils_incremental_save_os_makedirs_pinned_regex():
-    """``unsloth_zoo/saving_utils.py:2517`` re.search
-    ``os.makedirs(save_directory...)`` in save_pretrained; absent ->
-    incremental_save_pretrained aborts push-to-hub path."""
+    """saving_utils.py:2517 re.search ``os.makedirs(save_directory...)`` in
+    save_pretrained; absent -> incremental_save_pretrained aborts push-to-hub."""
     pytest.importorskip("transformers")
     import transformers.modeling_utils as mu
     try:
@@ -1181,16 +1147,10 @@ def test_saving_utils_incremental_save_os_makedirs_pinned_regex():
 
 
 def test_saving_utils_incremental_save_for_loop_filename_to_tensors_pinned():
-    """``unsloth_zoo/saving_utils.py:2526-2533`` requires
-    ``for shard_file, tensors in filename_to_tensors`` in
-    save_pretrained; RuntimeError otherwise.
-
-    transformers 5.x renamed the iterator. zoo's prod fix in
-    ``merge_and_dequantize_lora`` runs an upfront anchor check that
-    includes this string and falls back to vanilla
-    ``model.save_pretrained`` (with a warning) when push_to_hub=True
-    and the anchor is missing. On 5.x: assert the anchor is gone AND
-    zoo's preflight check covers it.
+    """saving_utils.py:2526-2533 requires
+    ``for shard_file, tensors in filename_to_tensors`` in save_pretrained;
+    RuntimeError otherwise. On 5.x (renamed iterator): assert the anchor is
+    gone AND zoo's preflight check covers it so push-to-hub falls back cleanly.
     """
     pytest.importorskip("transformers")
     import transformers.modeling_utils as mu
@@ -1224,9 +1184,8 @@ def test_saving_utils_incremental_save_for_loop_filename_to_tensors_pinned():
 
 
 def test_saving_utils_config_json_dtype_torch_dtype_rename_targets():
-    """``unsloth_zoo/saving_utils.py:1827-1828`` save-time replaces
-    ``"dtype"`` -> ``"torch_dtype"`` in config.json; needs model
-    config.to_dict() to expose either field."""
+    """saving_utils.py:1827-1828 save-time replaces ``"dtype"`` ->
+    ``"torch_dtype"`` in config.json; needs config.to_dict() to expose either."""
     pytest.importorskip("transformers")
     try:
         from transformers import LlamaConfig
@@ -1245,10 +1204,9 @@ def test_saving_utils_config_json_dtype_torch_dtype_rename_targets():
 
 
 def test_saving_utils_lora_key_normalize_replacements_targetable():
-    """``unsloth_zoo/saving_utils.py:309-314`` five str.replace on LoRA
-    keys (.base_layer, .modules_to_save.default, .original_module,
-    .lora_A.default, .lora_B.default). Pin peft's ``base_layer`` /
-    ``lora_A.default`` naming."""
+    """saving_utils.py:309-314 five str.replace on LoRA keys (.base_layer,
+    .modules_to_save.default, .original_module, .lora_A/B.default). Pin peft's
+    ``base_layer`` / ``lora_A.default`` naming."""
     pytest.importorskip("peft")
     try:
         import peft.tuners.lora.layer as ly
@@ -1267,9 +1225,8 @@ def test_saving_utils_lora_key_normalize_replacements_targetable():
 
 
 def test_saving_utils_moe_experts_gate_up_proj_regex_targetable():
-    """``unsloth_zoo/saving_utils.py:600,653,700`` rebuilds fused
-    gate_up_proj from per-expert shards via three re.match on
-    ``mlp.experts.<i>.<proj>.weight``."""
+    """saving_utils.py:600,653,700 rebuilds fused gate_up_proj from per-expert
+    shards via three re.match on ``mlp.experts.<i>.<proj>.weight``."""
     pytest.importorskip("transformers")
     candidates = [
         "transformers.models.mixtral.modeling_mixtral",
@@ -1299,8 +1256,8 @@ def test_saving_utils_moe_experts_gate_up_proj_regex_targetable():
 
 
 def test_saving_utils_hf_sharded_safetensors_regex_pattern():
-    """``unsloth_zoo/saving_utils.py:1838`` sharded-safetensors regex
-    must match canonical HF format ``<prefix>-<shard>-of-<total>.safetensors``."""
+    """saving_utils.py:1838 sharded-safetensors regex must match canonical HF
+    format ``<prefix>-<shard>-of-<total>.safetensors``."""
     pattern = re.compile(r"^(.+?)-(\d+)-of-(\d+)\.safetensors$")
     if pattern.match("model-00001-of-00005.safetensors") is None:
         _drift(
@@ -1313,9 +1270,8 @@ def test_saving_utils_hf_sharded_safetensors_regex_pattern():
 
 
 def test_saving_utils_lora_reverse_mapping_replacement_regex():
-    """``unsloth_zoo/saving_utils.py:2923`` re.sub regex must preserve a
-    typical mapping value like ``"model.language_model."`` (no leading
-    caret, no parens, no ?)."""
+    """saving_utils.py:2923 re.sub regex must preserve a typical mapping value
+    like ``"model.language_model."`` (no leading caret, no parens, no ?)."""
     sample = "model.language_model."
     out = re.sub(r"\^?([^(?]+).*", r"\1", sample.lstrip("^"))
     if out != sample:
@@ -1333,9 +1289,8 @@ def test_saving_utils_lora_reverse_mapping_replacement_regex():
 
 
 def test_training_utils_name_replace_base_model_pattern():
-    """``unsloth_zoo/training_utils.py:172-190`` builds exec-able
-    accessor from PEFT module names: replace base_model -> model,
-    .<i>. -> [<i>]., strip .weight."""
+    """training_utils.py:172-190 builds exec-able accessor from PEFT module
+    names: base_model -> model, .<i>. -> [<i>]., strip .weight."""
     pytest.importorskip("peft")
     sample = "base_model.model.model.layers.0.self_attn.q_proj.weight"
     out = sample.replace("base_model", "model", 1)
@@ -1356,9 +1311,8 @@ def test_training_utils_name_replace_base_model_pattern():
 
 
 def test_misc_merge_quantization_configs_classmethod_marker():
-    """``unsloth_zoo/temporary_patches/misc.py:141`` strips cls when
-    upstream ``AutoHfQuantizer.merge_quantization_configs`` is a
-    classmethod."""
+    """misc.py:141 strips cls when upstream
+    ``AutoHfQuantizer.merge_quantization_configs`` is a classmethod."""
     pytest.importorskip("transformers")
     try:
         from transformers.quantizers.auto import AutoHfQuantizer
@@ -1369,7 +1323,7 @@ def test_misc_merge_quantization_configs_classmethod_marker():
     except (OSError, TypeError):
         pytest.skip("source unavailable")
     if "@classmethod" not in src.lstrip().splitlines()[0] and "classmethod" not in src[:200]:
-        # Drift only if neither cls nor self in def line (exec binding broken).
+        # Drift only if neither cls nor self in the def line.
         first_def = next(
             (line for line in src.splitlines() if "def " in line),
             "",
@@ -1384,8 +1338,8 @@ def test_misc_merge_quantization_configs_classmethod_marker():
 
 
 def test_misc_merge_quantization_configs_dedent_def_marker():
-    """``unsloth_zoo/temporary_patches/misc.py:142`` requires ``def `` in
-    the source (``source = source[source.find("def"):]``)."""
+    """misc.py:142 requires ``def `` in the source
+    (``source = source[source.find("def"):]``)."""
     pytest.importorskip("transformers")
     try:
         from transformers.quantizers.auto import AutoHfQuantizer
@@ -1404,9 +1358,8 @@ def test_misc_merge_quantization_configs_dedent_def_marker():
 
 
 def test_misc_mamba_ssm_tl_dot_finder_regex_targetable():
-    """``unsloth_zoo/temporary_patches/misc.py:1082-1085``
-    fix_mamba_ssm_float32 finds ``tl.dot(`` in mamba_ssm Triton
-    chunk-scan source."""
+    """misc.py:1082-1085 fix_mamba_ssm_float32 finds ``tl.dot(`` in mamba_ssm
+    Triton chunk-scan source."""
     try:
         import mamba_ssm.ops.triton.ssd_chunk_scan as ssd
     except ImportError:
@@ -1431,16 +1384,10 @@ def test_misc_mamba_ssm_tl_dot_finder_regex_targetable():
 
 
 def test_gpt_oss_config_old_class_dedent_compare_marker():
-    """``unsloth_zoo/temporary_patches/gpt_oss.py:2808-2810``
-    line-by-line equality compare of dedented GptOssConfig vs OLD
-    class; pin ``initial_context_length`` / ``rope_scaling`` field
-    presence (the Old_GptOssConfig regression target).
-
-    transformers 5.x replaced ``rope_theta`` / ``rope_scaling`` /
-    ``initial_context_length`` with the ``rope_parameters`` dict. zoo's
-    ``patch_gpt_oss_config`` gates on
-    ``inspect.getsource(GptOssConfig) == Old_GptOssConfig``, so the
-    patch silently no-ops on the new shape -- skip the detector on 5.x.
+    """gpt_oss.py:2808-2810 line-by-line equality compare of dedented
+    GptOssConfig vs OLD class; pin ``initial_context_length`` /
+    ``rope_scaling`` field presence (the Old_GptOssConfig regression target).
+    Skipped on 5.x where these moved into the rope_parameters dict.
     """
     _skip_if_transformers_5x(
         "GptOssConfig replaced rope_theta/rope_scaling/initial_context_length "
@@ -1470,9 +1417,8 @@ def test_gpt_oss_config_old_class_dedent_compare_marker():
 
 
 def test_rl_replacements_grpo_compute_loss_def_marker():
-    """``unsloth_zoo/rl_replacements.py:560-565`` renames
-    ``def grpo_compute_loss`` -> ``def grpo_compute_loss_slow``
-    (slow-fallback RL_REPLACEMENTS variant)."""
+    """rl_replacements.py:560-565 renames ``def grpo_compute_loss`` ->
+    ``def grpo_compute_loss_slow`` (slow-fallback RL_REPLACEMENTS variant)."""
     try:
         from unsloth_zoo.rl_replacements import grpo_compute_loss
     except ImportError:
@@ -1502,9 +1448,8 @@ def test_rl_replacements_grpo_compute_loss_def_marker():
 
 
 def test_unsloth_rl_trainer_signature_columns_pinned_string():
-    """``unsloth/models/rl.py:1667-1670`` augments SFTTrainer
-    ``self._signature_columns`` with ``"labels"``. DRIFT when
-    ``_signature_columns`` is gone from SFTTrainer source."""
+    """rl.py:1667-1670 augments SFTTrainer ``self._signature_columns`` with
+    ``"labels"``. DRIFT when ``_signature_columns`` is gone."""
     pytest.importorskip("trl")
     try:
         from trl.trainer.sft_trainer import SFTTrainer
@@ -1526,9 +1471,9 @@ def test_unsloth_rl_trainer_signature_columns_pinned_string():
 
 
 def test_unsloth_rl_trainer_vlm_signature_columns_old_form_pinned():
-    """``unsloth/models/rl.py:1706-1713`` pins TRL 0.22.x VLM form
-    ``["messages", "prompt", "completion", "images"]``. DRIFT only when
-    ALL four member tokens are gone from SFTTrainer."""
+    """rl.py:1706-1713 pins TRL 0.22.x VLM form
+    ``["messages", "prompt", "completion", "images"]``. DRIFT only when ALL
+    four member tokens are gone from SFTTrainer."""
     pytest.importorskip("trl")
     try:
         from trl.trainer.sft_trainer import SFTTrainer
@@ -1550,9 +1495,8 @@ def test_unsloth_rl_trainer_vlm_signature_columns_old_form_pinned():
 
 
 def test_unsloth_rl_trainer_prepare_dataset_pattern():
-    """``unsloth/models/rl.py:1717-1721`` injects
-    ``self._unsloth_model_ref = model`` before SFTTrainer's
-    ``self._prepare_dataset(`` call (token_type_ids detection)."""
+    """rl.py:1717-1721 injects ``self._unsloth_model_ref = model`` before
+    SFTTrainer's ``self._prepare_dataset(`` call (token_type_ids detection)."""
     pytest.importorskip("trl")
     try:
         from trl.trainer.sft_trainer import SFTTrainer
@@ -1574,7 +1518,7 @@ def test_unsloth_rl_trainer_prepare_dataset_pattern():
 
 
 def test_unsloth_rl_trainer_is_loaded_in_4bit_pinned_string():
-    """``unsloth/models/rl.py:1662-1665`` replaces TRL's
+    """rl.py:1662-1665 replaces TRL's
     ``if getattr(model, "is_loaded_in_4bit"/"is_loaded_in_8bit", ...)``
     bf16 cast block with ``if False:``."""
     pytest.importorskip("trl")
@@ -1608,9 +1552,8 @@ def test_unsloth_rl_trainer_is_loaded_in_4bit_pinned_string():
 
 
 def test_unsloth_rl_trainer_peft_config_branches_pinned():
-    """``unsloth/models/rl.py:1842-1857`` six peft_config str.replace
-    targets (peft_config branches, get_peft_model, prepare_peft_model);
-    DRIFT only when ``peft_config`` is gone from every TRL trainer."""
+    """rl.py:1842-1857 six peft_config str.replace targets; DRIFT only when
+    ``peft_config`` is gone from every TRL trainer."""
     pytest.importorskip("trl")
     import importlib
     candidates = [
@@ -1644,8 +1587,8 @@ def test_unsloth_rl_trainer_peft_config_branches_pinned():
 
 
 def test_unsloth_rl_init_comments_with_brackets_pattern():
-    """``unsloth/models/rl.py:1832-1833`` normalises bracketed
-    ``#...(...)`` comments to ``[...]`` in SFTTrainer __init__."""
+    """rl.py:1832-1833 normalises bracketed ``#...(...)`` comments to
+    ``[...]`` in SFTTrainer __init__."""
     pytest.importorskip("trl")
     try:
         from trl.trainer.sft_trainer import SFTTrainer
@@ -1664,9 +1607,8 @@ def test_unsloth_rl_init_comments_with_brackets_pattern():
 
 
 def test_unsloth_rl_init_use_vllm_marker():
-    """``unsloth/models/rl.py:1895-1928`` vLLM-engine wiring needs
-    ``args.use_vllm`` / ``self.use_vllm`` marker in some TRL RL
-    trainer __init__."""
+    """rl.py:1895-1928 vLLM-engine wiring needs ``args.use_vllm`` /
+    ``self.use_vllm`` marker in some TRL RL trainer __init__."""
     pytest.importorskip("trl")
     import importlib
     candidates = [
@@ -1696,7 +1638,7 @@ def test_unsloth_rl_init_use_vllm_marker():
 
 
 def test_unsloth_rl_vllm_part_findall_pattern_targetable():
-    """``unsloth/models/rl.py:1932-1936`` matches 8-space-indented
+    """rl.py:1932-1936 matches 8-space-indented
     ``if (self|args).use_vllm:\\n...else:\\n`` branch in TRL trainer."""
     pytest.importorskip("trl")
     import importlib
@@ -1731,9 +1673,8 @@ def test_unsloth_rl_vllm_part_findall_pattern_targetable():
 
 
 def test_unsloth_rl_sampling_params_findall_pattern_targetable():
-    """``unsloth/models/rl.py:1949-1953`` patches
-    ``self.X = SamplingParams(...)`` in TRL trainer; pin
-    ``SamplingParams(`` presence."""
+    """rl.py:1949-1953 patches ``self.X = SamplingParams(...)`` in TRL trainer;
+    pin ``SamplingParams(`` presence."""
     pytest.importorskip("trl")
     import importlib
     candidates = [
@@ -1762,8 +1703,7 @@ def test_unsloth_rl_sampling_params_findall_pattern_targetable():
 
 
 def test_unsloth_rl_state_dict_strip_pattern():
-    """``unsloth/models/rl.py:2072-2076`` strips ``.state_dict()`` from
-    TRL function source via re.sub."""
+    """rl.py:2072-2076 strips ``.state_dict()`` from TRL source via re.sub."""
     pytest.importorskip("trl")
     sample = (
         "    llm_model.load_weights(model.state_dict().items())\n"
@@ -1780,9 +1720,8 @@ def test_unsloth_rl_state_dict_strip_pattern():
 
 
 def test_unsloth_rl_llm_generate_chat_capture_pattern():
-    """``unsloth/models/rl.py:2087-2093`` injects ``lora_request =
-    self.model.load_lora(...)`` into ``self.llm.(generate|chat)(...)``
-    calls."""
+    """rl.py:2087-2093 injects ``lora_request = self.model.load_lora(...)``
+    into ``self.llm.(generate|chat)(...)`` calls."""
     sample = "self.llm.generate(prompts, sampling_params=sp)"
     rewritten = re.sub(
         r"(self\.llm\.(?:generate|chat)\([^\)]{1,})\)",
@@ -1800,8 +1739,7 @@ def test_unsloth_rl_llm_generate_chat_capture_pattern():
 
 
 def test_unsloth_rl_sampling_params_kwargs_replace_pinned():
-    """``unsloth/models/rl.py:2107-2115`` replaces
-    ``SamplingParams(**generation_kwargs)`` with
+    """rl.py:2107-2115 replaces ``SamplingParams(**generation_kwargs)`` with
     ``SamplingParams(**grpo_update_SamplingParams(...))``."""
     pytest.importorskip("trl")
     import importlib
@@ -1833,8 +1771,8 @@ def test_unsloth_rl_sampling_params_kwargs_replace_pinned():
 
 
 def test_unsloth_rl_class_rename_pinned():
-    """``unsloth/models/rl.py:2137-2139`` renames ``class SFTTrainer``
-    -> ``class _UnslothSFTTrainer``."""
+    """rl.py:2137-2139 renames ``class SFTTrainer`` -> ``class
+    _UnslothSFTTrainer``."""
     pytest.importorskip("trl")
     try:
         from trl.trainer.sft_trainer import SFTTrainer
@@ -1855,8 +1793,8 @@ def test_unsloth_rl_class_rename_pinned():
 
 
 def test_unsloth_rl_torch_compile_options_dict_pattern():
-    """``unsloth/models/rl.py:1622-1625`` re.sub on
-    ``torch_compile_options = {...}`` dict assignment."""
+    """rl.py:1622-1625 re.sub on ``torch_compile_options = {...}`` dict
+    assignment."""
     sample = 'torch_compile_options = {"epilogue_fusion": True, "max_autotune": False}'
     out = re.sub(
         r"torch_compile_options\s*=\s*\{[^}]*\}",
@@ -1875,9 +1813,9 @@ def test_unsloth_rl_torch_compile_options_dict_pattern():
 
 
 def test_unsloth_rl_add_adapter_block_pattern_regex():
-    """``unsloth/models/rl.py:1865-1870`` comments out the "ref"
-    adapter creation block in GRPOTrainer; needs ``is_peft_available()``
-    AND ``ref_param.data.copy_`` together in TRL trainer source."""
+    """rl.py:1865-1870 comments out the "ref" adapter creation block in
+    GRPOTrainer; needs ``is_peft_available()`` AND ``ref_param.data.copy_``
+    together in TRL trainer source."""
     pytest.importorskip("trl")
     import importlib
     candidates = [
@@ -1907,9 +1845,8 @@ def test_unsloth_rl_add_adapter_block_pattern_regex():
 
 
 def test_unsloth_rl_warmup_ratio_keyword_pattern():
-    """``unsloth/models/rl.py:1323-1333`` re.sub on
-    ``<kwarg> = <value>,\\n`` config-arguments block (warmup_ratio,
-    warmup_steps, etc.)."""
+    """rl.py:1323-1333 re.sub on ``<kwarg> = <value>,\\n`` config-arguments
+    block (warmup_ratio, warmup_steps, etc.)."""
     sample = (
         "warmup_ratio = 0.1,\n"
         "learning_rate = 5e-5,\n"
@@ -1930,8 +1867,8 @@ def test_unsloth_rl_warmup_ratio_keyword_pattern():
 
 
 def test_unsloth_rl_anihilate_typo_marker_search():
-    """``unsloth/models/rl.py:1725-1746`` searches both ``anihilate``
-    (typo) and ``annihilate`` in SFTTrainer to strip the surrounding
+    """rl.py:1725-1746 searches both ``anihilate`` (typo) and ``annihilate``
+    in SFTTrainer to strip the surrounding
     ``args.per_device_train_batch_size == 1`` warning block."""
     pytest.importorskip("trl")
     try:
@@ -1952,8 +1889,8 @@ def test_unsloth_rl_anihilate_typo_marker_search():
 
 
 def test_unsloth_rl_per_device_train_batch_size_marker():
-    """``unsloth/models/rl.py:1730-1731`` searches
-    ``if args.per_device_train_batch_size == 1`` in TRL trainer."""
+    """rl.py:1730-1731 searches ``if args.per_device_train_batch_size == 1``
+    in TRL trainer."""
     pytest.importorskip("trl")
     import importlib
     candidates = [
@@ -1983,8 +1920,8 @@ def test_unsloth_rl_per_device_train_batch_size_marker():
 
 
 def test_unsloth_rl_processing_class_call_args_pattern():
-    """``unsloth/models/rl.py:980-985`` injects tokenizer fallback:
-    ``processing_class = processing_class`` ->
+    """rl.py:980-985 injects tokenizer fallback: ``processing_class =
+    processing_class`` ->
     ``= tokenizer if tokenizer is not None else processing_class``."""
     sample = "processing_class = processing_class,\nmodel = model"
     out = sample.replace(
@@ -2002,9 +1939,8 @@ def test_unsloth_rl_processing_class_call_args_pattern():
 
 
 def test_unsloth_rl_shuffle_sequence_dict_pinned_pattern():
-    """``unsloth/models/rl.py:2051-2055`` wraps
-    ``generation_batch = shuffle_sequence_dict(...)`` in try/except
-    pass (torch 2.8 AcceleratorError workaround)."""
+    """rl.py:2051-2055 wraps ``generation_batch = shuffle_sequence_dict(...)``
+    in try/except pass (torch 2.8 AcceleratorError workaround)."""
     pytest.importorskip("trl")
     import importlib
     candidates = [
@@ -2033,9 +1969,8 @@ def test_unsloth_rl_shuffle_sequence_dict_pinned_pattern():
 
 
 def test_unsloth_rl_model_executor_driver_worker_pinned_pattern():
-    """``unsloth/models/rl.py:2058-2062`` strips
-    ``model_executor.driver_worker`` vLLM internal-API call so zoo's
-    vllm-engine wiring can replace it."""
+    """rl.py:2058-2062 strips ``model_executor.driver_worker`` vLLM
+    internal-API call so zoo's vllm-engine wiring can replace it."""
     pytest.importorskip("trl")
     import importlib
     candidates = [
@@ -2065,8 +2000,8 @@ def test_unsloth_rl_model_executor_driver_worker_pinned_pattern():
 
 
 def test_unsloth_rl_load_weights_strip_pinned_pattern():
-    """``unsloth/models/rl.py:2065-2069`` strips ``load_weights(...)``
-    lines from TRL trainer source via re.sub."""
+    """rl.py:2065-2069 strips ``load_weights(...)`` lines from TRL trainer
+    source via re.sub."""
     pytest.importorskip("trl")
     import importlib
     candidates = [
@@ -2095,9 +2030,8 @@ def test_unsloth_rl_load_weights_strip_pinned_pattern():
 
 
 def test_unsloth_rl_peft_pattern_27_marker():
-    """``unsloth/models/rl.py:1629-1633,1641-1646`` TWO PEFT init-block
-    regexes (TRL 0.26.0 and 0.27.0 shapes) ending in
-    ``param.data = param.data.to(torch.bfloat16)``."""
+    """rl.py:1629-1633,1641-1646 TWO PEFT init-block regexes (TRL 0.26.0 and
+    0.27.0 shapes) ending in ``param.data = param.data.to(torch.bfloat16)``."""
     pytest.importorskip("trl")
     try:
         import trl.trainer.grpo_trainer as gt
@@ -2120,17 +2054,9 @@ def test_unsloth_rl_peft_pattern_27_marker():
 
 
 def test_unsloth_trainer_exec_marker():
-    """``unsloth/trainer.py:614`` exec()'s synthesized trainer source;
-    pin that unsloth.trainer is importable.
-
-    Skips on a host without a real accelerator: ``import unsloth`` raises
-    ``NotImplementedError("Unsloth cannot find any torch accelerator")``
-    at top-level on a CPU-only CI runner, which is neither an ImportError
-    nor a drift signal -- it's just the harness gate. ``importorskip``
-    only converts ``ImportError`` to ``skip``, so we have to wrap the
-    whole import path. Treat the no-accelerator case as skip so the
-    no-GPU CI cell goes green; the GPU cell still exercises the import
-    end-to-end.
+    """unsloth/trainer.py:614 exec()'s synthesized trainer source; pin that
+    unsloth.trainer is importable. Treat the no-accelerator case as skip
+    (NotImplementedError, not ImportError) so the no-GPU CI cell goes green.
     """
     try:
         import unsloth  # noqa: F401
@@ -2168,9 +2094,8 @@ def test_unsloth_trainer_exec_marker():
 
 
 def test_zoo_compiler_replace_gradient_checkpointing_template_format():
-    """``unsloth_zoo/compiler.py:2226-2234`` template
-    ``replace_gradient_checkpointing`` placeholders LAYER /
-    MODULELIST_ITEM / ARGS / $ must all be present."""
+    """compiler.py:2226-2234 template ``replace_gradient_checkpointing``
+    placeholders LAYER / MODULELIST_ITEM / ARGS / $ must all be present."""
     import importlib
     compiler = importlib.import_module("unsloth_zoo.compiler")
     template = getattr(compiler, "replace_gradient_checkpointing", None)
@@ -2195,9 +2120,8 @@ def test_zoo_compiler_replace_gradient_checkpointing_template_format():
 
 
 def test_zoo_compiler_moe_routing_weights_replace_substitution_well_formed():
-    """``unsloth_zoo/compiler.py:2423-2426`` MOE_ROUTING_WEIGHTS_CAST
-    PATTERN/REPLACE rewrites ``routing_weights.to(hidden_states.dtype)``
-    -> ``...to(router_logits.dtype)``."""
+    """compiler.py:2423-2426 MOE_ROUTING_WEIGHTS_CAST PATTERN/REPLACE rewrites
+    ``routing_weights.to(hidden_states.dtype)`` -> ``...to(router_logits.dtype)``."""
     import importlib
     compiler = importlib.import_module("unsloth_zoo.compiler")
     pat = getattr(compiler, "MOE_ROUTING_WEIGHTS_CAST_PATTERN", None)
@@ -2222,8 +2146,8 @@ def test_zoo_compiler_moe_routing_weights_replace_substitution_well_formed():
 
 
 def test_zoo_compiler_dtype_mismatch_constants_targetable():
-    """``unsloth_zoo/compiler.py:2381-2391`` DTYPE_MISMATCH_FIND /
-    REPLACE constants must contain their pinned sentinel substrings."""
+    """compiler.py:2381-2391 DTYPE_MISMATCH_FIND / REPLACE constants must
+    contain their pinned sentinel substrings."""
     import importlib
     compiler = importlib.import_module("unsloth_zoo.compiler")
     find = getattr(compiler, "DTYPE_MISMATCH_FIND", None)
