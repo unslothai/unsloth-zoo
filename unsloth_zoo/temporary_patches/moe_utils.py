@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import os
 import shutil
 import sys
+import importlib
 import importlib.util
 from typing import Optional, Tuple
 from torch.autograd import Function
@@ -191,6 +192,7 @@ def _check_torch_grouped_mm_supported():
 
 _TRITON_ALLOCATOR_INITIALIZED = False
 _PERSISTENT_BUFFER = None
+_original_peft_get_peft_model = None
 
 
 def _init_triton_allocator():
@@ -243,7 +245,7 @@ def _check_grouped_gemm_available():
     return _GROUPED_GEMM_AVAILABLE
 
 
-from functools import lru_cache
+from functools import lru_cache, wraps
 
 
 @lru_cache(maxsize=1)
@@ -429,6 +431,7 @@ def _get_moe_lora_io_dims(wrapper, experts_module=None):
     source = experts_module if experts_module is not None else base
     if source is None:
         return None, None
+    _set_gpt_oss_grouped_mm_format_on_experts(source)
 
     shape = _get_param_shape_from_module(source, parameter_name)
     if shape is not None and len(shape) >= 3:
@@ -729,6 +732,138 @@ def preprocess_weight(
 # Generic MoE detection and ParamWrapper patching.
 
 
+def _normalize_model_type(value) -> str:
+    if value is None:
+        return ""
+    return str(value).lower().replace("-", "_")
+
+
+def _iter_model_configs(model):
+    seen = set()
+    queue = [model]
+    while queue and len(seen) < 8:
+        current = queue.pop(0)
+        if current is None:
+            continue
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+
+        config = getattr(current, "config", None)
+        if config is not None:
+            yield config
+
+        for attr in ("base_model", "model"):
+            nested = getattr(current, attr, None)
+            if nested is not None and nested is not current:
+                queue.append(nested)
+
+
+def _is_gpt_oss_model(model) -> bool:
+    for config in _iter_model_configs(model):
+        model_type = _normalize_model_type(getattr(config, "model_type", None))
+        if model_type == "gpt_oss":
+            return True
+
+        for attr in ("_name_or_path", "name_or_path"):
+            if "gpt_oss" in _normalize_model_type(getattr(config, attr, None)):
+                return True
+
+    return False
+
+
+def _set_gpt_oss_grouped_mm_format_on_experts(module) -> bool:
+    if module is None:
+        return False
+    if module.__class__.__name__ != "GptOssExperts":
+        return False
+    if bool(getattr(module, "_unsloth_grouped_mm_format", False)):
+        return False
+    # Require the gpt-oss (E, in, out) weight signature: gate_up's out dim is
+    # twice down's in dim. Same-named classes with other layouts stay unflagged.
+    gate_shape = _get_param_shape_from_module(module, "gate_up_proj")
+    down_shape = _get_param_shape_from_module(module, "down_proj")
+    if gate_shape is None or down_shape is None:
+        return False
+    if len(gate_shape) < 3 or len(down_shape) < 3:
+        return False
+    if gate_shape[0] != down_shape[0]:
+        return False
+    if gate_shape[-2] != down_shape[-1] or gate_shape[-1] != 2 * down_shape[-2]:
+        return False
+    module._unsloth_grouped_mm_format = True
+    return True
+
+
+def patch_gpt_oss_grouped_mm_format(model) -> int:
+    """
+    Mark GPT-OSS experts as storing weights in grouped_mm format.
+
+    Stock transformers GPT-OSS experts use (E, in_dim, out_dim) tensors but do
+    not carry Unsloth's `_unsloth_grouped_mm_format` instance flag. Set it on
+    live expert modules so the shared MoE LoRA extractor chooses GPT-OSS
+    ordering instead of the Qwen-style fallback.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if model is None or not _is_gpt_oss_model(model):
+        return 0
+
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return 0
+
+    updated = 0
+    for module in modules():
+        if _set_gpt_oss_grouped_mm_format_on_experts(module):
+            updated += 1
+    return updated
+
+
+def _patch_peft_get_peft_model_for_moe():
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    global _original_peft_get_peft_model
+    if _original_peft_get_peft_model is not None:
+        return
+
+    try:
+        import peft
+    except Exception:
+        return
+
+    original_get_peft_model = getattr(peft, "get_peft_model", None)
+    if original_get_peft_model is None:
+        return
+    if getattr(original_get_peft_model, "_unsloth_moe_patched", False):
+        return
+
+    _original_peft_get_peft_model = original_get_peft_model
+
+    @wraps(original_get_peft_model)
+    def patched_get_peft_model(model, *args, **kwargs):
+        peft_model = original_get_peft_model(model, *args, **kwargs)
+        try:
+            patch_gpt_oss_grouped_mm_format(model)
+            if peft_model is not model:
+                patch_gpt_oss_grouped_mm_format(peft_model)
+        except Exception:
+            pass
+        return peft_model
+
+    patched_get_peft_model._unsloth_moe_patched = True
+    peft.get_peft_model = patched_get_peft_model
+
+    for module_name in ("peft.mapping_func", "peft.mapping"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        if getattr(module, "get_peft_model", None) is original_get_peft_model:
+            module.get_peft_model = patched_get_peft_model
+
+
 def _is_moe_experts_module(module) -> bool:
     """Generic check for an MoE experts layer with stacked 3D expert weights.
 
@@ -853,6 +988,7 @@ def patch_param_wrapper_for_moe():
             _original_param_wrapper_forward = ParamWrapper.forward
 
         ParamWrapper.forward = _patched_param_wrapper_forward
+        _patch_peft_get_peft_model_for_moe()
 
         return True
     except ImportError:
@@ -1371,6 +1507,9 @@ def forward_native_moe_loop(
     # Prefer it over the shape check, which is unsafe when intermediate_dim == hidden_dim.
     grouped_mm_format = bool(getattr(self, "_unsloth_grouped_mm_format", False))
 
+    # GPT-OSS uses interleaved gate/up, clamped swiglu, and per-expert biases.
+    is_gpt_oss = "GptOssExperts" in self.__class__.__name__
+
     for expert_idx_t in expert_hit:
         expert_idx = expert_idx_t.item()
 
@@ -1388,12 +1527,28 @@ def forward_native_moe_loop(
                 lora_delta = current_state @ first_weight[expert_idx]
                 lora_delta = lora_delta @ second_weight[expert_idx]
                 gate_up = gate_up + lora_delta * scaling
-            gate, up = gate_up.chunk(2, dim=-1)
+            if is_gpt_oss:
+                gate_up_bias = getattr(self, "gate_up_proj_bias", None)
+                if gate_up_bias is not None:
+                    gate_up = gate_up + gate_up_bias[expert_idx].to(gate_up.dtype)
+                gate = gate_up[..., ::2]
+                up = gate_up[..., 1::2]
+            else:
+                gate, up = gate_up.chunk(2, dim=-1)
         else:
             gate = F.linear(current_state, self.w1[expert_idx])
             up = F.linear(current_state, self.w3[expert_idx])
 
-        current_hidden_states = self.act_fn(gate) * up
+        if is_gpt_oss:
+            limit = getattr(self, "limit", 7.0)
+            alpha = getattr(self, "alpha", 1.702)
+            gate = gate.clamp(min=None, max=limit)
+            up = up.clamp(min=-limit, max=limit)
+            current_hidden_states = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
+        elif hasattr(self, "act_fn") and callable(self.act_fn):
+            current_hidden_states = self.act_fn(gate) * up
+        else:
+            current_hidden_states = F.silu(gate) * up
 
         # down projection for this expert.
         if hasattr(self, "down_proj"):
@@ -1407,6 +1562,10 @@ def forward_native_moe_loop(
                 lora_delta = current_hidden_states @ first_weight[expert_idx]
                 lora_delta = lora_delta @ second_weight[expert_idx]
                 down = down + lora_delta * scaling
+            if is_gpt_oss:
+                down_bias = getattr(self, "down_proj_bias", None)
+                if down_bias is not None:
+                    down = down + down_bias[expert_idx].to(down.dtype)
             current_hidden_states = down
         else:
             current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])

@@ -1313,6 +1313,7 @@ from .moe_utils import (
     select_moe_backend,
     patch_param_wrapper_for_moe,
     forward_native_grouped_mm,
+    forward_native_moe_loop,
     # torch_native_forward,
 )
 
@@ -1350,7 +1351,10 @@ def patch_gpt_oss_moe_for_lora():
     if backend == "grouped_mm":
         forward = forward_native_grouped_mm
     else:
-        forward = torch_native_forward
+        # torch_native_forward expects the bnb4bit ModuleList layout; the stock
+        # 3D GptOssExperts needs the generic loop, which handles gpt-oss
+        # activation, biases, and the separated LoRA stash.
+        forward = forward_native_moe_loop
 
     # Store original forward and patch - but DON'T replace the class!
     GptOssExpertsClass._original_forward = GptOssExpertsClass.forward
