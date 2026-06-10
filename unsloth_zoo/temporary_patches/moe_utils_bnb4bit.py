@@ -13,15 +13,13 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""
-bitsandbytes 4-bit support for transformers v5 MoE expert parameters.
+"""bitsandbytes 4-bit support for transformers v5 MoE expert parameters.
 
-transformers' bitsandbytes integration only quantizes nn.Linear modules. MoE
-expert weights in transformers v5 are bare 3-D nn.Parameters
-(gate_up_proj / down_proj on the experts module), so the integration skips
-them. The patches here teach the integration to recognize and quantize those
-parameters, and route the experts forward through the standard backend after
-on-the-fly dequantization.
+transformers' bnb integration only quantizes nn.Linear. In v5 the MoE expert
+weights are bare 3-D nn.Parameters (gate_up_proj / down_proj on the experts
+module), so the integration skips them. These patches teach it to recognize
+and quantize those parameters and route the experts forward through the
+standard backend after on-the-fly dequantization.
 """
 
 import os
@@ -82,9 +80,7 @@ def _moe_uses_bnb4bit_expert_weights(self) -> bool:
 
 
 def _is_expert_module(module: nn.Module) -> bool:
-    """A module is a transformers v5 MoE experts module iff gate_up_proj and
-    down_proj are both nn.Parameter (not nn.Linear).
-    """
+    """True iff gate_up_proj and down_proj are both nn.Parameter (v5 MoE experts)."""
     return (
         hasattr(module, "gate_up_proj")
         and hasattr(module, "down_proj")
@@ -98,8 +94,7 @@ def _is_expert_module(module: nn.Module) -> bool:
 # ============================================================================
 
 def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
-    """Dequantize a packed Params4bit MoE expert weight to logical 3D
-    `(E, in, out)` (or `(E, out, in)`, whichever the original storage was) at
+    """Dequantize a packed Params4bit MoE expert to its logical 3D shape at
     `target_dtype`. Returns None if `weight` isn't a quantized Params4bit.
     """
     if not _is_bnb4bit_param(weight):
@@ -128,12 +123,11 @@ def _log_moe_bnb4bit_backend_once(experts_module, message: str):
 
 
 def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights):
-    """
-    bnb 4-bit MoE forward: dequantize the expert weights to the input dtype,
-    then dispatch to the standard MoE backend (grouped_mm / triton / native).
+    """bnb 4-bit MoE forward: dequantize experts to the input dtype, then
+    dispatch to the standard MoE backend (grouped_mm / triton / native).
 
-    Mirrors `forward_moe_backend_fp8` structure. Base weights stay in 4-bit
-    Params4bit storage; the dequantized copies are temporary.
+    Mirrors `forward_moe_backend_fp8`. Base weights stay in 4-bit Params4bit
+    storage; dequantized copies are temporary.
     """
     from .moe_utils import (
         select_moe_backend,
@@ -150,8 +144,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
     gate_up_weight = _dequantize_bnb4bit_expert_weights(self.gate_up_proj, target_dtype)
     down_weight = _dequantize_bnb4bit_expert_weights(self.down_proj, target_dtype)
     if gate_up_weight is None or down_weight is None:
-        # Not bnb4bit after all (mixed state) — fall through to caller.
-        return None
+        return None  # not bnb4bit (mixed state) — fall through to caller
 
     backend = select_moe_backend()
     if backend == "grouped_mm":
@@ -185,9 +178,7 @@ def replace_expert_params_with_bnb_params(
     quantization_config = None,
     pre_quantized: bool = False,
 ) -> nn.Module:
-    """
-    Replace MoE parameters (gate_up_proj, down_proj) of nn.Parameter type with Params4bit.
-    """
+    """Replace MoE gate_up_proj / down_proj nn.Parameters with Params4bit."""
 
     try:
         from transformers.quantizers.quantizers_utils import should_convert_module
@@ -242,9 +233,8 @@ def replace_expert_params_with_bnb_params(
 
 
 def patch_bnb4bit_quantize_convert():
-    """
-    Expert modules of nn.Parameter type are converted to Params4bit placeholders during weight loading.
-    Also preserves the original shape of the expert parameters for PEFT LoRA compatibility.
+    """Convert nn.Parameter experts to Params4bit during weight loading,
+    preserving original shape for PEFT LoRA compatibility.
     """
 
     try:
@@ -363,12 +353,9 @@ pass
 
 
 def patch_transformers_weight_converter_kwargs():
-    """
-    PEFT 0.19 constructs WeightConverter with kwargs (distributed_operation,
-    quantization_operation, ...) that transformers 5.6.2's __init__ does not
-    accept, raising TypeError during PeftModel.from_pretrained for any MoE
-    4-bit model. Drop unknown kwargs so the installed transformers signature
-    only sees what it knows.
+    """Drop kwargs PEFT 0.19 passes to WeightConverter (distributed_operation,
+    quantization_operation, ...) that transformers 5.6.2's __init__ rejects,
+    which otherwise raises TypeError in PeftModel.from_pretrained for MoE 4-bit.
     """
     try:
         from transformers.core_model_loading import WeightConverter
@@ -400,18 +387,15 @@ pass
 
 # ============================================================================
 # PEFT LoRA support for stacked-MoE bnb 4-bit experts.
-# These hooks teach peft.tuners.lora.layer.ParamWrapper how to expose the
-# logical 3-D shape of a Params4bit (so LoRA picks the right (E, out, in)
-# layout) and how to merge / unmerge through a dequant -> add -> requant
-# cycle (so merge_and_unload() works against packed 4-bit storage).
-# They live here rather than in misc.py because they are functionally
-# partners to replace_expert_params_with_bnb_params + patch_bnb4bit_*.
+# Teach peft.tuners.lora.layer.ParamWrapper to expose a Params4bit's logical
+# 3-D shape (so LoRA picks the right (E, out, in) layout) and to merge/unmerge
+# via a dequant -> add -> requant cycle (so merge_and_unload() works against
+# packed 4-bit storage). Kept here as partners to
+# replace_expert_params_with_bnb_params + patch_bnb4bit_* rather than in misc.py.
 # ============================================================================
 
 class _ParamShapeProxy:
-    """
-    Wrapper class so that attributes for 4bit MoE params are exposed correctly for compatibility with PEFT LoRA, everything else delegates.
-    """
+    """Expose 4bit MoE param attributes correctly for PEFT LoRA; delegate the rest."""
 
     def __init__(self, param, shape):
         self._param = param
@@ -441,9 +425,8 @@ class _ParamShapeProxy:
 
 
 def patch_peft_param_wrapper_4bit_expert_shape():
-    """
-    ParamWrapper.get_param() derives shape from param.shape, which is incorrect for Params4bit parameters.
-    Patch ParamWrapper.get_param() to return a proxy that exposes .shape = _original_shape for 4bit MoE params.
+    """Patch ParamWrapper.get_param() to return a proxy exposing
+    .shape = _original_shape for 4bit MoE params (param.shape is wrong for them).
     """
     try:
         from peft.tuners.lora.layer import ParamWrapper
@@ -480,12 +463,11 @@ pass
 
 
 def patch_peft_param_wrapper_merge_4bit():
-    """
-    PEFT's ParamWrapper.merge does in-place `param.data += delta_weight`, which
-    fails for a Params4bit MoE expert because `param.data` is the packed
-    (N_packed, 1) uint8 storage and `delta_weight` is the logical 3D tensor.
-    Override merge/unmerge with a dequantize -> add -> re-quantize cycle when
-    the wrapped param is a Params4bit with a 3D _original_shape.
+    """Override ParamWrapper.merge/unmerge with a dequantize -> add ->
+    re-quantize cycle for Params4bit MoE experts with a 3D _original_shape.
+
+    PEFT's in-place `param.data += delta_weight` fails here: `param.data` is
+    packed (N_packed, 1) uint8 storage while `delta_weight` is the logical 3D.
     """
     try:
         from peft.tuners.lora.layer import ParamWrapper, check_adapters_to_merge
@@ -507,9 +489,8 @@ def patch_peft_param_wrapper_merge_4bit():
         return isinstance(param, Params4bit) and getattr(param, "_original_shape", None) is not None
 
     def _dequant_param_for_merge(param, parameter_name):
-        """Dequantize a Params4bit MoE expert to its logical 3D shape at the
-        compute dtype. Raises if `quant_state` hasn't been populated yet.
-        Shared helper between merge and unmerge."""
+        """Dequantize a Params4bit MoE expert to logical 3D at the compute
+        dtype; raises if `quant_state` is unpopulated. Shared by merge/unmerge."""
         quant_state = getattr(param, "quant_state", None)
         if quant_state is None:
             raise RuntimeError(

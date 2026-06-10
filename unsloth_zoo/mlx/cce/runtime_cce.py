@@ -38,9 +38,9 @@ def _get_memory_budget() -> int:
          — but too many chunks incurs kernel-launch overhead.
 
     We use 0.1% of the device's recommended working set as the budget, capped
-    at 128 MB.  The cap ensures the scheduler always gets enough granularity
-    (≥16 chunks for 128K vocab at any batch size ≤4), while the hardware
-    scaling ensures small devices chunk even more aggressively.
+    at 128 MB and floored at 4 MB.  The cap ensures the scheduler always gets
+    enough granularity (≥16 chunks for 128K vocab at any batch size ≤4), while
+    the hardware scaling ensures small devices chunk even more aggressively.
 
       M4 Max 128GB → 103 GB recommended → min(103 MB, 128 MB) = 103 MB
       M3 Pro 36GB  →  27 GB recommended → min(27 MB, 128 MB)  =  27 MB
@@ -120,8 +120,8 @@ def _target_validity_masks(
     vocab_size: int,
     ignore_index: int,
 ) -> tuple[mx.array, mx.array]:
-    # Cast unsigned labels to int64 before comparisons: direct `>= 0` on
-    # uint16/32/64 crashes the torch-backed MLX shim ("ge_cpu" not implemented).
+    # Cast unsigned labels to int64 first: direct `>= 0` on uint16/32/64 crashes
+    # the torch-backed MLX shim ("ge_cpu" not implemented).
     _unsigned_safe_to_i64 = tuple(
         dtype for dtype in (
             getattr(mx, "uint8", None),
@@ -132,10 +132,10 @@ def _target_validity_masks(
     )
     _uint64_dtype = getattr(mx, "uint64", None)
     if _uint64_dtype is not None and targets.dtype == _uint64_dtype:
-        # uint64 -> int64: any value >= 2**63 wraps negative. Route those
-        # to an out-of-vocab sentinel (1<<62) so wrap artifacts like
-        # 2**64-100 NaN-poison instead of colliding with ignore_index.
-        # Avoid float validation: float32 loses precision above 2**24.
+        # uint64 -> int64: values >= 2**63 wrap negative. Route those to an
+        # out-of-vocab sentinel (1<<62) so wrap artifacts (e.g. 2**64-100)
+        # NaN-poison instead of colliding with ignore_index. Avoid float
+        # validation: float32 loses precision above 2**24.
         targets_i64 = targets.astype(mx.int64)
         overflow = targets_i64 < 0
         invalid_sentinel = mx.array(1 << 62, dtype=mx.int64)
@@ -159,8 +159,8 @@ def _target_validity_masks(
 
 
 def _poison_invalid_targets(values: mx.array, invalid: mx.array) -> mx.array:
-    # Use mx.full (real tensor) instead of a 0-d scalar: a scalar bakes
-    # into the Metal kernel as the literal token `nan`, which MSL rejects.
+    # mx.full (real tensor), not a 0-d scalar: a scalar bakes into the Metal
+    # kernel as the literal token `nan`, which MSL rejects.
     return mx.where(
         invalid,
         mx.full(values.shape, float("nan"), dtype=values.dtype),
@@ -303,10 +303,9 @@ def _build_forward_update_kernel() -> Callable:
     )
 
 
-# INVARIANT: kernel emits finite lse_out/loss_out for every row (no
-# vocab_size). Callers MUST _poison_invalid_targets(loss, invalid) and
-# (lse, invalid) before the dlogits kernel, or invalid rows get finite
-# wrong gradients silently.
+# INVARIANT: kernel emits finite lse_out/loss_out for every row (no vocab_size).
+# Callers MUST _poison_invalid_targets on loss and lse before the dlogits kernel,
+# else invalid rows silently get finite wrong gradients.
 def _build_forward_update_finalize_kernel() -> Callable:
     source = """
         uint gid = thread_position_in_grid.x;
@@ -527,14 +526,13 @@ def _forward_chunked_fused_finalize(
 ) -> tuple[mx.array, mx.array]:
     hidden_compute = hidden
     weight_compute = weight
-    # Validate in the original dtype so wide ints cannot wrap into a valid
-    # class id or ignore_index after the int32 narrow.
+    # Validate in the original dtype so wide ints can't wrap into a valid class
+    # id or ignore_index after the int32 narrow.
     targets_raw = targets
 
     n, _ = hidden_compute.shape
     vocab_size = weight_compute.shape[0]
-    # Reject rank-2 targets up front; they would slip past the length check
-    # and crash inside the kernels.
+    # Reject rank-2 targets up front; they slip past the length check and crash the kernels.
     if len(targets_raw.shape) != 1:
         raise ValueError(
             "MLX CCE: targets must be a flat 1D vector "
@@ -547,7 +545,7 @@ def _forward_chunked_fused_finalize(
                 "MLX CCE: hidden has 0 tokens but targets is non-empty "
                 f"(targets.shape={targets_raw.shape})."
             )
-        # Separate allocations so the VJP cannot alias loss into lse.
+        # Separate allocations so the VJP can't alias loss into lse.
         return (
             mx.zeros((0,), dtype=mx.float32),
             mx.zeros((0,), dtype=mx.float32),
@@ -670,8 +668,8 @@ def _forward_chunked_fused_finalize(
     raise RuntimeError("Unreachable: fused finalize path did not return outputs.")
 
 
-# Requires lse pre-poisoned with NaN for invalid rows; this fallback does
-# not re-check vocab bounds and relies on NaN propagation for the gradient.
+# Requires lse pre-poisoned with NaN for invalid rows: this fallback does not
+# re-check vocab bounds and relies on NaN propagation for the gradient.
 def _fallback_dlogits(
     logits: mx.array,
     lse: mx.array,
@@ -699,8 +697,8 @@ def _fallback_dlogits(
         t = mx.tanh(logits / softcap)
         d_capped = d_capped * (1.0 - t * t)
 
-    # Force NaN grad on lse-NaN rows BEFORE the ignore_index mask, so wide
-    # invalid labels that narrow to ignore_index do not silently zero-grad.
+    # NaN grad on lse-NaN rows BEFORE the ignore_index mask, so wide invalid
+    # labels that narrow to ignore_index do not silently zero-grad.
     invalid_lse = mx.isnan(lse)
     nan_grad = mx.full(d_capped.shape, float("nan"), dtype=d_capped.dtype)
     d_capped = mx.where(mx.expand_dims(invalid_lse, -1), nan_grad, d_capped)
@@ -735,8 +733,7 @@ def make_runtime_cce_loss_fused_finalize(
     ) -> tuple[int, list[int], list[mx.array], list[mx.array]]:
         n_tokens = hidden.shape[0]
         vocab_size = weight.shape[0]
-        # why: dtype drives compute_bytes; key must include it or a bf16
-        # plan is reused for fp32 and OOMs.
+        # dtype drives compute_bytes; key must include it or a bf16 plan is reused for fp32 and OOMs.
         key = (n_tokens, vocab_size, hidden.dtype)
         if key in chunk_plan_cache:
             return chunk_plan_cache[key]
@@ -865,10 +862,9 @@ def make_runtime_cce_loss_fused_finalize(
                     transpose=False,
                 )
 
-            # Quantized weight gradients are zero — correct for LoRA where the
-            # LM head is frozen and gradients flow through grad_hidden only.
-            # Full fine-tuning of quantized models would need
-            # dequantize → grad → requantize, which is not supported.
+            # Quantized weight gradients are zero: correct for LoRA (frozen LM head,
+            # gradients flow only through grad_hidden). Full fine-tuning of quantized
+            # models would need dequantize -> grad -> requantize, which is unsupported.
             return (
                 grad_hidden.astype(hidden.dtype),
                 mx.zeros_like(weight),
@@ -887,8 +883,8 @@ def make_runtime_cce_loss_fused_finalize(
             losses, lse = runtime_cce_loss_full(
                 hidden, weight, scales, biases, targets
             )
-            # Keep lse live for the custom VJP under mx.compile (reads it
-            # from outputs during backward); zero-weight add preserves losses.
+            # Keep lse live for the custom VJP under mx.compile (read from outputs
+            # during backward); zero-weight add preserves losses.
             return losses + lse * mx.array(0.0, dtype=mx.float32)
 
         return runtime_cce_loss, use_metal_kernel
@@ -934,9 +930,9 @@ def make_runtime_cce_loss_fused_finalize(
         vocab_size = weight_compute.shape[0]
 
         grad_hidden = mx.zeros_like(hidden_compute)
-        # Accumulate weight gradient in float32 to avoid precision loss
-        # when hidden is float16/bfloat16. Only matters for full fine-tuning
-        # (LoRA freezes the LM head so this VJP path is never reached).
+        # Accumulate weight gradient in float32 to avoid precision loss with
+        # float16/bfloat16 hidden. Only matters for full fine-tuning (LoRA
+        # freezes the LM head, so this VJP path is never reached).
         grad_weight = mx.zeros(weight_compute.shape, dtype=mx.float32)
         n_reads = 4
 
@@ -993,9 +989,8 @@ def make_runtime_cce_loss_fused_finalize(
 
     def runtime_cce_loss(hidden: mx.array, weight: mx.array, targets: mx.array) -> mx.array:
         losses, lse = runtime_cce_loss_full(hidden, weight, targets)
-        # Preserve the public return value/type as losses while keeping
-        # auxiliary log-sum-exp live for the custom VJP under mx.compile.
-        # The VJP reads lse from custom-function outputs during backward.
+        # Return losses, but keep lse live for the custom VJP under mx.compile
+        # (it reads lse from custom-function outputs during backward).
         return losses + lse * mx.array(0.0, dtype=mx.float32)
 
     return runtime_cce_loss, use_metal_kernel

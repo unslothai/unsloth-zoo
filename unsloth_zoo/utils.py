@@ -45,9 +45,8 @@ def Version(version):
         package_name = None
 
         if isinstance(version, str):
-            # Check if it looks like a package name (e.g. "trl", "transformers", "zope.interface")
-            # Package names start with a letter, can contain letters/digits/dots/hyphens/underscores,
-            # and must end with a letter or digit (no trailing hyphens/underscores)
+            # Treat as a package name (e.g. "trl") if it matches the pattern,
+            # else as a literal version string.
             if re.match(r'^[A-Za-z](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$', version):
                 try:
                     raw = importlib_version(version)
@@ -87,7 +86,7 @@ def Version(version):
 
         new_version = match.group(0).rstrip(".")
         if match_at_start and new_version != raw:
-            new_version += ".1" # Add .1 for dev / alpha / beta / rc
+            new_version += ".1" # for dev / alpha / beta / rc
         return TrueVersion(new_version)
     except:
         from inspect import getframeinfo, stack
@@ -138,10 +137,9 @@ except AttributeError:
 
 def is_main_process():
     if torch_distributed_is_initialized():
-        # torch.distributed.init_process_group was run, so get_rank works
         return torch_distributed_get_rank() == 0
     elif torch_distributed_is_torchelastic_launched():
-        # accelerate launch for example calls init_process_group later
+        # accelerate launch calls init_process_group later
         return os.environ.get("RANK", "0") == "0"
     return True
 pass
@@ -153,9 +151,9 @@ pass
 def distributed_function(n = 1, function = None, *args, **kwargs):
     assert function is not None
 
-    # Run independently if process group isn't initialized yet.
-    # This covers both: (1) not distributed at all, and (2) torchrun launched
-    # but init_process_group() wasn't called yet (e.g. during module imports).
+    # Run independently when the process group isn't initialized: not
+    # distributed, or torchrun launched but init_process_group() not yet
+    # called (e.g. during module imports).
     # Ref: https://github.com/unslothai/unsloth/issues/3703
     if not torch_distributed_is_initialized():
         out = function(*args, **kwargs)
@@ -168,12 +166,9 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
     else:
         obj_list = [None for _ in range(n)]
 
-    # If the process group is initialized, we can synchronize / share the result
     if torch_distributed_is_initialized():
-        # Broadcast result to all ranks
         dist.broadcast_object_list(obj_list, src = 0)
-        # Barrier to make sure everyone waits until main is done
-        dist.barrier()
+        dist.barrier()  # wait until main is done
 
     return obj_list[0] if n == 1 else obj_list
 pass
@@ -185,15 +180,9 @@ def _lock_path_for(target: str) -> str:
     return str(locks_dir / f".lock.{pathlib.Path(target).name}")
 
 def get_lock(target: str, timeout: Optional[int] = None) -> FileLock:
-    """
-    Get a lock for a target file.
-    target: str, the path to the file to lock
-    timeout: int, the timeout in seconds for the lock
-    If timeout is not provided, it will use the value of
-    the environment variable UNSLOTH_LOCK_TIMEOUT, otherwise 10 seconds.
+    """Get a FileLock for `target`.
 
-    Returns:
-        FileLock, the lock for the target file
+    timeout defaults to env UNSLOTH_LOCK_TIMEOUT, otherwise 10 seconds.
     """
     lock_path = _lock_path_for(target)
     if timeout is None:

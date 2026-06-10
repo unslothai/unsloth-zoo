@@ -9,14 +9,14 @@
 """Auto-installer for the fused lm_head + cross_entropy forward.
 
 Tier 1 swaps the forward via a hand-registered structural-hash allowlist
-(empty by default; populate with `register_canonical`). Tier 2 falls back
-to `ast_rewriter` which rewrites the canonical HF triplet in-place; misses
-go to `_UNMATCHED` and the LOSS_MAPPING sweep stays as the backstop.
+(empty by default; populate with `register_canonical`). Tier 2 falls back to
+`ast_rewriter`, which rewrites the canonical HF triplet in-place; misses go to
+`_UNMATCHED` with the LOSS_MAPPING sweep as backstop.
 
-On by default. Set `UNSLOTH_FUSED_FORWARD=0` to disable. Soft floor at
-transformers >= 4.56, the release where every `*ForCausalLM` settled on
-the `outputs.last_hidden_state` + `self.loss_function(logits, labels,
-vocab_size, **kwargs)` shape we match against.
+On by default; set `UNSLOTH_FUSED_FORWARD=0` to disable. Requires transformers
+>= 4.56, where every `*ForCausalLM` settled on the
+`outputs.last_hidden_state` + `self.loss_function(logits, labels, vocab_size,
+**kwargs)` shape we match against.
 """
 
 from __future__ import annotations
@@ -69,9 +69,8 @@ def is_enabled() -> bool:
 
 
 def register_canonical(forward_hash: str, replacement_forward) -> None:
-    """Register a hand-written canonical forward for a known structural hash.
-    Future installs that fingerprint to `forward_hash` get the replacement
-    directly without the AST rewrite step."""
+    """Register a hand-written canonical forward for a structural hash. Future
+    installs fingerprinting to `forward_hash` use it without the AST rewrite."""
     with _REGISTRY_LOCK:
         _CANONICAL_FORWARDS[forward_hash] = replacement_forward
 
@@ -222,8 +221,8 @@ def install_for_class(cls) -> bool:
         ns.setdefault("can_return_tuple", can_return_tuple)
     except Exception:
         pass
-    # Backfill transformers.modeling_outputs symbols; unsloth's compiled-cache
-    # forwards reference CausalLMOutputWithPast & friends in the return line.
+    # Backfill modeling_outputs symbols; rewritten forwards reference
+    # CausalLMOutputWithPast & friends in the return line.
     try:
         import transformers.modeling_outputs as _mo
         for _name in dir(_mo):

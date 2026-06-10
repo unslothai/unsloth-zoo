@@ -629,11 +629,9 @@ pass
 
 def fix_attention_dtype_consistency(source):
     """
-    Fix dtype mismatch between Q/K and V in attention modules.
-    After apply_rotary_pos_emb, Q and K may be promoted to a different dtype
-    (e.g. float32) while V stays in the original dtype (e.g. float16/bfloat16).
-    This happens in 4-bit BNB mode when cos/sin from RoPE are in float32.
-    We insert a cast to align V's dtype with Q's dtype.
+    Fix Q/K vs V dtype mismatch in attention. apply_rotary_pos_emb may promote
+    Q/K (e.g. to float32 in 4-bit BNB when RoPE cos/sin are float32) while V stays
+    float16/bfloat16; insert a cast aligning V's dtype with Q's.
     """
     pattern = re.compile(
         r"([ \t]*)(query_states\s*,\s*key_states\s*=\s*apply_rotary_pos_emb\([^\)]+\))"
@@ -972,13 +970,12 @@ def create_new_function(
                     and f"def {b}(" not in new_source
                 ):
                     items.append(b)
-    # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
+    # Pull in any create_*_mask functions referenced in the source
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
         if mask_function in new_source:
             items += [mask_function]
     pass
-    # Full import script
     imports = "from torch import Tensor\n"
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
@@ -1255,7 +1252,6 @@ def create_standalone_class(
      replacement so indentation and whitespace should be handled ahead of time!
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    # Create optimized standalone forward function
     f = eval(f"{model_location}.{module}")
     full_class = inspect.getsource(f)
     old_source = inspect.getsource(f.forward)
@@ -1282,12 +1278,10 @@ def create_standalone_class(
     if full_class.lstrip().startswith("@"):
         start = re.search(r"^class ", full_class, flags=re.MULTILINE)
         if start:
-            # Found class definition - now check decorators
             class_start = start.start()
             preamble = full_class[:class_start]
             class_def = full_class[class_start:]
 
-            # Split preamble into lines
             lines = preamble.split('\n')
             new_lines = []
 
@@ -1302,7 +1296,7 @@ def create_standalone_class(
 
             for line in lines:
                 if skipping:
-                    # Continue skipping decorator args until balanced
+                    # Skip decorator args until parens balance
                     paren_depth += line.count("(") - line.count(")")
                     if paren_depth <= 0:
                         skipping = False
@@ -2265,7 +2259,6 @@ pass
 # Patch remaining functions
 def convert_attention_masks_to_bool(module, old_source):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Convert attention mask creation functions to boolean
     source = re.sub(r"\([\s]{0,}", "(", old_source)
     source = re.sub(r"[\s]{0,}\)", ")", source)
     all_splits = source.strip().split("\n")
@@ -2968,7 +2961,6 @@ def patch_gradient_accumulation(modeling_file, module):
     else:
         return None
 
-    # Now replace old forward with new one
     source = inspect.getsource(module).replace(inspect.getsource(forward), source)
     return source
 
@@ -3308,7 +3300,6 @@ def unsloth_compile_transformers(
     return_logits: bool = False,
     supports_sdpa: list = None,
 ):
-    # import transformers logging module and instantiate model_type logging instance.
     from transformers import logging as transformers_logging
 
     try:
