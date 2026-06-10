@@ -42,10 +42,7 @@ __all__ = [
 
 @torch.inference_mode
 def fix_zero_training_loss(model, tokenizer, train_dataset):
-    """
-    Sometimes the labels get masked by all -100s, causing the loss
-    to be 0. We check for this!
-    """
+    """Warn/raise when labels are all -100 (masked), which zeroes the loss."""
     # All Unsloth Zoo code licensed under LGPLv3
     if isinstance(train_dataset, datasets.IterableDataset):
         # Skip the check since the code below assumes
@@ -119,9 +116,8 @@ def prepare_model_for_training(
         # We need to upcast to float32
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
-        # For full finetuning, update config dtype to match actual weight dtype.
-        # The KV cache uses model.config.torch_dtype, but weights are upcast to float32.
-        # Without this, generation fails with dtype mismatch in index_copy_().
+        # Full finetuning upcasts weights to float32; sync config dtype so the
+        # KV cache matches and generation avoids a dtype mismatch in index_copy_().
         if full_finetuning:
             model._unsloth_original_dtype = dtype
             model.config.torch_dtype = torch.float32
@@ -195,8 +191,7 @@ def prepare_model_for_training(
                 exec(f"model.{name}.to({str(torch.float32)})")
     pass
 
-    # Gradient checkpointing
-    # If the user requested vanilla GC (True/False), ensure any prior Unsloth patch is undone.
+    # Vanilla GC (True/False) requires undoing any prior Unsloth patch.
     if use_gradient_checkpointing != "unsloth":
         unpatch_unsloth_gradient_checkpointing()
         unpatch_unsloth_smart_gradient_checkpointing()
@@ -290,7 +285,6 @@ pass
 
 
 def set_training(model):
-    # Start training
     model.training = True
     while hasattr(model, "model"):
         model = model.model
@@ -300,7 +294,6 @@ pass
 
 
 def unset_training(model):
-    # End training
     model.training = False
     while hasattr(model, "model"):
         model = model.model
@@ -317,10 +310,8 @@ pass
 
 def unsloth_train(trainer):
     """
-    Unsloth Trainer
-    1. Fixes gradient accumulation
-    2. Scaled down version of HF's trainer
-    3. Much less feature complete
+    Minimal trainer: a scaled-down HF Trainer that fixes gradient accumulation.
+    Much less feature complete.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     assert(hasattr(trainer, "args"))

@@ -46,8 +46,7 @@ def _safe_token_denominator(ntoks):
 def _get_transformer_layers(model):
     """Find transformer layers, unwrapping VLM wrappers if needed.
 
-    VLMs: model.language_model.model.layers
-    Text: model.layers or model.model.layers
+    VLMs: model.language_model.model.layers; text: model.(model.)layers.
     """
     m = getattr(model, 'language_model', model)
     m = getattr(m, 'model', m)
@@ -82,7 +81,7 @@ def _get_vision_encoder_layers(model):
 
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
-        return  # already applied
+        return  # already patched
     layer_cls._orig_call = layer_cls.__call__
     fn = layer_cls.__call__
 
@@ -105,11 +104,10 @@ def _unpatch_layer_class_gc(layer_cls):
 def apply_gradient_checkpointing(model):
     """Apply gradient checkpointing to language and vision tower layers.
 
-    Patches each layer class's ``__call__`` with ``mx.checkpoint`` so MLX
-    recomputes the layer's forward during backward instead of storing
-    activations. Trades ~30% extra compute for substantial memory savings —
-    critical for VLMs where vision tower backward at native image
-    resolution can otherwise materialize tens of GB of activation tape.
+    Patches each layer class's ``__call__`` with ``mx.checkpoint`` to recompute
+    the forward during backward instead of storing activations. Trades ~30%
+    extra compute for large memory savings — critical for VLM vision towers at
+    native resolution, which can otherwise materialize tens of GB.
     """
     lm_layers = _get_transformer_layers(model)
     if lm_layers is not None and len(lm_layers) > 0:
@@ -133,10 +131,8 @@ def remove_gradient_checkpointing(model):
 def _get_text_model(model):
     """Get the inner text model, unwrapping multimodal wrappers if present.
 
-    Standard models (Llama, Qwen): model itself is the text model.
-    Multimodal wrappers (Gemma 4): model.language_model is the text model.
-
-    Returns the text model that has .model (backbone) and optionally .lm_head.
+    Standard models (Llama, Qwen) are themselves the text model; multimodal
+    wrappers (Gemma 4) expose it at model.language_model.
     """
     if hasattr(model, "language_model"):
         return model.language_model
@@ -218,12 +214,9 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
 def _get_lm_head_layer(model):
     """Get the raw LM head layer (QuantizedLinear or Linear/Embedding).
 
-    Checks for a separate lm_head first (untied models like Qwen), then
-    falls back to embed_tokens (tied models like Gemma/Llama).
-    Handles multimodal wrappers (e.g. Gemma 4) via _get_text_model.
-
-    Returns the layer object (not its weight), so callers can access
-    .weight, .scales, .biases, .group_size, .bits for quantized layers.
+    Prefers a separate lm_head (untied models like Qwen), else falls back to
+    embed_tokens (tied models like Gemma/Llama). Returns the layer object (not
+    its weight) so callers can read .weight/.scales/.biases/.group_size/.bits.
     """
     tm = _get_text_model(model)
     if hasattr(tm, "lm_head") and tm.lm_head is not None:
@@ -249,11 +242,10 @@ def _get_logit_softcap(model):
 
 
 def _is_lm_head_trainable(model):
-    """Check if the LM head weight is trainable (not frozen by LoRA).
+    """Whether the LM head weight is trainable (not frozen by LoRA).
 
-    For LoRA training, the LM head weight is frozen — computing its gradient
-    in CCE is a wasted V x chunk_size x H matmul per chunk. Returns False
-    when the weight should be wrapped with mx.stop_gradient.
+    When frozen, its CCE gradient is a wasted V x chunk_size x H matmul per
+    chunk, so callers wrap the weight with mx.stop_gradient (returns False).
     """
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     # Module-anchored so unrelated trainables containing the substring
@@ -272,8 +264,8 @@ def _is_lm_head_trainable(model):
             key, lora_module_prefixes, has_root_lora_module,
         ):
             continue
-        # Segment-match (not substring) so names like
-        # `decoder.not_lm_head_router.weight` are not classified as lm_head.
+        # Segment-match (not substring) so e.g.
+        # `decoder.not_lm_head_router.weight` is not classified as lm_head.
         segments = key.split(".")
         is_lm_head_param = "lm_head" in segments
         is_embed_tokens_weight = (
@@ -283,24 +275,18 @@ def _is_lm_head_trainable(model):
         )
         if is_lm_head_param or is_embed_tokens_weight:
             return True
-    return len(trainable) == 0  # no LoRA = full fine-tuning = trainable
+    return len(trainable) == 0  # no LoRA = full fine-tuning
 
 
 def make_cce_loss_fn(model):
-    """Create a CCE loss function using the bundled chunked cross-entropy engine.
+    """Create a chunked cross-entropy (CCE) loss function.
 
-    CCE computes cross-entropy directly from hidden states and the LM head weight,
-    avoiding full logit materialization. This saves significant memory for large
-    vocabularies.
+    CCE computes loss directly from hidden states and the LM head weight,
+    avoiding full logit materialization (big memory savings for large vocabs).
 
-    Args:
-        model: MLX model.
-
-    Returns:
-        A function (model, batch, lengths, labels=None) -> (loss, ntoks).
-        When labels is provided, uses labels[:,1:] for targets with
-        (targets != -100) as the loss mask.
-        The function has a ``_unsloth_cce_backend`` attribute for logging.
+    Returns a function (model, batch, lengths, labels=None) -> (loss, ntoks).
+    With labels, uses labels[:,1:] as targets and (targets != -100) as mask.
+    The returned function has a ``_unsloth_cce_backend`` attribute for logging.
     """
     softcap = _get_logit_softcap(model)
     if softcap > 0:
@@ -337,12 +323,11 @@ def make_cce_loss_fn(model):
         return backbone.embed_tokens
 
     if use_quantized:
-        # Backstop: the quantized CCE backward returns mx.zeros for the
-        # weight gradient (dequant→grad→requant is not implemented). That's
-        # fine when the LM head is frozen (LoRA on a quantized base — the
-        # gradient flows through grad_hidden into the LoRA adapters), but
-        # full fine-tuning would silently skip the LM head update. The
-        # loader rejects this combination earlier; this is a safety net.
+        # Backstop: quantized CCE backward zeros the weight gradient
+        # (dequant->grad->requant unimplemented). Fine when the LM head is
+        # frozen (LoRA on a quantized base flows grad through grad_hidden), but
+        # full fine-tuning would silently skip the LM head update. The loader
+        # rejects this earlier; this is a safety net.
         if getattr(model, "_unsloth_full_finetuning", False):
             raise ValueError(
                 "Unsloth: full_finetuning=True with a quantized LM head is "
@@ -434,16 +419,12 @@ def make_cce_loss_fn(model):
 
 
 def make_baseline_loss_fn():
-    """Create a standard cross-entropy loss function.
+    """Create a standard cross-entropy loss function (full logits via LM head).
 
-    Uses the full logit computation through the LM head, then applies
-    nn.losses.cross_entropy. Used when use_cce=False.
-
-    Returns:
-        A function (model, batch, lengths, labels=None) -> (loss, ntoks).
-        When labels is provided, uses labels[:,1:] for targets with
-        (targets != -100) as the loss mask. The labels=None branch is
-        byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
+    Used when use_cce=False. Returns a function
+    (model, batch, lengths, labels=None) -> (loss, ntoks). With labels, uses
+    labels[:,1:] and (targets != -100) as mask. The labels=None branch is
+    byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
     """
     def loss_fn(model, batch, lengths, labels=None):
         if labels is None:
@@ -484,7 +465,7 @@ def make_baseline_loss_fn():
 # ---------------------------------------------------------------------------
 
 # Image/vision special tokens that should never contribute to loss.
-# Mirrors unsloth's IMAGE_TOKENS list from vision_utils.py.
+# Mirrors unsloth's IMAGE_TOKENS list in vision_utils.py.
 _IMAGE_TOKEN_STRINGS = (
     "<|image|>",           # Llama 3.2 Vision, Phi 3.5, Gemma4
     "<|vision_start|>",    # Qwen
@@ -515,7 +496,7 @@ def _get_image_token_ids(model):
         try:
             tok_ids = tokenizer.convert_tokens_to_ids([tok_str])
             if tok_ids and tok_ids[0] is not None:
-                # Some tokenizers return the unk_token_id for unknown tokens
+                # Some tokenizers return unk_token_id for unknown tokens
                 unk_id = getattr(tokenizer, "unk_token_id", None)
                 if tok_ids[0] != unk_id:
                     ids.append(tok_ids[0])
@@ -573,17 +554,12 @@ def _normalize_cce_label_dtype(labels):
 def _mask_image_tokens(targets, image_token_ids):
     """Set image token positions in targets to -100 (ignore_index).
 
-    Prevents the model from training to predict image placeholder tokens,
-    which are fixed special tokens that provide no useful gradient signal.
-
-    Args:
-        targets: mx.array of token IDs.
-        image_token_ids: plain Python list of int token IDs, or None.
+    Image placeholder tokens are fixed specials with no useful gradient signal.
+    image_token_ids is a plain Python list of ints, or None.
     """
     if not image_token_ids:
         return targets
     targets = _normalize_cce_label_dtype(targets)
-    # Build a mask: True where target is any image token
     is_image = targets == image_token_ids[0]
     for tok_id in image_token_ids[1:]:
         is_image = is_image | (targets == tok_id)
@@ -592,13 +568,10 @@ def _mask_image_tokens(targets, image_token_ids):
 
 
 def _mask_prompt_tokens(targets, assistant_token_id):
-    """Mask all tokens before the first assistant response in each sequence.
+    """Mask tokens before the first assistant response (train_on_completions_only).
 
-    Scans each row of targets for assistant_token_id. All positions before
-    the first occurrence are set to -100 (ignore_index). If the token is
-    not found, the entire sequence is left unmasked (assumes all completion).
-
-    This implements train_on_completions_only for VLM training.
+    Per row, positions before the first assistant_token_id become -100. If the
+    token is absent, the row is left unmasked (assumed all completion).
     """
     if assistant_token_id <= 0:
         return targets
@@ -694,8 +667,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
         logits = logits.astype(mx.float32)
 
         if labels is not None:
-            # train_on_responses_only: labels encode instruction/padding masking.
-            # Still mask image placeholder tokens.
+            # labels encode instruction/padding masking; still mask image tokens
             targets = _normalize_cce_label_dtype(labels[:, 1:])
             targets = _mask_image_tokens(targets, _image_token_ids)
             logits, targets = _align_logits_with_labels(logits, targets)
@@ -707,7 +679,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
             target_source = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, input_ids)
             targets = _normalize_cce_label_dtype(target_source[:, 1:])
 
-            # Handle sequence length mismatch from vision token injection
+            # Vision token injection can change seq length
             logits, targets = _align_logits_with_labels(logits, targets)
 
             # Build mask from attention_mask (shifted to match targets)
@@ -717,10 +689,9 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
             else:
                 length_mask = mx.ones_like(targets, dtype=mx.float32)
 
-            # Mask image placeholder tokens and prompt tokens
             targets = _mask_image_tokens(targets, _image_token_ids)
             targets = _mask_prompt_tokens(targets, _assistant_token_id)
-            # Update length_mask to exclude masked positions
+            # Exclude masked positions from length_mask
             mask = mx.where(
                 targets == -100,
                 mx.array(0, dtype=length_mask.dtype),
@@ -744,7 +715,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
 def _unpack_embed_result(embed_result, model):
     """Unpack get_input_embeddings result into embeds + backbone kwargs.
 
-    Handles both plain mx.array returns and InputEmbeddingsFeatures dataclass
+    Handles plain mx.array returns and the InputEmbeddingsFeatures dataclass
     (gemma4 per_layer_inputs, qwen3-vl position_ids/deepstack, etc.).
     """
     backbone_kwargs = {}
@@ -777,11 +748,10 @@ def _unpack_embed_result(embed_result, model):
     else:
         merged_embeds = embed_result
 
-    # Qwen-VL family: get_input_embeddings stashes position_ids on the
-    # language model wrapper; the inner backbone needs them explicitly.
-    # When no position_ids were stashed (e.g. text-only samples or simple
-    # images without grid_thw), generate sequential ones so the backbone
-    # doesn't crash accessing cache.offset with cache=None.
+    # Qwen-VL: get_input_embeddings stashes position_ids on the language model
+    # wrapper; the inner backbone needs them explicitly. When none were stashed
+    # (text-only or simple images without grid_thw), generate sequential ones
+    # so the backbone doesn't crash on cache.offset with cache=None.
     lm = getattr(model, "language_model", None)
     if lm is not None:
         _MISSING = object()
@@ -877,9 +847,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     )
 
     if labels is not None:
-        # train_on_responses_only: labels already encode instruction and
-        # padding masking. Still need to mask image placeholder tokens
-        # since they provide no useful gradient signal.
+        # labels already encode instruction/padding masking; still mask image tokens
         targets = labels[:, 1:]
         masked_targets = _mask_image_tokens(targets, image_token_ids)
         ntoks = (masked_targets != -100).sum()
@@ -898,11 +866,8 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         ignore = mx.array(-100, dtype=targets.dtype)
         masked_targets = mx.where(length_mask, targets, ignore)
 
-        # Mask image placeholder tokens, they're fixed special tokens that
-        # provide no useful gradient signal.
         masked_targets = _mask_image_tokens(masked_targets, image_token_ids)
-
-        # Completion-only masking: mask prompt tokens before first assistant response
+        # Completion-only: mask prompt before first assistant response
         masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
 
         ntoks = (masked_targets != -100).sum()
@@ -1601,22 +1566,13 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
 def make_vlm_cce_loss_fn(model, assistant_token_id=0):
     """Create a CCE loss function for VLMs.
 
-    Uses model.get_input_embeddings() to get merged vision+text embeddings,
-    then runs through the language model backbone to get hidden states before
-    the LM head, and applies CCE.
+    Uses model.get_input_embeddings() for merged vision+text embeddings, runs
+    the backbone to pre-lm_head hidden states, and applies CCE. Falls back to
+    baseline loss when get_input_embeddings is unavailable.
 
-    Falls back to baseline loss if get_input_embeddings is not available.
-
-    Args:
-        model: VLM model.
-        assistant_token_id: Token ID marking start of assistant responses.
-            When > 0, all tokens before the first occurrence are masked
-            from the loss (completion-only training).
-
-    Returns:
-        A function (model, batch_dict) -> (loss, ntoks).
+    assistant_token_id > 0 enables completion-only training (mask tokens before
+    the first occurrence). Returns a function (model, batch_dict) -> (loss, ntoks).
     """
-    # Check if the model supports get_input_embeddings
     if not hasattr(model, "get_input_embeddings"):
         import warnings
         warnings.warn(
@@ -1639,8 +1595,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
     softcap = _get_logit_softcap(model)
     lm_layer = _get_lm_head_layer(model)
     use_quantized = _is_quantized_layer(lm_layer)
-    # Evaluate once — trainability doesn't change during training.
-    # Must be called after LoRA setup.
+    # Evaluate once (after LoRA setup); trainability doesn't change mid-training.
     _skip_weight_grad = not _is_lm_head_trainable(model)
 
     _image_token_ids = _get_image_token_ids(model)
@@ -1651,9 +1606,9 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
         print(f"Unsloth: Completion-only training (assistant_token_id={_assistant_token_id}).")
 
     if use_quantized:
-        # Backstop: same as the text CCE path — full FT against a quantized
-        # LM head silently skips the LM head update. Reject loudly here in
-        # case the loader-level check is bypassed.
+        # Backstop (as in the text CCE path): full FT against a quantized LM
+        # head silently skips the LM head update. Reject loudly here in case
+        # the loader-level check is bypassed.
         if getattr(model, "_unsloth_full_finetuning", False):
             raise ValueError(
                 "Unsloth: full_finetuning=True with a quantized VLM LM head "
@@ -1718,16 +1673,15 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
 
 
 def _get_vlm_image_size(config, processor):
-    """Get target image size for uniform resizing, matching GPU collator.
+    """Get target image size for uniform resizing, matching the GPU collator.
 
-    Tries vision_config.image_size (dict OR dataclass), then
+    Tries vision_config.image_size (dict or dataclass), then
     processor.image_processor.size, falls back to 512.
 
-    Note: Qwen2.5-VL's processor.image_processor.size has
-    {'shortest_edge': 3136, 'longest_edge': 12845056} — those are
-    *area pixel counts* (min_pixels / max_pixels), not dimensions.
-    Reading them as "height" produces a 3136x3136 upsample → 50k patches
-    per image → OOM. Skip area-style ``size`` dicts.
+    Note: Qwen2.5-VL's image_processor.size holds *area pixel counts*
+    (shortest_edge/longest_edge = min/max pixels), not dimensions. Reading
+    them as height would 3136x3136-upsample -> 50k patches -> OOM, so skip
+    area-style ``size`` dicts.
     """
     vc = config.get("vision_config") if isinstance(config, dict) else getattr(config, "vision_config", None)
     if vc is not None:
@@ -2420,11 +2374,9 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
 def _collate_vlm_batch(items, processor, max_seq_length, image_size, formatting_func=None):
     """Collate a batch of VLM samples using the processor directly.
 
-    Mirrors Unsloth's GPU UnslothVisionDataCollator:
-    1. Extract images from messages or top-level keys
-    2. Resize to uniform size
-    3. apply_chat_template for text
-    4. Single processor() call handles tokenization + image processing + padding
+    Mirrors Unsloth's GPU UnslothVisionDataCollator: extract images, resize
+    to uniform size, apply_chat_template, then one processor() call for
+    tokenization + image processing + padding.
     """
     normalize_vlm_processor_chat_template(processor, strict=False)
     formatted_items = []
@@ -2754,9 +2706,9 @@ def _extract_mlx_lora_parameters(model):
     for _, m in iter_mlx_lora_modules(model):
         a_tensor = m.lora_a
         a_shape = tuple(getattr(a_tensor, "shape", ()))
-        # Switch LoRA layouts vary across mlx-lm versions; lora_b's last
-        # axis is always `rank`, so prefer it when num_experts is declared.
-        # Plain LoRALinear uses (in_dims, rank) where rank is shape[-1].
+        # Switch LoRA layouts vary across mlx-lm versions; lora_b's last axis is
+        # always `rank`, so prefer it when num_experts is declared. Plain
+        # LoRALinear uses (in_dims, rank) where rank is shape[-1].
         b_tensor = getattr(m, "lora_b", None)
         b_shape = tuple(getattr(b_tensor, "shape", ())) if b_tensor is not None else ()
         if hasattr(m, "num_experts") and len(b_shape) >= 3:
@@ -2768,7 +2720,7 @@ def _extract_mlx_lora_parameters(model):
         scale = getattr(m, "scale", 1.0)
 
         drop = getattr(m, "dropout", None)
-        # mlx.nn.Dropout stores keep-prob in _p_1; fall back to .p for shims.
+        # mlx.nn.Dropout stores keep-prob in _p_1; fall back to .p for shims
         if drop is None:
             dropout = 0.0
         else:
@@ -3192,10 +3144,10 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
-    # Only stamp LoRA-flavoured fields when the live model carries LoRA
-    # modules (or the caller already declared a lora/dora artifact);
-    # otherwise mlx-lm.load_adapters() would inject LoRA wrappers before
-    # binding the saved full-precision weights and break reload.
+    # Only stamp LoRA fields when the live model has LoRA modules (or the
+    # caller declared a lora/dora artifact); otherwise mlx-lm.load_adapters()
+    # would inject LoRA wrappers before binding full-precision weights and
+    # break reload.
     has_lora_modules = any(True for _ in iter_mlx_lora_modules(model))
     declared_lora_artifact = (
         has_lora_modules
@@ -3463,7 +3415,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
-    # Fuse LoRA weights into base model using mlx-lm's pattern
+    # Fuse LoRA weights into base model (mlx-lm pattern)
     model.eval()
     fused_linears = [
         (n, m.fuse(dequantize=dequantize))
@@ -3506,7 +3458,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     try:
         create_model_card(path, hf_repo)
     except Exception:
-        # Fails if hf_repo doesn't exist on Hub — create a minimal card
+        # hf_repo missing on Hub — write a minimal card
         readme = path / "README.md"
         if not readme.exists():
             readme.write_text("---\nlibrary_name: mlx\ntags:\n- mlx\n- unsloth\n---\n")
@@ -3834,7 +3786,7 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
             check=True,
         )
 
-    # Install Python dependencies — use gguf from the cloned repo to stay in sync
+    # Install deps; prefer gguf from the cloned repo to stay in sync
     gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
     if os.path.exists(gguf_py_dir):
         subprocess.run(
@@ -3940,7 +3892,7 @@ def save_pretrained_gguf(
         if quant_type in ("bf16", "f16", "f32"):
             first_conversion = quant_type
         else:
-            # All k-quants and q8_0 go through bf16 intermediate then llama-quantize
+            # k-quants and q8_0 go through a bf16 intermediate, then llama-quantize
             first_conversion = "bf16"
 
     # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
@@ -3967,8 +3919,8 @@ def save_pretrained_gguf(
             print("Unsloth: Installing llama.cpp (this only happens once)...")
             _install_llama_cpp_macos(llama_cpp_folder)
 
-        # Ensure gguf Python package is installed (may be missing if
-        # llama.cpp was built in a different venv)
+        # Ensure gguf is installed (may be missing if llama.cpp was built
+        # in a different venv)
         try:
             import gguf  # noqa: F401
         except ImportError:
