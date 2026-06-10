@@ -124,9 +124,15 @@ def resolve_file_uri_to_path(path):
     from urllib.request import url2pathname
 
     parsed = urlparse(path)
-    if parsed.netloc and parsed.netloc != "localhost":
+    netloc = parsed.netloc
+    path_part = parsed.path
+    # Legacy Windows form file://C:/x parses the drive letter as the authority
+    if netloc and len(netloc) == 2 and netloc[1] in (":", "|") and netloc[0].isalpha():
+        path_part = f"/{netloc}{path_part}"
+        netloc = ""
+    if netloc and netloc != "localhost":
         return path
-    return url2pathname(parsed.path) or path
+    return url2pathname(path_part) or path
 
 
 def round_by_factor(number: int, factor: int) -> int:
