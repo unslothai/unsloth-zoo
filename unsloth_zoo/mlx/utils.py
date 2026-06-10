@@ -2332,7 +2332,11 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
 
         prompt_texts.append(prompt_text)
         combined_texts.append(combined_text)
-        all_images.append(images)
+        # mlx-vlm >= 0.6 expects a flat list of images across the whole batch;
+        # the text placeholders pair positionally with each image. Same fix
+        # as the message-collator path -- this path handles prompt+completion
+        # datasets where messages are split across two fields.
+        all_images.extend(images)
 
     combined_inputs = _processor_vlm_inputs(
         processor, combined_texts, all_images, max_seq_length
@@ -2419,7 +2423,11 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size, formatting_
             )
         images = _extract_vlm_images(item, messages, image_size)
         all_texts.append(text)
-        all_images.append(images)
+        # mlx-vlm >= 0.6 expects a flat list of images across the whole batch;
+        # the text placeholders pair positionally with each image. Using
+        # extend instead of append avoids the nested-list shape that crashes
+        # the per-image processor (image.shape unpacking).
+        all_images.extend(images)
         all_suffixes.append(item.get("suffix") if isinstance(item, dict) else None)
 
     inputs = _processor_vlm_inputs(
