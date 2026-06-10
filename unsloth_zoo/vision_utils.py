@@ -109,6 +109,26 @@ FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
 
 
+def resolve_file_uri_to_path(path):
+    """Resolve a file:// URI (RFC 8089) to a local filesystem path.
+
+    Returns the percent-decoded local path for file:// URIs with an empty or
+    "localhost" authority. Everything else (plain paths, http/https, data:,
+    non-local authorities, non-strings) is returned unchanged. Naive
+    `path[7:]` stripping breaks file://localhost/... (yielding the unopenable
+    "localhost/...") and never decodes percent-escapes.
+    """
+    if not isinstance(path, str) or not path.startswith("file://"):
+        return path
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
+
+    parsed = urlparse(path)
+    if parsed.netloc and parsed.netloc != "localhost":
+        return path
+    return url2pathname(parsed.path) or path
+
+
 def round_by_factor(number: int, factor: int) -> int:
     """Returns the closest integer to 'number' that is divisible by 'factor'."""
     return round(number / factor) * factor
@@ -167,7 +187,7 @@ def fetch_image(
         if image.startswith("http://") or image.startswith("https://"):
             image_obj = Image.open(requests.get(image, stream=True, timeout=30).raw)
         elif image.startswith("file://"):
-            image_obj = Image.open(image[7:])
+            image_obj = Image.open(resolve_file_uri_to_path(image))
         elif image.startswith("data:image"):
             if "base64," in image:
                 _, base64_data = image.split("base64,", 1)
@@ -250,12 +270,10 @@ def _read_video_torchvision(
     `ele` keys: video (path/file/http/https), video_start, video_end.
     Returns a (T, C, H, W) tensor and the sample fps.
     """
-    video_path = ele["video"]
+    video_path = resolve_file_uri_to_path(ele["video"])
     if version.parse(torchvision.__version__) < version.parse("0.19.0"):
         if "http://" in video_path or "https://" in video_path:
             warnings.warn("torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0.")
-        if "file://" in video_path:
-            video_path = video_path[7:]
     st = time.time()
     video, audio, info = io.read_video(
         video_path,
@@ -343,7 +361,7 @@ def _read_video_decord(
     Returns a (T, C, H, W) tensor and the sample fps.
     """
     import decord
-    video_path = ele["video"]
+    video_path = resolve_file_uri_to_path(ele["video"])
     st = time.time()
     vr = decord.VideoReader(video_path)
     total_frames, video_fps = len(vr), vr.get_avg_fps()
@@ -386,10 +404,7 @@ def _read_video_torchcodec(
     TORCHCODEC_NUM_THREADS = int(os.environ.get('TORCHCODEC_NUM_THREADS', 8))
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: set TORCHCODEC_NUM_THREADS: {TORCHCODEC_NUM_THREADS}")
-    video_path = ele["video"]
-    # Support file URI scheme
-    if isinstance(video_path, str) and video_path.startswith("file://"):
-        video_path = video_path[7:]
+    video_path = resolve_file_uri_to_path(ele["video"])
     st = time.time()
     decoder = VideoDecoder(video_path, num_ffmpeg_threads=TORCHCODEC_NUM_THREADS)
     video_fps = decoder.metadata.average_fps
