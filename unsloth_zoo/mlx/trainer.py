@@ -364,6 +364,34 @@ def _clip_grad_norm_fp32(grad, max_norm):
     return tree_map(lambda g: g * scale.astype(g.dtype), grad), total_norm
 
 
+def _prune_stale_checkpoints(output_dir, save_total_limit):
+    """Keep the newest ``save_total_limit`` checkpoint-* dirs (HF Trainer parity).
+
+    ``-1`` / ``0`` / ``None`` preserve the existing "no limit" contract.
+    """
+    if not save_total_limit or save_total_limit < 1:
+        return
+    import shutil
+    from pathlib import Path
+
+    checkpoints = []
+    for child in Path(output_dir).glob("checkpoint-*"):
+        # Only prune real step-checkpoint dirs the trainer created; never
+        # follow symlinks or touch user paths that share the prefix.
+        if child.is_symlink() or not child.is_dir():
+            continue
+        try:
+            step = int(child.name.removeprefix("checkpoint-"))
+        except ValueError:
+            continue
+        checkpoints.append((step, child))
+    checkpoints.sort()
+    for _, stale in checkpoints[:-save_total_limit]:
+        shutil.rmtree(stale, ignore_errors=True)
+        print(f"  Unsloth: pruned old checkpoint {stale} "
+              f"(save_total_limit={save_total_limit})")
+
+
 @dataclass
 class MLXTrainingConfig:
     """Training configuration mirroring SFTConfig / TrainingArguments field names."""
@@ -1779,6 +1807,7 @@ class MLXTrainer:
                     except Exception as e:
                         print(f"  Unsloth: checkpoint saved without resume state ({e})")
                     print(f"  Saved checkpoint to {ckpt_dir}")
+                    _prune_stale_checkpoints(args.output_dir, args.save_total_limit)
 
         total_time = time.perf_counter() - start_time
         avg_loss = (
