@@ -1,9 +1,7 @@
 """Edge cases for MLX save / GGUF export beyond the regression suite.
 
-Covers branches test_mlx_save_export_regressions.py never reaches: rank-3/5D/1D
-tensor matching, the _MlxVlmSanitizeProxy path, the real shard-rewrite loop,
-sidecar filesystem edges, non-dict sidecar JSON, concurrent exports over the
-llama.cpp patcher env mutation, and monolith vs package converter placement.
+Covers tensor-match ranks, sanitizer proxy replay, the real shard-rewrite
+loop, sidecar and JSON edges, concurrent exports, and converter placement.
 Runs on the tests/mlx_simulation torch shim like the rest of the MLX suite.
 """
 
@@ -39,9 +37,7 @@ def _patch_mlx_tensor_helpers_for_torch(monkeypatch, mutils):
     monkeypatch.setattr(mutils.mx, "all", _all)
 
 
-# --------------------------------------------------------------------------
-# Group 1: _mlx_arrays_match
-# --------------------------------------------------------------------------
+# --- Group 1: _mlx_arrays_match ---
 
 
 def test_arrays_match_rank3_checks_values(monkeypatch):
@@ -123,9 +119,7 @@ def test_arrays_match_nan_tensors_do_not_match(monkeypatch):
     assert mutils._mlx_arrays_match(nan, nan) is True
 
 
-# --------------------------------------------------------------------------
-# Group 2: _rewrite_mlx_vlm_tensor_for_gguf branches
-# --------------------------------------------------------------------------
+# --- Group 2: _rewrite_mlx_vlm_tensor_for_gguf branches ---
 
 
 def test_rewrite_handles_5d_layout_transform(monkeypatch):
@@ -255,9 +249,7 @@ def test_rewrite_model_prefixed_alias_families(monkeypatch):
     assert new_name == "model.visual.embed.bias"
 
 
-# --------------------------------------------------------------------------
-# Group 3: _MlxVlmSanitizeProxy (2-param sanitize path)
-# --------------------------------------------------------------------------
+# --- Group 3: _MlxVlmSanitizeProxy (2-param sanitize path) ---
 
 
 def test_two_param_sanitize_receives_config_proxy():
@@ -305,9 +297,7 @@ def test_sanitize_missing_method_returns_weights_unchanged():
     assert mutils._call_mlx_vlm_sanitize(NoSanitize, {}, weights) is weights
 
 
-# --------------------------------------------------------------------------
-# Group 4: _prepare_vlm_gguf_export_directory end-to-end (real shards)
-# --------------------------------------------------------------------------
+# --- Group 4: _prepare_vlm_gguf_export_directory end-to-end (real shards) ---
 
 
 class _ConvAndRenameSanitizer:
@@ -495,8 +485,7 @@ def _nextn_model(num_layers):
 def test_nextn_decrement_branch_keeps_partial_layers(tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
-    # 6 exported layers, 4 text layers: 2 of the 3 advertised speculative
-    # layers exist, so the key decrements to 2 instead of being popped.
+    # 2 of the 3 advertised speculative layers exist: decrement, do not pop.
     config = {
         "text_config": {"num_hidden_layers": 4, "num_nextn_predict_layers": 3},
     }
@@ -551,9 +540,7 @@ def test_nextn_handles_language_and_thinker_nested_configs():
     assert "nextn_predict_layers" not in config["thinker_config"]["text_config"]
 
 
-# --------------------------------------------------------------------------
-# Group 5: _copy_source_sidecars filesystem edges
-# --------------------------------------------------------------------------
+# --- Group 5: _copy_source_sidecars filesystem edges ---
 
 
 def test_sidecars_src_equals_dst_copies_nothing(tmp_path):
@@ -590,8 +577,7 @@ def test_sidecars_skip_suffixless_and_uppercase_suffix_files(tmp_path):
     src.mkdir()
     dst.mkdir()
     (src / "LICENSE").write_text("MIT", encoding="utf-8")
-    # Suffix matching is exact lowercase on every OS; HF sidecars are
-    # lowercase by convention, so uppercase names staying behind is accepted.
+    # Suffix matching is exact lowercase; HF sidecars are lowercase by convention.
     (src / "PREPROCESSOR_CONFIG.JSON").write_text("{}", encoding="utf-8")
     assert mutils._copy_source_sidecars(src, dst) == 0
 
@@ -633,15 +619,12 @@ def test_sidecars_windows_style_path_object_does_not_crash():
     assert mutils._copy_source_sidecars(PureWindowsPath("C:/no/such"), "out") == 0
 
 
-# --------------------------------------------------------------------------
-# Group 6: _read_json_file non-dict payloads + processor repair robustness
-# --------------------------------------------------------------------------
+# --- Group 6: _read_json_file non-dict payloads + processor repair robustness ---
 
 
 @pytest.mark.parametrize("payload", ["[]", '"just a string"', "null", "3.14"])
 def test_read_json_file_non_dict_payload_yields_dict(tmp_path, payload):
-    """Valid JSON that is not an object must degrade to {} like other
-    malformed sidecars; callers .get() on the result."""
+    """Non-object JSON must degrade to {}; callers .get() on the result."""
     import unsloth_zoo.mlx.loader as loader
 
     sidecar = tmp_path / "processor_config.json"
@@ -651,7 +634,6 @@ def test_read_json_file_non_dict_payload_yields_dict(tmp_path, payload):
 
 
 def test_repair_survives_non_dict_sidecar_json(tmp_path):
-    """Processor repair must not crash on a sidecar holding a JSON array."""
     import unsloth_zoo.mlx.loader as loader
 
     (tmp_path / "processor_config.json").write_text("[1, 2]", encoding="utf-8")
@@ -699,9 +681,7 @@ def test_read_json_file_accepts_str_and_path(tmp_path):
     assert loader._read_json_file(sidecar) == {"a": 1}
 
 
-# --------------------------------------------------------------------------
-# Group 7: _get_model_config fallback ladder
-# --------------------------------------------------------------------------
+# --- Group 7: _get_model_config fallback ladder ---
 
 
 def test_get_model_config_to_dict_returning_non_dict_falls_through():
@@ -758,9 +738,7 @@ def test_get_model_config_non_dict_private_config_falls_through():
     assert mutils._get_model_config(model) == {"model_type": "qwen3"}
 
 
-# --------------------------------------------------------------------------
-# Group 8: _save_mlx_config routing and quantization key handling
-# --------------------------------------------------------------------------
+# --- Group 8: _save_mlx_config routing and quantization key handling ---
 
 
 def _capture_save_config(monkeypatch, module_name):
@@ -777,8 +755,7 @@ def _capture_save_config(monkeypatch, module_name):
 
 
 def test_save_config_vlm_clobbers_stale_quantization_config(monkeypatch, tmp_path):
-    """When both keys exist the live MLX `quantization` wins: it reflects the
-    weights being saved, so a stale HF `quantization_config` must not survive."""
+    """Live MLX `quantization` wins over a stale HF `quantization_config`."""
     import unsloth_zoo.mlx.utils as mutils
 
     calls = _capture_save_config(monkeypatch, "mlx_vlm.utils")
@@ -814,9 +791,7 @@ def test_save_config_vlm_without_quantization_key_adds_nothing(monkeypatch, tmp_
     assert "quantization" not in calls["config"]
 
 
-# --------------------------------------------------------------------------
-# Group 9: _is_vlm_model real body
-# --------------------------------------------------------------------------
+# --- Group 9: _is_vlm_model real body ---
 
 
 def test_is_vlm_explicit_flag_overrides_structure():
@@ -858,9 +833,7 @@ def test_is_vlm_requires_language_model():
     assert mutils._is_vlm_model(object()) is False
 
 
-# --------------------------------------------------------------------------
-# Group 10: save_merged_model contracts
-# --------------------------------------------------------------------------
+# --- Group 10: save_merged_model contracts ---
 
 
 def _install_fake_lm_save(monkeypatch):
@@ -983,9 +956,7 @@ def test_merged_save_keeps_quantization_when_not_dequantizing(
     assert calls["saved_config"]["quantization"] == {"bits": 4}
 
 
-# --------------------------------------------------------------------------
-# Group 11: save_pretrained_gguf first_conversion derivation + quantize step
-# --------------------------------------------------------------------------
+# --- Group 11: save_pretrained_gguf first_conversion derivation + quantize step ---
 
 
 def _gguf_export_scaffold(monkeypatch, tmp_path):
@@ -1051,7 +1022,6 @@ def test_gguf_default_first_conversion_quantizes_through_bf16(
     )
     assert calls["convert_kwargs"]["quantization_type"] == "bf16"
     assert calls["quantize_kwargs"]["quant_type"] == "q8_0"
-    # Intermediate bf16 removed, final q8_0 kept.
     assert not (out / "EdgeModel.BF16.gguf").exists()
     assert (out / "EdgeModel.Q8_0.gguf").read_bytes() == b"GGUF-final"
 
@@ -1079,9 +1049,7 @@ def test_gguf_default_first_conversion_not_quantized_skips_quantizer(
     assert (out / "EdgeModel.BF16.gguf").exists()
 
 
-# --------------------------------------------------------------------------
-# Group 12: concurrency over the patcher env mutation
-# --------------------------------------------------------------------------
+# --- Group 12: concurrency over the patcher env mutation ---
 
 
 def test_concurrent_gguf_exports_serialize_env_mutation(monkeypatch, tmp_path):
@@ -1137,7 +1105,6 @@ def test_concurrent_gguf_exports_serialize_env_mutation(monkeypatch, tmp_path):
     assert state["max_inside"] == 1
     expected = str(tmp_path / "llama.cpp")
     assert state["env_values"] == [expected] * 6
-    # Restored once everyone is done.
     assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") is None
 
 
@@ -1172,9 +1139,7 @@ def test_gguf_export_respects_preexisting_scripts_dir_override(
     assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") == custom
 
 
-# --------------------------------------------------------------------------
-# Group 13: converter placement contract (monolith vs package layout)
-# --------------------------------------------------------------------------
+# --- Group 13: converter placement contract (monolith vs package layout) ---
 
 _PACKAGE_ENTRYPOINT = b"""\
 #!/usr/bin/env python3
@@ -1320,8 +1285,7 @@ def test_package_layout_patched_script_lands_beside_conversion(
     finally:
         llama_cpp._download_convert_hf_to_gguf_cached.cache_clear()
 
-    # Package layout: the patched entrypoint must sit beside conversion/ so
-    # `from conversion import ...` resolves in a subprocess.
+    # Patched entrypoint must sit beside conversion/ for sibling imports.
     assert Path(patched_path).parent == root
     assert "LlamaForCausalLM" in text_archs
     assert not default_dir.exists() or not list(default_dir.glob("*.py"))
@@ -1351,9 +1315,7 @@ def test_monolith_layout_patched_script_stays_in_default_dir(
     assert (root / "convert_hf_to_gguf.py").read_bytes() == _MONOLITH
 
 
-# --------------------------------------------------------------------------
-# Group 14: path-shape portability
-# --------------------------------------------------------------------------
+# --- Group 14: path-shape portability ---
 
 
 def test_save_config_accepts_str_and_path_targets(monkeypatch, tmp_path):

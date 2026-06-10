@@ -439,11 +439,9 @@ def _repair_degraded_vlm_processor(
 ):
     """Rebuild VLM processors when mlx-vlm falls back to tokenizer-only.
 
-    mlx-vlm registers several custom processors through an AutoProcessor patch.
-    If the custom processor's image processor cannot be constructed through
-    AutoImageProcessor, the patch falls back to the prior tokenizer-only loader.
-    Rebuild from the source processor configs so downstream saves preserve real
-    multimodal processor metadata.
+    mlx-vlm degrades to a tokenizer-only processor when AutoImageProcessor
+    fails; rebuild from the source sidecar configs so downstream saves keep
+    real multimodal processor metadata.
     """
     if processor is None or getattr(processor, "image_processor", None) is not None:
         return processor

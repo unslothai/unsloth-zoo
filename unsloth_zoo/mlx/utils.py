@@ -3862,9 +3862,8 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
             name_map[name] = new_name
             file_rewritten += int(changed)
         if file_rewritten:
-            # mx.load() may return arrays backed by the source safetensors file.
-            # Saving back to the same path can truncate those backing bytes before
-            # unchanged tensors are materialized, so write beside it and replace.
+            # mx.load() arrays may be file-backed; saving over the source can
+            # truncate them before they materialize, so write beside and replace.
             mx.eval(*updated.values())
             tmp_file = file.with_name(f"{file.stem}.tmp{file.suffix}")
             mx.save_safetensors(str(tmp_file), updated, metadata={"format": "mlx"})
@@ -3996,7 +3995,6 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     # Save tokenizer
     tokenizer.save_pretrained(str(path))
 
-    # Copy auxiliary source files that tokenizer/model saves may omit.
     src_path = _get_src_path(model)
     if src_path is not None:
         _copy_source_sidecars(src_path, path)

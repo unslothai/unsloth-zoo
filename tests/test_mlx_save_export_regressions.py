@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Fast regressions for MLX save/export parity fixes.
-
-These tests cover the contracts behind the real save / GGUF export bugs without
-downloading or converting large models.
+"""Fast regressions for MLX save/export parity fixes: the contracts behind
+the real save / GGUF export bugs, without downloading or converting models.
 """
 
 from __future__ import annotations
