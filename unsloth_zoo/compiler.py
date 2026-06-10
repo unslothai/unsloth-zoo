@@ -3318,6 +3318,10 @@ def patch_output_capture_targets(modeling_file, replacement_classes=None):
 
 def calls_output_capture_target(init, source, target_names):
     """Detect direct calls to submodules targeted by Transformers output hooks."""
+    # A forward decorated with @capture_outputs installs the hooks itself, even
+    # when its captured submodules are built indirectly (e.g. via helpers).
+    if re.search(r"^\s*@capture_outputs\b", source, flags=re.MULTILINE):
+        return True
     for target_name in target_names:
         assigned_names = re.findall(
             rf"self\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)*{re.escape(target_name)}\(",
