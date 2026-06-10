@@ -30,7 +30,15 @@ def _load_module():
 @pytest.fixture
 def hf_cache(monkeypatch):
     # Clear the cache env so each test fully controls it.
-    for v in ("HF_HOME", "HF_HUB_CACHE", "HF_XET_CACHE", "HF_TOKEN", "HF_TOKEN_PATH"):
+    for v in (
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "HF_XET_CACHE",
+        "XDG_CACHE_HOME",
+        "HF_TOKEN",
+        "HF_TOKEN_PATH",
+    ):
         monkeypatch.delenv(v, raising = False)
     return _load_module()
 
@@ -60,6 +68,7 @@ def test_writable_default_no_redirect(hf_cache, tmp_path, monkeypatch):
 def test_explicit_writable_hub_honored(hf_cache, tmp_path, monkeypatch):
     hub = tmp_path / "myhub"
     monkeypatch.setenv("HF_HUB_CACHE", str(hub))
+    monkeypatch.setenv("HF_XET_CACHE", str(tmp_path / "myxet"))
     assert hf_cache.redirect_hf_cache_if_readonly() is None
     assert os.environ["HF_HUB_CACHE"] == str(hub)
 
@@ -141,6 +150,126 @@ def test_token_path_preserved_on_redirect(hf_cache, tmp_path, monkeypatch):
     with pytest.warns(UserWarning):
         hf_cache.redirect_hf_cache_if_readonly()
     assert os.environ["HF_TOKEN_PATH"] == str(old_home / "token")
+
+
+def test_xdg_cache_home_writable_no_redirect(hf_cache, tmp_path, monkeypatch):
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
+    assert hf_cache.redirect_hf_cache_if_readonly() is None
+    assert "HF_HUB_CACHE" not in os.environ
+    # The probe must target where Hub will actually write.
+    assert (xdg / "huggingface" / "hub").is_dir()
+
+
+def test_xdg_cache_home_blocked_redirects(hf_cache, tmp_path, monkeypatch):
+    xdg_blocker = tmp_path / "xdg_blocker"
+    xdg_blocker.write_text("")  # file, so nothing can be created beneath it
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_blocker))
+    fallback = tmp_path / "fallback"
+    monkeypatch.setattr(hf_cache, "_fallback_bases", lambda: [fallback])
+    with pytest.warns(UserWarning):
+        assert hf_cache.redirect_hf_cache_if_readonly() == str(fallback)
+    assert os.environ["HF_HUB_CACHE"] == str(fallback / "hub")
+
+
+def test_legacy_hub_cache_env_honored(hf_cache, tmp_path, monkeypatch):
+    legacy = tmp_path / "legacy_hub"
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(legacy))
+    monkeypatch.setenv("HF_XET_CACHE", str(tmp_path / "myxet"))
+    assert hf_cache.redirect_hf_cache_if_readonly() is None
+    assert "HF_HUB_CACHE" not in os.environ
+
+
+def test_legacy_hub_cache_env_blocked_redirects(hf_cache, tmp_path, monkeypatch):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("")
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(blocker / "hub"))
+    fallback = tmp_path / "fallback"
+    monkeypatch.setattr(hf_cache, "_fallback_bases", lambda: [fallback])
+    with pytest.warns(UserWarning):
+        assert hf_cache.redirect_hf_cache_if_readonly() == str(fallback)
+    assert os.environ["HF_HUB_CACHE"] == str(fallback / "hub")
+
+
+def test_env_vars_in_paths_expanded(hf_cache, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    monkeypatch.setenv("MY_CACHE_ROOT", str(root))
+    monkeypatch.setenv("HF_HUB_CACHE", "$MY_CACHE_ROOT/hub")
+    monkeypatch.setenv("HF_XET_CACHE", "$MY_CACHE_ROOT/xet")
+    assert hf_cache.redirect_hf_cache_if_readonly() is None
+    # Probed the expanded path, not a literal "$MY_CACHE_ROOT" directory.
+    assert (root / "hub").is_dir()
+    assert not Path("$MY_CACHE_ROOT").exists()
+
+
+def test_explicit_hub_cache_survives_home_failure(hf_cache, tmp_path, monkeypatch):
+    def _no_home():
+        raise RuntimeError("could not determine home directory")
+    monkeypatch.setattr(hf_cache.Path, "home", staticmethod(_no_home))
+    hub = tmp_path / "myhub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub))
+    fallback = tmp_path / "fallback"
+    monkeypatch.setattr(hf_cache, "_fallback_bases", lambda: [fallback])
+    # The hub cache stays put; only the unresolvable xet default moves.
+    with pytest.warns(UserWarning):
+        assert hf_cache.redirect_hf_cache_if_readonly() is None
+    assert os.environ["HF_HUB_CACHE"] == str(hub)
+    assert os.environ["HF_XET_CACHE"] == str(fallback / "xet")
+
+
+def test_child_symlink_in_fallback_rejected(hf_cache, tmp_path, monkeypatch):
+    _readonly_hub(tmp_path, monkeypatch)
+    target = tmp_path / "target"
+    target.mkdir()
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    (bad / "hub").symlink_to(target)
+    good = tmp_path / "good"
+    monkeypatch.setattr(hf_cache, "_fallback_bases", lambda: [bad, good])
+    with pytest.warns(UserWarning):
+        assert hf_cache.redirect_hf_cache_if_readonly() == str(good)
+    assert os.environ["HF_HUB_CACHE"] == str(good / "hub")
+
+
+def test_explicit_writable_xet_kept_on_redirect(hf_cache, tmp_path, monkeypatch):
+    _readonly_hub(tmp_path, monkeypatch)
+    xet = tmp_path / "fast_xet"
+    monkeypatch.setenv("HF_XET_CACHE", str(xet))
+    fallback = tmp_path / "fallback"
+    monkeypatch.setattr(hf_cache, "_fallback_bases", lambda: [fallback])
+    with pytest.warns(UserWarning):
+        assert hf_cache.redirect_hf_cache_if_readonly() == str(fallback)
+    assert os.environ["HF_XET_CACHE"] == str(xet)
+
+
+def test_xet_only_breakage_moves_only_xet(hf_cache, tmp_path, monkeypatch):
+    home = tmp_path / "hfhome"
+    (home / "hub").mkdir(parents = True)
+    (home / "xet").write_text("")  # file blocks the xet dir
+    monkeypatch.setenv("HF_HOME", str(home))
+    fallback = tmp_path / "fallback"
+    monkeypatch.setattr(hf_cache, "_fallback_bases", lambda: [fallback])
+    with pytest.warns(UserWarning):
+        assert hf_cache.redirect_hf_cache_if_readonly() is None
+    assert os.environ["HF_HOME"] == str(home)
+    assert "HF_HUB_CACHE" not in os.environ
+    assert os.environ["HF_XET_CACHE"] == str(fallback / "xet")
+
+
+def test_resolve_hf_home_none_on_failure(hf_cache, monkeypatch):
+    def _no_home():
+        raise RuntimeError("could not determine home directory")
+    monkeypatch.setattr(hf_cache.Path, "home", staticmethod(_no_home))
+    assert hf_cache._resolve_hf_home() is None
+
+
+def test_safe_user_uid_fallback(hf_cache, monkeypatch):
+    monkeypatch.delenv("USER", raising = False)
+    monkeypatch.delenv("USERNAME", raising = False)
+    user = hf_cache._safe_user()
+    assert user
+    if hasattr(os, "getuid"):
+        assert user == str(os.getuid())
 
 
 def test_explicit_token_env_not_overridden(hf_cache, tmp_path, monkeypatch):

@@ -2727,7 +2727,12 @@ def _get_hf_cache_dir() -> Optional[Path]:
         potential_paths.append(Path(os.environ["HF_HUB_CACHE"]))
     if "HF_HOME" in os.environ:
         potential_paths.append(Path(os.environ["HF_HOME"]) / "hub")
-    potential_paths.append(Path.home() / ".cache" / "huggingface" / "hub")
+    try:
+        potential_paths.append(Path.home() / ".cache" / "huggingface" / "hub")
+    except Exception:
+        # Home can be unresolvable on locked-down machines; the env-derived
+        # candidates above still apply.
+        pass
 
     for cache_dir in potential_paths:
         try:
