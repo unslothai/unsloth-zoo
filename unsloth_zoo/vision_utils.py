@@ -58,6 +58,7 @@ AUDIO_TOKENS = [
 ]
 
 import torch
+import numpy as np
 from PIL import Image
 import base64
 from io import BytesIO
@@ -527,7 +528,33 @@ def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> L
     return vision_infos
 
 
-def extract_audio_info(conversations: Union[List[Dict], List[List[Dict]]]) -> List:
+def _check_audio_sampling_rate(sampling_rate, target_sampling_rate):
+    if (
+        sampling_rate is not None
+        and target_sampling_rate is not None
+        and sampling_rate != target_sampling_rate
+    ):
+        raise ValueError(
+            f"Unsloth: audio sampling_rate = {sampling_rate} does not match the feature "
+            f"extractor's {target_sampling_rate}, so the clip would be processed at the wrong speed. "
+            f'Resample first, e.g. dataset = dataset.cast_column("audio", Audio(sampling_rate={target_sampling_rate})).'
+        )
+
+
+def _resolve_audio_dict(audio, sampling_rate=None):
+    # HuggingFace Audio feature dict -> waveform array, else a path / url string
+    # (covers Audio(decode=False) payloads like {"bytes": None, "path": ...})
+    _check_audio_sampling_rate(audio.get("sampling_rate"), sampling_rate)
+    value = audio.get("array")
+    if value is None:
+        value = audio.get("path") or audio.get("url")
+    return value
+
+
+def extract_audio_info(
+    conversations: Union[List[Dict], List[List[Dict]]],
+    sampling_rate: int = None,
+) -> List:
     audio_inputs = []
     if len(conversations) == 0:
         return audio_inputs
@@ -538,13 +565,20 @@ def extract_audio_info(conversations: Union[List[Dict], List[List[Dict]]]) -> Li
             content = message.get("content")
             if isinstance(content, list):
                 for ele in content:
-                    if isinstance(ele, dict) and ele.get("type") == "audio" and "audio" in ele:
-                        audio = ele["audio"]
-                        # HuggingFace Audio feature dict -> raw waveform
-                        if isinstance(audio, dict):
-                            audio = audio.get("array")
-                        if audio is not None:
-                            audio_inputs.append(audio)
+                    if not (isinstance(ele, dict) and ele.get("type") == "audio"):
+                        continue
+                    audio = ele.get("audio")
+                    # Feature extractors also accept local paths and URLs as strings
+                    if audio is None:
+                        audio = ele.get("url") or ele.get("path")
+                    if isinstance(audio, dict):
+                        audio = _resolve_audio_dict(audio, sampling_rate)
+                    if audio is None:
+                        raise ValueError(
+                            "Unsloth: an audio content part has no `audio`, `url` or `path` data, "
+                            "so the clip cannot be loaded and the example would train as text only."
+                        )
+                    audio_inputs.append(audio)
     return audio_inputs
 
 
@@ -955,28 +989,74 @@ class UnslothVisionDataCollator:
         return image, video, video_kwarg
 
     def _extract_audio_for_example(self, example, messages):
+        feature_extractor = getattr(self.processor, "feature_extractor", None)
+        target_sr = getattr(feature_extractor, "sampling_rate", None)
         audio_val = example.get("audio")
         if audio_val is None:
             # No usable top-level audio -> fall back to inline message content
-            return extract_audio_info(messages)
+            clips = extract_audio_info(messages, sampling_rate=target_sr)
         # HuggingFace Audio feature: {"array": np.ndarray, "sampling_rate": int, ...}
-        if isinstance(audio_val, dict):
-            return [audio_val["array"]] if "array" in audio_val else []
-        if isinstance(audio_val, (list, tuple)):
+        elif isinstance(audio_val, dict):
+            clip = _resolve_audio_dict(audio_val, target_sr)
+            if clip is None:
+                raise ValueError(
+                    "Unsloth: the `audio` column dict has no `array`, `path` or `url` data, "
+                    "so the clip cannot be loaded and the example would train as text only."
+                )
+            clips = [clip]
+        elif isinstance(audio_val, (list, tuple)):
             if len(audio_val) == 0:
-                return []
+                clips = []
             # A flat list of samples is one clip, not a list of clips
-            if not isinstance(audio_val[0], (dict, list, tuple)) and getattr(audio_val[0], "ndim", 0) == 0:
-                return [audio_val]
-            clips = []
-            for clip in audio_val:
-                if isinstance(clip, dict):
-                    clip = clip.get("array")
-                if clip is not None:
-                    clips.append(clip)
-            return clips
-        # Raw ndarray or other single-clip value
-        return [audio_val]
+            # (strings are path/url clips, so they stay in the list-of-clips branch)
+            elif not isinstance(audio_val[0], (dict, list, tuple, str)) and getattr(audio_val[0], "ndim", 0) == 0:
+                clips = [audio_val]
+            else:
+                clips = []
+                for clip in audio_val:
+                    if isinstance(clip, dict):
+                        clip = _resolve_audio_dict(clip, target_sr)
+                        if clip is None:
+                            raise ValueError(
+                                "Unsloth: an `audio` column entry has no `array`, `path` or `url` data, "
+                                "so the clip cannot be loaded and the example would train as text only."
+                            )
+                    if clip is not None:
+                        clips.append(clip)
+        else:
+            # Raw ndarray or other single-clip value
+            clips = [audio_val]
+        return self._normalize_audio_clips(clips)
+
+    def _normalize_audio_clips(self, clips):
+        normalized = []
+        for clip in clips:
+            if torch.is_tensor(clip):
+                clip = clip.detach().cpu().numpy()
+            elif isinstance(clip, (list, tuple)):
+                if len(clip) > 0 and isinstance(clip[0], str):
+                    raise ValueError(
+                        "Unsloth: an audio clip cannot be a list of strings. Pass each "
+                        "path or url as its own clip or content part."
+                    )
+                # Catches stereo-as-nested-lists in the mono guard below
+                try:
+                    clip = np.asarray(clip)
+                except Exception as e:
+                    raise ValueError(
+                        f"Unsloth: could not interpret an audio clip list as a waveform: {e}"
+                    ) from e
+            if getattr(clip, "ndim", 1) > 1:
+                # torchaudio.load returns [channels, frames]; accept mono (1, N)
+                if clip.shape[0] == 1:
+                    clip = clip.reshape(-1)
+                else:
+                    raise ValueError(
+                        f"Unsloth: audio clips must be mono 1D waveforms, got shape {tuple(clip.shape)}. "
+                        "Convert stereo to mono first, e.g. waveform.mean(axis=0)."
+                    )
+            normalized.append(clip)
+        return normalized
 
     def _truncate_sequence_tensors(self, batch, seq_len):
         # Slice only per-token tensors. Matching on shape[-1] == seq_len can clip
