@@ -697,11 +697,8 @@ class UnslothVisionDataCollator:
             else:
                 self.patch_size = IMAGE_FACTOR // 2
 
-        # Some configs (e.g. InternVL3) specify patch_size as a (height, width)
-        # tuple/list, but UnslothVisionDataCollator uses it as a scalar size
-        # factor (`self.patch_size * 2`) for image resizing. Coerce to a single
-        # int: take the unique value for square patches, else fall back to the
-        # max so resized images remain divisible in both dimensions.
+        # Configs like InternVL3 store patch_size as (height, width); coerce to
+        # an int since it is used as a scalar size factor (patch_size * 2).
         if isinstance(self.patch_size, (tuple, list)):
             if len(self.patch_size) == 0:
                 self.patch_size = IMAGE_FACTOR // 2
@@ -710,16 +707,23 @@ class UnslothVisionDataCollator:
             else:
                 logger.warning(
                     f"Unsloth: non-square vision patch_size {tuple(self.patch_size)} "
-                    f"detected; using max for image size factor."
+                    f"detected; using the least common multiple as the size factor."
                 )
-                self.patch_size = int(max(self.patch_size))
+                self.patch_size = math.lcm(*(int(p) for p in self.patch_size))
+        elif self.patch_size is None:
+            self.patch_size = IMAGE_FACTOR // 2
         else:
             self.patch_size = int(self.patch_size)
 
         # Auto resize images to save VRAM!
         if resize == "min":
             try:
-                self.image_size = model.config.vision_config.image_size
+                image_size = model.config.vision_config.image_size
+                # Configs like InternVL3 store image_size as [height, width];
+                # a tuple makes _resize_images_inplace do a fixed-size resize.
+                if isinstance(image_size, (tuple, list)):
+                    image_size = tuple(int(x) for x in image_size) if len(image_size) else None
+                self.image_size = image_size
             except Exception:
                 print("Unsloth: Model does not have a default image size - using 512")
                 self.image_size = 512
