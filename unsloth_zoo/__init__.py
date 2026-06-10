@@ -72,9 +72,17 @@ from .hf_cache import redirect_hf_cache_if_readonly
 redirect_hf_cache_if_readonly()
 del redirect_hf_cache_if_readonly
 
-hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")).expanduser()
-xet_cache = Path(os.environ.get("HF_XET_CACHE", hf_home / "xet")).expanduser()
-os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", has_429_exact_full_read(xet_cache / "logs"))
+try:
+    hf_home = Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface").expanduser()
+    xet_cache = Path(os.environ.get("HF_XET_CACHE") or hf_home / "xet").expanduser()
+except Exception:
+    # Path.home() can raise on locked-down machines with an unresolvable home
+    # directory; "1" matches the probe's no-logs-found default.
+    hf_home = xet_cache = None
+os.environ.setdefault(
+    "HF_XET_HIGH_PERFORMANCE",
+    has_429_exact_full_read(xet_cache / "logs") if xet_cache is not None else "1",
+)
 os.environ.setdefault("HF_XET_CHUNK_CACHE_SIZE_BYTES", "0")
 os.environ.setdefault("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", "0")
 os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "64")

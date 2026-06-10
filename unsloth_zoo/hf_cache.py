@@ -44,6 +44,23 @@ def _is_writable(path: Path) -> bool:
         return False
 
 
+def _is_safe_private_dir(path: Path) -> bool:
+    # Fallbacks live under predictable names in shared locations (e.g. /tmp),
+    # so a pre-existing dir could belong to another local user. Only accept a
+    # non-symlink dir we own, and clamp it to 0700 so cached models (and the
+    # token file Hub keeps under HF_HOME) are not readable by other users.
+    try:
+        path.mkdir(parents = True, exist_ok = True)
+        if path.is_symlink():
+            return False
+        if hasattr(os, "getuid") and path.stat().st_uid != os.getuid():
+            return False
+        os.chmod(path, 0o700)
+        return True
+    except Exception:
+        return False
+
+
 def _safe_user() -> str:
     user = os.environ.get("USER") or os.environ.get("USERNAME") or ""
     if not user and hasattr(os, "getuid"):
@@ -54,30 +71,73 @@ def _safe_user() -> str:
 def _fallback_bases() -> list[Path]:
     # Ordered writable candidates used when the default cache is read-only.
     user = _safe_user()
-    return [
-        Path(tempfile.gettempdir()) / f"huggingface_{user}",
-        Path.cwd() / ".cache" / "huggingface",
-    ]
+    bases = [Path(tempfile.gettempdir()) / f"huggingface_{user}"]
+    try:
+        bases.append(Path.cwd() / ".cache" / "huggingface")
+    except Exception:
+        # cwd can be deleted or unreadable; the temp candidate still stands.
+        pass
+    return bases
+
+
+def _default_caches() -> tuple[Path, Path] | None:
+    # Mirror Hub's layering: HF_HUB_CACHE, else HF_HOME/hub, else
+    # ~/.cache/huggingface/hub. Path.home() (and expanduser on "~" paths) can
+    # raise on locked-down machines with an unresolvable home directory; treat
+    # that as "no usable default" rather than crashing import.
+    try:
+        hf_home_env = os.environ.get("HF_HOME")
+        if hf_home_env:
+            hf_home = Path(hf_home_env).expanduser()
+        else:
+            hf_home = Path.home() / ".cache" / "huggingface"
+        hub_cache_env = os.environ.get("HF_HUB_CACHE")
+        if hub_cache_env:
+            hub_cache = Path(hub_cache_env).expanduser()
+        else:
+            hub_cache = hf_home / "hub"
+        return hf_home, hub_cache
+    except Exception:
+        return None
 
 
 def redirect_hf_cache_if_readonly() -> str | None:
     """Repoint HF_HOME and the hub/xet caches when the active hub cache is not
     writable. Returns the new HF_HOME, or None when no change is needed."""
-    hf_home = Path(
-        os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")
-    ).expanduser()
-    hub_cache = Path(os.environ.get("HF_HUB_CACHE", hf_home / "hub")).expanduser()
-    if _is_writable(hub_cache):
-        return None
+    resolved = _default_caches()
+    if resolved is None:
+        hf_home = hub_cache = None
+    else:
+        hf_home, hub_cache = resolved
+        if _is_writable(hub_cache):
+            return None
     for base in _fallback_bases():
-        if _is_writable(base / "hub"):
-            os.environ["HF_HOME"] = str(base)
-            os.environ["HF_HUB_CACHE"] = str(base / "hub")
-            os.environ["HF_XET_CACHE"] = str(base / "xet")
-            warnings.warn(
-                f"Unsloth: Hugging Face cache '{hub_cache}' is not writable; "
-                f"redirecting downloads to '{base}'.",
-                stacklevel = 2,
-            )
-            return str(base)
+        if not _is_safe_private_dir(base):
+            continue
+        if not (_is_writable(base / "hub") and _is_writable(base / "xet")):
+            continue
+        os.environ["HF_HOME"] = str(base)
+        os.environ["HF_HUB_CACHE"] = str(base / "hub")
+        os.environ["HF_XET_CACHE"] = str(base / "xet")
+        # Moving HF_HOME also moves Hub's default token lookup; keep a
+        # readable token from the old location working.
+        old_token = hf_home / "token" if hf_home is not None else None
+        if (
+            old_token is not None
+            and "HF_TOKEN" not in os.environ
+            and "HF_TOKEN_PATH" not in os.environ
+            and old_token.is_file()
+        ):
+            os.environ["HF_TOKEN_PATH"] = str(old_token)
+        reason = (
+            f"cache '{hub_cache}' is not writable"
+            if hub_cache is not None
+            else "default cache location could not be resolved"
+        )
+        warnings.warn(
+            f"Unsloth: Hugging Face {reason}; "
+            f"redirecting downloads to '{base}'.",
+            stacklevel = 2,
+        )
+        return str(base)
     return None
