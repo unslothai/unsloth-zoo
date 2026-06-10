@@ -33,6 +33,8 @@ __all__ = [
 ]
 
 import ast
+import builtins
+import dis
 import hashlib
 import importlib.abc
 import importlib.util
@@ -108,6 +110,27 @@ def _transformers_version_ok() -> bool:
     while len(parts) < 3:
         parts.append(0)
     return tuple(parts) >= _MIN_TRANSFORMERS
+
+
+def _unresolved_globals(code, ns) -> set:
+    """Globals `code` loads (recursively) that resolve in neither `ns` nor
+    builtins. LOAD_GLOBAL only, so locals and attributes are never flagged."""
+    _builtin_names = set(dir(builtins))
+    missing, seen, stack = set(), set(), [code]
+    while stack:
+        c = stack.pop()
+        for ins in dis.get_instructions(c):
+            if (
+                ins.opname == "LOAD_GLOBAL"
+                and ins.argval not in ns
+                and ins.argval not in _builtin_names
+            ):
+                missing.add(ins.argval)
+        for const in c.co_consts:
+            if isinstance(const, type(code)) and id(const) not in seen:
+                seen.add(id(const))
+                stack.append(const)
+    return missing
 
 
 def _structural_hash(fn) -> str | None:
@@ -212,7 +235,15 @@ def install_for_class(cls) -> bool:
             _UNMATCHED[qn] = f"non-linear-head: {cap.head_attr}"
         return False
 
-    ns = dict(getattr(forward, "__globals__", {}))
+    # inspect.getsource above unwraps decorators, so globals must come from the
+    # unwrapped function too; the wrapper's __globals__ (transformers.utils.generic)
+    # lack modeling helpers like load_balancing_loss_func. Overlaying the wrapper
+    # globals keeps this a strict superset of the previous namespace.
+    _base_forward = inspect.unwrap(forward)
+    ns = dict(getattr(_base_forward, "__globals__", {}) or {})
+    if _base_forward is not forward:
+        for _name, _value in (getattr(forward, "__globals__", {}) or {}).items():
+            ns.setdefault(_name, _value)
     ns["unsloth_fused_lm_head_loss"] = unsloth_fused_lm_head_loss
     ns["EMPTY_LOGITS"] = EMPTY_LOGITS
     # The rewritten body reads UNSLOTH_RETURN_LOGITS via os.environ.get.
@@ -259,6 +290,18 @@ def install_for_class(cls) -> bool:
         new_forward.__doc__ = forward.__doc__
     except Exception:
         pass
+
+    # Never swap in a body referencing names we cannot resolve; skip with a
+    # warning instead of crashing mid-training.
+    _missing = _unresolved_globals(new_forward.__code__, ns)
+    if _missing:
+        with _REGISTRY_LOCK:
+            _FAILED[qn] = f"unresolved-globals: {sorted(_missing)}"
+        logger.warning(
+            "Unsloth fused-forward skipped for %s: unresolved name(s) %s; "
+            "keeping original forward.", qn, sorted(_missing),
+        )
+        return False
 
     cls.forward = new_forward
     with _REGISTRY_LOCK:

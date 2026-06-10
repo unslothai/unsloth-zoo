@@ -82,7 +82,7 @@ def unsloth_fused_lm_head_loss(
         target = labels
         do_shift = True
 
-    return unsloth_fused_ce_loss(
+    loss = unsloth_fused_ce_loss(
         trainer        = None,
         hidden_states  = hidden_states,
         lm_head_weight = lm_head.weight,
@@ -92,3 +92,8 @@ def unsloth_fused_lm_head_loss(
         shift_labels   = do_shift,
         **kwargs,
     )
+    # The autograd.Function output is a view; MoE forwards then do an in-place
+    # loss += aux_loss, which autograd rejects. Return a non-view tensor.
+    if isinstance(loss, torch.Tensor):
+        loss = loss.clone()
+    return loss
