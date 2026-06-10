@@ -527,7 +527,23 @@ def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> L
     return vision_infos
 
 
-def extract_audio_info(conversations: Union[List[Dict], List[List[Dict]]]) -> List:
+def _check_audio_sampling_rate(sampling_rate, target_sampling_rate):
+    if (
+        sampling_rate is not None
+        and target_sampling_rate is not None
+        and sampling_rate != target_sampling_rate
+    ):
+        raise ValueError(
+            f"Unsloth: audio sampling_rate = {sampling_rate} does not match the feature "
+            f"extractor's {target_sampling_rate}, so the clip would be processed at the wrong speed. "
+            f'Resample first, e.g. dataset = dataset.cast_column("audio", Audio(sampling_rate={target_sampling_rate})).'
+        )
+
+
+def extract_audio_info(
+    conversations: Union[List[Dict], List[List[Dict]]],
+    sampling_rate: int = None,
+) -> List:
     audio_inputs = []
     if len(conversations) == 0:
         return audio_inputs
@@ -538,13 +554,22 @@ def extract_audio_info(conversations: Union[List[Dict], List[List[Dict]]]) -> Li
             content = message.get("content")
             if isinstance(content, list):
                 for ele in content:
-                    if isinstance(ele, dict) and ele.get("type") == "audio" and "audio" in ele:
-                        audio = ele["audio"]
-                        # HuggingFace Audio feature dict -> raw waveform
-                        if isinstance(audio, dict):
-                            audio = audio.get("array")
-                        if audio is not None:
-                            audio_inputs.append(audio)
+                    if not (isinstance(ele, dict) and ele.get("type") == "audio"):
+                        continue
+                    audio = ele.get("audio")
+                    # Feature extractors also accept local paths and URLs as strings
+                    if audio is None:
+                        audio = ele.get("url") or ele.get("path")
+                    # HuggingFace Audio feature dict -> raw waveform
+                    if isinstance(audio, dict):
+                        _check_audio_sampling_rate(audio.get("sampling_rate"), sampling_rate)
+                        audio = audio.get("array")
+                    if audio is None:
+                        raise ValueError(
+                            "Unsloth: an audio content part has no `audio`, `url` or `path` data, "
+                            "so the clip cannot be loaded and the example would train as text only."
+                        )
+                    audio_inputs.append(audio)
     return audio_inputs
 
 
@@ -932,28 +957,47 @@ class UnslothVisionDataCollator:
         return image, video, video_kwarg
 
     def _extract_audio_for_example(self, example, messages):
+        feature_extractor = getattr(self.processor, "feature_extractor", None)
+        target_sr = getattr(feature_extractor, "sampling_rate", None)
         audio_val = example.get("audio")
         if audio_val is None:
             # No usable top-level audio -> fall back to inline message content
-            return extract_audio_info(messages)
+            clips = extract_audio_info(messages, sampling_rate=target_sr)
         # HuggingFace Audio feature: {"array": np.ndarray, "sampling_rate": int, ...}
-        if isinstance(audio_val, dict):
-            return [audio_val["array"]] if "array" in audio_val else []
-        if isinstance(audio_val, (list, tuple)):
+        elif isinstance(audio_val, dict):
+            _check_audio_sampling_rate(audio_val.get("sampling_rate"), target_sr)
+            clips = [audio_val["array"]] if "array" in audio_val else []
+        elif isinstance(audio_val, (list, tuple)):
             if len(audio_val) == 0:
-                return []
+                clips = []
             # A flat list of samples is one clip, not a list of clips
-            if not isinstance(audio_val[0], (dict, list, tuple)) and getattr(audio_val[0], "ndim", 0) == 0:
-                return [audio_val]
-            clips = []
-            for clip in audio_val:
-                if isinstance(clip, dict):
-                    clip = clip.get("array")
-                if clip is not None:
-                    clips.append(clip)
-            return clips
-        # Raw ndarray or other single-clip value
-        return [audio_val]
+            elif not isinstance(audio_val[0], (dict, list, tuple)) and getattr(audio_val[0], "ndim", 0) == 0:
+                clips = [audio_val]
+            else:
+                clips = []
+                for clip in audio_val:
+                    if isinstance(clip, dict):
+                        _check_audio_sampling_rate(clip.get("sampling_rate"), target_sr)
+                        clip = clip.get("array")
+                    if clip is not None:
+                        clips.append(clip)
+        else:
+            # Raw ndarray or other single-clip value
+            clips = [audio_val]
+        return self._normalize_audio_clips(clips)
+
+    def _normalize_audio_clips(self, clips):
+        normalized = []
+        for clip in clips:
+            if torch.is_tensor(clip):
+                clip = clip.detach().cpu().numpy()
+            if getattr(clip, "ndim", 1) > 1:
+                raise ValueError(
+                    f"Unsloth: audio clips must be mono 1D waveforms, got shape {tuple(clip.shape)}. "
+                    "Convert stereo to mono first, e.g. waveform.mean(axis=0)."
+                )
+            normalized.append(clip)
+        return normalized
 
     def _truncate_sequence_tensors(self, batch, seq_len):
         # Slice only per-token tensors. Matching on shape[-1] == seq_len can clip
