@@ -14,18 +14,13 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Structural pins for the PR #659 cleanup.
+"""Structural pins for the PR #659 cleanup (not the FP8/bnb4bit kernels):
 
-These tests don't exercise the FP8 / bnb4bit forward kernels — that's the
-job of the existing MoE integration tests. They lock in the structural
-invariants we relied on while restructuring:
-
-1. The post-load FP8 scale reattach machinery (which never had a caller)
-   is gone.
-2. _call_with_temporary_moe_weights has been unified in moe_utils and
-   removed from both moe_utils_fp8 and moe_utils_bnb4bit.
-3. The PEFT bnb4bit MoE merge/unmerge patches live alongside the rest
-   of the bnb4bit code, not in misc.py.
+1. The unused post-load FP8 scale reattach machinery is gone.
+2. _call_with_temporary_moe_weights is unified in moe_utils (removed from
+   moe_utils_fp8 and moe_utils_bnb4bit).
+3. The PEFT bnb4bit MoE merge/unmerge patches live in moe_utils_bnb4bit,
+   not misc.py.
 """
 
 from __future__ import annotations
@@ -53,8 +48,7 @@ def test_dead_fp8_reattach_machinery_is_gone():
 
 def test_moe_utils_fp8_does_not_open_safetensors_at_load_time():
     """The deleted reattach path was the only consumer of safetensors /
-    hf_hub_download inside moe_utils_fp8 (load-time, after-the-fact). After
-    cleanup, nothing in this module reopens checkpoint shards."""
+    hf_hub_download in moe_utils_fp8; nothing should reopen checkpoint shards."""
     from pathlib import Path
     import unsloth_zoo.temporary_patches.moe_utils_fp8 as m
     src = Path(m.__file__).read_text()

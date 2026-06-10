@@ -74,9 +74,8 @@ def test_q2_k_l_expands_to_q2_k_with_dynamic_recipe(monkeypatch):  # noqa: D401
 
     cmd = captured["cmd"]
     assert isinstance(cmd, str), f"command should be a shell string (existing convention); got {type(cmd)!r}"
-    # The literal preset name must NOT reach llama-quantize.
+    # Preset name must NOT reach llama-quantize; expanded ftype must, as a token.
     assert "q2_k_l" not in cmd, f"q2_k_l leaked into llama-quantize command: {cmd!r}"
-    # The expanded ftype must appear, as a standalone token.
     assert " q2_k " in cmd, f"q2_k token missing: {cmd!r}"
     # All four preset flags must appear.
     assert "--output-tensor-type Q6_K" in cmd, f"--output-tensor-type Q6_K missing: {cmd!r}"
@@ -93,7 +92,6 @@ def test_q2_k_l_expands_to_q2_k_with_dynamic_recipe(monkeypatch):  # noqa: D401
     assert first_tt < cmd.index("/tmp/in.gguf"), (
         f"--tensor-type must precede positional args: {cmd!r}"
     )
-    # Sanity: input/output paths and thread count are still present.
     assert "/tmp/in.gguf" in cmd
     assert "/tmp/out.gguf" in cmd
     assert " 4" in cmd, f"n_threads missing: {cmd!r}"
@@ -158,11 +156,9 @@ def test_q2_k_l_is_case_insensitive(monkeypatch):
 
 
 def test_other_quant_types_are_untouched(monkeypatch):
-    """Non-preset ftypes must traverse the original code path byte-for-byte.
+    """Non-preset ftypes traverse the original code path unchanged.
 
-    Linux + Windows non-regression: ensures the q2_k_l branch does not affect
-    any other ftype. q3_k_l is a real llama.cpp ftype distinct from q2_k_l and
-    must be passed through verbatim.
+    q3_k_l is a real llama.cpp ftype distinct from q2_k_l and must pass through verbatim.
     """
 
     llama_cpp = _load_llama_cpp_module()

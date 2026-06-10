@@ -64,7 +64,7 @@ def raise_error(f: str, exception: Any = None):
     return
 pass
 
-# Output classes sometimes might remove objects, so we make a fastpath
+# Fastpath: output classes sometimes drop args.
 global PROCESS_RETURN_ALLOWED_TYPES
 PROCESS_RETURN_ALLOWED_TYPES = {}
 def process_return(
@@ -98,23 +98,19 @@ def process_return(
     pass
 pass
 
-# Get Unpack
-# Python 3.10 doesnt have t_Unpack!
+# Get Unpack (Python 3.10 lacks t.Unpack).
 try:
     t_Unpack = t.Unpack
 except:
     from typing_extensions import Unpack as t_Unpack
-# Fix stale module caching (common on Kaggle/Colab after upgrading packages mid-session)
-# If packages were upgraded without restarting the kernel, old modules stay cached in
-# sys.modules. New on-disk files then fail when they reference symbols that only exist
-# in the upgraded version.
-# - PIL: can be fixed by clearing sys.modules (pure Python mismatch)
-# - numpy/scipy: C extensions are loaded into process memory and cannot be reloaded,
-#   so we must raise a clear error telling users to restart.
+# Fix stale module caching (Kaggle/Colab after upgrading packages mid-session):
+# old modules stay cached in sys.modules and fail when new on-disk files reference
+# upgraded-only symbols. PIL: clear sys.modules. numpy/scipy: C extensions cannot
+# be reloaded, so raise a clear restart error.
 import sys as _sys
 from importlib.metadata import version as _get_pkg_version
 
-# Check numpy -- C extensions cannot be reloaded, must restart
+# numpy: C extensions cannot be reloaded, so must restart.
 _np_mod = _sys.modules.get("numpy")
 if _np_mod is not None and hasattr(_np_mod, "__version__"):
     try:
@@ -129,9 +125,9 @@ if _np_mod is not None and hasattr(_np_mod, "__version__"):
     except RuntimeError:
         raise
     except Exception:
-        pass # Best-effort check -- non-critical if importlib.metadata is unavailable
+        pass # Best-effort; non-critical if importlib.metadata is unavailable.
 
-# Check PIL -- can fix by clearing sys.modules
+# PIL: fixable by clearing sys.modules.
 _pil_mod = _sys.modules.get("PIL")
 if _pil_mod is not None and hasattr(_pil_mod, "__version__"):
     try:
@@ -144,37 +140,23 @@ if _pil_mod is not None and hasattr(_pil_mod, "__version__"):
 del _sys, _pil_mod
 
 # ROCm on Windows ships PyTorch without the full torch.distributed C-extension
-# stack (torch._C._distributed_c10d, DeviceMesh, etc.).
-# torchao pulls the entire distributed chain in at module-import time
-# (torch.distributed._functional_collectives → _tensor → DeviceMesh …),
-# which cascades into ImportError even for code paths that never use
-# distributed features (e.g. plain LoRA training).
-# Fix: try to import torchao; if it fails due to the missing distributed
-# stack, register a minimal stub so subsequent imports (transformers →
-# quantizer_torchao → torchao) succeed.  Any runtime path that actually
-# needs a real distributed collective will still fail loudly.
-# Ref: https://github.com/ROCm/TheRock/issues/3284
-# ROCm on Windows ships PyTorch without the full torch.distributed C-extension
 # stack. torchao pulls the entire distributed chain in at module-import time,
 # cascading into ImportError even for code paths that never use distributed
 # features (e.g. plain LoRA training).
-#
-# Fix: if torchao can't be imported, install a sys.meta_path hook that
-# intercepts *all* "torchao" and "torchao.*" imports and returns self-contained
-# stub modules.  Each stub satisfies `from torchao.X import Y` by returning a
-# no-op sentinel class for any attribute, so transformers can define its
-# TorchAoHfQuantizer class at import time without the full torchao stack.
-# Any runtime call that actually needs a real torchao op will still fail loudly.
+# Fix: if torchao can't be imported, install a sys.meta_path hook intercepting
+# all "torchao"/"torchao.*" imports and returning self-contained stub modules.
+# Each stub satisfies `from torchao.X import Y` via a no-op sentinel class, so
+# transformers can define TorchAoHfQuantizer at import time. Any runtime call
+# needing a real torchao op still fails loudly.
 # Ref: https://github.com/ROCm/TheRock/issues/3284
 import sys as _sys_rocm_stub, types as _types_rocm_stub
 from importlib.abc import MetaPathFinder as _MetaPathFinder, Loader as _Loader
 from importlib.machinery import ModuleSpec as _ModuleSpec
 
 
-# Metaclass that makes sentinel classes chainable via attribute access,
-# e.g. AffineQuantizedTensor.subattr returns another sentinel class.
-# This is needed because peft does isinstance(weight, AffineQuantizedTensor)
-# which requires the second arg to be a real type, not a module.
+# Metaclass making sentinel classes chainable via attribute access
+# (AffineQuantizedTensor.subattr -> another sentinel). peft does
+# isinstance(weight, AffineQuantizedTensor), which needs a real type.
 class _ROCmSentinelMeta(type):
     def __getattr__(cls, name):
         child = _ROCmSentinelMeta(name, (), {"__module__": cls.__module__})
@@ -188,14 +170,11 @@ def _rocm_make_sentinel(attr, parent_name):
 
 
 def _rocm_make_torchao_stub(name):
-    """
-    Create a stub module for a torchao path.
+    """Create a stub module for a torchao path.
 
-    - Sub-module imports (torchao.dtypes, torchao.quantization …) are handled
-      by the meta_path finder and get proper module stubs.
-    - Direct attribute access on a stub (torchao.dtypes.AffineQuantizedTensor)
-      returns a sentinel CLASS so that isinstance() checks succeed (returning
-      False, since no real weight will ever be an instance of the sentinel).
+    Sub-module imports get module stubs via the meta_path finder; direct
+    attribute access returns a sentinel CLASS so isinstance() works (always
+    False, since no real weight is an instance of the sentinel).
     """
     import sys as _s, types as _t
     from importlib.machinery import ModuleSpec as _MS
@@ -207,11 +186,10 @@ def _rocm_make_torchao_stub(name):
 
     def _getattr(attr):
         full = f"{name}.{attr}"
-        # If a sub-module was already imported (via meta_path), use that.
+        # Reuse an already-imported sub-module; else a sentinel class.
         if full in _s.modules:
             obj = _s.modules[full]
         else:
-            # Otherwise return a sentinel class usable in isinstance().
             obj = _rocm_make_sentinel(attr, name)
         setattr(mod, attr, obj)
         return obj
@@ -227,7 +205,7 @@ class _ROCmTorchaoLoader(_Loader):
         return _rocm_make_torchao_stub(spec.name)
 
     def exec_module(self, module):
-        pass  # _rocm_make_torchao_stub already configures the module
+        pass  # _rocm_make_torchao_stub already configured it
 
 
 class _ROCmTorchaoFinder(_MetaPathFinder):
@@ -240,17 +218,15 @@ class _ROCmTorchaoFinder(_MetaPathFinder):
             return _MS(fullname, self._loader, is_package=True)
         return None
 
-    def find_module(self, fullname, path=None):   # Python < 3.12 compat shim
+    def find_module(self, fullname, path=None):   # Python < 3.12 shim
         return None
 
 
-# Only Windows + ROCm (HIP) PyTorch actually needs this stub: that is the one
-# build where `import torchao` crashes on the missing torch.distributed
-# C-extension stack. On every other platform a failing `import torchao` simply
-# means torchao is not installed -- transformers handles that correctly on its
-# own. Installing the stub there is actively harmful: transformers'
-# is_torchao_available() would then read torchao.__version__, get a sentinel
-# class, and crash in packaging.version.parse() with
+# Only Windows + ROCm (HIP) PyTorch needs this stub -- the one build where
+# `import torchao` crashes on the missing torch.distributed C-extension stack.
+# Elsewhere a failing import just means torchao isn't installed (transformers
+# handles that), and the stub would be harmful: is_torchao_available() reads a
+# sentinel torchao.__version__ and crashes in packaging.version.parse() with
 # "'_ROCmSentinelMeta' object is not iterable".
 _is_windows_rocm = False
 if _sys_rocm_stub.platform == "win32":
@@ -268,12 +244,12 @@ if _is_windows_rocm and "torchao" not in _sys_rocm_stub.modules:
     try:
         import torchao  # noqa: F401
     except Exception:
-        # torchao import fails on Windows ROCm -- install the meta path hook
-        # so every subsequent "import torchao.*" gets a harmless stub instead.
+        # torchao import failed on Windows ROCm: install the meta path hook so
+        # subsequent "import torchao.*" gets a harmless stub.
         _sys_rocm_stub.meta_path.insert(0, _ROCmTorchaoFinder())
 
-# _rocm_make_torchao_stub, _rocm_make_sentinel, _ROCmSentinelMeta are kept
-# alive -- the loader and sentinel classes call them at runtime.
+# Keep _rocm_make_torchao_stub / _rocm_make_sentinel / _ROCmSentinelMeta alive;
+# the loader and sentinel classes call them at runtime.
 del _ROCmTorchaoLoader, _ROCmTorchaoFinder
 del _MetaPathFinder, _Loader, _ModuleSpec, _sys_rocm_stub, _types_rocm_stub
 del _is_windows_rocm
@@ -318,15 +294,14 @@ pass
 KWARGS_TYPE = t_Unpack[t_TypedDictMeta]
 
 
-# Sometimes output classes change! Account for this
+# Account for output classes changing across versions.
 def process_output_options(
     self : Any,
     locals_items : Dict,
     kwargs : Dict,
 ) -> Dict:
     """ Latest transformers also deletes output_attentions and output_hidden_states """
-    # Preserve old transformers style
-    # 4.54.0 removes output_attentions and output_hidden_states
+    # transformers 4.54.0 removed output_attentions/output_hidden_states.
     output_attentions    = locals_items.get("output_attentions",    False)
     output_hidden_states = locals_items.get("output_hidden_states", False)
 
@@ -472,10 +447,7 @@ except:
     pass
 
 def _canonicalize_annotation(annotation: Any) -> Any:
-    """
-    Canonicalize type annotations for consistent comparison.
-    Makes List[int], typing.List[int], list[int] equivalent.
-    """
+    """Canonicalize annotations so List[int]/typing.List[int]/list[int] match."""
     if annotation is EMPTY:
         return EMPTY
 
@@ -484,8 +456,8 @@ def _canonicalize_annotation(annotation: Any) -> Any:
         if origin is not None:
             args = t.get_args(annotation)
             args = tuple(canonicalize_annotation(arg) for arg in args)
-            # Map origin to canonical form (e.g., types.UnionType -> typing.Union)
-            # so that `int | str` and `Union[int, str]` are equivalent
+            # Canonicalize origin (types.UnionType -> typing.Union) so
+            # `int | str` and `Union[int, str]` match.
             origin = TYPE_MAPPINGS.get(origin, origin)
             return (origin, args)
     return TYPE_MAPPINGS.get(annotation, annotation)
@@ -493,25 +465,21 @@ pass
 def canonicalize_annotation(annotation: Any) -> Any:
     annotation = _canonicalize_annotation(annotation)
     if type(annotation) is tuple and len(annotation) == 2:
-        # Fix up reordering of Union with sorting
-        # Union[str, List[str], list[str]] gets reduced to Union[str, list[str]]
-        # due to duplicates. We also sort Unions
+        # Dedupe + sort Union args (Union[str, List[str], list[str]] ->
+        # Union[str, list[str]]); sort by str(x) since sets are unordered.
         if annotation[0] == t.Union:
             args = list(set(annotation[1]))
-            # We must sort by str(x) since set is NOT ordered
             args.sort(key = lambda x: str(x))
             args = tuple(args)
             annotation = (annotation[0], args,)
-        # Fix up kwargs
-        # (typing.Unpack, (<class 'transformers.models.csm.modeling_csm.KwargsForCausalLM'>,)) to
-        # (typing.Unpack, (<class 'typing._TypedDictMeta'>,))
+        # Normalize Unpack[...Kwargs] to Unpack[_TypedDictMeta].
         elif annotation[0] == t_Unpack and \
             type(annotation[1]) is tuple and \
             len(annotation[1]) == 1 and \
             "Kwargs" in str(annotation[1][0]):
             annotation = (t_Unpack, (t_TypedDictMeta,),)
 
-        # (typing.Unpack, <class 'typing._TypedDictMeta'>,)
+        # Same normalization for the bare-type Unpack form.
         elif annotation[0] == t_Unpack and \
             type(annotation[1]) is type and \
             "Kwargs" in str(annotation[1]):
@@ -522,8 +490,8 @@ pass
 
 
 def get_function_fingerprint(func: Callable) -> List[Dict[str, Any]]:
-    """
-    Return a fingerprint we can use to compare function signatures.
+    """Fingerprint for comparing function signatures.
+
     Returns: [{'name': str, 'kind': int, 'is_required': bool, 'annotation': Any}]
     """
     try:
@@ -538,18 +506,17 @@ def get_function_fingerprint(func: Callable) -> List[Dict[str, Any]]:
         param_kind = param.kind.value # 4 is type VAR_KEYWORD **kwargs
         annotation = param.annotation
 
-        # If **kwargs is seen, then canonicalize name to simply kwargs
+        # Canonicalize any **kwargs name to "kwargs".
         if "kwargs" in param_name.lower():
             param_name = "kwargs"
-            # Also if no type set, set it to a default
+            # Default the annotation when untyped.
             if \
                 (param_kind == VAR_KEYWORD_ID) and \
                 (annotation == EMPTY) and \
                 (len(signature_parameters)-1 == kk):
                 annotation = (t_Unpack, (t_TypedDictMeta,),)
         pass
-        # If name is simply x, and annotation is empty, set to torch.Tensor
-        # For eg def forward(self, x)
+        # forward(self, x) with untyped x -> torch.Tensor.
         if \
             (param_name == "x") and \
             (len(signature_parameters) == 2) and \
@@ -632,8 +599,8 @@ def can_safely_patch(
 
 
     if len(old_fp) != len(new_fp):
-        # New transformers 4.54.0 removed output_attentions and output_hidden_states
-        # We check it and ignore if the old function has both these, and the new removed them
+        # transformers 4.54.0 dropped output_attentions/output_hidden_states;
+        # tolerate exactly that removal.
         removed_flags_list = removed_flags(old_fp, new_fp)
         if removed_flags_list == ("output_attentions", "output_hidden_states",):
             return False, f"New function removed output_attentions and output_hidden_states"
@@ -643,11 +610,10 @@ def can_safely_patch(
         return False, f"Parameter count mismatch: {len(old_fp)} vs {len(new_fp)}"
     pass
 
-    # Go through function one by one
     for old_param, new_param in zip(old_fp, new_fp):
         if (old_param['name'], old_param['kind']) != (new_param['name'], new_param['kind']):
             if match_level == "relaxed":
-                # Check one last time for *args, **kwargs replacement
+                # Last chance: *args, **kwargs replacement.
                 removed_flags_list = removed_flags(old_fp, new_fp)
                 result, error = check_args_kwargs(old_fp, new_fp, removed_flags_list)
                 if result == True:
@@ -657,7 +623,7 @@ def can_safely_patch(
         if new_param['is_required'] and not old_param['is_required']:
             return False, f"Parameter '{new_param['name']}' changed from optional to required"
 
-        # For strict matching, also check type annotations
+        # Strict matching also compares type annotations.
         if match_level == "strict" and old_param['annotation'] != new_param['annotation']:
             return False, \
             f"Parameter '{old_param['name']}' type annotation changed from:\n"\
@@ -672,9 +638,7 @@ def _get_unique_storage_name(
     target_obj: Any,
     attr_name: str,
 ) -> str:
-    """
-    Generate a unique name for storing the original function.
-    """
+    """Unique attribute name for stashing the original function."""
     if hasattr(target_obj, '__name__'):
         obj_name = target_obj.__name__
     elif hasattr(target_obj, '__class__'):
@@ -682,9 +646,9 @@ def _get_unique_storage_name(
     else:
         obj_name = str(type(target_obj).__name__)
 
-    # Include module if available for extra uniqueness
+    # Include module for extra uniqueness when available.
     if hasattr(target_obj, '__module__'):
-        module_name = target_obj.__module__.split('.')[-1]  # Just the last part
+        module_name = target_obj.__module__.split('.')[-1]
         return f"_original_{module_name}_{obj_name}_{attr_name}"
     else:
         return f"_original_{obj_name}_{attr_name}"
@@ -701,9 +665,7 @@ def patch_function(
     fullgraph = None,
     dynamic = True,
 ) -> bool:
-    """
-    Patch a function/method on an object.
-    """
+    """Patch a function/method on an object."""
     if not hasattr(target_obj, attr_name):
         if UNSLOTH_ENABLE_LOGGING:
             logger.error(f"Unsloth: Attribute '{attr_name}' not found on {target_obj.__name__}")
@@ -711,9 +673,9 @@ def patch_function(
 
     original_func = getattr(target_obj, attr_name)
 
-    # torch.compile function if requested
+    # torch.compile if requested.
     if fullgraph is not None and type(fullgraph) is bool and not UNSLOTH_COMPILE_DISABLE:
-        # Get wrapped function if already compiled
+        # Unwrap already-compiled functions.
         if hasattr(new_func, "get_compiler_config"):
             new_func = new_func.__wrapped__
         if hasattr(original_func, "get_compiler_config"):
@@ -726,7 +688,7 @@ def patch_function(
         )
     pass
 
-    # Store original for potential restoration with unique name
+    # Stash original under a unique name for later restoration.
     if store_original:
         unique_name = _get_unique_storage_name(target_obj, attr_name)
         setattr(target_obj, unique_name, original_func)
@@ -816,9 +778,7 @@ def patch_multiple(
     fullgraph = None,
     dynamic = True,
 ) -> Dict[str, bool]:
-    """
-    Apply multiple patches at once.
-    """
+    """Apply multiple patches at once."""
     results = {}
 
     for target_obj, attr_name, new_func in patches:
@@ -847,9 +807,7 @@ def restore_original(
     target_obj: Any,
     attr_name: str,
 ) -> bool:
-    """
-    Restore original function if it was stored.
-    """
+    """Restore the original function if it was stored."""
     unique_name = _get_unique_storage_name(target_obj, attr_name)
 
     if not hasattr(target_obj, unique_name):
@@ -860,7 +818,7 @@ def restore_original(
     try:
         original_func = getattr(target_obj, unique_name)
         setattr(target_obj, attr_name, original_func)
-        delattr(target_obj, unique_name)  # Clean up
+        delattr(target_obj, unique_name)
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Restored original {attr_name}")
         return True
@@ -872,27 +830,22 @@ pass
 
 
 def list_stored_originals(target_obj: Any) -> List[str]:
-    """
-    List all stored original functions on a target object.
-    """
+    """List all stored original functions on a target object."""
     stored = []
     for attr_name in dir(target_obj):
         if attr_name.startswith('_original_') and not attr_name.startswith('_original___'):
-            # Extract the original method name from the unique storage name
-            # Format: _original_{module}_{class}_{method} or _original_{class}_{method}
-            parts = attr_name.split('_')[2:]  # Skip '_original_'
+            # Name format: _original_{module}_{class}_{method} (method = last part).
+            parts = attr_name.split('_')[2:]
             if len(parts) >= 2:
-                method_name = parts[-1]  # Last part is the method name
+                method_name = parts[-1]
                 stored.append(method_name)
 
-    return sorted(list(set(stored)))  # Remove duplicates and sort
+    return sorted(list(set(stored)))
 pass
 
 
 def restore_multiple(target_objs_and_attrs: List[Tuple[Any, str]]) -> Dict[str, bool]:
-    """
-    Restore multiple original functions.
-    """
+    """Restore multiple original functions."""
     results = {}
 
     for target_obj, attr_name in target_objs_and_attrs:

@@ -73,9 +73,5 @@ def _get_runtime_cce(
 
 
 def clear_cce_cache():
-    """Clear the CCE kernel cache.
-
-    Call this when switching models or devices to free cached Metal
-    kernels and compiled functions that may hold stale references.
-    """
+    """Clear the CCE kernel cache (call when switching models/devices)."""
     _RUNTIME_CCE_CACHE.clear()
