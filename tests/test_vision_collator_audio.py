@@ -165,10 +165,45 @@ def test_torch_tensor_converted_to_numpy():
     assert len(out) == 1 and isinstance(out[0], np.ndarray) and out[0].ndim == 1
 
 
+def test_mono_torchaudio_tensor_squeezed():
+    # torchaudio.load returns [channels, frames]; mono is (1, N)
+    collator = make_collator()
+    out = collator._extract_audio_for_example({"audio": torch.zeros(1, 16)}, [])
+    assert len(out) == 1 and isinstance(out[0], np.ndarray)
+    assert out[0].shape == (16,)
+
+
 def test_stereo_raises():
     collator = make_collator()
     with pytest.raises(ValueError, match="mono"):
         collator._extract_audio_for_example({"audio": np.zeros((2, 16))}, [])
+
+
+def test_top_level_dict_path_resolved():
+    # datasets.Audio(decode=False) style payload: {"bytes": None, "path": ...}
+    collator = make_collator()
+    out = collator._extract_audio_for_example(
+        {"audio": {"bytes": None, "path": "/tmp/a.wav"}}, [])
+    assert out == ["/tmp/a.wav"]
+
+
+def test_top_level_dict_no_payload_raises():
+    collator = make_collator()
+    with pytest.raises(ValueError, match="cannot be loaded"):
+        collator._extract_audio_for_example({"audio": {"sampling_rate": 16000}}, [])
+
+
+def test_top_level_list_dict_path_resolved():
+    collator = make_collator()
+    out = collator._extract_audio_for_example(
+        {"audio": [{"path": "/tmp/a.wav"}, {"array": CLIP, "sampling_rate": 16000}]}, [])
+    assert out[0] == "/tmp/a.wav" and out[1] is CLIP
+
+
+def test_inline_audio_decode_false_dict_resolved():
+    part = {"type": "audio", "audio": {"bytes": None, "path": "/tmp/a.wav"}}
+    out = extract_audio_info(msgs(part), sampling_rate=16000)
+    assert out == ["/tmp/a.wav"]
 
 
 # ---------------------------------------------------------------------------

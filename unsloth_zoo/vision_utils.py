@@ -540,6 +540,16 @@ def _check_audio_sampling_rate(sampling_rate, target_sampling_rate):
         )
 
 
+def _resolve_audio_dict(audio, sampling_rate=None):
+    # HuggingFace Audio feature dict -> waveform array, else a path / url string
+    # (covers Audio(decode=False) payloads like {"bytes": None, "path": ...})
+    _check_audio_sampling_rate(audio.get("sampling_rate"), sampling_rate)
+    value = audio.get("array")
+    if value is None:
+        value = audio.get("path") or audio.get("url")
+    return value
+
+
 def extract_audio_info(
     conversations: Union[List[Dict], List[List[Dict]]],
     sampling_rate: int = None,
@@ -560,10 +570,8 @@ def extract_audio_info(
                     # Feature extractors also accept local paths and URLs as strings
                     if audio is None:
                         audio = ele.get("url") or ele.get("path")
-                    # HuggingFace Audio feature dict -> raw waveform
                     if isinstance(audio, dict):
-                        _check_audio_sampling_rate(audio.get("sampling_rate"), sampling_rate)
-                        audio = audio.get("array")
+                        audio = _resolve_audio_dict(audio, sampling_rate)
                     if audio is None:
                         raise ValueError(
                             "Unsloth: an audio content part has no `audio`, `url` or `path` data, "
@@ -965,8 +973,13 @@ class UnslothVisionDataCollator:
             clips = extract_audio_info(messages, sampling_rate=target_sr)
         # HuggingFace Audio feature: {"array": np.ndarray, "sampling_rate": int, ...}
         elif isinstance(audio_val, dict):
-            _check_audio_sampling_rate(audio_val.get("sampling_rate"), target_sr)
-            clips = [audio_val["array"]] if "array" in audio_val else []
+            clip = _resolve_audio_dict(audio_val, target_sr)
+            if clip is None:
+                raise ValueError(
+                    "Unsloth: the `audio` column dict has no `array`, `path` or `url` data, "
+                    "so the clip cannot be loaded and the example would train as text only."
+                )
+            clips = [clip]
         elif isinstance(audio_val, (list, tuple)):
             if len(audio_val) == 0:
                 clips = []
@@ -977,8 +990,12 @@ class UnslothVisionDataCollator:
                 clips = []
                 for clip in audio_val:
                     if isinstance(clip, dict):
-                        _check_audio_sampling_rate(clip.get("sampling_rate"), target_sr)
-                        clip = clip.get("array")
+                        clip = _resolve_audio_dict(clip, target_sr)
+                        if clip is None:
+                            raise ValueError(
+                                "Unsloth: an `audio` column entry has no `array`, `path` or `url` data, "
+                                "so the clip cannot be loaded and the example would train as text only."
+                            )
                     if clip is not None:
                         clips.append(clip)
         else:
@@ -992,10 +1009,14 @@ class UnslothVisionDataCollator:
             if torch.is_tensor(clip):
                 clip = clip.detach().cpu().numpy()
             if getattr(clip, "ndim", 1) > 1:
-                raise ValueError(
-                    f"Unsloth: audio clips must be mono 1D waveforms, got shape {tuple(clip.shape)}. "
-                    "Convert stereo to mono first, e.g. waveform.mean(axis=0)."
-                )
+                # torchaudio.load returns [channels, frames]; accept mono (1, N)
+                if clip.shape[0] == 1:
+                    clip = clip.reshape(-1)
+                else:
+                    raise ValueError(
+                        f"Unsloth: audio clips must be mono 1D waveforms, got shape {tuple(clip.shape)}. "
+                        "Convert stereo to mono first, e.g. waveform.mean(axis=0)."
+                    )
             normalized.append(clip)
         return normalized
 
