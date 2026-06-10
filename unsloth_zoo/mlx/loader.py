@@ -364,9 +364,11 @@ def _read_json_file(path):
     """Read a JSON object, returning an empty dict for missing/bad sidecars."""
     try:
         with open(path, "r", encoding="utf-8") as file:
-            return json.load(file)
+            data = json.load(file)
     except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
+    # Non-object JSON (list/str/number/null) is as malformed; callers expect a dict.
+    return data if isinstance(data, dict) else {}
 
 
 def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
