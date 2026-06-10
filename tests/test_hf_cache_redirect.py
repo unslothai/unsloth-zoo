@@ -94,12 +94,34 @@ def test_home_resolution_failure_redirects(hf_cache, tmp_path, monkeypatch):
     monkeypatch.setattr(hf_cache.Path, "home", staticmethod(_no_home))
     fallback = tmp_path / "fallback"
     monkeypatch.setattr(hf_cache, "_fallback_bases", lambda: [fallback])
-    with pytest.warns(UserWarning):
+    with pytest.warns(UserWarning, match = "could not be resolved"):
         result = hf_cache.redirect_hf_cache_if_readonly()
     assert result == str(fallback)
     assert os.environ["HF_HUB_CACHE"] == str(fallback / "hub")
 
 
+def test_no_writable_fallback_warns_and_leaves_env(hf_cache, tmp_path, monkeypatch):
+    _readonly_hub(tmp_path, monkeypatch)
+    blocked = tmp_path / "blocker2"
+    blocked.write_text("")
+    # The only candidate sits under a file, so it can never be created.
+    monkeypatch.setattr(hf_cache, "_fallback_bases", lambda: [blocked / "base"])
+    with pytest.warns(UserWarning, match = "no writable fallback"):
+        assert hf_cache.redirect_hf_cache_if_readonly() is None
+    assert "HF_HOME" not in os.environ
+
+
+def test_empty_env_value_matches_hub_semantics(hf_cache, tmp_path, monkeypatch):
+    # Hub's os.getenv keeps a present-but-empty HF_HOME, yielding relative
+    # cache paths; the probe must target those same locations.
+    monkeypatch.setenv("HF_HOME", "")
+    monkeypatch.chdir(tmp_path)
+    assert hf_cache.redirect_hf_cache_if_readonly() is None
+    assert (tmp_path / "hub").is_dir()
+    assert (tmp_path / "xet").is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "symlinks need privileges on Windows")
 def test_symlinked_fallback_rejected(hf_cache, tmp_path, monkeypatch):
     _readonly_hub(tmp_path, monkeypatch)
     target = tmp_path / "target"
@@ -216,6 +238,7 @@ def test_xet_env_value_probed_literally(hf_cache, tmp_path, monkeypatch):
     assert not (root / "xet").exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason = "symlinks need privileges on Windows")
 def test_explicit_symlinked_hub_cache_honored(hf_cache, tmp_path, monkeypatch):
     # Users symlink caches to large volumes; Hub writes through the link, so
     # a writable symlinked cache must not be redirected away.
@@ -238,12 +261,13 @@ def test_explicit_hub_cache_survives_home_failure(hf_cache, tmp_path, monkeypatc
     fallback = tmp_path / "fallback"
     monkeypatch.setattr(hf_cache, "_fallback_bases", lambda: [fallback])
     # The hub cache stays put; only the unresolvable xet default moves.
-    with pytest.warns(UserWarning):
+    with pytest.warns(UserWarning, match = "xet cache location could not be resolved"):
         assert hf_cache.redirect_hf_cache_if_readonly() is None
     assert os.environ["HF_HUB_CACHE"] == str(hub)
     assert os.environ["HF_XET_CACHE"] == str(fallback / "xet")
 
 
+@pytest.mark.skipif(os.name != "posix", reason = "symlinks need privileges on Windows")
 def test_child_symlink_in_fallback_rejected(hf_cache, tmp_path, monkeypatch):
     _readonly_hub(tmp_path, monkeypatch)
     target = tmp_path / "target"

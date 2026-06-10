@@ -34,8 +34,9 @@ __all__ = ["redirect_hf_cache_if_readonly"]
 
 
 def _expand_env_path(value: str) -> Path:
-    # Hub applies expandvars + expanduser to env-provided paths; mirror that.
-    return Path(os.path.expandvars(value)).expanduser()
+    # Hub applies os.path.expandvars(os.path.expanduser(...)) to env-provided
+    # paths; mirror the exact order.
+    return Path(os.path.expandvars(os.path.expanduser(value)))
 
 
 def _is_writable(path: Path) -> bool:
@@ -58,7 +59,23 @@ def _is_safe_private_dir(path: Path) -> bool:
     # token file Hub keeps under HF_HOME) are not readable by other users.
     # The ownership check is POSIX-only; Windows temp dirs are per-user.
     try:
-        path.mkdir(parents = True, exist_ok = True)
+        if hasattr(os, "getuid"):
+            # /tmp is safe against dir-swap races because of the sticky bit; a
+            # world-writable NON-sticky ancestor we do not own gives no such
+            # guarantee, so refuse to build a fallback there.
+            ancestor = path
+            while not ancestor.exists():
+                ancestor = ancestor.parent
+            st = ancestor.stat()
+            if (
+                st.st_mode & 0o002
+                and not st.st_mode & 0o1000
+                and st.st_uid != os.getuid()
+            ):
+                return False
+        # mode applies to the leaf, so a fresh dir is never looser than 0700
+        # even under a permissive umask; chmod below covers pre-existing dirs.
+        path.mkdir(mode = 0o700, parents = True, exist_ok = True)
         if path.is_symlink():
             return False
         if hasattr(os, "getuid") and path.stat().st_uid != os.getuid():
@@ -94,11 +111,13 @@ def _resolve_hf_home() -> Path | None:
     # raise on locked-down machines with an unresolvable home directory; treat
     # that as "no usable default" rather than crashing import.
     try:
+        # Presence-based (not truthiness) lookups mirror Hub's os.getenv
+        # semantics: a present-but-empty value resolves to a relative path.
         hf_home_env = os.environ.get("HF_HOME")
-        if hf_home_env:
+        if hf_home_env is not None:
             return _expand_env_path(hf_home_env)
         xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
-        if xdg_cache_home:
+        if xdg_cache_home is not None:
             return _expand_env_path(xdg_cache_home) / "huggingface"
         return Path.home() / ".cache" / "huggingface"
     except Exception:
@@ -110,19 +129,19 @@ def _active_caches() -> tuple[Path | None, Path | None, Path | None]:
     # vars are resolved first so they never depend on home resolution; the
     # legacy HUGGINGFACE_HUB_CACHE name is still honored by Hub.
     hf_home = _resolve_hf_home()
-    hub_cache_env = (
-        os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE")
-    )
+    hub_cache_env = os.environ.get("HF_HUB_CACHE")
+    if hub_cache_env is None:
+        hub_cache_env = os.environ.get("HUGGINGFACE_HUB_CACHE")
     xet_cache_env = os.environ.get("HF_XET_CACHE")
     try:
-        if hub_cache_env:
+        if hub_cache_env is not None:
             hub_cache = _expand_env_path(hub_cache_env)
         else:
             hub_cache = hf_home / "hub" if hf_home is not None else None
     except Exception:
         hub_cache = None
     try:
-        if xet_cache_env:
+        if xet_cache_env is not None:
             # Hub reads HF_XET_CACHE literally (no expanduser/expandvars),
             # unlike HF_HOME and HF_HUB_CACHE; probe the same literal path.
             xet_cache = Path(xet_cache_env)
@@ -142,8 +161,16 @@ def redirect_hf_cache_if_readonly() -> str | None:
     xet_ok = xet_cache is not None and _is_writable(xet_cache)
     if hub_ok and xet_ok:
         return None
+    if hub_cache is None:
+        reason = "default cache location could not be resolved"
+    elif not hub_ok:
+        reason = f"cache '{hub_cache}' is not writable"
+    elif xet_cache is None:
+        reason = "xet cache location could not be resolved"
+    else:
+        reason = f"xet cache '{xet_cache}' is not writable"
     # An explicitly set writable HF_XET_CACHE is kept as the user chose.
-    keep_explicit_xet = xet_ok and bool(os.environ.get("HF_XET_CACHE"))
+    keep_explicit_xet = xet_ok and "HF_XET_CACHE" in os.environ
 
     for base in _fallback_bases():
         if not _is_safe_private_dir(base):
@@ -155,7 +182,7 @@ def redirect_hf_cache_if_readonly() -> str | None:
                 continue
             os.environ["HF_XET_CACHE"] = str(base / "xet")
             warnings.warn(
-                f"Unsloth: Hugging Face xet cache '{xet_cache}' is not writable; "
+                f"Unsloth: Hugging Face {reason}; "
                 f"redirecting xet downloads to '{base / 'xet'}'.",
                 stacklevel = 2,
             )
@@ -180,15 +207,15 @@ def redirect_hf_cache_if_readonly() -> str | None:
             and old_token.is_file()
         ):
             os.environ["HF_TOKEN_PATH"] = str(old_token)
-        reason = (
-            f"cache '{hub_cache}' is not writable"
-            if hub_cache is not None
-            else "default cache location could not be resolved"
-        )
         warnings.warn(
             f"Unsloth: Hugging Face {reason}; "
             f"redirecting downloads to '{base}'.",
             stacklevel = 2,
         )
         return str(base)
+    warnings.warn(
+        f"Unsloth: Hugging Face {reason} and no writable fallback was found; "
+        f"downloads may fail. Set HF_HOME to a writable directory.",
+        stacklevel = 2,
+    )
     return None
