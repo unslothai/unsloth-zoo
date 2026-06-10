@@ -53,6 +53,10 @@ IMAGE_TOKENS = [
     "<|IMG_PATCH|>",      # Cohere
 ]
 
+AUDIO_TOKENS = [
+    "<|audio|>",  # Gemma 4
+]
+
 import torch
 from PIL import Image
 import base64
@@ -523,6 +527,27 @@ def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> L
     return vision_infos
 
 
+def extract_audio_info(conversations: Union[List[Dict], List[List[Dict]]]) -> List:
+    audio_inputs = []
+    if len(conversations) == 0:
+        return audio_inputs
+    if isinstance(conversations[0], dict):
+        conversations = [conversations]
+    for conversation in conversations:
+        for message in conversation:
+            content = message.get("content")
+            if isinstance(content, list):
+                for ele in content:
+                    if isinstance(ele, dict) and ele.get("type") == "audio" and "audio" in ele:
+                        audio = ele["audio"]
+                        # HuggingFace Audio feature dict -> raw waveform
+                        if isinstance(audio, dict):
+                            audio = audio.get("array")
+                        if audio is not None:
+                            audio_inputs.append(audio)
+    return audio_inputs
+
+
 def process_vision_info(
     conversations: Union[List[Dict], List[List[Dict]]],
     size_factor: int = IMAGE_FACTOR,
@@ -555,14 +580,16 @@ def process_vision_info(
 
 
 def get_padding_tokens_ids(tokenizer):
-    global IMAGE_TOKENS
+    global IMAGE_TOKENS, AUDIO_TOKENS
 
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
-    image_tokens = IMAGE_TOKENS
+    placeholder_tokens = IMAGE_TOKENS + AUDIO_TOKENS
     if hasattr(tokenizer, "image_token"):
-        image_tokens = IMAGE_TOKENS + [tokenizer.image_token]
+        placeholder_tokens = placeholder_tokens + [tokenizer.image_token]
+    if hasattr(tokenizer, "audio_token"):
+        placeholder_tokens = placeholder_tokens + [tokenizer.audio_token]
 
-    padding_token_ids = tokenizer.convert_tokens_to_ids(image_tokens)
+    padding_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
     if hasattr(tokenizer, "pad_token_id"):
         padding_token_ids.append(tokenizer.pad_token_id)
 
@@ -752,6 +779,7 @@ class UnslothVisionDataCollator:
         texts  = []
         images = []
         videos = []
+        audios = []
         video_kwargs = {'fps': []}
         for example in examples:
             messages = self._select_messages_or_raw(example)
@@ -784,15 +812,25 @@ class UnslothVisionDataCollator:
                     video_kwarg = {"fps": []}
                 video_kwargs['fps'].extend(video_kwarg['fps'])
 
+            audio = self._extract_audio_for_example(example, messages)
+            audios.extend(audio)
+
         # Tokenize the texts and process the images
+        # When audio is present, omit max_length/truncation from the top-level processor
+        # call — passing them at top-level causes _merge_kwargs to broadcast them into
+        # audio_kwargs, which makes the audio feature extractor truncate the waveform to
+        # max_length *samples* (e.g. 512 samples = 32ms) instead of leaving it intact.
+        # We truncate input_ids manually after the call instead.
         proc_kwargs = dict(
             text=texts,
             padding=True,
-            truncation=self.truncation,
-            max_length=self.max_seq_length,
             return_tensors="pt",
             add_special_tokens=False,
         )
+        if not audios:
+            # Safe to pass truncation kwargs top-level when no audio is involved
+            proc_kwargs["truncation"] = self.truncation
+            proc_kwargs["max_length"] = self.max_seq_length
         if images:
             proc_kwargs["images"] = images
         if videos:
@@ -800,9 +838,17 @@ class UnslothVisionDataCollator:
             video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
             for k, v in video_kwargs.items():
                 proc_kwargs[k] = v
+        if audios:
+            proc_kwargs["audio"] = audios
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
         batch = self.processor(**proc_kwargs)
+
+        # Truncate manually when audio is present (couldn't pass max_length to processor)
+        if audios and self.truncation and self.max_seq_length:
+            seq_len = batch["input_ids"].shape[1]
+            if seq_len > self.max_seq_length:
+                batch = self._truncate_sequence_tensors(batch, seq_len)
 
         # Cannot remove due to bidirectional attention from Gemma 3!
         # batch.pop("token_type_ids", None)
@@ -884,6 +930,65 @@ class UnslothVisionDataCollator:
             if image is None: image = []
             if video is None: video = []
         return image, video, video_kwarg
+
+    def _extract_audio_for_example(self, example, messages):
+        audio_val = example.get("audio")
+        if audio_val is None:
+            # No usable top-level audio -> fall back to inline message content
+            return extract_audio_info(messages)
+        # HuggingFace Audio feature: {"array": np.ndarray, "sampling_rate": int, ...}
+        if isinstance(audio_val, dict):
+            return [audio_val["array"]] if "array" in audio_val else []
+        if isinstance(audio_val, (list, tuple)):
+            if len(audio_val) == 0:
+                return []
+            # A flat list of samples is one clip, not a list of clips
+            if not isinstance(audio_val[0], (dict, list, tuple)) and getattr(audio_val[0], "ndim", 0) == 0:
+                return [audio_val]
+            clips = []
+            for clip in audio_val:
+                if isinstance(clip, dict):
+                    clip = clip.get("array")
+                if clip is not None:
+                    clips.append(clip)
+            return clips
+        # Raw ndarray or other single-clip value
+        return [audio_val]
+
+    def _truncate_sequence_tensors(self, batch, seq_len):
+        # Slice only per-token tensors. Matching on shape[-1] == seq_len can clip
+        # input_features [B, frames, mel] or input_features_mask [B, frames].
+        new_len = self.max_seq_length
+        keys = [
+            k for k in ("input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids")
+            if k in batch and isinstance(batch[k], torch.Tensor) and batch[k].shape[-1] == seq_len
+        ]
+        tok = getattr(self.processor, "tokenizer", self.processor)
+        audio_tokens = list(AUDIO_TOKENS)
+        if getattr(tok, "audio_token", None) is not None:
+            audio_tokens.append(tok.audio_token)
+        audio_ids = torch.tensor(
+            [i for i in tok.convert_tokens_to_ids(audio_tokens) if isinstance(i, int) and i >= 0],
+            device=batch["input_ids"].device,
+        )
+        n_audio = int(torch.isin(batch["input_ids"], audio_ids).sum())
+        if self._tokenizer_padding_side() == "left":
+            # Keep each row's first new_len content tokens and re-pad on the left,
+            # otherwise short rows keep only their left padding.
+            lengths = batch["attention_mask"].sum(-1)
+            starts = seq_len - torch.clamp(lengths, min=new_len)
+            gather_idx = starts.unsqueeze(1) + torch.arange(new_len, device=starts.device)
+            for k in keys:
+                batch[k] = torch.gather(batch[k], 1, gather_idx)
+        else:
+            for k in keys:
+                batch[k] = batch[k][..., :new_len]
+        if int(torch.isin(batch["input_ids"], audio_ids).sum()) != n_audio:
+            raise ValueError(
+                f"Unsloth: max_seq_length = {new_len} cuts into the expanded audio tokens, which "
+                "breaks audio alignment at model forward. Increase max_seq_length or shorten the audio."
+            )
+        return batch
 
     def _extract_images_for_pc(self, example, p_msgs, c_msgs):
         # PC: prefer embedded across prompt+completion; else top-level first image; else []
@@ -1105,7 +1210,7 @@ class UnslothVisionDataCollator:
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
     def _collate_prompt_completion(self, examples):
-        prompt_texts, completion_texts, images, videos = [], [], [], []
+        prompt_texts, completion_texts, images, videos, audios = [], [], [], [], []
         video_kwargs = {'fps': []}
 
         for ex in examples:
@@ -1152,15 +1257,23 @@ class UnslothVisionDataCollator:
                     vids_kwarg = {"fps": []}
                 video_kwargs['fps'].extend(vids_kwarg['fps'])
 
-        prompt_kwargs = dict(
-            padding=True,
-            padding_side="left",
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
+            if is_c_msgs and extract_audio_info(c):
+                raise ValueError(
+                    "Unsloth: audio inside `completion` is not supported yet. "
+                    "Move the audio content parts into `prompt`."
+                )
+            audio = self._extract_audio_for_example(ex, p if is_p_msgs else [])
+            audios.extend(audio)
+
         completion_kwargs = dict(
             padding=True,
             padding_side="right",
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        prompt_kwargs = dict(
+            padding=True,
+            padding_side="left",
             return_tensors="pt",
             add_special_tokens=False,
         )
@@ -1171,6 +1284,8 @@ class UnslothVisionDataCollator:
             video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
             for k, v in video_kwargs.items():
                 prompt_kwargs[k] = v
+        if audios:
+            prompt_kwargs["audio"] = audios
 
         proc_prompts = self.processor(text=prompt_texts, **prompt_kwargs)
         # Encode completions (RIGHT pad) text-only
