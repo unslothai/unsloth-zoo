@@ -629,11 +629,9 @@ pass
 
 def fix_attention_dtype_consistency(source):
     """
-    Fix dtype mismatch between Q/K and V in attention modules.
-    After apply_rotary_pos_emb, Q and K may be promoted to a different dtype
-    (e.g. float32) while V stays in the original dtype (e.g. float16/bfloat16).
-    This happens in 4-bit BNB mode when cos/sin from RoPE are in float32.
-    We insert a cast to align V's dtype with Q's dtype.
+    Fix Q/K vs V dtype mismatch in attention. apply_rotary_pos_emb may promote
+    Q/K (e.g. to float32 in 4-bit BNB when RoPE cos/sin are float32) while V stays
+    float16/bfloat16; insert a cast aligning V's dtype with Q's.
     """
     pattern = re.compile(
         r"([ \t]*)(query_states\s*,\s*key_states\s*=\s*apply_rotary_pos_emb\([^\)]+\))"
@@ -972,13 +970,12 @@ def create_new_function(
                     and f"def {b}(" not in new_source
                 ):
                     items.append(b)
-    # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
+    # Pull in any create_*_mask functions referenced in the source
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
         if mask_function in new_source:
             items += [mask_function]
     pass
-    # Full import script
     imports = "from torch import Tensor\n"
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
@@ -1255,7 +1252,6 @@ def create_standalone_class(
      replacement so indentation and whitespace should be handled ahead of time!
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    # Create optimized standalone forward function
     f = eval(f"{model_location}.{module}")
     full_class = inspect.getsource(f)
     old_source = inspect.getsource(f.forward)
@@ -1275,19 +1271,16 @@ def create_standalone_class(
         "use_kernelized_func",
         "auto_docstring",
         "merge_with_config_defaults",
-        "capture_outputs",
         # add more here if needed
     }
 
     if full_class.lstrip().startswith("@"):
         start = re.search(r"^class ", full_class, flags=re.MULTILINE)
         if start:
-            # Found class definition - now check decorators
             class_start = start.start()
             preamble = full_class[:class_start]
             class_def = full_class[class_start:]
 
-            # Split preamble into lines
             lines = preamble.split('\n')
             new_lines = []
 
@@ -1302,7 +1295,7 @@ def create_standalone_class(
 
             for line in lines:
                 if skipping:
-                    # Continue skipping decorator args until balanced
+                    # Skip decorator args until parens balance
                     paren_depth += line.count("(") - line.count(")")
                     if paren_depth <= 0:
                         skipping = False
@@ -1476,7 +1469,7 @@ def create_standalone_class(
     _PAREN_GROUP = r"(?P<grp>\((?:[^()'\"]|'[^'\\]*(?:\\.[^'\\]*)*'|\"[^\"\\]*(?:\\.[^\"\\]*)*\"|(?P>grp))*\))"
     for _dec in (
         "auto_docstring", "use_kernelized_func", "check_model_inputs",
-        "merge_with_config_defaults", "capture_outputs",
+        "merge_with_config_defaults",
     ):
         source = regex.sub(rf"@{_dec}\s*(?:{_PAREN_GROUP})?", "", source)
 
@@ -2265,7 +2258,6 @@ pass
 # Patch remaining functions
 def convert_attention_masks_to_bool(module, old_source):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Convert attention mask creation functions to boolean
     source = re.sub(r"\([\s]{0,}", "(", old_source)
     source = re.sub(r"[\s]{0,}\)", ")", source)
     all_splits = source.strip().split("\n")
@@ -2968,7 +2960,6 @@ def patch_gradient_accumulation(modeling_file, module):
     else:
         return None
 
-    # Now replace old forward with new one
     source = inspect.getsource(module).replace(inspect.getsource(forward), source)
     return source
 
@@ -3280,6 +3271,60 @@ FIX_GC_LAYER_CALLER_MODULES = [
 ]
 
 
+def patch_output_capture_targets(modeling_file, replacement_classes=None):
+    """Return captured target names and retarget them after class replacement."""
+    try:
+        from transformers.utils.output_capturing import OutputRecorder
+    except ImportError:
+        return set()
+
+    replacement_classes = replacement_classes or {}
+    target_names = set()
+
+    def patch_capture_spec(spec):
+        if isinstance(spec, (list, tuple)):
+            patched = [patch_capture_spec(x) for x in spec]
+            return tuple(patched) if isinstance(spec, tuple) else patched
+        if isinstance(spec, OutputRecorder) and spec.target_class is not None:
+            target_names.add(spec.target_class.__name__)
+            replacement_class = replacement_classes.get(spec.target_class.__name__)
+            if replacement_class is not None:
+                spec.target_class = replacement_class
+        elif isinstance(spec, type):
+            target_names.add(spec.__name__)
+            return replacement_classes.get(spec.__name__, spec)
+        return spec
+
+    for item_name in dir(modeling_file):
+        try:
+            item = getattr(modeling_file, item_name)
+            capture_flags = getattr(item, "_can_record_outputs", None)
+        except Exception:
+            continue
+        if not isinstance(capture_flags, dict):
+            continue
+        for flag_name, capture_spec in capture_flags.items():
+            capture_flags[flag_name] = patch_capture_spec(capture_spec)
+    return target_names
+
+
+def calls_output_capture_target(init, source, target_names):
+    """Detect direct calls to submodules targeted by Transformers output hooks."""
+    # A forward decorated with @capture_outputs installs the hooks itself, even
+    # when its captured submodules are built indirectly (e.g. via helpers).
+    if re.search(r"^\s*@capture_outputs\b", source, flags=re.MULTILINE):
+        return True
+    for target_name in target_names:
+        assigned_names = re.findall(
+            rf"self\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)*{re.escape(target_name)}\(",
+            init,
+        )
+        for assigned_name in assigned_names:
+            if f"self.{assigned_name}(" in source:
+                return True
+    return False
+
+
 def unsloth_compile_transformers(
     model_type: str = "llama",
     sdpa_dynamic_mask: bool = True,
@@ -3308,7 +3353,6 @@ def unsloth_compile_transformers(
     return_logits: bool = False,
     supports_sdpa: list = None,
 ):
-    # import transformers logging module and instantiate model_type logging instance.
     from transformers import logging as transformers_logging
 
     try:
@@ -3769,8 +3813,10 @@ def unsloth_compile_transformers(
     # Remove modules which have attention mechanisms
     # since torch.compile will compile too many kernels
     bad_torch_modules = set()
+    no_fullgraph_modules = set()
     # actively disable certain modules
     disable_modules = set()
+    output_capture_target_names = patch_output_capture_targets(modeling_file)
     for module, fullgraph in torch_modules.items():
         try:
             source = eval(f"{model_location}.{module}")
@@ -3824,6 +3870,17 @@ def unsloth_compile_transformers(
                 f"Unsloth: Will not compile {module} since data-dependent routing is done."
             )
             bad_torch_modules.add(module)
+        pass
+
+        if (
+            fullgraph
+            and len(output_capture_target_names) > 0
+            and calls_output_capture_target(init, source, output_capture_target_names)
+        ):
+            print(
+                f"Unsloth: Will compile {module} without fullgraph since output capture hooks run inside it."
+            )
+            no_fullgraph_modules.add(module)
         pass
 
         # Remove decoder layers
@@ -3914,7 +3971,7 @@ def unsloth_compile_transformers(
                     module,
                     model_location,
                     functions,
-                    fullgraph=fullgraph,
+                    fullgraph=False if module in no_fullgraph_modules else fullgraph,
                     disable=disable,
                 )
                 print(f"Unsloth: Compiled module {module}.")
@@ -4476,10 +4533,15 @@ def unsloth_compile_transformers(
             print(str(dir(combined_module)))
         combined_module = None
 
-    if compile_torch_modules and not disable:
-        from .patch_torch_functions import patch_torch_functions
+    # These rewrites never compile (add_torch_compile=False), so run them even
+    # when compiling is disabled: norms are fp32 upcast at load regardless, and
+    # eager F.layer_norm crashes on bf16 activations against fp32 weights.
+    if compile_torch_modules:
+        if not disable:
+            # Compiled global F.layer_norm: only when compiling is allowed
+            from .patch_torch_functions import patch_torch_functions
 
-        patch_torch_functions()
+            patch_torch_functions()
 
         _conv_modules = frozenset([
             "Conv1d", "Conv2d", "Conv3d",
@@ -4523,7 +4585,23 @@ def unsloth_compile_transformers(
                 import re as _re
                 m = _re.search(r"def forward\(self,\s*(\w+)", source)
                 param_name = m.group(1) if m else "input"
-                append_str = f".to({param_name}.dtype)\n"
+                if disable:
+                    # Eager F.layer_norm needs input dtype == weight dtype: cast in
+                    # and out. Compiled path left untouched (adding the cast there
+                    # changes batched numerics). weight is None when affine=False.
+                    lines = source.split("\n")
+                    def_line = lines[0]
+                    body_lines = lines[1:]
+                    first_body = next((l for l in body_lines if l.strip()), "")
+                    body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
+                    prologue = [
+                        body_indent + f"original_dtype = {param_name}.dtype",
+                        body_indent + f"if self.weight is not None: {param_name} = {param_name}.to(self.weight.dtype)",
+                    ]
+                    source = "\n".join([def_line] + prologue + body_lines)
+                    append_str = ".to(original_dtype)\n"
+                else:
+                    append_str = f".to({param_name}.dtype)\n"
 
             forward = create_new_function(
                 module,
@@ -4575,6 +4653,7 @@ def unsloth_compile_transformers(
         return
 
     # Import and replace with new module
+    replacement_classes = {}
     for module in all_standalone_classes.keys():
         try:
             exec(
@@ -4582,9 +4661,12 @@ def unsloth_compile_transformers(
                 globals(),
                 locals(),
             )
+            replacement_classes[module] = getattr(combined_module, module)
         except:
             pass
     pass
+
+    patch_output_capture_targets(modeling_file, replacement_classes)
 
     # Finally edit dictionary items inside the target file
     replaced_classes = all_standalone_classes.keys()

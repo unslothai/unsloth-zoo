@@ -52,10 +52,9 @@ import psutil
 try:
     from .device_type import device_is_bf16_supported
 except (ImportError, NotImplementedError):
-    # device_type can fail two ways: ImportError when torch is
-    # absent, NotImplementedError when get_device_type() runs at
-    # import on an unrecognised platform. Fall through to the
-    # platform probe in either case.
+    # ImportError when torch is absent; NotImplementedError when
+    # get_device_type() runs at import on an unrecognised platform.
+    # Fall through to the platform probe either way.
     import platform as _platform
     _IS_APPLE_SILICON = (
         _platform.system() == "Darwin" and _platform.machine() == "arm64"
@@ -63,9 +62,8 @@ except (ImportError, NotImplementedError):
     def device_is_bf16_supported():
         return _IS_APPLE_SILICON
 
-# Get a logger instance
 logger = logging.getLogger(__name__)
-# Configure logging basic level if not already configured elsewhere
+# Configure basic logging if not already configured elsewhere
 if not logger.hasHandlers():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s: %(message)s')
 
@@ -138,12 +136,11 @@ LLAMA_CPP_DEFAULT_DIR = os.environ.get(
 
 
 def _resolve_local_convert_script():
-    """Returns (abs_path, mtime_ns, size) for a local convert_hf_to_gguf.py if
-    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points at a directory containing one, else None.
-    The mtime_ns and size are part of the cache key on the cached implementation
-    so in-place updates to the same path are honored. When the env var is set
-    but invalid, this raises RuntimeError so an explicit pin fails closed
-    instead of silently falling back to the network."""
+    """Return (abs_path, mtime_ns, size) for a local convert_hf_to_gguf.py if
+    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR holds one, else None. mtime_ns/size are part
+    of the cache key so in-place updates are honored. An invalid env var raises
+    RuntimeError (an explicit pin fails closed rather than hitting the network).
+    """
     scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
     if not scripts_dir:
         return None
@@ -183,32 +180,29 @@ def use_local_gguf():
     original_gguf_modules = {}
 
     try:
-        # Add gguf-py to sys.path if it exists
         if os.path.exists(gguf_py_path):
             logger.debug(f"Adding {gguf_py_path} to sys.path")
             sys.path.insert(1, gguf_py_path)
 
-            # Remove system gguf modules to force reimport
+            # Drop system gguf modules to force a reimport from gguf-py
             gguf_modules = [key for key in sys.modules.keys() if key.startswith('gguf')]
             for module in gguf_modules:
-                original_gguf_modules[module] = sys.modules[module]  # Store original
+                original_gguf_modules[module] = sys.modules[module]
                 del sys.modules[module]
                 logger.debug(f"Removed system module {module}")
 
-        yield  # Let the conversion happen
+        yield
 
     finally:
-        # Restore original sys.path
         sys.path[:] = original_sys_path
 
-        # Remove any new gguf modules that were imported
+        # Remove any newly imported gguf modules
         new_modules = set(sys.modules.keys()) - original_modules
         gguf_modules_to_remove = [m for m in new_modules if m.startswith('gguf')]
         for module in gguf_modules_to_remove:
             del sys.modules[module]
             logger.debug(f"Cleaned up module {module}")
 
-        # Restore original gguf modules
         for module_name, module_obj in original_gguf_modules.items():
             sys.modules[module_name] = module_obj
             logger.debug(f"Restored original module {module_name}")
@@ -483,8 +477,8 @@ pass
 
 
 def _find_visual_studio():
-    """Detect Visual Studio Build Tools installation (aligned with setup.ps1 Find-VsBuildTools).
-    Returns (cmake_generator, vs_install_path) or (None, None) if not found."""
+    """Detect VS Build Tools (aligned with setup.ps1 Find-VsBuildTools).
+    Returns (cmake_generator, vs_install_path) or (None, None)."""
     program_files = [
         os.environ.get('ProgramFiles', r'C:\Program Files'),
         os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
@@ -502,8 +496,8 @@ def _find_visual_studio():
 
 
 def _find_openssl_root():
-    """Find OpenSSL dev installation on Windows (aligned with setup.ps1 $OpenSslRoots).
-    Returns the root path if found, or None."""
+    """Find OpenSSL dev on Windows (aligned with setup.ps1 $OpenSslRoots).
+    Returns the root path or None."""
     openssl_roots = [
         r'C:\Program Files\OpenSSL-Win64',
         r'C:\Program Files\OpenSSL',
@@ -516,8 +510,7 @@ def _find_openssl_root():
 
 
 def _find_lib_path(lib_name):
-    """Find a shared library path using gcc's linker search.
-    Returns the absolute path if found, or None."""
+    """Find a shared library path via gcc's linker search; abs path or None."""
     try:
         result = subprocess.run(
             ['gcc', f'-print-file-name={lib_name}'],
@@ -930,10 +923,9 @@ _BRANDING_PATTERN = re.compile(
 
 
 def _get_llama_cpp_dir(local_script_info):
-    """Resolve the directory holding the converter being patched.
-    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR wins when set; otherwise the default
-    ~/.unsloth/llama.cpp. Single anchor for layout detection, branding patch,
-    Qwen check, and sibling-info cache key."""
+    """Directory holding the converter being patched: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
+    when set, else ~/.unsloth/llama.cpp. Single anchor for layout detection,
+    branding patch, Qwen check, and sibling-info cache key."""
     if local_script_info is not None:
         return os.path.dirname(local_script_info[0])
     return LLAMA_CPP_DEFAULT_DIR
@@ -941,9 +933,9 @@ pass
 
 
 def _conversion_sibling_info(llama_cpp_dir):
-    """Hashable (path, mtime, size) tuples for conversion/{__init__,base,qwen}.py.
-    Folded into the patcher cache key so re-pulled llama.cpp checkouts re-patch.
-    Returns None on monolithic layout."""
+    """Hashable (path, mtime, size) tuples for conversion/{__init__,base,qwen}.py,
+    folded into the patcher cache key so re-pulled checkouts re-patch. None on
+    the monolithic layout."""
     conv_dir = os.path.join(llama_cpp_dir, "conversion")
     init_py  = os.path.join(conv_dir, "__init__.py")
     base_py  = os.path.join(conv_dir, "base.py")
@@ -965,9 +957,9 @@ pass
 
 
 def _detect_converter_layout(entry_content_bytes, llama_cpp_dir):
-    """Return 'package' for the new conversion/ package layout, else 'monolith'.
-    Detection is structural: entrypoint must contain `from conversion import`
-    AND conversion/__init__.py + conversion/base.py must exist on disk."""
+    """Return 'package' for the new conversion/ layout, else 'monolith'.
+    Structural: entrypoint must contain `from conversion import` AND
+    conversion/__init__.py + conversion/base.py must exist on disk."""
     try:
         if b"from conversion import" not in entry_content_bytes:
             return "monolith"
@@ -985,7 +977,7 @@ pass
 
 def _extract_dict_keys_from_conversion_init(conv_init_path, dict_name):
     """AST-parse conversion/__init__.py for TEXT_MODEL_MAP / MMPROJ_MODEL_MAP
-    string-literal keys. Used as the arch allowlist on the new layout because
+    keys. Used as the arch allowlist on the new layout, where
     ModelBase._model_classes is empty until load_all_models() runs."""
     try:
         with open(conv_init_path, "rb") as f:
@@ -1012,7 +1004,7 @@ pass
 
 def _apply_branding_patch_to_base(conv_base_path):
     """Insert Unsloth metadata branding after `self.metadata = gguf.Metadata.load(...)`
-    in conversion/base.py. Idempotent via a one-line marker.
+    in conversion/base.py (idempotent via a one-line marker).
     Returns 'applied' / 'already-applied' / 'pattern-missing'."""
     try:
         with open(conv_base_path, "rb") as f:
@@ -1048,10 +1040,10 @@ pass
 
 
 def _qwen_already_handles_expert_aliases(conv_qwen_path):
-    """True iff conversion/qwen.py already searches both num_local_experts AND
-    num_experts. Upstream master uses
-        self.find_hparam(["num_local_experts", "num_experts"])
-    so the legacy patch is a no-op and the warning is misleading."""
+    """True iff conversion/qwen.py already searches both num_local_experts and
+    num_experts (upstream master uses
+    find_hparam(["num_local_experts", "num_experts"])), making the legacy
+    patch a no-op with a misleading warning."""
     try:
         with open(conv_qwen_path, "rb") as f:
             content = f.read()
@@ -1062,11 +1054,10 @@ pass
 
 
 def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
-    # Resolve env vars + sibling mtimes on every call; both are folded into
-    # the @lru_cache key so re-pulled llama.cpp checkouts re-run the patcher.
-    # Anchor the conversion/ lookup to the converter being patched, not
-    # always LLAMA_CPP_DEFAULT_DIR -- matters when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
-    # points at a different checkout.
+    # Resolve env vars + sibling mtimes each call; both feed the @lru_cache key
+    # so re-pulled checkouts re-run the patcher. Anchor conversion/ to the
+    # converter being patched (matters when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points
+    # at a different checkout), not always LLAMA_CPP_DEFAULT_DIR.
     local_script_info = _resolve_local_convert_script()
     return _download_convert_hf_to_gguf_cached(
         name,
@@ -1078,26 +1069,24 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
 @lru_cache(1)
 def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_info):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Downloads from llama.cpp's GitHub repository, or reads a local copy when
+    # Download from llama.cpp's GitHub, or read a local copy when
     # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is set. _local_script_info is
     # (path, mtime_ns, size); mtime/size in the cache key invalidate stale
     # entries on in-place updates. Cache size is 1 because the patched script
-    # is written to a single shared on-disk path, so a second cache entry
-    # would always read stale bytes off disk.
+    # is written to one shared on-disk path, so a second entry would read stale
+    # bytes.
 
     # Ensure llama.cpp directory exists
     os.makedirs(LLAMA_CPP_DEFAULT_DIR, exist_ok=True)
 
-    supported_types = set() # Initialize outside try block
+    supported_types = set()
     text_archs = set()
     vision_archs = set()
-    temp_original_file_path = None # Initialize for finally block
+    temp_original_file_path = None # for the finally block
     original_module_name = None    # Only set on the monolith branch
-    # Set by introspection; read by Patch 2 + Patch 3 below. Default to
-    # 'monolith' so a failed introspection still drives the legacy patches.
+    # Default to 'monolith' so a failed introspection still drives the legacy
+    # patches; set by introspection and read by Patch 2 + Patch 3 below.
     _layout = "monolith"
-    # Resolve once: same dir feeds layout detection, branding patch, Qwen
-    # check, sibling cache key. UNSLOTH_LLAMA_CPP_SCRIPTS_DIR overrides default.
     _llama_cpp_dir = _get_llama_cpp_dir(_local_script_info)
 
     _local_script = _local_script_info[0] if _local_script_info is not None else None
@@ -1131,12 +1120,11 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
             if original_content is None:
                 raise _last_err  # type: ignore[misc]
 
-        # 2. Detect layout BEFORE attempting to import. The package-layout
-        # entrypoint does `from conversion import ...`, which a temp-file
-        # import resolves against LLAMA_CPP_DEFAULT_DIR -- so when the user
-        # set UNSLOTH_LLAMA_CPP_SCRIPTS_DIR to a different checkout, the
-        # import would ModuleNotFoundError and abort the patcher before we
-        # could reach the AST-based arch extraction path.
+        # 2. Detect layout BEFORE importing: the package entrypoint does
+        # `from conversion import ...`, which a temp-file import resolves
+        # against LLAMA_CPP_DEFAULT_DIR; with a different
+        # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR that would ModuleNotFoundError and
+        # abort before the AST-based arch extraction path.
         _layout = _detect_converter_layout(original_content, _llama_cpp_dir)
         logger.info(f"Unsloth: convert_hf_to_gguf layout detected: {_layout}")
         logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
@@ -1338,7 +1326,11 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
 
 
         # 4. Write Patched File
-        patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{name}.py")
+        # Keep package-layout entrypoints beside conversion/ so subprocess
+        # execution resolves `from conversion import ...`.
+        patched_dir = _llama_cpp_dir if _layout == "package" else LLAMA_CPP_DEFAULT_DIR
+        os.makedirs(patched_dir, exist_ok=True)
+        patched_filename = os.path.join(patched_dir, f"{name}.py")
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
         with open(patched_filename, "wb") as file:
             file.write(patched_content)
@@ -1559,6 +1551,49 @@ def check_max_shard_size(max_shard_size = "50GB"):
 pass
 
 
+# Converter deps, only installed in install_llama_cpp() (skipped when llama.cpp
+# already exists), so a stale `gguf` can fail with exit 1.
+_CONVERTER_PYTHON_DEPS = ("gguf", "protobuf", "sentencepiece", "mistral_common")
+
+# Markers meaning the converter env (not the model) is broken; only these
+# trigger auto-repair, genuine model errors surface as-is.
+_CONVERTER_DEP_ERROR_MARKERS = (
+    "ModuleNotFoundError",
+    "No module named",
+    "ImportError",
+    "cannot import name",
+    "DLL load failed",      # common Windows broken-package symptom
+    "undefined symbol",
+)
+
+
+def _looks_like_converter_dep_error(text):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not text: return False
+    return any(marker in text for marker in _CONVERTER_DEP_ERROR_MARKERS)
+
+
+def _reinstall_converter_deps(python_exe, print_output = False):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Force-reinstall converter deps into their interpreter to self-heal.
+    if print_output:
+        print(
+            f"Unsloth: The GGUF converter environment looks broken (stale/missing "
+            f"package). Reinstalling {', '.join(_CONVERTER_PYTHON_DEPS)} and retrying..."
+        )
+    def _run(cmd):
+        return subprocess.run(cmd, encoding="utf-8", errors="replace",
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    install = [python_exe, "-m", "pip", "install", "--upgrade", "--force-reinstall",
+               *_CONVERTER_PYTHON_DEPS]
+    result = _run(install)
+    # Some envs (eg uv-created venvs) ship without pip; bootstrap it once.
+    if result.returncode != 0 and "no module named pip" in (result.stdout or "").lower():
+        _run([python_exe, "-m", "ensurepip", "--upgrade"])
+        result = _run(install)
+    return result
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -1691,18 +1726,55 @@ def convert_to_gguf(
                 command.extend([str(key), str(value)])
         command.append(str(input_folder))
 
-        try:
-            if print_output:
-                result = subprocess.run(command, shell=False, check=True, text=True,
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                print(result.stdout)
-            else:
-                subprocess.run(command, shell=False, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            if print_output and hasattr(e, 'stdout') and e.stdout:
-                print(e.stdout)
-            cmd = " ".join(str(x) for x in command)
-            raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}")
+        # Run the converter; self-heal and retry once if the env (not the model)
+        # is broken. No cost on the happy path.
+        attempted_repair = False
+        repair_note = ""
+        while True:
+            try:
+                # encoding/errors pinned so non-UTF8 output never crashes decoding.
+                if print_output:
+                    result = subprocess.run(command, shell=False, check=True,
+                                          encoding="utf-8", errors="replace",
+                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    print(result.stdout)
+                else:
+                    # Capture so a failure surfaces the real traceback.
+                    subprocess.run(command, shell=False, check=True,
+                                   encoding="utf-8", errors="replace",
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                break
+            except subprocess.CalledProcessError as e:
+                captured = ""
+                for stream in (getattr(e, "stderr", None), getattr(e, "stdout", None)):
+                    if stream:
+                        captured += stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
+
+                # Self-heal: reinstall the converter deps (command[0] = its
+                # interpreter) and retry once instead of failing.
+                if not attempted_repair and _looks_like_converter_dep_error(captured):
+                    attempted_repair = True
+                    try:
+                        repair = _reinstall_converter_deps(command[0], print_output = print_output)
+                        if repair.returncode == 0:
+                            continue
+                        repair_note = f"\n--- dependency reinstall failed ---\n{(repair.stdout or '').strip()}"
+                    except Exception as repair_error:
+                        repair_note = f"\n--- dependency reinstall failed ---\n{repair_error}"
+
+                if print_output and getattr(e, 'stdout', None):
+                    print(e.stdout)
+                cmd = " ".join(str(x) for x in command)
+                # Surface the converter output, else the failure is just "exit
+                # status 1" with the real traceback discarded.
+                details = ""
+                for label, stream in (("stderr", getattr(e, "stderr", None)),
+                                      ("stdout", getattr(e, "stdout", None))):
+                    if not stream: continue
+                    text = stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
+                    text = text.strip()
+                    if text: details += f"\n--- converter {label} ---\n{text}"
+                raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}")
 
         # Simple validation using native Python - check for main file or sharded files
         if os.path.exists(output_file):
@@ -1798,14 +1870,12 @@ def quantize_gguf(
         import shlex
         return shlex.quote(s)
 
-    # Q2_K_L is an Unsloth preset (q2_k base with selective upcasts), not a
-    # native llama.cpp ftype. Recipe: token_embd -> Q4_K, output -> Q6_K, and
-    # every ffn_down / ffn_down_exps tensor (all layer ids, dense + MoE) ->
-    # Q3_K. llama-quantize matches --tensor-type with std::regex_search and
-    # iterates with first-match-wins, so we chain the more-specific MoE
-    # pattern first; the leading `\.` anchors on the GGUF path separator so
-    # the override does not slip into unrelated tensor names that happen to
-    # contain the substring "ffn_down".
+    # Q2_K_L is an Unsloth preset (q2_k base + selective upcasts), not a native
+    # llama.cpp ftype. Recipe: token_embd->Q4_K, output->Q6_K, every
+    # ffn_down/ffn_down_exps->Q3_K. llama-quantize matches --tensor-type via
+    # regex_search first-match-wins, so chain the more-specific MoE pattern
+    # first; the leading `\.` anchors on the GGUF path separator so the
+    # override doesn't leak into other tensors containing "ffn_down".
     _display_quant_type = quant_type
     _extra_flags = ""
     if str(quant_type).strip().lower() == "q2_k_l":
@@ -1833,16 +1903,27 @@ def quantize_gguf(
 
     try:
         if print_output:
-            result = subprocess.run(command, shell=True, check=True, text=True,
+            result = subprocess.run(command, shell=True, check=True,
+                                  encoding="utf-8", errors="replace",
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             print(result.stdout)
         else:
-            subprocess.run(command, shell=True, check=True, capture_output=True)
+            # Capture so llama-quantize's output can be surfaced on failure.
+            subprocess.run(command, shell=True, check=True,
+                           encoding="utf-8", errors="replace",
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     except subprocess.CalledProcessError as e:
         if print_output and hasattr(e, 'stdout') and e.stdout:
             print(e.stdout)
-        raise RuntimeError(f"Failed to quantize {input_gguf} to {_display_quant_type}: {e}")
+        details = ""
+        for label, stream in (("stderr", getattr(e, "stderr", None)),
+                              ("stdout", getattr(e, "stdout", None))):
+            if not stream: continue
+            text = stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
+            text = text.strip()
+            if text: details += f"\n--- llama-quantize {label} ---\n{text}"
+        raise RuntimeError(f"Failed to quantize {input_gguf} to {_display_quant_type}: {e}{details}")
 
     # Verify output exists and get size using pathlib
     output_path = Path(output_gguf)

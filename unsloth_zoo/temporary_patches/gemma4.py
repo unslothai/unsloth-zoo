@@ -21,96 +21,58 @@ from .utils import raise_error, patch_function
 
 
 # ============================================================================
-# Gemma-4 variant summary (affects which fix engages which model):
-#
-#   - Gemma-4 31B:      num_kv_shared_layers = 0  -> Fix 1 engages, Fix 2 is a no-op
-#   - Gemma-4 26B-A4B:  num_kv_shared_layers = 0  -> Fix 1 engages, Fix 2 is a no-op
-#   - Gemma-4 E4B:      num_kv_shared_layers = 18 -> Fix 1 is a no-op, Fix 2 engages
-#   - Gemma-4 E2B:      num_kv_shared_layers = 20 -> Fix 1 is a no-op, Fix 2 engages
-#   - Gemma3n:          num_kv_shared_layers = 15 -> both are no-ops (different model)
-#   - Llama/Qwen/etc:   attribute absent          -> both are no-ops
-#
-# The two fixes are mutually exclusive at runtime: Fix 1 only acts when the
-# value is exactly 0, Fix 2 only acts when the value is strictly greater
-# than 0. Non-Gemma-4 models never hit either branch because the attribute
-# is not present.
+# Gemma-4 variant summary (which fix engages which model):
+#   - 31B / 26B-A4B:  num_kv_shared_layers = 0  -> Fix 1 engages, Fix 2 no-op
+#   - E4B (18) / E2B (20): num_kv_shared_layers > 0 -> Fix 1 no-op, Fix 2 engages
+#   - Gemma3n (15) / Llama / Qwen / etc.: both no-ops (different / absent attr)
+# The fixes are mutually exclusive: Fix 1 acts only when the value is exactly
+# 0, Fix 2 only when it is > 0.
 # ============================================================================
 
 
 # ============================================================================
 # Fix 1: num_kv_shared_layers == 0 cache-init bug (Gemma-4 31B and 26B-A4B).
 #
-# Root cause: transformers/cache_utils.py DynamicCache.__init__ (and StaticCache.
-# __init__) contains:
-#
+# Root cause: transformers/cache_utils.py DynamicCache/StaticCache __init__:
 #     if hasattr(decoder_config, "num_kv_shared_layers"):
 #         layer_types = layer_types[: -decoder_config.num_kv_shared_layers]
+# When num_kv_shared_layers == 0, `layer_types[:-0] == []`, so the cache gets
+# zero layer slots and the first attention forward raises IndexError from
+# Cache.update. Present in transformers 4.57.6, 5.5.0, and main (filed upstream).
 #
-# When num_kv_shared_layers == 0 (Gemma-4 26B-A4B and 31B both ship this way),
-# Python evaluates `layer_types[:-0] == layer_types[:0] == []`, so the cache is
-# constructed with zero layer slots and the very first attention forward
-# raises `IndexError: list index out of range` from `Cache.update`.
+# Primary fix (proxy): patch get_text_config on Gemma4Config / Gemma4TextConfig
+# to return a proxy that raises AttributeError for num_kv_shared_layers when it
+# is 0, so the upstream hasattr check is False and the buggy slice is skipped.
+# Preferred over wrapping Cache.__init__ because it touches only Gemma-4
+# classes, mutates nothing, and survives the compiler cache. Downstream reads
+# of config.num_kv_shared_layers still see 0 (they read self.config directly).
 #
-# Bug confirmed present in transformers 4.57.6, 5.5.0, and main.
-# Filed for upstream fix.
-#
-# Primary fix (proxy approach): patch `get_text_config` on Gemma4Config and
-# Gemma4TextConfig so that, when the resolved text config has
-# num_kv_shared_layers == 0, a thin proxy is returned that raises
-# AttributeError for that attribute. The upstream `hasattr(decoder_config,
-# "num_kv_shared_layers")` check becomes False, the buggy slice is skipped,
-# and the cache is built with the full layer list.
-#
-# Why the proxy approach is preferred over wrapping Cache.__init__:
-#   - Only Gemma-4 classes are touched. DynamicCache and StaticCache are
-#     byte-identical to upstream for every other model.
-#   - No attribute mutation: the real Gemma4TextConfig is never modified, so
-#     there are no thread-safety, finally-block, or __slots__ concerns.
-#   - Survives Unsloth's compiler cache (`unsloth_compiled_cache/
-#     unsloth_compiled_module_gemma4.py`) trivially. The compiler copies
-#     attention/MLP forward methods but never cache code, and the config
-#     classes are not touched by the compiler at all.
-#   - Downstream reads of `config.num_kv_shared_layers` (e.g.
-#     Gemma4TextMLP.__init__, Gemma4TextAttention.__init__) still see the
-#     original 0 because they read from `self.config` directly, not from
-#     `self.config.get_text_config(...)`.
-#
-# Fallback (wrapper approach): a hardened Cache.__init__ wrapper is also
-# installed as defense-in-depth. It only fires when the proxy path did not
-# apply (e.g. a future transformers refactor that bypasses get_text_config).
-# The wrapper uses a try/finally to hide-and-restore the attribute and bails
-# out to the original init on any mutation failure (rather than converting
-# IndexError -> TypeError by setting a None sentinel).
+# Fallback (wrapper): a hardened Cache.__init__ wrapper is installed as
+# defense-in-depth; it only fires if the proxy path did not apply.
 # ============================================================================
 
 
 class _Gemma4KVSharedSafeProxy:
-    """Thin read-only proxy around Gemma4TextConfig.
+    """Read-only proxy around Gemma4TextConfig hiding num_kv_shared_layers when 0.
 
-    When `num_kv_shared_layers == 0`, `hasattr(proxy, "num_kv_shared_layers")`
-    must return False so that upstream's `layer_types[:-0]` slice is skipped.
-    All other attribute lookups (`sliding_window`, `layer_types`,
-    `num_hidden_layers`, etc.) forward to the real config object.
-
-    Important: Python looks up dunder methods on the TYPE, not the instance,
-    so `__getattr__` alone is NOT sufficient for iteration, len, etc. We
-    explicitly forward every dunder method that PreTrainedConfig is known
-    to rely on so the proxy survives callers like
-    `PreTrainedConfig.validate_token_ids`, which does
-    `for value in self.get_text_config(decoder=True): ...`.
-
-    `__slots__` avoids creating a `__dict__`, which keeps the proxy cheap
-    and lets default `copy`/`deepcopy` traverse only the `_real` slot.
+    Makes `hasattr(proxy, "num_kv_shared_layers")` False so upstream's
+    `layer_types[:-0]` slice is skipped; all other lookups forward to the real
+    config. Dunder methods are forwarded explicitly because Python resolves them
+    on the type, so callers like PreTrainedConfig.validate_token_ids (which
+    iterates the config) still work. `__slots__` keeps the proxy cheap.
     """
 
     __slots__ = ("_real",)
+
+    # __dict__/vars() still expose num_kv_shared_layers (no instance dict -> forwards
+    # to _real); keep it that way -- to_dict() deepcopies __dict__, so sealing it
+    # would drop the field from serialization. #6089
 
     def __init__(self, real):
         object.__setattr__(self, "_real", real)
 
     def __getattr__(self, name):
-        # Only invoked when normal attribute lookup fails (i.e. not a slot
-        # and not a method of this proxy class).
+        # Only invoked when normal attribute lookup fails.
         if name == "num_kv_shared_layers":
             raise AttributeError(
                 "num_kv_shared_layers is 0 (no KV sharing) -- hidden from "
@@ -119,22 +81,22 @@ class _Gemma4KVSharedSafeProxy:
         return getattr(object.__getattribute__(self, "_real"), name)
 
     def get_text_config(self, decoder=None, encoder=None):
-        # If upstream recursively calls get_text_config on the proxy, return
-        # self so the proxy is not unwrapped back into a raw config.
+        # Return self so recursive get_text_config calls don't unwrap the proxy.
         return self
 
-    # ---- dict-like dunder forwarding ----
-    # PreTrainedConfig.__iter__ yields attribute names from self.__dict__.
-    # Validators such as validate_token_ids rely on this iteration.
+    # ---- dict-like dunder forwarding (used by config validators) ----
     def __iter__(self):
-        return iter(object.__getattribute__(self, "_real"))
+        # Hide num_kv_shared_layers, like __getattr__/__contains__/__getitem__:
+        # validate_token_ids does `for n in cfg: getattr(cfg, n)`, so yielding it
+        # would re-raise the AttributeError from __getattr__. See unslothai/unsloth#6089.
+        for name in object.__getattribute__(self, "_real"):
+            if name == "num_kv_shared_layers":
+                continue
+            yield name
 
     def __len__(self):
-        real = object.__getattribute__(self, "_real")
-        try:
-            return len(real)
-        except TypeError:
-            return len(getattr(real, "__dict__", {}))
+        # Consistent with __iter__ (hidden attr excluded).
+        return sum(1 for _ in self)
 
     def __contains__(self, item):
         if item == "num_kv_shared_layers":
@@ -173,10 +135,7 @@ class _Gemma4KVSharedSafeProxy:
 
 
 def _wrap_get_text_config_for_kv_zero(cls):
-    """Replace `cls.get_text_config` with a version that wraps the result
-    in `_Gemma4KVSharedSafeProxy` whenever the resolved config has
-    `num_kv_shared_layers == 0`. Idempotent.
-    """
+    """Wrap cls.get_text_config to return a proxy when num_kv_shared_layers == 0. Idempotent."""
     _sentinel = "_unsloth_kv_shared_get_text_config_patched"
     if getattr(cls.get_text_config, _sentinel, False):
         return
@@ -196,13 +155,11 @@ def _wrap_get_text_config_for_kv_zero(cls):
 
 
 def patch_Gemma4Config_kv_shared_zero():
-    """Patch Gemma4Config.get_text_config. This is the path exercised by
-    StaticCache (called from transformers.generation.utils) and any caller
-    that passes the top-level `model.config` to a cache constructor."""
+    """Patch Gemma4Config.get_text_config (StaticCache / top-level config path)."""
     try:
         from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
     except ImportError:
-        # transformers < 5.x (e.g. 4.57.6) has no Gemma-4 -> nothing to patch.
+        # transformers < 5.x has no Gemma-4 -> nothing to patch.
         return
     except Exception as e:
         return raise_error("Gemma4Config.get_text_config kv_shared_zero fix", e)
@@ -215,10 +172,7 @@ TEMPORARY_PATCHES.append(patch_Gemma4Config_kv_shared_zero)
 
 
 def patch_Gemma4TextConfig_kv_shared_zero():
-    """Patch Gemma4TextConfig.get_text_config. This is the path exercised by
-    DynamicCache when `Gemma4TextModel.forward` auto-constructs the cache
-    with `DynamicCache(config=self.config)` where `self.config` is the
-    already-nested Gemma4TextConfig."""
+    """Patch Gemma4TextConfig.get_text_config (DynamicCache auto-construct path)."""
     try:
         from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
     except ImportError:
@@ -234,29 +188,14 @@ TEMPORARY_PATCHES.append(patch_Gemma4TextConfig_kv_shared_zero)
 
 
 # ----------------------------------------------------------------------------
-# Defense-in-depth: hardened Cache.__init__ wrapper.
-#
-# This only takes effect if the proxy patches above did NOT apply (for
-# example, a hypothetical future transformers that bypasses get_text_config,
-# or a third-party composite model that wraps Gemma4TextConfig without
-# exposing it via get_text_config). In the steady state this wrapper is a
-# pure pass-through: the proxy catches the bug first.
+# Defense-in-depth: hardened Cache.__init__ wrapper, only active if the proxy
+# patches above did not apply. In steady state it is a pure pass-through.
 # ----------------------------------------------------------------------------
 
 def _make_kv_shared_zero_safe_init(_orig_init, _resolve_decoder_config):
-    """Return a hardened `__init__` wrapper.
-
-    Behavior:
-      1. Resolve the decoder config the cache class will see.
-      2. If num_kv_shared_layers is present AND equals 0 AND we have not
-         already been bypassed by the proxy (the proxy raises AttributeError
-         from hasattr, so the check short-circuits to pass-through), then
-         transiently delete the attribute and call the original init inside
-         a try/finally that restores the value.
-      3. If the attribute cannot be deleted (e.g. dataclass __slots__, frozen
-         config, C extension descriptor), BAIL OUT to the original init --
-         preserving the original IndexError rather than converting it to a
-         TypeError via a None sentinel (this was a bug in the first draft).
+    """Hardened cache __init__: transiently delete num_kv_shared_layers==0 around
+    the original init (try/finally restores it), bailing to the original init if
+    the attribute cannot be deleted so the upstream error surfaces unchanged.
     """
 
     def __init__(self, *args, **kwargs):
@@ -266,10 +205,8 @@ def _make_kv_shared_zero_safe_init(_orig_init, _resolve_decoder_config):
         except Exception:
             decoder_config = None
 
-        # Proxy path already bypassed the buggy branch via AttributeError,
-        # so hasattr returns False for the Gemma-4 zero case and this whole
-        # block is skipped. This check only fires if the proxy patch did not
-        # apply for some reason.
+        # Skipped when the proxy path applied (hasattr returns False there);
+        # this only fires if the proxy patch did not apply.
         if (
             decoder_config is not None
             and hasattr(decoder_config, "num_kv_shared_layers")
@@ -278,9 +215,7 @@ def _make_kv_shared_zero_safe_init(_orig_init, _resolve_decoder_config):
             try:
                 del decoder_config.num_kv_shared_layers
             except (AttributeError, TypeError):
-                # Attribute cannot be mutated -- fall through to original
-                # init and let the upstream error surface (no worse than
-                # without the patch).
+                # Cannot mutate; fall through to original init.
                 return _orig_init(self, *args, **kwargs)
             try:
                 _orig_init(self, *args, **kwargs)
@@ -358,56 +293,28 @@ TEMPORARY_PATCHES.append(patch_StaticCache_kv_shared_zero)
 # ============================================================================
 # Fix 2: use_cache=False with KV sharing produces garbage (Gemma-4 E2B and E4B).
 #
-# Root cause: Gemma4TextAttention.forward uses
+# Gemma4TextAttention.forward only reuses stored K/V from the cache for
+# is_kv_shared_layer layers; with use_cache=False, Gemma4TextModel.forward
+# never auto-constructs the cache, so those layers recompute K/V from the wrong
+# hidden states. Symptoms: training loss explodes, logits become garbage.
+# See huggingface/transformers#45242.
 #
-#     if self.is_kv_shared_layer and past_key_values is not None:
-#         key_states, value_states = past_key_values.shared_layers[...]
-#     else:
-#         # compute K/V locally from current hidden_states
+# Affects num_kv_shared_layers > 0 (E2B=20, E4B=18); 31B / 26B-A4B (=0) are
+# unaffected.
 #
-# The cache is the ONLY place where the KV values produced by the
-# "store_full_length_kv" layers are stashed for later reuse by the
-# is_kv_shared_layer layers. When the caller passes `use_cache=False`,
-# Gemma4TextModel.forward skips auto-construction of past_key_values:
-#
-#     if use_cache and past_key_values is None:
-#         past_key_values = DynamicCache(config=self.config)
-#
-# so every is_kv_shared_layer falls through to the `else` branch and
-# recomputes K/V from the current layer's hidden states, which is wrong.
-# Symptoms: training loss explodes, logits become garbage. See
-# huggingface/transformers#45242.
-#
-# Affects models with num_kv_shared_layers > 0 (Gemma-4 E2B=20, E4B=18).
-# Does NOT affect 31B or 26B-A4B (num_kv_shared_layers=0 -> no layer is
-# is_kv_shared_layer -> path is byte-identical with or without cache).
-#
-# Fix: wrap Gemma4TextModel.forward (and Gemma4Model.forward for the
-# multimodal parent) so that when num_kv_shared_layers > 0 and the caller
-# passes past_key_values=None with use_cache falsy, we transparently
-# construct a DynamicCache, run the original forward, then drop
-# past_key_values from the returned `BaseModelOutputWithPast` to preserve
-# the caller's use_cache=False semantics.
-#
-# This wrapper is a pure pass-through for:
-#   - Any model that doesn't expose num_kv_shared_layers (not Gemma-4)
-#   - Gemma-4 31B / 26B-A4B (num_kv_shared_layers == 0)
-#   - Any Gemma-4 call that already has past_key_values or use_cache=True
+# Fix: wrap Gemma4TextModel.forward (and Gemma4Model.forward) so that when KV
+# sharing is active and the caller passes past_key_values=None with use_cache
+# falsy, we build a DynamicCache, run the original forward, then drop it from
+# the output to preserve use_cache=False semantics. Pass-through otherwise.
 # ============================================================================
 
 def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):
-    """Wrap a Gemma-4 text-model-style forward so it builds an internal
-    DynamicCache when KV sharing is active but the caller passed use_cache=False.
-    The internal cache is nulled out in the returned output so the caller's
-    semantics are preserved.
+    """Wrap a Gemma-4 forward to build an internal DynamicCache when KV sharing
+    is active but the caller passed use_cache=False, nulling it from the output.
 
-    Argument resolution uses `inspect.signature.bind_partial` so that
-    `past_key_values` and `use_cache` are correctly resolved whether the
-    caller passed them positionally or by keyword. Calling the inner forward
-    via `bound.args` / `bound.kwargs` (rather than mixing positional and
-    keyword) avoids the `TypeError: got multiple values for argument`
-    case that a naive `kwargs[...] = ...` injection would trigger when the
-    caller already passed the same argument positionally.
+    Uses inspect.signature.bind_partial so past_key_values / use_cache resolve
+    whether passed positionally or by keyword, and calls the inner forward via
+    bound.args/bound.kwargs to avoid duplicate-argument TypeErrors.
     """
     import inspect
 
@@ -420,12 +327,11 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):
         num_kv_shared = getattr(
             getattr(self, "config", None), "num_kv_shared_layers", 0
         )
-        # Nothing to do for variants without KV sharing (31B, 26B-A4B, non-Gemma-4).
+        # No-op without KV sharing (31B, 26B-A4B, non-Gemma-4).
         if not num_kv_shared or num_kv_shared <= 0:
             return _orig_forward(self, *args, **kwargs)
 
-        # Resolve past_key_values and use_cache from EITHER args or kwargs.
-        # bind_partial handles both positional and keyword forms uniformly.
+        # Resolve past_key_values / use_cache from args or kwargs.
         if _sig is None:
             # Fallback if signature introspection failed: kwargs-only path.
             past_key_values = kwargs.get("past_key_values", None)
@@ -448,50 +354,38 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):
             else getattr(self.config, "use_cache", True)
         )
 
-        # Only intervene when the original forward would have left
-        # past_key_values as None (i.e. use_cache is explicitly False or
-        # config.use_cache is False and the caller did not pass one in).
+        # Only intervene when the original forward would leave past_key_values
+        # as None (use_cache falsy and no cache passed in).
         if past_key_values is not None or use_cache_resolved:
             return _orig_forward(self, *args, **kwargs)
 
-        # Build a local cache JUST for cross-layer KV sharing; do not leak
-        # it back to the caller since they asked for use_cache=False.
+        # Local cache for cross-layer KV sharing only; not leaked to the caller.
         try:
             from transformers.cache_utils import DynamicCache
         except Exception:
             return _orig_forward(self, *args, **kwargs)
 
-        # Inject the cache and force use_cache=True on the inner call so the
-        # original forward takes the same mask/position path it would have
-        # with a real cache. The outer result is cleaned up below to preserve
-        # the caller's use_cache=False contract.
+        # Inject the cache and force use_cache=True so the inner forward takes
+        # the same mask/position path; the result is cleaned up below.
         if arguments is not None:
             arguments["past_key_values"] = DynamicCache(config=self.config)
             arguments["use_cache"] = True
-            # Re-bind through args/kwargs to avoid duplicate-keyword TypeErrors
-            # if the caller had passed past_key_values or use_cache positionally.
+            # bound.args/kwargs derive from `arguments`, so the injected values
+            # land in the correct slot without duplicate-keyword TypeErrors.
             inner_args = bound.args
             inner_kwargs = bound.kwargs
-            # bound.args / bound.kwargs are derived from `arguments`, so they
-            # already contain the injected values in the correct slot.
             result = _orig_forward(*inner_args, **inner_kwargs)
         else:
             kwargs["past_key_values"] = DynamicCache(config=self.config)
             kwargs["use_cache"] = True
             result = _orig_forward(self, *args, **kwargs)
 
-        # Preserve the caller's use_cache=False contract: null the cache
-        # from EVERY shape the result might have:
-        #   1. ModelOutput (BaseModelOutputWithPast) -- attribute + dict slot
-        #   2. plain dict
-        #   3. tuple (Gemma4Model.forward is decorated with @can_return_tuple,
-        #      so return_dict=False produces a tuple where past_key_values is
-        #      typically the second element of BaseModelOutputWithPast.to_tuple())
+        # Null the cache from every result shape (ModelOutput, dict, tuple) to
+        # preserve the caller's use_cache=False contract.
         try:
             if isinstance(result, tuple):
-                # ModelOutput.to_tuple() drops None entries, so the cache
-                # may not be at a fixed index. Reconstruct by scanning for
-                # the injected DynamicCache instance and dropping it.
+                # to_tuple() drops None entries, so the cache index isn't fixed;
+                # scan for the injected DynamicCache and drop it.
                 injected = (
                     arguments["past_key_values"]
                     if arguments is not None
@@ -500,10 +394,8 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):
                 new_items = tuple(None if x is injected else x for x in result)
                 result = new_items
             else:
-                # ModelOutput subclasses behave like dicts internally; using
-                # __setitem__ keeps both the attribute slot and the underlying
-                # OrderedDict in sync. Fall back to attribute assignment if
-                # the result does not support __setitem__.
+                # ModelOutput acts dict-like; __setitem__ keeps the attribute
+                # slot and OrderedDict in sync. Fall back to attribute assignment.
                 set_via_item = False
                 try:
                     if hasattr(result, "__setitem__") and "past_key_values" in result:
@@ -534,9 +426,7 @@ def _patch_forward_for_kv_shared_no_cache(cls):
 
 
 def patch_Gemma4TextModel_forward_kv_shared_no_cache():
-    """Patch Gemma4TextModel.forward (the language decoder). This is the class
-    that auto-creates the cache and drives per-layer attention. Fires for
-    text-only model loading (Gemma4ForCausalLM -> Gemma4TextModel)."""
+    """Patch Gemma4TextModel.forward (the language decoder that drives attention)."""
     try:
         from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel
     except ImportError:
@@ -552,10 +442,8 @@ TEMPORARY_PATCHES.append(patch_Gemma4TextModel_forward_kv_shared_no_cache)
 
 
 def patch_Gemma4Model_forward_kv_shared_no_cache():
-    """Patch Gemma4Model.forward (the multimodal parent). Its forward calls
-    into the nested Gemma4TextModel, so patching Gemma4TextModel alone is
-    enough to fix attention, but we also wrap Gemma4Model as a safety net
-    in case a future refactor moves cache auto-creation up a level."""
+    """Patch Gemma4Model.forward (multimodal parent) as a safety net in case a
+    refactor moves cache auto-creation above Gemma4TextModel."""
     try:
         from transformers.models.gemma4.modeling_gemma4 import Gemma4Model
     except ImportError:
@@ -570,11 +458,9 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4Model_forward_kv_shared_no_cache)
 
 
-# ============================================================================
-# Gemma4 AudioAttention patch - fix attention_invalid_logits_value overflow in fp16
-# The config value is -1e9 which overflows fp16 max (65504).
-# On Tesla T4, autocast can downcast attn_weights to fp16, causing masked_fill to fail.
-# ============================================================================
+# Gemma4 AudioAttention: config attention_invalid_logits_value (-1e9) overflows
+# fp16 max (65504); on Tesla T4 autocast downcasts attn_weights to fp16 and
+# masked_fill fails.
 
 def patch_Gemma4AudioAttention():
     try:
@@ -590,8 +476,8 @@ def patch_Gemma4AudioAttention():
     _original_audio_attn_forward = Gemma4AudioAttention.forward
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None, **kwargs):
-        # Clamp attention_invalid_logits_value to dtype-safe range before attention
-        # Only needed for fp16 (Tesla T4) where -1e9 overflows. bf16 supports up to ~3.4e38.
+        # Clamp attention_invalid_logits_value: only fp16 (Tesla T4) overflows
+        # at -1e9; bf16 supports up to ~3.4e38.
         original_value = getattr(self.config, "attention_invalid_logits_value", -1e9)
         needs_clamp = hidden_states.dtype == torch.float16 and abs(original_value) > 65000.0
         if needs_clamp:
@@ -608,26 +494,77 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4AudioAttention)
 
 
+# Gemma4 PEFT reload: make PeftModel.from_pretrained handle adapters saved
+# against Gemma4ClippableLinear.inner .linear modules.
+
+def patch_Gemma4ClippableLinear_peft_reload():
+    try:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ClippableLinear
+        from peft.tuners.lora.model import LoraModel
+    except ImportError:
+        return
+    except Exception as e:
+        return raise_error("Gemma4ClippableLinear PEFT reload", e)
+
+    original_create_and_replace = LoraModel._create_and_replace
+    if getattr(original_create_and_replace, "_unsloth_gemma4_clippable_linear_patched", False):
+        return
+
+    def create_and_replace(
+        self,
+        peft_config,
+        adapter_name,
+        target,
+        target_name,
+        parent,
+        current_key=None,
+        **kwargs,
+    ):
+        # Match by identity OR name+structure: the compiler emits a duplicate
+        # Gemma4ClippableLinear, so a compiled model's modules aren't isinstance of the
+        # transformers class (breaks a 2nd adapter, e.g. GRPO "ref"). #6089
+        if isinstance(target, Gemma4ClippableLinear) or (
+            type(target).__name__ == "Gemma4ClippableLinear" and hasattr(target, "linear")
+        ):
+            return original_create_and_replace(
+                self,
+                peft_config,
+                adapter_name,
+                target.linear,
+                "linear",
+                target,
+                current_key=current_key,
+                **kwargs,
+            )
+        return original_create_and_replace(
+            self,
+            peft_config,
+            adapter_name,
+            target,
+            target_name,
+            parent,
+            current_key=current_key,
+            **kwargs,
+        )
+
+    create_and_replace._unsloth_gemma4_clippable_linear_patched = True
+    create_and_replace._unsloth_original_create_and_replace = original_create_and_replace
+    LoraModel._create_and_replace = create_and_replace
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4ClippableLinear_peft_reload)
+
+
 # Gemma-4 float16 MLP overflow fix.
 #
 # `down_proj(act_fn(gate_proj(x)) * up_proj(x))` overflows fp16 at layers.0
-# (E2B) / layers.1 (E4B): the product + fp16 matmul accumulator saturate to
-# +-inf, poison the residual stream, and generation samples NaN logits that
-# trip the CUDA categorical sampler on GRPO step ~2.
-#
-# Fix: fp32 gate*up, clamp to a safe bound, fp16 cast, nan_to_num on the
-# down_proj output. Gated on gate output dtype so bf16/fp32 users see no
-# change and no env flag is required. RMSNorm / Attention / Embedding
-# patches are unnecessary (verified by bisection - identical loss/kl/grad
-# trajectories).
+# (E2B) / layers.1 (E4B): product + matmul accumulator saturate to +-inf,
+# poison the residual stream, and generation samples NaN logits that trip the
+# CUDA categorical sampler on GRPO step ~2. Fix: fp32 gate*up, clamp to a safe
+# bound, fp16 cast, nan_to_num. Gated on gate dtype so bf16/fp32 see no change.
 
 
 def patch_Gemma4TextMLP():
-    """fp16 overflow clamp for Gemma4TextMLP.
-
-    Does gate*up in fp32, clamps to a safe fp16 bound, then nan_to_nums
-    the down_proj output. Self-gated on gate dtype - no-op on bf16/fp32.
-    """
+    """fp16 overflow clamp for Gemma4TextMLP (no-op on bf16/fp32)."""
     try:
         import transformers.models.gemma4.modeling_gemma4 as mod
     except ImportError:
@@ -637,13 +574,12 @@ def patch_Gemma4TextMLP():
     except AttributeError as e:
         return raise_error("Gemma4TextMLP.forward", e)
 
-    # Largest value representable in both fp16 and bf16 (65536 rounds to
-    # fp16 inf).
+    # Largest value representable in both fp16 and bf16 (65536 rounds to fp16 inf).
     _SAFE_FP16 = 65280.0
 
     def forward(self, x):
         gate = self.gate_proj(x)
-        # Check matmul output dtype so autocast / PEFT fp16 casts are caught.
+        # Check matmul output dtype to catch autocast / PEFT fp16 casts.
         if gate.dtype != torch.float16:
             return self.down_proj(self.act_fn(gate) * self.up_proj(x))
         product = self.act_fn(gate.float()) * self.up_proj(x).float()

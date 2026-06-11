@@ -33,9 +33,8 @@ import pytest
 import torch
 
 
-# Install the shim once at session start.  All later `import mlx*` calls
-# resolve to the stubs.  The shim package lives at workspace_1/mlx_simulation/
-# (loaded via the workspace conftest.py that puts the workspace on sys.path).
+# Install the shim once at session start so all later `import mlx*` resolve to
+# the stubs (loaded via the workspace conftest.py that puts it on sys.path).
 @pytest.fixture(autouse=True, scope="session")
 def _install_mlx_shim():
     from mlx_simulation import simulate_mlx_on_torch

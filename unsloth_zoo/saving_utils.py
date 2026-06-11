@@ -30,8 +30,7 @@ from collections import defaultdict
 try:
     from transformers.integrations.mxfp4 import convert_moe_packed_tensors, convert_moe_packed_tensors_cpu
 except (ImportError, ModuleNotFoundError):
-    # Provide a fallback or a clear error if the function isn't available
-    # when not using mxfp4.
+    # Absent unless mxfp4 is in use
     convert_moe_packed_tensors     = None
     convert_moe_packed_tensors_cpu = None
 pass
@@ -116,20 +115,16 @@ def create_huggingface_repo(
     )
     username = repo_id.split("/")[0]
 
-    # Check if base_model is a local path
+    # If base_model is a local path, resolve to the original model ID so the
+    # card doesn't reference a local dir (which fails HF validation).
     base_model = model.config._name_or_path
     if os.path.exists(base_model) and os.path.isdir(base_model):
-        # Try to get the original model ID from config
         original_model_id = get_original_model_id(base_model)
         if original_model_id is not None and not os.path.exists(original_model_id):
-            # Use the original model ID if it doesn't look like a local path
             base_model = original_model_id
         else:
-            # If we can't determine the original model, use repo_id as a generic description
-            # that won't cause HF validation errors
-            base_model = repo_id
+            base_model = repo_id  # fall back to a generic, valid description
 
-    # Create model card
     content = MODEL_CARD.format(
         username   = username,
         base_model = base_model,
@@ -159,13 +154,10 @@ import os, shutil, re, functools
 
 @functools.lru_cache(maxsize = 1)
 def _active_merge_device():
-    """Pick the active accelerator family for LoRA merge math.
+    """Pick the active accelerator family for LoRA merge math, cached.
 
-    Hardcoding ``"cuda"`` breaks ROCm (AMD), XPU (Intel), and MPS (Apple
-    Silicon) backends. Routing through ``DEVICE_TYPE_TORCH`` only covers
-    cuda/xpu/hip and silently drops MPS, which the MLX backend relies on
-    for the on-host LoRA merge step. Probe the available accelerator
-    family at first call and cache the result.
+    Hardcoding "cuda" breaks ROCm/XPU/MPS; DEVICE_TYPE_TORCH drops MPS (needed
+    by the MLX backend's on-host merge). So probe at first call instead.
     """
     if torch.cuda.is_available():
         return "cuda"  # PyTorch ROCm aliases the cuda API, so this also covers HIP
@@ -202,7 +194,7 @@ def _get_modules_to_save_weight(module):
     if modules_to_save is None:
         return None
 
-    # Prefer the active/default adapter if present, else first entry
+    # Prefer the default adapter, else first entry with a weight
     for key in ("default",):
         try:
             candidate = modules_to_save[key]
@@ -284,9 +276,9 @@ pass
 
 
 def assert_same_keys(model, new_state_dict):
-    """
-    Normalize keys so MoE helper wrappers (base_layer, modules_to_save, original_module)
-    and LoRA suffixes don't trigger false mismatches. Compare only weight/bias tensors.
+    """Compare only weight/bias tensors, normalizing MoE helper wrappers
+    (base_layer, modules_to_save, original_module) and LoRA suffixes so they
+    don't trigger false mismatches.
     """
     inner_model = model.base_model.model if hasattr(model, "base_model") else model
 
@@ -302,14 +294,12 @@ def assert_same_keys(model, new_state_dict):
         )
 
     def _normalize(key: str) -> str:
-        # keep only weight/bias tensors
         if not (key.endswith(".weight") or key.endswith(".bias")):
             return ""
         # strip helper wrappers
         key = key.replace(".base_layer", "")
         key = key.replace(".modules_to_save.default", "")
         key = key.replace(".original_module", "")
-        # consolidate lora default suffix
         key = key.replace(".lora_A.default", ".lora_A")
         key = key.replace(".lora_B.default", ".lora_B")
         return key
@@ -421,11 +411,10 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             new_keys = expand_module_keys(name, module, set())
             for key in new_keys:
                 if not key.endswith((".weight", ".bias")):
-                    # Check if quantized item exactly which has ".weight"
+                    # Drop quantized sub-keys (".weight."); keep gate_tanh, embedding etc
                     if ".weight." in key:
                         remove_keys.add(key)
                     else:
-                        # Keep gate_tanh, embedding etc
                         pass
             remove_keys.add(name)
         pass
@@ -549,8 +538,7 @@ def _merge_and_overwrite_lora(
     if base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4":
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("mxfp4 quantized model detected. Using safe rewrite strategy (requires temporary disk space).")
-        # Here, we fall back to the complete rewrite logic.
-        # This logic is extracted from your original 'working_code'.
+        # mxfp4 needs the full-rewrite path
         return _merge_and_overwrite_lora_mxfp4(
             save_directory, filename, lora_weights, output_dtype,
             model_class_name, base_model_is_quantized, quant_type,
@@ -573,15 +561,13 @@ def _merge_and_overwrite_lora(
         model_class_name = model_class_name,
     )
 
-    # Open original file for reading
     raw_pointer = None
     mm = None
     header_metadata = None
     length_of_header = 0
 
-    # Only if overwriting
     try:
-        # Memory map the file for direct access
+        # Memory-map for in-place overwrite
         raw_pointer = open(filename_original, "r+b")
         mm = mmap.mmap(raw_pointer.fileno(), length = 0, access = mmap.ACCESS_WRITE)
 
@@ -652,13 +638,12 @@ def _merge_and_overwrite_lora(
                 ):
                     logger.info(f"[merge_debug] First shard key example: {key}")
 
-                # FORCE memory cleanup before processing each tensor
+                # Free memory before each tensor
                 device_empty_cache()
                 device_synchronize()
 
-                # ---------- Special handling for MoE stacked expert params ----------
-                # gate_up_proj is stored fused in the model but sharded as gate_proj & up_proj per expert on disk.
-                # Gate / Up projection
+                # MoE stacked experts: gate_up_proj is fused in the model but
+                # sharded as per-expert gate_proj/up_proj on disk.
                 m_gate = re.match(r"^(.*mlp\.experts)\.(\d+)\.(gate_proj|up_proj)\.weight$", key)
                 if m_gate:
                     if UNSLOTH_ENABLE_LOGGING and len(processed_moe_gate) < 2:
@@ -666,24 +651,19 @@ def _merge_and_overwrite_lora(
                     base_prefix, expert_idx, proj_type = m_gate.groups()
                     expert_idx = int(expert_idx)
 
-                    # Skip experts that aren't present in this shard (defensive)
+                    # Skip experts not present in this shard (defensive)
                     available_experts = moe_num_experts.get(base_prefix, None)
                     if available_experts is not None and expert_idx >= available_experts:
                         continue
 
-                    # LoRA keys for gate_up_proj are stored on experts.base_layer in PEFT
-                    # Usually: model.layers.X.mlp.experts.base_layer
+                    # PEFT stores gate_up_proj LoRA on experts.base_layer
                     fused_key = base_prefix + ".base_layer"
                     lora_stats = converted_lora_weights.get(fused_key)
                     if lora_stats is None:
-                        # Fallback
                         fused_key = base_prefix + ".gate_up_proj"
                         lora_stats = converted_lora_weights.get(fused_key)
 
                     if lora_stats is not None and lora_stats.lora_A is not None and lora_stats.lora_B is not None:
-                        # Track processed (fused_key, expert_idx, proj_type) to avoid double counting if needed
-                        # But here we process per-file key, so we just process what we see.
-
                         num_experts = moe_num_experts.get(base_prefix, None)
 
                         W = file.get_tensor(key)
@@ -700,7 +680,7 @@ def _merge_and_overwrite_lora(
                         _write_tensor_direct_torch(mm, header_metadata, length_of_header, key, merged_W, W.dtype)
                         processed_mxfp4_keys.add(key)
 
-                        # We count the module as "saved" if we process at least one part of it.
+                        # Count the module once any part of it is processed
                         if fused_key not in counted_lora_modules:
                             count += 1
                             counted_lora_modules.add(fused_key)
@@ -713,7 +693,7 @@ def _merge_and_overwrite_lora(
                     available_experts = moe_num_experts.get(base_prefix, None)
                     if available_experts is not None and expert_idx >= available_experts:
                         continue
-                    fused_key = base_prefix  # down_proj LoRA stored directly on experts module
+                    fused_key = base_prefix  # down_proj LoRA stored on experts module
                     lora_stats = converted_lora_weights.get(fused_key)
                     if lora_stats is None and len(processed_moe_gate) < 3:
                         if UNSLOTH_ENABLE_LOGGING:
@@ -745,14 +725,13 @@ def _merge_and_overwrite_lora(
 
                 output_key = key
                 action_logged = False
-                # Standard 16-bit model
+                # Standard 16-bit tensor
                 W = file.get_tensor(key)
                 W_original_dtype = W.dtype
 
                 if W is None:
                     continue
 
-                # Check for LoRA merge
                 lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
                 lora_stats = converted_lora_weights.get(lora_key, None)
                 # Fallback: handle Gemma4ClippableLinear (.linear.weight -> .weight)
@@ -775,7 +754,7 @@ def _merge_and_overwrite_lora(
                         lora_stats = converted_lora_weights.get("model." + lm_head_key, None)
 
                 if lora_stats is not None:
-                    # Prefer modules_to_save weights if present
+                    # Prefer modules_to_save weights when there's no LoRA delta
                     if getattr(lora_stats, "lora_A", None) is None and getattr(lora_stats, "module", None) is not None:
                         saved_weight = _get_modules_to_save_weight(lora_stats.module)
                         if saved_weight is None and hasattr(lora_stats.module, "weight"):
@@ -788,12 +767,10 @@ def _merge_and_overwrite_lora(
                         W = _merge_lora(W, lora_stats, output_key)
                         count += 1
 
-                # FIXED: Direct tensor writing using torch
                 success = _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, W, W_original_dtype)
 
                 if not success:
-                    # Tensor was resized (e.g. new tokens added to embeddings).
-                    # Track it so the shard file can be rewritten afterwards.
+                    # Tensor was resized (e.g. vocab grew); track for rewrite
                     if not hasattr(_merge_and_overwrite_lora, "_resized"):
                         _merge_and_overwrite_lora._resized = {}
                     _merge_and_overwrite_lora._resized[output_key] = W.to(
@@ -803,7 +780,6 @@ def _merge_and_overwrite_lora(
                 del W
                 device_empty_cache()
             pass
-            # Success! Direct overwrite completed
         pass
         mm.flush()
         mm.close()
@@ -813,7 +789,7 @@ def _merge_and_overwrite_lora(
         resized = getattr(_merge_and_overwrite_lora, "_resized", {})
         if resized:
             _merge_and_overwrite_lora._resized = {}
-            # Reload the shard, replace resized tensors, save new file
+            # Reload shard, swap in resized tensors, save
             tensors = {}
             with safe_open(filename_original, framework="pt", device="cpu") as f:
                 for key in f.keys():
@@ -1007,8 +983,111 @@ def _resolve_num_experts_from_lora_stats(lora_stats, fallback):
     return fallback
 
 
-def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim):
-    """Shape-classify as 'swapped' / 'standard' / 'unknown'; returns (layout, r)."""
+# MoE-quant save-side dispatch. Each quant kind (FP8 today, room for bnb4bit
+# later) registers a handler in `unsloth_zoo.temporary_patches.moe_utils_fp8.
+# _MOE_QUANT_HANDLERS`; we consult that list via `apply_moe_quant_load`
+# instead of inlining quant-specific dequant/requant math here.
+try:
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
+        apply_moe_quant_load as _apply_moe_quant_load,
+        _MOE_QUANT_UNSAFE,
+    )
+except ImportError:
+    _apply_moe_quant_load = None
+    _MOE_QUANT_UNSAFE = object()
+
+
+def _merge_moe_expert_quant_aware(
+    role: str,
+    key: str,
+    file,
+    header_metadata,
+    lora_stats,
+    expert_idx: int,
+    num_experts: int,
+    output_dtype,
+    mm,
+    length_of_header,
+    processed_mxfp4_keys,
+    merge_fn,
+) -> bool:
+    """Read one expert weight (dequantising via the quant registry), apply
+    `merge_fn`, requantise if the handler gave a requant closure, and write
+    data + companion scales back to `mm`. True on merge+write, False on skip.
+    """
+    if key not in header_metadata:
+        return False
+
+    if _apply_moe_quant_load is None:
+        W = file.get_tensor(key)
+        requant_fn = None
+    else:
+        loaded = _apply_moe_quant_load(file, header_metadata, key)
+        if loaded[0] is _MOE_QUANT_UNSAFE:
+            _record_moe_merge_fallback(
+                role, expert_idx,
+                f"{role} base at {key} has no usable quant companion scale; "
+                "skipping LoRA merge to avoid scale-loss corruption",
+                lora_stats, None,
+            )
+            return False
+        W, requant_fn = loaded
+
+    merged = merge_fn(W, lora_stats, expert_idx, num_experts, output_dtype or W.dtype)
+
+    if requant_fn is None:
+        write_dtype = W.dtype
+    else:
+        merged, write_dtype, extra_writes = requant_fn(merged)
+        for extra_key, extra_tensor, extra_dtype in extra_writes:
+            _write_tensor_direct_torch(
+                mm, header_metadata, length_of_header,
+                extra_key, extra_tensor, extra_dtype,
+            )
+            processed_mxfp4_keys.add(extra_key)
+
+    _write_tensor_direct_torch(mm, header_metadata, length_of_header, key, merged, write_dtype)
+    processed_mxfp4_keys.add(key)
+    return True
+
+
+def _peft_paramwrapper_swaps_in_out():
+    """True if PEFT's ParamWrapper.update_layer swaps
+    `(experts, in, out) -> (experts, out, in)` for 3D non-transposed MoE params
+    (PEFT 0.19+; absent in 0.18-).
+
+    Uses `peft.__version__`, falling back to a source check for
+    `_did_swap_in_out_features` when no version string is available.
+    """
+    try:
+        from peft import __version__ as _peft_version
+        major, minor = _peft_version.split(".")[:2]
+        return (int(major), int(minor)) >= (0, 19)
+    except Exception:
+        pass
+    try:
+        from peft.tuners.lora.layer import ParamWrapper
+        # PEFT 0.19's update_layer references `_did_swap_in_out_features`; the
+        # attribute is set on instances, not the class, so a hasattr check on
+        # the class doesn't suffice — fall back to source inspection.
+        import inspect
+        return "_did_swap_in_out_features" in inspect.getsource(ParamWrapper.update_layer)
+    except Exception:
+        return True  # assume modern PEFT
+
+
+_PEFT_AMBIGUOUS_LAYOUT_DEFAULT = "standard" if _peft_paramwrapper_swaps_in_out() else "swapped"
+
+
+def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim, lora_module=None):
+    """Shape-classify as 'swapped' / 'standard' / 'unknown'; returns (layout, r).
+
+    When 2*I == H for the fused gate_up_proj, both checks pass. That ambiguous
+    case resolves on whether PEFT swapped in/out features: 0.19+ swaps ->
+    "standard", 0.18- doesn't -> "swapped". The default comes from
+    `_PEFT_AMBIGUOUS_LAYOUT_DEFAULT` (computed at import) but a caller may
+    override via a `lora_module` with `_did_swap_in_out_features` set.
+    """
     total_rank_A, dim_A = lora_A.shape
     dim_B, total_rank_B = lora_B.shape
     if total_rank_A != total_rank_B or num_experts is None or num_experts <= 0:
@@ -1016,27 +1095,47 @@ def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim):
     if total_rank_A % num_experts != 0:
         return "unknown", 0
     r = total_rank_A // num_experts
-    if dim_A == out_dim and dim_B == in_dim:
-        return "swapped", r
-    if dim_A == in_dim and dim_B == out_dim:
+    standard_match = (dim_A == in_dim and dim_B == out_dim)
+    swapped_match  = (dim_A == out_dim and dim_B == in_dim)
+    if standard_match and swapped_match:
+        # Ambiguous (typically 2*I == H): prefer the per-wrapper signal
+        # (_did_swap_in_out_features=True -> "standard"), else version default.
+        if lora_module is not None and hasattr(lora_module, "_did_swap_in_out_features"):
+            return ("standard" if lora_module._did_swap_in_out_features else "swapped"), r
+        return _PEFT_AMBIGUOUS_LAYOUT_DEFAULT, r
+    if standard_match:
         return "standard", r
+    if swapped_match:
+        return "swapped", r
     return "unknown", r
 
 
 def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_dtype, *, role):
-    """Per-expert merge for gate_proj / up_proj. role='gate' -> first I, 'up' -> last I."""
+    """Per-expert merge for gate_proj/up_proj (role='gate' -> first I, 'up' -> last I)."""
     if lora_stats is None or lora_stats.lora_A is None or lora_stats.lora_B is None:
         return W
     _MOE_MERGE_STATE["attempted"] += 1
     try:
         num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
         if num_experts is None or num_experts <= 0:
-            num_experts = lora_stats.lora_A.shape[0] // max(1, getattr(lora_stats, "rank", 0) or 1)
+            rank = getattr(lora_stats, "rank", 0) or 0
+            if rank <= 0:
+                # No num_experts and no rank: `total_rank // 1` would give a
+                # degenerate r=1 slicing that passes the shape check but emits a
+                # wrong delta silently. Refuse to merge.
+                _record_moe_merge_fallback(
+                    role, expert_idx,
+                    "num_experts and lora_stats.rank both missing — cannot derive per-expert slicing",
+                    lora_stats, tuple(W.shape),
+                )
+                return W
+            num_experts = lora_stats.lora_A.shape[0] // rank
 
         I, H = W.shape
         layout, r = _detect_moe_lora_layout(
             lora_stats.lora_A, lora_stats.lora_B,
             num_experts = num_experts, out_dim = 2 * I, in_dim = H,
+            lora_module = getattr(lora_stats, "module", None),
         )
         if layout == "unknown" or r <= 0:
             _record_moe_merge_fallback(
@@ -1051,6 +1150,11 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
             _record_moe_merge_fallback(role, expert_idx, "expert_idx out of range", lora_stats, (I, H))
             return W
 
+        # unsloth's MoE forward (temporary_patches/moe_utils.py
+        # `_canonical_lora_weights_for_grouped_mm`) views lora_B as
+        # (out, num_experts, r) — contiguous-r columns per expert. Must match
+        # here so the merged checkpoint reproduces the training-time forward.
+        # (unsloth bypasses PEFT's get_delta_weight via patch_param_wrapper_for_moe.)
         a_slice = lora_stats.lora_A[start:end, :]
         b_slice = lora_stats.lora_B[:, start:end]
         device  = _active_merge_device()
@@ -1097,12 +1201,21 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
     try:
         num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
         if num_experts is None or num_experts <= 0:
-            num_experts = lora_stats.lora_A.shape[0] // max(1, getattr(lora_stats, "rank", 0) or 1)
+            rank = getattr(lora_stats, "rank", 0) or 0
+            if rank <= 0:
+                _record_moe_merge_fallback(
+                    "down", expert_idx,
+                    "num_experts and lora_stats.rank both missing — cannot derive per-expert slicing",
+                    lora_stats, tuple(down_W.shape),
+                )
+                return down_W
+            num_experts = lora_stats.lora_A.shape[0] // rank
 
         H, I = down_W.shape
         layout, r = _detect_moe_lora_layout(
             lora_stats.lora_A, lora_stats.lora_B,
             num_experts = num_experts, out_dim = H, in_dim = I,
+            lora_module = getattr(lora_stats, "module", None),
         )
         if layout == "unknown" or r <= 0:
             _record_moe_merge_fallback(
@@ -1117,6 +1230,7 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
             _record_moe_merge_fallback("down", expert_idx, "expert_idx out of range", lora_stats, (H, I))
             return down_W
 
+        # See _merge_moe_gate_or_up_expert for the slicing convention rationale.
         a_slice = lora_stats.lora_A[start:end, :]
         b_slice = lora_stats.lora_B[:, start:end]
         device  = _active_merge_device()
@@ -1367,37 +1481,26 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
             if is_gate:
                 gate_key = f"{prefix}.{expert_idx}.gate_proj.weight"
                 up_key   = f"{prefix}.{expert_idx}.up_proj.weight"
-
-                # Check for gate_proj
-                if gate_key in header_metadata:
-                    gate_W = file.get_tensor(gate_key)
-                    merged_gate = _merge_moe_gate_expert(
-                        gate_W, lora_stats, expert_idx, num_experts, output_dtype or gate_W.dtype
-                    )
-                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, gate_key, merged_gate, gate_W.dtype)
-                    processed_mxfp4_keys.add(gate_key)
+                if _merge_moe_expert_quant_aware(
+                    "gate", gate_key, file, header_metadata, lora_stats,
+                    expert_idx, num_experts, output_dtype, mm, length_of_header,
+                    processed_mxfp4_keys, _merge_moe_gate_expert,
+                ):
                     module_updated = True
-
-                # Check for up_proj
-                if up_key in header_metadata:
-                    up_W = file.get_tensor(up_key)
-                    merged_up = _merge_moe_up_expert(
-                        up_W, lora_stats, expert_idx, num_experts, output_dtype or up_W.dtype
-                    )
-                    _write_tensor_direct_torch(mm, header_metadata, length_of_header, up_key, merged_up, up_W.dtype)
-                    processed_mxfp4_keys.add(up_key)
+                if _merge_moe_expert_quant_aware(
+                    "up", up_key, file, header_metadata, lora_stats,
+                    expert_idx, num_experts, output_dtype, mm, length_of_header,
+                    processed_mxfp4_keys, _merge_moe_up_expert,
+                ):
                     module_updated = True
             else:
                 down_key = f"{prefix}.{expert_idx}.down_proj.weight"
-                if down_key not in header_metadata:
-                    continue
-                down_W = file.get_tensor(down_key)
-                merged_down = _merge_moe_down_proj_expert(
-                    down_W, lora_stats, expert_idx, num_experts, output_dtype or down_W.dtype
-                )
-                _write_tensor_direct_torch(mm, header_metadata, length_of_header, down_key, merged_down, down_W.dtype)
-                processed_mxfp4_keys.add(down_key)
-                module_updated = True
+                if _merge_moe_expert_quant_aware(
+                    "down", down_key, file, header_metadata, lora_stats,
+                    expert_idx, num_experts, output_dtype, mm, length_of_header,
+                    processed_mxfp4_keys, _merge_moe_down_proj_expert,
+                ):
+                    module_updated = True
         if module_updated and not already_counted:
             count += 1
             counted_lora_modules.add(lora_key)
@@ -1412,8 +1515,13 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
       - Standard (Gemma4):    (E, 2*I, H) with lora_A (E*R, H), lora_B (2*I, E*R)
     is_transposed: if provided, overrides dimension-based heuristic (needed when dims are equal).
     """
+    _MOE_MERGE_STATE["attempted"] += 1
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
+            _record_moe_merge_fallback(
+                "fused_gate_up", -1, "lora_A or lora_B is None",
+                lora_stats, tuple(gate_up_W.shape),
+            )
             return gate_up_W
 
         num_experts, dim1, dim2 = gate_up_W.shape
@@ -1421,10 +1529,20 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
         dim_B, total_rank_B = lora_stats.lora_B.shape
 
         if total_rank_B != total_rank:
+            _record_moe_merge_fallback(
+                "fused_gate_up", -1,
+                f"total_rank mismatch (A.shape[0]={total_rank}, B.shape[1]={total_rank_B})",
+                lora_stats, tuple(gate_up_W.shape),
+            )
             return gate_up_W
 
         rank = total_rank // num_experts
         if total_rank % num_experts != 0:
+            _record_moe_merge_fallback(
+                "fused_gate_up", -1,
+                f"total_rank {total_rank} not divisible by num_experts {num_experts}",
+                lora_stats, tuple(gate_up_W.shape),
+            )
             return gate_up_W
 
         if is_transposed is not None:
@@ -1434,6 +1552,11 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
         elif dim_A == dim2 and dim_B == dim1:
             use_transpose = False
         else:
+            _record_moe_merge_fallback(
+                "fused_gate_up", -1,
+                f"layout ambiguous (W.shape={tuple(gate_up_W.shape)}, A.shape={tuple(lora_stats.lora_A.shape)}, B.shape={tuple(lora_stats.lora_B.shape)})",
+                lora_stats, tuple(gate_up_W.shape),
+            )
             return gate_up_W
 
         device = _active_merge_device()
@@ -1441,6 +1564,9 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
 
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
+            # lora_B is contiguous-r per expert (see moe_utils.py
+            # _canonical_lora_weights_for_grouped_mm); must match for the saved
+            # checkpoint to reproduce the training-time forward.
             a_slice = lora_stats.lora_A[start:end, :]
             b_slice = lora_stats.lora_B[:, start:end]
             delta = b_slice.to(
@@ -1451,8 +1577,13 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
                 delta.T if use_transpose else delta, alpha=lora_stats.alpha
             )
 
+        _MOE_MERGE_STATE["applied"] += 1
         return gate_up_merged.to(output_dtype)
-    except Exception:
+    except Exception as exc:
+        _record_moe_merge_fallback(
+            "fused_gate_up", -1, repr(exc),
+            lora_stats, tuple(gate_up_W.shape),
+        )
         return gate_up_W
 
 
@@ -1464,8 +1595,13 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
       - Standard (Gemma4):    (E, H, I) with lora_A (E*R, H), lora_B (I, E*R)
     is_transposed: if provided, overrides dimension-based heuristic (needed when H==I).
     """
+    _MOE_MERGE_STATE["attempted"] += 1
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
+            _record_moe_merge_fallback(
+                "fused_down", -1, "lora_A or lora_B is None",
+                lora_stats, tuple(down_W.shape),
+            )
             return down_W
 
         num_experts, dim1, dim2 = down_W.shape
@@ -1473,10 +1609,20 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
         dim_B, total_rank_B = lora_stats.lora_B.shape
 
         if total_rank_B != total_rank:
+            _record_moe_merge_fallback(
+                "fused_down", -1,
+                f"total_rank mismatch (A.shape[0]={total_rank}, B.shape[1]={total_rank_B})",
+                lora_stats, tuple(down_W.shape),
+            )
             return down_W
 
         rank = total_rank // num_experts
         if total_rank % num_experts != 0:
+            _record_moe_merge_fallback(
+                "fused_down", -1,
+                f"total_rank {total_rank} not divisible by num_experts {num_experts}",
+                lora_stats, tuple(down_W.shape),
+            )
             return down_W
 
         if is_transposed is not None:
@@ -1486,6 +1632,11 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
         elif dim_A == dim2 and dim_B == dim1:
             use_transpose = False
         else:
+            _record_moe_merge_fallback(
+                "fused_down", -1,
+                f"layout ambiguous (W.shape={tuple(down_W.shape)}, A.shape={tuple(lora_stats.lora_A.shape)}, B.shape={tuple(lora_stats.lora_B.shape)})",
+                lora_stats, tuple(down_W.shape),
+            )
             return down_W
 
         device = _active_merge_device()
@@ -1493,6 +1644,7 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
 
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
+            # See _merge_moe_fused_gate_up_expert for the slicing rationale.
             a_slice = lora_stats.lora_A[start:end, :]
             b_slice = lora_stats.lora_B[:, start:end]
             delta = b_slice.to(
@@ -1503,8 +1655,13 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
                 delta.T if use_transpose else delta, alpha=lora_stats.alpha
             )
 
+        _MOE_MERGE_STATE["applied"] += 1
         return down_merged.to(output_dtype)
-    except Exception:
+    except Exception as exc:
+        _record_moe_merge_fallback(
+            "fused_down", -1, repr(exc),
+            lora_stats, tuple(down_W.shape),
+        )
         return down_W
 
 
@@ -1552,16 +1709,15 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
             W = None
             output_key = key
             action_logged = False
-            # --- START OF MODIFIED LOGIC ---
 
-            # This block handles ALL keys from a hybrid MXFP4 file.
+            # Handle all keys from a hybrid MXFP4 file
             if key.endswith("_blocks"):
                 if convert_moe_packed_tensors is None:
                     raise ImportError("MXFP4 dequantization is required, but `convert_moe_packed_tensors` could not be imported.")
 
                 base_name = key[:-len("_blocks")]
                 scales_key = base_name + "_scales"
-                output_key = base_name # Correct naming without .weight
+                output_key = base_name  # name without .weight
                 if scales_key not in safetensor_keys:
                     warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
                     continue
@@ -1571,14 +1727,12 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 device_synchronize()
                 device_empty_cache()
 
-                # Determine optimal device and chunk size for mxfp4 dequantization
+                # Pick device + chunk size for mxfp4 dequantization
                 device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
                     blocks_tensor, scales_tensor
                 )
 
-                # Apply dequantization with optimal parameters
                 if device_type == 'cpu':
-                    # Use CPU-optimized version
                     try:
                         from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
                         W = convert_moe_packed_tensors_cpu(
@@ -1587,12 +1741,10 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                         if UNSLOTH_ENABLE_LOGGING:
                             logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
                     except ImportError:
-                        # Fallback to original function
                         W = convert_moe_packed_tensors(
                             blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                         ).transpose(1, 2).contiguous()
                 else:
-                    # Use GPU version (original or patched)
                     W = convert_moe_packed_tensors(
                         blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                     ).transpose(1, 2).contiguous()
@@ -1615,19 +1767,17 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 continue
 
             else:
-                # Handle the 16-bit tensors (like attention layers)
-                # that are present in the same file as the MXFP4 tensors.
+                # 16-bit tensors (e.g. attention) coexisting with MXFP4 tensors
                 W = file.get_tensor(key)
 
 
-            # Remove .weight suffix to match LoRA key format
             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
             lora_stats = converted_lora_weights.get(lora_key, None)
 
             if W is not None and lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                 if not action_logged:
                     count += 1
-                    W = _merge_lora(W, lora_stats, output_key)  # Assume _merge_lora is defined elsewhere
+                    W = _merge_lora(W, lora_stats, output_key)
                     action_logged = True
 
             if W is None:
@@ -2486,10 +2636,8 @@ def _try_copy_all_from_cache(
     hf_cache_dir: Optional[Path],
     token: Optional[str],
 ) -> bool:
-    """
-    Checks if ALL specified files exist in the HF cache. If yes, creates the
-    target_dir_str and copies ALL files into it using os functions.
-    Returns True if successful, False otherwise.
+    """If ALL files exist in the HF cache, copy them into target_dir_str.
+    Returns True on success, False otherwise.
     """
     from huggingface_hub.errors import LocalEntryNotFoundError
 
@@ -2574,38 +2722,30 @@ pass
 
 def _get_hf_cache_dir() -> Optional[Path]:
     """Determines the Hugging Face Hub cache directory."""
-    potential_paths = []
-    if "HF_HUB_CACHE" in os.environ:
-        potential_paths.append(Path(os.environ["HF_HUB_CACHE"]))
-    if "HF_HOME" in os.environ:
-        potential_paths.append(Path(os.environ["HF_HOME"]) / "hub")
-    potential_paths.append(Path.home() / ".cache" / "huggingface" / "hub")
+    # Resolve through hf_cache._active_caches so cache reuse sees the same
+    # location Hub uses (XDG_CACHE_HOME, legacy HUGGINGFACE_HUB_CACHE,
+    # expanded env values, unresolvable-home handling).
+    from .hf_cache import _active_caches
+    _, cache_dir, _ = _active_caches()
 
-    for cache_dir in potential_paths:
+    if cache_dir is not None:
         try:
-            # 1. Check if it exists and is a directory
             if cache_dir.is_dir():
-                # 2. Check if we have read/write/execute access
-                # Need W/X for potential lock files or internal operations by huggingface_hub
+                # Need R/W/X for HF's lock files and internal operations
                 if os.access(cache_dir, os.R_OK | os.W_OK | os.X_OK):
                     print(f"Found HuggingFace hub cache directory: {cache_dir.resolve()}")
-                    return cache_dir.resolve() # Return absolute path
+                    return cache_dir.resolve()
                 else:
                     print(f"Warning: Found cache directory {cache_dir}, but lack R/W/X permissions. Cannot use cache.")
-                    # Don't check other paths if we found the prioritized one but lack permissions
                     return None
-            # If it exists but is not a dir, it's problematic, stop checking.
             elif cache_dir.exists():
+                 # Exists but not a directory: bail
                  print(f"Warning: Path {cache_dir} exists but is not a directory. Cannot use cache.")
                  return None
-            # If it doesn't exist, continue to check the next potential path
-
         except Exception as e:
-            # Handle potential issues like symlink loops, permissions errors during check
-            print(f"Warning: Error accessing potential cache path {cache_dir}: {e}. Checking next option.")
-            continue # Try the next path
+            # symlink loops, permission errors, etc.
+            print(f"Warning: Error accessing potential cache path {cache_dir}: {e}.")
 
-    # If none of the paths worked
     print("No existing and accessible Hugging Face cache directory found.")
     return None
 pass
@@ -2651,7 +2791,6 @@ def incremental_save_pretrained(
         save_pretrained[span[1]:]
     pass
 
-    # Find the main loop
     if "for shard_file, tensors in filename_to_tensors" not in save_pretrained:
         raise RuntimeError("Unsloth: Failed to find `for shard_file, tensors in filename_to_tensors`")
     for_loop = re.search(
@@ -2934,12 +3073,11 @@ def get_original_model_id(local_path: str):
 pass
 
 def _get_checkpoint_conversion_mapping(model_class_name):
-    """Get the checkpoint conversion mapping for a specific model class"""
+    """Get a model class's _checkpoint_conversion_mapping ({} if absent)."""
     try:
-        # Dynamically import the model class
         module = __import__('transformers', fromlist=[model_class_name])
         model_class = getattr(module, model_class_name)
-        return getattr(model_class, '_checkpoint_conversion_mapping', {})  # Returns {} if attribute doesn't exist
+        return getattr(model_class, '_checkpoint_conversion_mapping', {})
     except (ImportError, AttributeError):
         return {}
 pass
@@ -2952,54 +3090,44 @@ def detect_keys_format(keys_to_check, forward_mapping):
     count_matches_old_pattern = 0
     count_matches_new_pattern = 0
 
-    # Compile regex patterns for efficiency if called multiple times with same mapping (though here it's per call)
     old_regex_compiled = [re.compile(p) for p in forward_mapping.keys()]
-    # For new patterns (values of forward_mapping), treat them as literal prefixes to match
+    # New patterns (mapping values) are matched as literal prefixes
     new_regex_compiled = [re.compile(r"^" + re.escape(val)) for val in forward_mapping.values()]
 
     for key in keys_to_check:
         if not isinstance(key, str): continue
 
-        # A key is "new" if it starts with one of the new_prefix_strings (values of forward_mapping)
-        # A key is "old" if it matches one of the old_pattern_regex (keys of forward_mapping)
-        #   AND it does NOT start with one of the new_prefix_strings (to avoid double counting if patterns overlap badly)
-
+        # "new" = starts with a mapping value; "old" = matches a mapping key
+        # but not a new prefix (avoids double counting on overlap)
         matched_new = any(r.match(key) for r in new_regex_compiled)
         matched_old = any(r.match(key) for r in old_regex_compiled)
 
         if matched_new:
             count_matches_new_pattern += 1
-        elif matched_old: # Only count as old if not already counted as new
+        elif matched_old:
             count_matches_old_pattern += 1
 
-    # Decision logic
     if count_matches_new_pattern > 0 and count_matches_old_pattern == 0: return "new"
     if count_matches_old_pattern > 0 and count_matches_new_pattern == 0: return "old"
 
-    # If mixed,
+    # Mixed: go with the majority
     if count_matches_new_pattern > count_matches_old_pattern: return "new"
     if count_matches_old_pattern > count_matches_new_pattern: return "old"
 
-    return "new" # Default, assuming most models/keys will be in the "new" (current HF) format.
+    return "new" # Default to current HF format
 pass
 
 def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     """Infer missing key prefixes by matching LoRA keys against safetensor keys.
 
-    Some composite models (e.g. Qwen3.5) store safetensors with an extra
-    prefix like ``model.language_model.`` that differs from the runtime key
-    namespace ``model.``.  When no explicit ``_checkpoint_conversion_mapping``
-    exists, this helper detects the discrepancy and remaps LoRA keys so that
-    the merge loop can match them.
+    Composite models (e.g. Qwen3.5) may store safetensors under an extra prefix
+    (``model.language_model.``) that differs from the runtime ``model.``
+    namespace. With no ``_checkpoint_conversion_mapping``, remap per key:
+    already-matching keys are kept; keys with a single prefix candidate are
+    remapped; unmatched keys (e.g. fused MoE params) inherit the most common
+    inferred prefix.
 
-    Uses per-key matching: keys that already match a safetensor key are
-    preserved as-is, keys with a single unambiguous prefix candidate are
-    remapped. Keys that cannot be suffix-matched (e.g. MoE expert fused
-    parameters with different naming) inherit the most common inferred
-    prefix from the keys that were successfully matched.
-
-    Returns a remapped ``defaultdict`` on success, or ``None`` if no keys
-    were remapped (caller should fall back to returning keys unchanged).
+    Returns the remapped ``defaultdict``, or ``None`` if nothing was remapped.
     """
     if not safetensor_keys:
         return None
@@ -3014,11 +3142,11 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
         if not isinstance(k, str):
             remapped[k] = v
             continue
-        # Already matches a safetensor key -- keep as-is
+        # Already matches a safetensor key
         if (k + ".weight") in sf_key_set:
             remapped[k] = v
             continue
-        # Find all unique non-empty prefix candidates for this key
+        # Unique non-empty prefix candidates for this key
         suffix = k + ".weight"
         candidates = list(dict.fromkeys(
             sf_key[: -len(suffix)]
@@ -3036,9 +3164,7 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     if not changed:
         return None
 
-    # For keys that couldn't be suffix-matched (e.g. MoE expert fused
-    # parameters whose safetensor naming differs from LoRA naming),
-    # apply the most common prefix inferred from successful matches.
+    # Unmatched keys (e.g. fused MoE params): use the most common inferred prefix
     if unmatched_keys and inferred_prefixes:
         from collections import Counter
         common_prefix = Counter(inferred_prefixes).most_common(1)[0][0]
@@ -3058,7 +3184,6 @@ def _convert_lora_keys_to_safetensor_format(
 ):
     import re
 
-    # Get the forward mapping from the model class itself
     forward_mapping = _get_checkpoint_conversion_mapping(model_class_name)
 
     if not forward_mapping:
@@ -3067,11 +3192,9 @@ def _convert_lora_keys_to_safetensor_format(
             return remapped
         return defaultdict(lora_weights.default_factory, lora_weights)
 
-    # Create reverse mapping
     reverse_mapping = {}
     for pattern, replacement in forward_mapping.items():
         reverse_mapping[replacement] = pattern
-    # Determine formats
     lora_key_format_assumed = "new"
     shard_key_format = detect_keys_format(safetensor_keys, forward_mapping)
 
@@ -3087,8 +3210,7 @@ def _convert_lora_keys_to_safetensor_format(
         applied_conversion_for_this_key = False
 
         if lora_key_format_assumed == "new" and shard_key_format == "old":
-            # LoRA keys are new format, shard is old style -> convert LoRA key to old style
-            # Use reverse mapping
+            # New LoRA keys, old shard -> convert LoRA key to old via reverse mapping
             for pattern, replacement in reverse_mapping.items():
                 replacement = re.sub(r"\^?([^(?]+).*", r"\1", replacement.lstrip("^"))
                 temp_key, n_replace = re.subn(pattern, replacement, converted_key_for_lookup)
@@ -3098,7 +3220,7 @@ def _convert_lora_keys_to_safetensor_format(
                     break
 
         elif lora_key_format_assumed == "old" and shard_key_format == "new":
-            # LoRA keys are old format, shard is new format -> convert LoRA key to new style
+            # Old LoRA keys, new shard -> convert LoRA key to new
             for pattern, replacement in forward_mapping.items():
                 temp_key, n_replace = re.subn(pattern, replacement, converted_key_for_lookup)
                 if n_replace > 0:

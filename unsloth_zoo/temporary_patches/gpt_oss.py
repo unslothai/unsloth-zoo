@@ -46,14 +46,12 @@ from .utils import (
 from ..hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
 
-# MXFP4 configuration
-# Set UNSLOTH_MXFP4_NO_DEQUANTIZE=1 to keep MXFP4 weights quantized (requires triton_kernels)
-# Otherwise, MXFP4 weights will be dequantized to bf16 for LoRA training
+# UNSLOTH_MXFP4_NO_DEQUANTIZE=1 keeps MXFP4 quantized (needs triton_kernels); else dequantized to bf16 for LoRA.
 UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0") == "1"
 
 
 def _check_triton_kernels_available():
-    """Check if OpenAI's triton_kernels package is available for MXFP4."""
+    """Is OpenAI's triton_kernels package available for MXFP4."""
     try:
         from triton_kernels import matmul_ogs, swiglu
 
@@ -319,12 +317,12 @@ def patch_gpt_oss():
 
         @property
         def gate_up_proj(self):
-            """Return gate_up_proj tensor (created from blocks/scales or stored directly)."""
-            # Check if already set as an attribute (from checkpoint loading or previous dequantization)
+            """gate_up_proj tensor, from blocks/scales or stored directly."""
+            # Already set from checkpoint loading or previous dequantization
             if "_gate_up_proj" in self.__dict__:
                 return self.__dict__["_gate_up_proj"]
 
-            # Check if MXFP4 weights are present (blocks and scales are not all zeros)
+            # MXFP4 weights present when blocks/scales are not all zeros
             blocks_valid = (
                 self.gate_up_proj_blocks.device.type != "meta"
                 and self.gate_up_proj_blocks.numel() > 0
@@ -332,18 +330,15 @@ def patch_gpt_oss():
             )
 
             if not blocks_valid:
-                # No MXFP4 weights and no regular weights loaded
                 raise AttributeError(
                     f"Mxfp4GptOssExperts.gate_up_proj: No weights loaded. "
                     f"Try 'openai/gpt-oss-20b' with load_in_4bit=True instead."
                 )
 
-            # MXFP4 weights present - dequantize them
+            # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
             try:
                 from transformers.integrations.mxfp4 import dequantize
-                # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim)
                 dequantized = dequantize(self.gate_up_proj_blocks, self.gate_up_proj_scales)
-                # Cache for future accesses
                 self.__dict__["_gate_up_proj"] = dequantized
                 return dequantized
             except Exception as e:
@@ -354,12 +349,12 @@ def patch_gpt_oss():
 
         @gate_up_proj.setter
         def gate_up_proj(self, value):
-            """Set gate_up_proj tensor (called during checkpoint loading)."""
+            """Set gate_up_proj tensor (during checkpoint loading)."""
             self.__dict__["_gate_up_proj"] = value
 
         @property
         def down_proj(self):
-            """Return down_proj tensor (created from blocks/scales or stored directly)."""
+            """down_proj tensor, from blocks/scales or stored directly."""
             if "_down_proj" in self.__dict__:
                 return self.__dict__["_down_proj"]
 
@@ -374,12 +369,10 @@ def patch_gpt_oss():
                     f"Mxfp4GptOssExperts.down_proj: No weights loaded."
                 )
 
-            # MXFP4 weights present - dequantize them
+            # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
             try:
                 from transformers.integrations.mxfp4 import dequantize
-                # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim)
                 dequantized = dequantize(self.down_proj_blocks, self.down_proj_scales)
-                # Cache for future accesses
                 self.__dict__["_down_proj"] = dequantized
                 return dequantized
             except Exception as e:
@@ -389,7 +382,7 @@ def patch_gpt_oss():
 
         @down_proj.setter
         def down_proj(self, value):
-            """Set down_proj tensor (called during checkpoint loading)."""
+            """Set down_proj tensor (during checkpoint loading)."""
             self.__dict__["_down_proj"] = value
 
         def forward(
@@ -486,8 +479,7 @@ def patch_gpt_oss():
                 scales_attr = f"{proj}_scales"
                 blocks = getattr(module, blocks_attr)
                 scales = getattr(module, scales_attr)
-                # Check if both blocks and scales both not on meta device AND not all zeros
-                # (if blocks are all zeros, they're from initialization, not from checkpoint)
+                # Valid = blocks/scales off meta AND non-zero (all-zeros means init, not checkpoint)
                 blocks_valid = (
                     blocks.device.type != "meta"
                     and scales.device.type != "meta"
@@ -573,45 +565,31 @@ TEMPORARY_PATCHES.append(patch_gpt_oss)
 
 class ParameterModule(nn.Linear):
     """
-    A module that wraps a parameter to look like a Linear layer for PEFT.
-    It inherits from nn.Linear but manages 3D <-> 2D weight conversion.
-    Unsloth grouped_mm requires 3D weights:
-      - gate_up: (E, H, 2I)
-      - down: (E, I, H)
-    PEFT Linear requires 2D weights: (Out, In).
-    We store the weight as 2D for PEFT, and reshape for Unsloth via get_param().
+    Wraps a parameter as an nn.Linear for PEFT, managing 3D <-> 2D weight conversion.
+    Unsloth grouped_mm needs 3D weights (gate_up: (E, H, 2I); down: (E, I, H)); PEFT
+    Linear needs 2D (Out, In). Stored 2D for PEFT, reshaped for Unsloth via get_param().
     """
 
     def __init__(
         self, in_features, out_features, shape_3d, permute_to_2d, permute_to_3d
     ):
-        # Initialize nn.Linear (creates weight of size (out, in))
         super().__init__(in_features, out_features, bias=False)
         self.shape_3d = shape_3d
         self.permute_to_2d = permute_to_2d
         self.permute_to_3d = permute_to_3d
-
-        # We expect the caller to set the weight content correctly.
-        # nn.Linear initialized it randomly. We will overwrite it.
+        # Caller must overwrite the randomly initialized weight.
 
     def extra_repr(self):
         return f"in_features={self.in_features}, out_features={self.out_features}, shape_3d={self.shape_3d}"
 
     def get_param(self):
-        """Restores the 3D weight for Unsloth computation."""
-        # 2D weight (Out, In) -> View (Unflattened 2D) -> Permute -> 3D(E, ...)
-        # We need to know the unflattened shape.
-        # gate_up: 2D (E*2I, H). View (E, 2I, H). Permute(0,2,1) -> (E, H, 2I).
-        # We store (E*2I, H).
-        # To restore: View (E, 2I, H)?
-        # (E, 2I, H) is shape_3d permuted by permute_to_2d.
-
+        """Restore the 3D weight for Unsloth computation."""
+        # 2D (Out, In) -> view to (E, 2I, H) [shape_3d permuted by permute_to_2d] -> permute -> 3D
         unflattened_shape = [self.shape_3d[i] for i in self.permute_to_2d]
         return self.weight.view(*unflattened_shape).permute(*self.permute_to_3d).contiguous()
 
     def set_weight_from_3d(self, weight_3d):
-        """Sets the 2D weight from a 3D tensor."""
-        # 3D -> Permute -> Flatten
+        """Set the 2D weight from a 3D tensor."""
         weight_2d = weight_3d.permute(*self.permute_to_2d).reshape(self.out_features, self.in_features)
         self.weight.data.copy_(weight_2d)
 
@@ -625,18 +603,12 @@ class ParameterModule(nn.Linear):
         unexpected_keys,
         error_msgs,
     ):
-        # 'gate_up_proj' in checkpoint is 3D.
-        # We need to load it into 'gate_up_proj.weight' (2D).
-        # key is '...gate_up_proj'
+        # Checkpoint 'gate_up_proj' is 3D; load into 'gate_up_proj.weight' (2D)
         key = prefix[:-1]
 
         if key in state_dict:
-            # Found the parameter (likely from original model structure where it was a Param)
             val = state_dict[key]
-            # Convert 3D val to 2D
             val_2d = val.permute(*self.permute_to_2d).reshape(self.out_features, self.in_features)
-
-            # Put into 'weight' key
             state_dict[prefix + "weight"] = val_2d
             del state_dict[key]
 
@@ -661,7 +633,7 @@ def patch_gpt_oss_compiler_exports():
         raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
         return
 
-    # Export helpers so compiler generated GPT-OSS modules can resolve symbols.
+    # Export helpers so compiler-generated GPT-OSS modules can resolve symbols.
     m = transformers.models.gpt_oss.modeling_gpt_oss
     m.ParameterModule = ParameterModule
     m.swiglu_torch_forward = swiglu_torch_forward
@@ -673,10 +645,8 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_compiler_exports)
 
 class GptOssExperts(nn.Module):
     """
-    GPT OSS MoE Experts layer with 3D stacked parameters.
-    Compatible with transformers' _init_weights and supports grouped_mm with split LoRA.
-
-    Uses the same structure as the original transformers GptOssExperts:
+    GPT OSS MoE Experts layer with 3D stacked parameters; supports grouped_mm with split LoRA.
+    Same structure as transformers GptOssExperts:
     - gate_up_proj: (num_experts, hidden_size, 2 * expert_dim)
     - gate_up_proj_bias: (num_experts, 2 * expert_dim)
     - down_proj: (num_experts, expert_dim, hidden_size)
@@ -694,8 +664,7 @@ class GptOssExperts(nn.Module):
         self.limit = getattr(config, "swiglu_limit", 7.0)
         self.dtype = dtype_from_config(config)
 
-        # gate_up_proj: 3D (E, H, 2I). Target 2D (E*2I, H).
-        # Permute (0, 2, 1) -> (E, 2I, H). Reverse (0, 2, 1).
+        # gate_up_proj: 3D (E, H, 2I) -> 2D (E*2I, H); permute (0,2,1), reverse (0,2,1)
         self.gate_up_proj = ParameterModule(
             in_features=self.hidden_size,
             out_features=self.num_experts * 2 * self.expert_dim,
@@ -703,7 +672,6 @@ class GptOssExperts(nn.Module):
             permute_to_2d=(0, 2, 1),
             permute_to_3d=(0, 2, 1),
         )
-        # Initialize 3D zero tensor and set 2D weight
         self.gate_up_proj.set_weight_from_3d(
             torch.zeros(
                 self.num_experts,
@@ -715,8 +683,7 @@ class GptOssExperts(nn.Module):
 
         self.gate_up_proj_bias = nn.Parameter(torch.zeros(self.num_experts, 2 * self.expert_dim, dtype=self.dtype))
 
-        # down_proj: 3D (E, I, H). Target 2D (H, E*I).
-        # Permute (2, 0, 1) -> (H, E, I). Reverse (1, 2, 0)
+        # down_proj: 3D (E, I, H) -> 2D (H, E*I); permute (2,0,1), reverse (1,2,0)
         self.down_proj = ParameterModule(
             in_features=self.num_experts * self.expert_dim,
             out_features=self.hidden_size,
@@ -743,32 +710,25 @@ class GptOssExperts(nn.Module):
         error_msgs,
     ):
         """
-        Override to handle loading 3D tensors (gate_up_proj, down_proj) from original checkpoints.
-        The original checkpoint has these as nn.Parameter (3D tensors), but we now have
-        them as ParameterModule (nn.Linear subclass) which expects .weight as 2D tensors.
-
-        This method intercepts the 3D tensors and converts them to the 2D format
-        that ParameterModule expects.
+        Convert checkpoint 3D tensors (gate_up_proj, down_proj nn.Parameter) to the 2D
+        .weight format that ParameterModule (nn.Linear subclass) expects.
         """
-        # Handle gate_up_proj: checkpoint has 3D tensor, we need 2D for ParameterModule.weight
         gate_up_key = prefix + "gate_up_proj"
         gate_up_weight_key = prefix + "gate_up_proj.weight"
         if gate_up_key in state_dict and gate_up_weight_key not in state_dict:
             val_3d = state_dict.pop(gate_up_key)
-            # gate_up_proj: 3D (E, H, 2I) -> permute (0, 2, 1) -> (E, 2I, H) -> reshape (E*2I, H)
+            # 3D (E, H, 2I) -> permute (0,2,1) -> (E, 2I, H) -> reshape (E*2I, H)
             val_2d = val_3d.permute(0, 2, 1).reshape(self.num_experts * 2 * self.expert_dim, self.hidden_size)
             state_dict[gate_up_weight_key] = val_2d
 
-        # Handle down_proj: checkpoint has 3D tensor, we need 2D for ParameterModule.weight
         down_key = prefix + "down_proj"
         down_weight_key = prefix + "down_proj.weight"
         if down_key in state_dict and down_weight_key not in state_dict:
             val_3d = state_dict.pop(down_key)
-            # down_proj: 3D (E, I, H) -> permute (2, 0, 1) -> (H, E, I) -> reshape (H, E*I)
+            # 3D (E, I, H) -> permute (2,0,1) -> (H, E, I) -> reshape (H, E*I)
             val_2d = val_3d.permute(2, 0, 1).reshape(self.hidden_size, self.num_experts * self.expert_dim)
             state_dict[down_weight_key] = val_2d
 
-        # Call parent implementation
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -783,11 +743,8 @@ class GptOssExperts(nn.Module):
         self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
     ) -> torch.Tensor:
         """Forward using grouped_mm or loop fallback with LoRA support."""
-        # Use optimized grouped_mm if available
         if _check_torch_grouped_mm_supported():
             return forward_native_grouped_mm(self, hidden_states, router_indices, routing_weights)
-
-        # Fallback to loop-based implementation
         return torch_native_forward(self, hidden_states, router_indices, routing_weights)
 
 
@@ -796,10 +753,9 @@ pass
 
 class _RouterLinearParams(nn.Module):
     """
-    Simple parameter container that stores weight/bias like nn.Linear
-    but is NOT nn.Linear itself, so BitsAndBytes will NOT quantize it.
-    State dict keys: linear.weight, linear.bias (matching BnB 4-bit checkpoints
-    where the router was saved via an nn.Linear submodule).
+    weight/bias container like nn.Linear but NOT nn.Linear, so BitsAndBytes will NOT quantize it.
+    State dict keys linear.weight/linear.bias match BnB 4-bit checkpoints where the router was
+    saved via an nn.Linear submodule.
     """
     def __init__(self, in_features, out_features, dtype):
         super().__init__()
@@ -816,12 +772,11 @@ class GptOssTopKRouter(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_local_experts
         self.hidden_dim = config.hidden_size
-        # Use _RouterLinearParams (not nn.Linear) to avoid BnB 4-bit quantization.
-        # State dict keys are router.linear.weight / router.linear.bias, matching
-        # the BnB 4-bit checkpoint format where router was stored via nn.Linear.
+        # _RouterLinearParams (not nn.Linear) avoids BnB 4-bit quantization; keys
+        # router.linear.weight/bias match the BnB 4-bit checkpoint format.
         self.linear = _RouterLinearParams(self.hidden_dim, self.num_experts, dtype=dtype_from_config(config))
 
-    # Properties for compatibility with transformers' _init_weights which expects .weight and .bias
+    # transformers' _init_weights expects .weight and .bias
     @property
     def weight(self):
         return self.linear.weight
@@ -855,9 +810,8 @@ pass
 # BitsAndBytes 4bit compatible classes for loading pre-quantized models
 class GptOssExpertsBnb4bit(nn.Module):
     """
-    GPT OSS MoE Experts using nn.Linear layers for BitsAndBytes 4bit compatibility.
-    This version uses gate_up_projs and down_projs as ModuleLists of Linear layers,
-    which can be properly quantized with BitsAndBytes.
+    GPT OSS MoE Experts using ModuleLists of nn.Linear (gate_up_projs, down_projs)
+    so BitsAndBytes can quantize them.
     """
 
     def __init__(self, config):
@@ -880,8 +834,7 @@ class GptOssExpertsBnb4bit(nn.Module):
             for _ in range(self.num_experts)
         ])
 
-        # Provide minimal tensors for transformers _init_weights compatibility.
-        # Keep them empty to avoid allocating large bf16 weights in 4-bit mode.
+        # Empty buffers for transformers _init_weights compat; avoid large bf16 alloc in 4-bit mode.
         self.register_buffer(
             "gate_up_proj", torch.empty(0, dtype=self.dtype), persistent=False
         )
@@ -922,7 +875,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                 # Use pre-computed indices (no torch.where needed)
                 token_idx = sorted_tokens[offset:offset + count]
                 current_state = hidden_states[token_idx]
-                
+
                 gate_up = self.gate_up_projs[expert_idx](current_state)
                 gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
                 # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
@@ -961,8 +914,7 @@ pass
 
 class GptOssTopKRouterBnb4bit(nn.Module):
     """
-    GPT OSS Router using direct parameters for BitsAndBytes 4bit compatibility.
-    This version uses weight/bias as direct nn.Parameter instead of nested Linear.
+    GPT OSS Router with weight/bias as direct nn.Parameter (not nested Linear) for BnB 4bit.
     """
 
     def __init__(self, config):
@@ -1041,9 +993,8 @@ pass
 
 def patch_gpt_oss_bnb4bit():
     """
-    Patch transformers to use BnB 4bit compatible classes when loading pre-quantized models.
-    This should be called before loading models that were saved with BitsAndBytes quantization
-    using the linear-based expert structure.
+    Patch transformers to use BnB 4bit compatible classes for pre-quantized models.
+    Call before loading models saved with BitsAndBytes (linear-based expert structure).
 
     Usage:
         from unsloth_zoo.temporary_patches.gpt_oss import patch_gpt_oss_bnb4bit
@@ -1055,32 +1006,28 @@ def patch_gpt_oss_bnb4bit():
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
 
-    # Store original classes for potential restoration
+    # Store original classes for restoration
     if not hasattr(transformers.models.gpt_oss.modeling_gpt_oss, '_original_GptOssExperts'):
         transformers.models.gpt_oss.modeling_gpt_oss._original_GptOssExperts = \
             transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
         transformers.models.gpt_oss.modeling_gpt_oss._original_GptOssTopKRouter = \
             transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter
 
-    # Replace with BnB 4bit compatible versions
-    # Preserve original symbol names for compiler-generated modules.
+    # Replace with BnB 4bit versions; preserve original symbol names for compiler-generated modules.
     GptOssExpertsBnb4bit.__name__ = "GptOssExperts"
     GptOssExpertsBnb4bit.__qualname__ = "GptOssExperts"
 
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExpertsBnb4bit
-    # Use the unsloth GptOssTopKRouter (with self.linear = nn.Linear) for the router.
-    # The BnB 4-bit checkpoint stores router weights as router.linear.weight/bias.
-    # GptOssTopKRouterBnb4bit had self.weight/bias directly with a _load_from_state_dict
-    # override to remap keys, but transformers v5 bypasses _load_from_state_dict
-    # (uses accelerate's set_module_tensor_to_device), so the remapping never ran
-    # and router weights were randomly initialized - causing high loss (~4-5).
+    # Use unsloth GptOssTopKRouter (self.linear = nn.Linear): BnB 4-bit checkpoints store
+    # router.linear.weight/bias. GptOssTopKRouterBnb4bit remapped keys via _load_from_state_dict,
+    # but transformers v5 bypasses it (accelerate's set_module_tensor_to_device), so weights
+    # stayed randomly initialized -> high loss (~4-5).
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
 
     logger.info("Unsloth: Patched GPT OSS with BitsAndBytes 4bit compatible classes")
     os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "1"
 
-    # Inject BnB helpers so compiler-generated modules can import them
-    # from transformers.models.gpt_oss.modeling_gpt_oss
+    # Inject BnB helpers so compiler-generated modules can import them.
     m = transformers.models.gpt_oss.modeling_gpt_oss
     m._RouterLinearParams  = _RouterLinearParams
     m.swiglu_torch_forward = swiglu_torch_forward
@@ -1117,9 +1064,8 @@ def _normalized_unsloth_model_name() -> str:
 
 def _should_use_gpt_oss_bnb4bit() -> bool:
     """
-    Decide if GPT-OSS should use BnB-compatible 4-bit experts.
-    Default: True when load_in_4bit is active.
-    Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to force BF16 path.
+    Use BnB-compatible 4-bit experts (default when load_in_4bit active).
+    UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 forces the BF16 path.
     """
     if "gpt_oss" not in _normalized_unsloth_model_name():
         return False
@@ -1143,10 +1089,9 @@ def patch_gpt_oss_bnb4bit_auto():
     """
     if not _should_use_gpt_oss_bnb4bit():
         return
-    # BnB helpers are now injected into the transformers module by
-    # patch_gpt_oss_bnb4bit(), so the compiler can resolve all symbols.
+    # patch_gpt_oss_bnb4bit() injects BnB helpers so the compiler resolves all symbols.
     patch_gpt_oss_bnb4bit()
-    # Ensure inference path avoids torch.compile for 4-bit
+    # Inference path avoids torch.compile for 4-bit
     try:
         global moe_forward_inference
         moe_forward_inference = torch.compiler.disable(moe_forward_inference)
@@ -1160,9 +1105,11 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
 # Combo kernels uses too much VRAM for low memory GPUs
 from ..device_type import DEVICE_TYPE
 
-if DEVICE_TYPE == "xpu":
+# UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE="cuda" on GPU-less hosts, so guard
+# with is_available() like device_synchronize() does.
+if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
     device_memory = torch.xpu.memory.mem_get_info(0)[-1]
-elif DEVICE_TYPE in ("cuda", "hip"):
+elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
     device_memory = torch.cuda.memory.mem_get_info(0)[-1]
 else:
     device_memory = 0
@@ -1210,9 +1157,8 @@ def moe_forward_inference(self, hidden_states):
     num_experts = routing_weights.shape[1]
     X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
 
-    # Check if using ModuleList (old style) or 3D parameters (new style)
+    # ModuleList (old style) vs 3D parameters (new style)
     if hasattr(moe, "gate_up_projs"):
-        # ModuleList style
         gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(moe.gate_up_projs)]
         gate_up = torch.stack(gate_up_list, dim=0)
         dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
@@ -1224,8 +1170,7 @@ def moe_forward_inference(self, hidden_states):
             out_list = [down_l(fused[e].to(dtype)) for e, down_l in enumerate(moe.down_projs)]
         outs = torch.stack(out_list, dim=0)
     else:
-        # 3D parameter style (compatible with transformers)
-        # gate_up_proj: (E, hidden_size, 2*expert_dim) - bmm: (E, N, H) @ (E, H, 2I) -> (E, N, 2I)
+        # 3D parameter style: gate_up_proj (E, H, 2I); bmm (E, N, H) @ (E, H, 2I) -> (E, N, 2I)
         gate_up = torch.bmm(X_rep, moe.gate_up_proj) + moe.gate_up_proj_bias[..., None, :]
         dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
         fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit, dtype=dtype)
@@ -1233,7 +1178,7 @@ def moe_forward_inference(self, hidden_states):
         fused = fused.to(dtype)
         device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
-            # down_proj: (E, expert_dim, hidden_size) - bmm: (E, N, I) @ (E, I, H) -> (E, N, H)
+            # down_proj (E, I, H); bmm (E, N, I) @ (E, I, H) -> (E, N, H)
             outs = torch.bmm(fused.to(dtype), moe.down_proj) + moe.down_proj_bias[..., None, :]
 
     rw = routing_weights.to(dtype).transpose(0, 1).unsqueeze(-1)
@@ -1304,8 +1249,7 @@ def moe_forward_inference_bf16(self, hidden_states):
 
     moe = _unwrap_peft_experts(self.experts)
 
-    # Handle ParameterModule (which wraps nn.Linear) vs direct 3D tensor
-    # Extract weights BEFORE the compiled region
+    # Extract weights (ParameterModule wrapping nn.Linear vs direct 3D tensor) before compiled region
     gate_up_proj = moe.gate_up_proj
     if hasattr(gate_up_proj, "get_param"):
         gate_up_proj = gate_up_proj.get_param()
@@ -1371,18 +1315,15 @@ from .moe_utils import (
     select_moe_backend,
     patch_param_wrapper_for_moe,
     forward_native_grouped_mm,
+    forward_native_moe_loop,
     # torch_native_forward,
 )
 
 
 def patch_gpt_oss_moe_for_lora():
     """
-    Patch GPT OSS MoE experts for LoRA training with grouped GEMM support.
-    This patches the original GptOssExperts class (with 3D parameter tensors)
-    to use optimized grouped GEMM kernels with LoRA support.
-
-    IMPORTANT: We only patch the forward method, NOT replace the entire class.
-    This preserves the original class structure so weights load correctly.
+    Patch GptOssExperts (3D parameter tensors) forward to use grouped GEMM kernels with LoRA.
+    Only patches forward, not the class itself, so original structure loads weights correctly.
     """
     if "gpt_oss" not in _normalized_unsloth_model_name():
         return
@@ -1392,7 +1333,6 @@ def patch_gpt_oss_moe_for_lora():
     if not _is_transformers_v5():
         # Split-LoRA grouped_mm path is only needed for transformers v5+
         return
-    # First patch ParamWrapper for MoE separated LoRA
     patch_param_wrapper_for_moe()
 
     try:
@@ -1405,17 +1345,18 @@ def patch_gpt_oss_moe_for_lora():
             logger.warning(f"Unsloth: Could not patch GPT OSS MoE for LoRA: {e}")
         return
 
-    # Check if already patched
     if hasattr(GptOssExpertsClass, "_unsloth_lora_patched"):
         return
 
-    # Select backend
     backend = select_moe_backend()
 
     if backend == "grouped_mm":
         forward = forward_native_grouped_mm
     else:
-        forward = torch_native_forward
+        # torch_native_forward expects the bnb4bit ModuleList layout; the stock
+        # 3D GptOssExperts needs the generic loop, which handles gpt-oss
+        # activation, biases, and the separated LoRA stash.
+        forward = forward_native_moe_loop
 
     # Store original forward and patch - but DON'T replace the class!
     GptOssExpertsClass._original_forward = GptOssExpertsClass.forward
@@ -1451,18 +1392,8 @@ def forward_mxfp4_gpt_oss_with_lora(
     scatter_idx,
 ) -> torch.Tensor:
     """
-    MXFP4 GPT OSS MoE forward pass with LoRA support.
-
-    For LoRA training with MXFP4:
-    - Base MXFP4 matmul is computed without gradients (frozen weights)
-    - LoRA delta is computed with gradients
-    - Output = base_output + lora_delta
-
-    This allows finetuning MXFP4 quantized models with LoRA.
-
-    Requires triton_kernels for native MXFP4 matmul.
-    If triton_kernels is not available, model should be loaded with
-    Mxfp4Config(dequantize=True) to convert to bf16.
+    MXFP4 GPT OSS MoE forward with LoRA: output = base_output (frozen MXFP4, no grad) + lora_delta.
+    Requires triton_kernels for native MXFP4 matmul; else load with Mxfp4Config(dequantize=True).
     """
     if not is_triton_kernels_available():
         raise RuntimeError(
@@ -1481,7 +1412,6 @@ def forward_mxfp4_gpt_oss_with_lora(
     FusedActivation = matmul_ogs.FusedActivation
     swiglu_fn = swiglu.swiglu_fn
 
-    # Get LoRA wrappers
     gate_up_wrapper = _get_lora_wrapper_for_param(self, "gate_up_proj")
     down_wrapper = _get_lora_wrapper_for_param(self, "down_proj")
 
@@ -1527,9 +1457,9 @@ def forward_mxfp4_gpt_oss_with_lora(
             )
         return intermediate_cache3
 
-    # With LoRA: compute base MXFP4 output (no grad) + LoRA delta (with grad)
+    # With LoRA: base MXFP4 output (no grad) + LoRA delta (with grad)
     with torch_cuda_device(hidden_states.device):
-        # 1. Compute MXFP4 base output (detached, no gradients for base weights)
+        # 1. MXFP4 base output, no gradients for base weights
         with torch.no_grad():
             if not hasattr(self, "act"):
                 self.act = FusedActivation(
@@ -1538,7 +1468,6 @@ def forward_mxfp4_gpt_oss_with_lora(
                     2,
                 )
 
-            # Gate-up projection (MXFP4)
             pre_activation = matmul_ogs_fn(
                 hidden_states.to(torch.bfloat16),
                 self.gate_up_proj,
@@ -1556,19 +1485,17 @@ def forward_mxfp4_gpt_oss_with_lora(
             if lora_data is not None:
                 lora_A, lora_B, scaling, num_experts = lora_data
 
-                # Convert triton_kernels routing format to grouped_mm offsets
-                # routing_data.exp_indx contains expert index for each token
+                # routing_data.exp_indx (expert index per token) -> grouped_mm offsets
                 gather_src = gather_idx.src_indx
                 permuted_input = hidden_states[gather_src].to(torch.bfloat16)
 
-                # Compute offsets from expert indices (cumsum of token counts)
+                # Offsets = cumsum of per-expert token counts
                 expert_ids = routing_data.exp_indx
                 num_tokens_per_expert = torch.bincount(
                     expert_ids.int(), minlength=num_experts
                 ).int()
                 offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
-                # Use grouped_mm for LoRA computation (much faster than loop!)
                 lora_delta = _apply_lora_grouped_mm(
                     permuted_input,
                     lora_A,
@@ -1602,14 +1529,12 @@ def forward_mxfp4_gpt_oss_with_lora(
             if lora_data is not None:
                 lora_A, lora_B, scaling, num_experts = lora_data
 
-                # Compute offsets from expert indices (reuse if available)
                 expert_ids = routing_data.exp_indx
                 num_tokens_per_expert = torch.bincount(
                     expert_ids.int(), minlength=num_experts
                 ).int()
                 offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
-                # Use grouped_mm for LoRA computation
                 lora_delta = _apply_lora_grouped_mm(
                     swiglu_output,
                     lora_A,
@@ -1631,17 +1556,11 @@ def forward_mxfp4_gpt_oss_with_lora(
 
 def patch_mxfp4_gpt_oss_for_lora():
     """
-    Patch MXFP4 GPT OSS experts for LoRA training.
-
-    This enables finetuning the MXFP4 quantized model (unsloth/gpt-oss-20b)
-    with LoRA.
-
-    IMPORTANT: Requires triton_kernels for native MXFP4 matmul.
-    If triton_kernels is not available, users must either:
-    - Use Mxfp4Config(dequantize=True) when loading, OR
-    - Use the BF16 model: 'unsloth/gpt-oss-20b-BF16'
+    Patch MXFP4 GPT OSS experts for LoRA training (unsloth/gpt-oss-20b).
+    Requires triton_kernels for native MXFP4 matmul; else use Mxfp4Config(dequantize=True)
+    or the BF16 model 'unsloth/gpt-oss-20b-BF16'.
     """
-    # First patch ParamWrapper for MoE separated LoRA (v5 only)
+    # ParamWrapper for MoE separated LoRA (v5 only)
     if _is_transformers_v5():
         patch_param_wrapper_for_moe()
 
@@ -1662,23 +1581,19 @@ def patch_mxfp4_gpt_oss_for_lora():
             logger.warning(f"Unsloth: Could not patch MXFP4 GPT OSS for LoRA: {e}")
         return
 
-    # Check if already patched
     if hasattr(Mxfp4GptOssExpertsClass, "_unsloth_mxfp4_lora_patched"):
         return
 
-    # Only patch if triton_kernels is available
-    # Without triton_kernels, MXFP4 weights cannot be used directly
-    # Users must use dequantization or BF16 model
+    # Without triton_kernels, MXFP4 weights cannot be used directly (need dequant or BF16 model)
     if is_triton_kernels_available():
-        # Use native MXFP4 + LoRA (keeps weights quantized)
+        # Native MXFP4 + LoRA, keeps weights quantized
         Mxfp4GptOssExpertsClass._original_forward = Mxfp4GptOssExpertsClass.forward
         Mxfp4GptOssExpertsClass.forward = forward_mxfp4_gpt_oss_with_lora
         Mxfp4GptOssExpertsClass._unsloth_mxfp4_lora_patched = True
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("Unsloth: Patched MXFP4 GPT OSS MoE for LoRA training")
     else:
-        # triton_kernels NOT available - do NOT patch
-        # The model will fail with a helpful error if user tries to use MXFP4 without dequantization
+        # No triton_kernels: don't patch; model errors helpfully if MXFP4 used without dequant
         Mxfp4GptOssExpertsClass._unsloth_mxfp4_lora_patched = True
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(
@@ -1698,21 +1613,9 @@ _MXFP4_DEQUANT_WARNED = False
 
 def should_dequantize_mxfp4():
     """
-    Check if MXFP4 should be dequantized to bf16.
-
-    Returns True if:
-    - UNSLOTH_MXFP4_NO_DEQUANTIZE is not set or "0", OR
-    - UNSLOTH_MXFP4_NO_DEQUANTIZE="1" but triton_kernels is not available
-
-    Returns False if:
-    - UNSLOTH_MXFP4_NO_DEQUANTIZE="1" AND triton_kernels is available
-
-    MEMORY IMPACT:
-    - MXFP4 quantized: ~10GB for GPT-OSS 20B
-    - MXFP4 dequantized to bf16: ~40GB for GPT-OSS 20B
-
-    To keep MXFP4 quantized (requires triton_kernels):
-        export UNSLOTH_MXFP4_NO_DEQUANTIZE=1
+    Whether MXFP4 should be dequantized to bf16. False only when
+    UNSLOTH_MXFP4_NO_DEQUANTIZE="1" AND triton_kernels is available.
+    Memory for GPT-OSS 20B: ~10GB quantized vs ~40GB dequantized to bf16.
     """
     global _MXFP4_DEQUANT_WARNED
 
@@ -1819,14 +1722,14 @@ def torch_native_forward(
     pass
 pass
 
-# Use torch_native_forward which has full float32 protection (swiglu in float32,
-# autocast disabled around down_proj) to prevent NaN in fp16 training.
+# torch_native_forward has full float32 protection (swiglu in float32, autocast
+# disabled around down_proj) to prevent NaN in fp16 training.
 GptOssExpertsBnb4bit.forward = torch_native_forward
 
 def patch_gpt_oss_linearized():
     """
     Patch GPT OSS for 4bit loading with grouped_mm support.
-    Only patches the GptOssExperts forward method - keeps original classes for proper weight loading.
+    Only patches GptOssExperts.forward; keeps original classes for proper weight loading.
     """
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
     if "_load_in_4bit_" not in _normalized_unsloth_model_name(): return
@@ -1836,8 +1739,7 @@ def patch_gpt_oss_linearized():
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
 
-    # Don't replace classes - just patch the forward method of GptOssExperts
-    # This keeps the original class structure which properly handles 4-bit weight loading
+    # Patch only GptOssExperts.forward (not the class) to keep 4-bit weight loading working
     backend = select_moe_backend()
 
     if backend == "grouped_mm":
@@ -1895,8 +1797,8 @@ def patch_GptOssAttention():
 
     def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         """
-        This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-        num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+        Equivalent to torch.repeat_interleave(x, dim=1, repeats=n_rep): (batch,
+        num_key_value_heads, seqlen, head_dim) -> (batch, num_attention_heads, seqlen, head_dim).
         """
         batch, num_key_value_heads, slen, head_dim = hidden_states.shape
         if n_rep == 1:
@@ -1908,15 +1810,10 @@ def patch_GptOssAttention():
     F_dropout = nn.functional.dropout
     matmul = torch.matmul
     def _align_kv_to_mask(key_states, value_states, attention_mask):
-        # Eager attention does `attn_weights += attention_mask`, which requires the
-        # key/value length to equal the mask's key dimension. On some
-        # transformers/torch combinations (e.g. transformers 5.x on torch < 2.11)
-        # the KV cache hands back more positions than the causal mask covers
-        # (pre-allocated cache slots), so a full-attention layer can see e.g. 161
-        # keys against a 128-wide mask and crash. The surplus positions are masked
-        # out anyway, so attend only the overlap by trimming KV (and the mask) to
-        # the shorter length. This keeps the path correct and shape-consistent
-        # across transformers/torch versions.
+        # Eager `attn_weights += attention_mask` requires KV length == mask key dim. On some
+        # transformers/torch combos (e.g. transformers 5.x on torch < 2.11) the KV cache returns
+        # more positions than the mask covers (pre-allocated slots), crashing full-attention layers.
+        # Surplus positions are masked out anyway, so trim KV (and mask) to the shorter length.
         if attention_mask is None or not hasattr(attention_mask, "shape"):
             return key_states, value_states, attention_mask
         kvlen = key_states.shape[-2]
@@ -2594,6 +2491,24 @@ def patch_GptOssModel():
 pass
 TEMPORARY_PATCHES.append(patch_GptOssModel)
 
+encoding = None
+
+_HARMONY_SYMBOLS = (
+    "Author",
+    "Conversation",
+    "DeveloperContent",
+    "HarmonyEncodingName",
+    "Message",
+    "Role",
+    "SystemContent",
+    "ToolDescription",
+    "load_harmony_encoding",
+    "ReasoningEffort",
+)
+
+# Best-effort eager import; when openai_harmony is installed after this module was
+# imported, _ensure_harmony rebinds the symbols lazily at call time.
+# See https://github.com/unslothai/unsloth/issues/3361
 try:
     from openai_harmony import (
         Author,
@@ -2607,10 +2522,47 @@ try:
         load_harmony_encoding,
         ReasoningEffort
     )
-
-    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-except:
+except Exception:
     pass
+
+
+def _ensure_harmony():
+    g = globals()
+    if all(g.get(name) is not None for name in _HARMONY_SYMBOLS):
+        return
+    try:
+        import openai_harmony
+    except ModuleNotFoundError as e:
+        if not e.name or e.name == "openai_harmony":
+            raise ImportError("Please install openai_harmony via `pip install openai_harmony`") from e
+        if e.name.startswith("openai_harmony."):
+            raise ImportError(f"Unsloth: failed to import openai_harmony: {e}") from e
+        raise ImportError(f"Unsloth: failed to import openai_harmony; its dependency `{e.name}` is missing: {e}") from e
+    except Exception as e:
+        raise ImportError(f"Unsloth: failed to import openai_harmony: {e}") from e
+
+    missing = [name for name in _HARMONY_SYMBOLS if getattr(openai_harmony, name, None) is None]
+    if missing:
+        raise ImportError(
+            f"Unsloth: openai_harmony is installed but is missing required symbols ({', '.join(missing)}); "
+            f"please upgrade via `pip install --upgrade openai_harmony`"
+        )
+    for name in _HARMONY_SYMBOLS:
+        g[name] = getattr(openai_harmony, name)
+pass
+
+
+def _get_gpt_oss_harmony_encoding():
+    global encoding
+    _ensure_harmony()
+
+    if encoding is None:
+        try:
+            encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        except Exception as e:
+            raise RuntimeError(f"Unsloth: failed to load the gpt-oss harmony encoding: {e}") from e
+    return encoding
+pass
 
 
 def encode_conversations_with_harmony(
@@ -2621,10 +2573,7 @@ def encode_conversations_with_harmony(
     developer_instructions = None,
     model_identity = "You are ChatGPT, a large language model trained by OpenAI.",
 ):
-    try:
-        SystemContent
-    except:
-        raise ImportError("Please install openai_harmony via `pip install openai_harmony`")
+    harmony_encoding = _get_gpt_oss_harmony_encoding()
 
     assert reasoning_effort in ("low", "medium", "high")
 
@@ -2690,10 +2639,10 @@ def encode_conversations_with_harmony(
     # Create Harmony conversations
     convos = Conversation.from_messages(convos)
     if add_generation_prompt:
-        harmony_input_ids = encoding.render_conversation_for_completion(convos, Role.ASSISTANT)
+        harmony_input_ids = harmony_encoding.render_conversation_for_completion(convos, Role.ASSISTANT)
     else:
-        harmony_input_ids = encoding.render_conversation(convos)
-    harmony_decoded_text = encoding.decode(harmony_input_ids)
+        harmony_input_ids = harmony_encoding.render_conversation(convos)
+    harmony_decoded_text = harmony_encoding.decode(harmony_input_ids)
     return harmony_decoded_text, harmony_input_ids
 pass
 
@@ -2974,12 +2923,9 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_init_weights_modulelist_fix)
 # ============================================================================
 def patch_gpt_oss_for_grpo(phase="post_compile"):
     """
-    Patch GptOssForCausalLM.forward for GRPO training.
-    When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits.
-    This fixes the matrix multiplication dimension mismatch issue in GRPO training.
-
-    Only runs post-compile so the compiler can pattern-match cross-entropy in the
-    original forward source and apply fused loss (preventing OOM from full logits).
+    Patch GptOssForCausalLM.forward for GRPO: when UNSLOTH_RETURN_HIDDEN_STATES=1, return
+    hidden_states instead of logits (fixes the GRPO matmul dimension mismatch).
+    Runs post-compile so the compiler can pattern-match cross-entropy and fuse loss (avoids OOM).
     """
     if phase != "post_compile":
         return

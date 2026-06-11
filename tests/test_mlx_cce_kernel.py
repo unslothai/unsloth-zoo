@@ -141,14 +141,12 @@ def test_dequantize_affine_roundtrip():
     """Construct a known-good packed weight and verify dequant."""
     from mlx_simulation.mlx_helpers.quant import dequantize_affine
 
-    # 4-bit affine: 8 elements packed into 1 uint32 word (4 bits each, 8 elements per word).
-    # Group size = 8, bits = 4. Use a simple test vector.
+    # 4-bit affine, group_size 8: pack values 0..7 (4 bits each) into one
+    # uint32, element 0 in the lowest bits.
     bits = 4
     group_size = 8
     elements_per_word = 32 // bits  # = 8
 
-    # Pack values 0..7 (4-bit each) into a single uint32.
-    # Element 0 in lowest bits, element 7 in highest.
     packed_value = 0
     for i, v in enumerate([0, 1, 2, 3, 4, 5, 6, 7]):
         packed_value |= v << (i * bits)
@@ -251,7 +249,7 @@ def test_tensor_at_set():
 
 def test_transpose_multi_axis_is_permute():
     t = torch.zeros(2, 3, 4, 5)
-    # 4-axis transpose = full permute, shape becomes (5, 4, 3, 2)
+    # 4-axis transpose = full permute -> (5, 4, 3, 2)
     out = t.transpose(3, 2, 1, 0)
     assert out.shape == (5, 4, 3, 2)
 

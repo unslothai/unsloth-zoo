@@ -90,11 +90,11 @@ def test_fast_mlx_model_save_helpers_exist():
     loader.py and attached via types.MethodType after load.
     """
     import unsloth_zoo.mlx.loader as ml
-    # The free functions must exist:
+    # Free functions must exist.
     assert hasattr(ml, "_mlx_save_pretrained_merged")
     assert hasattr(ml, "_mlx_save_lora_adapters")
     assert hasattr(ml, "_mlx_push_to_hub_merged")
-    # And the underlying utils targets:
+    # And the underlying utils targets.
     import unsloth_zoo.mlx.utils as mu
     assert hasattr(mu, "save_pretrained_merged")
     assert hasattr(mu, "save_lora_adapters")
@@ -195,14 +195,12 @@ def test_gated_delta_vjp_imports():
 def test_trainer_config_smoke():
     """MLXTrainingConfig should construct with sane defaults."""
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
-    # Try the default constructor — many MLX configs require keyword args.
     import dataclasses
     try:
         cfg = MLXTrainingConfig()
         ok = True
     except TypeError:
-        # Required positional/keyword args; that's fine for now.
-        # We just want the class to be inspectable.
+        # Required args are fine; we only need the class to be inspectable.
         ok = dataclasses.is_dataclass(MLXTrainingConfig) or True
     assert ok
 

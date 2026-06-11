@@ -13,16 +13,11 @@
 
 """Drift detectors for ``unsloth_zoo`` source-string / regex rewriters.
 
-Patches in ``unsloth_zoo/compiler.py`` and
-``unsloth_zoo/temporary_patches/*.py`` fetch upstream function source
-via ``inspect.getsource`` and ``str.replace`` / ``re.sub`` against
-literal strings. If upstream renames/refactors/reflows the targeted
-region, the rewriter silently no-ops and the zoo patch becomes invisible.
-
-DRIFT-DETECTED framing: when the pinned string / regex is gone, fire
-``pytest.fail("DRIFT DETECTED: zoo source-rewriter at <zoo file:line>
-expects '<pattern>' in <upstream module>, not found")``. Each test
-cites the zoo file:line it pins.
+Patches in ``unsloth_zoo/compiler.py`` and ``temporary_patches/*.py`` rewrite
+upstream source via ``inspect.getsource`` + ``str.replace`` / ``re.sub`` on
+literal strings; if upstream reflows the target, the rewriter silently no-ops.
+Each test pins the zoo file:line and fails with a "DRIFT DETECTED" message when
+its pinned pattern is gone.
 """
 
 from __future__ import annotations
