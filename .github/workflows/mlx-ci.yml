@@ -77,3 +77,8 @@ jobs:
         # Exercises the MLX-on-torch shim end-to-end against the real mlx runtime
         # on Apple Silicon; on Linux runners it would run against tests/mlx_simulation/ stubs.
         run: python -m pytest tests/test_mlx_torch_shim_smoke.py -v
+
+      - name: tests/test_qwen35_vjp_metal.py
+        # Metal regression tests confirming both unslothai/unsloth#6002 crashes
+        # are fixed on main (qwen3_5 attention kwargs, gated-delta and MRoPE VJP).
+        run: python -m pytest tests/test_qwen35_vjp_metal.py -v -rs
