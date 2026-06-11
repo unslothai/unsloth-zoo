@@ -678,13 +678,7 @@ def _fix_qwen35_attention_cache(model):
 
     def patched_attn_call(self, x, mask=None, cache=None, position_ids=None, **kwargs):
         # Compute position_ids when training (cache=None, position_ids=None).
-        # Extra kwargs (position_embeddings, target_verify, ...) added by
-        # newer mlx-vlm releases must pass through untouched.
-        if (
-            cache is None
-            and position_ids is None
-            and kwargs.get("position_embeddings") is None
-        ):
+        if cache is None and position_ids is None:
             import mlx.core as mx
             L = x.shape[1]
             position_ids = mx.arange(L)
@@ -698,14 +692,8 @@ def _fix_qwen35_attention_cache(model):
 
 
 def _disable_fused_mrope(model):
-    """Route MRoPE through the differentiable cos/sin fallback for training.
-
-    mlx-vlm's MRoPERotaryEmbedding.apply_rotary uses a fused Metal kernel
-    whenever Metal is available, with no gradient support — training dies
-    with [Primitive::vjp] Not implemented for CustomKernel. Flipping
-    fused_apply off makes apply_rotary take its pure-MLX fallback, which
-    differentiates fine.
-    """
+    """Flip fused_apply off so MRoPE training uses the differentiable
+    cos/sin fallback; the fused Metal kernel has no VJP."""
     count = 0
     try:
         modules = model.modules()

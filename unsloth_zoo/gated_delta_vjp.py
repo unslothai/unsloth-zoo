@@ -277,14 +277,11 @@ def patch_gated_delta():
 
 
 def patch_gated_delta_vlm():
-    """Monkey-patch mlx_vlm's qwen3_5 gated_delta module the same way.
+    """Patch mlx_vlm's qwen3_5 gated_delta_update the same way.
 
-    mlx_vlm.models.qwen3_5 ships its own gated_delta_update wrapper that
-    calls mlx_lm's gated_delta_kernel directly (imported by name), so
-    patch_gated_delta() never intercepts it. The kernel has no VJP, which
-    crashes training with [Primitive::vjp] Not implemented for CustomKernel.
-    language.py also from-imports gated_delta_update, so patch both
-    namespaces.
+    mlx_vlm ships its own copy that calls the non-differentiable
+    gated_delta_kernel directly, so patch_gated_delta() never intercepts
+    it; language.py also from-imports it, so patch both namespaces.
     """
     try:
         from mlx_lm.models import gated_delta
@@ -302,9 +299,8 @@ def patch_gated_delta_vlm():
         q, k, v, a, b, A_log, dt_bias,
         state=None, mask=None, use_kernel=True,
     ):
-        # Same heuristic as patch_gated_delta: state=None means a training
-        # call (no KV cache), which must avoid the non-differentiable
-        # custom kernel and route through the memory-efficient VJP.
+        # state=None means a training call; route it through the
+        # differentiable VJP. Inference (state provided) keeps the kernel.
         if state is not None:
             return original_update(
                 q, k, v, a, b, A_log, dt_bias,
