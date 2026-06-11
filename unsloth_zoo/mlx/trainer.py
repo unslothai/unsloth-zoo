@@ -66,6 +66,10 @@ from .utils import (
     collect_mlx_texts,
     save_lora_adapters,
     save_trainable_adapters,
+    save_optimizer_state,
+    load_optimizer_state,
+    save_trainer_state,
+    load_trainer_state,
     collect_mlx_lora_adapter_tensors,
     iter_mlx_lora_modules,
     apply_gradient_checkpointing,
@@ -541,9 +545,11 @@ class MLXTrainer:
             pass
         self._prior_metal_limits = {}
 
-    def train(self):
+    def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
+        # Stash for _train_inner. None = fresh start, a path = resume.
+        self._resume_from_checkpoint = resume_from_checkpoint
         args = self.args
         model = self.model
         args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
@@ -677,6 +683,40 @@ class MLXTrainer:
 
         # Build optimizer with LR schedule
         optimizer = self._build_optimizer(total_steps)
+
+        # Resume from checkpoint: load adapter weights, optimizer state,
+        # and trainer state (step counter + loss history). Adapters were
+        # already loaded by the Studio worker into the model before train()
+        # was called, so we only handle optimizer and trainer state here.
+        # The step offset is applied below at loop start so the LR scheduler
+        # and dataloader fast-forward to the right position.
+        _resume_step = 0
+        _resume_from = getattr(self, "_resume_from_checkpoint", None)
+        if _resume_from:
+            try:
+                # 1. Load trained adapter weights into the model. The model
+                #    already has LoRA wrappers applied (Studio pipeline does
+                #    get_peft_model before training); strict=False ensures
+                #    only the LoRA params match and base weights are untouched.
+                model.load_weights(
+                    f"{_resume_from}/adapters.safetensors", strict=False,
+                )
+                # 2. Restore optimizer state (Adam moments m,v, step counter).
+                load_optimizer_state(optimizer, _resume_from)
+                # 3. Restore trainer scalars (step counter, loss history).
+                ts = load_trainer_state(_resume_from)
+                _resume_step = int(ts.get("global_step", 0))
+                self._train_loss_history = list(ts.get("train_loss_history", []))
+                print(
+                    f"Unsloth: Resuming from {_resume_from} "
+                    f"(step={_resume_step}, loss_history={len(self._train_loss_history)} entries)."
+                )
+            except FileNotFoundError as e:
+                raise RuntimeError(
+                    f"Unsloth: resume_from_checkpoint={_resume_from!r} but "
+                    f"resume state files are missing ({e}). Refusing to "
+                    f"silently restart from step 0."
+                ) from e
 
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
@@ -1025,9 +1065,27 @@ class MLXTrainer:
         trained_tokens = 0
         train_time = 0
         grad_accum_state = None
-        batch_idx = 0
+        # When resuming, start batch_idx at the resume position so
+        # batches[batch_idx % len(batches)] lands on the same batch the
+        # original run would have seen next.
+        batch_idx = _resume_step * grad_accum
 
-        for it in range(1, total_steps * grad_accum + 1):
+        # Streaming mode: fast-forward the iterator to the resume position.
+        # The seed is the same and create_batches/iterate_*_batches is
+        # deterministic, so consuming N batches gives us the same data
+        # ordering the killed run would have produced.
+        if _resume_step > 0 and batch_iter is not None:
+            for _ in range(_resume_step * grad_accum):
+                try:
+                    next(batch_iter)
+                except StopIteration:
+                    raise RuntimeError(
+                        f"Unsloth: streaming dataset exhausted while "
+                        f"fast-forwarding to resume step {_resume_step}. "
+                        f"Dataset may be shorter than the killed run consumed."
+                    ) from None
+
+        for it in range(_resume_step * grad_accum + 1, total_steps * grad_accum + 1):
             if self.stop_requested:
                 print("Unsloth: Stop requested — ending training early.")
                 break
@@ -1202,6 +1260,21 @@ class MLXTrainer:
                 except ValueError as e:
                     print(f"  Unsloth: skipped checkpoint ({e})")
                 else:
+                    # Also write optimizer + trainer state so resume_from_checkpoint
+                    # can restore Adam moments, step counter, and loss history.
+                    # Adapter save was successful -- treat the extra writes as
+                    # best-effort: log on failure but don't undo the adapter save.
+                    try:
+                        save_optimizer_state(optimizer, ckpt_dir)
+                        save_trainer_state(
+                            {
+                                "global_step": current_step,
+                                "train_loss_history": list(self._train_loss_history),
+                            },
+                            ckpt_dir,
+                        )
+                    except Exception as e:
+                        print(f"  Unsloth: checkpoint saved without resume state ({e})")
                     print(f"  Saved checkpoint to {ckpt_dir}")
 
         total_time = time.perf_counter() - start_time
