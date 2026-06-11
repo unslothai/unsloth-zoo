@@ -640,6 +640,7 @@ class MLXTrainer:
         self._lr_schedule = schedule if callable(schedule) else None
         wd = self.args.weight_decay
         self._manual_weight_decay = 0.0
+        self._coupled_weight_decay = 0.0
         adam_beta1 = getattr(self.args, "adam_beta1", None)
         adam_beta2 = getattr(self.args, "adam_beta2", None)
         adam_kwargs = {}
@@ -688,8 +689,11 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name == "sgd":
-            # HF parity: manual bias/norm-aware decoupled decay.
-            self._manual_weight_decay = float(wd or 0.0)
+            # HF/PyTorch SGD couples weight decay into the gradient (and thus
+            # momentum/Nesterov), unlike AdamW's decoupled shrink. Apply our
+            # own bias/norm-aware coupled decay so the exemption matches HF
+            # while keeping SGD's coupled dynamics.
+            self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "muon":
             self._manual_weight_decay = float(wd or 0.0)
@@ -731,10 +735,11 @@ class MLXTrainer:
     def _apply_manual_weight_decay(self, model, optimizer, grad):
         """Decoupled HF-parity decay on trainable non-bias/non-norm leaves.
 
-        Active for AdamW, SGD, Muon, and Lion. The underlying MLX
-        optimizer is constructed with ``weight_decay=0.0`` so this
-        helper owns the full update for the weight-decay term and
-        matches what HF Trainer does via ``param_groups``.
+        Active for AdamW, Muon, and Lion. The underlying MLX optimizer is
+        constructed with ``weight_decay=0.0`` so this helper owns the full
+        update for the weight-decay term and matches what HF Trainer does
+        via ``param_groups``. SGD uses coupled decay instead (see
+        ``_apply_coupled_weight_decay``).
         """
         wd = float(getattr(self, "_manual_weight_decay", 0.0) or 0.0)
         if wd <= 0:
@@ -758,6 +763,39 @@ class MLXTrainer:
             decayed.append((name, (parameter.astype(mx.float32) * scale).astype(parameter.dtype)))
         if decayed:
             model.update(tree_unflatten(decayed))
+
+    def _apply_coupled_weight_decay(self, model, grad):
+        """Fold HF/PyTorch-SGD coupled decay (wd * param) into the gradient.
+
+        SGD adds ``weight_decay * parameter`` to the gradient before the
+        momentum/Nesterov update, so it must be applied to ``grad`` rather
+        than as a post-update parameter shrink. Keeps HF's bias/norm
+        exemption. Returns a possibly-modified grad tree; the original is
+        returned unchanged when no decay applies.
+        """
+        wd = float(getattr(self, "_coupled_weight_decay", 0.0) or 0.0)
+        if wd <= 0:
+            return grad
+
+        params = dict(tree_flatten(model.trainable_parameters()))
+        wd_arr = mx.array(wd, dtype=mx.float32)
+        updated = []
+        changed = False
+        for name, value in tree_flatten(grad):
+            parameter = params.get(name)
+            if (
+                parameter is not None
+                and self._should_apply_weight_decay(name, parameter)
+                and mx.issubdtype(parameter.dtype, mx.floating)
+            ):
+                decayed = value + (parameter.astype(value.dtype) * wd_arr.astype(value.dtype))
+                updated.append((name, decayed))
+                changed = True
+            else:
+                updated.append((name, value))
+        if not changed:
+            return grad
+        return tree_unflatten(updated)
 
     @staticmethod
     def _adafactor_unsupported_parameters(model):
@@ -1048,8 +1086,11 @@ class MLXTrainer:
                 loss_fn = make_baseline_loss_fn()
                 print("Unsloth: Using standard cross-entropy loss.")
 
-        # Prepare data — determine total_steps first
-        self._prepared_batches_include_epochs = False
+        # Prepare data, determine total_steps first. Keep any prebuilt flag
+        # from train_on_responses_only; _prepare_data returns self._batches
+        # early and never re-derives it for the completion-only text path.
+        if self._batches is None:
+            self._prepared_batches_include_epochs = False
         batches, batch_iter = self._prepare_data(is_vlm)
 
         if batches is not None and not batches:
@@ -1273,6 +1314,9 @@ class MLXTrainer:
                 final_grad = _clip_grad_by_value(final_grad, max_grad_value)
             if _clip_grad_leaf_norm:
                 final_grad = _clip_grad_by_leaf_norm(final_grad, max_grad_leaf_norm)
+            # Coupled (SGD) decay folds into the post-clip grad so it feeds
+            # momentum; decoupled (AdamW-family) decay shrinks params directly.
+            final_grad = self._apply_coupled_weight_decay(model, final_grad)
             self._apply_manual_weight_decay(model, optimizer, final_grad)
             optimizer.update(model, final_grad)
             _restore_trainable_storage_dtypes()
@@ -1292,6 +1336,7 @@ class MLXTrainer:
                 grad = _clip_grad_by_value(grad, max_grad_value)
             if _clip_grad_leaf_norm:
                 grad = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm)
+            grad = self._apply_coupled_weight_decay(model, grad)
             self._apply_manual_weight_decay(model, optimizer, grad)
             optimizer.update(model, grad)
             _restore_trainable_storage_dtypes()
@@ -2105,9 +2150,12 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         if preserve_dataset_order or dataset_order == "sequential":
             return list(items)
         if dataset_order == "torch_randperm":
-            from .utils import _torch_randperm_order
-            # Reseed per epoch (matches `create_ordered_batches`).
-            order = _torch_randperm_order(len(items), seed + epoch_idx)
+            from .utils import _torch_randperm_order, _normalize_seed
+            # Reseed per epoch (matches `create_ordered_batches`). Normalize a
+            # None seed first so seed=None does not raise on the int add.
+            order = _torch_randperm_order(
+                len(items), _normalize_seed(seed) + epoch_idx
+            )
             return [items[i] for i in order]
         # legacy default: length-sort once
         return sorted(items, key=lambda x: len(x[0]))
@@ -2291,11 +2339,13 @@ def train_on_responses_only(
         )
 
     # Unwrap to a callable HF tokenizer (mlx-lm TokenizerWrapper._tokenizer,
-    # or VLM processor.tokenizer).
-    if hasattr(_tokenizer, "_tokenizer"):
-        _tokenizer = _tokenizer._tokenizer
-    elif hasattr(_tokenizer, "tokenizer"):
-        _tokenizer = _tokenizer.tokenizer
+    # or VLM processor.tokenizer). HF fast tokenizers already speak the API
+    # and their _tokenizer is the Rust backend, so leave those as-is.
+    if not hasattr(_tokenizer, "convert_tokens_to_ids"):
+        if hasattr(_tokenizer, "_tokenizer"):
+            _tokenizer = _tokenizer._tokenizer
+        elif hasattr(_tokenizer, "tokenizer"):
+            _tokenizer = _tokenizer.tokenizer
 
     # Get masking closure from the HF/CUDA implementation
     mask_fn = _hf_train_on_responses_only(
@@ -2328,6 +2378,14 @@ def train_on_responses_only(
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
         )
+        # Only materialize all epoch blocks for true epoch-based runs. Step-based
+        # runs (max_steps>0) truncate to num_batches, so pre-building every epoch
+        # just wastes tokenization/memory. Mirrors the unlabeled path's gate.
+        labeled_num_epochs = (
+            int(args.num_train_epochs)
+            if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)
+            else None
+        )
         batches = _create_labeled_batches(
             dataset=trainer.train_dataset,
             tokenizer=_tokenizer,
@@ -2348,17 +2406,13 @@ def train_on_responses_only(
             append_eos=bool(getattr(args, "append_eos", True)),
             dataset_order=getattr(args, "dataset_order", "default"),
             preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
-            num_epochs=(
-                int(args.num_train_epochs)
-                if getattr(args, "num_train_epochs", -1) > 0
-                else None
-            ),
+            num_epochs=labeled_num_epochs,
         )
 
         # Safety check: detect all-masked labels early
         _check_all_masked(batches)
         trainer._prepared_batches_include_epochs = (
-            getattr(args, "num_train_epochs", -1) > 0
+            labeled_num_epochs is not None
         )
         trainer._batches = batches
 

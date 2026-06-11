@@ -226,8 +226,15 @@ def _run_hidden_stack(stack, inputs, inputs_embeds=None, **kwargs):
     if mask is None and token_type_mask is None:
         mask = create_attention_mask(h, cache)
 
+    # mlx-vlm gemma3/gemma4 stacks copy these onto the module, but fall back to
+    # config (sliding_window) so a stack that only stores them there still
+    # builds windowed masks instead of treating every layer as global.
     sliding_window_pattern = getattr(stack, "sliding_window_pattern", None)
+    if sliding_window_pattern is None:
+        sliding_window_pattern = _config_get(config, "sliding_window_pattern")
     window_size = getattr(stack, "window_size", None)
+    if window_size is None:
+        window_size = _config_get(config, "sliding_window")
     sliding_token_type_mask = None
     if token_type_ids is not None and sliding_window_pattern and window_size:
         sliding_token_type_mask = _build_gemma_image_attention_mask(
@@ -716,15 +723,19 @@ def _mask_image_tokens(targets, image_token_ids):
 
 def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
                            ignore_index=-100):
+    # Do NOT narrow to int32: runtime CCE validates the original dtype before
+    # its own narrow, so wide/unsigned invalid ids (e.g. uint32(2**32-100))
+    # must survive as out-of-vocab sentinels instead of wrapping to -100.
+    # Prefer the pre-narrow raw carrier when deriving labels from input_ids.
     if labels is None:
-        labels = batch_dict["input_ids"].astype(mx.int32)
-    else:
-        labels = labels.astype(mx.int32)
+        labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, batch_dict["input_ids"])
+    labels = _normalize_cce_label_dtype(labels)
     labels = _mask_label_token_ids(labels, ignore_token_ids, ignore_index)
     attention_mask = batch_dict.get("attention_mask")
     if attention_mask is not None:
-        labels = mx.where(attention_mask == 0, mx.array(ignore_index), labels)
-    return labels.astype(mx.int32)
+        ignore = mx.array(ignore_index, dtype=labels.dtype)
+        labels = mx.where(attention_mask == 0, ignore, labels)
+    return labels
 
 
 def _mask_prompt_tokens(targets, assistant_token_id):
@@ -816,13 +827,13 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         fwd_mask = attention_mask
 
         # Model owns the causal mask. Pass through extras (e.g. image_grid_thw
-        # for Qwen). Strip the private raw-ids carrier so backbone never sees it.
+        # for Qwen). Strip every private `_unsloth_*` carrier (raw-ids plus the
+        # _unsloth_collated_position_ids marker) so model(...) never sees a kwarg
+        # it would reject, matching _vlm_cce_forward's filter.
         fwd_kwargs = {
             k: v for k, v in batch_dict.items()
-            if k not in (
-                "input_ids", "pixel_values", "attention_mask", "labels",
-                _RAW_INPUT_IDS_FOR_LABELS,
-            )
+            if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+            and not k.startswith("_unsloth_")
             and v is not None
         }
         fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
@@ -1940,6 +1951,12 @@ def _has_chat_template(obj):
 def _get_processor_tokenizer(processor):
     if processor is None:
         return None
+    # HF fast tokenizers expose the public API directly while their _tokenizer
+    # is the low-level Rust backend (no convert_tokens_to_ids / chat_template /
+    # apply_chat_template). Only unwrap _tokenizer for wrappers that do not
+    # already speak the HF tokenizer API (mlx-lm's TokenizerWrapper proxies it).
+    if hasattr(processor, "convert_tokens_to_ids"):
+        return processor
     if hasattr(processor, "_tokenizer"):
         return processor._tokenizer
     return getattr(processor, "tokenizer", processor)
@@ -2470,10 +2487,14 @@ def _resize_vlm_images(images, image_size):
             if isinstance(image_size, int):
                 # Match UnslothVisionDataCollator resize="min": shrink large
                 # images to the model limit, but let processors handle upscaling.
-                if image.size[0] > image_size:
-                    width, height = image.size
-                    new_width = (width * image_size + width // 2) // width
-                    new_height = (height * image_size + width // 2) // width
+                # Scale on the larger side so tall portrait images (e.g.
+                # 512x2048 with a 512 cap) also shrink instead of slipping
+                # through on a width-only check.
+                width, height = image.size
+                side = max(width, height)
+                if side > image_size:
+                    new_width = max(1, (width * image_size + side // 2) // side)
+                    new_height = max(1, (height * image_size + side // 2) // side)
                     image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
             else:
                 image = image.resize(target, Image.Resampling.LANCZOS)

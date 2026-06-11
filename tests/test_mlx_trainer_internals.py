@@ -130,11 +130,11 @@ def test_adamw_weight_decay_uses_hf_bias_norm_filter():
     assert not MLXTrainer._should_apply_weight_decay("vision.blocks.0.norm1.weight")
 
 
-@pytest.mark.parametrize("optim_name", ["sgd", "muon", "lion"])
-def test_non_adamw_optimizers_use_hf_parity_manual_decay(optim_name):
-    """SGD, Muon, and Lion must mirror the AdamW pattern: zero out the
-    optimizer's built-in `weight_decay` and let `_apply_manual_weight_decay`
-    own the decoupled decay so bias and norm params are excluded."""
+@pytest.mark.parametrize("optim_name", ["muon", "lion"])
+def test_decoupled_optimizers_use_hf_parity_manual_decay(optim_name):
+    """Muon and Lion mirror the AdamW pattern: zero out the optimizer's
+    built-in `weight_decay` and let `_apply_manual_weight_decay` own the
+    decoupled decay so bias and norm params are excluded."""
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     class DummyModel:
@@ -151,6 +151,28 @@ def test_non_adamw_optimizers_use_hf_parity_manual_decay(optim_name):
     optimizer = trainer._build_optimizer(total_steps=4)
 
     assert trainer._manual_weight_decay == pytest.approx(0.05)
+    assert trainer._coupled_weight_decay == pytest.approx(0.0)
+    if hasattr(optimizer, "_kw"):
+        assert optimizer._kw["weight_decay"] == 0.0
+
+
+def test_sgd_weight_decay_is_coupled_not_decoupled():
+    """SGD must use coupled decay (folded into the gradient before momentum)
+    to match HF/PyTorch SGD, not the AdamW-style decoupled parameter shrink."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class DummyModel:
+        def trainable_parameters(self):
+            return {}
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = DummyModel()
+    trainer.args = MLXTrainingConfig(optim="sgd", weight_decay=0.05)
+
+    optimizer = trainer._build_optimizer(total_steps=4)
+
+    assert trainer._coupled_weight_decay == pytest.approx(0.05)
+    assert trainer._manual_weight_decay == pytest.approx(0.0)
     if hasattr(optimizer, "_kw"):
         assert optimizer._kw["weight_decay"] == 0.0
 

@@ -2562,7 +2562,7 @@ def _dequantize_selected_mlx_modules(model, predicate):
     return len(replacements)
 
 
-def _nf4_dense_dequantize_weight(weight, group_size=64):
+def _nf4_dense_dequantize_weight(weight, group_size=64, use_double_quant=False):
     import mlx.core as mx
 
     codebook = mx.array(
@@ -2647,7 +2647,12 @@ def _nf4_dense_dequantize_weight(weight, group_size=64):
     denom = mx.where(absmax > 0, absmax, mx.ones_like(absmax))
     scaled = groups / denom
     indices = mx.argmin(mx.abs(scaled[..., None] - codebook), axis=-1)
-    absmax = _bnb_nested_absmax(absmax.reshape((-1,))).reshape((-1, 1))
+    # Only simulate the nested (double-quantized) absmax when double quant is
+    # requested. The accepted BitsAndBytesConfig path rejects
+    # bnb_4bit_use_double_quant=True, and CUDA bitsandbytes dequantizes plain
+    # NF4 with the raw absmax, so default NF4 must keep un-nested scales.
+    if use_double_quant:
+        absmax = _bnb_nested_absmax(absmax.reshape((-1,))).reshape((-1, 1))
     dequantized = (codebook[indices] * absmax).reshape((-1,))[:original_size]
     return dequantized.reshape(original_shape).astype(original_dtype)
 
