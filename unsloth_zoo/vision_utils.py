@@ -1417,12 +1417,20 @@ class UnslothVisionDataCollator:
 
         p_ids, c_ids = proc_prompts["input_ids"], proc_completions["input_ids"]
         p_m, c_m = proc_prompts["attention_mask"], proc_completions["attention_mask"]
-        p_tt, c_tt = proc_prompts.get("token_type_ids", None), proc_completions.get("token_type_ids", None)
+        # Gemma 3n emits token_type_ids, Gemma 4 emits mm_token_type_ids; route
+        # whichever is present through the concat/flush/truncate path below, else
+        # `out = dict(proc_prompts)` keeps a stale prompt-width copy whose vision
+        # block positions no longer align with the flushed input_ids.
+        tt_key = "token_type_ids" if "token_type_ids" in proc_prompts else "mm_token_type_ids"
+        p_tt, c_tt = proc_prompts.get(tt_key, None), proc_completions.get(tt_key, None)
 
         input_ids = torch.cat((p_ids, c_ids), dim=1)
         attention_mask = torch.cat((p_m, c_m), dim=1)
         completion_mask = torch.cat((torch.zeros_like(p_m), c_m), dim=1)
-        if p_tt is not None and c_tt is not None:
+        if p_tt is not None or c_tt is not None:
+            # A side missing the key is text-only: type 0 in both vocabularies
+            if p_tt is None: p_tt = torch.zeros_like(p_ids)
+            if c_tt is None: c_tt = torch.zeros_like(c_ids)
             token_type_ids = torch.cat((p_tt, c_tt), dim=1)
         else:
             token_type_ids = None
@@ -1476,7 +1484,7 @@ class UnslothVisionDataCollator:
         out["attention_mask"] = attention_mask
         out["labels"] = labels
         if token_type_ids is not None:
-            out["token_type_ids"] = token_type_ids
+            out[tt_key] = token_type_ids
         if 'pixel_values' in out:
             out = self._cast_pixel_values_dtype_inplace(out)
         if 'pixel_values_videos' in out:
