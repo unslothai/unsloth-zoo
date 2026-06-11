@@ -550,7 +550,7 @@ def _fix_audio_feature_extractor_padding_side(processor):
     # padding_side = "left" (a text setting) to AutoProcessor.from_pretrained,
     # which forwards it to every sub-component including the feature extractor.
     feature_extractor = getattr(processor, "feature_extractor", None)
-    if getattr(feature_extractor, "padding_side", None) == "left":
+    if feature_extractor is not None and getattr(feature_extractor, "padding_side", None) == "left":
         feature_extractor.padding_side = "right"
 
 
