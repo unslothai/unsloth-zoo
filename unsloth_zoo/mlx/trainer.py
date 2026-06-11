@@ -1661,6 +1661,14 @@ class MLXTrainer:
               f"Steps: {total_steps} | "
               f"Tokens: {trained_tokens}")
 
+        # Honor the documented save_steps=0 contract: save at end of training.
+        try:
+            self.save_model()
+        except ValueError as e:
+            print(f"Unsloth: skipped final save ({e})")
+        else:
+            print(f"Unsloth: Saved final adapters to {args.output_dir}")
+
         return {
             "train_loss": avg_loss,
             "train_runtime": total_time,
