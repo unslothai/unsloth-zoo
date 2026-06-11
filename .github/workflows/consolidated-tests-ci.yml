@@ -93,6 +93,19 @@ jobs:
       - name: pytest tests/security (HARD GATE)
         run: python -m pytest tests/security -v
 
+      - name: pytest behavioral gates (HARD GATE)
+        # Deterministic, CPU-pure, sub-second files executed as a gate.
+        # test_mlx_finetune_last_n_layers was born broken in #669 and stayed
+        # invisible until #739 because no job executed it (collect-only plus
+        # the macOS shim smoke). test_training_utils_use_cache pins the
+        # use_cache disable/restore contract for gradient checkpointing
+        # (#715). Executing both here keeps fixture/source drift visible.
+        run: |
+          python -m pytest \
+            tests/test_training_utils_use_cache.py \
+            tests/test_mlx_finetune_last_n_layers.py \
+            -v
+
       - name: pytest tests/test_pr_a_imports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
         # session-scoped network_blocker autouse fixture that would otherwise block

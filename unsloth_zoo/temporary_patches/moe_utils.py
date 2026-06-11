@@ -767,7 +767,13 @@ def _is_gpt_oss_model(model) -> bool:
             return True
 
         for attr in ("_name_or_path", "name_or_path"):
-            if "gpt_oss" in _normalize_model_type(getattr(config, attr, None)):
+            name = getattr(config, attr, None)
+            if name is None:
+                continue
+            # Match only the final path component so parent directories like
+            # /data/gpt-oss-tests/qwen3-7b do not count as gpt-oss.
+            base = str(name).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+            if "gpt_oss" in _normalize_model_type(base):
                 return True
 
     return False

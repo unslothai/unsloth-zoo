@@ -604,15 +604,14 @@ class MLXTrainer:
         config = getattr(model, "_config", {})
         model_type = config.get("model_type", "") if isinstance(config, dict) else ""
         if "qwen3_5" in model_type:
-            from .loader import _fix_qwen35_attention_cache
+            from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
             _fix_qwen35_attention_cache(model)
-            from ..gated_delta_vjp import patch_gated_delta
+            _disable_fused_mrope(model)
+            from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
             patch_gated_delta()
-        # Qwen3-VL-specific fixes: the language tower's MRoPERotaryEmbedding
-        # uses the same non-differentiable fused Metal kernel that breaks
-        # training with [Primitive::vjp] Not implemented for CustomKernel.
-        # Flip fused_apply off so apply_rotary takes the differentiable
-        # fallback path.
+            patch_gated_delta_vlm()
+        # Qwen3-VL's language tower uses the same fused MRoPE kernel with no
+        # VJP; flip it off so training takes the differentiable fallback.
         if "qwen3_vl" in model_type:
             from .loader import _disable_fused_mrope
             _disable_fused_mrope(model)

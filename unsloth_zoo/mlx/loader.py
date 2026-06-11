@@ -692,14 +692,8 @@ def _fix_qwen35_attention_cache(model):
 
 
 def _disable_fused_mrope(model):
-    """Route MRoPE through the differentiable cos/sin fallback for training.
-
-    mlx-vlm's MRoPERotaryEmbedding.apply_rotary uses a fused Metal kernel
-    whenever Metal is available, with no gradient support -- training dies
-    with [Primitive::vjp] Not implemented for CustomKernel. Flipping
-    fused_apply off makes apply_rotary take its pure-MLX fallback, which
-    differentiates fine.
-    """
+    """Flip fused_apply off so MRoPE training uses the differentiable
+    cos/sin fallback; the fused Metal kernel has no VJP."""
     count = 0
     try:
         modules = model.modules()

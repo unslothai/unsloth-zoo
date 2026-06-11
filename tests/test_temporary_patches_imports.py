@@ -112,3 +112,26 @@ def test_temporary_patches_submodule_list_is_complete():
         "TEMPORARY_PATCHES_SUBMODULES references modules that don't "
         f"exist on disk: {sorted(extra)}. Remove them."
     )
+
+
+def test_gpt_oss_imports_without_visible_gpus():
+    """gpt_oss.py computes device_memory at import; with UNSLOTH_ALLOW_CPU=1
+    DEVICE_TYPE stays "cuda" on GPU-less hosts, so mem_get_info must be
+    guarded. Subprocess so conftest's mem_get_info stub cannot mask it."""
+    import os
+    import subprocess
+    import sys
+
+    env = {
+        **os.environ,
+        "UNSLOTH_ALLOW_CPU": "1",
+        "CUDA_VISIBLE_DEVICES": "",
+        "HIP_VISIBLE_DEVICES": "",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import unsloth_zoo.temporary_patches.gpt_oss; print('IMPORT_OK')"],
+        env=env, capture_output=True, text=True, timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "IMPORT_OK" in result.stdout
