@@ -546,10 +546,10 @@ class MLXTrainer:
         self._prior_metal_limits = {}
 
     def train(self, resume_from_checkpoint: str | None = None):
-        # Stash for _train_inner. None = fresh start, a path = resume.
-        self._resume_from_checkpoint = resume_from_checkpoint
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
+        # Stash for _train_inner. None = fresh start, a path = resume.
+        self._resume_from_checkpoint = resume_from_checkpoint
         args = self.args
         model = self.model
         args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
@@ -1081,7 +1081,7 @@ class MLXTrainer:
                         f"Unsloth: streaming dataset exhausted while "
                         f"fast-forwarding to resume step {_resume_step}. "
                         f"Dataset may be shorter than the killed run consumed."
-                    )
+                    ) from None
 
         for it in range(_resume_step * grad_accum + 1, total_steps * grad_accum + 1):
             if self.stop_requested:
