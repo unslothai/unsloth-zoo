@@ -1313,6 +1313,7 @@ from .moe_utils import (
     select_moe_backend,
     patch_param_wrapper_for_moe,
     forward_native_grouped_mm,
+    forward_native_moe_loop,
     # torch_native_forward,
 )
 
@@ -1350,7 +1351,10 @@ def patch_gpt_oss_moe_for_lora():
     if backend == "grouped_mm":
         forward = forward_native_grouped_mm
     else:
-        forward = torch_native_forward
+        # torch_native_forward expects the bnb4bit ModuleList layout; the stock
+        # 3D GptOssExperts needs the generic loop, which handles gpt-oss
+        # activation, biases, and the separated LoRA stash.
+        forward = forward_native_moe_loop
 
     # Store original forward and patch - but DON'T replace the class!
     GptOssExpertsClass._original_forward = GptOssExpertsClass.forward
@@ -2485,6 +2489,24 @@ def patch_GptOssModel():
 pass
 TEMPORARY_PATCHES.append(patch_GptOssModel)
 
+encoding = None
+
+_HARMONY_SYMBOLS = (
+    "Author",
+    "Conversation",
+    "DeveloperContent",
+    "HarmonyEncodingName",
+    "Message",
+    "Role",
+    "SystemContent",
+    "ToolDescription",
+    "load_harmony_encoding",
+    "ReasoningEffort",
+)
+
+# Best-effort eager import; when openai_harmony is installed after this module was
+# imported, _ensure_harmony rebinds the symbols lazily at call time.
+# See https://github.com/unslothai/unsloth/issues/3361
 try:
     from openai_harmony import (
         Author,
@@ -2498,10 +2520,47 @@ try:
         load_harmony_encoding,
         ReasoningEffort
     )
-
-    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-except:
+except Exception:
     pass
+
+
+def _ensure_harmony():
+    g = globals()
+    if all(g.get(name) is not None for name in _HARMONY_SYMBOLS):
+        return
+    try:
+        import openai_harmony
+    except ModuleNotFoundError as e:
+        if not e.name or e.name == "openai_harmony":
+            raise ImportError("Please install openai_harmony via `pip install openai_harmony`") from e
+        if e.name.startswith("openai_harmony."):
+            raise ImportError(f"Unsloth: failed to import openai_harmony: {e}") from e
+        raise ImportError(f"Unsloth: failed to import openai_harmony; its dependency `{e.name}` is missing: {e}") from e
+    except Exception as e:
+        raise ImportError(f"Unsloth: failed to import openai_harmony: {e}") from e
+
+    missing = [name for name in _HARMONY_SYMBOLS if getattr(openai_harmony, name, None) is None]
+    if missing:
+        raise ImportError(
+            f"Unsloth: openai_harmony is installed but is missing required symbols ({', '.join(missing)}); "
+            f"please upgrade via `pip install --upgrade openai_harmony`"
+        )
+    for name in _HARMONY_SYMBOLS:
+        g[name] = getattr(openai_harmony, name)
+pass
+
+
+def _get_gpt_oss_harmony_encoding():
+    global encoding
+    _ensure_harmony()
+
+    if encoding is None:
+        try:
+            encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        except Exception as e:
+            raise RuntimeError(f"Unsloth: failed to load the gpt-oss harmony encoding: {e}") from e
+    return encoding
+pass
 
 
 def encode_conversations_with_harmony(
@@ -2512,10 +2571,7 @@ def encode_conversations_with_harmony(
     developer_instructions = None,
     model_identity = "You are ChatGPT, a large language model trained by OpenAI.",
 ):
-    try:
-        SystemContent
-    except:
-        raise ImportError("Please install openai_harmony via `pip install openai_harmony`")
+    harmony_encoding = _get_gpt_oss_harmony_encoding()
 
     assert reasoning_effort in ("low", "medium", "high")
 
@@ -2581,10 +2637,10 @@ def encode_conversations_with_harmony(
     # Create Harmony conversations
     convos = Conversation.from_messages(convos)
     if add_generation_prompt:
-        harmony_input_ids = encoding.render_conversation_for_completion(convos, Role.ASSISTANT)
+        harmony_input_ids = harmony_encoding.render_conversation_for_completion(convos, Role.ASSISTANT)
     else:
-        harmony_input_ids = encoding.render_conversation(convos)
-    harmony_decoded_text = encoding.decode(harmony_input_ids)
+        harmony_input_ids = harmony_encoding.render_conversation(convos)
+    harmony_decoded_text = harmony_encoding.decode(harmony_input_ids)
     return harmony_decoded_text, harmony_input_ids
 pass
 

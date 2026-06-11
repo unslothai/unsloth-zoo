@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2026.6.1"
+__version__ = "2026.6.2"
 
 import os
 import warnings
@@ -66,13 +66,23 @@ def has_429_exact_full_read(log_dir: str | Path) -> str:
             continue
     return "1"
 
-hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")).expanduser()
-xet_cache = Path(os.environ.get("HF_XET_CACHE", hf_home / "xet")).expanduser()
-os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", has_429_exact_full_read(xet_cache / "logs"))
+# Redirect the HF cache off a read-only default (locked-down machines) so
+# snapshot_download() can write. Runs before any huggingface_hub import.
+from .hf_cache import redirect_hf_cache_if_readonly, _active_caches
+redirect_hf_cache_if_readonly()
+
+# _active_caches mirrors Hub's env layering (XDG_CACHE_HOME included) and
+# returns None entries instead of raising when home is unresolvable; "1"
+# matches the probe's no-logs-found default.
+_, _, xet_cache = _active_caches()
+os.environ.setdefault(
+    "HF_XET_HIGH_PERFORMANCE",
+    has_429_exact_full_read(xet_cache / "logs") if xet_cache is not None else "1",
+)
 os.environ.setdefault("HF_XET_CHUNK_CACHE_SIZE_BYTES", "0")
 os.environ.setdefault("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", "0")
 os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "64")
-del has_429_exact_full_read, hf_home, xet_cache
+del has_429_exact_full_read, xet_cache, redirect_hf_cache_if_readonly, _active_caches
 
 # More verbose HF Hub info
 if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":

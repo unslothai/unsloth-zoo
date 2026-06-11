@@ -260,3 +260,46 @@ def test_forward_native_moe_loop_lora_dtype_precast_no_loop_alloc(dtype):
     rtol = 1e-4 if dtype == torch.float32 else 1e-1
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
     assert out.dtype == dtype
+
+
+class GptOssExperts(nn.Module):
+    """Stock gpt-oss layout: (E, in, out) weights, biases, clamped swiglu."""
+
+    def __init__(self, num_experts=4, hidden=16, intermediate=12):
+        super().__init__()
+        self.num_experts = num_experts
+        self.alpha = 1.702
+        self.limit = 7.0
+        self.gate_up_proj = nn.Parameter(
+            torch.randn(num_experts, hidden, 2 * intermediate) * 0.1)
+        self.gate_up_proj_bias = nn.Parameter(
+            torch.randn(num_experts, 2 * intermediate) * 0.1)
+        self.down_proj = nn.Parameter(
+            torch.randn(num_experts, intermediate, hidden) * 0.1)
+        self.down_proj_bias = nn.Parameter(torch.randn(num_experts, hidden) * 0.1)
+        self._unsloth_grouped_mm_format = True
+
+
+def test_forward_native_moe_loop_gpt_oss_matches_naive():
+    torch.manual_seed(0)
+    num_experts, hidden, num_tokens, top_k = 4, 16, 8, 2
+    experts = GptOssExperts(num_experts, hidden)
+    hidden_states = torch.randn(num_tokens, hidden)
+    top_k_index = torch.stack(
+        [torch.randperm(num_experts)[:top_k] for _ in range(num_tokens)])
+    top_k_weights = torch.softmax(torch.randn(num_tokens, top_k), dim=-1)
+
+    out = forward_native_moe_loop(experts, hidden_states, top_k_index, top_k_weights)
+
+    ref = torch.zeros_like(hidden_states)
+    for t in range(num_tokens):
+        for k in range(top_k):
+            e = top_k_index[t, k].item()
+            h = hidden_states[t] @ experts.gate_up_proj[e] + experts.gate_up_proj_bias[e]
+            gate, up = h[::2], h[1::2]
+            gate = gate.clamp(max=experts.limit)
+            up = up.clamp(min=-experts.limit, max=experts.limit)
+            inter = (up + 1.0) * (gate * torch.sigmoid(gate * experts.alpha))
+            ref[t] += top_k_weights[t, k] * (
+                inter @ experts.down_proj[e] + experts.down_proj_bias[e])
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)

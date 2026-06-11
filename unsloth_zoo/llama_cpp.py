@@ -1326,7 +1326,11 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
 
 
         # 4. Write Patched File
-        patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{name}.py")
+        # Keep package-layout entrypoints beside conversion/ so subprocess
+        # execution resolves `from conversion import ...`.
+        patched_dir = _llama_cpp_dir if _layout == "package" else LLAMA_CPP_DEFAULT_DIR
+        os.makedirs(patched_dir, exist_ok=True)
+        patched_filename = os.path.join(patched_dir, f"{name}.py")
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
         with open(patched_filename, "wb") as file:
             file.write(patched_content)
