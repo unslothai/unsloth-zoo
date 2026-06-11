@@ -116,7 +116,7 @@ _np_mod = _sys.modules.get("numpy")
 if _np_mod is not None and hasattr(_np_mod, "__version__"):
     try:
         _installed_numpy = _get_pkg_version("numpy")
-        if parse_version(_np_mod.__version__).base_version != parse_version(_installed_numpy).base_version:
+        if parse_version(_np_mod.__version__).public != parse_version(_installed_numpy).public:
             raise RuntimeError(
                 f"***** numpy was upgraded mid-session (loaded: {_np_mod.__version__}, "
                 f"installed: {_installed_numpy}) but the kernel still has the old version "
