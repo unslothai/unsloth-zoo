@@ -138,12 +138,146 @@ def test_force_compile_skips_prebuilt(monkeypatch, tmp_path):
     assert llama_cpp._maybe_install_llama_cpp_prebuilt(str(tmp_path / "llama.cpp")) is None
 
 
-def test_gpu_support_skips_prebuilt(monkeypatch, tmp_path):
+def test_gpu_without_detectable_target_falls_back(monkeypatch, tmp_path):
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
+    _patch_platform(monkeypatch, "Linux", "x86_64")
+    monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: None)
     def boom(*a, **k):
         raise AssertionError("network must not be touched")
     monkeypatch.setattr(llama_cpp, "_resolve_llama_cpp_release", boom)
     assert llama_cpp._maybe_install_llama_cpp_prebuilt(str(tmp_path / "llama.cpp"), gpu_support = True) is None
+
+
+# --- GPU asset selection (unslothai/llama.cpp fork bundles) -------------------
+
+FORK_MANIFEST = {"artifacts": [
+    {"asset_name": "app-b9585-linux-x64-cuda12-older.tar.gz",    "install_kind": "linux-cuda",
+     "runtime_line": "cuda12", "coverage_class": "older",    "supported_sms": ["70","75","80","86","89"],
+     "min_sm": 70, "max_sm": 89, "rank": 10},
+    {"asset_name": "app-b9585-linux-x64-cuda12-newer.tar.gz",    "install_kind": "linux-cuda",
+     "runtime_line": "cuda12", "coverage_class": "newer",    "supported_sms": ["86","89","90","100","103","120"],
+     "min_sm": 86, "max_sm": 120, "rank": 20},
+    {"asset_name": "app-b9585-linux-x64-cuda12-portable.tar.gz", "install_kind": "linux-cuda",
+     "runtime_line": "cuda12", "coverage_class": "portable", "supported_sms": ["70","75","80","86","89","90","100","103","120"],
+     "min_sm": 70, "max_sm": 120, "rank": 30},
+    {"asset_name": "app-b9585-linux-x64-cuda13-newer.tar.gz",    "install_kind": "linux-cuda",
+     "runtime_line": "cuda13", "coverage_class": "newer",    "supported_sms": ["86","89","90","100","103","120"],
+     "min_sm": 86, "max_sm": 120, "rank": 50},
+    {"asset_name": "app-b9585-linux-x64-rocm-gfx110X.tar.gz",    "install_kind": "linux-rocm"},
+    {"asset_name": "app-b9585-linux-x64-rocm-gfx120X.tar.gz",    "install_kind": "linux-rocm"},
+]}
+FORK_ASSETS = {a["asset_name"]: f"https://example.invalid/{a['asset_name']}" for a in FORK_MANIFEST["artifacts"]}
+FORK_ASSETS["llama-b9585-bin-macos-arm64.tar.gz"] = "https://example.invalid/llama-b9585-bin-macos-arm64.tar.gz"
+
+
+def test_select_gpu_assets_narrowest_coverage_first(monkeypatch):
+    _patch_platform(monkeypatch, "Linux", "x86_64")
+    monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: ("cuda", 86, "cuda12"))
+    names = [n for n, _ in llama_cpp._select_gpu_assets("b9585", FORK_ASSETS, FORK_MANIFEST)]
+    # sm86 fits cuda12-older (range 19) before cuda12-newer (range 34),
+    # then the cuda12 portable, then the other runtime line.
+    assert names[:2] == [
+        "app-b9585-linux-x64-cuda12-older.tar.gz",
+        "app-b9585-linux-x64-cuda12-portable.tar.gz",
+    ]
+    assert "app-b9585-linux-x64-cuda13-newer.tar.gz" in names
+
+
+def test_select_gpu_assets_prefers_torch_runtime_line(monkeypatch):
+    _patch_platform(monkeypatch, "Linux", "x86_64")
+    monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: ("cuda", 100, "cuda13"))
+    names = [n for n, _ in llama_cpp._select_gpu_assets("b9585", FORK_ASSETS, FORK_MANIFEST)]
+    assert names[0] == "app-b9585-linux-x64-cuda13-newer.tar.gz"
+
+
+def test_select_gpu_assets_rocm_family(monkeypatch):
+    _patch_platform(monkeypatch, "Linux", "x86_64")
+    monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: ("rocm", "gfx1100"))
+    names = [n for n, _ in llama_cpp._select_gpu_assets("b9585", FORK_ASSETS, FORK_MANIFEST)]
+    assert names == ["app-b9585-linux-x64-rocm-gfx110X.tar.gz"]
+
+
+def test_select_gpu_assets_macos_metal_bundle(monkeypatch):
+    # macOS needs no torch GPU detection; the fork Metal bundle is selected.
+    _patch_platform(monkeypatch, "Darwin", "arm64")
+    monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: None)
+    names = [n for n, _ in llama_cpp._select_gpu_assets("b9585", FORK_ASSETS, FORK_MANIFEST)]
+    assert names == ["llama-b9585-bin-macos-arm64.tar.gz"]
+
+
+def test_rocm_gfx_family_mapping():
+    assert llama_cpp._rocm_gfx_family("gfx1100") == "gfx110X"
+    assert llama_cpp._rocm_gfx_family("gfx1030") == "gfx103X"
+    assert llama_cpp._rocm_gfx_family("gfx1201") == "gfx120X"
+    assert llama_cpp._rocm_gfx_family("gfx1151") == "gfx1151"
+    assert llama_cpp._rocm_gfx_family("gfx906") is None
+
+
+@pytest.mark.skipif(not IS_POSIX, reason = "shell-script fake binaries")
+def test_gpu_full_install_happy_path(monkeypatch, tmp_path):
+    tag = "b9585"
+    asset = f"app-{tag}-linux-x64-cuda12-newer.tar.gz"
+    binary = tmp_path / "fixtures" / asset
+    source = tmp_path / "fixtures" / "source.tar.gz"
+    os.makedirs(binary.parent, exist_ok = True)
+    _make_binary_archive(str(binary), tag)
+    _make_source_archive(str(source), tag)
+    sha = llama_cpp._sha256_file(str(binary))
+
+    _patch_platform(monkeypatch, "Linux", "x86_64")
+    monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
+    monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: ("cuda", 100, "cuda12"))
+    monkeypatch.setattr(
+        llama_cpp, "_resolve_llama_cpp_release",
+        lambda releases_api = None: (tag, {asset: f"https://example.invalid/{asset}"}),
+    )
+    monkeypatch.setattr(
+        llama_cpp, "_fetch_release_json_asset",
+        lambda assets, name: FORK_MANIFEST if "manifest" in name else {"artifacts": {asset: {"sha256": sha}}},
+    )
+    def fake_download(url, dest_path):
+        fixture = binary if "app-" in os.path.basename(dest_path) else source
+        with open(fixture, "rb") as fr, open(dest_path, "wb") as fw:
+            fw.write(fr.read())
+    monkeypatch.setattr(llama_cpp, "_download_archive", fake_download)
+    monkeypatch.setattr(llama_cpp, "try_execute", lambda *a, **k: "")
+    monkeypatch.setattr(llama_cpp, "check_pip", lambda: "pip")
+
+    folder = str(tmp_path / "llama.cpp")
+    result = llama_cpp._install_llama_cpp_prebuilt(folder, gpu_support = True)
+    assert result is not None
+    marker = json.load(open(os.path.join(folder, llama_cpp.UNSLOTH_PREBUILT_INFO_FILENAME)))
+    assert marker["repo"] == "unslothai/llama.cpp"
+    assert marker["asset"] == asset
+
+
+@pytest.mark.skipif(not IS_POSIX, reason = "shell-script fake binaries")
+def test_gpu_sha256_mismatch_falls_back(monkeypatch, tmp_path):
+    tag = "b9585"
+    asset = f"app-{tag}-linux-x64-cuda12-newer.tar.gz"
+    binary = tmp_path / "fixtures" / asset
+    os.makedirs(binary.parent, exist_ok = True)
+    _make_binary_archive(str(binary), tag)
+
+    _patch_platform(monkeypatch, "Linux", "x86_64")
+    monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
+    monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: ("cuda", 100, "cuda12"))
+    monkeypatch.setattr(
+        llama_cpp, "_resolve_llama_cpp_release",
+        lambda releases_api = None: (tag, {asset: f"https://example.invalid/{asset}"}),
+    )
+    monkeypatch.setattr(
+        llama_cpp, "_fetch_release_json_asset",
+        lambda assets, name: FORK_MANIFEST if "manifest" in name else {"artifacts": {asset: {"sha256": "0" * 64}}},
+    )
+    def fake_download(url, dest_path):
+        with open(binary, "rb") as fr, open(dest_path, "wb") as fw:
+            fw.write(fr.read())
+    monkeypatch.setattr(llama_cpp, "_download_archive", fake_download)
+
+    folder = str(tmp_path / "llama.cpp")
+    assert llama_cpp._install_llama_cpp_prebuilt(folder, gpu_support = True) is None
+    assert not os.path.exists(folder)
 
 
 # --- extraction and placement ------------------------------------------------
