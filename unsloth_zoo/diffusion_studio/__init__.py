@@ -16,13 +16,24 @@
 """Run DiffusionGemma in Unsloth Studio over the GGUF path.
 
 DiffusionGemma is a block-diffusion model, so llama.cpp serves it through a dedicated diffusion runner
-rather than the autoregressive server. This package wraps that runner in an OpenAI-compatible shim so
-Studio can talk to it as an ordinary llama.cpp / OpenAI-compatible Connection - an additive path that
-leaves the autoregressive flows untouched. See the README for the end-to-end setup.
+rather than the autoregressive server. This package drives the optimized on-device visual decoder
+(llama-diffusion-gemma-visual-server) and wraps it in an OpenAI-compatible shim so Studio can serve it
+as an ordinary llama.cpp / OpenAI-compatible model. The shim streams the committed answer text and a
+self-contained ```html artifact that replays the per-step denoising canvas, which Studio auto-renders for
+DiffusionGemma. Autoregressive flows are untouched.
 
-The engine (LlamaServer / Tok / generate) imports cleanly; the HTTP shim pulls in fastapi/uvicorn only
-when you build or run it, so importing this package stays dependency-light.
+The visual server tokenizes, applies the chat template and detokenizes from the GGUF's own embedded
+tokenizer, so no tokenizer files are needed here. visual_engine imports cleanly; the HTTP shim pulls in
+fastapi/uvicorn only when run, so importing this package stays dependency-light.
 """
-from .engine import LlamaServer, Tok, generate, VOCAB, CANVAS, EOS_IDS, DEFAULTS
+import os
 
-__all__ = ["LlamaServer", "Tok", "generate", "VOCAB", "CANVAS", "EOS_IDS", "DEFAULTS"]
+from .visual_engine import VisualServer, generate_visual, CANVAS
+
+
+def canvas_player_path():
+    """Absolute path to the self-contained denoising canvas player template (bundled with this package)."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "canvas_player.html")
+
+
+__all__ = ["VisualServer", "generate_visual", "CANVAS", "canvas_player_path"]

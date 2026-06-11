@@ -60,6 +60,9 @@ version = {attr = "unsloth_zoo.__init__.__version__"}
 [tool.setuptools]
 include-package-data = false
 
+[tool.setuptools.package-data]
+unsloth_zoo = ["diffusion_studio/*.html"]
+
 [tool.setuptools.packages.find]
 exclude = ["images*"]
 
