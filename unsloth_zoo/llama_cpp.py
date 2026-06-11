@@ -266,7 +266,7 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
                 '--accept-source-agreements',
             ] + extra_args
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"Unsloth: Failed to install {winget_id} via winget.\n"
@@ -421,6 +421,8 @@ def check_pip():
             stdout = subprocess.PIPE,
             stderr = subprocess.STDOUT,
             text = True,
+            encoding = "utf-8",
+            errors = "replace",
         )
         output = probe.stdout or ""
 
@@ -439,7 +441,7 @@ pass
 def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None, system_type = "debian", ignore_deprecation = False):
     # All Unsloth Zoo code licensed under LGPLv3
 
-    with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, text=True) as sp:
+    with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, text=True, encoding="utf-8", errors="replace") as sp:
         stdout, stderr = sp.communicate()
         stdout = stdout or ""
         stderr = stderr or ""
@@ -529,7 +531,7 @@ def _find_lib_path(lib_name):
     try:
         result = subprocess.run(
             ['gcc', f'-print-file-name={lib_name}'],
-            capture_output=True, text=True
+            capture_output=True, text=True, encoding="utf-8", errors="replace"
         )
         path = os.path.realpath(result.stdout.strip())
         if os.path.isabs(path) and os.path.exists(path):
@@ -589,6 +591,8 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
                     [location, "--help"],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=5
                 )
                 if result.returncode == 0 or "usage" in result.stdout.lower() or "usage" in result.stderr.lower():
@@ -1201,7 +1205,7 @@ def install_llama_cpp(
                 print(f"Unsloth: cmake configure with {cmake_generator}")
                 print(f"Unsloth: cmake args: {' '.join(cmake_args)}")
 
-            result = subprocess.run(cmake_args, capture_output=True, text=True)
+            result = subprocess.run(cmake_args, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"cmake configure failed (exit {result.returncode}):\n"
@@ -1216,7 +1220,7 @@ def install_llama_cpp(
 
             if print_output: print("Unsloth: Building llama.cpp (this may take several minutes)...")
 
-            result = subprocess.run(build_cmd, capture_output=True, text=True)
+            result = subprocess.run(build_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"cmake build failed (exit {result.returncode}):\n"
@@ -1909,6 +1913,8 @@ def _convert_to_gguf(command, output_filename, print_output = False, print_outpu
         stdout = subprocess.PIPE,
         stderr = subprocess.STDOUT,
         universal_newlines = True,
+        encoding = "utf-8",
+        errors = "replace",
         shell = True,
     )
     ProgressBar._instances.clear()
@@ -2574,7 +2580,7 @@ def check_build_requirements():
 
     for tool, package in required_tools.items():
         try:
-            result = subprocess.run(['which', tool], capture_output=True, text=True)
+            result = subprocess.run(['which', tool], capture_output=True, text=True, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 # Adjust package names for non-Debian systems
                 if system_type == "rpm":
@@ -2630,7 +2636,7 @@ def check_libcurl_dev():
     if system_type == "debian":
         package_name = "libcurl4-openssl-dev"
         try:
-            result = subprocess.run(['dpkg','-l', package_name], capture_output = True, text = True)
+            result = subprocess.run(['dpkg','-l', package_name], capture_output = True, text = True, encoding = "utf-8", errors = "replace")
             is_installed = result.returncode == 0 and 'ii' in result.stdout
             return is_installed, package_name
         except Exception:
@@ -2639,7 +2645,7 @@ def check_libcurl_dev():
     elif system_type == "rpm":
         package_name = "libcurl-devel"
         try:
-            result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True)
+            result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True, encoding = "utf-8", errors = "replace")
             is_installed = result.returncode == 0
             return is_installed, package_name
         except Exception:
@@ -2648,7 +2654,7 @@ def check_libcurl_dev():
     elif system_type == "arch":
         package_name = "curl"
         try:
-            result = subprocess.run(['pacman', '-Q', package_name], capture_output=True, text=True)
+            result = subprocess.run(['pacman', '-Q', package_name], capture_output=True, text=True, encoding="utf-8", errors="replace")
             is_installed = result.returncode == 0
             return is_installed, package_name
         except Exception:
