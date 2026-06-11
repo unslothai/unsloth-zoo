@@ -1341,6 +1341,13 @@ def test_patch_gemma4_vllm_lora_support_early_returns_when_no_classes():
     ):
         saved[missing] = _sys.modules.get(missing)
         _sys.modules[missing] = None
+    # Evict any cached copy so the no-classes path is exercised against a
+    # fresh import regardless of test order. vllm_lora_worker_manager needs
+    # vllm.config (not stubbed here), which only resolves on a real vllm
+    # install; the early return must not pull it in.
+    saved_worker_manager = _sys.modules.pop(
+        "unsloth_zoo.vllm_lora_worker_manager", None
+    )
     try:
         # Must not raise when no gemma4 class is importable.
         empty_model.patch_gemma4_vllm_lora_support()
@@ -1352,6 +1359,8 @@ def test_patch_gemma4_vllm_lora_support_early_returns_when_no_classes():
                 _sys.modules.pop(name, None)
             else:
                 _sys.modules[name] = prev
+        if saved_worker_manager is not None:
+            _sys.modules["unsloth_zoo.vllm_lora_worker_manager"] = saved_worker_manager
 
 
 def test_patch_gemma4_vllm_k_eq_v_support_noop_when_private_attr_missing():
