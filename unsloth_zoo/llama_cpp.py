@@ -36,6 +36,7 @@ import requests
 import json
 from tqdm.auto import tqdm as ProgressBar
 from functools import lru_cache
+import getpass
 import inspect
 import contextlib
 import importlib.util
@@ -264,11 +265,11 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
     # Choose package manager based on system type
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
+        install_cmd = f"{'sudo -S ' if sudo else ''}{pkg_manager} install {package} -y"
     elif system_type == "arch":
-        install_cmd = f"{'sudo ' if sudo else ''}pacman -S --noconfirm {package}"
+        install_cmd = f"{'sudo -S ' if sudo else ''}pacman -S --noconfirm {package}"
     else:  # Default to debian/apt-get
-        install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+        install_cmd = f"{'sudo -S ' if sudo else ''}apt-get install {package} -y"
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
@@ -278,11 +279,18 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
                 f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
                 "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
             )
-    with subprocess.Popen(install_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+    if sudo:
+        password = getpass.getpass(f"Enter password for user {getpass.getuser()}: ")
+    with subprocess.Popen(install_cmd, shell = True, stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+        if sudo and sp.stdin:
+            sp.stdin.write(f"{password}\n".encode())
+            sp.stdin.flush()
+            sp.stdin.close()
+
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
 
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line or "requires superuser" in line:
                 sp.terminate()
                 raise RuntimeError(f"[FAIL] Unsloth: Permission denied when installing package {package}\n"\
                                    "This operation requires elevated sudo/root permissions. Please manually install missing packages and retry again"
@@ -313,7 +321,7 @@ def do_we_need_sudo(system_type="debian"):
     # Choose update command based on system type
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        update_cmd = f"{pkg_manager} check-update"
+        update_cmd = f"{pkg_manager} install package --setopt=tsflags=test"
     elif system_type == "arch":
         update_cmd = "pacman -Sy"
     else:
@@ -323,7 +331,7 @@ def do_we_need_sudo(system_type="debian"):
     with subprocess.Popen(update_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line or "requires superuser" in line:
                 sp.terminate()
                 sudo = True
                 break
@@ -802,75 +810,66 @@ def install_llama_cpp(
             build_errors.append(f"Windows cmake build failed: {str(e)}")
 
     else:
-        # Linux/macOS: Try make first, then cmake
+        # Linux/macOS: Use cmake to build (build using make is already removed from llama.cpp)
         try:
-            if print_output: print("Trying to build with make...")
-            try_execute("make clean", cwd = llama_cpp_folder, **kwargs)
-            try_execute(f"make all -j{cpu_count}", cwd = llama_cpp_folder, **kwargs)
+            # Clean up any partial build
+            try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
+
+            # Build cmake configure command with library detection
+            cmake_configure = (
+                f"cmake . -B build "
+                f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
+            )
+
+            # Detect OpenMP library path (fixes GOMP linker errors)
+            gomp_path = _find_lib_path('libgomp.so')
+            if gomp_path:
+                cmake_configure += (
+                    f" -DOpenMP_C_LIB_NAMES=gomp"
+                    f" -DOpenMP_CXX_LIB_NAMES=gomp"
+                    f" -DOpenMP_gomp_LIBRARY={gomp_path}"
+                )
+
+            # Detect OpenSSL library paths
+            ssl_path = _find_lib_path('libssl.so')
+            crypto_path = _find_lib_path('libcrypto.so')
+            if ssl_path and crypto_path:
+                cmake_configure += (
+                    f" -DOPENSSL_ROOT_DIR=/usr"
+                    f" -DOPENSSL_SSL_LIBRARY={ssl_path}"
+                    f" -DOPENSSL_CRYPTO_LIBRARY={crypto_path}"
+                )
+
+            # LLAMA_CURL is deprecated upstream (ggml-org/llama.cpp#18791),
+            # so we pass ignore_deprecation=True to handle any deprecation warnings.
+            try_execute(
+                cmake_configure,
+                cwd = llama_cpp_folder,
+                ignore_deprecation = True,
+                **kwargs
+            )
+            try_execute(
+                f"cmake --build build --config Release "\
+                f"-j{cpu_count} --clean-first --target "\
+                f"{' '.join(llama_cpp_targets)}",
+                cwd = llama_cpp_folder,
+                ignore_deprecation=True,
+                **kwargs
+            )
+            # Move compiled objects to main folder.
+            # Remove only the target binaries first to avoid
+            # "same file" errors when symlinks point into build/bin/.
+            try_execute(
+                "rm -f " + " ".join(llama_cpp_targets) + " && cp build/bin/llama-* .",
+                cwd = llama_cpp_folder,
+                **kwargs
+            )
             build_success = True
-            print("Successfully built with make")
+            # Remove build folder
+            try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
+            if print_output: print("Successfully built with cmake")
         except Exception as e:
-            build_errors.append(f"Make failed: {str(e)}")
-            if print_output: print(f"Make failed, trying cmake...")
-            # Use cmake instead
-            try:
-                # Clean up any partial build
-                try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
-
-                # Build cmake configure command with library detection
-                cmake_configure = (
-                    f"cmake . -B build "
-                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
-                )
-
-                # Detect OpenMP library path (fixes GOMP linker errors)
-                gomp_path = _find_lib_path('libgomp.so')
-                if gomp_path:
-                    cmake_configure += (
-                        f" -DOpenMP_C_LIB_NAMES=gomp"
-                        f" -DOpenMP_CXX_LIB_NAMES=gomp"
-                        f" -DOpenMP_gomp_LIBRARY={gomp_path}"
-                    )
-
-                # Detect OpenSSL library paths
-                ssl_path = _find_lib_path('libssl.so')
-                crypto_path = _find_lib_path('libcrypto.so')
-                if ssl_path and crypto_path:
-                    cmake_configure += (
-                        f" -DOPENSSL_ROOT_DIR=/usr"
-                        f" -DOPENSSL_SSL_LIBRARY={ssl_path}"
-                        f" -DOPENSSL_CRYPTO_LIBRARY={crypto_path}"
-                    )
-
-                # LLAMA_CURL is deprecated upstream (ggml-org/llama.cpp#18791),
-                # so we pass ignore_deprecation=True to handle any deprecation warnings.
-                try_execute(
-                    cmake_configure,
-                    cwd = llama_cpp_folder,
-                    ignore_deprecation = True,
-                    **kwargs
-                )
-                try_execute(
-                    f"cmake --build build --config Release "\
-                    f"-j{cpu_count} --clean-first --target "\
-                    f"{' '.join(llama_cpp_targets)}",
-                    cwd = llama_cpp_folder,
-                    **kwargs
-                )
-                # Move compiled objects to main folder.
-                # Remove only the target binaries first to avoid
-                # "same file" errors when symlinks point into build/bin/.
-                try_execute(
-                    "rm -f " + " ".join(llama_cpp_targets) + " && cp build/bin/llama-* .",
-                    cwd = llama_cpp_folder,
-                    **kwargs
-                )
-                build_success = True
-                # Remove build folder
-                try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
-                if print_output: print("Successfully built with cmake")
-            except Exception as e:
-                build_errors.append(f"CMake failed: {str(e)}")
+            build_errors.append(f"CMake failed: {str(e)}")
 
     if not build_success:
         error_msg = "=== Unsloth: FAILED building llama.cpp ===\n"
