@@ -109,13 +109,14 @@ except:
 # be reloaded, so raise a clear restart error.
 import sys as _sys
 from importlib.metadata import version as _get_pkg_version
+from packaging.version import parse as parse_version
 
 # numpy: C extensions cannot be reloaded, so must restart.
 _np_mod = _sys.modules.get("numpy")
 if _np_mod is not None and hasattr(_np_mod, "__version__"):
     try:
         _installed_numpy = _get_pkg_version("numpy")
-        if _np_mod.__version__ != _installed_numpy:
+        if parse_version(_np_mod.__version__).base_version != parse_version(_installed_numpy).base_version:
             raise RuntimeError(
                 f"***** numpy was upgraded mid-session (loaded: {_np_mod.__version__}, "
                 f"installed: {_installed_numpy}) but the kernel still has the old version "
