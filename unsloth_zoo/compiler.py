@@ -4533,15 +4533,12 @@ def unsloth_compile_transformers(
             print(str(dir(combined_module)))
         combined_module = None
 
-    # The dtype-coercing forward rewrites below never compile anything
-    # (add_torch_compile=False), so they must also run when compiling is
-    # disabled: the fp32 norm weight upcast happens unconditionally at load,
-    # and without these casts eager F.layer_norm crashes on bf16 activations
-    # ("expected scalar type BFloat16 but found Float", eg Gemma 4 audio /
-    # Gemma 3 SigLIP towers under UNSLOTH_COMPILE_DISABLE=1).
+    # These rewrites never compile (add_torch_compile=False), so run them even
+    # when compiling is disabled: norms are fp32 upcast at load regardless, and
+    # eager F.layer_norm crashes on bf16 activations against fp32 weights.
     if compile_torch_modules:
         if not disable:
-            # Compiled global F.layer_norm; never install when compile is off
+            # Compiled global F.layer_norm: only when compiling is allowed
             from .patch_torch_functions import patch_torch_functions
 
             patch_torch_functions()
@@ -4589,12 +4586,9 @@ def unsloth_compile_transformers(
                 m = _re.search(r"def forward\(self,\s*(\w+)", source)
                 param_name = m.group(1) if m else "input"
                 if disable:
-                    # Eager F.layer_norm requires input dtype == weight dtype,
-                    # so cast the input to the (fp32 upcast) weight dtype and
-                    # the output back. Only under UNSLOTH_COMPILE_DISABLE: the
-                    # compiled path type-promotes inside the fused kernel, and
-                    # adding the cast there changes batched numerics. weight
-                    # is None when elementwise_affine/affine=False.
+                    # Eager F.layer_norm needs input dtype == weight dtype: cast in
+                    # and out. Compiled path left untouched (adding the cast there
+                    # changes batched numerics). weight is None when affine=False.
                     lines = source.split("\n")
                     def_line = lines[0]
                     body_lines = lines[1:]
