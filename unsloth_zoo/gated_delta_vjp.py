@@ -283,8 +283,14 @@ def patch_gated_delta():
                 Hv, Dv = v.shape[-2:]
                 state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-            # No incoming state cache: use the memory-efficient ops path.
+            # No incoming state cache: training. Prefer the fused-kernel VJP
+            # (fast, O(chunks) graph); fall back to the ops VJP when the call
+            # shape is outside kernel support.
             if is_training_call:
+                if gated_delta_kernel_supported(q, g, mask):
+                    return gated_delta_kernel_efficient(
+                        q, k, v, g, beta, state, mask,
+                    )
                 return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
 
             # Cached state: prefer the kernel for speed, else efficient ops.
@@ -389,3 +395,348 @@ def patch_gated_delta_vlm():
     vlm_language.gated_delta_update = patched_gated_delta_update
     vlm_gated_delta._unsloth_gated_delta_patched = True
     print("Unsloth: Patched mlx-vlm GatedDeltaNet with memory-efficient custom VJP.")
+
+
+# --------------------------------------------------------------------------
+# Fused Metal kernels for the training backward pass.
+#
+# The ops-based VJP above is memory-correct but builds ~T*12 lazy
+# primitives per layer per step (dispatch-bound, unfusable by mx.compile).
+# These kernels replace both directions at chunk granularity: forward
+# reuses mlx-lm's fused gated_delta_kernel per chunk; backward replays the
+# chunk states (K1) and reverse-scans with atomic grad accumulation (K2).
+# Eligibility: Metal GPU, no mask (training passes mask=None), scalar
+# gating, Dk % 32 == 0 — anything else falls back to the ops VJP. Atomic
+# accumulation makes low-order gradient bits nondeterministic, matching
+# Metal reduction-order behavior elsewhere.
+# --------------------------------------------------------------------------
+
+_KERNEL_CHUNK_SIZE = 64
+
+
+def _make_gd_chunk_states_kernel():
+    """K1: replay the chunk forward, storing every post-step state.
+
+    Thread layout mirrors mlx-lm's gated_delta_step kernel: grid z = B*Hv,
+    grid y = Dv (one state row per simdgroup), 32 lanes each owning
+    Dk/32 contiguous state columns held in registers.
+    """
+    if not mx.metal.is_available():
+        return None
+    source = """
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        constexpr int n_per_t = Dk / 32;
+
+        // q unused in the state replay; k: [B, T, Hv, Dk] (post GQA-repeat)
+        auto k_ = k + b_idx * T * Hv * Dk + hv_idx * Dk;
+        // v: [B, T, Hv, Dv]
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // state_in: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        // states: [B, Hv, T, Dv, Dk] -- post-update state for each step
+        auto states_ = states + ((n * T) * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        // g: [B, T, Hv] (scalar gating only on the kernel path)
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * g_[hv_idx];
+            kv_mem += state[i] * k_[s_idx];
+          }
+          kv_mem = simd_sum(kv_mem);
+
+          auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem)
+              * static_cast<float>(beta_[hv_idx]);
+
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
+            states_[s_idx] = state[i];
+          }
+
+          k_ += Hv * Dk;
+          v_ += Hv * Dv;
+          g_ += Hv;
+          beta_ += Hv;
+          states_ += Dv * Dk;
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="unsloth_gd_chunk_states",
+        input_names=["k", "v", "g", "beta", "state_in", "T"],
+        output_names=["states"],
+        source=source,
+    )
+
+
+def _make_gd_chunk_backward_kernel():
+    """K2: reverse-time scan over one chunk, accumulating input gradients.
+
+    Same thread layout as K1. The per-row d_state slice lives in registers;
+    cross-row reductions (d_q, d_k, d_g, d_beta) go through atomic float
+    adds into zero-initialized outputs.
+    """
+    if not mx.metal.is_available():
+        return None
+    source = """
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        constexpr int n_per_t = Dk / 32;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // Start every per-timestep pointer at t = T-1.
+        auto q_ = q + (b_idx * T + (T - 1)) * Hv * Dk + hv_idx * Dk;
+        auto k_ = k + (b_idx * T + (T - 1)) * Hv * Dk + hv_idx * Dk;
+        auto v_ = v + (b_idx * T + (T - 1)) * Hv * Dv + hv_idx * Dv;
+        auto g_ = g + (b_idx * T + (T - 1)) * Hv;
+        auto beta_ = beta + (b_idx * T + (T - 1)) * Hv;
+        auto dy_ = dy + (b_idx * T + (T - 1)) * Hv * Dv + hv_idx * Dv;
+
+        auto d_q_ = d_q + (b_idx * T + (T - 1)) * Hv * Dk + hv_idx * Dk;
+        auto d_k_ = d_k + (b_idx * T + (T - 1)) * Hv * Dk + hv_idx * Dk;
+        auto d_v_ = d_v + (b_idx * T + (T - 1)) * Hv * Dv + hv_idx * Dv;
+        auto d_g_ = d_g + (b_idx * T + (T - 1)) * Hv;
+        auto d_beta_ = d_beta + (b_idx * T + (T - 1)) * Hv;
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto states_ = states + ((n * T) * Dv + dv_idx) * Dk;
+        auto d_state_out_ = d_state_out + (n * Dv + dv_idx) * Dk;
+        auto d_state_in_ = d_state_in + (n * Dv + dv_idx) * Dk;
+
+        // d_state: cotangent w.r.t. the state RETURNED by step t.
+        float d_state[n_per_t];
+        float s_prev[n_per_t];
+        float s_cur[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          d_state[i] = static_cast<float>(d_state_out_[s_idx]);
+        }
+
+        for (int t = T - 1; t >= 0; --t) {
+          auto prev_row = states_ + (t - 1) * Dv * Dk;
+          auto cur_row = states_ + t * Dv * Dk;
+          float g_t = g_[hv_idx];
+          float beta_t = beta_[hv_idx];
+          float v_t = static_cast<float>(v_[dv_idx]);
+          float dy_t = static_cast<float>(dy_[dv_idx]);
+
+          // Recompute Sd = S_prev * g, kv, delta from the stored states.
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            s_prev[i] = (t > 0) ? prev_row[s_idx]
+                                : static_cast<float>(i_state[s_idx]);
+            s_cur[i] = cur_row[s_idx];
+            kv_mem += s_prev[i] * g_t * static_cast<float>(k_[s_idx]);
+          }
+          kv_mem = simd_sum(kv_mem);
+          float delta = (v_t - kv_mem) * beta_t;
+
+          // y = (S_t * q).sum(-1): dy contributes to d_state and d_q.
+          float d_delta_partial = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            float k_c = static_cast<float>(k_[s_idx]);
+            float q_c = static_cast<float>(q_[s_idx]);
+            float dS_tot = d_state[i] + dy_t * q_c;
+
+            atomic_fetch_add_explicit(&d_q_[s_idx], dy_t * s_cur[i],
+                                      memory_order_relaxed);
+            d_delta_partial += dS_tot * k_c;
+            // Stash dS_tot for the second pass below.
+            s_cur[i] = dS_tot;
+          }
+          float d_delta = simd_sum(d_delta_partial);
+
+          float d_kv = -d_delta * beta_t;
+          float d_g_partial = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            float k_c = static_cast<float>(k_[s_idx]);
+            float dS_tot = s_cur[i];
+            float sd = s_prev[i] * g_t;
+            float d_sd = dS_tot + d_kv * k_c;
+
+            atomic_fetch_add_explicit(&d_k_[s_idx],
+                                      dS_tot * delta + d_kv * sd,
+                                      memory_order_relaxed);
+            d_g_partial += d_sd * s_prev[i];
+            d_state[i] = d_sd * g_t;
+          }
+          d_g_partial = simd_sum(d_g_partial);
+
+          if (thread_index_in_simdgroup == 0) {
+            atomic_fetch_add_explicit(&d_v_[dv_idx], d_delta * beta_t,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&d_beta_[hv_idx],
+                                      d_delta * (v_t - kv_mem),
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&d_g_[hv_idx], d_g_partial,
+                                      memory_order_relaxed);
+          }
+
+          q_ -= Hv * Dk;
+          k_ -= Hv * Dk;
+          v_ -= Hv * Dv;
+          g_ -= Hv;
+          beta_ -= Hv;
+          dy_ -= Hv * Dv;
+          d_q_ -= Hv * Dk;
+          d_k_ -= Hv * Dk;
+          d_v_ -= Hv * Dv;
+          d_g_ -= Hv;
+          d_beta_ -= Hv;
+        }
+
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          atomic_fetch_add_explicit(&d_state_in_[s_idx], d_state[i],
+                                    memory_order_relaxed);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="unsloth_gd_chunk_backward",
+        input_names=[
+            "q", "k", "v", "g", "beta", "state_in", "states",
+            "dy", "d_state_out", "T",
+        ],
+        output_names=["d_q", "d_k", "d_v", "d_g", "d_beta", "d_state_in"],
+        source=source,
+        atomic_outputs=True,
+    )
+
+
+_GD_STATES_KERNEL = None
+_GD_BACKWARD_KERNEL = None
+
+
+def _get_kernels():
+    global _GD_STATES_KERNEL, _GD_BACKWARD_KERNEL
+    if _GD_STATES_KERNEL is None:
+        _GD_STATES_KERNEL = _make_gd_chunk_states_kernel()
+        _GD_BACKWARD_KERNEL = _make_gd_chunk_backward_kernel()
+    return _GD_STATES_KERNEL, _GD_BACKWARD_KERNEL
+
+
+def gated_delta_kernel_supported(q, g, mask) -> bool:
+    """Whether the fused-kernel VJP path can handle this call."""
+    return (
+        mask is None
+        and g.ndim == 3
+        and q.shape[-1] % 32 == 0
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+    )
+
+
+def gated_delta_kernel_efficient(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
+) -> Tuple[mx.array, mx.array]:
+    """Chunked GDN forward+backward with fused Metal kernels.
+
+    Same contract as gated_delta_ops_efficient, restricted to the
+    kernel-eligible case (see gated_delta_kernel_supported).
+    """
+    assert mask is None
+    from mlx_lm.models.gated_delta import gated_delta_kernel
+
+    B, T, Hk, Dk = q.shape
+    Hv, Dv = v.shape[-2:]
+    if state is None:
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+    if (repeat_factor := Hv // Hk) > 1:
+        # The repeat is recorded outside the custom_function, so autodiff
+        # folds the per-group gradient sum back to [B, T, Hk, Dk] for us.
+        q = mx.repeat(q, repeat_factor, -2)
+        k = mx.repeat(k, repeat_factor, -2)
+
+    states_kernel, backward_kernel = _get_kernels()
+
+    @mx.custom_function
+    def _chunk(q_c, k_c, v_c, g_c, beta_c, state_in):
+        return gated_delta_kernel(q_c, k_c, v_c, g_c, beta_c, state_in)
+
+    @_chunk.vjp
+    def _chunk_vjp(primals, cotangents, outputs):
+        q_c, k_c, v_c, g_c, beta_c, state_in = primals
+        dy, d_state_out = cotangents
+        Bc, Tc = q_c.shape[:2]
+
+        (states,) = states_kernel(
+            inputs=[k_c, v_c, g_c, beta_c, state_in, Tc],
+            template=[("Dk", Dk), ("Dv", Dv), ("Hv", Hv)],
+            grid=(32, Dv, Bc * Hv),
+            threadgroup=(32, 4, 1),
+            output_shapes=[(Bc, Hv, Tc, Dv, Dk)],
+            output_dtypes=[mx.float32],
+        )
+        d_q, d_k, d_v, d_g, d_beta, d_state_in = backward_kernel(
+            inputs=[
+                q_c, k_c, v_c, g_c, beta_c, state_in, states,
+                dy, d_state_out, Tc,
+            ],
+            template=[("Dk", Dk), ("Dv", Dv), ("Hv", Hv)],
+            grid=(32, Dv, Bc * Hv),
+            threadgroup=(32, 4, 1),
+            output_shapes=[
+                (Bc, Tc, Hv, Dk),
+                (Bc, Tc, Hv, Dk),
+                (Bc, Tc, Hv, Dv),
+                (Bc, Tc, Hv),
+                (Bc, Tc, Hv),
+                (Bc, Hv, Dv, Dk),
+            ],
+            output_dtypes=[mx.float32] * 6,
+            init_value=0,
+        )
+        return (
+            d_q.astype(q_c.dtype),
+            d_k.astype(k_c.dtype),
+            d_v.astype(v_c.dtype),
+            d_g.astype(g_c.dtype),
+            d_beta.astype(beta_c.dtype),
+            d_state_in.astype(state_in.dtype),
+        )
+
+    all_ys = []
+    s = state
+    for t_start in range(0, T, _KERNEL_CHUNK_SIZE):
+        t_end = min(t_start + _KERNEL_CHUNK_SIZE, T)
+        chunk_y, s = _chunk(
+            q[:, t_start:t_end],
+            k[:, t_start:t_end],
+            v[:, t_start:t_end],
+            g[:, t_start:t_end],
+            beta[:, t_start:t_end],
+            s,
+        )
+        all_ys.append(chunk_y)
+
+    y = mx.concatenate(all_ys, axis=1) if len(all_ys) > 1 else all_ys[0]
+    return y, s
