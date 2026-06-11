@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import inspect
 import importlib
+import functools
 from collections.abc import Mapping
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 from .common import TEMPORARY_PATCHES, torch_compile, _torch_compile
@@ -1644,3 +1645,46 @@ def patch_qwen2vl_image_processor_pixel_attrs():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
+
+
+def patch_kv_cache_compute_dtype():
+    # Full finetuning upcasts the trainable weights to float32, but the rollout used
+    # by GRPO (and eval generation) runs under a bf16/fp16 autocast. apply_rotary_pos_emb
+    # rotates the keys through the float32 cos/sin buffers, so the key reaching the cache
+    # is float32 while the value (no RoPE) stays the compute dtype. transformers sizes the
+    # cache buffer from the first key written (float32), then the value write mismatches:
+    #   cache_utils.py  self.values.index_copy_(...)  ->  self Float vs source BFloat16
+    # Align the key and value at the cache write: the first write follows the value
+    # (compute) dtype, so the rollout cache is allocated in fp16/bf16 (fast, half the KV
+    # memory), and later writes follow the existing cache dtype, so they can never disagree.
+    # A no-op when the key and value already match (LoRA, QLoRA, plain float32 inference).
+    try:
+        import transformers.cache_utils as cache_utils
+        base = cache_utils.CacheLayerMixin
+    except Exception as e:
+        return raise_error("transformers.cache_utils.CacheLayerMixin", e)
+
+    def make_dtype_safe_update(original_update):
+        if getattr(original_update, "_unsloth_dtype_safe", False):
+            return original_update
+        @functools.wraps(original_update)
+        def update(self, key_states, value_states, cache_kwargs = None):
+            cache_dtype = getattr(self, "dtype", None)
+            if getattr(self, "is_initialized", False) and cache_dtype is not None:
+                if key_states.dtype   != cache_dtype: key_states   = key_states.to(cache_dtype)
+                if value_states.dtype != cache_dtype: value_states = value_states.to(cache_dtype)
+            elif key_states.dtype != value_states.dtype:
+                # First write: the un-rotated value carries the true compute dtype.
+                key_states = key_states.to(value_states.dtype)
+            return original_update(self, key_states, value_states, cache_kwargs)
+        update._unsloth_dtype_safe = True
+        return update
+
+    for cls in list(vars(cache_utils).values()):
+        if not (isinstance(cls, type) and issubclass(cls, base) and cls is not base):
+            continue
+        original_update = cls.__dict__.get("update", None)
+        if original_update is None: continue
+        cls.update = make_dtype_safe_update(original_update)
+pass
+TEMPORARY_PATCHES.append(patch_kv_cache_compute_dtype)
