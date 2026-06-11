@@ -16,13 +16,9 @@
 
 """Prompt-completion collation: token type id routing.
 
-Gemma 3n emits ``token_type_ids`` and Gemma 4 emits ``mm_token_type_ids``.
-Both must be concatenated, flushed, and truncated in lock-step with
-``input_ids``; before this fix the mm variant was left in the output as a
-stale prompt-width copy whose vision block positions no longer lined up
-with the flushed sequence (silent attention mis-masking on Gemma 4 12B+).
-
-Hermetic CPU tests with a stub whitespace processor, no model or network.
+Gemma 3n emits ``token_type_ids``, Gemma 4 ``mm_token_type_ids``; both must
+move in lock-step with ``input_ids`` instead of staying a stale prompt-width
+copy. Hermetic CPU tests with a stub whitespace processor.
 """
 
 from __future__ import annotations
@@ -51,8 +47,6 @@ class _FakeFeatureExtractor:
 
 
 class _FakeProcessor:
-    """Whitespace tokenizer emitting a configurable token-type-ids key."""
-
     def __init__(self, tt_key):
         self.tokenizer = _FakeTokenizer()
         self.feature_extractor = _FakeFeatureExtractor()
@@ -96,9 +90,7 @@ def make_collator(tt_key, max_seq_length=None):
     return collator
 
 
-# Skewed lengths: row 0 has the long prompt (with an image token), row 1 has
-# the long completion, so prompt left pads and completion right pads both
-# appear and the flush genuinely moves tokens.
+# Skewed lengths so both pad sides appear and the flush genuinely moves tokens
 EXAMPLES = [
     {"prompt": "<img> a b", "completion": "x"},
     {"prompt": "a", "completion": "x y z w"},
@@ -109,9 +101,8 @@ def test_mm_token_type_ids_routed_through_pc_path():
     out = make_collator("mm_token_type_ids")(EXAMPLES)
     assert "token_type_ids" not in out
     mm = out["mm_token_type_ids"]
-    # Stale pre-fix copy kept the prompt-only width (2, 3)
+    # Pre-fix the stale copy kept the prompt-only width (2, 3)
     assert mm.shape == out["input_ids"].shape
-    # Type ids must move in lock-step with input_ids through flush/truncate
     assert torch.equal(mm, (out["input_ids"] == IMG_ID).long())
 
 

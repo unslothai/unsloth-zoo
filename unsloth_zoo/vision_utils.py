@@ -1417,10 +1417,8 @@ class UnslothVisionDataCollator:
 
         p_ids, c_ids = proc_prompts["input_ids"], proc_completions["input_ids"]
         p_m, c_m = proc_prompts["attention_mask"], proc_completions["attention_mask"]
-        # Gemma 3n emits token_type_ids, Gemma 4 emits mm_token_type_ids; route
-        # whichever is present through the concat/flush/truncate path below, else
-        # `out = dict(proc_prompts)` keeps a stale prompt-width copy whose vision
-        # block positions no longer align with the flushed input_ids.
+        # Gemma 3n emits token_type_ids, Gemma 4 mm_token_type_ids; route whichever
+        # exists, else dict(proc_prompts) keeps a stale prompt-width copy.
         tt_key = "token_type_ids" if "token_type_ids" in proc_prompts else "mm_token_type_ids"
         p_tt, c_tt = proc_prompts.get(tt_key, None), proc_completions.get(tt_key, None)
 
