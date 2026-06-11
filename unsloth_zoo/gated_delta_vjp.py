@@ -279,15 +279,33 @@ def patch_gated_delta():
 def patch_gated_delta_vlm():
     """Patch mlx_vlm's qwen3_5 gated_delta_update the same way.
 
-    mlx_vlm ships its own copy that calls the non-differentiable
+    mlx_vlm >= 0.6 ships its own copy that calls the non-differentiable
     gated_delta_kernel directly, so patch_gated_delta() never intercepts
     it; language.py also from-imports it, so patch both namespaces.
+    Older mlx_vlm (0.4.4 - 0.5.x) has no qwen3_5/gated_delta.py and
+    instead from-imports mlx_lm's gated_delta_update into language.py,
+    a by-value copy that patch_gated_delta() cannot rebind either.
     """
     try:
         from mlx_lm.models import gated_delta
-        from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
         from mlx_vlm.models.qwen3_5 import language as vlm_language
     except ImportError:
+        return
+
+    try:
+        from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
+    except ImportError:
+        # Old layout: re-route language.py's stale by-value copy through the
+        # mlx_lm module attribute, which patch_gated_delta() keeps patched.
+        if getattr(vlm_language, "_unsloth_gated_delta_patched", False):
+            return
+
+        def forwarded_gated_delta_update(*args, **kwargs):
+            return gated_delta.gated_delta_update(*args, **kwargs)
+
+        vlm_language.gated_delta_update = forwarded_gated_delta_update
+        vlm_language._unsloth_gated_delta_patched = True
+        print("Unsloth: Patched mlx-vlm GatedDeltaNet (legacy mlx_lm import) with memory-efficient custom VJP.")
         return
 
     if getattr(vlm_gated_delta, "_unsloth_gated_delta_patched", False):
