@@ -81,6 +81,7 @@ from .compile import (
     explain_compile_support,
     get_compile_qualification,
     get_model_architecture,
+    model_has_gated_delta_layers,
     normalize_mlx_patch_mode,
     resolve_training_compile,
     trace_compile_application,
@@ -613,9 +614,13 @@ class MLXTrainer:
             from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
             _fix_qwen35_attention_cache(model)
             _disable_fused_mrope(model)
-            from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
-            patch_gated_delta()
+            from ..gated_delta_vjp import patch_gated_delta_vlm
             patch_gated_delta_vlm()
+        # Structural, not model_type-based: qwen3_next / kimi_linear share the
+        # same gated_delta_update call sites and need the efficient VJP too.
+        if model_has_gated_delta_layers(model):
+            from ..gated_delta_vjp import patch_gated_delta
+            patch_gated_delta()
         # Qwen3-VL's language tower uses the same fused MRoPE kernel with no
         # VJP; flip it off so training takes the differentiable fallback.
         if "qwen3_vl" in model_type:

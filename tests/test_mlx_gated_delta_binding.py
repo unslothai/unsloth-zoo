@@ -114,3 +114,47 @@ def test_second_call_sweeps_consumers_imported_after_first_patch(
     assert late.gated_delta_update is patched
     # No double-wrap: the patched function is stable across calls.
     assert fake_mlx_lm.gated_delta.gated_delta_update is patched
+
+
+# -- gated-delta detection + compile blocker ---------------------------------
+
+
+class _GatedDeltaNet:
+    """Name + A_log/dt_bias mirror the real GDN layer classes."""
+
+    def __init__(self):
+        self.A_log = object()
+        self.dt_bias = object()
+
+
+class _Mamba2Mixer:
+    """Same parameters, non-delta class name: must NOT match."""
+
+    def __init__(self):
+        self.A_log = object()
+        self.dt_bias = object()
+
+
+class _FakeModel:
+    def __init__(self, layer):
+        self._layers = [("layers.0", layer)] if layer is not None else []
+
+    def named_modules(self):
+        return list(self._layers)
+
+
+def test_detection_matches_gated_delta_only():
+    from unsloth_zoo.mlx.compile import model_has_gated_delta_layers
+    assert model_has_gated_delta_layers(_FakeModel(_GatedDeltaNet()))
+    assert not model_has_gated_delta_layers(_FakeModel(_Mamba2Mixer()))
+    assert not model_has_gated_delta_layers(_FakeModel(None))
+
+
+def test_detection_tolerates_broken_models():
+    from unsloth_zoo.mlx.compile import model_has_gated_delta_layers
+
+    class Broken:
+        def named_modules(self):
+            raise RuntimeError("no module tree")
+
+    assert not model_has_gated_delta_layers(Broken())
