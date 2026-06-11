@@ -66,12 +66,13 @@ def _plain_reference(q, k, v, g, beta, state):
     return mx.stack(ys, axis=1), s
 
 
-def _make_case(B, T, Hk, Hv, Dk, Dv, dtype):
+def _make_case(B, T, Hk, Hv, Dk, Dv, dtype, vectorized=False):
     mx.random.seed(0)
     q = (mx.random.normal((B, T, Hk, Dk)) * 0.1).astype(dtype)
     k = (mx.random.normal((B, T, Hk, Dk)) * 0.1).astype(dtype)
     v = (mx.random.normal((B, T, Hv, Dv)) * 0.1).astype(dtype)
-    g = mx.sigmoid(mx.random.normal((B, T, Hv))) * 0.9
+    g_shape = (B, T, Hv, Dk) if vectorized else (B, T, Hv)
+    g = mx.sigmoid(mx.random.normal(g_shape)) * 0.9
     beta = mx.sigmoid(mx.random.normal((B, T, Hv)))
     state = mx.random.normal((B, Hv, Dv, Dk)) * 0.1
     dy = (mx.random.normal((B, T, Hv, Dv)) * 0.5).astype(dtype)
@@ -90,27 +91,32 @@ def _assert_grads_match(fn, args, cots, tol):
 
 
 CASES = [
-    # (B, T, Hk, Hv, Dk, Dv, dtype, tol) — B >= 2 everywhere: batch rows past
-    # the first are exactly what the .at[] scatter bug corrupted.
-    (2, 96, 2, 4, 64, 32, mx.float32, 5e-4),
-    (3, 70, 2, 4, 32, 16, mx.float32, 5e-4),
-    (2, 130, 4, 4, 96, 64, mx.bfloat16, 2e-2),
+    # (B, T, Hk, Hv, Dk, Dv, dtype, tol, vectorized) — B >= 2 everywhere:
+    # batch rows past the first are exactly what the .at[] scatter bug
+    # corrupted. vectorized=True exercises kimi_linear-style per-column
+    # gating (g: [B, T, Hv, Dk]).
+    (2, 96, 2, 4, 64, 32, mx.float32, 5e-4, False),
+    (3, 70, 2, 4, 32, 16, mx.float32, 5e-4, False),
+    (2, 130, 4, 4, 96, 64, mx.bfloat16, 2e-2, False),
+    (2, 96, 4, 4, 64, 64, mx.float32, 5e-4, True),
+    (2, 130, 4, 4, 128, 128, mx.bfloat16, 2e-2, True),
 ]
+CASE_IDS = ["b2-gqa", "b3-gqa", "b2-bf16", "b2-vec-kimi", "b2-vec-bf16"]
 
 
-@pytest.mark.parametrize("case", CASES, ids=["b2-gqa", "b3-gqa", "b2-bf16"])
+@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
 def test_ops_vjp_matches_plain_autodiff(case):
     from unsloth_zoo.gated_delta_vjp import gated_delta_ops_efficient
-    *cfg, dtype, tol = case
-    args, cots = _make_case(*cfg, dtype)
+    *cfg, dtype, tol, vectorized = case
+    args, cots = _make_case(*cfg, dtype, vectorized=vectorized)
     _assert_grads_match(gated_delta_ops_efficient, args, cots, tol)
 
 
-@pytest.mark.parametrize("case", CASES, ids=["b2-gqa", "b3-gqa", "b2-bf16"])
+@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
 def test_kernel_vjp_matches_plain_autodiff(case):
     from unsloth_zoo.gated_delta_vjp import gated_delta_kernel_efficient
-    *cfg, dtype, tol = case
-    args, cots = _make_case(*cfg, dtype)
+    *cfg, dtype, tol, vectorized = case
+    args, cots = _make_case(*cfg, dtype, vectorized=vectorized)
     _assert_grads_match(gated_delta_kernel_efficient, args, cots, tol)
 
 
