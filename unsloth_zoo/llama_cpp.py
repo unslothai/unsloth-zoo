@@ -1473,6 +1473,9 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     # converter being patched (matters when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points
     # at a different checkout), not always LLAMA_CPP_DEFAULT_DIR.
     local_script_info = _resolve_local_convert_script()
+    # Outside the cache on purpose: cheap, idempotent, and a checkout pulled
+    # or replaced after the first conversion still gets the Qwen3.5 aliases.
+    _patch_tensor_mapping_for_qwen35(_get_llama_cpp_dir(local_script_info))
     return _download_convert_hf_to_gguf_cached(
         name,
         local_script_info,
@@ -1792,6 +1795,64 @@ pass
 _download_convert_hf_to_gguf.cache_clear = _download_convert_hf_to_gguf_cached.cache_clear
 _download_convert_hf_to_gguf.cache_info = _download_convert_hf_to_gguf_cached.cache_info
 _download_convert_hf_to_gguf.cache_parameters = _download_convert_hf_to_gguf_cached.cache_parameters
+
+
+# Qwen3.5 HF tensor names emitted by empty_model.py's GDN export, keyed by
+# the tensor_mapping.py block each belongs to on llama.cpp master. dt_bias
+# needs no entry: the converter renames it to dt_proj.bias before mapping.
+_QWEN35_TENSOR_MAPPINGS = (
+    ("ATTN_QKV",   "model.layers.{bid}.linear_attn.in_proj_qkv"),
+    ("ATTN_GATE",  "model.layers.{bid}.linear_attn.in_proj_z"),
+    ("SSM_BETA",   "model.layers.{bid}.linear_attn.in_proj_b"),
+    ("SSM_ALPHA",  "model.layers.{bid}.linear_attn.in_proj_a"),
+    ("SSM_CONV1D", "model.layers.{bid}.linear_attn.conv1d"),
+    ("SSM_DT",     "model.layers.{bid}.linear_attn.dt_proj"),
+    ("SSM_A",      "model.layers.{bid}.linear_attn.A_log"),
+    ("SSM_NORM",   "model.layers.{bid}.linear_attn.norm"),
+    ("SSM_OUT",    "model.layers.{bid}.linear_attn.out_proj"),
+)
+
+
+def _patch_tensor_mapping_for_qwen35(llama_cpp_dir: str):
+    """Insert missing Qwen3.5 linear_attn aliases into a stale
+    gguf-py/gguf/tensor_mapping.py. The converter script is fetched from
+    llama.cpp master, but gguf-py comes from the local checkout, so a
+    checkout predating Qwen3.5 cannot map the split GDN projections.
+    Idempotent per entry; blocks absent from old checkouts are skipped."""
+    tensor_mapping_path = os.path.join(llama_cpp_dir, "gguf-py", "gguf", "tensor_mapping.py")
+    if not os.path.isfile(tensor_mapping_path):
+        return
+    try:
+        with open(tensor_mapping_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+
+    content = "".join(lines)
+    missing = [(block, name) for block, name in _QWEN35_TENSOR_MAPPINGS if f'"{name}"' not in content]
+    if not missing:
+        return
+
+    new_lines = []
+    for line in lines:
+        new_lines.append(line)
+        stripped = line.strip()
+        for block, name in missing:
+            if stripped == f"MODEL_TENSOR.{block}: (":
+                indent = line[: len(line) - len(line.lstrip())] + "    "
+                new_lines.append(f'{indent}"{name}",  # qwen3.5\n')
+                break
+
+    if new_lines == lines:
+        return
+    patched = "".join(new_lines)
+    try:
+        ast.parse(patched)
+    except SyntaxError:
+        logger.warning("Unsloth: Qwen3.5 tensor_mapping.py patch produced invalid syntax, leaving file unchanged.")
+        return
+    with open(tensor_mapping_path, "w", encoding="utf-8") as f:
+        f.write(patched)
 
 
 def _split_str_to_n_bytes(split_str: str) -> int:
