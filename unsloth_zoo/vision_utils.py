@@ -109,6 +109,32 @@ FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
 
 
+def resolve_file_uri_to_path(path):
+    """Resolve a file:// URI (RFC 8089) to a local filesystem path.
+
+    Returns the percent-decoded local path for file:// URIs with an empty or
+    "localhost" authority. Everything else (plain paths, http/https, data:,
+    non-local authorities, non-strings) is returned unchanged. Naive
+    `path[7:]` stripping breaks file://localhost/... (yielding the unopenable
+    "localhost/...") and never decodes percent-escapes.
+    """
+    if not isinstance(path, str) or not path.startswith("file://"):
+        return path
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
+
+    parsed = urlparse(path)
+    netloc = parsed.netloc
+    path_part = parsed.path
+    # Legacy Windows form file://C:/x parses the drive letter as the authority
+    if netloc and len(netloc) == 2 and netloc[1] in (":", "|") and netloc[0].isalpha():
+        path_part = f"/{netloc}{path_part}"
+        netloc = ""
+    if netloc and netloc != "localhost":
+        return path
+    return url2pathname(path_part) or path
+
+
 def round_by_factor(number: int, factor: int) -> int:
     """Returns the closest integer to 'number' that is divisible by 'factor'."""
     return round(number / factor) * factor
@@ -167,7 +193,7 @@ def fetch_image(
         if image.startswith("http://") or image.startswith("https://"):
             image_obj = Image.open(requests.get(image, stream=True, timeout=30).raw)
         elif image.startswith("file://"):
-            image_obj = Image.open(image[7:])
+            image_obj = Image.open(resolve_file_uri_to_path(image))
         elif image.startswith("data:image"):
             if "base64," in image:
                 _, base64_data = image.split("base64,", 1)
@@ -250,12 +276,10 @@ def _read_video_torchvision(
     `ele` keys: video (path/file/http/https), video_start, video_end.
     Returns a (T, C, H, W) tensor and the sample fps.
     """
-    video_path = ele["video"]
+    video_path = resolve_file_uri_to_path(ele["video"])
     if version.parse(torchvision.__version__) < version.parse("0.19.0"):
         if "http://" in video_path or "https://" in video_path:
             warnings.warn("torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0.")
-        if "file://" in video_path:
-            video_path = video_path[7:]
     st = time.time()
     video, audio, info = io.read_video(
         video_path,
@@ -343,7 +367,7 @@ def _read_video_decord(
     Returns a (T, C, H, W) tensor and the sample fps.
     """
     import decord
-    video_path = ele["video"]
+    video_path = resolve_file_uri_to_path(ele["video"])
     st = time.time()
     vr = decord.VideoReader(video_path)
     total_frames, video_fps = len(vr), vr.get_avg_fps()
@@ -386,10 +410,7 @@ def _read_video_torchcodec(
     TORCHCODEC_NUM_THREADS = int(os.environ.get('TORCHCODEC_NUM_THREADS', 8))
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: set TORCHCODEC_NUM_THREADS: {TORCHCODEC_NUM_THREADS}")
-    video_path = ele["video"]
-    # Support file URI scheme
-    if isinstance(video_path, str) and video_path.startswith("file://"):
-        video_path = video_path[7:]
+    video_path = resolve_file_uri_to_path(ele["video"])
     st = time.time()
     decoder = VideoDecoder(video_path, num_ffmpeg_threads=TORCHCODEC_NUM_THREADS)
     video_fps = decoder.metadata.average_fps
@@ -539,6 +560,15 @@ def _check_audio_sampling_rate(sampling_rate, target_sampling_rate):
             f"extractor's {target_sampling_rate}, so the clip would be processed at the wrong speed. "
             f'Resample first, e.g. dataset = dataset.cast_column("audio", Audio(sampling_rate={target_sampling_rate})).'
         )
+
+
+def _fix_audio_feature_extractor_padding_side(processor):
+    # The loader's padding_side="left" (a text setting) leaks into the audio
+    # feature extractor via from_pretrained. Frame-validity masks assume right
+    # padding; left padding desyncs Gemma 4 audio token counts (crash on tf < 5.10).
+    feature_extractor = getattr(processor, "feature_extractor", None)
+    if feature_extractor is not None and getattr(feature_extractor, "padding_side", None) == "left":
+        feature_extractor.padding_side = "right"
 
 
 def _resolve_audio_dict(audio, sampling_rate=None):
@@ -695,6 +725,7 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+        _fix_audio_feature_extractor_padding_side(processor)
         self.formatting_func = formatting_func
         self.completion_only_loss = completion_only_loss
         self.pad_to_multiple_of = pad_to_multiple_of
@@ -1396,12 +1427,18 @@ class UnslothVisionDataCollator:
 
         p_ids, c_ids = proc_prompts["input_ids"], proc_completions["input_ids"]
         p_m, c_m = proc_prompts["attention_mask"], proc_completions["attention_mask"]
-        p_tt, c_tt = proc_prompts.get("token_type_ids", None), proc_completions.get("token_type_ids", None)
+        # Gemma 3n emits token_type_ids, Gemma 4 mm_token_type_ids; route whichever
+        # exists, else dict(proc_prompts) keeps a stale prompt-width copy.
+        tt_key = "token_type_ids" if "token_type_ids" in proc_prompts else "mm_token_type_ids"
+        p_tt, c_tt = proc_prompts.get(tt_key, None), proc_completions.get(tt_key, None)
 
         input_ids = torch.cat((p_ids, c_ids), dim=1)
         attention_mask = torch.cat((p_m, c_m), dim=1)
         completion_mask = torch.cat((torch.zeros_like(p_m), c_m), dim=1)
-        if p_tt is not None and c_tt is not None:
+        if p_tt is not None or c_tt is not None:
+            # A side missing the key is text-only: type 0 in both vocabularies
+            if p_tt is None: p_tt = torch.zeros_like(p_ids)
+            if c_tt is None: c_tt = torch.zeros_like(c_ids)
             token_type_ids = torch.cat((p_tt, c_tt), dim=1)
         else:
             token_type_ids = None
@@ -1455,7 +1492,7 @@ class UnslothVisionDataCollator:
         out["attention_mask"] = attention_mask
         out["labels"] = labels
         if token_type_ids is not None:
-            out["token_type_ids"] = token_type_ids
+            out[tt_key] = token_type_ids
         if 'pixel_values' in out:
             out = self._cast_pixel_values_dtype_inplace(out)
         if 'pixel_values_videos' in out:

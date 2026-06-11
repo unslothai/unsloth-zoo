@@ -274,3 +274,64 @@ def patch_gated_delta():
     gated_delta.gated_delta_update = patched_gated_delta_update
     gated_delta._unsloth_gated_delta_patched = True
     print("Unsloth: Patched GatedDeltaNet with memory-efficient custom VJP.")
+
+
+def patch_gated_delta_vlm():
+    """Patch mlx_vlm's qwen3_5 gated_delta_update the same way.
+
+    mlx_vlm >= 0.6 ships its own copy that calls the non-differentiable
+    gated_delta_kernel directly, so patch_gated_delta() never intercepts
+    it; language.py also from-imports it, so patch both namespaces.
+    Older mlx_vlm (0.4.4 - 0.5.x) has no qwen3_5/gated_delta.py and
+    instead from-imports mlx_lm's gated_delta_update into language.py,
+    a by-value copy that patch_gated_delta() cannot rebind either.
+    """
+    try:
+        from mlx_lm.models import gated_delta
+        from mlx_vlm.models.qwen3_5 import language as vlm_language
+    except ImportError:
+        return
+
+    try:
+        from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
+    except ImportError:
+        # Old layout: re-route language.py's stale by-value copy through the
+        # mlx_lm module attribute, which patch_gated_delta() keeps patched.
+        if getattr(vlm_language, "_unsloth_gated_delta_patched", False):
+            return
+
+        def forwarded_gated_delta_update(*args, **kwargs):
+            return gated_delta.gated_delta_update(*args, **kwargs)
+
+        vlm_language.gated_delta_update = forwarded_gated_delta_update
+        vlm_language._unsloth_gated_delta_patched = True
+        print("Unsloth: Patched mlx-vlm GatedDeltaNet (legacy mlx_lm import) with memory-efficient custom VJP.")
+        return
+
+    if getattr(vlm_gated_delta, "_unsloth_gated_delta_patched", False):
+        return
+
+    original_update = vlm_gated_delta.gated_delta_update
+
+    def patched_gated_delta_update(
+        q, k, v, a, b, A_log, dt_bias,
+        state=None, mask=None, use_kernel=True,
+    ):
+        # state=None means a training call; route it through the
+        # differentiable VJP. Inference (state provided) keeps the kernel.
+        if state is not None:
+            return original_update(
+                q, k, v, a, b, A_log, dt_bias,
+                state=state, mask=mask, use_kernel=use_kernel,
+            )
+        beta = mx.sigmoid(b)
+        g = gated_delta.compute_g(A_log, a, dt_bias)
+        B, _, Hk, Dk = q.shape
+        Hv, Dv = v.shape[-2:]
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
+
+    vlm_gated_delta.gated_delta_update = patched_gated_delta_update
+    vlm_language.gated_delta_update = patched_gated_delta_update
+    vlm_gated_delta._unsloth_gated_delta_patched = True
+    print("Unsloth: Patched mlx-vlm GatedDeltaNet with memory-efficient custom VJP.")
