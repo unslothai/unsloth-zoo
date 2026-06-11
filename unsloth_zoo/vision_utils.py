@@ -562,6 +562,15 @@ def _check_audio_sampling_rate(sampling_rate, target_sampling_rate):
         )
 
 
+def _fix_audio_feature_extractor_padding_side(processor):
+    # The loader's padding_side="left" (a text setting) leaks into the audio
+    # feature extractor via from_pretrained. Frame-validity masks assume right
+    # padding; left padding desyncs Gemma 4 audio token counts (crash on tf < 5.10).
+    feature_extractor = getattr(processor, "feature_extractor", None)
+    if feature_extractor is not None and getattr(feature_extractor, "padding_side", None) == "left":
+        feature_extractor.padding_side = "right"
+
+
 def _resolve_audio_dict(audio, sampling_rate=None):
     # HuggingFace Audio feature dict -> waveform array, else a path / url string
     # (covers Audio(decode=False) payloads like {"bytes": None, "path": ...})
@@ -716,6 +725,7 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+        _fix_audio_feature_extractor_padding_side(processor)
         self.formatting_func = formatting_func
         self.completion_only_loss = completion_only_loss
         self.pad_to_multiple_of = pad_to_multiple_of
