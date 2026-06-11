@@ -540,6 +540,21 @@ def _find_lib_path(lib_name):
     return None
 
 
+def _is_cmake_only_llama_cpp(llama_cpp_folder):
+    """True if llama.cpp's Makefile is the post-CMake-migration deprecation
+    stub (or missing entirely), so `make` cannot build it."""
+    makefile = os.path.join(llama_cpp_folder, "Makefile")
+    if not os.path.exists(makefile):
+        return True
+    try:
+        with open(makefile, "r", encoding = "utf-8", errors = "ignore") as f:
+            content = f.read(4096)
+    except OSError:
+        return False
+    lowered = content.lower()
+    return "build system changed" in lowered or ("cmake" in lowered and "deprecated" in lowered)
+
+
 def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if the folder exists
@@ -1216,16 +1231,23 @@ def install_llama_cpp(
             build_errors.append(f"Windows cmake build failed: {str(e)}")
 
     else:
-        # Linux/macOS: Try make first, then cmake
-        try:
-            if print_output: print("Trying to build with make...")
-            try_execute("make clean", cwd = llama_cpp_folder, **kwargs)
-            try_execute(f"make all -j{cpu_count}", cwd = llama_cpp_folder, **kwargs)
-            build_success = True
-            print("Successfully built with make")
-        except Exception as e:
-            build_errors.append(f"Make failed: {str(e)}")
-            if print_output: print(f"Make failed, trying cmake...")
+        # Linux/macOS: Try make first, then cmake. Modern llama.cpp Makefiles
+        # are CMake migration stubs; skip make there so the misleading
+        # "Build system changed" error never surfaces (unslothai/unsloth#5832).
+        try_make = not _is_cmake_only_llama_cpp(llama_cpp_folder)
+        if try_make:
+            try:
+                if print_output: print("Trying to build with make...")
+                try_execute("make clean", cwd = llama_cpp_folder, **kwargs)
+                try_execute(f"make all -j{cpu_count}", cwd = llama_cpp_folder, **kwargs)
+                build_success = True
+                print("Successfully built with make")
+            except Exception as e:
+                build_errors.append(f"Make failed: {str(e)}")
+                if print_output: print(f"Make failed, trying cmake...")
+        elif print_output:
+            print("CMake-only llama.cpp checkout detected; skipping make...")
+        if not build_success:
             # Use cmake instead
             try:
                 # Clean up any partial build
