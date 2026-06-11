@@ -408,9 +408,15 @@ def patch_gated_delta_vlm():
 # Eligibility: Metal GPU, no mask (training passes mask=None), and
 # Dk % 32 == 0; both scalar (qwen3_5/qwen3_next) and vectorized
 # (kimi_linear) gating are supported — anything else falls back to the
-# ops VJP. Atomic
-# accumulation makes low-order gradient bits nondeterministic, matching
-# Metal reduction-order behavior elsewhere.
+# ops VJP. Atomic accumulation makes low-order gradient bits
+# nondeterministic, matching Metal reduction-order behavior elsewhere.
+#
+# NOTE: this section must stay BELOW patch_gated_delta. The pinned-symbol
+# suite asserts the patched function's training branch precedes the first
+# `gated_delta_kernel(` occurrence in this file (commit 46866ce regression
+# net), and the chunked forward below legitimately calls that kernel.
+# patch_gated_delta resolves these names at call time, so definition
+# order is semantically irrelevant.
 # --------------------------------------------------------------------------
 
 _KERNEL_CHUNK_SIZE = 64
