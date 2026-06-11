@@ -239,41 +239,85 @@ def gated_delta_ops_efficient(
     return y, s
 
 
+_WARNED_FOREIGN_GATED_DELTA: set = set()
+
+
 def patch_gated_delta():
-    """Monkey-patch mlx_lm's gated_delta module to use our efficient VJP."""
+    """Monkey-patch mlx_lm's gated_delta module to use our efficient VJP.
+
+    Consumers (mlx_lm qwen3_5 / qwen3_next / kimi_linear, mlx_vlm qwen3_5)
+    bind ``gated_delta_update`` via ``from .gated_delta import ...`` at import
+    time, so rebinding the source module alone never reaches their call sites.
+    After patching the source, sweep already-imported consumer modules and
+    rebind any stale reference to the original function.
+    """
+    import sys
     from mlx_lm.models import gated_delta
 
-    if getattr(gated_delta, "_unsloth_gated_delta_patched", False):
-        return
+    if not getattr(gated_delta, "_unsloth_gated_delta_patched", False):
+        original_gated_delta_update = gated_delta.gated_delta_update
 
-    def patched_gated_delta_update(
-        q, k, v, a, b, A_log, dt_bias,
-        state=None, mask=None, use_kernel=True,
-    ):
-        # Heuristic: training calls enter with state=None (no cache); inference
-        # passes the cached state in. Route training through the efficient ops
-        # so the custom VJP runs — gated_delta_kernel has none, so it would keep
-        # all T intermediate states alive and defeat this module.
-        is_training_call = state is None
-        beta = mx.sigmoid(b)
-        g = gated_delta.compute_g(A_log, a, dt_bias)
-        if state is None:
-            B, _, Hk, Dk = q.shape
-            Hv, Dv = v.shape[-2:]
-            state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        def patched_gated_delta_update(
+            q, k, v, a, b, A_log, dt_bias,
+            state=None, mask=None, use_kernel=True,
+        ):
+            # Heuristic: training calls enter with state=None (no cache); inference
+            # passes the cached state in. Route training through the efficient ops
+            # so the custom VJP runs — gated_delta_kernel has none, so it would keep
+            # all T intermediate states alive and defeat this module.
+            is_training_call = state is None
+            beta = mx.sigmoid(b)
+            g = gated_delta.compute_g(A_log, a, dt_bias)
+            if state is None:
+                B, _, Hk, Dk = q.shape
+                Hv, Dv = v.shape[-2:]
+                state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-        # No incoming state cache: use the memory-efficient ops path.
-        if is_training_call:
-            return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
+            # No incoming state cache: use the memory-efficient ops path.
+            if is_training_call:
+                return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
 
-        # Cached state: prefer the kernel for speed, else efficient ops.
-        if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
-            return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
-        return gated_delta.gated_delta_kernel(q, k, v, g, beta, state, mask)
+            # Cached state: prefer the kernel for speed, else efficient ops.
+            if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+                return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
+            return gated_delta.gated_delta_kernel(q, k, v, g, beta, state, mask)
 
-    gated_delta.gated_delta_update = patched_gated_delta_update
-    gated_delta._unsloth_gated_delta_patched = True
-    print("Unsloth: Patched GatedDeltaNet with memory-efficient custom VJP.")
+        gated_delta._unsloth_gated_delta_original = original_gated_delta_update
+        gated_delta.gated_delta_update = patched_gated_delta_update
+        gated_delta._unsloth_gated_delta_patched = True
+        print("Unsloth: Patched GatedDeltaNet with memory-efficient custom VJP.")
+
+    # Sweep on every call (not just the first): a consumer module imported
+    # after a previous patch still holds a stale from-import binding.
+    original = gated_delta._unsloth_gated_delta_original
+    patched = gated_delta.gated_delta_update
+    rebound = []
+    foreign = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not name.startswith(("mlx_lm.models", "mlx_vlm.models")):
+            continue
+        binding = getattr(module, "gated_delta_update", None)
+        if binding is None or binding is patched:
+            continue
+        if binding is original:
+            # Identity match: this is a stale from-import of the function we
+            # replaced. Anything else (e.g. mlx-vlm >= 0.6 ships its own
+            # gated_delta module) is a foreign implementation we must not touch.
+            module.gated_delta_update = patched
+            rebound.append(name)
+        else:
+            foreign.append(name)
+    if rebound:
+        print(f"Unsloth: Rebound gated_delta_update in {', '.join(sorted(rebound))}.")
+    new_foreign = [name for name in foreign if name not in _WARNED_FOREIGN_GATED_DELTA]
+    if new_foreign:
+        _WARNED_FOREIGN_GATED_DELTA.update(new_foreign)
+        print(
+            "Unsloth: WARNING — unrecognized gated_delta_update in "
+            f"{', '.join(sorted(new_foreign))}; those modules will train without "
+            "the memory-efficient VJP (slow, and long sequences may exhaust "
+            "Metal resources)."
+        )
 
 
 def patch_gated_delta_vlm():
