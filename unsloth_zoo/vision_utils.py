@@ -542,13 +542,9 @@ def _check_audio_sampling_rate(sampling_rate, target_sampling_rate):
 
 
 def _fix_audio_feature_extractor_padding_side(processor):
-    # Audio feature extractors must keep their stock right padding: their
-    # frame-validity masks assume trailing padding, so a left-padded waveform
-    # gains an extra valid mel frame on some clip lengths. On Gemma 4 with
-    # transformers < 5.10 that desyncs audio features from audio placeholder
-    # tokens and crashes the forward pass. The model loader passes
-    # padding_side = "left" (a text setting) to AutoProcessor.from_pretrained,
-    # which forwards it to every sub-component including the feature extractor.
+    # The loader's padding_side="left" (a text setting) leaks into the audio
+    # feature extractor via from_pretrained. Frame-validity masks assume right
+    # padding; left padding desyncs Gemma 4 audio token counts (crash on tf < 5.10).
     feature_extractor = getattr(processor, "feature_extractor", None)
     if feature_extractor is not None and getattr(feature_extractor, "padding_side", None) == "left":
         feature_extractor.padding_side = "right"

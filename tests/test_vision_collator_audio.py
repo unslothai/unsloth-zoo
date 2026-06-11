@@ -249,9 +249,6 @@ def test_inline_audio_decode_false_dict_resolved():
 # ---------------------------------------------------------------------------
 
 def test_left_padded_feature_extractor_reset_to_right():
-    # The model loader leaks padding_side="left" into the audio feature
-    # extractor; left-padded waveforms desync mel frame masks from audio
-    # placeholder counts (crashes Gemma 4 on transformers < 5.10).
     proc = _FakeProcessor()
     proc.feature_extractor.padding_side = "left"
     _fix_audio_feature_extractor_padding_side(proc)
