@@ -43,6 +43,9 @@ import tempfile
 import logging
 import shlex
 import shutil
+import tarfile
+import zipfile
+import platform
 try:
     import torch
 except ImportError:
@@ -133,6 +136,12 @@ LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     "UNSLOTH_LLAMA_CPP_PATH",
     os.path.join(UNSLOTH_HOME, "llama.cpp"),
 )
+
+# Prebuilt llama.cpp binaries from official releases. Marker file
+# distinguishes a prebuilt install from a corrupted source checkout.
+UNSLOTH_PREBUILT_INFO_FILENAME = "UNSLOTH_PREBUILT_INFO.json"
+LLAMA_CPP_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases"
+LLAMA_CPP_SOURCE_TARBALL = "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/tags/{tag}"
 
 
 def _resolve_local_convert_script():
@@ -615,6 +624,231 @@ def _is_safe_to_delete(path):
     return False
 
 
+def _github_auth_headers():
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _requests_get_with_retries(url, timeout = (10, 120), headers = None, stream = False, max_attempts = 3):
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            response = requests.get(url, timeout = timeout, headers = headers, stream = stream)
+            if response.status_code in (403, 429):
+                logger.warning(
+                    "Unsloth: GitHub returned HTTP %s for %s. "
+                    "Set GH_TOKEN or GITHUB_TOKEN to raise the rate limit.",
+                    response.status_code, url,
+                )
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt + 1 < max_attempts:
+                time.sleep(2 ** attempt)
+    raise last_error
+
+
+def _resolve_llama_cpp_release():
+    """Return (tag, {asset_name: download_url}) for the UNSLOTH_LLAMA_TAG
+    pinned release or the latest one, or None when resolution fails."""
+    tag = os.environ.get("UNSLOTH_LLAMA_TAG", "").strip()
+    url = f"{LLAMA_CPP_RELEASES_API}/tags/{tag}" if tag else f"{LLAMA_CPP_RELEASES_API}/latest"
+    try:
+        release = _requests_get_with_retries(url, headers = _github_auth_headers()).json()
+        assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
+        return release["tag_name"], assets
+    except Exception as e:
+        logger.warning("Unsloth: Could not resolve a llama.cpp release (%s).", e)
+        return None
+
+
+def _select_prebuilt_asset(tag, assets):
+    """Map this host to the official CPU archive. llama-quantize is CPU-only,
+    so the CPU bundle suffices even on GPU machines. Returns (name, url) or
+    None for unsupported platforms or releases missing the asset."""
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"): arch = "x64"
+    elif machine in ("aarch64", "arm64"): arch = "arm64"
+    else: return None
+    name = {
+        ("Linux",   "x64")   : f"llama-{tag}-bin-ubuntu-x64.tar.gz",
+        ("Linux",   "arm64") : f"llama-{tag}-bin-ubuntu-arm64.tar.gz",
+        ("Darwin",  "x64")   : f"llama-{tag}-bin-macos-x64.tar.gz",
+        ("Darwin",  "arm64") : f"llama-{tag}-bin-macos-arm64.tar.gz",
+        ("Windows", "x64")   : f"llama-{tag}-bin-win-cpu-x64.zip",
+        ("Windows", "arm64") : f"llama-{tag}-bin-win-cpu-arm64.zip",
+    }.get((platform.system(), arch))
+    if name is None or name not in assets:
+        return None
+    return name, assets[name]
+
+
+def _download_archive(url, dest_path):
+    response = _requests_get_with_retries(url, headers = _github_auth_headers(), stream = True)
+    with open(dest_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size = 1 << 20):
+            f.write(chunk)
+
+
+def _extract_archive(archive_path, extract_dir):
+    """Extract a release .zip / .tar.gz, refusing path-escaping members."""
+    real_root = os.path.realpath(extract_dir)
+    def _check(name):
+        target = os.path.realpath(os.path.join(extract_dir, name))
+        if target != real_root and not target.startswith(real_root + os.sep):
+            raise RuntimeError(f"Unsloth: Archive member escapes extraction dir: {name}")
+    if archive_path.endswith(".zip"):
+        with zipfile.ZipFile(archive_path) as archive:
+            for member in archive.namelist(): _check(member)
+            archive.extractall(extract_dir)
+    else:
+        tar_kwargs = {"filter": "data"} if sys.version_info >= (3, 12) else {}
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for member in archive.getmembers(): _check(member.name)
+            archive.extractall(extract_dir, **tar_kwargs)
+
+
+def _single_extracted_root(extract_dir):
+    """Release archives nest contents under llama-{tag}/ (source tarballs
+    under llama.cpp-{tag}/); flat archives extract in place."""
+    entries = [os.path.join(extract_dir, e) for e in os.listdir(extract_dir)]
+    dirs = [e for e in entries if os.path.isdir(e)]
+    if len(dirs) == 1 and len(entries) == 1:
+        return dirs[0]
+    return extract_dir
+
+
+def _place_prebuilt_binaries(extracted_root, install_folder):
+    """Copy executables + shared libs where check_llama_cpp/quantize_gguf
+    look: folder root on Linux/macOS (RPATH $ORIGIN needs libs as siblings),
+    build/bin/Release on Windows."""
+    dest = os.path.join(install_folder, "build", "bin", "Release") if IS_WINDOWS else install_folder
+    os.makedirs(dest, exist_ok = True)
+    n_executables = 0
+    lib_suffixes = (".so", ".dylib", ".dll", ".metal", ".txt", ".md")
+    for entry in sorted(os.listdir(extracted_root)):
+        source = os.path.join(extracted_root, entry)
+        if not os.path.isfile(source):
+            continue
+        target = os.path.join(dest, entry)
+        shutil.copy2(source, target)
+        is_lib = entry.startswith("lib") or any(s in entry for s in lib_suffixes)
+        if not is_lib:
+            if not IS_WINDOWS:
+                os.chmod(target, 0o755)
+            n_executables += 1
+    if n_executables == 0:
+        raise RuntimeError("Unsloth: No executables found in the prebuilt archive.")
+
+
+def _hydrate_converter_sources(tag, install_folder):
+    """Copy convert_hf_to_gguf.py, conversion/ and gguf-py/ from the same-tag
+    source tarball so check_llama_cpp and the converter machinery work
+    without a git checkout, and tensor mappings match the binaries."""
+    with tempfile.TemporaryDirectory(dir = os.path.dirname(install_folder) or ".") as source_dir:
+        archive_path = os.path.join(source_dir, "source.tar.gz")
+        _download_archive(LLAMA_CPP_SOURCE_TARBALL.format(tag = tag), archive_path)
+        extract_dir = os.path.join(source_dir, "extracted")
+        os.makedirs(extract_dir)
+        _extract_archive(archive_path, extract_dir)
+        root = _single_extracted_root(extract_dir)
+        converter = os.path.join(root, "convert_hf_to_gguf.py")
+        gguf_py = os.path.join(root, "gguf-py")
+        if not (os.path.isfile(converter) and os.path.isdir(gguf_py)):
+            raise RuntimeError(f"Unsloth: Source tarball for {tag} is missing converter files.")
+        shutil.copy2(converter, os.path.join(install_folder, "convert_hf_to_gguf.py"))
+        shutil.copytree(gguf_py, os.path.join(install_folder, "gguf-py"), dirs_exist_ok = True)
+        conversion = os.path.join(root, "conversion")
+        if os.path.isdir(conversion):
+            shutil.copytree(conversion, os.path.join(install_folder, "conversion"), dirs_exist_ok = True)
+
+
+def _write_prebuilt_marker(install_folder, tag, asset_name):
+    try:
+        info = {
+            "source"           : "ggml-org/llama.cpp official release",
+            "tag"              : tag,
+            "asset"            : asset_name,
+            "installed_at_utc" : time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        with open(os.path.join(install_folder, UNSLOTH_PREBUILT_INFO_FILENAME), "w", encoding = "utf-8") as f:
+            json.dump(info, f, indent = 2)
+    except Exception as e:
+        logger.warning("Unsloth: Could not write prebuilt marker (%s).", e)
+
+
+def _install_llama_cpp_prebuilt(llama_cpp_folder, print_output = False):
+    """Install official prebuilt llama.cpp binaries plus same-tag converter
+    sources into llama_cpp_folder. Returns (quantizer, converter) on success,
+    None on any failure so the caller compiles from source as before."""
+    staging = None
+    try:
+        resolved = _resolve_llama_cpp_release()
+        if resolved is None:
+            return None
+        tag, assets = resolved
+        selected = _select_prebuilt_asset(tag, assets)
+        if selected is None:
+            logger.warning("Unsloth: No prebuilt llama.cpp asset for this platform in release %s.", tag)
+            return None
+        asset_name, asset_url = selected
+        print(f"Unsloth: Installing prebuilt llama.cpp {tag} ({asset_name}) - skipping compilation.")
+
+        parent_dir = os.path.dirname(llama_cpp_folder) or "."
+        os.makedirs(parent_dir, exist_ok = True)
+        # Stage next to the target so activation is an atomic same-fs move,
+        # and validate before touching the real folder.
+        staging = tempfile.mkdtemp(prefix = ".llama_cpp_prebuilt_", dir = parent_dir)
+        archive_path = os.path.join(staging, asset_name)
+        _download_archive(asset_url, archive_path)
+        extract_dir = os.path.join(staging, "extracted")
+        os.makedirs(extract_dir)
+        _extract_archive(archive_path, extract_dir)
+        staged_install = os.path.join(staging, "install")
+        os.makedirs(staged_install)
+        _place_prebuilt_binaries(_single_extracted_root(extract_dir), staged_install)
+        _hydrate_converter_sources(tag, staged_install)
+        _write_prebuilt_marker(staged_install, tag, asset_name)
+        check_llama_cpp(llama_cpp_folder = staged_install)
+
+        if not os.path.exists(llama_cpp_folder):
+            shutil.move(staged_install, llama_cpp_folder)
+        else:
+            # Folder exists with broken/missing binaries: merge into it
+            # rather than deleting a tree the user may own.
+            shutil.copytree(staged_install, llama_cpp_folder, dirs_exist_ok = True)
+
+        try:
+            try_execute(f"{check_pip()} install gguf protobuf sentencepiece mistral_common", print_output = print_output)
+        except Exception as e:
+            logger.warning("Unsloth: Converter dependency install failed (%s); conversion self-heals if needed.", e)
+
+        return check_llama_cpp(llama_cpp_folder = llama_cpp_folder)
+    except Exception as e:
+        logger.warning("Unsloth: Prebuilt llama.cpp install failed (%s) - falling back to source build.", e)
+        return None
+    finally:
+        if staging and os.path.exists(staging):
+            shutil.rmtree(staging, ignore_errors = True)
+
+
+def _maybe_install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_output = False):
+    """Gate for the prebuilt path. Skipped when the caller asked for GPU
+    builds (official releases ship no Linux CUDA binaries, and gpu_support
+    means compiled CUDA targets were requested) or when
+    UNSLOTH_LLAMA_FORCE_COMPILE is set."""
+    try:
+        if gpu_support:
+            return None
+        if os.environ.get("UNSLOTH_LLAMA_FORCE_COMPILE", "0").lower() in ("1", "true", "yes", "on"):
+            return None
+        return _install_llama_cpp_prebuilt(llama_cpp_folder, print_output = print_output)
+    except Exception as e:
+        logger.warning("Unsloth: Prebuilt llama.cpp path errored (%s) - falling back to source build.", e)
+        return None
+
+
 def install_llama_cpp(
     llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR,
     llama_cpp_targets = LLAMA_CPP_TARGETS,
@@ -653,9 +887,12 @@ def install_llama_cpp(
             pass  # CWD copy is broken, proceed with default location
 
     if os.path.exists(llama_cpp_folder):
-        # Repo integrity check -- key directories must exist
+        # Repo integrity check -- a source checkout has src/ggml/common; a
+        # prebuilt install instead carries the UNSLOTH_PREBUILT_INFO.json marker
         required_dirs = ['src', 'ggml', 'common']
-        if not all(os.path.isdir(os.path.join(llama_cpp_folder, d)) for d in required_dirs):
+        is_source_checkout = all(os.path.isdir(os.path.join(llama_cpp_folder, d)) for d in required_dirs)
+        is_prebuilt_install = os.path.isfile(os.path.join(llama_cpp_folder, UNSLOTH_PREBUILT_INFO_FILENAME))
+        if not (is_source_checkout or is_prebuilt_install):
             print("Unsloth: llama.cpp repo appears corrupted (missing src/ggml/common) - will re-clone")
             # C4: Only delete if the path is safe
             if _is_safe_to_delete(llama_cpp_folder):
@@ -681,6 +918,17 @@ def install_llama_cpp(
         needs_clone = True
         needs_build = True
     pass
+
+    # Prefer official prebuilt binaries before any source-build work
+    # (no system package installs, no clone, no compile).
+    if needs_build and not just_clone_repo:
+        prebuilt = _maybe_install_llama_cpp_prebuilt(
+            llama_cpp_folder,
+            gpu_support = (gpu_support == "ON"),
+            print_output = print_output,
+        )
+        if prebuilt is not None:
+            return prebuilt
 
     print_outputs = []
     missing_packages, system_type = check_build_requirements()
