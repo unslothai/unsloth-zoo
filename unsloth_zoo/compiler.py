@@ -4533,10 +4533,15 @@ def unsloth_compile_transformers(
             print(str(dir(combined_module)))
         combined_module = None
 
-    if compile_torch_modules and not disable:
-        from .patch_torch_functions import patch_torch_functions
+    # These rewrites never compile (add_torch_compile=False), so run them even
+    # when compiling is disabled: norms are fp32 upcast at load regardless, and
+    # eager F.layer_norm crashes on bf16 activations against fp32 weights.
+    if compile_torch_modules:
+        if not disable:
+            # Compiled global F.layer_norm: only when compiling is allowed
+            from .patch_torch_functions import patch_torch_functions
 
-        patch_torch_functions()
+            patch_torch_functions()
 
         _conv_modules = frozenset([
             "Conv1d", "Conv2d", "Conv3d",
@@ -4580,7 +4585,23 @@ def unsloth_compile_transformers(
                 import re as _re
                 m = _re.search(r"def forward\(self,\s*(\w+)", source)
                 param_name = m.group(1) if m else "input"
-                append_str = f".to({param_name}.dtype)\n"
+                if disable:
+                    # Eager F.layer_norm needs input dtype == weight dtype: cast in
+                    # and out. Compiled path left untouched (adding the cast there
+                    # changes batched numerics). weight is None when affine=False.
+                    lines = source.split("\n")
+                    def_line = lines[0]
+                    body_lines = lines[1:]
+                    first_body = next((l for l in body_lines if l.strip()), "")
+                    body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
+                    prologue = [
+                        body_indent + f"original_dtype = {param_name}.dtype",
+                        body_indent + f"if self.weight is not None: {param_name} = {param_name}.to(self.weight.dtype)",
+                    ]
+                    source = "\n".join([def_line] + prologue + body_lines)
+                    append_str = ".to(original_dtype)\n"
+                else:
+                    append_str = f".to({param_name}.dtype)\n"
 
             forward = create_new_function(
                 module,
