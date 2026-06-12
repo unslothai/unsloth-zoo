@@ -83,6 +83,32 @@ def _resolve_bin(server_bin=None):
     return os.path.abspath(cand)
 
 
+def _torch_cuda_lib_dir():
+    """Windows: return torch's bundled CUDA-runtime dir (``torch/lib``) when it actually ships the
+    ``cudart64_*.dll`` the GPU backend needs, else None.
+
+    On Windows ``LD_LIBRARY_PATH`` is a no-op, so the visual-server child cannot load ``ggml-cuda.dll``
+    unless torch's bundled ``cudart64_*.dll`` / ``cublas64_*.dll`` (shipped in ``torch/lib`` by the
+    ``torch+cuXXX`` wheel) are on ``PATH``; otherwise the DLL fails to load with error 126 and the
+    server silently falls back to CPU. Mirrors the llama-server fix (unsloth#5491) for the diffusion
+    runner (unsloth#6273). The version glob keeps this CUDA-major-agnostic (cudart64_12/13/...)."""
+    try:
+        import torch
+        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+    except Exception:
+        return None
+    if not os.path.isdir(torch_lib):
+        return None
+    try:
+        has_cudart = any(
+            f.lower().startswith("cudart64_") and f.lower().endswith(".dll")
+            for f in os.listdir(torch_lib)
+        )
+    except OSError:
+        return None
+    return torch_lib if has_cudart else None
+
+
 class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
@@ -94,6 +120,10 @@ class VisualServer:
         self.req = req_path or os.path.join(req_dir, f"dg_visual_{os.getpid()}.req")
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), NGL="99", MAXTOK=str(maxtok))
         env["LD_LIBRARY_PATH"] = os.path.dirname(self.server_bin) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        if os.name == "nt":
+            torch_lib = _torch_cuda_lib_dir()
+            if torch_lib:
+                env["PATH"] = torch_lib + os.pathsep + env.get("PATH", "")
         self.env = env
         self.p = None
         self._spawn()
