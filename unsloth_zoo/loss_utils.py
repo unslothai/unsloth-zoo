@@ -35,7 +35,10 @@ else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
 
-if DEVICE_TYPE == "cuda":
+if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
+    # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts
+    HAS_CUT_CROSS_ENTROPY = False
+elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
