@@ -569,7 +569,6 @@ def _make_gd_chunk_backward_kernel(vectorized=False):
         }}
 
         for (int t = T - 1; t >= 0; --t) {{
-          auto prev_row = states_ + (t - 1) * Dv * Dk;
           auto cur_row = states_ + t * Dv * Dk;
           float beta_t = static_cast<float>(beta_[hv_idx]);
           float v_t = static_cast<float>(v_[dv_idx]);
@@ -580,8 +579,12 @@ def _make_gd_chunk_backward_kernel(vectorized=False):
           for (int i = 0; i < n_per_t; ++i) {{
             auto s_idx = n_per_t * dk_idx + i;
             {g_load}
-            s_prev[i] = (t > 0) ? prev_row[s_idx]
-                                : static_cast<float>(i_state[s_idx]);
+            if (t > 0) {{
+              auto prev_row = states_ + (t - 1) * Dv * Dk;
+              s_prev[i] = static_cast<float>(prev_row[s_idx]);
+            }} else {{
+              s_prev[i] = static_cast<float>(i_state[s_idx]);
+            }}
             s_cur[i] = cur_row[s_idx];
             kv_mem += s_prev[i] * {g_col} * static_cast<float>(k_[s_idx]);
           }}
@@ -630,17 +633,19 @@ def _make_gd_chunk_backward_kernel(vectorized=False):
                                       memory_order_relaxed);
           }}
 
-          q_ -= Hv * Dk;
-          k_ -= Hv * Dk;
-          v_ -= Hv * Dv;
-          {g_retreat}
-          beta_ -= Hv;
-          dy_ -= Hv * Dv;
-          d_q_ -= Hv * Dk;
-          d_k_ -= Hv * Dk;
-          d_v_ -= Hv * Dv;
-          {d_g_retreat}
-          d_beta_ -= Hv;
+          if (t > 0) {{
+            q_ -= Hv * Dk;
+            k_ -= Hv * Dk;
+            v_ -= Hv * Dv;
+            {g_retreat}
+            beta_ -= Hv;
+            dy_ -= Hv * Dv;
+            d_q_ -= Hv * Dk;
+            d_k_ -= Hv * Dk;
+            d_v_ -= Hv * Dv;
+            {d_g_retreat}
+            d_beta_ -= Hv;
+          }}
         }}
 
         for (int i = 0; i < n_per_t; ++i) {{
