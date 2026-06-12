@@ -41,6 +41,22 @@ import tempfile
 CANVAS = 256
 
 
+class ContextOverflow(RuntimeError):
+    """The templated conversation + canvas exceeds the visual server's per-turn context budget (MAXTOK).
+
+    Raised from ``generate_visual`` when the server reports ``ERR toolong <needed> <budget>`` so the caller
+    can surface a clean, user-facing message instead of a raw protocol string. ``needed`` is the token count
+    the request would require; ``budget`` is the server's resolved MAXTOK.
+    """
+
+    def __init__(self, needed, budget):
+        self.needed = int(needed)
+        self.budget = int(budget)
+        super().__init__(
+            f"conversation needs {self.needed} tokens but the context budget is {self.budget}"
+        )
+
+
 def _set_pdeathsig():
     """Linux: ask the kernel to SIGTERM this child when its parent (the shim) dies for any reason, so a
     hard-killed shim never orphans a GPU process."""
@@ -65,7 +81,7 @@ def _resolve_bin(server_bin=None):
 class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
-    def __init__(self, gguf, gpu="0", maxtok=8192, server_bin=None, req_path=None):
+    def __init__(self, gguf, gpu="0", maxtok=0, server_bin=None, req_path=None):
         server_bin = _resolve_bin(server_bin)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
         self.req = req_path or os.path.join(req_dir, f"dg_visual_{os.getpid()}.req")
@@ -78,7 +94,11 @@ class VisualServer:
         line = self.p.stdout.readline().strip()
         if not line.startswith("READY"):
             raise RuntimeError(f"visual server failed to start: {line!r}")
-        self.n_vocab = int(line.split()[1])
+        # "READY <n_vocab> <maxtok>": maxtok is the server's resolved per-turn context budget (it may have
+        # auto-sized it to fit VRAM when launched with MAXTOK=0). Older servers print only "READY <n_vocab>".
+        parts = line.split()
+        self.n_vocab = int(parts[1]) if len(parts) > 1 else 0
+        self.maxtok = int(parts[2]) if len(parts) > 2 else int(maxtok)
 
     def _send(self, messages, n_blocks, seed):
         with open(self.req, "w") as f:
@@ -96,12 +116,28 @@ class VisualServer:
             self.p.kill()
 
 
-def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on_commit=None):
+def _parse_stats(line):
+    """Parse a 'STATS k=v k=v ...' summary line into a dict (ints/floats where possible)."""
+    stats = {}
+    for tok in line.split()[1:]:
+        if "=" not in tok:
+            continue
+        k, v = tok.split("=", 1)
+        try:
+            stats[k] = float(v) if ("." in v or "e" in v.lower()) else int(v)
+        except ValueError:
+            stats[k] = v
+    return stats
+
+
+def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on_commit=None, on_stats=None):
     """Stream one turn through the optimized visual server.
 
     on_frame(block, step, total, text): a denoising frame (the current argmax canvas, already decoded).
     on_commit(cumulative_text): cumulative committed answer text after each block (for live OpenAI deltas).
-    Returns the full committed reply text.
+    on_stats(stats_dict): the server's end-of-request summary (prompt_n, predicted_n, prompt_ms,
+        predicted_ms, blocks, steps, canvas, n_ctx) for surfacing generation statistics.
+    Returns the full committed reply text. Raises ContextOverflow if the request exceeds the context budget.
     """
     server._send(messages, max_blocks, seed)
 
@@ -114,7 +150,16 @@ def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on
         if line == "DONE":
             break
         if line.startswith("ERR"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "toolong":
+                needed = int(parts[2]) if len(parts) > 2 else 0
+                budget = int(parts[3]) if len(parts) > 3 else 0
+                raise ContextOverflow(needed, budget)
             raise RuntimeError(f"visual server error: {line}")
+        if line.startswith("STATS"):
+            if on_stats is not None:
+                on_stats(_parse_stats(line))
+            continue
         if line[:1] == "F":
             parts = line.split(" ", 4)            # F <block> <step> <total> <json-string>
             if len(parts) < 5:
