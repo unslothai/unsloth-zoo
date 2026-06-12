@@ -19,13 +19,11 @@ llama.cpp / OpenAI-compatible server.
 Drives the OPTIMIZED visual decoder (visual_engine -> llama-diffusion-gemma-visual-server, the same
 on-device entropy-bound path as the CLI's --diffusion-visual: Stage 1 device sampling + Stage 2
 device-resident self-conditioning). Per streaming request it (a) streams the committed answer text as
-normal OpenAI deltas, and (b) appends a self-contained ```html artifact that replays the per-step
-denoising canvas in place - Studio renders that fenced HTML as a sandboxed-iframe artifact, so the user
-watches the 256-token canvas resolve out of noise just like the terminal.
+normal OpenAI deltas and (b) streams per-step "diffusion_frame" events so the 256-token canvas resolves
+in place in the chat bubble, like the terminal. Set DG_ARTIFACT=1 to also append a replay HTML artifact.
 
 Exposes /v1/models and /v1/chat/completions (streaming SSE + non-streaming) plus /health. The model loads
-once; requests are serialized (the decoder is single-sequence / stateful SC). This process serves only
-DiffusionGemma, so the denoising artifact is emitted for every request.
+once; requests are serialized (the decoder is single-sequence / stateful SC).
 
 Run:  DG_VISUAL_BIN=.../llama-diffusion-gemma-visual-server \
           python -m unsloth_zoo.diffusion_studio.shim --gguf diffusion-gemma-Q8_0.gguf --gpu 0 --port 8123
@@ -48,6 +46,8 @@ from . import visual_engine as V          # optimized visual decoder driver (sel
 
 MODEL_ID = os.environ.get("DG_MODEL_ID", "diffusiongemma")
 _PLAYER_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "canvas_player.html")
+# DG_ARTIFACT=1 also appends the legacy replay HTML artifact (export/debug); default is live frames only.
+_WANT_ARTIFACT = os.environ.get("DG_ARTIFACT", "") not in ("", "0", "false", "False", "no", "off")
 
 app = FastAPI()
 _STATE = {}          # server (VisualServer), player (html template str)
@@ -79,29 +79,47 @@ def _sse(obj):
 
 
 def _timings_from_stats(stats):
-    """Build a llama-server-style `timings` block (+ diffusion extras) from the server's STATS summary, so
-    Studio's stat tooltip lights up the same rich view it shows for ordinary GGUF models. Returns
-    (timings, prompt_tokens, completion_tokens)."""
+    """Build a `timings` block from the server STATS summary. Returns (timings, prompt_n, completion_n).
+
+    No autoregressive prefill exists, so we emit no prompt tok/s (the old one divided tokens by host
+    tokenize time and showed a meaningless ~14000). We report the diffusion CLI's two rates so Studio
+    matches the terminal: effective = canvas*blocks/wall (end-to-end, ~hundreds) and in-step parallel =
+    canvas*steps/wall (the model's real per-step rate, ~thousands)."""
+    def rate(n, ms):
+        return (n / ms * 1000.0) if ms > 0 else 0.0
     P = int(stats.get("prompt_n", 0))
     G = int(stats.get("predicted_n", 0))
-    pm = float(stats.get("prompt_ms", 0.0))
-    gm = float(stats.get("predicted_ms", 0.0))
+    prep_ms   = float(stats.get("prompt_prepare_ms", 0.0))
+    wall_ms   = float(stats.get("wall_ms", 0.0))
+    decode_ms = float(stats.get("decode_ms", 0.0))
+    steps     = int(stats.get("steps", 0))
+    blocks    = int(stats.get("blocks", 0))
+    canvas    = int(stats.get("canvas", 0))
+    # CLI-matching rates; wall_ms is the CLI's end-to-end measure (incl. visualization).
+    eff_tps   = rate(canvas * blocks, wall_ms)   # effective: total canvas tokens generated / wall
+    par_tps   = rate(canvas * steps,  wall_ms)   # in-step parallel: canvas / per_step (per_step = wall/steps)
+    out_tps   = rate(G, wall_ms)                 # committed answer tokens the user received / wall
     timings = {
-        "prompt_n": P,
-        "prompt_ms": pm,
-        "prompt_per_second": (P / pm * 1000.0) if pm > 0 else 0.0,
+        # Headline "Speed" = in-step parallel rate (the model's real per-step throughput, ~thousands tok/s,
+        # matching the CLI), not the old bogus 14000.
         "predicted_n": G,
-        "predicted_ms": gm,
-        "predicted_per_second": (G / gm * 1000.0) if gm > 0 else 0.0,
+        "predicted_ms": wall_ms,
+        "predicted_per_second": par_tps,
         "cache_n": 0,
+        # Diffusion-specific breakdown (Studio shows these in a dedicated tooltip section).
+        "diffusion": True,
+        "diffusion_blocks": blocks,
+        "diffusion_steps": steps,
+        "diffusion_canvas": canvas,
+        "diffusion_prompt_n": P,
+        "diffusion_prompt_prepare_ms": prep_ms,
+        "diffusion_decode_ms": decode_ms,
+        "diffusion_wall_ms": wall_ms,
+        "diffusion_effective_tok_s": eff_tps,   # canvas*blocks / wall  (CLI "throughput")
+        "diffusion_parallel_tok_s": par_tps,    # canvas / per_step      (CLI "in-step parallel")
+        "diffusion_output_tok_s": out_tps,      # committed answer tokens / wall
+        "diffusion_steps_per_second": rate(steps, wall_ms),
     }
-    # diffusion-specific extras (Studio renders these as additional rows; other clients ignore them)
-    if "blocks" in stats:
-        timings["diffusion_blocks"] = int(stats["blocks"])
-    if "steps" in stats:
-        timings["diffusion_steps"] = int(stats["steps"])
-    if "canvas" in stats:
-        timings["diffusion_canvas"] = int(stats["canvas"])
     return timings, P, G
 
 
@@ -179,11 +197,15 @@ async def chat(req: Request):
 
     async def gen():
         q: asyncio.Queue = asyncio.Queue()
-        frames = []        # collected denoising frames (worker thread owns until done)
+        frames = []        # retained only for the optional replay artifact (DG_ARTIFACT=1)
         stats_box = {}     # the server's end-of-request STATS summary
 
         def on_frame(block, step, total, text):
-            frames.append({"b": block, "s": step, "t": total, "x": text})
+            # Stream each frame (transient, not committed text); the frontend renders the canvas in
+            # place and drops it on commit.
+            loop.call_soon_threadsafe(q.put_nowait, ("frame", (block, step, total, text)))
+            if _WANT_ARTIFACT:
+                frames.append({"b": block, "s": step, "t": total, "x": text})
 
         def on_commit(cumulative):
             loop.call_soon_threadsafe(q.put_nowait, ("delta", cumulative))
@@ -205,17 +227,26 @@ async def chat(req: Request):
         sent = ""
         while True:
             kind, payload = await q.get()
+            if kind == "frame":
+                # type-tagged event on the tool_status channel; no assistant content, so plain
+                # OpenAI clients ignore it and still get the committed text.
+                block, step, total, text = payload
+                yield _sse({"type": "diffusion_frame", "block": block, "step": step,
+                            "total": total, "text": text})
+                continue
             if kind in ("delta", "done"):
                 new = payload[len(sent):]
                 if new:
+                    # committed block: normal assistant text (what the transcript keeps).
                     yield _sse(_chunk(cid, created, {"content": new}))
                     sent = payload
                 if kind == "done":
-                    art = _artifact(frames)
-                    if art:
-                        yield _sse(_chunk(cid, created, {"content": art}))
-                    # llama-server-style usage+timings chunk (empty choices) so Studio shows the rich
-                    # stat tooltip (tok/s, generation time, tokens) plus diffusion rows (steps, blocks).
+                    if _WANT_ARTIFACT:
+                        art = _artifact(frames)
+                        if art:
+                            yield _sse(_chunk(cid, created, {"content": art}))
+                    # llama-server-style usage+timings chunk (empty choices) so Studio shows the
+                    # stat tooltip plus the diffusion rows (steps, blocks).
                     timings, P, G = _timings_from_stats(stats_box)
                     yield _sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                                 "model": MODEL_ID, "choices": [],
