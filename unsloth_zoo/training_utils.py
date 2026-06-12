@@ -94,17 +94,14 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
 pass
 
 
-# Cache of generated autocast subclasses, keyed by (base_class, compute_dtype).
-# Caching keeps the subclass identity stable across instances of the same base
-# class and lets us register each subclass exactly once as a module-level
-# symbol so pickle / torch.save(model) can resolve it by module + qualname.
+# Cache of generated autocast subclasses keyed by (base_class, compute_dtype):
+# stable identity per base class + one module-level symbol so pickle can resolve it.
 _BF16_AUTOCAST_SUBCLASSES = {}
 
 
 def _find_tensor_device_type(*values):
-    """Device type of the first tensor found in args/kwargs, recursing into
-    mappings / lists / tuples (HF batches are often dicts; VLM inputs nest
-    tensors). Returns None if no tensor is found."""
+    """Device type of the first tensor in args/kwargs, recursing into dict/list/tuple
+    (HF batches are dicts; VLM inputs nest tensors). None if no tensor found."""
     from collections.abc import Mapping
     stack = list(values)
     while stack:
@@ -119,19 +116,16 @@ def _find_tensor_device_type(*values):
 
 
 def _call_forward_with_bf16_autocast(forward, model, args, kwargs, compute_dtype):
-    """Run `forward(*args, **kwargs)` inside `torch.amp.autocast(compute_dtype)`.
-    Device type is sniffed from the inputs (recursing into containers), falling
-    back to the model's parameter device, then "cuda". Defers to an outer
-    autocast that is already active, and to unsupported device types (meta).
-    Shared by both the subclass and instance-attribute wrapper paths."""
+    """Run forward inside torch.amp.autocast(compute_dtype). Device is sniffed from
+    inputs, else model params, else "cuda". Defers to an active outer autocast and to
+    unsupported devices (meta). Shared by the subclass and instance-forward paths."""
     device_type = _find_tensor_device_type(*args, *kwargs.values())
     if device_type is None:
         try:
             device_type = next(model.parameters()).device.type
         except StopIteration:
             device_type = "cuda"
-    # Order matters: is_autocast_enabled raises on unsupported device types
-    # (e.g. "meta"); is_autocast_available returns False cleanly.
+    # Check availability first: is_autocast_enabled raises on e.g. "meta"; available returns False.
     if not torch.amp.is_autocast_available(device_type):
         return forward(*args, **kwargs)
     if torch.is_autocast_enabled(device_type):
@@ -141,22 +135,16 @@ def _call_forward_with_bf16_autocast(forward, model, args, kwargs, compute_dtype
 
 
 def _reconstruct_bf16_autocast_model(base_cls, compute_dtype, instance_mode=False):
-    """Pickle / deepcopy reconstructor. Rebuilds (or fetches) the autocast
-    subclass from the IMPORTABLE base class, then returns a blank instance for
-    `__setstate__` to populate. Because reconstruction is driven by the base
-    class (which IS importable by module + qualname) rather than by the
-    runtime-generated subclass symbol, unpickling works in a FRESH interpreter
-    where `_make_bf16_autocast_subclass` has not been called yet (e.g. loading
-    a `torch.save(model)` checkpoint in another process / session)."""
+    """Pickle/deepcopy reconstructor: rebuild the subclass from the importable base
+    class and return a blank instance for __setstate__. Driving off the base class
+    (not the generated symbol) lets unpickling work in a fresh interpreter."""
     cls = _make_bf16_autocast_subclass(base_cls, compute_dtype, instance_mode)
     return cls.__new__(cls)
 
 
 def _bf16_autocast_reduce(self):
-    """`__reduce__` for generated autocast subclasses. Serialize via the base
-    class + the standard nn.Module state so no dynamically-generated class
-    symbol (and no instance-bound local function) needs to be resolvable at
-    unpickle time."""
+    """__reduce__ for generated subclasses: serialize via the base class + nn.Module
+    state so no generated symbol or instance-bound function is needed at unpickle."""
     cls = type(self)
     base_cls = cls.__dict__.get("_unsloth_autocast_base", cls.__mro__[1])
     compute_dtype = cls.__dict__.get("_unsloth_autocast_dtype", torch.bfloat16)
@@ -168,10 +156,9 @@ def _bf16_autocast_reduce(self):
 
 
 def _bf16_autocast_instance_forward(self, *args, **kwargs):
-    """Class-level forward for the `instance_mode` subclass: wraps the model's
-    ORIGINAL instance-level forward (saved on `self._unsloth_autocast_orig_forward`)
-    in autocast. Defined at module scope (not a closure) and read from `self`,
-    so it pickles by import path and rebinds correctly on deepcopy."""
+    """Class-level forward for instance_mode: wraps the original instance forward
+    (saved on self._unsloth_autocast_orig_forward) in autocast. Module-scoped (not a
+    closure) and read from self, so it pickles by import path and rebinds on deepcopy."""
     orig = self.__dict__["_unsloth_autocast_orig_forward"]
     compute_dtype = type(self).__dict__.get(
         "_unsloth_autocast_dtype", torch.bfloat16)
@@ -179,32 +166,19 @@ def _bf16_autocast_instance_forward(self, *args, **kwargs):
 
 
 def _make_bf16_autocast_subclass(cls, compute_dtype, instance_forward=False):
-    """Build (or fetch from cache) a subclass of `cls` whose `forward` is
-    wrapped in `torch.amp.autocast(compute_dtype)`.
-
-    Two modes:
-      - default: wrap the base class's `forward`.
-      - `instance_forward=True`: wrap a per-instance original forward stored on
-        `self._unsloth_autocast_orig_forward` (used when the model carried an
-        instance-level `forward`, e.g. Unsloth runtime forward patching).
-
-    Picklability: the subclass defines `__reduce__` (`_bf16_autocast_reduce`)
-    so model instances serialize via their importable BASE class and are
-    reconstructed by `_reconstruct_bf16_autocast_model` -- this is what makes
-    `torch.save(model)` checkpoints loadable in a fresh process. `forward` is a
-    CLASS attribute (never instance state), so no instance-bound local function
-    is ever serialized. The subclass is also registered as a module-level symbol
-    so that pickling the class object itself resolves by name.
-    """
+    """Build (or fetch from cache) a subclass of cls whose forward runs in
+    torch.amp.autocast(compute_dtype). Default wraps the base forward;
+    instance_forward=True wraps the per-instance forward saved on the model (Unsloth
+    runtime patching). __reduce__ serializes via the importable base class and forward
+    is a class attribute, so torch.save(model) loads in a fresh process. The subclass
+    is registered as a module-level symbol so the class itself also pickles by name."""
     cached = _BF16_AUTOCAST_SUBCLASSES.get((cls, compute_dtype, instance_forward))
     if cached is not None:
         return cached
 
     if instance_forward:
-        # Generic signature here -- the per-instance original forward is not
-        # available at class-creation time (the class is cached/shared), so
-        # `remove_unused_columns` falls back to keeping all columns for this
-        # (rare) path. Correctness/picklability take priority.
+        # Generic signature: the per-instance forward is not known at (cached) class
+        # creation, so remove_unused_columns keeps all columns on this rare path.
         _wrapped = _bf16_autocast_instance_forward
     else:
         _orig_forward = cls.forward
@@ -216,10 +190,8 @@ def _make_bf16_autocast_subclass(cls, compute_dtype, instance_forward=False):
                 self, args, kwargs, compute_dtype,
             )
 
-    # `pickle_name` is unique (for the module-level registration / same-process
-    # class pickling); the subclass keeps the ORIGINAL `__name__` so HF
-    # save_pretrained writes the base class into config.architectures rather
-    # than the generated wrapper name.
+    # pickle_name is unique for module-level registration; the subclass keeps the
+    # original __name__ so save_pretrained records the base class in architectures.
     pickle_name = cls.__name__ + "WithUnslothBf16Autocast"
     module = sys.modules[__name__]
     if hasattr(module, pickle_name) and getattr(module, pickle_name) is not None:
@@ -241,34 +213,13 @@ def _make_bf16_autocast_subclass(cls, compute_dtype, instance_forward=False):
 
 
 def _wrap_forward_in_bf16_autocast(model, compute_dtype):
-    """For bf16 full-FT with fp32 norm weights, the norm forward returns an
-    fp32 tensor which then meets the next bf16 linear and trips
-    `F.linear`'s dtype-equality check. Wrap `model.forward` in
-    `torch.amp.autocast(compute_dtype)` so linear/matmul inputs are
-    downcast at the op boundary -- the standard PyTorch mixed-precision
-    pattern PEFT and Accelerate already rely on. Idempotent; defers to an
-    outer autocast context if one is already active.
-
-    Implementation notes:
-      - `functools.wraps(_orig_forward)` preserves the model's forward
-        signature so `inspect.signature(model.forward)` still reports
-        the real parameter names. HF `Trainer._set_signature_columns_if_needed`
-        reads that signature to decide which dataset columns to keep under
-        `remove_unused_columns=True`.
-      - The wrap is installed by subclassing `type(model)` and overriding
-        `forward` on the new class, rather than reassigning `model.forward`
-        to a closure. `copy.deepcopy(model)` (used by EMA / model averaging
-        / `Trainer._save_optimizer_and_scheduler` checkpoint paths) uses
-        `obj.__class__` to reconstruct the copy, so the subclass survives
-        and the copy's `forward` correctly binds to the copy's `self`.
-      - The subclass is cached and registered as a module-level symbol (see
-        `_make_bf16_autocast_subclass`) so `pickle` / `torch.save(model)` can
-        resolve it by `module + qualname` instead of raising `PicklingError`.
-      - `is_autocast_available(device_type)` is probed BEFORE
-        `is_autocast_enabled(device_type)` because the latter raises on
-        unsupported device types (e.g. "meta" tensors during materialise),
-        whereas `is_autocast_available` returns False cleanly.
-    """
+    """With fp32 norm weights the norm forward returns fp32, which trips the next
+    bf16 linear's dtype check; wrap model.forward in autocast(compute_dtype) so
+    linear/matmul inputs downcast at the op boundary (the standard PEFT/Accelerate
+    pattern). Idempotent and defers to an active outer autocast. Implemented by
+    subclassing type(model) (not reassigning forward) so the wrap survives
+    deepcopy/pickle/torch.save; functools.wraps preserves the forward signature for
+    HF Trainer's remove_unused_columns."""
     if compute_dtype in (None, torch.float32):
         return model
     if getattr(model, "_unsloth_bf16_autocast_wrapped", False):
@@ -276,16 +227,10 @@ def _wrap_forward_in_bf16_autocast(model, compute_dtype):
 
     instance_forward = model.__dict__.get("forward")
     if instance_forward is not None:
-        # An instance-level `forward` (e.g. Unsloth runtime forward patching)
-        # shadows any class-method override -- `self.forward` resolves the
-        # instance attribute first -- so mutating `__class__` alone would NOT
-        # intercept it. Move the original forward to
-        # `_unsloth_autocast_orig_forward`, drop the instance attribute, and
-        # route through the SAME generated-subclass machinery (instance_mode).
-        # This keeps `forward` a CLASS attribute (never serialized as instance
-        # state), so the model stays picklable / deepcopy-safe via `__reduce__`
-        # -- a `types.MethodType` bound to a local function in `__dict__` would
-        # not survive `torch.load` in a fresh interpreter.
+        # An instance-level forward (e.g. Unsloth runtime patching) shadows a class
+        # override, so changing __class__ alone would not intercept it. Move it to
+        # _unsloth_autocast_orig_forward and route through the instance_mode subclass,
+        # keeping forward a class attribute so the model stays picklable/deepcopy-safe.
         model._unsloth_autocast_orig_forward = instance_forward
         del model.__dict__["forward"]
         model.__class__ = _make_bf16_autocast_subclass(
@@ -297,9 +242,8 @@ def _wrap_forward_in_bf16_autocast(model, compute_dtype):
 
 
 def _unwrap_forward_in_bf16_autocast(model):
-    """Undo a previous `_wrap_forward_in_bf16_autocast`. Without this, reusing
-    the same model object across prepare modes (e.g. bf16 full-FT then fp32)
-    would leave a stale bf16 autocast forcing bf16 compute on fp32 weights."""
+    """Undo _wrap_forward_in_bf16_autocast, so reusing a model across prepare modes
+    (bf16 full-FT then fp32) does not leave a stale autocast forcing bf16 on fp32."""
     if not getattr(model, "_unsloth_bf16_autocast_wrapped", False):
         return model
     base_cls = getattr(type(model), "_unsloth_autocast_base", None)
@@ -359,36 +303,27 @@ def prepare_model_for_training(
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
     pass
-    # Defer to any external compute-dtype policy already in effect on norm
-    # modules (e.g. UNSLOTH_HIGH_PRECISION_LAYERNORM which tags norm modules
-    # with `_pre_set_compute_dtype`). Record those parameter ids so we leave
-    # them alone instead of overwriting that policy.
+    # Defer to an external norm dtype policy (e.g. UNSLOTH_HIGH_PRECISION_LAYERNORM
+    # tags modules with _pre_set_compute_dtype); record those param ids and skip them.
     _externally_managed_param_ids = set()
-    # Also identify norm parameters by the OWNING MODULE's class name, not just
-    # by parameter-name substrings. Custom norm classes whose params don't carry
-    # a recognisable name token (e.g. Gemma audio tower's `norm_out`,
-    # `norm_pre_attn`, `norm_post_attn`) are missed by name matching alone but
-    # are still RMSNorm/LayerNorm modules that must be upcast for bf16 full-FT.
+    # Also detect norms by owning-module class name, catching custom norms whose
+    # param names lack a token (e.g. Gemma audio tower norm_out/norm_pre_attn).
     _norm_class_re = re.compile(r"(?i)(rms_?norm|layer_?norm)")
     _norm_param_ids = set()
     for _, _module in model.named_modules():
         if hasattr(_module, "_pre_set_compute_dtype"):
-            # Recurse: the external policy casts the tagged module recursively
-            # (`module.to(module._pre_set_compute_dtype)`), so every descendant
-            # parameter is externally managed and must not be re-cast here.
+            # The external policy casts the module recursively, so all descendants are managed.
             for _p in _module.parameters(recurse=True):
                 _externally_managed_param_ids.add(id(_p))
         if _norm_class_re.search(type(_module).__name__):
             for _, _p in _module.named_parameters(recurse=False):
                 _norm_param_ids.add(id(_p))
-    # Rollback switch (defaults off = corrected behaviour). Set to 1 to keep
-    # norm weights at their loaded dtype like the pre-fix code path.
+    # Rollback switch (default off): 1 keeps norm weights at their loaded dtype (pre-fix).
     _disable_float32_norm_upcast = (
         os.environ.get("UNSLOTH_DISABLE_FLOAT32_UPCAST", "0") == "1")
 
     def _is_norm_parameter(nm, p):
-        # Union matcher (also used by the legacy UNSLOTH_UPCAST_LAYERNORM path):
-        # owning-module class name OR known parameter-name substrings.
+        # Union matcher: owning-module class name OR known param-name substrings.
         return (
             id(p) in _norm_param_ids
             or "norm." in nm
@@ -410,12 +345,9 @@ def prepare_model_for_training(
             else:
                 requires_grad = False
         else:
-            # Full finetuning: train everything by default at compute dtype.
-            # Norm weights must be upcast to float32 for adam writeback
-            # precision -- without this ~60% of bf16 adam updates round to
-            # zero on writeback (measured on Qwen3-0.6B input_layernorm).
-            # Previously a dangling `else:` attached to `if train_lm_head:`
-            # silently clobbered the `upcast = True` set for norms above it.
+            # Full finetuning trains everything at compute dtype, but norms must be fp32
+            # for adam writeback precision (~60% of bf16 norm updates round to zero
+            # otherwise). A prior dangling else on `if train_lm_head:` had clobbered this.
             requires_grad = True
             upcast = False
             if (train_layernorms
@@ -430,25 +362,17 @@ def prepare_model_for_training(
         else:
             param.requires_grad_(False)
 
-        # Cast the parameter storage in place. `param.data = param.data.to(dtype)`
-        # is exactly what `nn.Module._apply` does for a dtype cast: it preserves
-        # the Parameter object identity (so tied weights stay tied) and updates
-        # the storage without the fragile param-name -> module-attribute-path
-        # resolution the old `exec(...)` caster needed. Skip params owned by a
-        # module that already has `_pre_set_compute_dtype` set (the external
-        # compute-dtype policy will have already cast them) so we don't silently
-        # downcast their fp32 storage back to the compute dtype here.
+        # Cast storage in place via param.data.to(dtype) (like nn.Module._apply): keeps
+        # the Parameter identity so tied weights stay tied, and avoids the old exec()
+        # path. Skip externally-managed params so we don't undo their fp32 cast.
         if requires_grad and id(param) not in _externally_managed_param_ids:
             dtype = torch.float32 if upcast else mixed_precision_dtype
             if param.dtype != dtype:
                 param.data = param.data.to(dtype)
         pass
 
-        # Legacy UNSLOTH_UPCAST_LAYERNORM path. Uses the SAME union matcher and
-        # honours the external-policy deferral guard, so it can no longer
-        # (a) miss norm1/norm2/class-detected norms or (b) clobber an externally
-        # managed norm. Fp32 norms it creates are still handled by the wrapper
-        # because installation is gated on the presence of fp32 norms below.
+        # Legacy UNSLOTH_UPCAST_LAYERNORM path: same union matcher + external-policy
+        # guard; any fp32 norms it creates are handled by the wrapper gate below.
         if (_is_norm
                 and id(param) not in _externally_managed_param_ids
                 and os.environ.get("UNSLOTH_UPCAST_LAYERNORM", "0") == "1"):
@@ -456,15 +380,9 @@ def prepare_model_for_training(
                 param.data = param.data.to(torch.float32)
     pass
 
-    # Install the bf16 autocast wrapper iff fp32 norm weights ACTUALLY exist
-    # (from our upcast, the legacy env upcast, or an external
-    # `_pre_set_compute_dtype` policy). Gating on the presence of fp32 norms --
-    # not on the upcast DECISION -- means: (1) `UNSLOTH_DISABLE_FLOAT32_UPCAST=1`
-    # never leaves externally-managed fp32 norms exposed to a bf16 linear with
-    # no autocast context, and (2) we never class-mutate a model that has no
-    # fp32 norm. With fp32 norms, the norm forward returns fp32 which would trip
-    # the next bf16 linear's dtype check; autocast(bf16) downcasts at the op
-    # boundary -- the canonical PyTorch mixed-precision pattern.
+    # Install the autocast wrapper only if fp32 norms actually exist (our upcast, the
+    # legacy env, or an external policy). Gating on presence (not the upcast decision)
+    # avoids exposing external fp32 norms under rollback and never wraps a model without them.
     _has_fp32_norms = any(
         _is_norm_parameter(nm, p) and p.dtype == torch.float32
         for nm, p in model.named_parameters()
