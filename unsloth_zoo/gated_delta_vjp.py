@@ -249,7 +249,7 @@ def gated_delta_ops_efficient(
     return y, s
 
 
-_WARNED_FOREIGN_GATED_DELTA: set = set()
+_WARNED_FOREIGN_GATED_DELTA: set[str] = set()
 
 
 def patch_gated_delta():
@@ -305,7 +305,11 @@ def patch_gated_delta():
 
     # Sweep on every call (not just the first): a consumer module imported
     # after a previous patch still holds a stale from-import binding.
-    original = gated_delta._unsloth_gated_delta_original
+    original = getattr(gated_delta, "_unsloth_gated_delta_original", None)
+    if original is None:
+        # An older patch set the flag without recording the original; the
+        # identity sweep has nothing safe to match against.
+        return
     patched = gated_delta.gated_delta_update
     rebound = []
     foreign = []
@@ -735,7 +739,12 @@ def gated_delta_kernel_efficient(
     Same contract as gated_delta_ops_efficient, restricted to the
     kernel-eligible case (see gated_delta_kernel_supported).
     """
-    assert mask is None
+    if not gated_delta_kernel_supported(q, g, mask, v):
+        raise ValueError(
+            "gated_delta_kernel_efficient called outside kernel support "
+            "(requires a Metal GPU, mask=None, Dk % 32 == 0, and Dv divisible "
+            "by the threadgroup rows); use gated_delta_ops_efficient instead."
+        )
     from mlx_lm.models.gated_delta import gated_delta_kernel
 
     B, T, Hk, Dk = q.shape
