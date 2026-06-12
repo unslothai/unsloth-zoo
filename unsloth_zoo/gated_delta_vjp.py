@@ -412,6 +412,8 @@ def patch_gated_delta_vlm():
 # --------------------------------------------------------------------------
 
 _KERNEL_CHUNK_SIZE = 64
+_KERNEL_THREADGROUP_X = 32
+_KERNEL_THREADGROUP_Y = 4
 
 
 def _make_gd_chunk_states_kernel(vectorized=False):
@@ -562,7 +564,13 @@ def _make_gd_chunk_backward_kernel(vectorized=False):
         float d_state[n_per_t];
         float s_prev[n_per_t];
         float s_cur[n_per_t];
+        // Reduce threadgroup-local Dv rows before the global d_q/d_k atomics.
+        threadgroup float tg_dq[TG_ROWS * 32];
+        threadgroup float tg_dk[TG_ROWS * 32];
         {g_step_decl}
+        auto tg_y = thread_position_in_threadgroup.y;
+        auto tg_lane = thread_index_in_simdgroup;
+        auto tg_idx = tg_y * 32 + tg_lane;
         for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
           d_state[i] = static_cast<float>(d_state_out_[s_idx]);
@@ -599,8 +607,17 @@ def _make_gd_chunk_backward_kernel(vectorized=False):
             float q_c = static_cast<float>(q_[s_idx]);
             float dS_tot = d_state[i] + dy_t * q_c;
 
-            atomic_fetch_add_explicit(&d_q_[s_idx], dy_t * s_cur[i],
-                                      memory_order_relaxed);
+            tg_dq[tg_idx] = dy_t * s_cur[i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tg_y == 0) {{
+              float d_q_group = 0.0f;
+              for (int yy = 0; yy < TG_ROWS; ++yy) {{
+                d_q_group += tg_dq[yy * 32 + tg_lane];
+              }}
+              atomic_fetch_add_explicit(&d_q_[s_idx], d_q_group,
+                                        memory_order_relaxed);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
             d_delta_partial += dS_tot * k_c;
             // Stash dS_tot for the second pass below.
             s_cur[i] = dS_tot;
@@ -617,9 +634,17 @@ def _make_gd_chunk_backward_kernel(vectorized=False):
             float sd = s_prev[i] * {g_col};
             float d_sd = dS_tot + d_kv * k_c;
 
-            atomic_fetch_add_explicit(&d_k_[s_idx],
-                                      dS_tot * delta + d_kv * sd,
-                                      memory_order_relaxed);
+            tg_dk[tg_idx] = dS_tot * delta + d_kv * sd;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tg_y == 0) {{
+              float d_k_group = 0.0f;
+              for (int yy = 0; yy < TG_ROWS; ++yy) {{
+                d_k_group += tg_dk[yy * 32 + tg_lane];
+              }}
+              atomic_fetch_add_explicit(&d_k_[s_idx], d_k_group,
+                                        memory_order_relaxed);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
             {d_g_accum}
             d_state[i] = d_sd * {g_col};
           }}
@@ -736,7 +761,7 @@ def gated_delta_kernel_efficient(
             inputs=[k_c, v_c, g_c, beta_c, state_in, Tc],
             template=[("Dk", Dk), ("Dv", Dv), ("Hv", Hv)],
             grid=(32, Dv, Bc * Hv),
-            threadgroup=(32, 4, 1),
+            threadgroup=(_KERNEL_THREADGROUP_X, _KERNEL_THREADGROUP_Y, 1),
             output_shapes=[(Bc, Hv, Tc, Dv, Dk)],
             output_dtypes=[mx.float32],
         )
@@ -745,9 +770,14 @@ def gated_delta_kernel_efficient(
                 q_c, k_c, v_c, g_c, beta_c, state_in, states,
                 dy, d_state_out, Tc,
             ],
-            template=[("Dk", Dk), ("Dv", Dv), ("Hv", Hv)],
+            template=[
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hv", Hv),
+                ("TG_ROWS", _KERNEL_THREADGROUP_Y),
+            ],
             grid=(32, Dv, Bc * Hv),
-            threadgroup=(32, 4, 1),
+            threadgroup=(_KERNEL_THREADGROUP_X, _KERNEL_THREADGROUP_Y, 1),
             output_shapes=[
                 (Bc, Tc, Hv, Dk),
                 (Bc, Tc, Hv, Dk),
