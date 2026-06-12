@@ -1023,9 +1023,9 @@ class MLXTrainer:
                 from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
                 patch_gated_delta()
                 patch_gated_delta_vlm()
-            # Qwen3-VL's language tower uses the same fused MRoPE kernel with no
-            # VJP; flip it off so training takes the differentiable fallback.
-            if "qwen3_vl" in model_type:
+            # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
+            # no VJP; flip it off so training takes the differentiable fallback.
+            if any(t in model_type for t in ("qwen3_vl", "qwen2_vl", "qwen2_5_vl")):
                 from .loader import _disable_fused_mrope
                 _disable_fused_mrope(model)
 
