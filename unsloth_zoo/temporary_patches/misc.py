@@ -1644,3 +1644,19 @@ def patch_qwen2vl_image_processor_pixel_attrs():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
+
+
+def patch_deepseek_v2_moe_alias():
+    # transformers 5.x renamed DeepseekV2MoE -> DeepseekV2Moe; trust_remote_code
+    # models (e.g. DeepSeek-OCR) still import the old name. Alias it back when
+    # absent. No-op on transformers 4.x where the original name still exists.
+    try:
+        import importlib
+        m = importlib.import_module(
+            "transformers.models.deepseek_v2.modeling_deepseek_v2")
+    except Exception:
+        return
+    if not hasattr(m, "DeepseekV2MoE") and hasattr(m, "DeepseekV2Moe"):
+        m.DeepseekV2MoE = m.DeepseekV2Moe
+pass
+TEMPORARY_PATCHES.append(patch_deepseek_v2_moe_alias)
