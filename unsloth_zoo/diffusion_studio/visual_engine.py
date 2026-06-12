@@ -57,6 +57,11 @@ class ContextOverflow(RuntimeError):
         )
 
 
+class VisualServerCrashed(RuntimeError):
+    """The visual-server subprocess died mid-request (EOF or broken pipe), e.g. a CUDA fault on a long
+    context. The caller respawns it and, if nothing was streamed yet, retries the turn once."""
+
+
 def _set_pdeathsig():
     """Linux: ask the kernel to SIGTERM this child when its parent (the shim) dies for any reason, so a
     hard-killed shim never orphans a GPU process."""
@@ -82,14 +87,22 @@ class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
     def __init__(self, gguf, gpu="0", maxtok=0, server_bin=None, req_path=None):
-        server_bin = _resolve_bin(server_bin)
+        self.gguf = gguf
+        self.server_bin = _resolve_bin(server_bin)
+        self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
         self.req = req_path or os.path.join(req_dir, f"dg_visual_{os.getpid()}.req")
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), NGL="99", MAXTOK=str(maxtok))
-        bin_dir = os.path.dirname(server_bin)
-        env["LD_LIBRARY_PATH"] = bin_dir + os.pathsep + env.get("LD_LIBRARY_PATH", "")
-        self.p = subprocess.Popen([server_bin, gguf], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  env=env, bufsize=1, text=True,
+        env["LD_LIBRARY_PATH"] = os.path.dirname(self.server_bin) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        self.env = env
+        self.p = None
+        self._spawn()
+
+    def _spawn(self):
+        """Launch the subprocess and finish the READY handshake. Used at startup and by restart()
+        after a crash (re-loads the model, so it costs tens of seconds)."""
+        self.p = subprocess.Popen([self.server_bin, self.gguf], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  env=self.env, bufsize=1, text=True,
                                   preexec_fn=_set_pdeathsig if os.name == "posix" else None)
         line = self.p.stdout.readline().strip()
         if not line.startswith("READY"):
@@ -98,14 +111,35 @@ class VisualServer:
         # auto-sized it to fit VRAM when launched with MAXTOK=0). Older servers print only "READY <n_vocab>".
         parts = line.split()
         self.n_vocab = int(parts[1]) if len(parts) > 1 else 0
-        self.maxtok = int(parts[2]) if len(parts) > 2 else int(maxtok)
+        self.maxtok = int(parts[2]) if len(parts) > 2 else self.maxtok_req
+
+    def restart(self):
+        """Tear down a dead/stuck server and spawn a fresh one, so one bad turn does not leave every
+        later turn failing with a broken pipe."""
+        try:
+            if self.p is not None:
+                self.p.kill()
+                self.p.wait(timeout=10)
+        except Exception:
+            pass
+        self._spawn()
 
     def _send(self, messages, n_blocks, seed):
+        # A previous turn may have crashed the decoder; respawn before writing so a dead child does not
+        # strand this and every later turn with a broken pipe.
+        if self.p is None or self.p.poll() is not None:
+            self.restart()
         with open(self.req, "w") as f:
             json.dump({"seed": int(seed), "n_blocks": int(n_blocks), "messages": messages}, f,
                       ensure_ascii=False)
-        self.p.stdin.write(self.req + "\n")
-        self.p.stdin.flush()
+        try:
+            self.p.stdin.write(self.req + "\n")
+            self.p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            # Died between the poll above and the write: respawn once and retry the send.
+            self.restart()
+            self.p.stdin.write(self.req + "\n")
+            self.p.stdin.flush()
 
     def close(self):
         try:
@@ -135,17 +169,43 @@ def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on
 
     on_frame(block, step, total, text): a denoising frame (the current argmax canvas, already decoded).
     on_commit(cumulative_text): cumulative committed answer text after each block (for live OpenAI deltas).
-    on_stats(stats_dict): the server's end-of-request summary (prompt_n, predicted_n, prompt_ms,
-        predicted_ms, blocks, steps, canvas, n_ctx) for surfacing generation statistics.
+    on_stats(stats_dict): the server's end-of-request summary (prompt_n, predicted_n,
+        prompt_prepare_ms, wall_ms, decode_ms, blocks, steps, canvas, n_ctx) for generation stats.
     Returns the full committed reply text. Raises ContextOverflow if the request exceeds the context budget.
+
+    Self-heals a crash: if the server dies mid-turn and nothing was streamed yet (the usual case, since
+    the crash is in the per-block prefill before any frame), respawn and retry once; otherwise propagate.
     """
+    progressed = {"emitted": False}
+
+    def _frame(b, s, t, x):
+        progressed["emitted"] = True
+        if on_frame is not None:
+            on_frame(b, s, t, x)
+
+    def _commit(txt):
+        progressed["emitted"] = True
+        if on_commit is not None:
+            on_commit(txt)
+
+    for attempt in (0, 1):
+        try:
+            return _generate_visual_once(server, messages, seed, max_blocks, _frame, _commit, on_stats)
+        except VisualServerCrashed:
+            server.restart()  # always bring a fresh server up so the next turn works regardless
+            if attempt == 1 or progressed["emitted"]:
+                raise
+            # nothing emitted yet -> safe to transparently resend on the fresh server
+
+
+def _generate_visual_once(server, messages, seed, max_blocks, on_frame, on_commit, on_stats):
     server._send(messages, max_blocks, seed)
 
     full_text = ""
     while True:
         line = server.p.stdout.readline()
         if not line:
-            raise RuntimeError("visual server closed the stream")
+            raise VisualServerCrashed("visual server closed the stream")
         line = line.rstrip("\n")
         if line == "DONE":
             break
