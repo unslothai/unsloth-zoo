@@ -1550,6 +1550,11 @@ class EmptyLogits:
     __getattr__ = raise_getattr_error
     def __repr__(self): return LOGITS_ERROR_STRING
     def __str__ (self): return LOGITS_ERROR_STRING
+    # Stateless pickling so accelerate gather_object works on the sentinel
+    def __reduce__(self): return (type(self), ())
+    # Gathered copies must compare equal in accelerate debug mode
+    def __eq__(self, other): return type(other).__name__ == "EmptyLogits"
+    __hash__ = object.__hash__
 pass
 EMPTY_LOGITS = EmptyLogits()
 functions = dir(torch.Tensor)
@@ -1558,6 +1563,11 @@ for j, function in enumerate(functions):
         exec(f"def raise_{j}(*args, **kwargs): print('{function}')", globals(), locals())
         try: exec(f"EMPTY_LOGITS.{function} = raise_{j}", globals(), locals())
         except: continue
+pass
+# The loop above stomps pickle hooks with stubs returning None; restore them.
+for function in ("__reduce__", "__reduce_ex__", "__getstate__", "__setstate__"):
+    try: delattr(EMPTY_LOGITS, function)
+    except Exception: pass
 pass
 
 
