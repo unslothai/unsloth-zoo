@@ -2853,6 +2853,61 @@ def save_trainable_adapters(model, path, adapter_config=None):
     _save_adapter_artifacts(model, path, tensors, adapter_config=adapter_config)
 
 
+def save_optimizer_state(optimizer, path):
+    """Save MLX optimizer state (Adam/AdamW m,v moments, step, learning_rate)
+    to ``<path>/optimizer_state.safetensors`` so training can resume from a
+    checkpoint with identical optimizer dynamics.
+
+    The optimizer's ``.state`` is a nested dict whose leaves are ``mx.array``.
+    ``tree_flatten`` produces dotted-name string keys (e.g.
+    ``"layers.0.lora_a.weight.m"``), all values are arrays, so the whole tree
+    serializes cleanly with ``mx.save_safetensors``. Round-trip preserves
+    bytes exactly for the optimizer's ``.state`` dict.
+    """
+    import os
+    os.makedirs(path, exist_ok=True)
+    flat = dict(mlx.utils.tree_flatten(optimizer.state))
+    mx.save_safetensors(f"{path}/optimizer_state.safetensors", flat)
+
+
+def load_optimizer_state(optimizer, path):
+    """Inverse of save_optimizer_state. Loads
+    ``<path>/optimizer_state.safetensors`` and replaces ``optimizer.state``
+    with the unflattened tree.
+
+    Raises FileNotFoundError if the file is missing -- a resume request with
+    no optimizer state is a hard error, not silent fall-back, because resuming
+    with a fresh optimizer would silently restart Adam's moment estimates.
+    """
+    state_path = f"{path}/optimizer_state.safetensors"
+    flat = mx.load(state_path)
+    optimizer.state = mlx.utils.tree_unflatten(list(flat.items()))
+
+
+def save_trainer_state(trainer_state, path):
+    """Save trainer scalar state to ``<path>/trainer_state.json``.
+
+    ``trainer_state`` is a plain dict (JSON-serializable). Currently:
+      - ``global_step``: int, the step the checkpoint represents
+      - ``train_loss_history``: list[float], for UI continuity
+    Kept separate from the safetensors blob because these are scalars/lists,
+    not tensors, and JSON is easier to inspect.
+    """
+    import json
+    import os
+    os.makedirs(path, exist_ok=True)
+    with open(f"{path}/trainer_state.json", "w") as f:
+        json.dump(trainer_state, f, indent=2)
+
+
+def load_trainer_state(path):
+    """Inverse of save_trainer_state. Returns the dict, or raises
+    FileNotFoundError if not present (resume requires it)."""
+    import json
+    with open(f"{path}/trainer_state.json", "r") as f:
+        return json.load(f)
+
+
 def save_lora_adapters(model, path, adapter_config=None):
     """Save LoRA adapter weights (lora_a / lora_b only) to disk.
 

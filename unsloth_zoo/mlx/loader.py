@@ -691,6 +691,22 @@ def _fix_qwen35_attention_cache(model):
     print("Unsloth: Fixed Qwen3.5 attention for training (cache=None).")
 
 
+def _disable_fused_mrope(model):
+    """Flip fused_apply off so MRoPE training uses the differentiable
+    cos/sin fallback; the fused Metal kernel has no VJP."""
+    count = 0
+    try:
+        modules = model.modules()
+    except Exception:
+        return
+    for module in modules:
+        if getattr(module, "fused_apply", False):
+            module.fused_apply = False
+            count += 1
+    if count:
+        print(f"Unsloth: Disabled fused MRoPE kernel on {count} modules for training (no VJP).")
+
+
 def _safe_getsource(obj) -> str:
     try:
         return inspect.getsource(obj)

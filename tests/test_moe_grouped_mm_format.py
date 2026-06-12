@@ -213,3 +213,23 @@ def test_lazy_path_does_not_flag_qwen_layout_named_gpt_oss():
     assert _get_moe_lora_io_dims(_Wrapper("gate_up_proj", experts)) == (16, 24)
     assert _get_moe_lora_io_dims(_Wrapper("down_proj", experts)) == (12, 16)
     assert not hasattr(experts, "_unsloth_grouped_mm_format")
+
+
+def test_name_or_path_matches_only_final_path_component():
+    from unsloth_zoo.temporary_patches.moe_utils import _is_gpt_oss_model
+
+    class _NamedConfig:
+        def __init__(self, name):
+            self.model_type = "unknown"
+            self._name_or_path = name
+
+    class _NamedModel(nn.Module):
+        def __init__(self, name):
+            super().__init__()
+            self.config = _NamedConfig(name)
+
+    assert _is_gpt_oss_model(_NamedModel("unsloth/gpt-oss-20b-BF16"))
+    assert _is_gpt_oss_model(_NamedModel("/data/models/gpt-oss-20b/"))
+    assert _is_gpt_oss_model(_NamedModel("C:\\models\\gpt-oss-20b"))
+    assert not _is_gpt_oss_model(_NamedModel("/data/gpt-oss-tests/qwen3-7b"))
+    assert not _is_gpt_oss_model(_NamedModel("/home/u/my-gpt-oss-runs/Qwen3-30B-A3B"))

@@ -562,6 +562,15 @@ def _check_audio_sampling_rate(sampling_rate, target_sampling_rate):
         )
 
 
+def _fix_audio_feature_extractor_padding_side(processor):
+    # The loader's padding_side="left" (a text setting) leaks into the audio
+    # feature extractor via from_pretrained. Frame-validity masks assume right
+    # padding; left padding desyncs Gemma 4 audio token counts (crash on tf < 5.10).
+    feature_extractor = getattr(processor, "feature_extractor", None)
+    if feature_extractor is not None and getattr(feature_extractor, "padding_side", None) == "left":
+        feature_extractor.padding_side = "right"
+
+
 def _resolve_audio_dict(audio, sampling_rate=None):
     # HuggingFace Audio feature dict -> waveform array, else a path / url string
     # (covers Audio(decode=False) payloads like {"bytes": None, "path": ...})
@@ -716,6 +725,7 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+        _fix_audio_feature_extractor_padding_side(processor)
         self.formatting_func = formatting_func
         self.completion_only_loss = completion_only_loss
         self.pad_to_multiple_of = pad_to_multiple_of
@@ -1417,12 +1427,18 @@ class UnslothVisionDataCollator:
 
         p_ids, c_ids = proc_prompts["input_ids"], proc_completions["input_ids"]
         p_m, c_m = proc_prompts["attention_mask"], proc_completions["attention_mask"]
-        p_tt, c_tt = proc_prompts.get("token_type_ids", None), proc_completions.get("token_type_ids", None)
+        # Gemma 3n emits token_type_ids, Gemma 4 mm_token_type_ids; route whichever
+        # exists, else dict(proc_prompts) keeps a stale prompt-width copy.
+        tt_key = "token_type_ids" if "token_type_ids" in proc_prompts else "mm_token_type_ids"
+        p_tt, c_tt = proc_prompts.get(tt_key, None), proc_completions.get(tt_key, None)
 
         input_ids = torch.cat((p_ids, c_ids), dim=1)
         attention_mask = torch.cat((p_m, c_m), dim=1)
         completion_mask = torch.cat((torch.zeros_like(p_m), c_m), dim=1)
-        if p_tt is not None and c_tt is not None:
+        if p_tt is not None or c_tt is not None:
+            # A side missing the key is text-only: type 0 in both vocabularies
+            if p_tt is None: p_tt = torch.zeros_like(p_ids)
+            if c_tt is None: c_tt = torch.zeros_like(c_ids)
             token_type_ids = torch.cat((p_tt, c_tt), dim=1)
         else:
             token_type_ids = None
@@ -1476,7 +1492,7 @@ class UnslothVisionDataCollator:
         out["attention_mask"] = attention_mask
         out["labels"] = labels
         if token_type_ids is not None:
-            out["token_type_ids"] = token_type_ids
+            out[tt_key] = token_type_ids
         if 'pixel_values' in out:
             out = self._cast_pixel_values_dtype_inplace(out)
         if 'pixel_values_videos' in out:

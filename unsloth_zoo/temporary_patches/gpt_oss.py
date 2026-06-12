@@ -1105,9 +1105,11 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
 # Combo kernels uses too much VRAM for low memory GPUs
 from ..device_type import DEVICE_TYPE
 
-if DEVICE_TYPE == "xpu":
+# UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE="cuda" on GPU-less hosts, so guard
+# with is_available() like device_synchronize() does.
+if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
     device_memory = torch.xpu.memory.mem_get_info(0)[-1]
-elif DEVICE_TYPE in ("cuda", "hip"):
+elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
     device_memory = torch.cuda.memory.mem_get_info(0)[-1]
 else:
     device_memory = 0

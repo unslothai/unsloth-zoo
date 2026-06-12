@@ -205,7 +205,11 @@ def patch_qwen3_moe():
     # Transformers >= 5       uses self.gate_up_proj = nn.Parameter(...)
     # whilst old transformers uses self.experts = nn.ModuleList(...)
 
-    # Patch ParamWrapper.forward for MoE separated LoRA
+    # Patch ParamWrapper.forward for MoE separated LoRA.
+    # Ordering is load-bearing: this unconditional call installs the
+    # peft.get_peft_model wrapper during the import-time patch pass, before
+    # unsloth.models.llama/vision capture their get_peft_model alias. Do not
+    # gate it by model name or move it below the qwen3 import check.
     patch_param_wrapper_for_moe()
 
     try:
