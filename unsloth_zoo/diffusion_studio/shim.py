@@ -89,8 +89,9 @@ def _timings_from_stats(stats):
         return (n / ms * 1000.0) if ms > 0 else 0.0
     P = int(stats.get("prompt_n", 0))
     G = int(stats.get("predicted_n", 0))
-    prep_ms   = float(stats.get("prompt_prepare_ms", 0.0))
-    wall_ms   = float(stats.get("wall_ms", 0.0))
+    # Fall back to the older STATS names so an older visual server still reports non-zero timings.
+    prep_ms   = float(stats.get("prompt_prepare_ms", stats.get("prompt_ms", 0.0)))
+    wall_ms   = float(stats.get("wall_ms", stats.get("predicted_ms", 0.0)))
     decode_ms = float(stats.get("decode_ms", 0.0))
     steps     = int(stats.get("steps", 0))
     blocks    = int(stats.get("blocks", 0))
@@ -228,11 +229,11 @@ async def chat(req: Request):
         while True:
             kind, payload = await q.get()
             if kind == "frame":
-                # type-tagged event on the tool_status channel; no assistant content, so plain
-                # OpenAI clients ignore it and still get the committed text.
+                # A valid (empty-delta) chunk plus a type tag: Studio routes on the tag, while a
+                # strict OpenAI client parses it as a no-op chunk and ignores the extra fields.
                 block, step, total, text = payload
-                yield _sse({"type": "diffusion_frame", "block": block, "step": step,
-                            "total": total, "text": text})
+                yield _sse({**_chunk(cid, created, {}), "type": "diffusion_frame",
+                            "block": block, "step": step, "total": total, "text": text})
                 continue
             if kind in ("delta", "done"):
                 new = payload[len(sent):]

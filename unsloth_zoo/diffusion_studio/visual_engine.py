@@ -169,8 +169,8 @@ def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on
 
     on_frame(block, step, total, text): a denoising frame (the current argmax canvas, already decoded).
     on_commit(cumulative_text): cumulative committed answer text after each block (for live OpenAI deltas).
-    on_stats(stats_dict): the server's end-of-request summary (prompt_n, predicted_n, prompt_ms,
-        predicted_ms, blocks, steps, canvas, n_ctx) for surfacing generation statistics.
+    on_stats(stats_dict): the server's end-of-request summary (prompt_n, predicted_n,
+        prompt_prepare_ms, wall_ms, decode_ms, blocks, steps, canvas, n_ctx) for generation stats.
     Returns the full committed reply text. Raises ContextOverflow if the request exceeds the context budget.
 
     Self-heals a crash: if the server dies mid-turn and nothing was streamed yet (the usual case, since
