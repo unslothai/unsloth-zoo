@@ -34,15 +34,12 @@ RL_REPLACEMENTS = dict()
 def selective_log_softmax(logits, index):
     logits = logits.to(torch.float32)
     selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
-    # loop to reduce peak mem consumption
-    # logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
     logsumexp_values = torch.logsumexp(logits, dim = -1)
     per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
     return per_token_logps
 pass
 
-# More memory efficient by chunking on (bsz+qlen) dimension
-# Exactly equivalent to the above
+# Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_selective_log_softmax(
     logits,
@@ -53,7 +50,7 @@ def chunked_selective_log_softmax(
     chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = chunks, dim = 0)
     chunked_index  = torch.chunk(index.reshape(-1), chunks = chunks, dim = 0)
     all_per_token_logps = []
-    # Below loop does the same as selective_log_softmax(chunk_logits, chunk_index)
+    # Per-chunk selective_log_softmax.
     for chunk_logits, chunk_index in zip(chunked_logits, chunked_index):
         chunk_logits = chunk_logits.to(torch.float32)
         if temperature != 1.0:
@@ -122,9 +119,7 @@ def calculate_pad_tokens_in_prompt(
     logits_to_keep: int,
     pad_token_id: int
 ) -> torch.Tensor:
-    """
-    Given prompt tensor, it returns all the left padded tokens in that sequence. so [pad, pad, pad, cat] = 3 tokens
-    """
+    """Count left-padded tokens per sequence, e.g. [pad, pad, pad, cat] -> 3."""
     if logits_to_keep >= input_ids.shape[1]:
         raise ValueError("logits_to_keep must be smaller than the sequence length.")
 
@@ -145,12 +140,10 @@ def create_completion_attention_mask(
     max_left_pad: int,
     pad_token_id: int
 ) -> torch.Tensor:
-    """
-    Given that we have a sequence, [p,p,p,c,c,c,pad,pad,pad]
+    """Build a completion mask that zeros leading prompt and trailing pad tokens.
 
-    Where p are extra prompt tokens we got from slicing the torch tensor, c is completion tokens
-    and pad are pad tokens, this function would make a completion mask that would 0 out the pad
-    and p tokens. so in this example [0,0,0,1,1,1,0,0,0]
+    For [p,p,p,c,c,c,pad,pad,pad] (p=sliced prompt, c=completion, pad=padding)
+    this returns [0,0,0,1,1,1,0,0,0].
     """
     batch_size, completion_len = completion_input_ids.shape
     device = completion_input_ids.device
@@ -220,11 +213,9 @@ def _unsloth_fix_mm_token_type_ids(
 pass
 
 def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
-    """
-    Moves all padding tokens in each sequence of a batch to the right.
-    """
+    """Move all padding tokens in each sequence to the right."""
     mask = (tensor != pad_id)
-    # Must do stable=True since binary mark is unordered
+    # stable=True since the binary mask is unordered.
     sorted_indices = torch.argsort(mask, dim=1, descending=True, stable=True)
     packed_tensor = torch.gather(tensor, 1, sorted_indices)
     return packed_tensor
@@ -236,9 +227,7 @@ def align_logprobs_with_mask(
     attention_mask: torch.Tensor,
     pad_value: float = 0.0
 ) -> torch.Tensor:
-    """
-    Aligns a log probability tensor with a given attention mask.
-    """
+    """Align a log probability tensor with a given attention mask."""
 
     device = logprob_tensor.device
     batch_size, logprob_seq_len = logprob_tensor.shape
@@ -258,29 +247,42 @@ def align_logprobs_with_mask(
 
     dest_indices = left_pad_counts.unsqueeze(1) + cols
 
-    # Create destination row indices
-    # Shape: [batch_size, logprob_seq_len]
+    # Destination row indices, shape [batch_size, logprob_seq_len].
     row_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(dest_indices)
 
-    # --- 4. Filter out-of-bounds indices and perform assignment ---
-    # Create a mask to identify only the indices that are within the bounds
-    # of the target tensor's sequence length.
+    # Keep only in-bounds destinations, then scatter via advanced indexing.
     valid_mask = dest_indices < mask_seq_len
-
-    # Use this mask to select only the valid row indices, column indices,
-    # and the corresponding values from the logprob tensor.
-    # This flattens the selected elements into 1D tensors.
     valid_rows = row_indices[valid_mask]
     valid_cols = dest_indices[valid_mask]
     valid_vals = logprob_tensor[valid_mask]
-
-    # Place the valid values into their correct positions in the padded tensor
-    # using a single, efficient advanced indexing operation.
     padded_logprobs[valid_rows, valid_cols] = valid_vals
 
     return padded_logprobs
 
 RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
+
+def align_completion_tool_mask(
+    tool_mask: torch.Tensor,
+    completion_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Align a raw completion-length tool/env mask with Unsloth's repacked loss mask."""
+    if tool_mask is None:
+        return completion_mask
+    if tool_mask.shape[0] != completion_mask.shape[0]:
+        raise ValueError("tool_mask batch size must match completion_mask batch size.")
+
+    tool_mask = tool_mask.to(device=completion_mask.device)
+    if tool_mask.shape == completion_mask.shape:
+        aligned_tool_mask = tool_mask
+    else:
+        aligned_tool_mask = align_logprobs_with_mask(
+            tool_mask,
+            completion_mask,
+            pad_value=0,
+        )
+    return completion_mask * aligned_tool_mask.to(dtype=completion_mask.dtype)
+pass
+RL_REPLACEMENTS["align_completion_tool_mask"] = align_completion_tool_mask
 
 def autotune_batch_and_chunks(
     total_input_rows,
@@ -299,13 +301,13 @@ def autotune_batch_and_chunks(
         free_bytes, _ = torch.cuda.mem_get_info()
         limit_gb = (free_bytes / (1024**3))*.80
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        # For XPU: estimate free memory from total - reserved
+        # XPU: estimate free memory as total - reserved.
         total_mem = torch.xpu.get_device_properties(0).total_memory
         reserved_mem = torch.xpu.memory_reserved()
         free_bytes = total_mem - reserved_mem
         limit_gb = (free_bytes / (1024**3)) * 0.80
     else:
-        # Fallback: assume 8GB available
+        # Fallback: assume 8GB available.
         limit_gb = 8.0
 
     bytes_to_gb = 1024**3
@@ -337,7 +339,6 @@ RL_REPLACEMENTS["grpo_autotune_batch_and_chunks"] = autotune_batch_and_chunks
 def grpo_update_SamplingParams(SamplingParams, generation_kwargs, vllm_sampling_params = None):
     good_sampling_params_keys = inspect.signature(SamplingParams).parameters.keys()
 
-    # Filter generation_kwargs
     new_generation_kwargs = {}
     for key in generation_kwargs.keys():
         if key in good_sampling_params_keys:
@@ -380,7 +381,7 @@ def grpo_compute_loss(
     **kwargs
 ):
     # All Unsloth Zoo code licensed under AGPL3
-    # Set defaults for optional arguments
+    # Optional argument defaults.
     loss_type = kwargs.get("loss_type", "grpo")
     epsilon_low = kwargs.get("epsilon_low", 0.2)
     epsilon_high = kwargs.get("epsilon_high", 0.2)
@@ -418,16 +419,14 @@ def grpo_compute_loss(
 
     with torch.no_grad():
         if use_vllm and sampling_per_token_logps is not None:
-            #must filter out extra prompt tokens in begining after making input_ids left padded
+            # Filter out extra leading prompt tokens after left-padding input_ids.
             importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
             importance_sampling_ratio = torch.clamp(
                 importance_sampling_ratio, max=vllm_importance_sampling_cap
             )
     pass
 
-    # Must detach - otherwise gradients are not propagated correctly!
-    # exp(x - x) == 1
-    # loss_i = torch.exp(new - new.detach()) * advantages.unsqueeze(1)
+    # Must detach when old is None: exp(new - new.detach()) == 1 but keeps grads correct.
     if old is not None:
         log_ratio = new - old
     else:
@@ -446,26 +445,20 @@ def grpo_compute_loss(
 
     coef_1 =  torch.exp(log_importance_weights)
 
-    # Reverse KL
-    # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
+    # Reverse KL: low-variance low-bias estimator as used in the GRPO paper.
     if beta != 0.0:
         kl_i = torch.exp(ref - new) - (ref - new) - 1.0
 
     else:
-        # set kl_i to a tensor of zeros with the correct shape
+        # Zeros with the correct shape.
         if importance_sampling_level == "sequence":
             kl_i = new.new_zeros(new.size(0), 1)
         else:
             kl_i = torch.zeros_like(new)
-    # Full correct reverse KL divergence?? Missing term maybe?
-    # kl_i = torch.exp(new) * kl_i
 
-    # Below is forward KL (normal KL)
-    # kl_i = torch.exp(old) * (old - new)
     if loss_type == "cispo":
         clamped_ratios = torch.clamp(coef_1, max=epsilon_high).detach()
         loss_i = -clamped_ratios * advantages * new
-        #breakpoint()
     elif loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
         coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
 
@@ -481,7 +474,7 @@ def grpo_compute_loss(
             raise Exception(f"sapo is only available in TRL 0.26.0+")
         loss_i = torch.empty_like(coef_1)
         positive_advantages_mask = advantages.repeat([1, coef_1.shape[1]]) > 0
-        #since we have n_chunks some tensors may error if they dont have elements in them
+        # With n_chunks some tensors may be empty; guard the indexing.
         if coef_1[positive_advantages_mask].numel() != 0:
             loss_i[positive_advantages_mask] = get_sapo_token_loss(
                 coef_1[positive_advantages_mask], sapo_temperature_pos
@@ -513,7 +506,7 @@ def grpo_compute_loss(
 
     if use_vllm and sampling_per_token_logps is not None:
         loss_i = loss_i * importance_sampling_ratio
-        #delta for metric
+        # delta for the metric.
         with torch.no_grad():
             delta = torch.abs(old - sampling_per_token_logps)
             delta = delta * mask
@@ -543,9 +536,7 @@ def grpo_compute_loss(
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
-    # loss = (loss_i * mask).sum() / mask.sum()
-
-    # Get metrics as well which are folded
+    # Folded metrics.
     def masked_batch_mean(x):
         with torch.inference_mode():
             completion_length = n_mask_per_reward.mean()
@@ -588,9 +579,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 **extra_kwargs,
             )
 
-            # Scale loss if needed for mixed precision training
+            # Scale for mixed precision; return loss.detach() or autograd uses 2x VRAM.
             scaled_loss = loss * scaling
-            # Must add .loss.detach otherwise autograd uses 2x VRAM
             return scaled_loss, (loss.detach(), completion_length, mean_kl, delta, flat_is_ratio, coef_1)
         pass
 
@@ -654,11 +644,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         mask               = torch.chunk(_mask,              chunks = n_chunks, dim = 0)
         advantages         = torch.chunk(_advantages,        chunks = n_chunks, dim = 0)
 
-        # Get mixed precision scaling if seen
+        # Mixed precision scaling if present.
         scaling = scaler.get_scale() if scaler is not None else 1.0
-
-        # Force torch.compile to use dynamic shapes for seqlen dim
-        # mark_dynamic = lambda x: torch._dynamo.mark_dynamic(x, 1)
 
         for (grad_inputs_j, new_logps_j, old_logps_j, ref_logps_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, ) in \
             zip(grad_inputs_chunks, new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages):
@@ -726,6 +713,7 @@ def grpo_accumulated_loss(
     old_logps,
     ref_logps,
     n_chunks = -1,
+    tool_mask = None,
     **kwargs,
 ):
     # All Unsloth Zoo code licensed under AGPL3
@@ -748,9 +736,9 @@ def grpo_accumulated_loss(
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
     logit_softcapping    = kwargs.get("logit_softcapping", 0.0)
-    prev_max_left_pad    = kwargs.get("max_left_pad", 0) #Always get max_left_pad for when training LLMs, enabled by deafult.
+    prev_max_left_pad    = kwargs.get("max_left_pad", 0) # max_left_pad for LLM training, enabled by default.
 
-    #Delete this from kwargs so less issues
+    # Pop from kwargs to avoid downstream issues.
     _ = kwargs.pop("sampling_per_token_logps", None)
     kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap if sampling_per_token_logps is not None else None
     kwargs["get_sapo_token_loss"] = trainer.get_sapo_token_loss if hasattr(trainer, "get_sapo_token_loss") else None
@@ -764,7 +752,7 @@ def grpo_accumulated_loss(
     kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
     kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
     kwargs["use_vllm"] = trainer.use_vllm
-    # Find closest multiple
+    # Snap n_chunks to the closest divisor of bsz.
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
     n_chunks = factors[min(np.searchsorted(factors, n_chunks), len(factors)-1)]
@@ -827,17 +815,18 @@ def grpo_accumulated_loss(
         input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
 
         completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
-
         completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
 
         if trainer.use_vllm and sampling_per_token_logps is not None and getattr(trainer, "vllm_importance_sampling_correction", False):
             sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
         else:
             sampling_per_token_logps = None
+        completion_mask = align_completion_tool_mask(tool_mask, completion_mask)
         attention_mask =  input_ids != trainer.processing_class.pad_token_id
         attention_mask = attention_mask.to(attention_mask.dtype)
     else:
         completion_input_ids = input_ids[:, -logits_to_keep:]
+        completion_mask = align_completion_tool_mask(tool_mask, completion_mask)
 
     unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
 
@@ -949,14 +938,12 @@ def grpo_accumulated_loss(
         return tensor.to(device, non_blocking=non_blocking)
 
     class Unsloth_Offloaded_Log_Softmax(torch.autograd.Function):
-        """
-        Manual Gradient Checkpointing/CPU Offloading for Log Softmax.
-        """
+        """Manual gradient checkpointing / CPU offloading for log softmax."""
         @staticmethod
         def forward(ctx, hidden_states, lm_head, index, chunks,
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature):
-            #Only the activations are needed so if we keep entire computational graph, keeps unnecessary memory on CPU so we detach it
+            # Detach so we don't keep the graph (and extra memory) on CPU.
             ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True)
             ctx.device = hidden_states.device
             ctx.dtype = hidden_states.dtype
@@ -1010,7 +997,7 @@ def grpo_accumulated_loss(
                             logit_scale_multiply=0.0, logit_scale_divide=0.0,
                             logit_softcapping=0.0, temperature=1, batch_size=8):
         if (index.shape[1] <= 1024 and batch_size <= 8) or batch_size==1:
-            #We save a gigabyte or speed with the normal path under these specific conditions
+            # Normal path is faster / saves a GB under these conditions.
             return chunked_hidden_states_selective_log_softmax(
                 hidden_states,
                 lm_head,
@@ -1097,8 +1084,7 @@ def grpo_accumulated_loss(
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
                     logprobs_chunk = compute_logprobs_chunk(new_hidden_states_chunk, completion_ids, input_ids_chunk)
-                #This is needed to avoid race conditions with GPT OSS offload_embbed=True
-                #However, it seems that this line does not slow down or disrupt models.
+                # Avoids race conditions with GPT OSS offload_embbed=True; no measurable slowdown.
                 device_synchronize()
             all_logprobs_list.append(logprobs_chunk)
 
@@ -1120,11 +1106,11 @@ def grpo_accumulated_loss(
             kwargs
         )
 
-    # Must force not returning hidden states but logits otherwise gibberish
+    # Force logits (not hidden states) again or output is gibberish.
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, completion_mask
-    # Old non efficient code path
+    # Old non-efficient code path (dead).
     new_logits = torch.matmul(new_hidden_states, lm_head.t())
     new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
     old_logits = torch.matmul(old_hidden_states, lm_head.t())

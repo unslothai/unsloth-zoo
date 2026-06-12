@@ -71,7 +71,7 @@ def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states
 
 
 def _make_gemma3_attn_forwards(forward_function, has_cache_position):
-    """Build past_key_value / past_key_values forward variants for Gemma3Attention."""
+    """Build the past_key_value / past_key_values forward variants."""
     functions = []
     if has_cache_position:
         def forward_past_key_value(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_value=None, cache_position=None, **kwargs):
@@ -288,9 +288,8 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
         if using_static_cache:
             target_length = past_key_values.get_max_cache_shape()
         elif HAS_HYBRID_CACHE and isinstance(past_key_values, HybridCache):
-            # HAS_HYBRID_CACHE gates the isinstance because transformers 5.x
-            # removed HybridCache; the fallback typing.Any from utils.py
-            # would otherwise raise TypeError here.
+            # Gated on HAS_HYBRID_CACHE: transformers 5.x removed HybridCache,
+            # and the typing.Any fallback from utils.py would raise here.
             target_length = past_key_values.get_max_cache_shape()
         else:
             target_length = (
@@ -375,13 +374,11 @@ def patch_Gemma3RMSNorm():
         return raise_error("Gemma3RMSNorm.forward", e)
 
     def forward(self, x): # x can be fp32 (from embeddings) or fp16 (from MLP/Attn)
-        # Internals in fp32
         x_fp32 = x.to(torch.float32)
         variance = x_fp32.pow(2).mean(-1, keepdim=True)
         hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + self.eps)
 
-        # self.weight is bf16 (from vision.py loading if UNSLOTH_FORCE_FLOAT32="1")
-        # So, cast self.weight to fp32 for the (1.0 + weight) operation
+        # self.weight may be bf16; cast to fp32 for the (1.0 + weight) op.
         output_fp32 = hidden_states_fp32 * (1.0 + self.weight.to(torch.float32))
 
         # Clamp to fp16 range before casting back to fp16
@@ -495,21 +492,18 @@ def patch_Gemma3Attention():
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.shape
-        input_shape = hidden_states.shape[:-1] # For reshaping o_proj output later
+        input_shape = hidden_states.shape[:-1]
 
-        # Determine head shapes
-        # Assuming these attributes are standard for Gemma3Attention
-        # If not, they might come from self.config
+        # Head shapes (fall back to config if attrs are absent)
         num_heads = getattr(self, "num_heads", self.config.num_attention_heads)
         num_key_value_heads = getattr(self, "num_key_value_heads", self.config.num_key_value_heads)
         head_dim = self.head_dim
 
-        # For projections view: (bsz, q_len, num_specific_heads, head_dim)
+        # Projection view shape: (bsz, q_len, num_specific_heads, head_dim)
         query_hidden_shape = (bsz, q_len, num_heads, head_dim)
         kv_hidden_shape    = (bsz, q_len, num_key_value_heads, head_dim)
 
         # 1. Projections (q, k, v) in fp16
-        # hidden_states is already fp16. Weights of q_proj, k_proj, v_proj are fp16.
         query_states_fp16 = self.q_proj(hidden_states) # output fp16
         key_states_fp16   = self.k_proj(hidden_states) # output fp16
         value_states_fp16 = self.v_proj(hidden_states) # output fp16
@@ -600,8 +594,7 @@ def patch_Gemma3Attention():
                 getattr(self, "sliding_window", None),
             )
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
-            # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
-            # We convert it to a bool for the SDPA kernel that only accepts bools.
+            # During jit tracing shapes are tensors, so is_causal may be a tensor; SDPA needs a bool.
             if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
             attn_output_fp32 = scaled_dot_product_attention(
                 query_states_fp32.contiguous(),
@@ -615,15 +608,13 @@ def patch_Gemma3Attention():
             )
             attn_weights = None # Defaulting to None
 
-        # 7. Reshape and Downcast for Output Projection
-        # SDPA returns (bsz, num_heads, q_len, head_dim) and needs transposing
-        # flex_attention returns (bsz, q_len, num_heads, head_dim) already transposed
+        # 7. Reshape and downcast for output projection.
+        # SDPA returns (bsz, heads, q_len, head_dim) needing transpose;
+        # flex_attention returns (bsz, q_len, heads, head_dim) already transposed.
         if attn_impl != "flex_attention":
             attn_output_fp32 = attn_output_fp32.transpose(1, 2).contiguous()
 
-        # Reshape to (bsz, q_len, num_query_heads * head_dim) which is (bsz, q_len, model_hidden_size)
-        # Using -1 for the last dimension is robust and aligns with your original example.
-        attn_output_fp32 = attn_output_fp32.reshape(bsz, q_len, -1) # REVISED FIX
+        attn_output_fp32 = attn_output_fp32.reshape(bsz, q_len, -1)
 
         attn_output_fp16 = attn_output_fp32.to(torch.float16)
 
@@ -737,21 +728,18 @@ def patch_Gemma3Attention_generic():
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.shape
-        input_shape = hidden_states.shape[:-1] # For reshaping o_proj output later
+        input_shape = hidden_states.shape[:-1]
 
-        # Determine head shapes
-        # Assuming these attributes are standard for Gemma3Attention
-        # If not, they might come from self.config
+        # Head shapes (fall back to config if attrs are absent)
         num_heads = getattr(self, "num_heads", self.config.num_attention_heads)
         num_key_value_heads = getattr(self, "num_key_value_heads", self.config.num_key_value_heads)
         head_dim = self.head_dim
 
-        # For projections view: (bsz, q_len, num_specific_heads, head_dim)
+        # Projection view shape: (bsz, q_len, num_specific_heads, head_dim)
         query_hidden_shape = (bsz, q_len, num_heads, head_dim)
         kv_hidden_shape    = (bsz, q_len, num_key_value_heads, head_dim)
 
         # 1. Projections (q, k, v) in fp16
-        # hidden_states is already fp16. Weights of q_proj, k_proj, v_proj are fp16.
         query_states_fp16 = self.q_proj(hidden_states) # output fp16
         key_states_fp16   = self.k_proj(hidden_states) # output fp16
         value_states_fp16 = self.v_proj(hidden_states) # output fp16
@@ -842,8 +830,7 @@ def patch_Gemma3Attention_generic():
                 getattr(self, "sliding_window", None),
             )
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
-            # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
-            # We convert it to a bool for the SDPA kernel that only accepts bools.
+            # During jit tracing shapes are tensors, so is_causal may be a tensor; SDPA needs a bool.
             if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
             attn_output_fp32 = scaled_dot_product_attention(
                 query_states_fp32.contiguous(),
@@ -857,15 +844,13 @@ def patch_Gemma3Attention_generic():
             )
             attn_weights = None # Defaulting to None
 
-        # 7. Reshape and Downcast for Output Projection
-        # SDPA returns (bsz, num_heads, q_len, head_dim) and needs transposing
-        # flex_attention returns (bsz, q_len, num_heads, head_dim) already transposed
+        # 7. Reshape and downcast for output projection.
+        # SDPA returns (bsz, heads, q_len, head_dim) needing transpose;
+        # flex_attention returns (bsz, q_len, heads, head_dim) already transposed.
         if attn_impl != "flex_attention":
             attn_output_fp32 = attn_output_fp32.transpose(1, 2).contiguous()
 
-        # Reshape to (bsz, q_len, num_query_heads * head_dim) which is (bsz, q_len, model_hidden_size)
-        # Using -1 for the last dimension is robust and aligns with your original example.
-        attn_output_fp32 = attn_output_fp32.reshape(bsz, q_len, -1) # REVISED FIX
+        attn_output_fp32 = attn_output_fp32.reshape(bsz, q_len, -1)
 
         attn_output_fp16 = attn_output_fp32#.to(torch.float16)
 

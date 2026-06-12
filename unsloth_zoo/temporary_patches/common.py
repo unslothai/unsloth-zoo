@@ -20,6 +20,7 @@ __all__ = [
     "UNSLOTH_ENABLE_LOGGING",
     "UNSLOTH_COMPILE_DISABLE",
     "get_torch_compile_options",
+    "is_transformers_v5_moe_quantization_available",
     "logger",
     "torch_compile",
     "_torch_compile",
@@ -47,6 +48,27 @@ def determine_compile_threads():
     return min(32, max(4, cpu_count))
 pass
 
+@functools.lru_cache(1)
+def is_transformers_v5_moe_quantization_available():
+    """True when Transformers exposes the v5 MoE weight-loading/dispatcher APIs
+    that PR #659 patches (v4 doesn't use bare nn.Parameter MoE experts here)."""
+    try:
+        from transformers.core_model_loading import WeightConverter
+        from transformers.integrations import moe as transformers_moe
+        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
+    except (ImportError, AttributeError):
+        return False
+
+    return (
+        WeightConverter is not None
+        and getattr(Bnb4BitHfQuantizer, "param_needs_quantization", None) is not None
+        and getattr(transformers_moe, "ALL_EXPERTS_FUNCTIONS", None) is not None
+        and (
+            getattr(transformers_moe, "grouped_mm_experts_forward", None) is not None
+            or getattr(transformers_moe, "batched_mm_experts_forward", None) is not None
+        )
+    )
+
 def get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False,
@@ -70,7 +92,7 @@ def get_torch_compile_options(
     # Needs integer
     multi_kernel = 1 if multi_kernel else 0
 
-    # Instead of Inductor Compilation:
+    # Relabel Inductor's compile progress bar
     try:
         import torch._inductor.async_compile
         from torch.hub import tqdm
@@ -137,22 +159,12 @@ torch_compile_options = get_torch_compile_options(
 from typing import Any, Callable, TypeVar
 F = TypeVar("F", bound=Callable[..., Any])
 def noop(*args: Any, **kwargs: Any):
-    """
-    A do-nothing decorator/adapter.
-
-    Works as:
-      - @noop
-      - @noop(...)
-      - noop(func, ...)
-    
-    Returns the original function unchanged in every case.
-    """
-    # If used like noop(func, **kwargs) or as @noop on a function,
-    # the first positional arg will be the function. Return it directly.
+    """No-op decorator/adapter usable as @noop, @noop(...), or noop(func, ...)."""
+    # @noop / noop(func, ...): first positional arg is the function.
     if args and callable(args[0]):
         return torch.compiler.disable(args[0]) # type: ignore[return-value]
 
-    # Otherwise, used as @noop(...): return a decorator that returns the function unchanged.
+    # @noop(...): return a decorator.
     def _decorator(func: F) -> F:
         return torch.compiler.disable(func)
     return _decorator

@@ -17,13 +17,10 @@
 """
 PR-A integration: exercise unsloth_zoo.mlx.loader._dequantize_selected_mlx_modules.
 
-Builds a synthetic MLX-style model with one QuantizedLinear submodule,
-runs PR-A's dequantize-and-replace helper, verifies the result is
-a numerically correct nn.Linear with the dequantized weight.
-
-This is the canonical PR-A code path: load_in_4bit=False (or
-selective requantize) walks named_modules, finds QuantizedLinear,
-calls mx.dequantize with mode='affine', and swaps in nn.Linear.
+Builds a synthetic model with one QuantizedLinear, runs the
+dequantize-and-replace helper, and verifies the result is a numerically
+correct nn.Linear. This is the canonical PR-A path: walk named_modules, find
+QuantizedLinear, mx.dequantize with mode='affine', swap in nn.Linear.
 """
 
 from __future__ import annotations

@@ -1,20 +1,13 @@
 # Unsloth Zoo - Utilities for Unsloth
-# Pin MLXTrainer's batch padding to match mlx-lm's iterate_batches
-# semantics: pad to `1 + _PAD_MULTIPLE * ceil(L / _PAD_MULTIPLE)`.
+# Pin MLXTrainer's batch padding to match mlx-lm's iterate_batches:
+# `1 + _PAD_MULTIPLE * ceil(L / _PAD_MULTIPLE)`.
 #
-# Why this matters:
-# mlx-lm's tuner trainer (`mlx_lm/tuner/trainer.py:158`) pads each
-# batch to `1 + 32 * ceil(max_len / 32)`. The default loss then
-# slices `inputs = batch[:, :-1]` / `targets = batch[:, 1:]`, so the
-# effective per-position-attention length is `32 * ceil(max_len/32)`.
-# unsloth_zoo's `create_text_batches` previously rounded WITHOUT the
-# `+1` (just `32 * ceil(max_len/32)`), which dropped one token of
-# input length after the autoregressive shift, putting the trainer
-# one token shy of mlx-lm. On a single-row LoRA memorization fixture
-# against gemma-3-270m-it, the one-token gap moved the run into a
-# different convergence basin (probe 31 manual loop = 10/15 = 67%
-# vs probe 33-37 MLXTrainer = 6-8/15 = 40-53% on paired seeds, see
-# danielhanchen/unsloth-staging-2).
+# mlx-lm (mlx_lm/tuner/trainer.py:158) pads to `1 + 32*ceil(max_len/32)`;
+# default_loss then slices [:, :-1] / [:, 1:]. unsloth_zoo's
+# create_text_batches previously dropped the `+1`, leaving the input one
+# token short after the autoregressive shift, which shifted small fixtures
+# into a different convergence basin (probe 31 = 67% vs probe 33-37 = 40-53%,
+# see danielhanchen/unsloth-staging-2).
 
 from __future__ import annotations
 

@@ -16,24 +16,12 @@
 
 """Compile qualification, policy resolution, and runtime monkey patches for MLX.
 
-This module is the canonical compile entrypoint for Unsloth's MLX training
-stack. The file is large because it owns three different layers of behavior:
-
-1. Qualification:
-   Discover installed `mlx_vlm` architectures, scan them for known compile
-   blocker patterns, and report whether each architecture has been verified.
-2. Policy:
-   Decide whether a particular training run should use `mx.compile`, fall back
-   to eager mode, or raise when strict compile is requested.
-3. Runtime patching:
-   Install monkey patches for repeated blocker patterns so verified
-   architectures can run compiled training without carrying architecture-local
-   one-off shims throughout the trainer.
-
-The qualification matrix is intentionally conservative. Architectures are only
-marked compile-ready once explicitly verified. Everything else either runs eager
-or stays in "pattern candidate" state until a verifier or real training sweep
-confirms the patch set is functionally correct.
+Canonical compile entrypoint for Unsloth's MLX training stack. Owns three
+layers: qualification (scan installed `mlx_vlm` architectures for compile
+blockers), policy (decide compile / eager / raise per run), and runtime
+patching (install monkey patches so verified architectures compile without
+per-architecture shims). Qualification is conservative: architectures are
+compile-ready only once explicitly verified.
 """
 
 from __future__ import annotations
@@ -56,14 +44,10 @@ _PATCHED_ARCHES: set[str] = set()
 _PATCHED_PATTERN_BUNDLES: set[str] = set()
 _PATCH_BINDINGS: set[tuple[str, str, str, str]] = set()
 
-# Architectures explicitly verified for mlx compile support.
-# Training verification currently covers:
-# - qwen2_5_vl: real end-to-end compiled training via train.py
-# - qwen3_vl / qwen3_5 / qwen3_5_moe / gemma4 / paligemma / moondream3:
-#   compiled synthetic forward+backward
-# SmolVLM has processor/template support, but real mlx-vlm training still hits
-# MLX primitive-less-array failures after a compiled call. Keep it patched but
-# unqualified until a real dataset compile run passes.
+# Architectures explicitly verified for mlx compile support. qwen2_5_vl is
+# real end-to-end; others are compiled synthetic forward+backward. SmolVLM is
+# kept patched but unqualified: real mlx-vlm training still hits MLX
+# primitive-less-array failures after a compiled call.
 _VERIFIED_TRAINING_ARCHES: set[str] = {
     "aya_vision",
     "deepseekocr",
@@ -238,10 +222,8 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
 class MLXVLMTraitReport:
     """Static scan result for one installed `mlx_vlm` architecture.
 
-    Trait reports are architecture-level hints only. They are used to:
-    - surface likely compile blocker categories for maintainers
-    - identify shared patch bundles that can be applied generically
-    - explain why an architecture is qualified, unqualified, or a candidate
+    Architecture-level hints only: surface likely blocker categories, identify
+    shared patch bundles, and explain qualification state.
     """
 
     arch: str
@@ -256,16 +238,9 @@ class MLXVLMTraitReport:
 class CompilePatternBundle:
     """A reusable compile patch bundle keyed by architecture traits.
 
-    The bundle registry is intentionally declarative. A bundle describes:
-    - how to recognize a family via `matcher`
-    - which semantic patch primitives it needs
-    - which thin family adapter explains method/contract differences
-    - which runtime patch primitives implement the monkey patches
-
-    Installation happens through a generic patch-plan executor rather than
-    through per-architecture installer dispatch. That keeps the public surface
-    easy to trace even when a runtime primitive still needs specialized code
-    under the hood.
+    Declarative: a bundle names its `matcher`, semantic primitives, family
+    adapter, and runtime primitives. Installation runs through a generic
+    patch-plan executor rather than per-architecture installer dispatch.
     """
 
     name: str
@@ -333,10 +308,8 @@ class CompilePatchPrimitive:
 class CompilePatchAdapter:
     """Thin family-level contract description for shared patch primitives.
 
-    Adapters should prefer semantic matching over explicit architecture lists.
-    A future family should ideally pick up an existing adapter because it
-    exposes the same source traits or naming convention, not because we added
-    one more architecture string by hand.
+    Prefer semantic matching (source traits / naming) over explicit
+    architecture lists so future families pick up existing adapters.
     """
 
     name: str
@@ -348,11 +321,8 @@ class CompilePatchAdapter:
 
 @dataclass(frozen=True)
 class CompilePatchPlan:
-    """Resolved patch plan for one matched compile bundle.
-
-    Patch plans are the maintainer-facing bridge between the declarative bundle
-    registry and the actual monkey patches that get applied at runtime.
-    """
+    """Resolved patch plan: bridges the declarative bundle registry and the
+    monkey patches applied at runtime."""
 
     bundle_name: str
     adapter_name: str | None
@@ -447,8 +417,8 @@ class CompilePatchabilityReport:
 def _iter_arch_modules() -> Iterable[tuple[str, Path]]:
     """Yield installed `mlx_vlm.models.<arch>` package roots.
 
-    We inspect the installed package instead of maintaining a static registry so
-    the qualification layer reflects the actual venv contents.
+    Inspects the installed package (not a static registry) so qualification
+    reflects actual venv contents.
     """
 
     try:
@@ -554,10 +524,9 @@ def _support_state(
 ) -> str:
     """Return the user-facing support state for one architecture.
 
-    `supported_inferred` is reserved for architectures where the shared patch
-    system confidently matched reusable patterns, but the family has not yet
-    been promoted to explicitly verified. We still keep runtime compile policy
-    conservative unless verification exists.
+    `supported_inferred` means the shared patch system matched reusable
+    patterns but the family is not yet explicitly verified; runtime policy
+    stays conservative without verification.
     """
 
     if training_ok or generation_ok:
@@ -621,9 +590,8 @@ def list_protocol_requirements(
 ) -> tuple[CompileProtocolRequirement, ...]:
     """Return the protocol registry used for generic compile target discovery.
 
-    These protocols are intentionally broader than architecture names. They
-    describe the stable runtime contracts we look for when deciding whether an
-    existing patch primitive can be reused by a new family.
+    Protocols are broader than architecture names: they describe the stable
+    runtime contracts checked when reusing a patch primitive for a new family.
     """
 
     protocols = (
@@ -819,10 +787,9 @@ def _config_get(config, key, default=None):
 def _iter_backend_subconfigs(config) -> Iterable[tuple[str, object]]:
     """Yield likely nested backend configs from an MLX config object.
 
-    The explicit key allowlist keeps the common paths readable and stable, but
-    newer mlx-vlm families may introduce additional `*_config` children. We
-    therefore also scan the config object's visible attributes / mapping keys
-    for nested config-shaped values that advertise a `model_type`.
+    Checks the explicit `*_config` allowlist, then also scans visible
+    attributes / mapping keys for nested config-shaped values with a
+    `model_type` (to catch newer mlx-vlm families).
     """
 
     if config is None:
@@ -1100,10 +1067,9 @@ def discover_compile_protocol_targets(
 ) -> tuple[CompileProtocolTarget, ...]:
     """Discover patchable protocol targets for an architecture or loaded model.
 
-    This is the main maintainer helper for new-family triage. It inspects the
-    installed `mlx_vlm` modules for a family and reports which generic compile
-    protocols match actual classes/methods, plus any missing source tokens that
-    prevented a clean protocol match.
+    Main new-family triage helper: inspects installed `mlx_vlm` modules and
+    reports which generic compile protocols match classes/methods, plus any
+    missing source tokens that prevented a clean match.
     """
 
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
@@ -1255,10 +1221,8 @@ def find_similar_compile_families(
 ) -> tuple[tuple[str, float, tuple[str, ...]], ...]:
     """Return nearby families based on shared traits, bundles, and protocols.
 
-    This helper is aimed at maintainers adding support for a new family. It
-    answers "what existing architecture looks most like this one?" so the next
-    step is usually to compare patchability and trace output against a known
-    neighbor rather than reading every patch body from scratch.
+    Answers "what existing architecture looks most like this one?" when adding
+    a new family, so patchability/trace can be compared against a neighbor.
     """
 
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
@@ -1414,9 +1378,8 @@ def get_backend_compile_qualifications(model_or_arch) -> tuple[MLXVLMCompileQual
 def _model_repo_training_compile_block_reason(model_or_arch) -> str | None:
     """Return a repo-specific compile block reason when policy should stay eager.
 
-    This is intentionally separate from architecture qualification. Sometimes an
-    architecture is broadly patchable, but a known repo family still fails real
-    training due to an unresolved runtime issue.
+    Separate from architecture qualification: an arch can be patchable while a
+    known repo family still fails real training on an unresolved runtime issue.
     """
 
     if isinstance(model_or_arch, str):
@@ -1538,10 +1501,8 @@ def _adapter_matches(
 ) -> bool:
     """Return whether a declarative adapter applies to one architecture.
 
-    Adapters intentionally match on multiple signals:
-    - exact architecture names for true exceptions
-    - architecture prefixes for stable family naming
-    - required traits for semantic reuse across future variants
+    Matches on exact names (exceptions), prefixes (family naming), and
+    required traits (semantic reuse).
     """
 
     if arch in adapter.arch_names:
@@ -1576,8 +1537,8 @@ def _recommend_compile_settings(
 ) -> tuple[CompileSettingRecommendation, ...]:
     """Return compile-aware training setting recommendations.
 
-    Recommendations are intentionally conservative. They target settings that
-    materially affect compiled training stability or memory behavior.
+    Conservative: targets settings that materially affect compiled training
+    stability or memory behavior.
     """
 
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
@@ -1641,13 +1602,9 @@ def resolve_training_compile(
 ) -> ResolvedTrainingCompileDecision:
     """Resolve whether a training run should use `mx.compile`.
 
-    Resolution order:
-    1. Normalize the global policy and any per-arch/backend overrides.
-    2. Check for repo-specific blocklist reasons.
-    3. Require the main architecture and every backend architecture to be
-       training-qualified.
-    4. Return either an enabled compile decision or an eager fallback / raise
-       decision, depending on policy strictness.
+    Order: normalize policy + overrides; check repo blocklist; require main and
+    backend architectures training-qualified; return enabled, or eager
+    fallback / raise depending on policy strictness.
     """
 
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
@@ -1871,9 +1828,8 @@ def _patch_method(cls, name, fn):
 def _try_import_module(module_name: str):
     """Best-effort import for optional `mlx_vlm` modules.
 
-    Patch installers are intentionally permissive because the installed MLX
-    stack may not include every architecture. Silent `None` keeps the patch
-    registry idempotent across different environments.
+    Returns None silently since the installed MLX stack may not include every
+    architecture; keeps the patch registry idempotent across environments.
     """
 
     try:
@@ -1889,10 +1845,8 @@ def _iter_trait_model_modules(
 ):
     """Yield model modules for architectures that share a compile trait.
 
-    Most `mlx_vlm` architectures follow `mlx_vlm.models.<arch>.<arch>`. Using
-    trait discovery here lets a future architecture inherit a shared patch
-    automatically when it exposes the same source-level pattern and follows the
-    standard module layout.
+    Trait discovery (over the standard `mlx_vlm.models.<arch>.<arch>` layout)
+    lets future architectures inherit a shared patch automatically.
     """
 
     candidate_arches = set(include_arches)
@@ -1911,18 +1865,10 @@ def _iter_trait_model_modules(
 def _install_safe_fused_sdpa_mask_patches():
     """Work around MLX SDPA NaN gradients on fully masked query rows.
 
-    Patch `mx.fast.scaled_dot_product_attention` itself so every direct caller
-    in mlx-vlm inherits the fix, including `ensure_fused_sdpa` and models that
-    invoke the fast kernel directly.
-
-    The upstream failure mode is:
-    - additive float mask
-    - one or more query rows entirely masked (all `-inf`)
-    - finite forward output, non-finite backward gradients
-
-    Preserve the intended semantics by:
-    1. clearing fully masked rows in the additive mask before SDPA
-    2. zeroing the corresponding output rows after SDPA
+    Patches `mx.fast.scaled_dot_product_attention` itself so every direct
+    mlx-vlm caller inherits the fix. Upstream bug: an additive float mask with
+    a fully `-inf` query row gives finite forward but non-finite backward.
+    Fix: clear fully masked rows before SDPA, zero those output rows after.
     """
     fast_ns = getattr(mx, "fast", None)
     current = getattr(fast_ns, "scaled_dot_product_attention", None) if fast_ns is not None else None
@@ -1936,22 +1882,9 @@ def _install_safe_fused_sdpa_mask_patches():
     def safe_scaled_dot_product_attention(q, k, v, scale=1.0, mask=None, **kwargs):
         row_all_masked = None
         if mask is not None and hasattr(mask, "dtype") and mx.issubdtype(mask.dtype, mx.floating):
-            # MLX's fused SDPA backward is unstable when an additive float mask
-            # contains one or more query rows that are entirely masked out with
-            # negative infinity (every key position is -inf for that query
-            # row). Forward remains
-            # finite, but gradients can become NaN.
-            #
-            # Semantically those rows should contribute zero output because the
-            # query is padding / otherwise invalid. Preserve that meaning by:
-            # 1. clearing the all-masked rows before calling SDPA, avoiding the
-            #    upstream backward bug
-            # 2. explicitly zeroing those rows in the output afterward
-            #
-            # This only applies to additive float masks with true -inf rows.
-            # Large finite negative biases (for example -1e9 or -1e30) are
-            # valid finite masks with non-zero semantics and must pass through
-            # unchanged.
+            # Clear all-masked rows before SDPA (avoids the unstable backward),
+            # zero them in the output after. Only true -inf rows count: large
+            # finite negative biases (-1e9, -1e30) are valid and pass through.
             row_all_masked = mx.all(
                 mx.logical_and(mx.logical_not(mx.isfinite(mask)), mask < 0),
                 axis=-1,
@@ -1964,8 +1897,7 @@ def _install_safe_fused_sdpa_mask_patches():
 
         out = original_fast_sdpa(q, k, v, scale=scale, mask=mask, **kwargs)
         if row_all_masked is not None:
-            # Restore the intended zero-output semantics for fully masked query
-            # rows after the SDPA call.
+            # Restore zero-output for fully masked query rows.
             out = mx.where(
                 mx.expand_dims(row_all_masked, axis=-1),
                 mx.zeros_like(out),
@@ -2082,9 +2014,8 @@ def _merge_replacement_segments(inputs_embeds, replacements_by_batch):
 def _masked_scatter_no_numpy(final_embedding, image_mask_expanded, scaled_image_features):
     """Compile-safe replacement for `masked_scatter`-style multimodal merges.
 
-    Upstream `mlx_vlm` variants often flatten to NumPy or use mutation-heavy
-    scatter helpers. This version stays entirely in MLX array ops so it can run
-    under `mx.compile` and backward.
+    Stays in pure MLX array ops (no NumPy / mutation) so it runs under
+    `mx.compile` and backward.
     """
 
     import mlx.core as mx
@@ -3298,10 +3229,9 @@ def _install_paddleocr_vl_compile_patches():
 def _install_qwen_like_image_merge_patches():
     """Patch qwen-style placeholder-token image merges with a shared helper.
 
-    This covers the common pattern where a model replaces one placeholder token
-    per image feature segment. We intentionally exclude the Qwen3 family here
-    because it returns an additional broadcast mask and has its own multimodal
-    deepstack plumbing.
+    Covers the one-placeholder-token-per-image-segment pattern. Qwen3 is
+    excluded: it returns an extra broadcast mask and has its own deepstack
+    plumbing.
     """
 
     for arch, module in _iter_trait_model_modules(
@@ -3861,11 +3791,8 @@ def _install_gemma3n_compile_patches():
         return img
 
     def _safe_branch_magnitude(x):
-        # Gemma3n's AltUp branch rescaling squares hidden states to estimate an
-        # RMS magnitude. In fp16, some finite branch activations exceed the
-        # range where squaring remains finite, so `x ** 2` overflows even
-        # though `x` itself is still valid. Compute the magnitude in float32
-        # and cast back afterward to preserve the intended rescaling.
+        # AltUp RMS rescaling squares hidden states; in fp16 finite activations
+        # can overflow `x ** 2`, so compute the magnitude in float32.
         return (mx.mean(x.astype(mx.float32) ** 2, axis=-1, keepdims=True) ** 0.5)
 
     def patched_gemma3model_call(
@@ -4341,9 +4268,8 @@ def _install_masked_scatter_multimodal_patches():
 def _install_idefics_family_compile_patches():
     """Patch Idefics-family image filtering and multimodal merges for compile.
 
-    The shared issue here is Python-side filtering of padded images and image
-    placeholder merging. Architectures that expose the same source-level trait
-    and standard model module layout can inherit this patch automatically.
+    Shared issue: Python-side padded-image filtering and placeholder merging.
+    Architectures with the same trait and standard layout inherit this patch.
     """
 
     def patched_prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
@@ -4832,9 +4758,8 @@ def _install_phi4_multimodal_patches():
 def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
     """Return the shared compile patch registry.
 
-    This is the main maintainer entrypoint for adding new compile patterns.
-    Matchers should prefer source traits over hardcoded architecture lists when
-    the same fix is semantically reusable.
+    Main entrypoint for adding new compile patterns. Matchers should prefer
+    source traits over hardcoded architecture lists for reusable fixes.
     """
 
     return (
@@ -5112,10 +5037,8 @@ def _resolve_compile_patch_plan(bundle: CompilePatternBundle) -> CompilePatchPla
 def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
     """Return the runtime primitive executor registry.
 
-    These runtime primitives are intentionally small semantic units that can be
-    composed by bundle plans. Some still wrap heavier helper bodies, but the
-    installation path itself no longer dispatches directly on architecture-
-    local installer names.
+    Small semantic units composed by bundle plans; installation no longer
+    dispatches on architecture-local installer names.
     """
 
     return {
@@ -5142,11 +5065,8 @@ def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
 def _apply_compile_patch_plan(plan: CompilePatchPlan) -> None:
     """Apply one resolved runtime patch plan.
 
-    The plan executor is intentionally generic so new model families usually
-    only need registry updates:
-    - add or extend a trait matcher
-    - point a bundle at an adapter
-    - reuse or add runtime primitives
+    Generic executor: new families usually only need registry updates (extend a
+    trait matcher, point a bundle at an adapter, reuse/add runtime primitives).
     """
 
     executors = _runtime_patch_primitive_installers()
@@ -5163,9 +5083,8 @@ def _apply_compile_patch_plan(plan: CompilePatchPlan) -> None:
 def trace_patch_bindings(model_or_arch) -> tuple[tuple[str, str, str, str], ...]:
     """Return concrete runtime patch bindings applied for one architecture.
 
-    This is intentionally lower-level than `trace_compile_application(...)`.
-    It answers "what class/method names were actually monkey-patched?" so a
-    maintainer can quickly diff current bindings against upstream changes.
+    Lower-level than `trace_compile_application`: lists which class/method
+    names were actually monkey-patched, for diffing against upstream changes.
     """
 
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)

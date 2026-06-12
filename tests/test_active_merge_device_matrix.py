@@ -14,24 +14,12 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-Comprehensive _active_merge_device() dispatch matrix.
+"""_active_merge_device() dispatch matrix.
 
-Drives every supported accelerator combination from a single test host
-by spoofing torch.cuda.is_available, torch.xpu.is_available,
-torch.backends.mps.is_available, and torch.version.hip so we can
-exercise the cascade
-
-    cuda (covers ROCm)  ->  xpu  ->  mps  ->  cpu
-
-deterministically without owning the actual hardware.
-
-This is the regression net for the LoRA merge fix landed in PR #620.
-A future change that hardcodes "cuda", reorders the cascade, or drops
-a backend will fail loudly here.
-
-Add a row to ``PROFILES`` to extend coverage; tests parametrize over
-it automatically. No real hardware required.
+Spoofs torch.cuda/xpu/mps availability and torch.version.hip to exercise the
+cascade `cuda (covers ROCm) -> xpu -> mps -> cpu` without real hardware.
+Regression net for the LoRA merge fix in PR #620. Add a row to ``PROFILES``
+to extend coverage; tests parametrize over it automatically.
 """
 
 from __future__ import annotations
@@ -108,15 +96,9 @@ PROFILE_IDS = [p.name for p in PROFILES]
 
 @pytest.fixture
 def spoof_accelerator(monkeypatch):
-    """Apply an AcceleratorProfile to torch in-process and reset the
-    @lru_cache on _active_merge_device so the next call re-probes.
-
-    Cache hygiene: ``_active_merge_device`` is decorated with
-    ``functools.lru_cache(maxsize=1)`` so its first return is sticky for
-    the rest of the process. The fixture clears the cache before AND
-    after each test so neither this test nor any subsequent test in the
-    session sees a stale "cpu" / "mps" answer baked in by an earlier
-    spoof.
+    """Apply an AcceleratorProfile to torch in-process and clear the
+    lru_cache(maxsize=1) on _active_merge_device before and after each test so
+    no stale "cpu"/"mps" answer leaks across the session.
     """
     from unsloth_zoo.saving_utils import _active_merge_device
 
@@ -165,9 +147,9 @@ def test_active_merge_device_cascade(profile, spoof_accelerator):
 
 
 def test_active_merge_device_takes_no_args(spoof_accelerator):
-    """The helper has no required positional args. The pre-fix signature was
-    _active_merge_device(W) which silently dropped MPS and propagated the
-    foreign device.index across families.
+    """The helper has no required positional args. The pre-fix
+    _active_merge_device(W) silently dropped MPS and propagated the foreign
+    device.index across families.
     """
     from unsloth_zoo.saving_utils import _active_merge_device
     spoof_accelerator(PROFILES[0])
@@ -201,10 +183,8 @@ def test_xpu_takes_priority_over_mps(spoof_accelerator):
 
 
 def test_lru_cache_freezes_first_result(spoof_accelerator):
-    """_active_merge_device() is @functools.lru_cache(maxsize=1). After the
-    first call returns, subsequent calls under different spoofs return
-    the cached value until cache_clear() is invoked. The fixture's
-    cache_clear discipline is what makes the parametrized tests reliable.
+    """_active_merge_device() is lru_cache(maxsize=1): subsequent calls under
+    different spoofs return the cached value until cache_clear() is invoked.
     """
     from unsloth_zoo.saving_utils import _active_merge_device
 

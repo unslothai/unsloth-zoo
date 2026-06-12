@@ -32,10 +32,7 @@ from .utils import (
 )
 
 
-# ============================================================================
 # Grouped GEMM kernel integration for MoE training acceleration
-# ============================================================================
-
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
@@ -208,7 +205,11 @@ def patch_qwen3_moe():
     # Transformers >= 5       uses self.gate_up_proj = nn.Parameter(...)
     # whilst old transformers uses self.experts = nn.ModuleList(...)
 
-    # Patch ParamWrapper.forward for MoE separated LoRA
+    # Patch ParamWrapper.forward for MoE separated LoRA.
+    # Ordering is load-bearing: this unconditional call installs the
+    # peft.get_peft_model wrapper during the import-time patch pass, before
+    # unsloth.models.llama/vision capture their get_peft_model alias. Do not
+    # gate it by model name or move it below the qwen3 import check.
     patch_param_wrapper_for_moe()
 
     try:
@@ -316,11 +317,8 @@ def patch_qwen3_moe():
                 final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
             return final_hidden_states.to(hidden_states.dtype), router_logits
     else:
-    # ====================================================================
-        # New transformers (5.0+) with stacked expert weights
-        # Uses Triton grouped GEMM kernels for high performance
-        # ====================================================================
-
+        # New transformers (5.0+) with stacked expert weights; uses Triton
+        # grouped GEMM kernels.
         _qwen3_lora_extractor = _make_qwen_moe_lora_extractor()
 
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts._unsloth_lora_extractor_fn = staticmethod(_qwen3_lora_extractor)
@@ -331,18 +329,16 @@ def patch_qwen3_moe():
             module_name=__name__,
         )
 
-    # For old transformers, patch Qwen3MoeSparseMoeBlock
-    # For new transformers, patch Qwen3MoeExperts (which has the expert loop)
+    # Old transformers: patch Qwen3MoeSparseMoeBlock.
+    # New transformers: patch Qwen3MoeExperts (which has the expert loop).
     if old_transformers:
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", forward)
     else:
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts, "forward", forward)
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", sparse_moe_block_forward)
 
-    # ====================================================================
-    # Patch Qwen3MoeForCausalLM.forward for GRPO training
-    # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
-    # ====================================================================
+    # Patch Qwen3MoeForCausalLM.forward for GRPO: return hidden_states instead
+    # of logits when UNSLOTH_RETURN_HIDDEN_STATES=1.
     try:
         from transformers.models.qwen3_moe.modeling_qwen3_moe import (
             Qwen3MoeForCausalLM,
