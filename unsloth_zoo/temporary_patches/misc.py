@@ -1644,3 +1644,24 @@ def patch_qwen2vl_image_processor_pixel_attrs():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
+
+
+def patch_deepseek_v2_moe_capitalisation_alias():
+    """
+    transformers 5.0 renamed `DeepseekV2MoE` -> `DeepseekV2Moe` (camelCase
+    consistency pass). Remote-code models like deepseek-ai/DeepSeek-OCR
+    ship a modeling file that still imports the old name, so loading them
+    on transformers 5.x raises `ImportError: cannot import name
+    'DeepseekV2MoE'`. Add a backward-compat alias so the old name keeps
+    resolving regardless of which transformers version is installed.
+    Forward-compatible: when transformers 4.x is installed and ships
+    `DeepseekV2MoE` natively, the alias check is a no-op.
+    """
+    try:
+        from transformers.models.deepseek_v2 import modeling_deepseek_v2 as _m
+    except ImportError:
+        return
+    if not hasattr(_m, "DeepseekV2MoE") and hasattr(_m, "DeepseekV2Moe"):
+        _m.DeepseekV2MoE = _m.DeepseekV2Moe
+pass
+TEMPORARY_PATCHES.append(patch_deepseek_v2_moe_capitalisation_alias)
